@@ -684,34 +684,29 @@ fn finish_cipher_bytes(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Allocate a freshly initialised Cipher synthetic and register an
-/// empty `CipherState` keyed on its heap pointer.  The algorithm
-/// string is stashed in the side-table — we do **not** write to any
-/// instance field of the real JDK class, because field-5 is
-/// `initialized:Z` (a primitive boolean) and storing an Object there
-/// breaks the `expected object reference` invariant on read-back.
-/// Reject `Cipher.getInstance` transformations that the requested JDK
-/// provider does not actually supply, so the native shim's "accept
-/// everything" behaviour doesn't mask a real-JDK `NoSuchAlgorithmException`.
+/// The gate in front of `cipher_alloc`: admit the transformation, or raise the
+/// exception the JDK specifies for it.
 ///
-/// Concretely: SunJCE provides AES in ECB/CBC/PCBC/CTR/CTS/CFB/OFB/GCM/KW/KWP
-/// but NOT **CCM** (that AEAD mode ships with BouncyCastle, not the JDK). On
-/// HotSpot `Cipher.getInstance("AES/CCM/…","SunJCE")` throws
-/// `NoSuchAlgorithmException: No such algorithm: AES/CCM/…`. Our native AES
-/// dispatch can't do CCM either, so accepting it (returning a synthetic
-/// Cipher) is strictly wrong — it silently masks the rejection that callers
-/// like Tomcat's `EncryptInterceptor` depend on to refuse the transform
-/// (TestEncryptInterceptorAlgorithms `doTestShouldNotSucceed`). Throw the
-/// catchable checked exception so the real-JDK call site behaves as on HotSpot.
+/// ## What this gate has had to learn, in order
 ///
-/// The CCM check alone was not enough: it looked only at the MODE, so the base
-/// ALGORITHM was never questioned and `Cipher.getInstance("CRATONVM-NO-SUCH-
-/// CIPHER")` returned a fully-formed synthetic `Cipher` — a fabricated success
-/// where the JDK mandates `NoSuchAlgorithmException`, which is what
-/// `regression-suite/src/RJdkFailure.java:309` measures (failing in `--real-jdk`
-/// and `--jdk-only`, passing on HotSpot 25). `MessageDigest.getInstance` and
-/// `KeyFactory.getInstance` in the sibling modules already validate this way;
-/// see `message_digest::algorithm_supported`.
+/// It began as a MODE check for `AES/CCM` alone — SunJCE ships AES in
+/// ECB/CBC/PCBC/CTR/CTS/CFB/OFB/GCM/KW/KWP but not CCM, and Tomcat's
+/// `TestEncryptInterceptorAlgorithms` `doTestShouldNotSucceed` depends on the
+/// refusal. A mode check could not see that the base ALGORITHM was never
+/// questioned, so `Cipher.getInstance("CRATONVM-NO-SUCH-CIPHER")` returned a
+/// fully-formed `Cipher` — the fabricated success
+/// `regression-suite/src/RJdkFailure.java:309` measures. That was fixed by
+/// adding an algorithm allow-list, `cipher_algorithm_known`, which was
+/// deliberately over-inclusive.
+///
+/// Over-inclusive was the third mistake, and the largest: the names it admitted
+/// but could not compute were not refused later, they were served as AES. See
+/// [`classify_transformation`], which replaces it, for the measurements. The
+/// gate is total now — every transformation is admitted as a named family or
+/// refused, with no arm in between.
+///
+/// Returns the admitted [`CipherFamily`] so a caller that needs to know which
+/// engine it just resolved does not have to re-derive it.
 fn check_transformation_supported(
     ctx: &mut dyn NativeContext,
     algo: &str,
@@ -1213,6 +1208,15 @@ fn aes_key_length_reason(algo: &str, key_len: usize) -> Option<String> {
         .then(|| format!("Invalid AES key length: {key_len} bytes"))
 }
 
+/// Allocate a freshly initialised Cipher synthetic and register an empty
+/// `CipherState` for it. The algorithm string is stashed in the side-table — we
+/// do **not** write it to any instance field of the real JDK class, because
+/// field 5 is `initialized:Z`, a primitive boolean, and storing an Object there
+/// breaks the `expected object reference` invariant on read-back.
+///
+/// Call only after [`check_transformation_supported`] has admitted `algo`: this
+/// function allocates unconditionally, so reaching it with an unserviceable
+/// name is how a fabricated `Cipher` gets built.
 fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
     let algo_str = ctx.read_string(algo).unwrap_or_default();
@@ -1536,11 +1540,19 @@ fn cipher_unwrap_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 /// Execute `doFinal` against the configured cipher state.
 ///
-/// Currently dispatches the WP6.3-probe-required `AES/GCM/NoPadding`
-/// path through `crypto_impl::AesGcm::{encrypt, decrypt}`.  Other
-/// modes (ECB / CBC / CTR / ChaCha20-Poly1305) are out of probe scope
-/// and return an `IllegalStateException` describing the requested
-/// transformation rather than silently producing wrong bytes.
+/// Reads the transformation back out of the side-table and routes it by
+/// FAMILY, in this order: RSA → PBES2 → the real SunJCE SPI (AES-CBC/CFB/OFB,
+/// DES, DESede) → the in-crate AES paths (GCM, ECB, RFC 3394 key wrap). Every
+/// arrival here has been admitted by `classify_transformation`, so there is no
+/// arm that guesses.
+///
+/// The retired version of this comment said the non-GCM modes were "out of
+/// probe scope and return an `IllegalStateException` describing the requested
+/// transformation rather than silently producing wrong bytes". Half of that was
+/// never true: `ChaCha20`, `Blowfish`, `RC4` and every other admitted-but-
+/// uncomputable name did not reach the `IllegalStateException` at all — they
+/// landed in the ECB arm and returned AES. A comment outlives its defect, and
+/// this one outlived a defect it also misdescribed.
 fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let key = obj_key(ctx, this);
     let state = with_table_read(|t| t.get(&key).cloned());
