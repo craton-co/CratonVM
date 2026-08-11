@@ -1,8 +1,11 @@
 # W3-4 — `ForkJoinTask.isCompletedAbnormally()` was unregistered, and what still
 # gates the `CRATONVM_FJP_EAGER_FORK` default
 
-Status: **fix landed (unbuilt, unmeasured)** for the assertion; the default flip
-is **prepared but NOT applied**. Wave 3, lane W3-4.
+Status: **fix landed (unbuilt, unmeasured)** for the assertion. **The default
+flip LANDED 2026-08-07** — see §3, which is kept as the record of what was
+measured before it moved. §4 (`quietly*`) was closed by
+`W6-7-forkjointask-quietly-family.md`; it is kept as the record of what that
+lane was handed. Wave 3, lane W3-4.
 
 Predecessors: `L12-forkjoinpool-no-workers-awaitdone-hang.md`,
 `L19-countedcompleter-lazy-fork-starvation.md`,
@@ -113,16 +116,51 @@ The anonymous `RecursiveTask<Long>` subclasses at 240/264/285 declare
 matches and the task takes the `ComputeObject` arm — the same arm `SumTask`
 already proves works.
 
-## 3. `CRATONVM_FJP_EAGER_FORK` as the default — prepared, not applied
+## 3. `CRATONVM_FJP_EAGER_FORK` as the default — FLIPPED 2026-08-07
+
+> **This section is history.** The flip landed on 2026-08-07 and the tree no
+> longer matches the "prepared, not applied" reading below.
+> `fjt_fork_mode()` (`native-builtins/src/phases_late/concurrent.rs`) now returns
+> `FjtForkMode::CountedCompleterEager` from its env-unset arm, so **lazy fork is
+> the OPT-OUT** (`CRATONVM_FJP_EAGER_FORK=0` / `CRATONVM_THREADS=
+> -fjp-eager-fork`, which falls through the `match` to
+> `_ => FjtForkMode::Lazy`). The one-line change §3's last subsection specified
+> is the change that was made, and the two doc comments it said must move in the
+> same commit — the `FJT_EAGER_FORK_ENV` mode table and `FjtForkMode::Lazy`'s own
+> line — now read that way too.
+>
+> **What was measured before flipping** (the flipping commit's own note in
+> `fjt_fork_mode`, i.e. the three conditions below, answered):
+>
+> 1. `=1` reaches `PASS RJdkForkJoin (26 checks)` in BOTH `--jdk-only` and
+>    `--real-jdk` — condition (1), closed by observation;
+> 2. `probes/FjpMatrixProbe.java` and `RJdkExecutors` are byte-identical A vs B
+>    (the only diff is the flag banner line), and `vm/tests/
+>    {fjp_recursive,rfjp1_recursive}.rs` are unchanged — with the same caveat
+>    §3's table already recorded, that those two tests are VACUOUS (their probe
+>    source `apps/fjp_probe/FjpProbe.java` does not exist, so they take a
+>    "skipping" branch and pass in 0.00s);
+> 3. `=all` passes too but buys nothing `=1` does not, so the NARROWER gate is
+>    what shipped.
+>
+> **Still unverified, and named as such in the source:** the Spring/H2 slice —
+> the entire remaining blast radius, since parallel streams are its only
+> `CountedCompleter` users. Its pre-flip state was already broken (every real
+> parallel stream starved under lazy fork, because `java.util.stream
+> .AbstractTask extends CountedCompleter`), so the flip is expected to repair
+> rather than regress it — but that has not been run. The reason the flip was
+> taken anyway is the one the source states: leaving it off shipped a
+> known-broken default.
 
 The gate's own three conditions (L19 §"What would justify making the new
-behaviour the default"):
+behaviour the default"), as this lane found them:
 
-### (1) `=1` reaches `PASS` in both modes — still open
+### (1) `=1` reaches `PASS` in both modes — was open here, CLOSED 2026-08-07
 
 This lane's fix removes the assertion at `:259`. `:260`–`:298` are argued
 correct above but **unrun**. Condition (1) closes only on an observed
-`PASS RJdkForkJoin (26 checks)`.
+`PASS RJdkForkJoin (26 checks)` — which is what the flipping commit recorded, on
+both `--jdk-only` and `--real-jdk`.
 
 ### (2) Regression guard unchanged A vs B — source verdict
 
@@ -156,9 +194,12 @@ blocker for `=1` (a `RecursiveTask` takes the lazy branch under `=1` regardless)
 So condition (2) reduces to exactly one question: **does the Spring/H2 slice
 move?** Everything reached by a parallel stream goes eager under `=1`.
 
-### (3) `=all` buys nothing `=1` does not — open, one command
+### (3) `=all` buys nothing `=1` does not — CLOSED 2026-08-07
 
-### Closing (2) and (3)
+`=all` passed too and bought nothing `=1` did not, so the narrower gate is what
+became the default.
+
+### Closing (2) and (3) — the recipe that was run
 
 Interleave A-B-B-A on the shared host (a straight A,A,B,B measures the host).
 
@@ -195,27 +236,54 @@ CRATONVM_FJP_EAGER_FORK=all timeout 300 cratonvm --real-jdk -cp out RJdkForkJoin
 `VmFlags` snapshot — **set it in the environment before launching the process**;
 a `std::env::set_var` after the snapshot is invisible.
 
-### The flip, when all three close — ONE line
+### The flip — ONE line, APPLIED 2026-08-07
 
 `native-builtins/src/phases_late/concurrent.rs`, in `fjt_fork_mode()`, the
 `else` of the `let Some(raw) = … else` (the "env var unset" arm):
 
 ```rust
-        return FjtForkMode::Lazy;          // <- becomes
+        return FjtForkMode::Lazy;          // <- became
         return FjtForkMode::CountedCompleterEager;
 ```
 
-Nothing else moves. `"0"` falls through the `match` to `_ => FjtForkMode::Lazy`,
+Nothing else moved. `"0"` falls through the `match` to `_ => FjtForkMode::Lazy`,
 so `CRATONVM_FJP_EAGER_FORK=0` / `CRATONVM_THREADS=-fjp-eager-fork` remains the
 escape hatch, and the knob stays bisectable. The doc comment above
 `FJT_EAGER_FORK_ENV` (the `unset / 0 / anything unrecognised → today's lazy fork
-(DEFAULT)` table) and `FjtForkMode::Lazy`'s own `/// … and the default` must be
-updated in the same commit or the next reader is misled.
+(DEFAULT)` table) and `FjtForkMode::Lazy`'s own `/// … and the default` were the
+two places that had to move with it or mislead the next reader. `FjtForkMode
+::Lazy`'s line moved with the flip; **the mode table did not, and read
+`unset … lazy fork (DEFAULT)` for four days** until it was corrected alongside
+this record (2026-08-11). That is the failure this paragraph was written to
+prevent, landing anyway — a doc comment one screen above the code it describes
+is not automatically read when the code changes.
 
-**Not applied in this lane by instruction.** Do not flip it on condition (1)
-alone.
+**It was not applied in this lane, by instruction** — this section is the
+inventory the flipping commit worked from, not a pending action.
 
-## 4. Still open, recorded not closed: `quietly*`
+## 4. `quietly*` — recorded here, CLOSED by W6-7
+
+> **This section is history.** `W6-7-forkjointask-quietly-family.md` took the
+> work specified below and landed it as one unit, in
+> `native-builtins/src/phases_late/concurrent.rs`'s
+> `register_forkjointask_quietly_bridge`, called from BOTH boot paths:
+> `quietlyJoin()V` at `:6932`, `quietlyInvoke()V` at `:6951`, the two timed
+> `(JLjava/util/concurrent/TimeUnit;)Z` overloads from the loop at `:6975`,
+> `quietlyJoinPoolInvokeAllTask(J)V` at `:6997`, and `quietlyComplete()V` at
+> `:7021`. All six are named in `keep_real_forkjointask_bridge`
+> (`native-api/src/registry.rs`) and `is_forkjoin_native_override`
+> (`vm/src/runtime/interpreter/native_override.rs`), so the three-edit rule this
+> section specified was satisfied entry for entry.
+>
+> The two things this section got right and W6-7 kept: the family went in as ONE
+> unit, and `quietlyComplete()` did NOT reuse `fjp_state_set_done`. It got the
+> new primitive named below,
+> `phases_early::fjp_state_set_done_preserving_thrown`.
+>
+> The thing this section only half-saw: it called `fjp_state_set_done`'s
+> `e.thrown = Value::Object(None)` a hazard *for `quietlyComplete`*. It was a
+> live defect for `complete(V)` itself, on four registrations that had been
+> calling it all along — `W6-9-complete-erases-the-abnormal-record.md`.
 
 `quietlyInvoke()V`, `quietlyJoin()V`, `quietlyComplete()V`,
 `quietlyJoin(JLjava/util/concurrent/TimeUnit;)Z` and

@@ -1714,6 +1714,11 @@ pub(crate) fn is_forkjoin_native_override(
             // `native-builtins/src/phases_early.rs`. Must stay in step with
             // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
             | ("completeExceptionally", "(Ljava/lang/Throwable;)V")
+            // W6-9 §7.2: registered by
+            // `native-builtins/src/phases_late/concurrent.rs::
+            // register_forkjointask_w6_9_residual_bridge`. Must stay in step
+            // with `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("reinitialize", "()V")
             // L12: the STATIC `invokeAll` overloads — the last real-bytecode
             // route from the lazy `fork()` above to an `awaitDone()` that no
             // worker thread can satisfy. Must stay in step with
