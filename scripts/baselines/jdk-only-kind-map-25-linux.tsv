@@ -7,9 +7,9 @@
 # jdk_version: 25.0.4
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11633
+# rows: 11635
 # unchosen: 0
-# note: Re-frozen on the merge with 892ab4f40. Two contributions, and they are not the same change: this branch restores 65 registrations dc55e8057 deleted (49 Bridge, 16 SyntheticStub on no-image receivers) taking the count 8977 -> 9026, and merging origin/dev's 892ab4f40 adds 6 more (native-builtins/src/lang_reflect.rs) taking it to 9032. The +6 is dev's and dev is red on its own baseline without this branch: the same tree measures 9026 before the merge and 9032 after, with nothing else differing. On the restores: the dead-sweep scored them method-nowhere, which is also what CratonVM's own additions to a real class look like -- a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists because the JDK declares only the BiFunction form. 24 tests across two crates pinned them and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md
+# note: Schema 4: image_declaring_method resolves up the hierarchy inside ClassManager::adjudicate_natives_against_image, so the 19 inherited ACC_NATIVE rows stop counting as unadjudicated and the 1,613 inherited shadows become visible without jdk-only-inherited-decl.sh plus a HotSpot run. Adds a third ratchet on STATED Bridge rows whose target is concrete bytecode (the 24 ForkJoinTask rows). without_acc_native 9032 -> 9015: 19 credited by the hierarchy (18 FileDispatcherImpl inheriting UnixFileDispatcherImpl, plus ComponentSampleModel.initIDs from SampleModel), 2 added by dev (PrintStream.format/printf with a Locale). The 4 java/lang/reflect/*Type.hashCode credits through java.lang.Object are deliberately NOT counted - Object is inherited by everything and would discharge any hashCode Bridge anywhere. shadows_bytecode 4555 -> 6170: the same ratchet now covers the inherited shadows it could not see.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -1412,6 +1412,7 @@ java/io/PrintStream	charset	()Ljava/nio/charset/Charset;	0	intrinsic	0	1
 java/io/PrintStream	close	()V	0	bridge	0	1
 java/io/PrintStream	flush	()V	0	bridge	0	1
 java/io/PrintStream	format	(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
+java/io/PrintStream	format	(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
 java/io/PrintStream	print	(C)V	0	bridge	0	1
 java/io/PrintStream	print	(D)V	0	bridge	0	1
 java/io/PrintStream	print	(F)V	0	bridge	0	1
@@ -1421,6 +1422,7 @@ java/io/PrintStream	print	(Ljava/lang/Object;)V	0	bridge	0	1
 java/io/PrintStream	print	(Ljava/lang/String;)V	0	bridge	0	1
 java/io/PrintStream	print	(Z)V	0	bridge	0	1
 java/io/PrintStream	printf	(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
+java/io/PrintStream	printf	(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
 java/io/PrintStream	println	()V	0	bridge	0	1
 java/io/PrintStream	println	(C)V	0	bridge	0	1
 java/io/PrintStream	println	(D)V	0	bridge	0	1
