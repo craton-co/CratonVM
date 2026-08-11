@@ -1849,6 +1849,134 @@ fn native_method_invoke_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Register the WP2.1 net-new natives. Called from `register_essential_natives`
 /// AFTER the existing reflection registrations so these supplement (don't
 /// override) the historical layer.
+/// One `Type`-typed slot of a reflection object, read from EITHER
+/// representation: the synthetic stub keeps its members in positional slots,
+/// the real `sun.reflect.generics.reflectiveObjects.*Impl` in named fields.
+/// `None` means the receiver is not that kind of type at all - the callers
+/// read it as "not equal", the same fail-closed rule the `TypeVariable`
+/// natives above already use.
+fn reflect_type_slot(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    stub_class: &str,
+    stub_slot: usize,
+    real_field: &str,
+) -> Option<Value> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    if cls == stub_class {
+        return Some(ctx.get_field(obj, stub_slot));
+    }
+    match ctx.get_field_by_name(obj, real_field) {
+        v @ Value::Object(_) => Some(v),
+        _ => None,
+    }
+}
+
+/// `Objects.equals(a, b)` over two `Type` references, dispatching to the
+/// receiver's own `equals` so a nested `TypeVariable` contributes its
+/// (declaration, name) identity rather than a rendered name.
+fn type_value_equals(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return Ok(true);
+            }
+            let r =
+                ctx.invoke_virtual(x, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(y))])?;
+            Ok(matches!(r, Some(Value::Int(v)) if v != 0))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `Objects.hashCode(t)` - 0 for null, the receiver's virtual `hashCode`
+/// otherwise.
+fn type_value_hash(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    match v {
+        Value::Object(Some(o)) => Ok(match ctx.invoke_virtual(o, "hashCode", "()I", &[])? {
+            Some(Value::Int(h)) => h,
+            _ => 0,
+        }),
+        _ => Ok(0),
+    }
+}
+
+/// `Arrays.equals(Type[], Type[])`.
+fn type_array_equals(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    let (Value::Object(oa), Value::Object(ob)) = (a, b) else {
+        return Ok(false);
+    };
+    let (Some(aa), Some(bb)) = (oa, ob) else {
+        return Ok(oa.is_none() && ob.is_none());
+    };
+    let n = ctx.array_length(aa);
+    if n != ctx.array_length(bb) {
+        return Ok(false);
+    }
+    for i in 0..n {
+        let x = ctx.get_array_element(aa, i);
+        let y = ctx.get_array_element(bb, i);
+        if !type_value_equals(ctx, x, y)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `Arrays.hashCode(Type[])` - 0 for a null array, else the JDK fold.
+fn type_array_hash(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    let Value::Object(Some(arr)) = v else {
+        return Ok(0);
+    };
+    let n = ctx.array_length(arr);
+    let mut h: i32 = 1;
+    for i in 0..n {
+        let e = ctx.get_array_element(arr, i);
+        h = h.wrapping_mul(31).wrapping_add(type_value_hash(ctx, e)?);
+    }
+    Ok(h)
+}
+
+/// The generic component type of a `GenericArrayType`, from either
+/// representation: the synthetic stub keeps it in slot 0, the real JDK
+/// `GenericArrayTypeImpl` in a named field. `None` means the receiver is not a
+/// generic array type at all (or carries no component), which the callers read
+/// as "not equal" / "hash 0" rather than guessing.
+fn generic_array_component(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default();
+    let slot = if cls == "java/lang/reflect/GenericArrayType" {
+        ctx.get_field(obj, 0)
+    } else {
+        ctx.get_field_by_name(obj, "genericComponentType")
+    };
+    match slot {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3030,6 +3158,200 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    // JDK `GenericArrayTypeImpl` compares by the generic COMPONENT type and
+    // nothing else - `equals` is `Objects.equals(component, other.component)`,
+    // `hashCode` is `Objects.hashCode(component)`. Without these two the
+    // synthetic `GenericArrayType` falls through to the `Object.equals` /
+    // `Object.hashCode` natives, which compare reflection stubs by their
+    // RENDERED TYPE NAME. A rendered name cannot tell `S[]` declared on one
+    // class from `S[]` declared on another: both render `S[]`, so they
+    // compared EQUAL and hashed alike, where HotSpot answers not-equal
+    // because the components are `TypeVariable`s carrying different generic
+    // declarations. The sibling `TypeVariable` natives above already do it
+    // the JDK way, which is why only the array wrapper was wrong.
+    //
+    // The blast radius is a cache. Spring's `SerializableTypeWrapper` keys
+    // every wrapped `Type` in a static map by the `Type` itself, so the
+    // collision served the FIRST `S[]`'s proxy for the SECOND's. The second
+    // resolver then held a type variable belonging to a class it knows
+    // nothing about, `S` stayed unresolved, and an `@Autowired S[]` field
+    // widened to `Object[]` - every bean in the factory got injected.
+    // `AutowiredAnnotationBeanPostProcessorTests
+    // .genericsBasedFieldInjectionWithSubstitutedVariables` is the witness: 4
+    // beans where 1 is expected, and ONLY when the method-injection test ran
+    // first in the same JVM, which is why it passes when run alone.
+    registry.register(
+        "java/lang/reflect/GenericArrayType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            // `other` is either another synthetic stub (component in slot 0) or
+            // the real `sun.reflect.generics.reflectiveObjects
+            // .GenericArrayTypeImpl` (named field). Anything without a readable
+            // component is not a generic array type: not equal, and no
+            // speculative virtual call that could leave an exception pending.
+            let (Some(a), Some(b)) = (
+                generic_array_component(ctx, this),
+                generic_array_component(ctx, other),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if a == b {
+                return Ok(Some(Value::Int(1)));
+            }
+            let eq = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])?;
+            Ok(Some(Value::Int(i32::from(
+                matches!(eq, Some(Value::Int(v)) if v != 0),
+            ))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/GenericArrayType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `Objects.hashCode(component)` — 0 for a missing component, and
+            // a VIRTUAL call so a `TypeVariable` component contributes its
+            // (declaration, name) hash rather than an identity hash. Anything
+            // else would break the equals/hashCode contract this pair now
+            // establishes.
+            let Some(c) = generic_array_component(ctx, this) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let h = match ctx.invoke_virtual(c, "hashCode", "()I", &[])? {
+                Some(Value::Int(v)) => v,
+                _ => 0,
+            };
+            Ok(Some(Value::Int(h)))
+        },
+    );
+
+    // The same JDK contract for the other two synthetic type stubs. They shared
+    // the `GenericArrayType` defect for the same reason - no bytecode
+    // `equals`/`hashCode`, so `Object.equals` compared them by RENDERED NAME -
+    // and they are reached THROUGH the array wrapper: `Repository<S>[]` is a
+    // `GenericArrayType` whose component is a `ParameterizedType`, so fixing
+    // only the wrapper still let `Repository<S>` declared on one class compare
+    // equal to `Repository<S>` declared on another.
+    //
+    // `ParameterizedTypeImpl`: equal iff ownerType, rawType and the
+    // actualTypeArguments all match; hash is
+    // `Arrays.hashCode(args) ^ hash(owner) ^ hash(raw)`.
+    registry.register(
+        "java/lang/reflect/ParameterizedType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            const STUB: &str = "java/lang/reflect/ParameterizedType";
+            let (Some(ra), Some(rb)) = (
+                reflect_type_slot(ctx, this, STUB, 0, "rawType"),
+                reflect_type_slot(ctx, other, STUB, 0, "rawType"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_value_equals(ctx, ra, rb)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(oa), Some(ob)) = (
+                reflect_type_slot(ctx, this, STUB, 2, "ownerType"),
+                reflect_type_slot(ctx, other, STUB, 2, "ownerType"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_value_equals(ctx, oa, ob)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(aa), Some(ab)) = (
+                reflect_type_slot(ctx, this, STUB, 1, "actualTypeArguments"),
+                reflect_type_slot(ctx, other, STUB, 1, "actualTypeArguments"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            Ok(Some(Value::Int(i32::from(type_array_equals(ctx, aa, ab)?))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/ParameterizedType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            const STUB: &str = "java/lang/reflect/ParameterizedType";
+            let a = reflect_type_slot(ctx, this, STUB, 1, "actualTypeArguments")
+                .unwrap_or(Value::Object(None));
+            let o =
+                reflect_type_slot(ctx, this, STUB, 2, "ownerType").unwrap_or(Value::Object(None));
+            let r = reflect_type_slot(ctx, this, STUB, 0, "rawType").unwrap_or(Value::Object(None));
+            let h = type_array_hash(ctx, a)? ^ type_value_hash(ctx, o)? ^ type_value_hash(ctx, r)?;
+            Ok(Some(Value::Int(h)))
+        },
+    );
+    // `WildcardTypeImpl`: equal iff both bound arrays match; hash is
+    // `Arrays.hashCode(lower) ^ Arrays.hashCode(upper)`.
+    registry.register(
+        "java/lang/reflect/WildcardType",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            const STUB: &str = "java/lang/reflect/WildcardType";
+            let (Some(ua), Some(ub)) = (
+                reflect_type_slot(ctx, this, STUB, 0, "upperBounds"),
+                reflect_type_slot(ctx, other, STUB, 0, "upperBounds"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if !type_array_equals(ctx, ua, ub)? {
+                return Ok(Some(Value::Int(0)));
+            }
+            let (Some(la), Some(lb)) = (
+                reflect_type_slot(ctx, this, STUB, 1, "lowerBounds"),
+                reflect_type_slot(ctx, other, STUB, 1, "lowerBounds"),
+            ) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            Ok(Some(Value::Int(i32::from(type_array_equals(ctx, la, lb)?))))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/WildcardType",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            const STUB: &str = "java/lang/reflect/WildcardType";
+            let u =
+                reflect_type_slot(ctx, this, STUB, 0, "upperBounds").unwrap_or(Value::Object(None));
+            let l =
+                reflect_type_slot(ctx, this, STUB, 1, "lowerBounds").unwrap_or(Value::Object(None));
+            let h = type_array_hash(ctx, l)? ^ type_array_hash(ctx, u)?;
+            Ok(Some(Value::Int(h)))
         },
     );
 
