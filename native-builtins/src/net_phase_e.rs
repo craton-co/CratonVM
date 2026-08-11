@@ -7647,27 +7647,42 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         };
         let url_str = ctx.read_string(url_str_obj).unwrap_or_default();
 
-        // Always build a synthetic URI. Returning a real-JDK URI here leaves
-        // our `URI.getSchemeSpecificPart()` override without access to the raw
-        // string (layout differs), which can degrade to empty SSP and break
-        // Spring Boot's `new File(url.toURI().getSchemeSpecificPart())` path.
-        // Layout per http2.rs:
-        //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
+        // Populate the URI the SAME way `File.toURI()` does — positional slots
+        // via `url_parse`, then the real class's NAMED fields via
+        // `uri_store_named`. Writing only the positional slots is what this did
+        // until 2026-08-10, and on a real image it is not enough:
+        // `try_alloc_concurrent_synthetic` hands back an instance of the REAL
+        // `java/net/URI`, whose field 6 is not "raw" and whose field 0 is not
+        // "scheme", so the writes landed on unrelated fields and the one the
+        // real bytecode actually reads — `string` — stayed null.
+        //
+        // `URI.toString()` therefore returned EMPTY for every `url.toURI()`,
+        // and the damage showed up one call later: Tomcat's
+        // `StandardRoot.processWebInfLib` does
+        // `createWebResourceSet(..., possibleJar.getURL(), ...)`, whose
+        // `new File(uri)` produced a File whose path was the whole URL text
+        // (`file:\C:\…\bug69135-lib.jar`). That is not absolute, so it was
+        // resolved against the doc base, and every webapp with a
+        // `WEB-INF/lib/*.jar` failed to start with
+        // `Unable to create WebResourceSet from [<docBase>\file:\C:\…]`.
+        //
+        // The retired comment here said returning a real URI would leave
+        // `getSchemeSpecificPart()` without the raw string. `uri_store_named`
+        // is exactly the answer to that: it writes `string` (and `authority` /
+        // `query` / `fragment`) under the names the real class declares, so the
+        // accessors and the real bytecode see the same object. `File.toURI()`
+        // has done it this way all along, which is why its output was correct
+        // in the same run where this one's was empty.
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
-        let raw_s = ctx.create_string(&url_str);
-        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-                                                           // Parse scheme.
-        if let Some(colon) = url_str.find(':') {
-            let scheme = &url_str[..colon];
-            let scheme_s = ctx.create_string(scheme);
-            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
-            // For file: URIs, the path is everything after "file:".
-            if scheme == "file" {
-                let path = &url_str[colon + 1..];
-                let path_s = ctx.create_string(path);
-                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
-            }
-        }
+        // Pin across the parse/store helpers: both create strings, so a moving
+        // young GC in either can relocate the fresh URI (the native
+        // stale-local family). Same discipline as `File.toURI()`.
+        let uri_pin = ctx.pin_native_root(uri);
+        crate::url_parse(ctx, uri, &url_str);
+        let uri = ctx.read_native_pin(uri_pin, uri);
+        crate::uri_store_named(ctx, uri, &url_str);
+        let uri = ctx.read_native_pin(uri_pin, uri);
+        ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
     });
 
