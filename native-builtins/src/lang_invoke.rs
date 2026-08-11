@@ -4649,10 +4649,20 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // GRANTS. Measured: `lookup().dropLookupMode(PUBLIC)` is 0 and its
             // `.in(<own class>)` / `.in(<package mate>)` / `.in(String.class)`
             // are all 0.
+            let target_is_public = match target_class {
+                Value::Object(Some(m)) => crate::lang_class::mirror_is_public(ctx, m),
+                _ => false,
+            };
             let modes = if prev == 0 {
                 0
             } else {
-                crate::classloader::lk_in_modes(prev, same_class, same_package, same_nest)
+                crate::classloader::lk_in_modes(
+                    prev,
+                    same_class,
+                    same_package,
+                    same_nest,
+                    target_is_public,
+                )
             };
             let lookup =
                 try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;

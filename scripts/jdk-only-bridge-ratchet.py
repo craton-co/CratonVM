@@ -49,7 +49,12 @@ to not repeat.
    `--jdk-only` came to be unable to start a thread). 4,796 rows can reach it,
    plus roughly 1,600 more that shadow bytecode they INHERIT — invisible until
    schema 4 resolved `image_declaring_method` up the hierarchy.
-3. `total_rows >= MIN_TOTAL_ROWS` — a **collapse detector, not a measurement**.
+3. `bridge.stated_shadows_bytecode <= baseline` with `SLACK = 0`. The two
+   ratchets above count rows regardless of `kind_stated`, and `kind_stated` is
+   the column every reader treats as "somebody checked this against the image".
+   Nothing asked whether a STATED claim is true, so 24 rows shadowing concrete
+   bytecode sat under a §1.5 claim for months, visible only to a `print`.
+4. `total_rows >= MIN_TOTAL_ROWS` — a **collapse detector, not a measurement**.
    Same reasoning as `essential_registry_is_populated` in `stub_ratchet.rs`:
    the ratchet is a ratio argument and the denominator was never asserted, so a
    wiring break that dropped nine thousand registrations would leave the
@@ -150,6 +155,8 @@ RATCHETS = (
      "Bridge registrations with no ACC_NATIVE target anywhere in the hierarchy"),
     ("shadows_bytecode_anywhere", "bridge_shadows_bytecode",
      "Bridge registrations shadowing concrete bytecode (declared or inherited)"),
+    ("stated_shadows_bytecode", "bridge_stated_shadows_bytecode",
+     "Bridge registrations that STATE their kind and shadow concrete bytecode"),
 )
 
 
@@ -184,8 +191,11 @@ def adjudicate(doc):
     bridges = [r for r in rows if r.get("kind") == "bridge"]
     acc_native = shadow = abstract_ = undeclared = absent = 0
     inh_native = inh_shadow = inh_abstract = 0
+    stated_shadow = 0
     for row in bridges:
         img = _img(row)
+        if row.get("kind_stated") and (img.get("has_code") or img.get("inherited_has_code")):
+            stated_shadow += 1
         if not img.get("image_has_class"):
             absent += 1
         elif img.get("declared"):
@@ -246,6 +256,23 @@ def adjudicate(doc):
             # native over a method the class inherits concretely shadows just as
             # much bytecode as one over a method it declares.
             "shadows_bytecode_anywhere": shadow + inh_shadow,
+            # Rows whose kind is STATED (a deliberate `set_category`/
+            # `register_with_kind`, not an ambient default) and whose target is
+            # concrete bytecode on this image: a §1.4 shadow wearing a §1.5
+            # claim. Neither ratchet above could see these -- both count rows
+            # regardless of `kind_stated`, and `kind_stated` is the column every
+            # reader treats as "somebody checked this against the image".
+            #
+            # Measured on JDK 25.0.4+7/linux, 2026-08-10: 24 registrations /
+            # 12 triples, all `ForkJoinTask.{fork, invokeAll x3, quietly*}`
+            # plus `RecursiveTask.fork` and `RecursiveAction.fork` in
+            # `native-builtins/src/phases_late/concurrent.rs`. Those are
+            # deliberate, load-bearing shadows (the site comments record that
+            # `RJdkForkJoin` hangs without them) and they belong to the shadow
+            # population and ITS blocker, not to a quick fix -- so the baseline
+            # holds them rather than a lane deleting them. What must not happen
+            # is a 25th arriving unnoticed.
+            "stated_shadows_bytecode": stated_shadow,
         },
     }
 
@@ -451,7 +478,8 @@ def _selftest_baseline():
         "schema": BLOCK_SCHEMA, "slack": 0, "min_total_rows": MIN_TOTAL_ROWS,
         "jdk": {"25/linux": {"mode": "compatible", "os": "linux",
                              "bridge_without_acc_native": 8,
-                             "bridge_shadows_bytecode": 4}},
+                             "bridge_shadows_bytecode": 4,
+                             "bridge_stated_shadows_bytecode": 0}},
     }
 
 
@@ -560,6 +588,26 @@ def selftest():
     #  (c) an inherited ABSTRACT declaration is still unadjudicated work.
     check("a Bridge inheriting an abstract method trips the aggregate ratchet", 1,
           _synthetic_census(extra=[_row("bridge", "p/INHA", _INH_ABSTRACT)]))
+
+    # 10. THE STATED-CLAIM RATCHET. A row that STATES Bridge over concrete
+    #     bytecode is a §1.4 shadow wearing a §1.5 claim, and no gate watched
+    #     that direction: `kind_stated` is exactly the column readers trust.
+    stated = _row("bridge", "p/STATED", _CODE)
+    stated["kind_stated"] = True
+    check("a STATED Bridge over concrete bytecode trips the stated ratchet", 1,
+          _synthetic_census(extra=[stated]))
+    tripped_stated = sum(1 for ln in checks[-1][4]
+                         if ln.startswith("BRIDGE-RATCHET REGRESSION")
+                         and "STATE their kind" in ln)
+    checks.append((tripped_stated == 1, "the stated ratchet is the one that names it",
+                   1, tripped_stated, []))
+
+    #     An inherited shadow under a stated claim counts too -- the whole
+    #     reason the hierarchy pass exists is that it was invisible.
+    stated_inh = _row("bridge", "p/STATEDINH", _INH_CODE)
+    stated_inh["kind_stated"] = True
+    check("a STATED Bridge over INHERITED bytecode trips it too", 1,
+          _synthetic_census(extra=[stated_inh]))
 
     failed = 0
     for ok, name, want, got, lines in checks:

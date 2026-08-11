@@ -3907,6 +3907,19 @@ pub(crate) fn mirror_is_array(ctx: &dyn NativeContext, mirror: ObjectRef) -> boo
     mirror_class_name(ctx, mirror).is_some_and(|n| n.starts_with('['))
 }
 
+/// `ACC_PUBLIC` on a mirror's class, callable from Rust.
+///
+/// A mirror whose `ClassId` cannot be resolved answers `false`. That is the
+/// conservative direction for the one caller: `Lookup.in` uses this to decide
+/// whether UNCONDITIONAL survives, and answering `true` for a class we could
+/// not identify would GRANT access, which is the direction every defect this
+/// surface has had already leaned.
+pub(crate) fn mirror_is_public(ctx: &dyn NativeContext, mirror: ObjectRef) -> bool {
+    const ACC_PUBLIC: u16 = 0x0001;
+    mirror_class_id(ctx, mirror)
+        .is_some_and(|cid| ctx.class_access_flags(cid) & ACC_PUBLIC != 0)
+}
+
 /// Instance-field index of `java/lang/Class.primitive` (a `boolean`),
 /// resolved by name against the loaded class — mirrors
 /// `resolve_class_mirror_slots`'s writer-side resolution in

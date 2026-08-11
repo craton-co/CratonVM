@@ -1693,12 +1693,42 @@ const LK_FULL_POWER_MODES: i32 =
 /// `pub(crate)` so `lang_invoke`'s competing `Lookup.in` registration (which
 /// WINS in real-JDK mode — see the note in `register_classloader_natives`) can
 /// adopt this arithmetic instead of keeping a second, differently-wrong copy.
-pub(crate) fn lk_in_modes(prev: i32, same_class: bool, same_package: bool, same_nest: bool) -> i32 {
-    // `publicLookup()` is UNCONDITIONAL-only (32) and `in()` leaves it alone —
-    // measured for a same-package, a cross-module and an `Object.class` target.
-    // The FULL_POWER_MODES mask below would answer 0 for it.
+pub(crate) fn lk_in_modes(
+    prev: i32,
+    same_class: bool,
+    same_package: bool,
+    same_nest: bool,
+    target_is_public: bool,
+) -> i32 {
+    // `publicLookup()` is UNCONDITIONAL-only (32), and `in()` KEEPS it only for
+    // a target the whole world can already see. The JDK routes this arm through
+    // `Lookup.publicLookup(requestedLookupClass)`, which yields 0 for a class
+    // that is not public or whose package is not exported.
+    //
+    // Re-measured on OpenJDK 25.0.3 (`PubIn`, receiver `publicLookup()` == 32):
+    //
+    // | target                                        | modes |
+    // |-----------------------------------------------|-------|
+    // | a PUBLIC class in the unnamed module          | 32    |
+    // | a PUBLIC nested class                         | 32    |
+    // | a package-private nested class                | **0** |
+    // | a package-private top-level class             | **0** |
+    // | `java.lang.String` (public, exported)         | 32    |
+    // | `jdk.internal.misc.Unsafe` (public, NOT exported) | **0** |
+    // | `java.lang.AbstractStringBuilder` (pkg-private)   | **0** |
+    //
+    // The old unconditional `return prev` came from a table measured only
+    // against PUBLIC targets, and it handed `publicLookup().in(<package-private
+    // class>)` the value 32 — a lookup that can resolve public members of a
+    // class the JDK refuses to give any lookup at all.
+    //
+    // MODULES ARE NOT MODELLED, so the export half of the test is not applied:
+    // a public class in a non-exported package (`jdk.internal.misc.Unsafe`)
+    // answers 32 here and 0 on HotSpot. That is the one remaining divergence on
+    // this arm, it is recorded rather than approximated by package prefix, and
+    // it is strictly narrower than what this arm granted before.
     if prev == LK_UNCONDITIONAL {
-        return prev;
+        return if target_is_public { prev } else { 0 };
     }
     if same_class {
         // `in(lookupClass())` returns `this` in the JDK, ORIGINAL included.
@@ -9478,10 +9508,14 @@ fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     // inventing PUBLIC: `in()` never GRANTS access the receiver did not have.
     // Measured: `lookup().dropLookupMode(PUBLIC)` is 0, and `.in(String.class)`
     // / `.in(<package-mate>)` / `.in(<its own lookup class>)` are all 0.
+    let target_is_public = match target {
+        Value::Object(Some(m)) => crate::lang_class::mirror_is_public(ctx, m),
+        _ => false,
+    };
     let new_modes = if modes == 0 {
         0
     } else {
-        lk_in_modes(modes, same_class, same_package, same_nest)
+        lk_in_modes(modes, same_class, same_package, same_nest, target_is_public)
     };
     let new_lk = alloc_lookup(ctx, new_modes)?;
     ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, target);
@@ -12626,22 +12660,43 @@ mod classloader_tests {
     /// `Lookup.in`, measured on OpenJDK 25.0.3 from `MethodHandles.lookup()`
     /// (modes 95). The lookup class itself keeps 95; a NESTMATE gets 31; a
     /// same-package class in another file gets **25**, not 31, because
-    /// `isSamePackageMember` strips `PRIVATE|PROTECTED` from a "cousin";
-    /// `String.class` gets 1; and `publicLookup()` (32) is returned unchanged.
+    /// `isSamePackageMember` strips `PRIVATE|PROTECTED` from a "cousin"; and
+    /// `String.class` gets 1.
     #[test]
     fn test_in_modes_matches_jdk25() {
-        // (same_class, same_package, same_nest)
-        assert_eq!(lk_in_modes(LK_FULL_POWER, true, true, true), 95);
-        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, true), 31);
-        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false), 25);
-        assert_eq!(lk_in_modes(LK_FULL_POWER, false, false, false), 1);
-        // publicLookup(): UNCONDITIONAL survives `in()` for every target.
-        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, false, false), 32);
-        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, true, true), 32);
+        // (same_class, same_package, same_nest, target_is_public)
+        assert_eq!(lk_in_modes(LK_FULL_POWER, true, true, true, true), 95);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, true, true), 31);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false, true), 25);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, false, false, true), 1);
+        // A full-power lookup's reduction does not depend on the target being
+        // public — a package-private nestmate is still 31.
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, true, false), 31);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false, false), 25);
         // An already-reduced lookup never REGAINS a mode.
-        assert_eq!(lk_in_modes(25, false, true, true), 25);
-        assert_eq!(lk_in_modes(25, false, false, false), 1);
-        assert_eq!(lk_in_modes(1, false, true, true), 1);
+        assert_eq!(lk_in_modes(25, false, true, true, true), 25);
+        assert_eq!(lk_in_modes(25, false, false, false, true), 1);
+        assert_eq!(lk_in_modes(1, false, true, true, true), 1);
+    }
+
+    /// `publicLookup()` (UNCONDITIONAL, 32) through `in()`: KEPT for a PUBLIC
+    /// target, and **0** for one that is not.
+    ///
+    /// The regression this pins is a whole-value one, not an edge: the arm used
+    /// to `return prev` for every target, so `publicLookup().in(<a
+    /// package-private class>)` reported 32 — a lookup able to resolve public
+    /// members of a class the JDK hands no lookup at all. Measured on OpenJDK
+    /// 25.0.3 (`PubIn`): a public nested class 32, a package-private nested
+    /// class 0, a package-private top-level class 0, `java.lang.String` 32.
+    #[test]
+    fn test_public_lookup_in_drops_to_zero_for_a_non_public_target() {
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, false, false, true), 32);
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, true, true, true), 32);
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, false, false, false), 0);
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, true, true, false), 0);
+        // …including a same-package cousin, which the `same_package` arm below
+        // would otherwise have kept at 32.
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, true, false, false), 0);
     }
 
     /// The nestmate approximation: `p/Outer` and `p/Outer$Inner` share an
@@ -12649,9 +12704,9 @@ mod classloader_tests {
     #[test]
     fn test_in_modes_nestmate_beats_bare_package_match() {
         // Package-mates that are NOT nestmates lose PRIVATE|PROTECTED …
-        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false) & LK_PRIVATE, 0);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false, true) & LK_PRIVATE, 0);
         // … while nestmates keep them.
-        assert_ne!(lk_in_modes(LK_FULL_POWER, false, true, true) & LK_PRIVATE, 0);
+        assert_ne!(lk_in_modes(LK_FULL_POWER, false, true, true, true) & LK_PRIVATE, 0);
     }
 
     /// `lk_modes_of` must read the SYNTHETIC slot when the receiver's class
