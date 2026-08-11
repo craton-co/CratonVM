@@ -1,4 +1,4 @@
-# The VM-internal door, swept: 42 classes, two gates, and four verdicts
+# The VM-internal door, swept: 44 classes, two gates, and four verdicts
 
 **Status: two hunks APPLIED IN SOURCE, sweep COMPLETE, 2026-08-11. NOT
 REBUILT.** Every number in this record was taken by running the already-built
@@ -10,6 +10,15 @@ REBUILT.** Every number in this record was taken by running the already-built
 Branch: `fix/jdk-only-vm-internal-door-sweep-20260811`.
 Files changed: `native-builtins/src/lang_class.rs`,
 `classloading/src/class_manager.rs`, and this record.
+
+**`dev` moved under this sweep, and the table is stated against `dev` as of
+`21232b4ef`, not against the branch point.** Two rows were resolved by other
+lanes while the measurements were being taken —
+`W7-14-fjp-common-factory-bound-by-name.md` and the `__mh_*` half of
+`W7-13` — and one row this sweep would have patched is a patch `W7-14`
+evaluated and rejected. §6B keeps the withdrawal, because the mistake is
+cheaper to read than to repeat. Every "unfixed" verdict below was re-checked
+against `dev`'s tree, not this branch's.
 
 `W7-12-strict-annotation-proxy.md` and `W7-13-strict-mh-insert-wrapper.md`
 each found one instance of a species — a shape the VM invents, minted through
@@ -148,12 +157,13 @@ cratonvm --jdk-only --jdk-only-report <F> --java-home <JDK25> -cp regression-sui
 # the same 71, Compatible — the WIDER net: execution continues past a mint that
 # strict kills, so it reaches sites strict never gets to
 cratonvm --real-jdk --jdk-only-report <F> …
-# 343 of the 409 `probes/*.java` (67 do not compile standalone), Compatible
+# 321 of the 409 `probes/*.java` (67 do not compile standalone; 21 hit the
+# per-run timeout), Compatible
 ```
 
-**~330 runs, 4,073 raw `compatibility-class-requested` rows, 42 distinct
-classes, 43 distinct (class, `requester`) pairs. All 43 adjudicated; 43 of 43
-resolved.** The count is of rows actually adjudicated, not of grep hits: a
+**465 runs, 6,284 raw `compatibility-class-requested` rows, 44 distinct
+classes, 45 distinct (class, `requester`) pairs — 22 of the 44 reachable under
+`--jdk-only`. All 45 pairs adjudicated; 45 of 45 resolved.** The count is of rows actually adjudicated, not of grep hits: a
 grep for `try_alloc_concurrent_synthetic` over the workspace returns thousands
 of call sites and would have answered a different question badly, which is the
 error the campaign README records being made in this direction repeatedly.
@@ -161,7 +171,7 @@ error the campaign README records being made in this direction repeatedly.
 **Two scope limits, stated rather than papered over:**
 
 * **Only one of the two fabrication choke points was ever reached.** Every one
-  of the 4,073 rows carries the `ENSURE_SYNTHETIC_STUB_REASON` text. The other
+  of the 6,284 rows carries the `ENSURE_SYNTHETIC_STUB_REASON` text. The other
   choke point — `create_synthetic_stub` on the `load_class` chain, with
   `NATIVE_BACKED_STUB_REASON` / `ENTERPRISE_PREFIX_STUB_REASON` /
   `MISSING_CLASS_FILE_STUB_REASON` — produced **zero** rows in this corpus. Its
@@ -175,7 +185,7 @@ error the campaign README records being made in this direction repeatedly.
 ## 5. The table
 
 `javap` column: run against the JDK 25 image on this host. **Every one of the
-42 answered "class not found" — there is not a single genuinely-missing real
+44 answered "class not found" — there is not a single genuinely-missing real
 JDK class in this species.** Two are near-misses worth naming, because the
 name the VM chose is a *stale* JDK name rather than an invented one, and that
 changes the fix completely.
@@ -188,7 +198,7 @@ changes the fix completely.
 | `java/lang/annotation/AnnotationProxy` | `native-builtins/src/lang_class.rs` · `create_annotation_proxy_with_type` | YES | 0 → 0 | **VM-internal, wrong door** | **FIXED here** |
 | `__mh_insert_wrapper__` + 9 siblings | `native-builtins/src/lang_invoke.rs` · 11 sites | YES | 0 → 0 | VM-internal, wrong door | already fixed (`W7-13`), binary predates it |
 | `CratonVM$HttpServerLoop` | `native-builtins/src/net_phase_e.rs` · `re10_spawn_dispatcher` | **YES, fatal** | 1 bridge → **1 bridge** | **VM-internal, wrong door — gate 2 already open** | **§6 hunk A** |
-| `java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory` | `native-builtins/src/phases_late/concurrent.rs` · `resolve_common_factory_internal_name` / `alloc_common_factory` | **YES, fatal** | 0 → 0 | **stale JDK name — NOT a door defect** | **§6 hunk B** |
+| `java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory` | `native-builtins/src/phases_late/concurrent.rs` · `resolve_common_factory_internal_name` / `alloc_common_factory` | **YES, fatal** | 0 → 0 | **stale JDK name — NOT a door defect** | strict half already FIXED on `dev` by `W7-14`; §6B corroborates its open `Compatible` half |
 | `cratonvm/internal/SystemLogger` | `native-builtins/src/lib.rs` · `craton_alloc_system_logger` | YES | 10 bridge → **10 bridge** | already correct — refusal has a measured real-JDK fallback | none |
 | `cratonvm/stream/LazyOp` | `native-collections/src/lib.rs` · `stream_make_lazy_derived` | YES | 0 → 0 | already correct — **deliberately** not laundered | none |
 | `java/util/HashMap$KeyItr` (×2 sites) | `native-collections/src/lib.rs` · `native_hs_iterator`, `native_ksv_iterator` | YES | 3 → 0 | behaviour carrier; door correct | none — fallback landed on `dev` after this binary |
@@ -203,6 +213,7 @@ changes the fix completely.
 | 3 × `Atomic*FieldUpdater$RustJvmImpl` | `native-builtins/src/atomic_updater.rs` | no | 8–12 → 0 | behaviour carriers; door correct | none |
 | `Function$AndThen`, `Function$Compose`, `Consumer$AndThen` | `native-builtins/src/phases_late/streams.rs` | no | 1 → 0 | behaviour carriers; door correct | none |
 | `java/util/logging/LogManager$StringEnumeration` | `native-builtins/src/logmanager.rs` | no | 2 → 0 | behaviour carrier; door correct | none |
+| `javax/net/ssl/SSLSocketInputStream`, `SSLSocketOutputStream` | `native-builtins/src/phases_late/ssl_security.rs` | no | 4 → 0 | behaviour carriers; door correct | none |
 
 **Why "no" in the strict column is a result, not a gap.** `RJdkLambdas`,
 `RJdkProcess` and `RJdkCollections` all **PASS** under `--jdk-only` while
@@ -229,7 +240,10 @@ Not built, not run. Both hunks are in files this lane does not own.
 ### Hunk A — `native-builtins/src/net_phase_e.rs`, `re10_spawn_dispatcher`
 
 **The sweep's one unfixed door defect, and it is fatal in strict mode.**
-Measured on the shipped binary:
+Still unfixed on `dev` at `21232b4ef`: `git show dev:native-builtins/src/net_phase_e.rs`
+has the bare `try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?` and no
+`ensure_vm_internal_class` anywhere in the file. Measured on the shipped
+binary:
 
 ```
 $ cratonvm --jdk-only --java-home <JDK25> -cp <probes> HttpServerWildcardAddressProbe
@@ -287,11 +301,39 @@ and (now) `AnnotationProxy` have — but only if the §2 argument can be made fo
 this name, and it can: `CratonVM$…` is this VM's reserved namespace and no
 loader defines into it.
 
-### Hunk B — `native-builtins/src/phases_late/concurrent.rs`, `resolve_common_factory_internal_name`
+### B — `ForkJoinPool$DefaultCommonPool…`: **no patch. `dev` got there first.**
 
-**Not a door defect. A stale JDK name, and it is a wrong answer in
-`Compatible` before it is a refusal in strict.** Three arms, one host, one
-probe (`ForkJoinPool.commonPool().getFactory().getClass().getName()`):
+**This lane's proposed patch is WITHDRAWN, and the withdrawal is the useful
+record.** The sweep reached this row independently and drafted the obvious fix
+— swap the literal for the name JDK 25 declares. `W7-14-fjp-common-factory-bound-by-name.md`
+landed on `dev` while this sweep was running, diagnosed the same row, and
+**explicitly rejects that patch**: swapping the string *"would be correct today
+and would rot at the next release exactly as this one did, silently, because
+nothing in the tree tests the answer"*. Its fix reads the specified
+`public static final ForkJoinPool.defaultForkJoinWorkerThreadFactory` out of
+the image instead, from `alloc_common_factory`'s `Err(_)` arm so `Compatible`
+is untouched by construction — which also reproduces HotSpot's *reference*
+identity, not merely its class identity. That is a better fix than the one this
+lane drafted, and it is already in the tree.
+
+Two things this sweep still contributes to that row, neither of them a patch:
+
+**1. The door verdict, which W7-14 does not state and which its fix depends
+on.** This name is the sweep's only `0 → 0` class that is *not* a door defect.
+Both gates are vacuous — zero natives registered under it in either mode — so
+`ensure_vm_internal_class` would "work" here in the sense of removing the
+refusal, and would have been the wrong move: it would have made an answer the
+image contradicts permanent. **A class passing the `javap` guardrail is
+necessary and not sufficient.** The guardrail asks whether a class file must
+exist for this name; it does not ask whether the VM should have been asking for
+this name at all. This row is the one instance in 42 where those two questions
+gave different answers.
+
+**2. Independent corroboration of W7-14's still-open half.** That record leaves
+`Compatible` mode deliberately unchanged and flags it as a human's call, noting
+it is *"measurably wrong here, and nothing tests it"*. Measured again here, on
+the same binary, from a different probe, agreeing exactly — and with one
+observation W7-14 does not record:
 
 ```
 HotSpot 25   java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory
@@ -300,50 +342,41 @@ HotSpot 25   java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactor
 
 CratonVM --real-jdk
              …$DefaultCommonPoolForkJoinWorkerThreadFactory        <- WRONG NAME
-             Class.forName on it SUCCEEDS                          <- fabrication
-                                                                      visible to
-                                                                      reflection
+             Class.forName on it SUCCEEDS                          <- the
+                                                                      fabrication
+                                                                      is visible
+                                                                      to reflection
 
 CratonVM --jdk-only
              NoClassDefFoundError: …$DefaultCommonPoolForkJoinWorkerThreadFactory
-             (kills RJdkForkJoin at parallelStreams, RJdkForkJoin.java:209)
+             (RJdkForkJoin, parallelStreams, RJdkForkJoin.java:209)
 ```
 
-`$DefaultCommonPoolForkJoinWorkerThreadFactory` was a real `ForkJoinPool`
-nested class in older JDKs; JDK 25 declares only
-`$DefaultForkJoinWorkerThreadFactory`. So the strict refusal is **correct
-policy applied to a wrong request**, and opening the door would make the wrong
-answer permanent — `Class.forName` would keep reporting a class HotSpot says
-does not exist. This also identifies the cause of `RJdkForkJoin`, one of
-`W7-11-strict-baseline-remeasured.md`'s six, which `W7-12` left open as R3.
+The third line is the part worth adding: it is not only that `getFactory()`
+answers a wrong name, it is that `Class.forName` on that name **succeeds** in
+`Compatible` mode, so an application probing for the class the way HotSpot code
+does gets `true` where HotSpot raises `ClassNotFoundException`. A fabrication
+that is reachable by name from application reflection is a larger surface than
+a wrong `getName()`, and it strengthens W7-14's argument for closing the
+`Compatible` half.
 
-The fix is the name, not the door:
+The drafted patch was a one-literal swap in
+`resolve_common_factory_internal_name` — `"…$DefaultCommonPoolForkJoinWorkerThreadFactory"`
+→ `"…$DefaultForkJoinWorkerThreadFactory"` — so that
+`alloc_common_factory`'s `ensure_class_initialized` arm hits and no
+fabrication happens in either mode. It is written down here **only** so the
+next sweep that reaches this row recognises it and stops: W7-14 evaluated
+exactly this and rejected it on the campaign's own rule. Do not apply it.
 
-```rust
-    // W7-17 — the JDK 25 image declares `$DefaultForkJoinWorkerThreadFactory`;
-    // `$DefaultCommonPoolForkJoinWorkerThreadFactory` was its name in older
-    // releases and `javap` on this image answers "class not found" for it.
-    // With the old name, `ensure_class_initialized` below misses, the fallback
-    // fabricates, and `Compatible` then answers
-    // `commonPool().getFactory().getClass().getName()` with a name HotSpot 25
-    // does not have — and makes `Class.forName` on it SUCCEED. `--jdk-only`
-    // refuses the fabrication and `HttpServer`-style kills the call
-    // (`RJdkForkJoin`, `parallelStreams`). Naming the class the image actually
-    // declares makes `ensure_class_initialized` hit and removes the
-    // fabrication from both modes.
-    "java/util/concurrent/ForkJoinPool$DefaultForkJoinWorkerThreadFactory".to_string()
-```
-
-Two things to check when landing it, neither of which this lane could:
-
-1. `is_safe_factory_class_name`'s allowlist must still accept the property
-   override path unchanged — only the default literal moves.
-2. **Better than either name**: `alloc_common_factory`'s
-   `ensure_class_initialized` arm allocates a bare object of the real class. On
-   an image with real `ForkJoinPool` bytecode, reading
-   `ForkJoinPool.common.factory` would give the *same instance* HotSpot gives,
-   and the whole mint would go away. That is a behaviour change in
-   `Compatible` and wants its own vector; the name fix does not.
+**The general lesson, since this lane made the mistake in full before catching
+it.** `dev` moves hourly, and a sweep that runs for an hour against a fixed
+binary is reading a tree that no longer exists. Two of the four rows this
+sweep would have "fixed" were already resolved on `dev` by other lanes —
+`W7-13` for the `__mh_*` carriers and `W7-14` for this one. **Run
+`git diff origin/dev --stat` and read the `docs/known-issues/jdk-only/`
+directory on `dev`, not on your branch point, before writing any patch this
+sweep produces.** A grep of your own worktree cannot see the fix that landed
+while you measured.
 
 ## 7. Census and ratchet movement, with direction
 
