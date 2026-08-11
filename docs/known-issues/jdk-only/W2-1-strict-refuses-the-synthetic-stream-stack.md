@@ -4,6 +4,60 @@ Status: fixed 2026-08-07 (wave-2 lane W2-1) in `native-collections/src/lib.rs`.
 Not built or run — this worktree cannot build. The inventory below is the more
 durable half of this record.
 
+> ## UPDATED 2026-08-11 — the stream half is green; the split that was still
+> ## costing runs is the ITERATOR family, and it wears `java/util/*` names
+>
+> This record was kept by a records audit on the grounds that *"the stream
+> stack is still SPLIT, and the staged path is unwalked."* Both halves of that
+> were re-measured, on a built binary, and the audit's premise needs splitting
+> in two.
+>
+> **The stream stack no longer costs a single run.** Every stream row of a
+> three-arm probe (HotSpot 25 / `cratonvm --real-jdk` / `cratonvm --jdk-only`,
+> one binary, only the mode differing) is byte-identical:
+> `stream().filter().map().collect()`, `IntStream.rangeClosed().boxed().limit()`,
+> `Collectors.joining`, and `parallelStream().map().collect()`. So is every row
+> of `probes/JdkOnlyCollectionViewProbe` — all 37 lines, all three arms, no
+> diff — which is the whole `Collections.unmodifiable*` / `List.of` / `Map.of` /
+> sub-list / comparator / function surface this record's "adjacent, same file,
+> not this lane's" paragraph listed. That family closed the way §1 of
+> `docs/architecture/natives-over-real-jdk-classes.md` says it should: the
+> factories were retagged `SyntheticStub`, strict DROPS the registration, and
+> `java.base`'s own bytecode runs.
+>
+> **The 13 `cratonvm/internal/*` boot refusals in every strict run are that
+> mechanism working, not the failure.** `ensure_bootstrap_compat_class`
+> (`vm/src/vm/vm_init.rs`) says so in place: *"these stand-ins exist for the
+> synthetic collection shims, which strict mode does not register."* Read the
+> WARN's "the natives bound to it are unreachable" as the claim it is — about
+> registration — and it is the intended end state for this family, not a
+> symptom. Nothing downstream of those 13 lines failed in any probe.
+>
+> **What WAS still costing runs is three iterator entry points**, and they are
+> invisible to a `cratonvm/*` grep because the fabricated names are
+> `java/util/*`:
+>
+> | entry point | fabricated class | image declares it? | before | after |
+> |---|---|---|---|---|
+> | `ConcurrentHashMap.newKeySet().iterator()`, `chm.keySet().iterator()` | `java/util/HashMap$KeyItr` | no (real: `HashMap$KeyIterator`) | `NoClassDefFoundError` | real `Arrays$ArrayItr` + `SetLike` write-through |
+> | `new LinkedList<>(..).iterator()` | `java/util/LinkedList$Itr` | no (real: `LinkedList$ListItr`) | `NoClassDefFoundError` | real `Arrays$ArrayItr` + new `LinkedList` route |
+> | `new ArrayDeque<>(..).iterator()` | `java/util/ArrayDeque$Itr` | no (real: `ArrayDeque$DeqIterator`) | `NoClassDefFoundError` | real `Arrays$ArrayItr` + new `ArrayDeque` route |
+>
+> The first of those is `RChmKeySetView --jdk-only`, which dies at
+> `surface():140` on a plain `for (String x : s)` — and dies identically on a
+> pre-merge control binary, so it is a standing defect rather than anything
+> this wave introduced. All three are fixed in
+> `native-collections/src/lib.rs`; `Compatible` executes none of the new arms.
+> The generalisation worth carrying out of this: **`--jdk-only` refuses a
+> fabrication by NAME, not by package**, so an inventory scoped to
+> `cratonvm/*` under-reports the same defect by however many stand-ins were
+> given a `java/util/*` name. `native-api/src/no_image_receiver.rs`'s
+> `NO_IMAGE_JDK_RECEIVERS` is the list to read alongside this one.
+>
+> The full re-measured split table, the two arguments that measurement
+> refuted, and the residuals are in the section *"2026-08-11 — the re-measured
+> split"* at the end of this file.
+
 ## The failure
 
 Two suite classes, one error, strict only. Both pass in `--real-jdk` (exit 0)
@@ -219,3 +273,172 @@ Expected: all four exit 0. The `--jdk-only` runs should still emit
 `CompatibilityClassRequested` violations naming `cratonvm/stream/LazyOp` under
 `--jdk-only-report` — silence there would mean the gap was hidden rather than
 recorded.
+
+---
+
+## 2026-08-11 — the re-measured split
+
+Everything below was measured on the built `target/release/cratonvm.exe` of
+the wave-1 integration merge, against Temurin 25.0.3.9 on windows/x64, one
+binary per row with only `--jdk-only` differing. **The fixes described here
+were written afterwards and are NOT rebuilt**, so every "after" is a claim
+about source, and every "before" is an observation.
+
+Method, and the one step that made the table trustworthy: each row prints
+CONTENT, never "ok". `docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md`
+is the reason — four `TreeMap` navigable views answered `{}` for months
+because every caller only iterated. Two rows below are *only* visible because
+of that rule (`ArrayDeque.stream().count()`, and the empty-`table` finding for
+`ConcurrentHashMap`).
+
+### The split table
+
+"Refused?" is `--jdk-only`'s answer to fabricating the class, which depends on
+the NAME and nothing else: no supported image declares it ⇒ refused.
+
+| fabricated class | needed by | refused? | resolution |
+|---|---|---|---|
+| `cratonvm/stream/LazyOp` | `stream_make_lazy_derived` (deferred `filter`/`map`/`flatMap`/`limit`/`skip`/`peek`) | yes | **already gated** (2026-08-07, this record). Falls back to the eager pipeline; all stream probe rows byte-identical in all three arms |
+| `cratonvm/internal/StreamCollector` | 3 drain sites | yes | **already gated** (L7). Falls back to `drain_spliterator_via_real_iterator` |
+| `cratonvm/internal/StreamChainCollector` | `drain_spliterator_inline` | yes | unreachable under strict — strict never builds a deferred op-chain. Still a bare `?`; a future path that reaches it fails loudly, which is the correct order of events |
+| `cratonvm/internal/Unmodifiable*` (11) | the `Collections.unmodifiable*` / `*.of` / `copyOf` factories | yes — the 13 boot WARNs | **already closed** by retag: the factories are `SyntheticStub`, strict drops them, real `java.util.Collections` bytecode runs. All 37 `JdkOnlyCollectionViewProbe` rows identical across the three arms |
+| `cratonvm/internal/ArrayListSubList` | `List.subList`, `Pattern.split` | yes | closed the same way — probe rows identical |
+| `cratonvm/util/MapViewBacking` | map key/value/entry views | yes | never reached under strict in any probe; `keySet`/`values`/`entrySet` all identical across arms |
+| `cratonvm/internal/SnapshotEnumeration` | `Collections.enumeration`, `Properties.propertyNames` | yes | never reached under strict — both rows identical across arms. The mint site is a bare `?`; left as a loud failure rather than gated blind |
+| `java/util/Comparator$Native` | `make_comparator` (`naturalOrder`/`reverseOrder`) | yes — a boot WARN | never reached under strict; both sort rows identical across arms |
+| `java/util/Collections$EmptyItr` | `Collections.emptyIterator()` | yes | never reached under strict; row identical |
+| `java/util/TreeMap$KeyItr`, `java/util/TreeSet$Itr` | `TreeMap.keySet().iterator()`, `TreeSet.iterator()`/`descendingIterator()` | yes | **already gated** — both land on `real_snapshot_iterator` with the `TreeSet` route; rows identical |
+| `java/util/HashMap$KeyItr` via `native_hs_iterator` | `HashSet`/`LinkedHashSet`/`Map.keySet()` iteration | yes | **already gated** (2026-08-05) — lands on `Arrays$ArrayItr` + `SetLike`; rows identical, including `it.remove()` write-through |
+| **`java/util/HashMap$KeyItr` via `native_ksv_iterator`** | `ConcurrentHashMap.newKeySet().iterator()`, `chm.keySet().iterator()` | yes | **FIXED HERE** — same fallback, `SetLike` route (which already discriminated key-set views) |
+| **`java/util/LinkedList$Itr`** | `linkedList.iterator()` | yes | **FIXED HERE** — `Arrays$ArrayItr` + new `LinkedList` route |
+| **`java/util/ArrayDeque$Itr`** | `arrayDeque.iterator()` | yes | **FIXED HERE** — `Arrays$ArrayItr` + new `ArrayDeque` route |
+| **`cratonvm/internal/LinkedListSnapshotListItr`** | `linkedList.listIterator()`, `listIterator(int)`, and every real `AbstractList` method that reaches them — `equals`, `hashCode`, `indexOf` on a foreign list | yes | **OPEN** — see the residual below. A real `Arrays$ArrayItr` cannot stand in for a `ListIterator` |
+
+Every `java/util/stream/*` name the stream natives allocate is a real class,
+as the original inventory says — that half needed no change and got none.
+
+### The two arguments this measurement refuted
+
+Both were correct when written, and both were outlived by later work in the
+same file. Recording the shape, not just the outcome: **a comment that argues
+why a fallback cannot exist has to be re-read against the fallback's own code
+before it is believed.** This is the habit
+`W6-12-stampedlock-split-brain.md` was kept for.
+
+1. **"The KeySetView site must refuse rather than land on the array
+   iterator."** The stated reason was that a fixed-size list's iterator
+   answers `UnsupportedOperationException: remove` and `RChmKeySetView`
+   exercises write-through removal. But `real_snapshot_iterator` had since
+   grown a `backing` parameter, `snapshot_itr_backing_table` had since grown
+   the pointer the real two-field class has no slot for, and
+   `native_snapshot_itr_remove`'s `SetLike` arm **already** reads
+   `if is_key_set_view(ctx, backing) { native_ksv_remove(..) }`. The
+   write-through was built for this exact receiver and never wired to it.
+
+2. **"Our overlay-based `LinkedList` never writes the real `size` and
+   `first`"** / **"the JDK `first` field is always null"** — two registrar
+   comments in the same file. Reflectively, under
+   `--add-opens java.base/java.util=ALL-UNNAMED`, a two-element CratonVM
+   `LinkedList` reads `size = 2` with `first` and `last` holding real
+   `LinkedList$Node`s, and a three-element one walks
+   `a(prev=null) b(prev=node) c(prev=node)` through the real `item`/`next`/
+   `prev` fields — character-for-character what HotSpot prints. `ll_set`
+   mirrors the overlay into the real fields (`ll_get`'s overlay-MISS arm
+   documents it), and `linkedList.descendingIterator()` — which nothing
+   intercepts — already runs real `LinkedList$ListItr` bytecode under
+   `--jdk-only` and answers `[c,b,a]`. Both comments are corrected in place.
+
+   **That did not make "let the real bytecode run" the right answer**, which
+   is the more useful half. Drive a real `ListItr.remove()` at a native
+   `LinkedList` and the two owners diverge: real `unlink` decrements the real
+   `size` and re-links the real nodes, `ll_get` consults the OVERLAY first and
+   still answers the old size, and the next real iteration walks past the end
+   —
+
+       first=c
+       removed ok
+       Exception: java/lang/NullPointerException: Cannot read field "item"
+           at java/util/LinkedList$ListItr.previous(LinkedList.java:921)
+           at java/util/LinkedList$DescendingIterator.next(LinkedList.java:1010)
+
+   reproducible in **`Compatible`** mode on an unmodified binary, so it is a
+   live defect independent of strict mode and independent of this fix. The
+   snapshot fallback was chosen precisely to avoid adding a second writer.
+
+### Why "let the real class serve it" was unavailable for the three fixed sites
+
+Measured, not assumed — and each is the empty-view failure mode:
+
+* **`ConcurrentHashMap`**: `table = null`, `baseCount = 0` on a native map
+  holding one entry, against `Node[16]` / `1` on HotSpot. A real
+  `KeySetView.iterator()` walks `table` and would iterate **empty**.
+* **`ArrayDeque`**: `elements = Object[2]`, `head = 0`, **`tail = 0`** on a
+  two-element deque, against `Object[3]` / `0` / `2` on HotSpot. Real
+  `DeqIterator` derives its bounds from `head`/`tail` and would see size 0.
+* **`LinkedList`**: the fields are right; the *ownership* is not (above).
+
+### Residuals — open, with the evidence
+
+1. **`linkedList.listIterator()` still refuses under `--jdk-only`**, and it
+   takes `AbstractList.equals`/`hashCode`/`indexOf` with it: `ll.equals(new
+   ArrayList<>(..))` answers `true` on HotSpot and in `Compatible`, and raises
+   `NoClassDefFoundError: cratonvm/internal/LinkedListSnapshotListItr` under
+   strict. Left refusing deliberately. Two designs were considered and both
+   are worse than a loud failure until someone can build and measure them:
+
+   * a real `Arrays$ArrayItr` cannot serve — `hasPrevious`/`previous`/`set`/
+     `add`/`nextIndex` are not on it, and the CratonVM stand-in registers
+     `set` (the registrar comment names `List.sort`'s default-method path as
+     the caller that needs it);
+   * a real `java.util.ArrayList$ListItr` over a snapshot `ArrayList` *is*
+     constructible — CratonVM's `ArrayList` does populate the real `size` and
+     `elementData` — but its `set()` is real bytecode writing the snapshot's
+     `elementData`, so the write would silently not reach the `LinkedList`.
+     A silently-dropped write is strictly worse than a `NoClassDefFoundError`,
+     and this file's history is mostly instances of that.
+
+   The honest fix is the same one the `Unmodifiable*` family got: make the
+   natives stop owning `LinkedList` state, then drop the interception. That is
+   a collections-reclassification-wave change, not an iterator change.
+
+2. **`ArrayDeque.stream().count()` answers `0` in BOTH modes** (HotSpot: `2`),
+   and `ad.size()`/`toString()`/`contains()` are all correct beside it — the
+   natives answer those. Root cause is the unwritten `tail` above: nothing
+   intercepts `stream()` for `ArrayDeque`, so the real `Collection.stream()`
+   default reaches real `ArrayDeque.spliterator()`, which reads `head`/`tail`
+   and reports an empty source. This is a `Compatible`-mode defect, so it was
+   **not** touched here. Fixing `tail` at the `ad_state` write sites would
+   close it and would also make the strict fallback above unnecessary; both
+   need a build to verify.
+
+3. **`java/util/HashMap$Entry`, `java/util/IteratorEnumeration`,
+   `java/util/ServiceLoader$Itr`, `java/util/concurrent/CompletedFuture`** and
+   the three `Atomic*FieldUpdater$RustJvmImpl` names are on
+   `NO_IMAGE_JDK_RECEIVERS` but are minted outside `native-collections`. Not
+   probed here. The species is the same; the owners are not.
+
+### Falsifying observation (updated)
+
+If a `--jdk-only` run of `RChmKeySetView` now fails at
+`ConcurrentHashMap$KeySetView.removeAll`/`retainAll` rather than at
+`surface():140`, the `SetLike` route is reaching `native_hs_remove` instead of
+`native_ksv_remove` — i.e. `is_key_set_view` is answering `false` for the
+receiver recorded as the backing, and the discriminator, not the fallback, is
+wrong. If instead any of the three fixed iterations comes back **empty**, the
+snapshot was taken from a collection the natives no longer own and the
+fallback is reading the real fields after all.
+
+### Verification (updated)
+
+    cargo build --release -p cratonvm-cli
+    for M in "--jdk-only" ""; do
+      target/release/cratonvm $M --java-home "$JDK" -cp regression-suite/build RChmKeySetView
+      target/release/cratonvm $M --java-home "$JDK" -cp probes JdkOnlyCollectionViewProbe
+    done
+
+Expected: exit 0 on all four, and the `JdkOnlyCollectionViewProbe` output
+identical to `java -cp probes JdkOnlyCollectionViewProbe`. The `--jdk-only`
+runs must still emit `CompatibilityClassRequested` violations naming
+`java/util/HashMap$KeyItr`, `java/util/LinkedList$Itr` and
+`java/util/ArrayDeque$Itr` under `--jdk-only-report`: the fallbacks are
+supposed to keep the gap on the census, not take it off.

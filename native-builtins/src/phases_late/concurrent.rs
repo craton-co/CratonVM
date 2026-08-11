@@ -7032,6 +7032,215 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 }
 
 // ---------------------------------------------------------------------------
+// W6-9 §7 — the residual divergences the `complete(V)` lane left open
+// ---------------------------------------------------------------------------
+//
+// W6-9 stopped `complete(V)` erasing the abnormal record and registered
+// `completeExceptionally`; its §7 listed four divergences it left standing
+// because each needed its own measurement. Three of them are closable from
+// here:
+//
+//   * `getException()` answered null for a CANCELLED task while
+//     `isCompletedAbnormally()` answered `true` — one task, two accessors,
+//     opposite verdicts on whether anything went wrong;
+//   * `reinitialize()` was registered nowhere, so a reused task kept its
+//     side-table completion and the next `join()` replayed the STALE result
+//     instead of recomputing;
+//   * `RecursiveAction.complete(Object)` was registered on neither boot path.
+//
+// The fourth — `complete(v)` on a cancelled task must still perform the
+// `setRawResult(v)` half — needs a write inside `fjp_complete_body`
+// (`native-builtins/src/phases_early.rs`), outside this lane's files. The exact
+// patch, and the verdict on the `ForkJoinPool.invoke` consequence that made
+// W6-9 defer it, are recorded in §8 of
+// docs/known-issues/jdk-only/W6-9-complete-erases-the-abnormal-record.md.
+//
+// WHY THESE CAN LIVE HERE. `NativeMethodRegistry::register` UPDATES AN EXISTING
+// TRIPLE'S SLOT IN PLACE (the `match prior_slot` arm), and this registrar rides
+// the same two hooks as `register_forkjointask_eager_fork_gate` below:
+// `register_new15_loom` runs after `phases_early::register_forkjoin_natives`,
+// and `register_t19_k3_forkjoinpool_common` is called immediately after
+// `phases_early::register_real_jdk_forkjoin_essentials` in
+// `register_essential_natives`. Whichever of those two registrars ran, one of
+// these hooks runs after it, so `fjt_get_exception` below SUPERSEDES the
+// `getException` slot installed in `register_real_jdk_forkjoin_essentials`.
+// That body is now unreachable; the patch deleting it is in W6-9 §8, so the
+// tree does not keep two registrars for one triple longer than it must.
+//
+// ALLOW-LISTS. `("getException", "()Ljava/lang/Throwable;")` and
+// `("complete", "(Ljava/lang/Object;)V")` are already named in both
+// (`keep_real_forkjointask_bridge`, native-api/src/registry.rs;
+// `is_forkjoin_native_override`, vm/src/runtime/interpreter/native_override.rs),
+// for all three task classes, so those two registrations are live in every
+// mode. **`("reinitialize", "()V")` is in neither**, and on the default
+// real-ForkJoinPool path `registry.rs` DROPS any Bridge on these classes whose
+// triple `keep_real_forkjointask_bridge` does not name — so until the two
+// one-line entries recorded in W6-9 §8 land, the `reinitialize` registration
+// below is live only under `CRATONVM_SYNTHETIC_FORKJOINPOOL`. That is stated
+// rather than assumed away: a registration present in neither list is the
+// `awaitQuiescence` failure mode, and half a fix that reads as a whole one is
+// what this campaign keeps finding.
+
+/// `ForkJoinTask.getException()` — the recorded throwable, or a FRESH
+/// `CancellationException` for a task that is abnormal with nothing recorded.
+///
+/// `javap -p -c java.util.concurrent.ForkJoinTask` (JDK 25.0.3.9). The public
+/// `final getException()` is `return getException(false);`, and that method is
+///
+/// ```text
+///    1: getfield status; 6: ifge 16           //  status >= 0          -> null
+///   10: ldc 65536;  iand; 13: ifne 18         // (status&ABNORMAL)==0  -> null
+///   19: ldc 131072; iand; 22: ifeq 45         // (status&THROWN)==0    -> 45
+///   32: aux ifnull 45;    42: aux.ex ifnonnull 53
+///   45: new java/util/concurrent/CancellationException; <init>()V; areturn
+/// ```
+///
+/// Branch 45 is what every CANCELLED task reaches: `trySetCancelled` ORs
+/// `DONE|ABNORMAL` into the status word and never touches `aux`, so there is no
+/// recorded throwable and the real answer is a `CancellationException` — never
+/// null. The registration this supersedes returned `fjp_state_thrown` or null,
+/// which left `isCompletedAbnormally() == true` beside `getException() == null`
+/// on the same task. Both now answer the same predicate,
+/// `done && (cancelled || threw)`, in the real method's own branch order.
+///
+/// The synthesised exception is deliberately NOT written back into the side
+/// table. Nothing would read it — `fjp_state_set_thrown` refuses to record on a
+/// cancelled entry anyway, and `isCompletedAbnormally`/`isCompletedNormally`
+/// read the `cancelled` bit directly — while a recorded throwable IS replayed
+/// by `fjp_state_get_for_join`, so writing one here would change what
+/// `join()`/`get()` raise as a side effect of calling an accessor. Fresh per
+/// call, exactly like the real `new CancellationException()`.
+///
+/// `this` is not touched after the allocation, so it needs no pin; the answer
+/// is read out of the side table first. A VM that cannot construct the class at
+/// all falls back to null — the pre-fix answer, not a new one — the same
+/// degrade `fjp_complete_exceptionally_body` takes when its wrapper constructor
+/// is missing.
+fn fjt_get_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(recorded) = crate::phases_early::fjp_state_thrown(this) {
+        return Ok(Some(Value::Object(Some(recorded))));
+    }
+    let (done, cancelled) = crate::phases_early::fjp_state_flags(this);
+    if !(done && cancelled) {
+        return Ok(Some(Value::Object(None)));
+    }
+    match ctx.new_object_initialized("java/util/concurrent/CancellationException", "()V", &[]) {
+        Ok(Some(fresh @ Value::Object(Some(_)))) => Ok(Some(fresh)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `ForkJoinTask.reinitialize()` — drop the side-table completion so the next
+/// `join()` recomputes.
+///
+/// ```text
+/// public void reinitialize();
+///    0: aload_0; 1: aconst_null; 2: putfield aux
+///    5: aload_0; 6: dup; 7: getfield status
+///   10: ldc int 16777216; 12: iand; 13: putfield status
+/// ```
+///
+/// It is the ONLY method on the class that ever CLEARS a status bit —
+/// `setDone`, `trySetCancelled` and `trySetThrown` are all OR-into-a-write-once
+/// word — and the one bit it keeps is `1<<24`, the pool-submit marker.
+/// Unregistered, real bytecode cleared the real `status`/`aux`, which this
+/// model never reads: the `fjp_state` entry survived untouched, so the next
+/// `join()` handed back the STALE result of the previous run and
+/// `isDone()` still answered `true` for a task the caller had just reset.
+/// Latent when W6-9 measured it (no caller in the tree), but the reason it is
+/// latent is that nothing calls it, not that calling it works.
+///
+/// The entry is REMOVED, not reset in place. "Never seen" is exactly the state
+/// this restores — every reader already treats a missing key and a fresh entry
+/// identically — and it is the only one that keeps `fjp_queued_task_count()`
+/// honest: that count is over `!done` entries, so a reset-in-place entry would
+/// report a task sitting in nobody's queue as forked-and-pending. The `1<<24`
+/// bit the real method preserves has no reader in this model. Dropping the key
+/// drops a GC root, which is safe here and nowhere else in this family: the
+/// caller is executing a method ON the task, so the task is live on its stack.
+fn fjt_reinitialize(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    crate::phases_early::fjp_state()
+        .lock()
+        .remove(&crate::phases_early::fjp_key(this));
+    Ok(None)
+}
+
+/// Register the three W6-9 §7 residuals. Called from BOTH boot paths, exactly
+/// like [`register_forkjointask_quietly_bridge`] and
+/// [`register_forkjointask_eager_fork_gate`].
+pub(crate) fn register_forkjointask_w6_9_residual_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // Both on all three class names, mirroring the `getException` shape
+    // `register_real_jdk_forkjoin_essentials` already used: `getException()` is
+    // `public final` and `reinitialize()` is `public` (NOT final, per `javap`),
+    // so in real-JDK mode the resolved declaring class is `ForkJoinTask` for
+    // both unless a subclass overrides `reinitialize` — but synthetic-mode
+    // lookup is per class name, and this is the belt-and-braces W3-4 argued
+    // for. `NativeKind::Bridge` is restated on every call because the kind is
+    // ambient: an unstated re-registration would downgrade the slot and
+    // `keep_real_forkjointask_bridge` only keeps Bridges.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register_with_kind(
+            task_class,
+            "getException",
+            "()Ljava/lang/Throwable;",
+            fjt_get_exception,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+        r.register_with_kind(
+            task_class,
+            "reinitialize",
+            "()V",
+            fjt_reinitialize,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
+
+    // `RecursiveAction.complete(Object)V` — `setDone()` and nothing else.
+    //
+    // `javap -p java.util.concurrent.RecursiveAction` (JDK 25.0.3.9):
+    //
+    //   public final java.lang.Void getRawResult();
+    //   protected final void setRawResult(java.lang.Void);
+    //
+    // Both FINAL, and `setRawResult`'s body is empty. No subclass can give a
+    // `RecursiveAction` a raw-result slot and `getRawResult()` is null for
+    // every one of them, so the real `complete(v)` —
+    // `setRawResult(v); setDone();` — reduces on this receiver to exactly
+    // `setDone()`, which is `fjp_state_set_done_preserving_thrown` (W6-7): OR
+    // the done bit, leave any recorded throwable alone. Routing it through
+    // `fjp_complete_body` instead would park `v` in the side table where
+    // nothing can read it back, because `RecursiveAction.getRawResult()` is a
+    // constant-null registration on both boot paths.
+    //
+    // Only the synthetic path had the hole. In real-JDK mode `RecursiveAction`
+    // does not declare `complete`, so the resolved declaring class is
+    // `ForkJoinTask` and that registration already covers an `ra` receiver —
+    // which is also why this costs no allow-list entry.
+    r.register_with_kind(
+        "java/util/concurrent/RecursiveAction",
+        "complete",
+        "(Ljava/lang/Object;)V",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_state_set_done_preserving_thrown(this);
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
 // L19 — `CountedCompleter` starves under a lazy `fork()`; the gated eager fork
 // ---------------------------------------------------------------------------
 //
@@ -7077,12 +7286,16 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 // the JDK can also produce.
 //
 // It is nevertheless an ORDERING change for every workload that forks, so it
-// is OFF by default and selected per run by `CRATONVM_FJP_EAGER_FORK`
-// (grouped spelling `CRATONVM_THREADS=fjp-eager-fork=...`):
+// shipped behind `CRATONVM_FJP_EAGER_FORK` (grouped spelling
+// `CRATONVM_THREADS=fjp-eager-fork=...`). The default FLIPPED on 2026-08-07
+// after the A/B `fjt_fork_mode` records below — the narrow `CountedCompleter`
+// cure is now what an unset environment gets, and lazy is the opt-out:
 //
-//   unset / `0` / anything unrecognised  today's lazy fork (DEFAULT)
-//   `1` / `cc` / `counted`               eager ONLY for a CountedCompleter
-//                                        receiver — the narrow cure
+//   unset                                eager for a CountedCompleter receiver
+//                                        (DEFAULT since 2026-08-07)
+//   `0` / anything unrecognised          the historical lazy fork — the
+//                                        OPT-OUT, and the bisection knob
+//   `1` / `cc` / `counted`               the default, stated explicitly
 //   `all`                                eager for every ForkJoinTask — the
 //                                        broad variant, for measuring the
 //                                        ordering blast radius
@@ -7255,9 +7468,11 @@ fn fjt_fork_always_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `register_t19_k3_forkjoinpool_common` inside `register_essential_natives`),
 /// so this wins in both.
 ///
-/// In `Lazy` mode it returns without touching the registry at all — the
-/// default path is not merely equivalent to today's, it is untouched, kind and
-/// slot included.
+/// In `Lazy` mode it returns without touching the registry at all, so the
+/// opt-out arm is not merely equivalent to the pre-L19 path, it IS that path,
+/// kind and slot included. Since the 2026-08-07 default flip that arm is
+/// reached only by `CRATONVM_FJP_EAGER_FORK=0` (or an unrecognised value), not
+/// by an unset environment.
 pub(crate) fn register_forkjointask_eager_fork_gate(r: &mut NativeMethodRegistry) {
     let mode = fjt_fork_mode();
     let callback: cratonvm_native_api::NativeCallback = match mode {
@@ -7297,8 +7512,14 @@ pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     // `doExec()` + `awaitDone()`. Rides the same hook as the static
     // `invokeAll` overloads for the same reason.
     register_forkjointask_quietly_bridge(r);
-    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
-    // `phases_early::register_forkjoin_natives`, which it is —
+    // W6-9 §7: `getException` on a cancelled task, `reinitialize`, and the
+    // missing `RecursiveAction.complete`. Rides this hook for the ordering
+    // reason spelled out above the registrar — it must run after
+    // `phases_early::register_forkjoin_natives`, which it does.
+    register_forkjointask_w6_9_residual_bridge(r);
+    // L19: re-registers `fork()` in every mode except the opt-out
+    // `CRATONVM_FJP_EAGER_FORK=0` (since the 2026-08-07 default flip). Must
+    // stay AFTER `phases_early::register_forkjoin_natives`, which it is —
     // `register_phase51_natives` runs earlier in `register_builtins`.
     register_forkjointask_eager_fork_gate(r);
     register_wp4_8_continuation_support(r);
@@ -7326,9 +7547,15 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     // are the LAST real-bytecode routes from this VM's side-table completion
     // model into `awaitDone()`, which no worker thread exists to satisfy.
     register_forkjointask_quietly_bridge(r);
-    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
-    // `phases_early::register_real_jdk_forkjoin_essentials`, which it is —
-    // `register_essential_natives` calls that first (native-builtins/src/lib.rs).
+    // W6-9 §7, on the same real-JDK essentials hook. `getException` here
+    // SUPERSEDES the slot `register_real_jdk_forkjoin_essentials` installed one
+    // call earlier — that is the whole mechanism, see the registrar's header.
+    register_forkjointask_w6_9_residual_bridge(r);
+    // L19: re-registers `fork()` in every mode except the opt-out
+    // `CRATONVM_FJP_EAGER_FORK=0` (since the 2026-08-07 default flip). Must
+    // stay AFTER `phases_early::register_real_jdk_forkjoin_essentials`, which
+    // it is — `register_essential_natives` calls that first
+    // (native-builtins/src/lib.rs).
     register_forkjointask_eager_fork_gate(r);
     r.set_category(__prev_cat);
 }
@@ -7953,9 +8180,17 @@ pub(crate) fn is_safe_factory_class_name(s: &str) -> bool {
 /// T19_K3 — Resolve the desired factory-class internal name
 /// (slash-separated form) from the JVM's system properties.
 ///
-/// Returns the JDK-default
-/// `java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory`
-/// when the property is unset or fails the allowlist check.
+/// Returns `java/util/concurrent/ForkJoinPool$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` when the property is unset or fails the
+/// allowlist check.
+///
+/// **That fallback is a JDK-21-era name and it is wrong on JDK 25** — see
+/// `common_factory_from_image` below for the measurement and the fix. It is
+/// deliberately still returned here: `Compatible` fabricates a class under this
+/// name today, and callers observe it through
+/// `getFactory().getClass().getName()`. Correcting the string would change that
+/// answer in `Compatible`, which is not this lane's call to make (contract
+/// §5/§10). `alloc_common_factory` repairs it on the `--jdk-only` path only.
 pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> String {
     let sf = ctx
         .get_system_property("java.util.concurrent.ForkJoinPool.common.threadFactory")
@@ -7964,6 +8199,56 @@ pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> S
         sf.replace('.', "/")
     } else {
         "java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory".to_string()
+    }
+}
+
+/// W7-14 — Ask the **image** for the common pool's factory instead of naming
+/// it: read the `defaultForkJoinWorkerThreadFactory` static field off the
+/// loaded `java/util/concurrent/ForkJoinPool`.
+///
+/// This is the substance of the fix, and it is not "update the string".
+/// `resolve_common_factory_internal_name`'s fallback is a *nested* JDK-internal
+/// class name from the JDK 21 era, when the common pool had its own
+/// permission-clearing factory. `javap` on JDK 25 (Adoptium 25.0.3.9) says the
+/// image declares exactly five nested classes and `…$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` is not among them — it went out with the
+/// security manager. Substituting today's sibling name would buy one release
+/// and then rot the same way, which is the shape five separate defects in this
+/// campaign reduced to: never bind by name.
+///
+/// The field does not rot, for two reasons worth stating separately:
+///
+/// * `ForkJoinPool.defaultForkJoinWorkerThreadFactory` is **public API**
+///   (`public static final`, since Java 7), not an internal nested class. A
+///   name the specification publishes is a different risk class from a name the
+///   implementation happens to use this year.
+/// * On HotSpot 25 it is not merely the same *class* as the common pool's
+///   factory, it is the same *instance*. Measured on this host:
+///   `commonPool().getFactory() == ForkJoinPool.defaultForkJoinWorkerThreadFactory`
+///   is `true`, and both report
+///   `java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory`.
+///
+/// So returning the singleton rather than allocating a fresh instance is more
+/// faithful, not less: it reproduces HotSpot's reference identity as well as
+/// its class identity. `getFactory()` then caches it into `factory` exactly as
+/// before.
+///
+/// Returns `None` — never an error — when the class, the field, or the value is
+/// missing, so the caller keeps its existing fallback intact. A JDK that stops
+/// publishing the field degrades to the old behaviour instead of failing.
+fn common_factory_from_image(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ObjectRef> {
+    // `ensure_class_initialized`, not `class_id_by_name`: the field is written
+    // by `ForkJoinPool.<clinit>`, so an uninitialized class reads null and we
+    // would fall back for no reason. Re-entering initialization from a native
+    // on this very class is the ordinary already-initializing no-op.
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/ForkJoinPool")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "defaultForkJoinWorkerThreadFactory")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(factory)) => Some(factory),
+        // Null or a non-reference: a synthetic-JDK build has no such field.
+        _ => None,
     }
 }
 
@@ -7982,7 +8267,52 @@ pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<craton
             let nfields = ctx.class_num_total_fields(cid).max(1);
             Ok(ctx.alloc_object(cid, nfields))
         }
-        Err(_) => try_alloc_concurrent_synthetic(ctx, &target, 1),
+        Err(_) => {
+            // W7-14 — `target` is not in the image. Under `--jdk-only` the
+            // fabrication below is *refused*, and that refusal costs the whole
+            // call: `RJdkForkJoin` dies at `parallelStreams():209` with
+            // `NoClassDefFoundError: java/util/concurrent/ForkJoinPool$Default`
+            // `CommonPoolForkJoinWorkerThreadFactory` on the first
+            // `ForkJoinPool.commonPool()` — nothing in that vector is about
+            // factories. Pre-existing rather than a regression; the control
+            // measurement is in
+            // docs/known-issues/jdk-only/W7-11-strict-baseline-remeasured.md.
+            //
+            // ORDER IS THE CONTRACT HERE. The recovery runs *after*
+            // `try_alloc_concurrent_synthetic`, not before it, so that
+            // `Compatible` is untouched by construction rather than by
+            // argument: where fabrication is available it still succeeds, still
+            // succeeds first, and still returns the same object built by the
+            // same call — the operator's own `…common.threadFactory` class
+            // included, which is what Keycloak/Quarkus's
+            // `getFactory().getClass().getName().equals(property)` check reads.
+            // Probing the policy *first* (the variant recorded in W6-12) would
+            // mint the class one call earlier and route `Compatible`'s
+            // allocation through a different entry point; that is a smaller
+            // change than it sounds and still not one this lane may make.
+            //
+            // The price of this order is paid only on the refusing path: the
+            // discarded `Err` is a `NoClassDefFoundError` that was allocated
+            // and is now garbage. `getFactory()` caches into `factory`, so it
+            // happens about once per process, and a throwable per process is
+            // the right trade for a mode that cannot change.
+            match try_alloc_concurrent_synthetic(ctx, &target, 1) {
+                Ok(factory) => Ok(factory),
+                // Refused. Ask the image what it actually has. Falling back to
+                // the default factory when the requested one cannot be produced
+                // is also what real `ForkJoinPool.<clinit>` does — it catches
+                // the property-named factory's failure and keeps
+                // `defaultForkJoinWorkerThreadFactory` — so this is the
+                // specified behaviour, not a strict-mode-only concession.
+                Err(refusal) => match common_factory_from_image(ctx) {
+                    Some(factory) => Ok(factory),
+                    // No image either (synthetic-JDK build): the original
+                    // refusal is still the honest answer, so re-raise it
+                    // unchanged rather than inventing a second one.
+                    None => Err(refusal),
+                },
+            }
+        }
     }
 }
 
@@ -8093,9 +8423,19 @@ pub(crate) mod new15_tests {
         assert!(is_safe_factory_class_name(
             "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
         ));
-        // JDK default factory name with $ inner-class separator.
+        // A nested class name, i.e. one carrying the `$` separator. W7-14: this
+        // asserts the *syntax* validator accepts `$`, nothing about which class
+        // the JDK declares — the name below is the JDK-21-era one that JDK 25
+        // dropped, and reading this case as "the JDK default" is how that name
+        // kept looking load-bearing. Both spellings are exercised so the
+        // distinction cannot quietly collapse again.
         assert!(is_safe_factory_class_name(
             "java.util.concurrent.ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory"
+        ));
+        // What JDK 25 actually declares, and what HotSpot 25 answers from
+        // `commonPool().getFactory().getClass().getName()`.
+        assert!(is_safe_factory_class_name(
+            "java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory"
         ));
     }
 

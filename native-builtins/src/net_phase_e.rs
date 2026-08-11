@@ -3967,6 +3967,181 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
 // RE.1 — java.net.Socket
 // ===========================================================================
 
+/// How long a parked `SocketInputStream.read` waits inside one poll before
+/// re-asking the registry whether its socket was closed under it.
+///
+/// A liveness bound, not a latency cost: the poll returns the instant the
+/// socket becomes readable, so payload is never delayed by it — it only bounds
+/// how long a reader stays parked after another thread calls `Socket.close()`.
+/// Same value and same role as `native-io/src/net.rs`'s
+/// `NET_READ_CLOSE_POLL_MS` and `socket_channel.rs`'s `READ_CLOSE_POLL_MS`,
+/// because this is the same loop.
+const RE1_READ_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked read reports once its socket has been closed from
+/// another thread. [`re1_socket_read_stream`] maps it to a real
+/// `java.net.SocketException`.
+///
+/// `ErrorKind::Interrupted` is unambiguous at this site because
+/// [`re1_read_retry_eintr`] reissues every real EINTR and
+/// [`re1_socket_poll_readable`] reports one as "not ready" rather than as an
+/// error, so nothing else in this path can produce it. That is the same
+/// argument `socket_channel.rs::channel_async_closed_err` makes for the
+/// channel side.
+fn re1_socket_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "socket closed")
+}
+
+/// Is `sid` still a live stream?
+///
+/// [`re1_close_socket`] *removes* the entry from `s2_registry().streams` (and
+/// `take_raw_socket_stream_for_tls` moves it out), so this flips exactly when
+/// Java closed the socket. The `net.rs` twin, `net_stream_still_registered`,
+/// tests for a `NetSocketHandle::Closed` marker instead only because that
+/// registry keeps closed slots; the question asked is identical.
+///
+/// The lock is taken for the map lookup alone and is never held across the
+/// poll or the read — the whole reason [`re1_socket_read_stream`] clones the
+/// `Arc` out in the first place (BUG-04 loopback hang).
+fn re1_stream_still_registered(sid: i32) -> bool {
+    s2_registry().lock().streams.contains_key(&sid)
+}
+
+/// One `recv`, reissued for as long as it reports EINTR.
+///
+/// EINTR must never escape to Java: this VM signals its own threads
+/// (`jit::xt_root_scan` SIGUSR2s every thread for a cross-thread root scan),
+/// so a bare `read` surfacing `Interrupted` would look to callers like a
+/// random mid-request connection abort.
+fn re1_read_retry_eintr(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    // The std impl is `impl Read for &TcpStream`, so this reads through a
+    // shared stream without excluding a peer writer on the same fd.
+    let mut r = stream;
+    loop {
+        match r.read(buf) {
+            Err(e) if is_eintr(&e) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// A blocking `SocketInputStream.read` that observes an asynchronous
+/// `Socket.close()`.
+///
+/// # Why the plain blocking read could not
+///
+/// `Socket.close()` on another thread reaches [`re1_close_socket`], which drops
+/// the registry's `Arc` and issues `shutdown(Both)` — but it does **not** close
+/// the OS handle, because this reader is holding an `Arc` clone of the very
+/// `TcpStream` the map dropped. HotSpot's answer to the same situation is
+/// `closesocket()` underneath the blocked `recv` (Windows) or `dup2` of a
+/// pre-closed descriptor plus a signal (Unix, `NativeDispatcher.preClose`).
+/// Neither is expressible over an `Arc<TcpStream>` without closing a handle
+/// another thread is mid-syscall on, which is a use-after-close the moment the
+/// OS recycles the number.
+///
+/// `shutdown` is not a substitute, and the platform split is what made this
+/// look like it was already fixed: on Linux `SHUT_RD` does wake a parked `recv`
+/// — with EOF, so the reader answered `-1` rather than throwing — while Winsock
+/// has no `shutdown` that aborts a pending blocking call at all, so on Windows
+/// the reader simply never returned.
+///
+/// So park in `poll` instead of in `recv` and re-ask the registry every
+/// [`RE1_READ_CLOSE_POLL_MS`]. That is not a new mechanism: it is the loop
+/// `net.rs::net_read_close_aware` and `socket_channel.rs::read_close_aware`
+/// landed on 2026-08-07 for the two *real* socket surfaces, and the loop
+/// [`re2_accept_into`] in this same file has used on the accept side since the
+/// MockWebServer teardown fix. This is the third reader that needed it and the
+/// one the 2026-08-07 pass missed, because it is the *synthetic*
+/// `java.net.Socket` surface (`CRATONVM_SYNTHETIC_NET_SOCKETS`) rather than
+/// either of the two the failing tests reached.
+///
+/// # `deadline` is not optional decoration
+///
+/// `Some(dl)` is a live `SO_TIMEOUT`. A wakeup that silently swallowed the
+/// caller's timeout would be the same defect pointed the other way: a
+/// `setSoTimeout(n)` reader would park past its own deadline forever. So the
+/// poll slice is clamped to the time remaining and an expired deadline returns
+/// `TimedOut` — which [`re1_socket_read_stream`] already maps to
+/// `SocketTimeoutException` — rather than merely declining to poll again. The
+/// socket's own `SO_RCVTIMEO` (applied at connect) stays set and remains the
+/// first line; this deadline is what still ends the park on a platform or a
+/// socket state where `SO_RCVTIMEO` does not fire.
+fn re1_read_close_aware(
+    sid: i32,
+    stream: &TcpStream,
+    buf: &mut [u8],
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<usize> {
+    loop {
+        let slice = match deadline {
+            None => RE1_READ_CLOSE_POLL_MS,
+            Some(dl) => {
+                let left = dl.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Socket read timed out",
+                    ));
+                }
+                // Floor of 1 ms so a sub-millisecond remainder polls once more
+                // instead of spinning on a 0 ms timeout.
+                left.as_millis().clamp(1, RE1_READ_CLOSE_POLL_MS as u128) as i32
+            }
+        };
+        let ready = match re1_socket_poll_readable(stream, slice) {
+            Some(result) => result?,
+            // No poll primitive on this target: fall back to the pre-fix
+            // blocking read, which cannot see the close but at least still
+            // transfers bytes. Spinning on a stub that can never report
+            // readiness would be strictly worse than the bug.
+            None => return re1_read_retry_eintr(stream, buf),
+        };
+        // Asked AFTER the poll, so a close landing while we are parked is seen
+        // on the very next pass — and a close that raced a readiness edge still
+        // wins. That race is safe by construction rather than by luck:
+        // `re1_close_socket` removes the registry entry FIRST and only then
+        // issues `shutdown(Both)`, so by the time the shutdown's own readiness
+        // edge wakes this poll the entry is already gone. Without this check
+        // the Linux path would answer such a read with `-1` — a clean
+        // end-of-stream — where `Socket.close()` mandates a `SocketException`.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        return re1_read_retry_eintr(stream, buf);
+    }
+}
+
+/// Build a real `java.net.SocketException` carrying `message`.
+///
+/// The concrete type is load-bearing, not decoration. JDK 25's
+/// `java.net.Socket.close()` specifies that "Any thread currently blocked in an
+/// I/O operation upon this socket will throw a SocketException", and callers
+/// catch that type; a `java.io.IOException` whose message merely mentions the
+/// name walks straight past `catch (SocketException e)`. `RuntimeError` has no
+/// `SocketException` variant — only its `ConnectException`/`BindException`/
+/// `SocketTimeoutException` subclasses — so the object has to be constructed,
+/// exactly as [`re1_socket_write_stream`] below already does for a peer reset.
+/// Falls back to a plain IOException if the class cannot be built.
+fn re1_socket_exception(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
+    let jmsg = ctx.create_string(message);
+    match ctx.new_object_initialized(
+        "java/net/SocketException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => ioex(message.to_string()),
+    }
+}
+
 fn re1_socket_read_stream(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -3989,10 +4164,18 @@ fn re1_socket_read_stream(
             "read out of range: off={off} len={ln} cap={cap}"
         )));
     }
-    let stream_id = sock_get(ctx, this).stream_id;
+    let side = sock_get(ctx, this);
+    let stream_id = side.stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
+    // A live `SO_TIMEOUT` has to bound the park, not just the recv — see
+    // `re1_read_close_aware`'s note on why the deadline is not optional.
+    // Computed here because `sock_get` needs `ctx`, which is not available
+    // inside the blocking region below.
+    let deadline = (side.read_timeout_ms > 0).then(|| {
+        std::time::Instant::now() + Duration::from_millis(side.read_timeout_ms as u64)
+    });
     // Clone the cheap Arc<TcpStream> out under a SHORT lock, then release
     // s2_registry BEFORE the blocking read(). Holding the global registry lock
     // across a blocking read deadlocks every other synthetic-socket operation
@@ -4013,40 +4196,63 @@ fn re1_socket_read_stream(
     };
     let dbg = crate::nbflags().dbg_sock;
     if dbg {
-        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
+        // "parking in poll", not "blocking on recv": since the asynchronous-close
+        // fix this read waits on readiness and re-asks the registry every
+        // RE1_READ_CLOSE_POLL_MS. A `[dbg-sock] read:` line with no matching
+        // `got=`/exception is therefore a reader that outlived its close, which
+        // is the exact symptom this line is used to hunt.
+        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (parking in poll...)");
     }
     let mut tmp = vec![0u8; ln];
     let mut blocked_refs = [Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let read_result = loop {
-        match (&*stream).read(&mut tmp) {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
-            {
-                continue
-            }
-            result => break result,
-        }
-    };
+    // Parks in `poll` rather than in `recv`, so a `Socket.close()` on another
+    // thread ends the park. The EINTR retry that used to be written out here
+    // now lives in `re1_read_retry_eintr`, which this calls once the poll says
+    // the socket is readable.
+    let read_result = re1_read_close_aware(stream_id, &stream, &mut tmp, deadline);
     ctx.end_blocking_region_refs(&mut blocked_refs);
 
     let buf = match blocked_refs[0] {
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read_result.map_err(|e| match e.kind() {
+    let n = match read_result {
+        Ok(n) => n,
+        // The socket was closed from another thread while this read was parked.
+        // JDK 25 `java.net.Socket.close()`: "Any thread currently blocked in an
+        // I/O operation upon this socket will throw a SocketException." The
+        // message matches what HotSpot actually produces, which is
+        // `NioSocketImpl.endRead`'s `throw new SocketException("Socket closed")`
+        // once the close has moved the impl to `ST_CLOSING`.
+        //
+        // That retyping is why the `net.rs` twin of this fix could get away with
+        // returning a generic error: on the real-JDK surface `endRead` runs in
+        // the `finally` of `implRead` and overwrites whatever text arrived. Here
+        // it cannot — these synthetic natives ARE the impl, `NioSocketImpl` is
+        // never on the path, and nothing downstream will name the type for us.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // SO_RCVTIMEO is reported as TimedOut on Windows and often as
-        // WouldBlock on Unix. Both are Java SocketTimeoutException, not EOF
-        // and not a generic IOException; callers deliberately catch this
-        // concrete type to retry their protocol operation.
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            RuntimeError::SocketTimeoutException {
+        // WouldBlock on Unix, and `re1_read_close_aware` raises TimedOut itself
+        // when the `SO_TIMEOUT` deadline expires with the socket still quiet.
+        // All three are Java SocketTimeoutException, not EOF and not a generic
+        // IOException; callers deliberately catch this concrete type to retry
+        // their protocol operation.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Err(RuntimeError::SocketTimeoutException {
                 message: format!("Socket read timed out: {e}"),
             }
-            .into()
+            .into());
         }
-        _ => ioex(format!("Socket read failed: {e}")),
-    })?;
+        Err(e) => return Err(ioex(format!("Socket read failed: {e}"))),
+    };
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
         if crate::nbflags().dbg_sock_bytes && n != 0 {
@@ -4259,19 +4465,33 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
     None
 }
 
-/// Zero-timeout OS readability query for a TCP stream.
+/// Wait up to `timeout_ms` for `stream` to become readable.
 ///
-/// Used by `SocketInputStream.available()`, which must never block. A `peek`
-/// on a blocking socket with an empty receive queue would block forever, so
-/// readiness is established first with `poll(2)` / `WSAPoll` — a pure query of
-/// kernel socket state that neither consumes bytes nor flips the socket's
-/// persistent blocking mode (flipping it would race a concurrent blocking
-/// `read` on the same fd into a spurious `WouldBlock`; see the same rewrite in
-/// `native-api/src/fd_table.rs::tcp_available`). A failed probe reports
-/// not-readable, so `available()` degrades to 0 — the answer it gave
-/// unconditionally before.
+/// `Some(Ok(true))` — readable, or errored/hung up (which the read that
+/// follows then surfaces as the concrete socket error); `Some(Ok(false))` —
+/// the timeout expired; `Some(Err(_))` — the poll itself failed. `None` means
+/// this build has NO poll primitive at all, and is the caller's signal to fall
+/// back to a plain blocking read rather than spin on a stub that answers "not
+/// ready" forever.
+///
+/// This is deliberately the same signature and the same three-state contract as
+/// `cratonvm_native_io::net::poll_stream_readable`, which is the primitive both
+/// halves of the 2026-08-07 asynchronous-close wakeup park in
+/// (`net.rs::net_read_close_aware` for `java.net.Socket`,
+/// `socket_channel.rs::read_close_aware` for `SocketChannel`). That function is
+/// `pub(crate)` to `cratonvm-native-io` and this crate cannot call it, so the
+/// contract is restated here rather than the mechanism reinvented — see
+/// [`re1_read_close_aware`], which is that same loop.
+///
+/// The `poll(2)`/`WSAPoll` binding below is not new either: it has serviced
+/// `SocketInputStream.available()` here since the readiness rewrite, with the
+/// timeout hard-coded to 0. Only the timeout became a parameter. Adding a
+/// fourth binding of the same syscall to this crate (`servlet.rs` and
+/// `xnio_conduits.rs` have the other two) would have been the third
+/// implementation of one primitive, which is the shape this file is trying not
+/// to grow.
 #[cfg(unix)]
-fn re1_socket_read_ready(stream: &TcpStream) -> bool {
+fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
     use std::os::unix::io::AsRawFd;
 
     let mut pfd = libc::pollfd {
@@ -4280,16 +4500,39 @@ fn re1_socket_read_ready(stream: &TcpStream) -> bool {
         revents: 0,
     };
     // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
-    // matches the one-element buffer; timeout 0 returns immediately.
-    let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 0) };
-    if rc <= 0 {
-        return false;
+    // matches the one-element buffer.
+    let rc =
+        unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, timeout_ms) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        // EINTR is "not ready" — never an error, and never an in-place
+        // re-poll. Same call as OpenJDK's `Net.poll` (which returns 0 revents
+        // on EINTR rather than throwing) and as `net.rs::net_poll_raw`'s
+        // AUDIT 2026-08-02 arm. `poll(2)` is NEVER auto-restarted by
+        // `SA_RESTART`, so a signal delivered to a thread parked here always
+        // comes straight back as EINTR — and this VM sends one on purpose,
+        // `jit::xt_root_scan` SIGUSR2s every thread to take it over for a
+        // cross-thread root scan. Reporting "not ready" is what keeps the
+        // caller's deadline honest: [`re1_read_close_aware`] recomputes its
+        // remaining `SO_TIMEOUT` on every pass, whereas re-polling here with
+        // the same `timeout_ms` would restart the whole wait on every GC.
+        if is_eintr(&error) {
+            return Some(Ok(false));
+        }
+        return Some(Err(error));
     }
-    pfd.revents & libc::POLLIN != 0
+    // `rc > 0` rather than `revents & POLLIN`: POLLERR/POLLHUP/POLLNVAL are
+    // reported whether or not they were requested, and have to count as
+    // "ready" so the read that follows surfaces the concrete socket error.
+    // Treating them as not-ready would park a reader forever on a socket that
+    // can never become readable — the failure mode this whole path exists to
+    // remove. `available()` is unaffected: its `peek` answers `Ok(0)` at EOF
+    // and `Err(_)` on a socket error, and it maps both to 0 already.
+    Some(Ok(rc > 0))
 }
 
 #[cfg(windows)]
-fn re1_socket_read_ready(stream: &TcpStream) -> bool {
+fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
     use std::os::windows::io::AsRawSocket;
 
     // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
@@ -4316,19 +4559,42 @@ fn re1_socket_read_ready(stream: &TcpStream) -> bool {
         revents: 0,
     };
     // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
-    // buffer length; timeout 0 returns immediately.
-    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, 0) };
-    if rc <= 0 {
-        return false;
+    // buffer length.
+    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, timeout_ms) };
+    if rc < 0 {
+        return Some(Err(std::io::Error::last_os_error()));
     }
-    pfd.revents & WSAPOLLRDNORM != 0
+    // See the Unix arm for why this is `rc > 0` and not a `revents` mask test.
+    // Winsock has no EINTR, so there is no signal arm to mirror here — and no
+    // `SA_RESTART` hazard either, because there are no signals to restart.
+    Some(Ok(rc > 0))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn re1_socket_read_ready(_stream: &TcpStream) -> bool {
-    // No readiness primitive on this target — report not-readable so
-    // `available()` returns 0 rather than risking a blocking peek.
-    false
+fn re1_socket_poll_readable(
+    _stream: &TcpStream,
+    _timeout_ms: i32,
+) -> Option<std::io::Result<bool>> {
+    // No readiness primitive on this target. `None` (rather than a stubbed
+    // "not ready") is load-bearing: it tells [`re1_read_close_aware`] to fall
+    // back to one plain blocking read instead of spinning a poll loop that
+    // could never report readiness.
+    None
+}
+
+/// Zero-timeout OS readability query for a TCP stream.
+///
+/// Used by `SocketInputStream.available()`, which must never block. A `peek`
+/// on a blocking socket with an empty receive queue would block forever, so
+/// readiness is established first with `poll(2)` / `WSAPoll` — a pure query of
+/// kernel socket state that neither consumes bytes nor flips the socket's
+/// persistent blocking mode (flipping it would race a concurrent blocking
+/// `read` on the same fd into a spurious `WouldBlock`; see the same rewrite in
+/// `native-api/src/fd_table.rs::tcp_available`). A failed probe — and a target
+/// with no poll at all — reports not-readable, so `available()` degrades to 0,
+/// the answer it gave unconditionally before.
+fn re1_socket_read_ready(stream: &TcpStream) -> bool {
+    matches!(re1_socket_poll_readable(stream, 0), Some(Ok(true)))
 }
 
 fn re1_connect_socket(

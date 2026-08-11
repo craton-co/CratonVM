@@ -1,504 +1,272 @@
-# JDK-only mode — open wave-2 work list
+# JDK-only mode — open defects
 
-**Status:** OPEN, reduced 2026-08-04, 2026-08-06, and **measured by execution
-2026-08-07**. Filed 2026-07-31 from wave-1 implementation findings; re-verified
-against the re-landed tree the same day. **Two of the five tier-1 rows (items 5
-and 7) closed 2026-08-06** — see the pass note below the table.
+**Status:** OPEN, **22 records**, reduced 2026-08-04, 2026-08-06, and
+**2026-08-11** (thirty records retired — see `RETIREMENT-20260811.md`). Filed
+2026-07-31 from wave-1 implementation findings.
 
-> ## 2026-08-07 — the strict corpus was built, run, and closed: 53 passed, 1 failed
->
-> Most records in this directory say "FIXED in source ... not yet verified,
-> no binary was built in this session". A binary was built (dev `5d22671e3`,
-> default features) and `CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh`
-> was run three times, with the identical result each time. The campaign's 14
-> failures are down to **3**:
->
-> | vector | was | now |
-> |---|---|---|
-> | `RJdkModule` | strict-only, `module service providers: []` | **FIXED** — module ServiceLoader providers now resolve; 44 checks, matching HotSpot |
-> | `RJdkFieldModule` | both modes, JLS 6.6.2 over-refusal | **FIXED** — `Method.invoke` no longer over-refuses a protected receiver |
-> | `RMapGcStress` | fails in every mode and every build | still open; dev's own, not this campaign |
->
-> Corpus after the two fixes: **53 passed, 1 failed**, ABBA-interleaved.
-> Compatible mode unchanged at 30/1. A `--features synthetic-jdk` binary run
-> `--jdk-only` is still worse (48/6) — a separate, previously unmeasured
-> configuration.
->
-> **What this does and does not license.** Every record whose corpus vector is
-> in `JDKONLY_CLASSES` and is not one of those three now has its vector passing,
-> so its "unverified by execution" caveat is discharged **at the vector level**.
-> It is not a per-assertion audit: a record claiming something narrower than its
-> vector asserts still owns that claim. Do not mass-flip statuses to FIXED on
-> the strength of this line — check what your record actually claims.
->
-> **If you re-measure, pass `--java-home`.** `run.sh` gives every CratonVM
-> invocation one; a hand-run that omits it measures the host's default JDK
-> instead of the JDK 25 image, which on this host inverted the per-mode verdict
-> for `RJdkModule`. Trace the real command rather than reconstructing it:
-> `ONLY="RJdkModule" bash -x regression-suite/run.sh 2>&1 | grep <binary>`.
->
-> Campaign-level record:
-> the retired `STRICT-CORPUS-CAMPAIGN` record.
+## 1. What jdk-only mode is, and where the contract lives
 
-> ## Looking for the plan? It is not here.
->
-> **This directory is the evidence base** — what is broken, how it was measured,
-> what the blast radius is. One record per defect; a record moves to
-> the internal record tree when it is fixed.
->
-> **The parallel execution plan is
-> the retired jdk-only wave-2 execution plan** —
-> twelve lanes with an explicit file-ownership map, a conflict matrix, and a
-> verification protocol. Nine of the twelve can start simultaneously. Read that
-> to decide *what to work on*; read this to understand *what you are fixing*.
->
-> Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md).
->
-> **Read the mechanism facts first:**
-> [`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
-> Eight facts every lane in this campaign rediscovered at cost — how a native
-> actually comes to run instead of real JDK bytecode (**not** the "four doors"
-> rule several records below still state), why a Cargo feature is not a runtime
-> mode, `register()`'s last-registration-wins semantics, what a by-name field
-> read cannot report, why a slot index against a real layout is heap corruption
-> rather than a wrong answer, what the registration censuses are scoped to, and
-> the measurement rules. Its §9 lists the records in this directory it corrected
-> and the claims it could not correct from `docs/`.
+`--jdk-only` (`CompatibilityMode::JdkOnly`) is the strict mode: CratonVM runs
+the real JDK image's own bytecode and **refuses** the compatibility layer that
+`--real-jdk` (`Compatible`, the default) admits. It is a *runtime* mode, not a
+Cargo feature — `--features synthetic-jdk` is a third, separate configuration
+that builds a VM with no class library at all.
+
+* **Normative contract:**
+  [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md)
+  — owned by the orchestrator; do not edit.
+* **Read the mechanism facts before anything else:**
+  [`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
+  Eight facts every lane in this campaign rediscovered at cost — how a native
+  actually comes to run instead of real JDK bytecode (**not** the "four doors"
+  rule several records still state), why a Cargo feature is not a runtime mode,
+  `register()`'s last-registration-wins semantics, what a by-name field read
+  cannot report, why a slot index against a real layout is heap corruption
+  rather than a wrong answer, what the registration censuses are scoped to, and
+  the measurement rules. Its §9 lists the records it corrected and the claims it
+  could not correct from `docs/`.
+* **This directory is the evidence base** — what is broken, how it was measured,
+  what the blast radius is. One record per defect. A record moves to the
+  internal record tree **when it is fixed**, not when it is planned. The
+  execution plan is elsewhere: the retired jdk-only wave-2 execution plan, twelve
+  lanes with a file-ownership map, a conflict matrix and a verification protocol.
+* Related non-known-issue docs:
+  [`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
+  [`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
+  [`docs/jdk-only-migration.md`](../../jdk-only-migration.md).
+
+### The corpus, and what a green corpus licenses
+
+On 2026-08-07 a binary was built (dev `5d22671e3`, default features) and
+`CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh` was run three times,
+ABBA-interleaved, with the identical result each time: **53 passed, 1 failed**.
+The one failure is `RMapGcStress`, which fails in every mode and every build and
+is dev's own, not this campaign's. Compatible mode is unchanged at 30/1. A
+`--features synthetic-jdk` binary run `--jdk-only` is still worse (48/6) — a
+separate, previously unmeasured configuration. Campaign-level record: the
+retired `STRICT-CORPUS-CAMPAIGN` record.
+
+**What that does and does not license.** Every record whose corpus vector is in
+`JDKONLY_CLASSES` (`regression-suite/run.sh:95`) has its vector passing, so its
+"unverified by execution" caveat is discharged **at the vector level**. It is
+not a per-assertion audit: a record claiming something narrower than its vector
+asserts still owns that claim. Do not mass-flip statuses to FIXED on the
+strength of this line — check what your record actually claims. The 2026-08-11
+audit did exactly that, one record at a time, and the arithmetic came out
+30 moved / 22 kept: most of what is left is *narrower than a vector*.
+
+**If you re-measure, pass `--java-home`.** `run.sh` gives every CratonVM
+invocation one; a hand-run that omits it measures the host's default JDK instead
+of the JDK 25 image, which on this host inverted the per-mode verdict for
+`RJdkModule`. Trace the real command rather than reconstructing it:
+`ONLY="RJdkModule" bash -x regression-suite/run.sh 2>&1 | grep <binary>`.
 
 ---
 
-## 2026-08-04 pass — what closed, what moved, what did not
+## 2. What is still open
 
-Two records left this directory, one item was retracted, and every remaining
-record carries a **What changed on 2026-08-04** section stating what was done
-and what it did *not* do. Read that section before working an item; the body
-below it is the original filing.
+Every open item is an `L*`/`W*` record in this directory. There is no ranked
+list any more — the old one is closed out and archived in §4. These are grouped
+by what they need from you, not by danger, because none of them is now a silent
+wrong answer on a corpus vector: the corpus is green.
 
-**Closed and moved to the internal record tree:**
+### 2.1 Named residuals inside an otherwise-fixed record
 
-| Was | Now |
+The defect is fixed and the vector passes; a specific sibling case is not, and
+the record says so and says why. Take these when you are already in the file.
+
+| Record | The residual |
 |---|---|
-| 9 — the observability surface | `jdk-only-observability-surface-FIXED-20260804.md` |
-| 10 — `System.exit` bypasses the census | `jdk-only-system-exit-census-FIXED-20260804.md` |
-| 8 — the real-protected-stub allow-lists | `jdk-only-real-protected-stub-allowlists-FIXED-20260804.md` |
+| `L8-securerandom-provider.md` | `crypto_impl.rs` registers `SecureRandom.<init>([B)V` to a no-op that stamps neither `algorithm` nor `provider`, and wins under synthetic-jdk. The clean fix is one deletion; the record names it. |
+| `L15-nestmate-access-field-and-constructor.md` | `Constructor.newInstance` still has the caller-step gap `Method.invoke` and the field paths had. Route it through `caller_may_access_member`. |
+| `L16-classnotfound-vs-noclassdeffound-shapes.md` | Our `ClassNotFoundException` names the array **descriptor**; HotSpot's `Class.forName` names the **element**. Closing it means teaching `native_class_for_name` to strip `[`s and resolve the element itself. |
+| `W2-2-blocked-reader-async-close-wakeup.md` | `net_phase_e.rs::re1_socket_read_stream` still parks in `read()` with no close-awareness. Synthetic `java.net.Socket` surface, reachable only under `CRATONVM_SYNTHETIC_NET_SOCKETS`. |
+| `W4-2-unnamed-accessor-bypasses-encapsulation.md` | `ServiceLoader` + an encapsulated module-path provider: the caller-sensitive `setAccessible` is refused, so `newInstance` is too. Also `is_package_exported_to` fails closed where `check_module_access` allows. |
+| `W5-1-loadlibrary-allowlist-too-wide.md` · `W6-6-nativelibraries-load-fabricated-success.md` | The same residual from two roads: there is **no class-loader-scoped `loadedLibraryNames` bookkeeping in this VM**, so the JDK's dynamic "already loaded elsewhere" rule cannot fire. A static allowlist cannot model it. |
+| `W4-3-security-getalgorithms-short-list.md` | `Security.getAlgorithms(type)` answers a plain `HashSet`, not `Collections.unmodifiableSet` — a caller asserting `UnsupportedOperationException` sees the divergence. Two real SHAKE digests are deliberately not advertised, because `message_digest::algorithm_supported` does not implement them. |
+| `W5-2-two-silently-skipped-process-checks.md` | `Info.user` is null on both platforms; `Info.totalTime` is `-1` on Linux. No vector guards either. |
+| `W6-2-module-serviceloader-provider-factory.md` | The constructor-form provider **subtype** check is absent — adding it could hard-fail every module-declared service in the JDK's own boot modules, and that was unmeasurable from the lane. |
+| `W6-12-stampedlock-split-brain.md` | `java/util/Collections` is served by two registrars at different fidelities, so `unmodifiableSet(s).add(x)` throws while `unmodifiableList(l).add(x)` succeeds. Synthetic-jdk only. |
 
-## 2026-08-06 — two records left this directory
+### 2.2 Whole surfaces that are still wrong
 
-| Was | Now |
+| Record | What is wrong |
 |---|---|
-| `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md` | `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md` |
-| `step1-bytecode-available-attempted-and-reverted.md` | `jdk-only-step1-bytecode-available-RESOLVED-20260806.md` |
+| `W6-8-method-invoke-exports-gate.md` | Two live **OPEN** rows in its own inventory: `Field.get`/`Field.set` ask the `opens` question unconditionally and so **over-deny** public fields of exported-but-not-opened packages; and the entire `Lookup.unreflect*` / `find*` family has no module check of any kind. HotSpot throws there — measured. |
+| `W2-3-module-descriptor-answers-empty-sets.md` | `ModuleDescriptor.modifiers()`, `Requires.compiledVersion()`, `version()`, `rawVersionString()` and `mainClass()` still have **no data source**: the bits are dropped at parse time or never surfaced through `NativeContext`. `RJdkModule` asserts none of them, which is exactly why the green corpus does not close this. |
+| `W3-6-processimpl-missing-natives.md` | `os_process_start_time` and `info0` stay empty on Windows (deliberate, argued). Separately: `children()`, `descendants()` and `parent()` are registered on the `java/lang/ProcessHandle` **interface** returning empty streams and "every process's parent is this VM" — inert in both JDK modes, live in synthetic-jdk. |
+| `W2-1-strict-refuses-the-synthetic-stream-stack.md` | The stream stack is **SPLIT**: some sources divert into the `cratonvm/*` synthetic model, some run real `java.util.stream` bytecode. The record carries the inventory and a four-step staged path to a real `java.util.stream`; step 1 (the real path's own `ForkJoinTask.invoke()` defect) has since landed, so the path is now walkable. |
 
-The first was marked CLOSED on 2026-08-05 with four of its five classes fixed
-and a header that said five; its own verification section said otherwise two
-paragraphs later. The fifth, `cratonvm/internal/SystemLogger`, is reached from
-`java.io.ObjectInputFilter$Config.<clinit>` — unconditionally, before any
-property is read — so refusing it cost every `ObjectInputStream` construction in
-the VM, i.e. all of deserialization, not one probe section. The refusal now
-lands on a real `jdk.internal.logger.SimpleConsoleLogger` built through its own
-constructor. `scripts/jdk-only-strict-probes.sh` PASSES with **no divergent
-strict-arm section left** in either of the two probes that carried them, the
-baseline is re-frozen, and the corpus is 33/16 under `--jdk-only` against 32/17.
+### 2.3 The slot-index species — swept, with a live tail
 
-The second is the more useful of the two to read before working item 4. Its own
-proposal — resolve `bytecode_available` at step 1 the way the invoke will — was
-implemented and **measured**: arming it takes the `--jdk-only` corpus from
-**32 passed / 17 failed to 3 / 46**, because `Charset.forName` hands out an
-instance of the ABSTRACT `java.nio.charset.Charset`, `System.props` is null,
-`SharedSecrets.javaLangAccess` is null, and `String`'s coder does not match its
-`value[]`. §1.4's lever is registration, not dispatch. What landed is the
-observation (step 1 now records every `Bridge` that runs in front of real bytes;
-it recorded nothing before) plus a dial,
-`CRATONVM_ENFORCE_NATIVE_SHADOW=1`, so item 4 can re-take that measurement one
-subsystem at a time.
+`W4-4-slot-index-species-sweep.md` and `W4-1-publiclookup-allowedmodes-never-checked.md`
+are the two that remain. The species: **a native reads or writes a real JDK
+object's field by the slot index the *synthetic* layout would have.** It fails
+silently — the wrong field reads back empty, zero or null and the caller takes a
+wrong branch with no exception. What is left:
 
-**Found on the way, fixed, not filed here:** `vm/src/jit/helpers.rs`'s third
-`note_site_identity` call site had the `CRATONVM_DBG_SITE_ALIAS` comment but not
-the `if`, so an ordinary run printed `[site-alias]` lines to stderr and grew an
-unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
-`dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
-which is the gate's third arm doing exactly what it is for.
+* `reflect_invoke::build_string_set`, `ModuleLayer.modules()`, and three-slot
+  `HashSet` allocations in `collections.rs` and `text_intl.rs`. **Latent, not
+  live** — synthetic-jdk-only callers. Anything that promotes one of them to the
+  real-JDK path must switch it to `build_real_layout_string_hashset` **first**.
+* `lk_drop_lookup_mode` and `lk_in_method` read `allowedModes` by index while
+  the by-name reader sits ten lines away. They survive by accident today.
+* Two GC stale-local sites in `register_p59_module` (an unrooted `ObjectRef`
+  held across a later allocation), left for whoever next touches that registrar.
+* `W4-1` also lists the access rules `publicLookup()` deliberately does not
+  enforce — all one-directional, admitting more than HotSpot, never less.
 
-## 2026-08-10 — three records retired
+### 2.4 In flight on sibling branches — do not start these
 
-The object-layout pair is **RETIRED** (see row 2 of the ranked list below):
-index-based field access against fabricated layouts is closed, the shadow-layout
-census is at zero NAME and zero `_vmN` rows on both standing probes, and both
-records moved to the internal tree as
-`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md` and
-`fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`.
+Fixes are being written for these right now; treat them as owned.
 
-`MemorySegment.set` had no implementation for five of its nine carriers —
-**FILED AND FIXED 2026-08-10**. Found while verifying the FFM half of the
-object-layout work and filed separately because it is **not** a layout defect:
-`java.lang.foreign.MemorySegment` declares nine `get`/`set` pairs, all eighteen
-`public abstract`, and a descriptor nobody registers raises
-`AbstractMethodError … has no Code attribute`. `panama.rs` enumerated all nine
-`get` descriptors and only the erased `set`; `foreign_ffm.rs` covered
-Byte/Short/Int/Long for both. So four worked and **boolean, char, float, double
-and address** did not — the original filing named `double` only because that is
-the one a probe happened to reach. `probes/FfmSegmentAccessProbe` also caught two
-`get` conversions nothing had reported: `char` sign-extended (`0xFFFE` → `-2`),
-and `get(ADDRESS)` returning `null` because a `Value::Long` was answered where
-the descriptor says `MemorySegment`. Record retired to the internal tree as
-`fixed-bugs/ffm-memorysegment-set-carriers-FIXED-20260810.md`.
-
-## 2026-08-05 — three records added
-
-**Both L5 records left this directory on 2026-08-10** —
-`retired/l5-native-io-bridge-residuals-RETIRED-20260810.md` and
-`retired/l5bc-awt-builtins-bridge-residuals-RETIRED-20260810.md` in the internal
-tree. What they held is split in two:
-
-* the last of their own items — `Bridge` registrations on a receiver class no
-  supported image declares — is **fixed**: 246 rows across 50 classes are
-  `SyntheticStub`, measured against six images (21.0.12+8 and 25.0.4+7 × linux,
-  windows, macos) and applied centrally in
-  `native-api/src/no_image_receiver.rs`. Along the way the 791-row deletion list
-  they handed off turned out to be a list of registrations **nobody had
-  exercised**, not dead ones: one probe dispatches 30 of them, 13 are on a macOS
-  image nobody had swept, and all 14 remaining legacy names resolve under
-  `--synthetic-jdk`. Record:
-  `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
-* the reclassification question they carried was re-homed with its numbers,
-  and **closed 2026-08-11**: all four of its "what would close this" items
-  landed, and the population is now five slack-free ratchets with committed
-  baselines rather than a number in a document —
-  `bridge_without_acc_native` 8,911, `bridge_shadows_bytecode` 6,066,
-  `bridge_stated_shadows_bytecode` 24, `superseded_kind_disagreements` 52,
-  `superseded_stub_lost_to_admitted` 4, all scored by
-  `regression-suite/bridge-ratchet.sh`. Record: the retired
-  `bridge-reclassification-wave` write-up.
-
-The original filings, for the record:
-
-*`l5-native-io-bridge-residuals.md`* — the 117 `native-io` `Bridge`
-registrations that L5's `register_with_kind` migration declined to claim,
-because the JDK 25 image declares no `ACC_NATIVE` target for them.
-Reclassification questions, not migration ones. The largest is 25 `Bridge`
-registrations on VM-minted `cratonvm/synthetic/Process*` classes — the
-`Function$Identity` shape (a surviving `Bridge` whose receiver class §5 forbids)
-found in a second place.
-
-*`l5bc-awt-builtins-bridge-residuals.md`*
-— the same question at crate scale, after L5b/L5c repeated the migration for
-`native-awt` and `native-builtins`: 7,748 `Bridge` registrations across those two
-crates that the image does not back. It also records three things the migration
-measured rather than assumed — that the tree's only `bridge` marker outside
-`native-io` names a method a Linux JDK 25 image does not declare, that
-`native-collections` has **zero** rows a migration could ever state, and that
-`ABSENT` on a platform-named class means "not measured here", not "dead".
-
-The census asks one class, on one platform — **RETIRED 2026-08-10**, its five
-open items closed under
-`fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`
-— and then the two instruments that answer both of those. The census asks about
-one class in one image, so **1,939 of the 2,542 "method not declared" rows are
-actually inherited** (19 of them from an `ACC_NATIVE` supertype) and **59
-registrations are a genuine bridge only on Windows**, provable from the Linux
-host because CratonVM adjudicates an image it cannot run. Corrects three
-verdicts in the two records above.
-
-**Found and fixed while working this list, not filed here before:**
-`--jdk-only` could not start a thread (`jdk-only-section7-step3-unsatisfiedlinkerror-FIXED-20260804.md`).
-§7 step 3's decline fell through to `UnsatisfiedLinkError` rather than to the
-bytecode, so every `new Thread(…)` died, every `ExecutorService` had no live
-workers, a workload that joined on one **hung**, and `FileChannel.size()`
-silently returned `0`. Pre-existing on `dev`. It was surfaced by the schema-3
-census on that instrument's first run — the three `java/lang/Thread` rows say
-`start0` is `ACC_NATIVE` and `run`/`start` are shadows of concrete bytecode —
-and the other 4,795 shadowing `Bridge` registrations can reach the same path.
-
-**The finding that came out of closing item 9, and that changes how the rest of
-this list should be worked.** `requested_by` now names the *Rust* call site that
-asked for each fabrication, not only the Java frame — because on a strict boot
-essentially every compatibility class comes from a native asking for an
-allocation shape, and has no Java frame at all. Item 4 scopes its migration at
-"52 live call sites in 27 files". **Three of them fire on a strict boot.** Take
-the census from the workload you care about before sizing any of this from a
-grep.
-
-**Substantially reduced, still open:**
-
-* **3** — the statically-unreachable h2-bnf block is alive (a landed, measured
-  fix that had never once executed); both halves of the policy are named
-  functions side by side; a 29-shape table pins the `(cold, warm)` verdict pair.
-  Deletion still needs RKC16N.6 fixed.
-* **8** — **CLOSED**, see above.
-* **7** — the marker undercount that made this tier-1 is gone: a census constant
-  names all eight sites plus the ninth, the probe has one implementation instead
-  of three, and a gate fails on a partial sweep. No site is deleted; that still
-  needs real `ThreadPoolExecutor` field initialisation first.
-* **5** — `AnonymousObject$N` migrated to `VmInternal` and verified
-  (`compatibility-stub` 14 → 13, `vm-internal` 0 → 1, total unchanged).
-  `Proxy$Instance`'s origin question is answered — `VmInternal`, not
-  `GeneratedProxy`, and the in-code marker is corrected — but flipping it is not
-  attempted.
-* **1** — **the census this item was blocked on has been taken.** Schema 3 adds
-  `image_declaring_method`, adjudicating every registration against the bytes on
-  the class path rather than against whatever the run happened to load, and
-  `scripts/jdk-only-adjudicate.py` reads it. Measured on JDK 25: **11,909
-  registrations**, `kind_stated` false on **all** of them (`register_with_kind`
-  has zero callers), and **10,084 of 10,844 `Bridge` rows have no `ACC_NATIVE`
-  target** — 4,796 shadow concrete bytecode, 1,321 are abstract, 2,489 name a
-  method the class does not declare. The record's "1,195 `native-collections`
-  registrations" framing is off by an order of magnitude and by scope: this is a
-  whole-tree problem, and `native-collections` is 1,338 of it. Nothing is
-  reclassified; contract §8 makes that its own wave, and it can now be cut into
-  subsystem batches from data.
-* **2** — **step 1 stopped being a hand sweep.** The runtime detector for this
-  exact defect already existed (`CRATONVM_DBG=overlay,overlay-all`) and had
-  never been run broadly. It produced a work list of **13 classes / 24 slots**,
-  each with class, slot, value kind, real descriptor and frequency — and
-  **identical under `--real-jdk` and `--jdk-only`**, so this is a
-  `Compatible`-mode defect too, not a strict-mode one. Two entries are now
-  fixed: `VarHandle` slots 0/1 (the VM was handing real `AtomicBoolean` /
-  `AtomicReference` `<clinit>`s a `VarHandle` whose `vform` it had nulled) and
-  `Properties` slots 5/6/7 (`try_set_jdk_map_field` resolved every field name
-  against a hard-coded `java/util/HashMap` and wrote that index into whatever
-  receiver it was given). **19 slots remain**, listed in the record.
-  `CRATONVM_DBG=overlay-bt` was added to name the *Rust* writer, because the
-  Java frames mislead. The two `unknown` overlay verdicts also drop from
-  ranked-HIGH on evidence (two of three checks run, both clean).
-* **11 §5** — **retracted**: its premise (the memo needs policy-qualifying) does
-  not hold. Checking it found a larger defect in its place — seven force-native
-  dispatch sites bypassing `resolve_dispatch` and the census entirely — which is
-  fixed. **11 §13** — closed, at 14 occurrences rather than the 5 filed.
-
-**Unchanged and open:** 4 (the migration itself), 11 §1, §2, §4, §6, §8, §9,
-§10, §11, and §3's residual.
-
-**One thing this pass established that no record says:** strict mode had never
-been run against ordinary Java. The first breadth workload pointed at it —
-`probes/JdkOnlyCensusLoadProbe.java`, nine sections of collections, streams,
-`Properties`, io, nio, net, executors — found that `--jdk-only` could not start
-a thread, and had been unable to for as long as anyone can date. Criterion 6
-("strict corpus green") is not a formality to tick after the list is done; it is
-where the defects are. Run the probe under both modes with a HotSpot control
-before trusting any strict-mode claim in this directory.
-
-Four new guards landed, each **verified by injecting a violation and watching it
-fail**, then reverted: the site census, the no-hand-inlined-probe scan, the
-allow-list divergence test, and the String-policy verdict table.
+`W3-4-forkjointask-status-flags-and-the-eager-default.md`,
+`W6-5-vacuous-tests.md`, `W6-9-complete-erases-the-abnormal-record.md`,
+`W6-10-process-enumeration-syscall-cost.md`,
+`W7-1-treemap-views-and-iterator-remove-contract.md`, and the `W7-2` … `W7-6`
+records.
 
 ---
 
-Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md)
-(owned by the orchestrator; do not edit). Wave 1 is **measurement, not
-deletion** (contract §10). Everything in this directory is a gap wave 1
-deliberately deferred rather than papered over, with the evidence that makes it
-actionable.
-
-Related non-known-issue docs:
-[`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
-[`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
-[`docs/jdk-only-migration.md`](../../jdk-only-migration.md).
-
-The registration census behind items 1 and 2, and the object-layout survey they
-rest on, were one-off audits; they have been retired and their durable findings
-are stated in [`docs/README.md`](../../README.md) and
-[`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
-
----
-
-## Citation status — read this before trusting a `file:line`
-
-These records were first written on 2026-07-31 against a working tree whose
-uncommitted wave-1 edits were then destroyed by an external `git restore`. The
-work was **re-landed** into this worktree (`C:\craton\wt-jdk-only`, branch
-`feat/jdk-only-mode`) by fresh agents. The re-land is equivalent in design and
-different in detail: line numbers moved, several helpers were renamed, and a few
-constructs were replaced by differently-shaped ones.
-
-Every `file:line` in this directory has since been re-verified against the
-re-landed tree and corrected. What that pass established:
-
-* **Anchor on the marker tag, not the number.** Wave-2 sites carry
-  `// JDK-ONLY-WAVE2:`, deferred observations carry `// JDK-ONLY-NOTE:`,
-  per-registrar category verdicts carry `// JDK-ONLY-CLASSIFY:`, and
-  field-slot verdicts carry `// JDK-ONLY-LAYOUT:`. Those tags are stable; the
-  numbers are not.
-* **The dispatch resolver re-land left exactly 14 `JDK-ONLY-WAVE2` markers**
-  across `vm/src/vm/vm_exec.rs` (6) and `vm/src/runtime/interpreter/invoke.rs`
-  (8). They are enumerated in the records that own them. Two of the fourteen
-  are a **cross-linked pair** for the `java/lang/String` policy that both say,
-  in terms, that they must be deleted together; two more are the
-  real-protected-stub allow-list copies, both now annotated *"RECONCILE, not
-  assume"*.
-* **Several wave-1 gaps closed during the re-land.** The most significant:
-  `real_declaring_method` is now populated rather than `null`; the two
-  divergent schema-2 census writers were unified into one; the JIT's inline
-  caches now refuse to publish native entries under `JdkOnly`; the JIT's
-  by-name native fast paths are policy-checked and counted. Each affected
-  record says so where it applies, and the ranking below reflects the move.
-* **`vm-cli/src/main.rs` was being edited while this pass ran.** Its citations
-  are given by function and marker name only.
-* Claims that could not be re-verified are marked **UNVERIFIED** inline rather
-  than deleted or asserted.
-
----
-
-## Ranked work list
-
-Ranked by *danger*, not by effort. The first tier causes **silent wrong
-behaviour** — no exception, no log line, no failing test.
-
-### Tier 1 — silent misbehaviour
-
-| # | Record | Why it is dangerous |
-|---|---|---|
-| 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at closed 2026-08-11** — the retired `bridge-reclassification-wave` write-up. It was re-homed there with its numbers and all four of its "what would close this" items landed: `image_declaring_method` resolves up the hierarchy (census schema 4, so the 19 inherited `ACC_NATIVE` rows stop counting as unadjudicated and the 1,613 inherited shadows become visible without a HotSpot run); `java.util.logging`'s 84 shadows are retired, measured verdict-neutral against the strict corpus with a newly subsystem-scopable `CRATONVM_ENFORCE_NATIVE_SHADOW`; the abstract-interception surface outside `java.util` is probed and measured INERT across eleven families; and the superseded rows are gated on the 52 whose kind disagrees with the winner's rather than bulk-deleted. What remains open is the 6,066-row shadow population itself, for the reason already established — a class's state has to become real before its shadow can be retired. |
-| 2 | Fabricated object layouts leak into native code — **RETIRED 2026-08-10** | Index-based field access against assumed synthetic layouts: on real bytes the index still resolves and points at a different field, with no fault and no log line. Closed across five lanes and a final residual pass. The shadow-layout census is at **zero** NAME rows, **zero** `_vmN` rows and zero `java/net/URI` access-site rows on both standing probes; the last live defects it found were `URI.getAuthority()` answering null, `ProxySelector.select()` returning an empty list, and every `getLogger(Foo.class)` logger being named `"unknown"`. Both `breaks-under-strict` sites and both `unknown` verdicts are adjudicated, and `safe` verdicts are now re-checked against the loaded image at every class definition instead of being remembered. Record retired to the internal tree as `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`, with the companion `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. |
-| 4 | `ensure_synthetic_class` cannot enforce policy, only record it — **RETIRED 2026-08-10** | Returned a bare `ClassId`, so under `--jdk-only` it recorded the violation and fabricated anyway. The entry point is deleted, along with the `NativeSystemAccess` trait method, the `NativeContextImpl` override and all three infallible allocation funnels; the grep gate matches zero sites, tests included. See `fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`. |
-
-Items 5 and 7 left this table on 2026-08-06, together with wave-2 lanes L10 and
-L11 item 7:
-
-| Was | Now |
-|---|---|
-| 5 — VM-internal classes mislabelled `CompatibilityStub` | `jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md` |
-| 7 — the `ThreadPoolExecutor.execute` receiver-shape copies | `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md` |
-
-Item 7 came down to the per-**instance** question the eight receiver-shape
-probes existed to answer having no receivers left. L10 landed that at
-registration the same day: real-JDK mode registers no `Executors` pool factory,
-so the real `Executors` bytecode builds every executor and a fabricated receiver
-CANNOT be minted — a statement about the code, not about a `false=0` reading.
-`native_es_execute` is then tagged `SyntheticStub` and `ThreadPoolExecutor` is
-on the real-protected-stub allow-list, which answers the question class-scoped
-on both dispatch paths; all nine sites and the probe helper are deleted, and a
-gate fails if one grows back. The native itself is NOT deleted — strict mode
-declines to admit it, and the `--features synthetic-jdk` build still runs it.
-
-Item 5 needed the prerequisite the record named: `is_synthetic_stub` was
-answering two different questions, so `Class::dispatch_lacks_class_file` now
-answers the dispatch one and `origin` answers the census one.
-`java/lang/reflect/Proxy$Instance` is `VmInternal` (census: 420 rows before and
-after, `compatibility-stub` 14 → 13, exactly one class moved), the fabricated
-`$$Lambda`/`$ProxyN`/`Generated*Accessor*` families are classified where they
-are minted, and **`Class::is_synthetic_stub` is deleted** — contract §5's "in a
-later wave", done.
-
-Item 8 left this table on 2026-08-04:
-the real-protected-stub allow-lists (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`)
-are one predicate now.
-
-Item 3 left it the same day:
-the forced-native `String` policy (`forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md`)
-is gone — all four copies of it, the fourth having gone uncounted by this
-record. The lists were removed after being MEASURED inert (a binary without
-them produced a byte-identical 392-case `String` transcript in both modes and
-identical invocation counts on every exercised slot), and the policy now lives
-at registration: `NativeMethodRegistry::register` drops every `java/lang/String`
-`Bridge` in real-JDK mode. It closes **L9** as well — RKC16N.6 does not
-reproduce, because the class-load defect behind the April symptom was fixed by
-RKC16N.9 and nobody went back to the workaround.
-
-Retired item 6: cached invoke targets retain and revalidate `NativeKind`
-was fixed on 2026-08-01. The interpreter invoke cache now carries the id and
-kind, re-applies central policy, and counts both static and virtual warm hits.
-The JIT MIC/PIC-slot half remains independently tracked by item 11 §1.
-
-**Every row in the tier-1 table above predates the 2026-08-04 pass.** The "why
-it is dangerous" column still describes the defect each record was filed for
-accurately; what changed is how much of each is left, and in one case (item 8's
-"two copies") the shape. See the summary at the top of this file, and the
-*What changed on 2026-08-04* section in each record.
-
-### Tier 2 — the instruments the tier-1 items must be measured with
-
-**Both closed 2026-08-04**, and moved to the internal record tree:
-the observability surface (`jdk-only-observability-surface-FIXED-20260804.md`)
-and the `System.exit` census (`jdk-only-system-exit-census-FIXED-20260804.md`).
-
-Their outputs are what the tier-1 items should now be worked from. In
-particular: `requested_by` names the Rust call site of every fabrication, the
-schema-2 census carries `kind_stated`, `--trace-jdk-only` reports class-origin
-violations live, and a run that ends in `System.exit` leaves a census behind.
-
-### Cross-cutting
-
-| # | Record | Contents |
-|---|---|---|
-| 11 | Additional wave-2 markers not in the original inventory — **RETIRED 2026-08-10**, record moved out of the public tree | 13 further findings, re-verified and re-scored against the re-land. Four of them moved materially: the JIT's inline caches are now closed-by-refusal under `JdkOnly` rather than unchecked; the JIT's by-name native fast paths are policy-checked and counted; `build_helpers` now publishes the policy before the first compile; and the three documentation-gap items are all closed. All of it is now closed: the two process globals moved or were threaded per compilation, the interface-substitution map is refused under strict, the `redefine_immune_*` predicates collapsed onto the aggregate, `check_override`'s chain is down to 179 disjuncts and is not consulted at all under `--jdk-only`, and the doc paths were repointed. The direct-call ladders' literals stay, adjudicated: they are the recognition map, not a policy list. |
-
----
-
-## Dependency order for wave 2
-
-The items are not independent. Steps 1 and 2 of the original order — finish the
-instruments, make the census survive `System.exit` — are **done**; what follows
-is the order for what remains.
-
-The single most useful thing to do before starting any of it: **take the
-schema-3 census and the class-origin census from a real-JDK run of the workload
-you actually care about**, and read them with `scripts/jdk-only-adjudicate.py`.
-Every item below is evidence-driven, and the instruments now produce that
-evidence: `requested_by` naming Rust call sites, `kind_stated` separating chosen
-from inherited kinds, `image_declaring_method` adjudicating every registration
-against the class-path bytes whether or not the run touched the class, and a
-live violation trace.
-
-**The grep-derived sizes in these records are systematically wrong, and always
-in the same direction.** Three measurements now say so: 52 grep-visible
-`ensure_synthetic_class` call sites of which **3** fire on a strict boot; "about
-8,000" registrations against a measured **11,909**; and a `native-collections`
-mis-tagging scoped at 1,195 registrations that is really **10,084** spread over
-the whole tree. Do not size anything here from a `rg` count.
-
-1. **Item 1** — make every native's kind an explicit, per-registration fact.
-   `register_with_kind` and the `kind_stated` census column exist now; the
-   migration and the reclassification do not, and contract §8 scopes them as
-   their own subsystem-per-PR wave. Nothing else in tier 1 can be done safely
-   before this: items 3, 7, 8 and item 11 §4/§11 all end with "let
-   `resolve_dispatch` decide from `NativeKind` + `Method::code()`", which
-   requires the kinds to be true.
-2. **Item 11 §1** — the JIT's MIC/PIC slots still store a raw entry pointer with
-   no kind beside it, and pay for the gap with a blanket refusal that costs
-   `JdkOnly` runs every inline-cached native call. Independent of item 1 in
-   principle, but the fix is the same shape and worth doing next to it.
-3. **The three blockers, each of which is real engineering rather than
-   cleanup.** They gate items 3, 8 and 7 respectively, and none of them is a
-   JDK-only change:
-   * **RKC16N.6** — real-JDK `java/lang/String` bytecode resolution during JDK
-     `<clinit>`s. Until this is fixed, both `String` lists have to stay.
-   * ~~**The `StringJoiner` heap-reference-integrity defect**~~ — retired
-     2026-08-04. It did not reproduce under the exact merge that was supposed to
-     trigger it, and the merge is landed.
-   * ~~**Real `ThreadPoolExecutor` field initialisation**~~ — retired
-     2026-08-06 by L10, at REGISTRATION: real-JDK mode registers no
-     `java/util/concurrent/Executors` pool factory at all, so the real
-     `Executors` bytecode constructs every executor and CratonVM has no code
-     path that can mint a half-built one. Item 7 spent that the same day —
-     `native_es_execute` is reclassified and all nine sites are gone.
-4. **Item 11 §4/§8/§9/§11** — delete the hard-coded lists, each with its own
-   regression corpus. Items 3, 7 and 8 are done (2026-08-04 / 2026-08-06).
-5. **Item 4** — migrate the remaining `ensure_synthetic_class` callers. Drive
-   the migration from the `requested_by` census, not from a grep. (Item 5 is
-   done: `Proxy$Instance` is settled and `is_synthetic_stub` is deleted.)
-6. **Item 2** — finish the layout sweep across `native-builtins`,
-   `native-collections`, `native-io` and `vm/src/native/`. Independent of the
-   rest and can run in parallel, but it is the item most likely to surface new
-   blockers.
-
-## Standing constraints for anyone working this list
+## 3. Standing constraints for anyone working this list
 
 * `native-builtins/tests/stub_ratchet.rs` asserts `BASELINE_SYNTHETIC_STUBS`
   **exactly**, with `SLACK = 0` (555 as of 2026-08-06; the constant carries its
   own re-freeze history — the figure moves, so read it there rather than here),
-  and separately asserts only
-  `total >= 8_000` as a vacuity floor. The floor is not a claim about the exact
-  total — do not cite one. The strict-mode siblings in the same file assert
-  zero `SyntheticStub` registrations and `strict_total >= 7_500`; that second
-  number is a collapse detector, not a measurement, for the same reason.
+  and separately asserts only `total >= 8_000` as a vacuity floor. The floor is
+  not a claim about the exact total — do not cite one. The strict-mode siblings
+  in the same file assert zero `SyntheticStub` registrations and
+  `strict_total >= 7_500`; that second number is a collapse detector, not a
+  measurement, for the same reason.
 * `Compatible` mode must remain byte-for-byte unchanged (contract §5, §10). Most
   of the dangerous mistakes catalogued here are `Compatible`-mode behaviour
   changes made while intending to fix strict mode.
 * No process globals for this feature's state (contract §2). Two of the items in
-  this directory are existing violations; do not add a third.
+  this directory were existing violations; do not add a third.
+* **Do not size anything here from an `rg` count.** The grep-derived sizes in
+  these records are systematically wrong, and always in the same direction.
+  Three measurements say so: 52 grep-visible `ensure_synthetic_class` call sites
+  of which **3** fire on a strict boot; "about 8,000" registrations against a
+  measured **11,909**; and a `native-collections` mis-tagging scoped at 1,195
+  registrations that is really **10,084** spread over the whole tree. Take the
+  census from the workload you care about instead — `requested_by` names the
+  *Rust* call site of every fabrication, `kind_stated` separates chosen from
+  inherited kinds, `image_declaring_method` adjudicates every registration
+  against the class-path bytes whether or not the run touched the class, and
+  `scripts/jdk-only-adjudicate.py` reads all three.
 * **JMX and `java.util.function.Function$Identity` are already retagged
   `Bridge`** and are *not* among the residual 157. Any plan that starts from
-  "retag JMX" is working from a stale report. `Function$Identity` has a
-  *successor* defect instead — see item 1.
-* `docs/known-issues/` holds **unfixed** issues only. A record moves to
-  `` when it is fixed, not when it is planned.
+  "retag JMX" is working from a stale report.
+* **Run the probe under both modes with a HotSpot control before trusting any
+  strict-mode claim in this directory.** Criterion 6 ("strict corpus green") is
+  not a formality to tick after the list is done; it is where the defects are.
+  The first breadth workload ever pointed at strict mode
+  (`probes/JdkOnlyCensusLoadProbe.java`) found that `--jdk-only` could not start
+  a thread, and had been unable to for as long as anyone can date.
+* **Anchor a `file:line` on the marker tag, not the number.** Wave-2 sites carry
+  `// JDK-ONLY-WAVE2:`, deferred observations `// JDK-ONLY-NOTE:`, per-registrar
+  category verdicts `// JDK-ONLY-CLASSIFY:`, field-slot verdicts
+  `// JDK-ONLY-LAYOUT:`. Those tags are stable; the numbers are not. These
+  records were first written on 2026-07-31 against a working tree whose
+  uncommitted wave-1 edits were destroyed by an external `git restore` and then
+  re-landed by fresh agents — equivalent in design, different in detail. Every
+  `file:line` was re-verified against the re-landed tree, and claims that could
+  not be re-verified are marked **UNVERIFIED** inline rather than deleted.
+* **Before believing a record that says a patch was never applied, grep for the
+  patch's token.** Fourteen records claimed a hand-off was still pending for a
+  change that is in the tree today; see `RETIREMENT-20260811.md`. Lanes that
+  could not edit a file wrote the patch down and handed it off, and nobody went
+  back to the record when it landed.
+
+---
+
+## 4. The historical passes, compressed
+
+Read this only to understand how the directory got here. Nothing below is work.
+
+**2026-08-04 — the instruments, and three closures.** The observability surface
+(`fixed-bugs/jdk-only-observability-surface-FIXED-20260804.md`), the `System.exit`
+census (`fixed-bugs/jdk-only-system-exit-census-FIXED-20260804.md`) and the
+real-protected-stub allow-lists
+(`fixed-bugs/jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`) all
+closed. The forced-native `String` policy closed the same day — all four copies,
+removed after being MEASURED inert (a binary without them produced a
+byte-identical 392-case `String` transcript in both modes), with the policy moved
+to registration: `NativeMethodRegistry::register` drops every `java/lang/String`
+`Bridge` in real-JDK mode. Four new guards landed, each verified by injecting a
+violation and watching it fail, then reverted.
+
+**2026-08-05/06 — the strict boot, and the step-1 experiment.** Strict boot's
+refusal of five classes closed
+(`fixed-bugs/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`); the
+fifth, `cratonvm/internal/SystemLogger`, was reached unconditionally from
+`ObjectInputFilter$Config.<clinit>`, so refusing it cost every
+`ObjectInputStream` construction in the VM. The `bytecode_available`-at-step-1
+proposal was implemented and **measured**: it took the corpus from 32/17 to
+**3/46**, and was reverted
+(`retired/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`). §1.4's lever
+is registration, not dispatch. What survived is the observation plus a dial,
+`CRATONVM_ENFORCE_NATIVE_SHADOW=1`. Two more records closed the same day: the
+`ThreadPoolExecutor.execute` receiver-shape copies
+(`retired/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`)
+and VM-internal classes mislabelled `CompatibilityStub`
+(`retired/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`),
+which also deleted `Class::is_synthetic_stub`.
+
+**2026-08-10 — the layouts, the bridges, the census.** Fabricated object layouts
+RETIRED: the shadow-layout census is at **zero** NAME rows, zero `_vmN` rows and
+zero `java/net/URI` access-site rows on both standing probes
+(`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`, with
+`fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`).
+`ensure_synthetic_class` deleted outright
+(`fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`).
+`Bridge` registrations on a receiver no supported image declares: 246 rows across
+50 classes reclassified against six images
+(`fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`)
+— and the 791-row deletion list handed off with them turned out to be a list of
+registrations **nobody had exercised**, not dead ones. The census that asks one
+class on one platform closed
+(`fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`): 1,939 of
+2,542 "method not declared" rows are actually **inherited**, and 59 registrations
+are a genuine bridge only on Windows — provable from a Linux host, because
+CratonVM adjudicates an image it cannot run. `MemorySegment.set` had no
+implementation for five of its nine carriers
+(`fixed-bugs/ffm-memorysegment-set-carriers-FIXED-20260810.md`).
+
+**2026-08-11 — the bridge wave, and this audit.** The reclassification question
+closed: the population is now five slack-free ratchets with committed baselines
+rather than a number in a document — `bridge_without_acc_native` 8,911,
+`bridge_shadows_bytecode` 6,066, `bridge_stated_shadows_bytecode` 24,
+`superseded_kind_disagreements` 52, `superseded_stub_lost_to_admitted` 4, all
+scored by `regression-suite/bridge-ratchet.sh` (the retired
+`bridge-reclassification-wave` write-up). What remains open there is the 6,066-row
+shadow population itself, for the reason already established — a class's state has
+to become real before its shadow can be retired. Then this directory's own
+retirement audit: 30 records moved, 22 kept, in `RETIREMENT-20260811.md`.
+
+**The ranked work list this file used to carry is closed.** Items 1 through 11
+are all either fixed or retired; the last of them (item 1, `NativeKind` ambient
+and defaulting to `SyntheticStub`) was retired 2026-08-06 and the
+reclassification it pointed at closed 2026-08-11. Item 11's thirteen
+cross-cutting findings all closed and its record left the public tree on
+2026-08-10. The three blockers that gated the list are gone: `StringJoiner`
+heap-reference integrity retired 2026-08-04 (did not reproduce), real
+`ThreadPoolExecutor` field initialisation retired 2026-08-06 at *registration*
+(real-JDK mode registers no `Executors` pool factory at all, so a half-built
+executor has no code path that can mint it), and RKC16N.6 was spent by moving
+the `String` policy to registration.
+
+**Retired one-off audits.** The registration census behind old items 1 and 2 and
+the object-layout survey they rested on were one-off audits; their durable
+findings are stated in [`docs/README.md`](../../README.md) and
+[`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
+
+---
+
+`docs/known-issues/` holds **unfixed** issues only. A record moves to the
+internal record tree when it is fixed, not when it is planned. Internal records
+are cited here **prefix-less and as plain text** — `fixed-bugs/foo-FIXED.md`,
+`retired/bar-RETIRED.md` — and never as a markdown link: the internal tree is
+being stripped from public git history before release, so a link into it would
+dangle for every public reader, and `types/tests/doc_citation_paths.rs` fails on
+one. It scans Rust comments too.

@@ -612,6 +612,23 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     });
 
     // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
+    //
+    // W7-9 — that "4-field synthetic" is a real JDK class, and this layout is
+    // laid over its declared one. `javap -p java.nio.channels.SelectionKey` on
+    // JDK 25 gives exactly one instance field,
+    // `private volatile java.lang.Object attachment`, at slot 0 — a REFERENCE.
+    // `try_alloc_concurrent_synthetic` takes `num_fields.max(real)` = 4 and
+    // reports an alias only when `num_fields < real`, so requesting 4 against
+    // a declared 1 is silent. Slot 0 happens to hold a reference in both
+    // readings (`channel` here, `attachment` there) which is why nothing has
+    // caught fire, but the two disagree about WHICH reference, and
+    // `nio_selector.rs`'s `sk_attach`/`sk_attachment` read the real one.
+    // Same species as W4-4/W6-3 in a third file; the census is in
+    // docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md §5.
+    // Not repaired here: this registrar is synthetic-only (reached from
+    // `register_synthetic_overrides`), the live SelectionKey surface is
+    // `native-io/src/nio_selector.rs::register_nio_selector_real`, and a
+    // one-sided renumbering would only move the disagreement.
     let sk = "java/nio/channels/SelectionKey";
 
     // The four public interest-op constants. They are `static final int`s, so
@@ -3192,6 +3209,41 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     //
     // The sock_id was added by NEW-3 so that send/receive/read/write
     // share one persistent UDP socket and the Selector can poll its fd.
+    //
+    // W7-9 — DO NOT WIRE THIS REGISTRAR INTO THE DEFAULT BUILD AS-IS.
+    //
+    // It is `pub(crate)` and reached only from `phases_late.rs`'s
+    // `register_phase72_natives` -> `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`-gated, so none of it runs in the
+    // real-JDK CLI. Two of its bodies — `setOption(SocketOption,Object)` and
+    // `getRemoteAddress()` — are `abstract` on the real JDK 25
+    // `DatagramChannel` (`javap -p`) and are registered by NOTHING in the
+    // default build, so a call on a minted receiver is a hard
+    // `AbstractMethodError` there. That reads as "wire this in and the gap
+    // closes". It is a trap.
+    //
+    // `native-io/src/lib.rs` has its OWN `register_datagram_channel` — same
+    // class name, live in the default build (twice: directly from
+    // `register_io_natives`, and again through
+    // `register_phase92_io_completeness`) — and it mints the receiver with a
+    // DIFFERENT slot assignment. The bodies below read `field 2` as the
+    // connected flag and `field 4` as a `SocketRegistry::dgrams` index. Run
+    // them against the object the default build actually allocates and those
+    // reads land on unrelated slots: an `Int` where the caller stored a
+    // reference, an arbitrary int used as a registry key. That is the
+    // slot-index species
+    // (docs/known-issues/jdk-only/W4-4-slot-index-species-sweep.md), i.e.
+    // heap corruption rather than a wrong answer.
+    //
+    // The precondition for wiring is therefore NOT "call it later than
+    // `register_io_natives`" — it is "one layout owns this class name". Unify
+    // first, then move the two bodies into `native-io`'s live registrar, where
+    // they need no new `vm_init.rs` call at all. Full adjudication — including
+    // the other two absent abstracts, the vectored
+    // `read`/`write([Ljava/nio/ByteBuffer;II)J`, which are NOT composable from
+    // the single-buffer natives because one call must move exactly one
+    // datagram — is in
+    // docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md.
 
     r.register(
         dc,
