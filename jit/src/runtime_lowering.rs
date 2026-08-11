@@ -149,6 +149,32 @@ pub(crate) fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_r
         // MOV <seg>:[disp32], RBP — REX.W + 89 /r + ModRM(00,RBP,SIB) + SIB(abs).
         buf.emit(&[0x48, 0x89, 0x2C, 0x25]);
         buf.emit(&(disp as u32).to_le_bytes());
+        // …and INVALIDATE the identity half, which this site cannot restore.
+        //
+        // The two backends' own republish paths rewrite the identity with the
+        // caller's compile id, because the method being compiled knows it. This
+        // one is shared code emitted into many callers and does not, and the
+        // call it follows can have been to a COMPILED callee — `CALL R11` in
+        // the hashed megamorphic dispatch below, or a helper that ran arbitrary
+        // Java. Such a callee published ITS id on entry. Restoring the caller's
+        // RBP while leaving that id would pair this frame with another method's
+        // identity, and `innermost_frame_method` would then read oop maps off
+        // the wrong method — a confidently WRONG answer, which is far worse
+        // than the absent one it replaced, and undetectable downstream because
+        // both halves still read consistently out of the mirrors.
+        //
+        // Zero is the honest value: `lookup_compile_id(0)` is `None`, so the
+        // scan falls back to decoding the call exactly as it did before the
+        // identity existed. Writing a constant needs no scratch register and no
+        // plumbing of the caller's id through five stub emitters.
+        let cm_disp = crate::x64::inline_cm_tls_disp();
+        if cm_disp != 0 {
+            buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+            // MOV dword <seg>:[disp32], 0 — C7 /0 + ModRM(00,/0,SIB) + SIB(abs).
+            buf.emit(&[0xC7, 0x04, 0x25]);
+            buf.emit(&(cm_disp as u32).to_le_bytes());
+            buf.emit(&0u32.to_le_bytes());
+        }
         return;
     }
     buf.emit_byte(0x50); // PUSH RAX (preserve Java return)
