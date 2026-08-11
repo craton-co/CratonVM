@@ -3817,6 +3817,31 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 ///
 /// The 64M cap is a runaway guard; a well-behaved iterator terminates long
 /// before it.
+///
+/// # This signature launders a `--jdk-only` refusal into a wrong answer
+///
+/// `-> Vec<Value>` has no error channel, so both `match` arms below map *every*
+/// failure of `iterator()` / `hasNext()` / `next()` to "no more elements". For
+/// a foreign collection that genuinely cannot be walked that is the intended
+/// best effort. For a strict-mode policy refusal it is not: measured
+/// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9,
+///
+///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+///
+/// answers `true` on HotSpot and in `Compatible`, and **`false`** under
+/// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
+/// java/util/LinkedList$Itr` raised by the `invoke_virtual` below arrives here
+/// as `Vec::new()` and `native_al_equals` then compares 3 elements against 0.
+///
+/// A refusal that reaches a caller with nowhere to put it stops being a
+/// refusal, which is the one failure mode contract §5 cannot tolerate: the
+/// census still records the violation, so the run looks *measured* while the
+/// program is handed a wrong answer. Not fixed here — every caller of this
+/// helper would need an error channel, and this branch cannot rebuild to
+/// verify one — but recorded at the source rather than only in the record, so
+/// the next reader of a "strict says false, Compatible says true" report finds
+/// the mechanism instead of re-deriving it. Reasoned in
+/// docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
 fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let pin_base = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(pin_base, this);
@@ -30233,6 +30258,45 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // and a real `ArrayList$ListItr` over a snapshot would drop `set()` writes
     // silently, which is worse. Reasoned in
     // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
+    //
+    // 2026-08-11, the third candidate that record did not consider: mint the
+    // carrier through `ensure_vm_internal_class` (`ClassOrigin::VmInternal`),
+    // the door ten `MethodHandles` combinator carriers were moved to the same
+    // day (docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md). The
+    // class qualifies — no image declares `cratonvm/internal/*`, no class file
+    // could exist for it, and it is a 3-slot tuple of the VM's own state — but
+    // **the door alone does not fix this site**, and that is the finding worth
+    // keeping. Two independent gates refuse this carrier, not one:
+    //
+    //   1. the class:  `try_alloc_synthetic` stamps `CompatibilityStub`, which
+    //      §5 forbids. The `VmInternal` door clears this.
+    //   2. its natives: `cratonvm/internal/LinkedListSnapshotListItr` is on
+    //      `VM_MINTED_STAND_IN_RECEIVERS` in native-api/src/no_image_receiver.rs,
+    //      so `register()` re-tags all nine registrations below from the
+    //      ambient `Bridge` to `SyntheticStub` BEFORE the `JdkOnly` arm reads
+    //      the kind — and that arm then returns without inserting them. The
+    //      door does not touch this.
+    //
+    // Clearing 1 without 2 leaves strict holding a well-formed carrier with no
+    // implementation: the failure moves from `NoClassDefFoundError` at
+    // `listIterator()` to `UnsatisfiedLinkError` at the first `hasNext()` —
+    // later, further from the cause, and no better for the contract. That is
+    // the exact trap `STRICT_STILL_FABRICATES` is kept as an empty table to
+    // name ("the two halves of this defect are the registration's kind and the
+    // class's existence"), running in the other direction. So this site is left
+    // refusing until both halves can land together; the companion retag is
+    // written out verbatim in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+    //
+    // What that record also measures, and what makes the current refusal worse
+    // than it looks: it is NOT loud everywhere. `new ArrayList<>(List.of("a",
+    // "b","c")).equals(linkedList)` answers **false** under `--jdk-only` — no
+    // exception, just the wrong answer. The launderer is ours and is in this
+    // file: `native_al_equals`'s cross-layout arm calls
+    // `collection_elements_generic`, whose signature is `-> Vec<Value>` with no
+    // error channel, so the `NoClassDefFoundError` its `iterator()` call raises
+    // becomes `Vec::new()` and the two sides differ in length. A refusal that
+    // reaches a caller with nowhere to put it does not stay a refusal.
     registry.register(
         c,
         "listIterator",
