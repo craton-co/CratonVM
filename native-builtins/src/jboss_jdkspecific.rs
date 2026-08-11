@@ -1507,7 +1507,7 @@ fn build_requires_set(
             try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4)?;
         let element_pin = ctx.pin_native_root(element);
 
-        let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+        let mut mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
         let mods_pin = ctx.pin_native_root(mods);
         if let Some(enum_id) = modifier_enum {
             for (wanted, constant) in [(*transitive, "TRANSITIVE"), (*is_static, "STATIC")] {
@@ -1515,8 +1515,11 @@ fn build_requires_set(
                     continue;
                 }
                 // Re-read the pin first: a previous `collection_add` re-entered
-                // Java (`Enum.hashCode`) and may have moved `mods`.
-                let mods = ctx.read_native_pin(mods_pin, mods);
+                // Java (`Enum.hashCode`) and may have moved `mods`. Assigned
+                // back into the outer binding rather than shadowed inside the
+                // loop body, so the second iteration re-reads from the updated
+                // ref instead of handing `read_native_pin` a stale fallback.
+                mods = ctx.read_native_pin(mods_pin, mods);
                 if let Some(value) = enum_constant(ctx, enum_id, constant) {
                     collection_add(ctx, mods, value)?;
                 }
