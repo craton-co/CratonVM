@@ -125,6 +125,63 @@ deleting it is what exposed the gap.** A silent hole became a red test.
 * `native-awt` 259 / 1 — `image::tests::get_rgb_oob`, pre-existing since the L5b
   record.
 
+## Follow-up 2026-08-11: were the other ~114 pinned too?
+
+The restore above covered the triples two crates' tests named. It did not answer
+whether the rest of `dc55e8057`'s deletions were also pinned somewhere, so that
+was measured rather than assumed: censuses from a binary at `dc55e8057^` and one
+at current `dev`, distinct triples, `P - C`.
+
+**258 registrations were still missing**, and running the whole tree's pins
+against them found **15**. All fifteen were resolved by measurement, and only
+one was a real gap:
+
+* **14 `sun/instrument/InstrumentationImpl` arities — the deletion was RIGHT.**
+  Every native on that class takes `long jvmtienv` first, on both Temurin
+  21.0.12+8 and 25.0.4+7. The deleted no-`long` spellings could never bind. But
+  the pin was real: `vm/src/runtime/instrument.rs`'s
+  `register_natives_includes_required_methods` asserted thirteen of them, and
+  **the `vm` crate was red on `dev`** — I had run only the two crates the
+  original report named. The test now asserts the ten descriptors the JDK
+  actually declares, plus negative assertions on the five unbindable ones.
+  Three more it asserted (`isRedefineClassesSupported0`,
+  `isNativeMethodPrefixSupported0`, `setNativeMethodPrefix0`) are native on no
+  supported image and are gone rather than corrected; `appendTo{Bootstrap,
+  System}ClassLoaderSearch0` is one JDK method, `appendToClassLoaderSearch0`.
+* **1 was a false positive of the pin extractor itself.** It counted my own
+  `assert!(r.find(…).is_none())` on the `Object`-tailed `FileChannelImpl.open`
+  as a pin — the parser could not tell a prohibition from a requirement, so it
+  protected exactly the row somebody had gone to the trouble of forbidding.
+  Fixed: a `.find(…).is_none()` within 60 characters is not a pin.
+* **1 genuine gap, restored.** `InstrumentationImpl.<init>(JLjava/lang/String;ZZ)V`
+  is a constructor, so it is `method-nowhere` on every image that will ever
+  exist. Deleting it left three things pointing at nothing — the `ctx.invoke` in
+  `attach_agent_in_process`, the force-native-override entry in
+  `native_override.rs`, and a `KEEP (empty body, justified)` comment explaining
+  why it must beat real bytecode. The invoke then reached the real ctor and
+  entered the VM-private init that comment says cannot be honoured, on the
+  self-attach path every `Mockito.mock()` arms.
+
+After both fixes: **0 still-missing-and-pinned**, of 257 still missing.
+
+Of the 257 that nothing pins, **140 are the `lang_string` covariant collapse and
+are not deletions at all.** Verified per class: `AbstractStringBuilder`,
+`StringBuilder` and `StringBuffer` each go from 103 triples to ~60 with **all 27
+method names intact on all three**. What went is the cross-product of wrong
+return types — `StringBuilder.append(C)` registered as returning `StringBuffer`
+and `AbstractStringBuilder` — which could never bind. The conversion derives the
+return descriptor from the class, so exactly the unbindable variants collapsed.
+
+Full-workspace check after the restore: `vm` 2,479, `native-builtins` 3,402,
+`native-io` 438, `native-api` 287, `native-collections` 105, `classloading` 790,
+`types` 536, `jit` 1,973, `reader` 337 — all 0 failed. `native-awt` 259/1, the
+pre-existing `image::tests::get_rgb_oob`.
+
+**The lesson worth keeping is the one about scope.** The original report named
+two crates because those were the two whose tests someone had run. A third was
+red the whole time. `P - C` over two censuses is the check that does not depend
+on which suites anyone thought to run.
+
 ## What this says about the deletion list
 
 Two of its three buckets have now been found unsafe as committed, for the same
@@ -134,6 +191,10 @@ underlying reason and a week apart:
 |---|---|
 | `class-absent` | not adjudicable — the VM mints the receiver on demand (2026-08-10) |
 | `method-nowhere` | not adjudicable **on its own** — the method may be CratonVM's own addition to a real class (this record) |
+
+…and the residue is smaller than either bucket suggested: of 258 registrations
+still missing after the restore, 140 are a descriptor collapse that removed only
+unbindable spellings, and 0 are pinned by anything.
 
 What survives is `method-nowhere` **minus** everything a test pins, and the pin
 source has to be the whole tree. The list is 292 rows now, down from 791, and
