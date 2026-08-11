@@ -398,6 +398,26 @@ pub struct ClassRealm {
     /// T10.9.B: FxHashMap — ClassId-keyed.
     pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
 
+    /// Cache of the synthesized `java.lang.reflect.Method` (with its
+    /// `parameterTypes`/`exceptionTypes` arrays and name/signature strings
+    /// already populated) that `proxy_invoke_handler_shared` builds for every
+    /// `InvocationHandler.invoke(proxy, method, args)` dispatch. Keyed by
+    /// (proxy's ClassId, method name, descriptor) — real JDK dynamic-proxy
+    /// classes build this Method object ONCE per interface method in their
+    /// static initializer, not per call; before this cache, CratonVM rebuilt
+    /// it (a fresh object + two arrays + two strings) on every single
+    /// reflective dispatch, which on allocation-heavy reflection-driven
+    /// workloads (e.g. ByteBuddy's `JavaDispatcher.INVOKER`) generated enough
+    /// short-lived garbage to fragment the non-compacting old-gen arena and
+    /// OOM even though most of the heap was nominally free.
+    /// Grow-only, bounded by the number of distinct (proxy class, method)
+    /// pairs an application actually exercises — not user-input-sized.
+    /// Rooted unconditionally in `memory::roots` alongside `class_mirrors`
+    /// since these Method objects, like class mirrors, are meant to outlive
+    /// any single call and be shared across every future dispatch to the
+    /// same proxy method.
+    pub proxy_method_cache: RwLock<FxHashMap<(ClassId, String, String), ObjectRef>>,
+
     /// Resolved implementation-owner `ClassId` for each lambda proxy id, on the
     /// **globally-resolved** path only.
     ///
