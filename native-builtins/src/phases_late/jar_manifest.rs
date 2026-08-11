@@ -1667,6 +1667,95 @@ pub(crate) fn p59_set_jar_entry_times(
     ctx.unpin_native_roots(entry_pin);
 }
 
+/// The last modification time this process has observed for `path`, in
+/// nanoseconds since the epoch, or 0 if the file could not be stat'ed.
+///
+/// # Why this is memoised and not simply stat'ed
+///
+/// `jar_contents_cached` and `jar_entry_bytes_cached` key on `(path, mtime)`
+/// so a jar rewritten on disk is not served stale. Deriving that key used to
+/// mean a `std::fs::metadata` call **on every accessor call**, and on Windows
+/// `std::fs::metadata` opens a file handle (`CreateFileW` +
+/// `GetFileInformationByHandle` + `CloseHandle`), which measured **~45 us per
+/// call** on the development host — three orders of magnitude more than the
+/// cache lookup it was guarding.
+///
+/// That is not a rounding error on the workloads this file exists for.
+/// Jasper's TLD scan drives Tomcat's `JarFileUrlJar.nextEntry()`, which on a
+/// multi-release jar calls `JarFile.getJarEntry(name)` once per entry; each of
+/// those reaches `jar_contents_cached` up to three times
+/// (`p59_jar_is_multi_release`, the versioned-name search, and the entry
+/// lookup itself). `probes/TldJarScanProbe.java` walks a 130-jar, 32 491-entry
+/// classpath the way that scan does: **789-1720 ms on CratonVM against 40-58 ms
+/// on HotSpot**, with the phase split putting 560-2474 ms of it in the 11 751
+/// `getJarEntry` re-lookups alone. `TomcatServletWebServerFactoryTests` does
+/// that walk once per embedded-container start, 121 times.
+///
+/// # What is given up, and why it is the right trade
+///
+/// The probe now happens once per path, plus once more whenever a `JarFile` /
+/// `ZipFile` is *constructed* for it ([`jar_cache_revalidate`]). So a jar
+/// rewritten on disk and then **reopened** still gets a fresh parse — which is
+/// the case the `(path, mtime)` key was introduced for — while a rewrite seen
+/// through an already-open handle keeps serving the snapshot taken at open.
+///
+/// That is HotSpot's behaviour, not a weakening of it: the JDK's
+/// `ZipFile.Source` cache is keyed on `(file, lastModified, size)` sampled in
+/// `ZipFile.Source.get()` at open time and never re-sampled, and the open file
+/// is held for the life of the `ZipFile`. Re-stat-per-accessor was stricter
+/// than the thing it was emulating.
+fn jar_path_mtime(path: &str) -> u128 {
+    if let Some(m) = mtime_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+    {
+        return *m;
+    }
+    jar_path_mtime_probe(path)
+}
+
+fn mtime_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, u128>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u128>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stat `path` for real and record the answer.
+///
+/// A failed stat is deliberately NOT memoised: a path that does not exist yet
+/// (a jar about to be written) must not be pinned to 0 for the life of the
+/// process.
+fn jar_path_mtime_probe(path: &str) -> u128 {
+    let probed = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    match probed {
+        Some(mtime) => {
+            mtime_memo()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_string(), mtime);
+            mtime
+        }
+        None => 0,
+    }
+}
+
+/// Re-stat `path`, so a jar rewritten since the last probe is picked up.
+///
+/// Call this from every place that OPENS an archive. Nothing else has to
+/// happen: both jar caches key on the mtime, so a changed value simply
+/// produces a different key and the next lookup parses afresh.
+pub(crate) fn jar_cache_revalidate(path: &str) {
+    if !path.is_empty() {
+        jar_path_mtime_probe(path);
+    }
+}
+
 /// Per-path cache of a JAR's parsed central directory (metadata only — no
 /// decompressed bytes; see `jar_entry_bytes_cached` for those).
 ///
@@ -1703,12 +1792,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
     if path.is_empty() {
         return None;
     }
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let mtime = jar_path_mtime(path);
     let key = format!("{path}\u{0}{mtime}");
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(c) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -1787,12 +1871,7 @@ pub(crate) fn jar_entry_bytes_cached(
     if path.is_empty() || entry_name.is_empty() {
         return None;
     }
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let mtime = jar_path_mtime(path);
     let key = format!("{path}\u{0}{mtime}\u{0}{entry_name}");
     let archive_key = format!("{path}\u{0}{mtime}");
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -2890,6 +2969,9 @@ pub(crate) fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, slot0_val);
     ctx.set_field_by_name(this, "name", slot0_val);
+    // Opening is the moment the jar caches re-check the file on disk; the
+    // accessors read a memoised mtime. See `jar_path_mtime`.
+    jar_cache_revalidate(&path);
     // Keep signed entry sections lazy. Constructing a JarFile only needs main
     // attributes; expanding thousands of signer entries here makes ordinary
     // construction pathological in the interpreter.
@@ -2949,6 +3031,9 @@ pub(crate) fn p59_jar_file_init_file(
     if crate::nbflags().dbg_sbload {
         eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
     }
+    // Opening is the moment the jar caches re-check the file on disk; the
+    // accessors read a memoised mtime. See `jar_path_mtime`.
+    jar_cache_revalidate(&path);
     // Pin across the manifest parse below — a moving young GC there would
     // relocate `this` (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
@@ -4281,5 +4366,105 @@ pub(crate) mod bc_small_factors_tests {
         assert!(!bc_util_has_any_small_factors(&mag_le(751))); // smallest prime > 743
         assert!(!bc_util_has_any_small_factors(&mag_le(999_983))); // prime
         assert!(!bc_util_has_any_small_factors(&mag_le((1u128 << 61) - 1))); // M61
+    }
+}
+
+#[cfg(test)]
+mod jar_mtime_memo_tests {
+    use super::{jar_cache_revalidate, jar_contents_cached, jar_path_mtime};
+    use std::fs::File;
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
+
+    /// Write a one-entry zip at `path` whose single entry is named `entry`,
+    /// then stamp it with `mtime` so the test does not depend on the host
+    /// filesystem's timestamp granularity.
+    fn write_jar(path: &std::path::Path, entry: &str, mtime: SystemTime) {
+        let file = File::create(path).expect("create jar");
+        let mut zipw = zip::ZipWriter::new(file);
+        zipw.start_file(entry, zip::write::SimpleFileOptions::default())
+            .expect("start_file");
+        zipw.write_all(b"x").expect("write entry");
+        let file = zipw.finish().expect("finish zip");
+        file.set_modified(mtime).expect("set mtime");
+        file.sync_all().expect("sync");
+    }
+
+    /// The accessors read a MEMOISED mtime, and opening re-probes it.
+    ///
+    /// Both halves are load-bearing and neither is incidental:
+    ///
+    /// * without the memo, every `JarFile.getEntry`/`size`/`getJarEntry` call
+    ///   pays a `std::fs::metadata` (a `CreateFileW` on Windows, ~45 us on the
+    ///   host this was measured on) — see `jar_path_mtime`;
+    /// * without the re-probe on open, a jar rewritten on disk and reopened
+    ///   would be served from the stale parse, which is the exact bug the
+    ///   `(path, mtime)` cache key was introduced to prevent.
+    #[test]
+    fn rewritten_jar_is_stale_until_reopened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jar = dir.path().join("memo.jar");
+        let path = jar.to_string_lossy().into_owned();
+
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        write_jar(&jar, "first.txt", t0);
+
+        // First touch parses and memoises the mtime.
+        let first = jar_contents_cached(&path).expect("first parse");
+        assert!(first.by_name.contains_key("first.txt"));
+        let memoised = jar_path_mtime(&path);
+
+        // Rewrite with a DIFFERENT entry and a distinctly later mtime.
+        let t1 = t0 + Duration::from_secs(3600);
+        write_jar(&jar, "second.txt", t1);
+
+        // Still the snapshot taken at open: the accessors do not re-stat.
+        assert_eq!(
+            jar_path_mtime(&path),
+            memoised,
+            "the accessor path must not re-stat"
+        );
+        let stale = jar_contents_cached(&path).expect("cached parse");
+        assert!(
+            stale.by_name.contains_key("first.txt"),
+            "an already-open jar keeps its snapshot, as HotSpot's ZipFile.Source does"
+        );
+
+        // Opening re-probes, and the changed mtime produces a new cache key.
+        jar_cache_revalidate(&path);
+        assert_ne!(
+            jar_path_mtime(&path),
+            memoised,
+            "revalidation must observe the new mtime"
+        );
+        let fresh = jar_contents_cached(&path).expect("reparse");
+        assert!(
+            fresh.by_name.contains_key("second.txt"),
+            "a reopened jar must be reparsed, not served stale"
+        );
+        assert!(!fresh.by_name.contains_key("first.txt"));
+    }
+
+    /// A path that does not exist must not pin a 0 mtime for the life of the
+    /// process: a jar written later has to be seen.
+    #[test]
+    fn missing_path_is_not_memoised() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jar = dir.path().join("later.jar");
+        let path = jar.to_string_lossy().into_owned();
+
+        assert_eq!(jar_path_mtime(&path), 0, "absent file reports 0");
+        assert!(jar_contents_cached(&path).is_none());
+
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        write_jar(&jar, "late.txt", t0);
+
+        assert_ne!(
+            jar_path_mtime(&path),
+            0,
+            "a failed stat must not be memoised, or the file could never appear"
+        );
+        let contents = jar_contents_cached(&path).expect("parse after creation");
+        assert!(contents.by_name.contains_key("late.txt"));
     }
 }

@@ -5771,8 +5771,21 @@ impl NativeMethodRegistry {
         descriptor: &str,
         callback: NativeCallback,
     ) {
+        // Two measured, centrally-applied kind decisions, in one arm because
+        // they have the same shape and the same reason: a fact about the JDK
+        // image that no registration site can know, adjudicated once.
+        //
+        //  * the receiver class no supported image declares (§1.5 has no target
+        //    to bind to), and
+        //  * a triple RETIRED as a §1.4 shadow, subsystem by subsystem, each
+        //    against a strict-corpus measurement. See `crate::retired_shadow`.
         if self.effective_category() == NativeKind::Bridge
-            && crate::no_image_receiver::receiver_declared_by_no_supported_image(class_name)
+            && (crate::no_image_receiver::receiver_declared_by_no_supported_image(class_name)
+                || crate::retired_shadow::triple_is_retired_shadow(
+                    class_name,
+                    method_name,
+                    descriptor,
+                ))
         {
             let prev = self.current_category;
             let prev_stated = self.next_kind_stated;

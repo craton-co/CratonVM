@@ -46,17 +46,28 @@ What still holds:
 
 - **The default collector's `NOSUMMARY` is gone** (0 on all three arms in the
   re-run), so it was not a standing property of that backend either.
-- **G1 crashed, and that crash is now fixed.** 4 → 1, and the survivor is a
-  different class that was a HANG before — see
-  fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md and
-  [g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md](g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md).
-  The cause was an unaligned G1 TLAB carve, **not** the JIT-frame root-coverage
-  gap this page originally credited.
+- **G1 crashed, and that crash is now fixed.** 4 → 1 → **0**. The cause was an
+  unaligned G1 TLAB carve, **not** the JIT-frame root-coverage gap this page
+  originally credited — see
+  fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md.
+  The 1 in the 08-11 G1 row is not a VM crash either: it was
+  `TestChunkedTransferEncodingWithProxy` faulting *inside* the verifier that
+  `CRATONVM_DBG=g1-dbg-reach` enables — and that flag was on the **G1 arm
+  only**. Flag off, the class passes 3/3. See
+  fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md.
+  Read the 08-11 G1 crash column as **0**.
+- **The 08-11 arms were not otherwise identical**, and the Method section above
+  now says so: the G1 arm carried a diagnostic the other two did not. That is a
+  variable of the comparison, and it is what produced the row above. An
+  instrument belongs on every arm or none.
 - **ZGC is still marginally healthiest** and is still the narrower guarantee,
   for the reason in "Why ZGC dodges it" below — but with the G1 defect fixed and
   the default collector's hangs gone, the margin is now 1–6 classes, not 85.
 - **G1 is now the slowest arm** (212.9 min vs 177/178). That is new and
-  unexplained; it is not the diagnostic flag (see Method).
+  unexplained. It survives the obvious suspicion — the diagnostic ran at 0.89×
+  the 08-10 per-class time on the 81 classes compared mid-run — but with that
+  flag now known to have changed an outcome on this arm, the timing deserves a
+  re-measure with the arms matched before anything is built on it.
 
 ## Why ZGC dodges it — corrected 2026-08-10
 

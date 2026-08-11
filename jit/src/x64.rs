@@ -691,6 +691,17 @@ struct Compiler {
     ldc_class_info: Vec<(usize, u32, u16)>,
     /// Resolved ldc2_w constants: (bytecode_pc, i64 value).
     ldc2w_info: Vec<(usize, i64)>,
+    /// `ldc`-family pcs whose constant is floating-point — `CONSTANT_Float` for
+    /// `ldc`/`ldc_w`, `CONSTANT_Double` for `ldc2_w`.
+    ///
+    /// `ldc_info`/`ldc2w_info` carry only the bits, because the codegen that
+    /// consumes them lets the CONSUMING opcode pick the width. The deopt
+    /// operand-stack snapshot has no consuming opcode to ask, so it needs the
+    /// constant-pool tag the resolver already read; without it `x64::stack_kinds`
+    /// answered `Unknown` for every numeric `ldc`, the snapshot recorded
+    /// `Unsupported`, and `osr_exit_policy` then refused OSR entry for the whole
+    /// artifact. See `osr-refused-for-a-loop-inline-in-main-20260810`.
+    ldc_fp_pcs: FxHashSet<usize>,
     /// Runtime helper function pointers for JIT callbacks.
     helpers: JitRuntimeHelpers,
     /// Expected simulated-stack depth at each forward branch target.
@@ -2328,6 +2339,7 @@ impl Compiler {
             ldc_string_info: Vec::new(),
             ldc_class_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: FxHashSet::default(),
             branch_target_stack_depth: FxHashMap::default(),
             branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
