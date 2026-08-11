@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkForkJoin` passes in the 53/1 run. Both "Out-of-file patches (must be applied for this fix to do anything)" are applied: the three static `invokeAll` overloads are in `keep_real_forkjointask_bridge` (`native-api/src/registry.rs:6072`) and in `is_forkjoin_native_override` (`vm/src/runtime/interpreter/native_override.rs:1717`), each carrying this record's `// L12:` comment. "What this does NOT fix" — the `CountedCompleter leaves: 0` failure it predicted — was taken by L19 and W2-8 and is closed; the `fork()` ordering change it declined to make is now the shipped default (`CRATONVM_FJP_EAGER_FORK`, flipped 2026-08-07).
+>
+> Previous location: `docs/known-issues/jdk-only/L12-forkjoinpool-no-workers-awaitdone-hang.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `ForkJoinTask.invokeAll` was the one real-bytecode route from a lazy `fork()` to an `awaitDone()` nothing can satisfy
 
 **Status:** FIXED in source 2026-08-06 (lane L12, JDK-only wave 2). Not yet

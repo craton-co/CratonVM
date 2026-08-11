@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkReflect` (in `JDKONLY_CLASSES`) passes in the 53/1 strict-corpus run of 2026-08-07. The one out-of-file patch this record handed to the orchestrator — the caller step in front of `native_method_invoke` — IS in the tree: `native-builtins/src/lang_class.rs:696` and `:8716` both call `lang_reflect::caller_may_access_member`. The "Known residual" it names (`check_field_access`, `Constructor.newInstance`) was re-homed to `L15-nestmate-access-field-and-constructor.md`, which stays open in `docs/known-issues/jdk-only/` and owns the still-unchecked constructor path.
+>
+> Previous location: `docs/known-issues/jdk-only/L1-reflect-setaccessible-invoke.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Method.invoke` has no caller step, so nestmate private invocation is refused
 
 Status: fix written, unbuilt (lane L1 cannot run cargo or the VM).

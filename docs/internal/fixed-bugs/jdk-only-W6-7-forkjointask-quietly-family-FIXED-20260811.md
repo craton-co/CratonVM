@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkForkJoin` passes in the 53/1 run. The `quietly*` registrations and the `quietlyComplete()` semantics are in `native-builtins/src/phases_late/concurrent.rs`. The one item under "Recorded, not fixed" — `complete(Ljava/lang/Object;)V` erasing the abnormal record — was taken by W6-9, which stays open in `docs/known-issues/jdk-only/` with a fix in flight.
+>
+> Previous location: `docs/known-issues/jdk-only/W6-7-forkjointask-quietly-family.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # W6-7 — the `ForkJoinTask.quietly*` family was registered nowhere, so every
 # member ran real bytecode into `awaitDone()`
 

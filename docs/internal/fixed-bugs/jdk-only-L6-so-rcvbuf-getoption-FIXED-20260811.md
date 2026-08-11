@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkNet` passes in the 53/1 run. The record is entirely in-lane (`native-io/src/net.rs`), carries no out-of-file patch and no residual section — only a falsifier.
+>
+> Previous location: `docs/known-issues/jdk-only/L6-so-rcvbuf-getoption.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `SO_RCVBUF` read back as 0 — `sun/nio/ch/Net.getIntOption0` never asked the OS
 
 **Status:** FIXED (code landed 2026-08-06, unverified — no binary was built in

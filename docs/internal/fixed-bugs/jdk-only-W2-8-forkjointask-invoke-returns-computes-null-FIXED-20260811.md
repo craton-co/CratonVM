@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkForkJoin` passes in the 53/1 run. This record specified a cure it could not build; the cure is in the tree — `native-builtins/src/phases_early.rs:8489-8509` implements `ForkJoinTask.invoke()` as `doInvoke(); return getRawResult();` through a virtual `getRawResult` dispatch with the `method_exists` guard and the memoisation this record specified. "The wall behind this one: `isCompletedAbnormally()`" was taken by W3-4, which is still open in `docs/known-issues/jdk-only/` with a fix in flight.
+>
+> Previous location: `docs/known-issues/jdk-only/W2-8-forkjointask-invoke-returns-computes-null.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `invoke()` answers `compute()`'s value, so every real parallel-stream terminal gets `null`
 
 **Status:** cure specified 2026-08-07 (lane W2-8, JDK-only wave 2). The cure is

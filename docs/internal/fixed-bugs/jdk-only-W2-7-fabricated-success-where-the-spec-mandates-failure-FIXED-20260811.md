@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vectors `RJdkJni`, `RJdkFailure` and `RJdkProcess` all pass in the 53/1 run. Four of the five inventory rows were FIXED in-lane; row #4, the only "OUT-OF-FILE PATCH", is applied — `native-builtins/src/phases_late.rs:2148-2222` now mints a real `java.lang.ProcessHandleImpl` with a per-VM memo instead of a fresh bare-interface object per call. The one row it listed as owned by another live lane (`ModuleLayer.findModule` fabricating a `Module` for any syntactically valid name) was closed by W2-3.
+>
+> Previous location: `docs/known-issues/jdk-only/W2-7-fabricated-success-where-the-spec-mandates-failure.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # W2-7 — fabricated success where the spec mandates a failure
 
 Status: fixed (4 in-file, 1 out-of-file patch), inventory extended.

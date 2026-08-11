@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkModule` passes all 44 checks in the 53/1 run. Both "Not landed — two wiring patches this lane does not own" ARE landed: `vm/src/vm/vm_init.rs:993` calls `resolve_module_path`, and `native-builtins/src/jboss_jdkspecific.rs:287,326` memoise the boot `ModuleLayer` per `vm_identity` behind `add_global_root`. All seven items in "What remains — the checks behind this one" were taken by successor records and closed: (1)/(3) by W2-3, (4) by W3-3, (5) by W4-2, (6) by W5-3, (7) by W6-2, and the boot-layer `ServicesCatalog` by W6-11 (`fixed-bugs/jdk-only-W6-11-module-serviceloader-FIXED-20260807.md`).
+>
+> Previous location: `docs/known-issues/jdk-only/L9-module-not-in-boot-layer.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `--module-path` / `--add-modules` were parsed and then read by nobody
 
 **Status:** PARTIAL (resolution layer landed 2026-08-06 in

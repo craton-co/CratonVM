@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkLambdas` passes in the 53/1 run. The out-of-file patch to `native-api/src/registry.rs` IS applied — `:6442-6470` drops the `Function`/`UnaryOperator` `identity` registration behind `drop_real_layout_synthetic`, with this record's own rationale comment.
+>
+> Previous location: `docs/known-issues/jdk-only/L18-function-identity-not-synthetic.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Function.identity()` answers a fabricated class in `--real-jdk`
 
 Status: fix written 2026-08-06 (lane L18) as an **out-of-file patch** to

@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkJmx` passes in the 53/1 run. The side table, the `Arrays$ArrayItr` arm and the `Intrinsic` registration of `java/util/Iterator.remove()V` are all in `native-collections/src/lib.rs`. The "Baselines that move (not this lane's files)" section is discharged rather than pending: `scripts/baselines/jdk-only-bridge-ratchet.json` was re-seeded wholesale by the bridge-reclassification wave (`retired/bridge-reclassification-wave-RETIRED-20260811.md`) and the counters this record predicted moving no longer exist at those values.
+>
+> Previous location: `docs/known-issues/jdk-only/L13-arrayitr-remove-writethrough.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `--jdk-only`: the snapshot iterator that stands in for `HashMap$KeyItr` had no `remove()`
 
 **Status:** FIXED in source 2026-08-06 (lane L13, JDK-only wave 2). Not verified

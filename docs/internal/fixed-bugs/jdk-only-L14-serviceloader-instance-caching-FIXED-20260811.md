@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkServices` passes in the 53/1 run, and this record's failing arm was the DEFAULT (`--real-jdk`) one, which the corpus also exercises. Entirely in-lane; the only closing section is "Residual risk / what would falsify this", which is a falsifier, not an open item.
+>
+> Previous location: `docs/known-issues/jdk-only/L14-serviceloader-instance-caching.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `ServiceLoader`'s instance cache was allocated, cleared on `reload()`, and never read
 
 **Status:** FIXED in source 2026-08-06 (lane L14, JDK-only wave 2). Not yet

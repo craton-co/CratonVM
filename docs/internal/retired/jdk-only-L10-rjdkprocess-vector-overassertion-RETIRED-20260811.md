@@ -1,3 +1,10 @@
+> **RETIRED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Not a CratonVM defect at all — the record's own headline finding is that the vector was a broken oracle that real HotSpot 25 also fails intermittently, and that **no VM code was changed**. `docs/known-issues/` holds unfixed CratonVM issues; a corrected test vector is not one. `RJdkProcess` passes in the 53/1 run against the corrected oracle. The under-assertion it noted and deliberately left alone (`allProcesses().limit(4).count() >= 0`) belongs to the vacuous-test sweep, which is still open.
+>
+> Previous location: `docs/known-issues/jdk-only/L10-rjdkprocess-vector-overassertion.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `RJdkProcess` was a broken oracle — it asserted a process-tree snapshot against a child that had already exited
 
 **Status:** FIXED in the vector (2026-08-06). Lane L10 of the jdk-wave2 pool.

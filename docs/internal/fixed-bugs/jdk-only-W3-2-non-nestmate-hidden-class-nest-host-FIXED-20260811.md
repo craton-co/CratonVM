@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkHidden` passes in the 53/1 run. Entirely in-lane. "Residual on this vector" was an expectation about the checks behind `:151` ("Expected green"), which the vector passing settles; "Optional companion patch (shadowed today)" concerns `classloader.rs::lk_define_hidden_class`, which this record itself establishes is dead code on every live path because a later registration overwrites the descriptor.
+>
+> Previous location: `docs/known-issues/jdk-only/W3-2-non-nestmate-hidden-class-nest-host.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # A non-nestmate hidden class joined its template's nest, because the NESTMATE option was never decoded
 
 Status: fix written, unbuilt (lane W3-2 cannot run cargo or the VM).

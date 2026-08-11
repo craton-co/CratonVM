@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> It owns **no corpus vector of its own** — it is an instrument record. The gate ships and is seeded from its first real run (1206 shadowed registrations, 53 with a kind disagreement); the analysis API is in `native-api` and the ratchet in `native-builtins/tests/duplicate_registration_gate.rs`. The one live defect it filed, "The unjustified one", was REFUTED in the record's own margin by lane W6-12 — the losing `StampedLock` registrar had been dead at its call site since 2026-07-28 — and its "second candidate" (`Phaser`) was confirmed and fixed by that same lane. What is left is "What this gate does not cover", which states the instrument's scope, not an unfixed defect.
+>
+> Previous location: `docs/known-issues/jdk-only/W6-4-duplicate-registration-gate.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # Duplicate registration: the species, the gate, and one live instance
 
 **Status:** the gate ships, and is now **seeded from its first real run**

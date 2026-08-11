@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkForkJoin` passes in the 53/1 run, and the decision this record was gated on **has been taken**. It landed its cure behind `CRATONVM_FJP_EAGER_FORK`, OFF by default, and listed three conditions under "What would justify making the new behaviour the default", prescribing "invert `fjt_fork_mode`'s `None` arm to `CountedCompleterEager` and keep `0`/`-fjp-eager-fork` as the escape hatch". That is exactly what `native-builtins/src/phases_late/concurrent.rs:7107` now says: *"since 2026-08-07 this is the OPT-OUT (`CRATONVM_FJP_EAGER_FORK=0`), not the default"*. The knob was kept, as asked.
+>
+> Previous location: `docs/known-issues/jdk-only/L19-countedcompleter-lazy-fork-starvation.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `CountedCompleter` has no consumer to intercept, so a lazy `fork()` starves it silently
 
 **Status:** cure implemented in source 2026-08-06 (lane L19, JDK-only wave 2)
