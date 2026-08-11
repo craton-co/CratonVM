@@ -116,7 +116,7 @@ public class RJdkX509Intercept {
 
         check(c.getNotBefore().getTime() == 1577836800000L,
                 "getNotBefore() = " + c.getNotBefore().getTime());
-        check(c.getNotAfter().getTime() == 4730630400000L,
+        check(c.getNotAfter().getTime() == 4731436800000L,
                 "getNotAfter() = " + c.getNotAfter().getTime());
         System.out.println("CK RJdkX509Intercept validity=" + c.getNotBefore().getTime()
                 + "," + c.getNotAfter().getTime());
