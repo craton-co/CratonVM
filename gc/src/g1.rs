@@ -2319,9 +2319,20 @@ impl G1Collector {
                         // those are behind their own mutexes and this runs
                         // under the regions lock — the deadlock hazard
                         // `candidate_header_is_plausible` already documents.
+                        let bytes = self
+                            .lookup_region_for_addr(seed)
+                            .and_then(|i| regions.get(i))
+                            .map(|r| {
+                                hexdump_around(
+                                    r.data.as_ptr() as *mut u8,
+                                    r.cursor,
+                                    seed.wrapping_sub(r.data.as_ptr() as usize),
+                                )
+                            })
+                            .unwrap_or_default();
                         tracing::warn!(
                             "[g1] rejected seed 0x{seed:x}: seeds={} map={} inbound_forwards={inbound} \
-                             passes={passes}",
+                             passes={passes} {bytes}",
                             seeds.len(),
                             acc.pointer_map.len(),
                         );
@@ -4556,7 +4567,7 @@ impl G1Collector {
                 let base = r.data.as_ptr() as usize;
                 format!(
                     "verdict={verdict:?} region={i} type={:?} base=0x{base:x} cursor=0x{:x} \
-                     off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={}",
+                     off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={} {}",
                     r.region_type,
                     r.cursor,
                     addr.wrapping_sub(base),
@@ -4564,10 +4575,88 @@ impl G1Collector {
                     r.pinned,
                     r.reuse_epoch,
                     r.recycled_in_generation,
+                    self.locate_in_object_grid(r, addr),
                 )
             }
             None => format!("verdict={verdict:?} region=none"),
         }
+    }
+
+    /// Where `addr` falls in its region's OWN object grid, walked linearly from
+    /// the region base exactly as `scan_source_region_for_cset_refs` walks it.
+    ///
+    /// This is the question that separates the candidate explanations for a
+    /// rejected address. "It is 0x18 bytes inside a live `class_id=42` object"
+    /// means someone produced an INTERIOR pointer; "it is inside a TLAB skip
+    /// span" means the address is in memory no object grid covers; "the walk
+    /// desynced before reaching it" means the region's own grid is broken and
+    /// the address is a symptom rather than the cause.
+    fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
+        let base = region.data.as_ptr() as usize;
+        if addr < base {
+            return "grid=below-base".to_string();
+        }
+        let target = addr - base;
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut offset = 0usize;
+        let mut objects = 0usize;
+        while offset < region.cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                if target < offset + skip {
+                    return format!("grid=IN-JIT-TLAB-SKIP span_start=0x{offset:x} len=0x{skip:x}");
+                }
+                offset += skip;
+                continue;
+            }
+            if let Some(gap) = gap_filler_len(obj_ptr) {
+                if target < offset + gap {
+                    return format!("grid=IN-TLAB-GAP-FILLER gap_start=0x{offset:x} len=0x{gap:x}");
+                }
+                offset += gap;
+                continue;
+            }
+            // The tag half of the real walk's validation (the region-bounds half
+            // is implied by the loop). A desync here is itself the answer, so
+            // report where it happened rather than guessing past it.
+            let ptr = obj_ptr as *const u8;
+            let kind_ok = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }.is_some();
+            let elem_ok =
+                unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }
+                    .is_some();
+            if !kind_ok || !elem_ok {
+                return format!(
+                    "grid=DESYNC-BEFORE-TARGET at=0x{offset:x} after={objects} objects \
+                     (target=0x{target:x})"
+                );
+            }
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if is_humongous_filler(header) {
+                return format!("grid=HUMONGOUS-FILLER at=0x{offset:x}");
+            }
+            let obj_size = object_total_size(header);
+            if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+                return format!(
+                    "grid=WALK-BROKE at=0x{offset:x} obj_size=0x{obj_size:x} after={objects} \
+                     objects (target=0x{target:x})"
+                );
+            }
+            if target == offset {
+                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x}");
+            }
+            if target < offset + obj_size {
+                return format!(
+                    "grid=INTERIOR of=0x{offset:x} delta=0x{:x} size=0x{obj_size:x} cid={} \
+                     kind={:?} idx={objects}",
+                    target - offset,
+                    header.class_id.as_u32(),
+                    header.kind(),
+                );
+            }
+            offset += obj_size;
+            objects += 1;
+        }
+        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x}")
     }
 
     fn scan_and_evacuate_refs(
