@@ -858,7 +858,36 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 15-21. VM/native side tables. The registry owns every built-in scan and
     // its matching relocation callback as one entry. The historical notes
     // below document why each registered source is a root.
+    let __pre_native_roots = roots.len();
     crate::memory::native_roots::scan_all_roots(shared, &mut roots);
+    // CRATONVM_DBG_ROOT_SOURCE, second question: which channel hands the
+    // collector an address that is NOT an object start?
+    //
+    // The G1 evacuation-failure path learned the hard way that it gets them —
+    // its kept-seed and ref-scan guards both reject INTERIOR pointers
+    // (`object_start + 8`, or 0x60 into an array's payload) that arrived in
+    // this very array. `is_object_address` is the strict probe, so a young or
+    // mid-initialisation object can legitimately fail it; the index split is
+    // what makes the output actionable. Everything below `__pre_native_roots`
+    // came from this thread's frames/stack, everything at or above it from a
+    // NAMED source that `root_source_of` can name.
+    if crate::memory::native_roots::root_attribution_on() {
+        for (i, r) in roots.iter().enumerate() {
+            let addr = r.as_ptr() as usize;
+            if shared.mem.heap.is_object_address(addr).is_none() {
+                eprintln!(
+                    "[ROOT-NOT-OBJECT] idx={i}/{} addr=0x{addr:x} phase={} source={:?}",
+                    roots.len(),
+                    if i < __pre_native_roots {
+                        "frame/thread"
+                    } else {
+                        "native-source"
+                    },
+                    crate::memory::native_roots::root_source_of(addr),
+                );
+            }
+        }
+    }
     if let Some(t0) = __rp_t0 {
         let ns = t0.elapsed().as_nanos();
         if ns >= 20_000_000 {
