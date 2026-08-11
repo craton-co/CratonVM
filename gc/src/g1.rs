@@ -5381,7 +5381,7 @@ impl G1Collector {
         // `cid=0x41414141 kind=Array len=0x41414141`, and the element loop then
         // read 1094795585 references from it and walked off the end of the
         // arena. That is the SIGSEGV in
-        // known-issues/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md —
+        // fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
         // produced by this diagnostic, in a run that only crashed because the
         // diagnostic was on.
         //

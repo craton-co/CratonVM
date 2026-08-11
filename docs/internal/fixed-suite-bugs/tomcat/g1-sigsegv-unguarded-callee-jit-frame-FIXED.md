@@ -32,17 +32,24 @@ Whole-arm comparison, all three collectors, both dates:
 | Default 08-10 | 519 | 16 | 115 | 0 (+1 NOSUMMARY) | 356.5 min |
 | **Default 08-11** | **628** | 12 | **11** | 0 | **177.5 min** |
 | G1 08-10 | 578 | 35 | 34 | **4** | 267 min |
-| **G1 08-11** | **623** | **7** | 20 | **1** | 212.9 min |
+| **G1 08-11** | **623** | **7** | 20 | **1**† | 212.9 min |
 | ZGC 08-10 | 604 | 18 | 29 | 0 | 247.1 min |
 | **ZGC 08-11** | **629** | 11 | **11** | 0 | 178.4 min |
 
-The one remaining G1 crash is a **different class**,
-`org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy`,
-which was a G1 `HANG` on 08-10 and passes under both other collectors in this
-same run. It has its own page,
-known-issues/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md, and
-the evidence there says it is not this defect: its process evacuated 2128
-regions across 4 pauses and broke the linear walk **zero** times.
+† **Zero in production configuration — corrected 2026-08-11.** The one crash was
+a **different class**,
+`org.apache.tomcat.integration.httpd.TestChunkedTransferEncodingWithProxy`, and
+it turned out to be caused by the diagnostic this arm carried, not by G1: the
+fault was inside `dbg_verify_reachable_integrity`, the verifier
+`CRATONVM_DBG=g1-dbg-reach` enables, which I had set on the **G1 arm only**.
+Same class, same heap, same collector, flag off: 3 runs, 3 passes; flag on:
+2 crashes in 3. See
+fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md.
+
+So the G1 arm of the re-run crashed **zero** times on anything a user would
+run, and "G1-only" for that class was really "flag-only". The measurement of
+this page's own defect is unaffected — the walk-break instrument and that BFS
+are different code — but the arm's crash column should be read as 0.
 
 ### The mechanism-level measurement
 
