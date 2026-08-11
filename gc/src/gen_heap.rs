@@ -9591,6 +9591,19 @@ impl GenerationalHeap {
             }
         }
         report_phase("sweep-walk-parallel-prefix");
+        // How much of from-space the PARALLEL prefix consumed, for the MARKWHY
+        // report below.
+        //
+        // Every MARKWHY sweep hook lives in the sequential walk. When the
+        // parallel prefix is accepted it consumes `[0, sweep_anchors.last())`
+        // and the sequential walk starts there, so a watched address inside the
+        // prefix is one the sequential walk NEVER VISITS BY CONSTRUCTION — and
+        // "the walk never stops at that base", the fourth-recurrence writeup's
+        // central measurement, would then be a property of where the instrument
+        // is rather than of the grid. The two are indistinguishable without
+        // this number, so report it beside the watch offset and let the reader
+        // compare them.
+        let par_prefix_end = cursor;
 
         // H2-CID0: anchor-validity probe. The parallel sweep prefix splits
         // from-space at `sweep_anchors` and starts an independent chain at each
@@ -10713,10 +10726,11 @@ impl GenerationalHeap {
                 //
                 // The walk-time facts are `dead_regions` and what the anomaly
                 // unwinds took out of it, so report those.
+                let watch_off = w - from_base;
                 eprintln!(
-                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} dead_regions={} dead_watermark={dead_watermark}                      unwinds={dead_unwinds} unwound_entries={dead_unwound_entries}",
-                    w - from_base,
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={watch_off:#x}                      objects_live={objects_live} dead_regions={} dead_watermark={dead_watermark}                      unwinds={dead_unwinds} unwound_entries={dead_unwound_entries}                      par_prefix_end={par_prefix_end:#x} watch_in_par_prefix={}",
                     dead_regions.len(),
+                    watch_off < par_prefix_end,
                 );
             }
         }
