@@ -96,60 +96,59 @@ fn test_vm() -> Vm {
 /// `(class, method)` pairs that do not produce the JDK-correct answer under
 /// CratonVM's synthetic class library — the pinned baseline of this corpus.
 ///
-/// Every entry is **measured twice**, and both measurements are load-bearing:
+/// **This list is EMPTY, and that is its finished state, not an unset one.**
+/// All 924 fixtures produce the JDK-correct answer. The eleven entries it
+/// carried from 2026-08-02 were closed on 2026-08-11; see
+/// fixed-bugs/synthetic-jdk-class-library-gaps-FIXED-20260811.md for what each
+/// one turned out to be. Every one of the eleven was *reachable* code that had
+/// been switched off, mis-shaped or unlinked — a feature gate the synthetic
+/// library could not satisfy, a reified `Type` no `instanceof` could
+/// recognise, a fixed-size list class fabricated as an interface so its
+/// backing array had nowhere to go, and one fixture that asked CratonVM a
+/// question its own harness could not pose.
 ///
-/// 1. Re-run under a real **JDK 25** (`probes/CorpusOracle`) — HotSpot
-///    produces the value the test expects, so the expectation is right and
+/// Keep the constant, and keep the gate around it. An empty list still fails
+/// the run on any mismatch; deleting it would turn the corpus back into
+/// something whose failures are a number nobody reads. Adding an entry is
+/// therefore a deliberate act with a price, and the price is the point.
+///
+/// **Before adding one**, measure it twice — both measurements are
+/// load-bearing, and the first one has changed three fixtures' minds already:
+///
+/// 1. Re-run under a real **JDK 25** (`probes/CorpusOracle`) — HotSpot must
+///    produce the value the test expects, so the expectation is right and
 ///    CratonVM is what is missing. Fixture expectations HotSpot *disagreed*
-///    with were corrected in the fixtures instead and are not listed here
+///    with were corrected in the fixtures instead and never belonged here
 ///    (`ReflectionComplete.testFieldGetPrivate`,
+///    `ReflectionComplete.testMethodInvokePrivateViaReflection`,
 ///    `PropertiesComplete.testPropertiesLoadSpaces`,
-///    `ScopedValueComplete.testThreadVisibility`).
-/// 2. Re-run **alone** in a fresh process (`--exact <test>`) — still fails, so
-///    it is a real gap and not an artefact of the ~900 VMs that precede it in
-///    a full run.
+///    `ScopedValueComplete.testThreadVisibility`). Note the oracle constructs
+///    a receiver for a non-static fixture method and `Vm::invoke` cannot, so a
+///    fixture that is not `static` asks the two sides different questions —
+///    that mismatch was filed as a class-library gap for nine days.
+/// 2. Re-run **alone** in a fresh process (`--exact <test>`) — it must still
+///    fail, so it is a real gap and not an artefact of the ~900 VMs that
+///    precede it in a full run. Two of the eleven were exactly that artefact:
+///    `SerializeBasic`'s side tables are keyed by the stream object's raw
+///    address, and a recycled address inherited a dead stream's wire-handle
+///    table.
 ///
 /// **Reading check 2 correctly matters.** Running `--exact` on a test that is
 /// already listed here reports `FAILED` when it *passes*, because the
 /// unexpected-pass arm below fires. Grepping the run for `result: FAILED` and
 /// calling that "still broken" inverts the answer for every listed entry —
-/// which is exactly the mistake that briefly filed these eleven as merely
+/// which is exactly the mistake that briefly filed the eleven as merely
 /// "order dependent" and the five proxy/annotation tests (which pass) as gaps.
 /// Read the panic text, not the exit status.
 ///
 /// The list is a two-way gate, which is the whole point of pinning it:
 /// a mismatch that is NOT listed fails the run, and a listed pair that starts
 /// PASSING also fails the run, telling you to delete the entry. A corpus whose
-/// known gaps close silently is how this one went dark for as long as it did.
-///
-/// The trailing comment on each is the observed failure, from
-/// `Vm::describe_result`.
-const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[
-    // Reflection on a private final field of the *declaring* class.
-    // NullPointerException: "Field.get: null receiver for instance field".
-    (
-        "cratonvm/ReflectionComplete",
-        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
-    ),
-    // Generic reflection: `getGenericType` / `getGenericSuperclass` do not
-    // surface `ParameterizedType` / `WildcardType` — all return 0.
-    ("cratonvm/GenericReflectionTest", "testParameterizedField"),
-    ("cratonvm/GenericReflectionTest", "testParameterizedSuperclass"),
-    ("cratonvm/GenericReflectionTest", "testTwoArgParameterizedField"),
-    ("cratonvm/GenericReflectionTest", "testWildcardExtendsNumber"),
-    // `System.gc()` is not decisive enough for the finalizer observation this
-    // asserts — returns 0.
-    ("cratonvm/FinalizerTest", "testNoFinalizeOnLive"),
-    // `Arrays.asList` — returns 0.
-    ("cratonvm/TckUtil", "testArraysAsList"),
-    // Serialization round-trips lose every field: the deserialized object's
-    // fields read back null. NullPointerException on the first field access.
-    ("cratonvm/SerializeBasic", "testSimpleRoundTrip"),
-    ("cratonvm/SerializeBasic", "testNestedObject"),
-    ("cratonvm/SerializeBasic", "testTransientField"),
-    // …and writing a non-Serializable does not raise NotSerializableException.
-    ("cratonvm/SerializeBasic", "testNonSerializableThrows"),
-];
+/// known gaps close silently is how this one went dark for as long as it did —
+/// and the gate has now paid for itself twice, first on five proxy/annotation
+/// tests and then on `FinalizerTest.testNoFinalizeOnLive`, which it reported
+/// as passing before anyone went looking for its cause.
+const KNOWN_SYNTHETIC_JDK_GAPS: &[(&str, &str)] = &[];
 
 fn listed(list: &[(&str, &str)], class: &str, method: &str) -> bool {
     list.iter().any(|&(c, m)| c == class && m == method)

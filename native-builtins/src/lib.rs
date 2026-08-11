@@ -23719,7 +23719,31 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     classfile_api::register_classfile_api_natives(registry);
 
     // --- Phase 13.1: Java Serialization ---
-    #[cfg(feature = "experimental-serialization")]
+    //
+    // NOT gated on `experimental-serialization` any more, and the gate was not
+    // a policy choice — it was a hole. This call site is already inside
+    // `register_synthetic_overrides`, which is `#[cfg(feature =
+    // "synthetic-jdk")]`, so it can only run in a synthetic-library build; and
+    // in that build `java/io/ObjectOutputStream` / `ObjectInputStream` are
+    // fabricated stub classes with NO bytecode behind them. Registering
+    // nothing therefore did not "disable an experiment", it left the two
+    // classes present-but-inert: `writeObject` succeeded, wrote nothing,
+    // `readObject` handed back a blank instance, and every field read back
+    // null (`NullPointerException: Cannot read field 'intValue' because the
+    // object is null`), while `writeObject(new NotSerializable())` raised no
+    // `NotSerializableException` at all.
+    //
+    // That is exactly what
+    // fixed-bugs/synthetic-jdk-class-library-gaps-FIXED-20260811.md
+    // filed as four "serialization gaps" in the synthetic class library. The
+    // implementation they were said to be missing is `serialization.rs`, all
+    // 7.6k lines of it, already compiled into this build (the module's own
+    // `#[cfg]` is `any(experimental-serialization, synthetic-jdk)`) — the
+    // registrations were the only thing the feature flag still withheld. The
+    // real-JDK path is unaffected: it never calls this function, and its own
+    // entry point (`register_reflection_factory_serialization`, from
+    // `register_essential_natives_with_shims`) keeps its
+    // `experimental-serialization` gate.
     serialization::register_serialization_natives(registry);
 
     // `ByteArrayOutputStream` intrinsic. The interpreter mis-resolves inherited
