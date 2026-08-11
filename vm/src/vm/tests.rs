@@ -45815,7 +45815,21 @@ use std::sync::Arc;
     fn process_handle_info_stubs_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        // Slot 0 of a `ProcessHandle` is its pid, and it is load-bearing now:
+        // `command()` answers `current_exe()` only when the `Info` describes
+        // THIS process, and `Optional.empty()` for any other. `current_exe()`
+        // measures exactly one process, so reporting it for another pid was a
+        // fabricated command line dressed as a measurement. This fixture used
+        // to leave the pid unset — reading 0, i.e. "some other process" — and
+        // still expect the executable, so it asserted precisely the behaviour
+        // the pid gate exists to remove. It could not report that: this module
+        // is `#[cfg(all(test, feature = "synthetic-jdk"))]` and did not compile
+        // at all while `JitMICSlot::update`'s arity was broken.
         let ph = alloc_receiver(&shared, &mut thread, "java/lang/ProcessHandle", 2);
+        shared
+            .mem
+            .heap
+            .set_field(ph, 0, Value::Long(std::process::id() as i64));
         let info = call_native(
             &shared,
             &mut thread,
@@ -45868,6 +45882,45 @@ use std::sync::Arc;
             .as_object()
             .expect("arguments() must return an Optional");
         assert_eq!(shared.mem.heap.get_field(args_ref, 0), Value::Object(None));
+
+        // The other side of the pid gate, which is what makes the `command()`
+        // assertion above mean anything: an `Info` describing a DIFFERENT
+        // process must not be handed this VM's executable. `Optional.empty()`
+        // is what `ProcessHandle.Info` specifies for a value the
+        // implementation cannot supply.
+        let other_ph = alloc_receiver(&shared, &mut thread, "java/lang/ProcessHandle", 2);
+        shared
+            .mem
+            .heap
+            .set_field(other_ph, 0, Value::Long(std::process::id() as i64 + 1));
+        let other_info = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle",
+            "info",
+            "()Ljava/lang/ProcessHandle$Info;",
+            &[Value::Object(Some(other_ph))],
+        )
+        .unwrap()
+        .unwrap();
+        let other_cmd = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle$Info",
+            "command",
+            "()Ljava/util/Optional;",
+            &[Value::Object(Some(other_info.as_object().unwrap()))],
+        )
+        .unwrap()
+        .unwrap();
+        let other_cmd_ref = other_cmd
+            .as_object()
+            .expect("command() must return an Optional even when empty");
+        assert_eq!(
+            shared.mem.heap.get_field(other_cmd_ref, 0),
+            Value::Object(None),
+            "command() must be empty for an Info that describes another process"
+        );
     }
 
     #[test]

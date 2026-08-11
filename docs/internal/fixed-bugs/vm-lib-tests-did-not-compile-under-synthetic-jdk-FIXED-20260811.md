@@ -92,6 +92,26 @@ under them any more.
   `jdk-only-dead-sweep.py`, and `registry_contracts.rs` for the registrations
   that must survive.
 
+## A seventh, found by merging dev again
+
+Merging current dev before landing turned up one more of the same kind:
+`process_handle_info_stubs_p60`, red because `ProcessHandle.Info.command()`
+grew a **pid gate** — it answers `current_exe()` only when the `Info` describes
+THIS process, and `Optional.empty()` otherwise, because `current_exe()` is a
+measurement of exactly one process and reporting it for any other pid was a
+fabricated command line dressed as a measurement.
+
+The fixture left the handle's pid slot unset, so it read 0 — "some other
+process" — and still expected the executable. It was asserting exactly the
+behaviour the gate exists to remove. Fixed by describing this VM (pid slot =
+`std::process::id()`), and extended with the other side of the gate: a handle
+for a different pid must come back empty. **Red proved** on that new arm too —
+setting the second handle's pid to our own fails it.
+
+That this appeared on a routine dev merge is the point of the whole record: for
+as long as the module does not compile, every change to a native it covers lands
+unmeasured, and the count of stale fixtures only grows.
+
 ## The residual this leaves
 
 In `--features synthetic-jdk` builds there is now no source for
@@ -110,7 +130,13 @@ two tests could be saved while these four could not.
 |---|---|
 | `-p cratonvm-vm --lib --features synthetic-jdk` | 4,001 passed, 0 failed, 118 ignored |
 | `-p cratonvm-vm --lib` (default) | 2,487 passed, 0 failed |
-| `-p cratonvm-jit --lib` | pass |
-| `-p cratonvm-vm --test tier1_tests --features synthetic-jdk` | pass |
+| `-p cratonvm-jit --lib` | 1,985 passed, 0 failed |
+| `-p cratonvm-vm --test tier1_tests --features synthetic-jdk` | 58 passed |
 | extended interpreter corpus, `--features synthetic-jdk` | 924 passed |
-| mutation: new test's second arm flipped to `false` | FAILS, as intended |
+| all of the above again after merging dev | unchanged |
+| mutation: `jdk_only` test's second arm flipped to `false` | FAILS, as intended |
+| mutation: `command()` test's second handle given our own pid | FAILS, as intended |
+
+Both mutations matter more than the greens: this module's whole failure mode is
+assertions nobody has run, and a green that cannot go red is the same thing
+again.
