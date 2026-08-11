@@ -3818,47 +3818,75 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 /// The 64M cap is a runaway guard; a well-behaved iterator terminates long
 /// before it.
 ///
-/// # This signature launders a `--jdk-only` refusal into a wrong answer
+/// # Why this returns a `Result` and not a bare `Vec`
 ///
-/// `-> Vec<Value>` has no error channel, so both `match` arms below map *every*
-/// failure of `iterator()` / `hasNext()` / `next()` to "no more elements". For
-/// a foreign collection that genuinely cannot be walked that is the intended
-/// best effort. For a strict-mode policy refusal it is not: measured
-/// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9,
+/// It used to be `-> Vec<Value>`, and both `match` arms mapped *every* failure
+/// of `iterator()` / `hasNext()` / `next()` to "no more elements". Measured
+/// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9:
 ///
 ///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
 ///
-/// answers `true` on HotSpot and in `Compatible`, and **`false`** under
+/// answered `true` on HotSpot and in `Compatible`, and **`false`** under
 /// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
-/// java/util/LinkedList$Itr` raised by the `invoke_virtual` below arrives here
-/// as `Vec::new()` and `native_al_equals` then compares 3 elements against 0.
+/// java/util/LinkedList$Itr` raised by the `invoke_virtual` below arrived here
+/// as `Vec::new()` and `native_al_equals` then compared 3 elements against 0.
 ///
 /// A refusal that reaches a caller with nowhere to put it stops being a
 /// refusal, which is the one failure mode contract §5 cannot tolerate: the
 /// census still records the violation, so the run looks *measured* while the
-/// program is handed a wrong answer. Not fixed here — every caller of this
-/// helper would need an error channel, and this branch cannot rebuild to
-/// verify one — but recorded at the source rather than only in the record, so
-/// the next reader of a "strict says false, Compatible says true" report finds
-/// the mechanism instead of re-deriving it. Reasoned in
+/// program is handed a wrong answer. And an empty collection is the failure
+/// mode that reads as a pass everywhere a caller only iterates — the same
+/// shape that let four `TreeMap` navigable views answer `{}` for months
+/// (docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md).
+/// Reasoned in
 /// docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
-fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+/// and docs/known-issues/jdk-only/W7-20-refusal-laundered-into-wrong-answer.md
+///
+/// The discrimination line, which is the whole of the fix and applies to every
+/// helper in this family:
+///
+/// * `Err(..)` — the call was *refused* or threw. Propagate. This is a policy
+///   `NoClassDefFoundError` under `--jdk-only`, and in `Compatible` it is an
+///   exception the receiver's own `iterator()`/`next()` raised, which HotSpot
+///   also propagates out of `AbstractList.equals` rather than truncating.
+/// * `Ok(..)` with nothing usable — a null iterator, a void return, a
+///   primitive. The call did not fail; it gave us nothing to walk. That is the
+///   documented best effort for a foreign collection whose layout we cannot
+///   model, and it is unchanged.
+fn collection_elements_generic(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let pin_base = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(pin_base, this);
     let iter = match ctx.invoke_virtual(this_cur, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
-        _ => {
+        Err(e) => {
             ctx.unpin_native_roots(pin_base);
-            return Vec::new();
+            return Err(e);
+        }
+        Ok(_) => {
+            ctx.unpin_native_roots(pin_base);
+            return Ok(Vec::new());
         }
     };
     let iter_pin = ctx.pin_native_root(iter);
     let mut out: Vec<(Value, Option<(usize, ObjectRef)>)> = Vec::new();
+    // Set when the walk was cut short by a *failure* rather than by the
+    // iterator reporting done. Held in a local instead of returning early so
+    // the pin unwind below stays one strictly-LIFO path — an early `return`
+    // past the per-element handles is the PIN-DANGLING shape this file's
+    // `chm_extra_entries` history already paid for once.
+    let mut failed: Option<MethodCallFailed> = None;
     const MAX_ELEMENTS: usize = 64 * 1024 * 1024;
     while out.len() < MAX_ELEMENTS {
         let iter_cur = ctx.read_native_pin(iter_pin, iter);
         match ctx.invoke_virtual(iter_cur, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
             _ => break,
         }
         let iter_cur = ctx.read_native_pin(iter_pin, iter);
@@ -3869,6 +3897,10 @@ fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
                     _ => None,
                 };
                 out.push((v, pin));
+            }
+            Err(e) => {
+                failed = Some(e);
+                break;
             }
             _ => break,
         }
@@ -3889,7 +3921,12 @@ fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
     }
     ctx.unpin_native_roots(iter_pin);
     ctx.unpin_native_roots(pin_base);
-    refreshed
+    match failed {
+        // The partial `refreshed` is dropped on purpose: a caller that got a
+        // prefix would be right back to comparing 3 elements against 0.
+        Some(e) => Err(e),
+        None => Ok(refreshed),
+    }
 }
 
 #[inline]
@@ -5083,19 +5120,31 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// via virtual dispatch. ONLY safe to call from paths the `iterator()` native
 /// does not itself route through (e.g. `toArray()`), since the iterator native
 /// snapshots non-list collections through `collect_collection_elements`.
-fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+///
+/// Fallible for the reason spelled out on [`collection_elements_generic`]: an
+/// `Err` from any of the three calls below is a refusal or a thrown exception,
+/// and returning `Vec::new()` for it hands the caller a wrong answer that
+/// every caller-that-only-iterates reads as a pass. `Ok` with nothing usable
+/// still means "nothing to walk" and still yields an empty `Vec`.
+fn collect_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let it = match ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
-        _ => return Vec::new(),
+        Err(e) => return Err(e),
+        Ok(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
     loop {
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => return Err(e),
             _ => break,
         }
         match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => out.push(v),
+            Err(e) => return Err(e),
             _ => break,
         }
         // Safety bound against a misbehaving iterator that never reports done.
@@ -5103,7 +5152,7 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Recursion-safe wrapper around [`collect_via_real_iterator`].
@@ -5112,16 +5161,23 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
 /// collection native that itself wants a fallback snapshot. One level is all
 /// any caller needs, so a re-entrant request yields an empty Vec (and the
 /// caller keeps whatever it already had) instead of recursing.
-fn collect_via_real_iterator_once(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+fn collect_via_real_iterator_once(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     use std::cell::Cell;
     thread_local! {
         static IN_REAL_ITER: Cell<bool> = const { Cell::new(false) };
     }
     if IN_REAL_ITER.with(Cell::get) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     IN_REAL_ITER.with(|g| g.set(true));
     let out = collect_via_real_iterator(ctx, coll);
+    // Cleared on the failing path too. `out` is now a `Result`, and an early
+    // `?` here would leave the guard latched for the rest of the thread's
+    // life — every later fallback walk on this thread would answer empty,
+    // which is the exact laundering this change exists to remove.
     IN_REAL_ITER.with(|g| g.set(false));
     out
 }
@@ -5205,29 +5261,52 @@ fn heuristic_snapshot_is_suspect(
 fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
     // GC-safety: every step below can run arbitrary Java (`invoke_virtual`),
     // which may complete a moving young collection and leave `this` stale.
+    //
+    // Split so the pin is released on the failing path as well. The body has
+    // always had a `?` in it (`collect_collection_elements`) and now has three
+    // more, and an early return past `unpin_native_roots` leaks a root for the
+    // rest of the run — the object is then immortal, and a later
+    // `unpin_native_roots` taken at a *lower* base silently truncates it away.
     let this_pin = ctx.pin_native_root(this);
+    let out = al_or_collection_elements_pinned(ctx, this, this_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+fn al_or_collection_elements_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
     if !elems.is_empty() {
         if heuristic_snapshot_is_suspect(ctx, this, &elems) {
             let this = ctx.read_native_pin(this_pin, this);
-            let real = collect_via_real_iterator_once(ctx, this);
+            // The `?` matters here even though we already hold `elems`:
+            // `heuristic_snapshot_is_suspect` has just said the snapshot in
+            // hand must NOT be trusted (null holes in a non-`List`), so
+            // swallowing a refusal from the real walk would return the
+            // untrusted answer as if it were the checked one.
+            let real = collect_via_real_iterator_once(ctx, this)?;
             if !real.is_empty() {
                 elems = real;
             }
         }
-        ctx.unpin_native_roots(this_pin);
         return Ok(elems);
     }
+    // A refused `size()` is not "size 0". Answering 0 here skips the walk and
+    // returns the empty heuristic snapshot, which is the wrong answer this
+    // whole family launders.
     let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
+        Err(e) => return Err(e),
         _ => 0,
     };
     let this = ctx.read_native_pin(this_pin, this);
     if real_size > 0 {
-        elems = collect_via_real_iterator(ctx, this);
+        elems = collect_via_real_iterator(ctx, this)?;
     }
-    ctx.unpin_native_roots(this_pin);
     Ok(elems)
 }
 
@@ -6335,9 +6414,23 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         if !al_eq_operand_is_list(ctx, other) || !al_eq_operand_is_list(ctx, this) {
             return Ok(Some(Value::Int(0)));
         }
-        let ea = collection_elements_generic(ctx, this);
+        // Nothing of ours is pinned yet, so a refusal on the first operand can
+        // propagate with a bare `?`.
+        let ea = collection_elements_generic(ctx, this)?;
         let (ea_pin, ea_handles) = pin_value_slice(ctx, &ea);
-        let eb = collection_elements_generic(ctx, other);
+        // The second operand is where `arrayList.equals(linkedList)` refuses
+        // under `--jdk-only`, and by now `ea`'s elements are pinned — so this
+        // one has to unwind before it propagates. `?` here would leak
+        // `ea_pin`'s roots for the rest of the run.
+        let eb = match collection_elements_generic(ctx, other) {
+            Ok(eb) => eb,
+            Err(e) => {
+                if ea_pin != usize::MAX {
+                    ctx.unpin_native_roots(ea_pin);
+                }
+                return Err(e);
+            }
+        };
         let (eb_pin, eb_handles) = pin_value_slice(ctx, &eb);
         let pin_base = if ea_pin == usize::MAX { eb_pin } else { ea_pin };
         let equal: Result<bool, MethodCallFailed> = (|| {
@@ -35067,15 +35160,24 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
             // caller of this helper (addAll / removeAll / retainAll /
             // containsAll / hashCode / copy ctors) is off the iterator
             // native's path, so driving the real `iterator()` is safe.
-            let real = collect_via_real_iterator_once(ctx, coll);
+            // See `al_or_collection_elements_pinned`: the snapshot in hand has
+            // just been declared untrustworthy, so a refused re-derivation
+            // must not be answered with it.
+            let real = collect_via_real_iterator_once(ctx, coll)?;
             if !real.is_empty() {
                 return Ok(real);
             }
         }
         return Ok(elems);
     }
+    // A refused `size()`/`toArray()` is not an empty collection. Both used to
+    // fall through to the (empty) `elems`, so every copy constructor, `addAll`,
+    // `removeAll`, `retainAll` and `containsAll` over a strict-refused argument
+    // silently saw zero elements — `addAll` in particular then reports `false`
+    // ("collection unchanged"), which reads as an ordinary no-op.
     let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
+        Err(e) => return Err(e),
         _ => 0,
     };
     if real_size <= 0 {
@@ -35083,6 +35185,7 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
     }
     let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
+        Err(e) => return Err(e),
         _ => return Ok(elems),
     };
     let len = ctx.array_length(arr);
