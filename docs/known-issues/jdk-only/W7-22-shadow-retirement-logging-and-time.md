@@ -1,0 +1,499 @@
+# W7-22 — the next shadow-retirement increment: logging and date/time
+
+**Status:** OPEN. 36 shadow rows resolved out of 36 owned; **7 retirable
+(patch below, not applied), 29 blocked**. Two live defects found on the way,
+one of them a regression in the retirement this lane was told to follow.
+
+**What a shadow is.** A `Bridge` native registered on a method whose real class
+has perfectly good bytecode. It runs *instead* of that bytecode, so the VM's
+answer is only as good as the native — and the real object's state may never be
+populated, which is how a family ends up right in the members with natives and
+wrong in the members without. Contract §1.4. The population is the ratchet
+`bridge_shadows_bytecode`, frozen at **6,066** in
+`scripts/baselines/jdk-only-bridge-ratchet.json`.
+
+**Scope.** The four files this lane owns: `native-builtins/src/logmanager.rs`,
+`native-builtins/src/logging_shims.rs`, `native-builtins/src/util_time.rs`,
+`native-builtins/src/date_format_fast.rs`. Precedent:
+`java/util/logging/`'s 84 triples, retired 2026-08-11 through
+`native-api/src/retired_shadow.rs` — see the retired
+`bridge-reclassification-wave` write-up.
+
+---
+
+## 0. How the population was sized — and why not by grep
+
+Not from an `rg` count; the README records grep-derived sizes here as wrong by
+up to an order of magnitude, always the same direction. Taken instead from a
+census the way `regression-suite/bridge-ratchet.sh` takes it — one boot,
+`--real-jdk --explain-jdk-only --dump-native-registry`, against
+`Eclipse Adoptium jdk-25.0.3.9-hotspot`, with a one-line probe on its own
+classpath. Binary: `target/release/cratonvm.exe` built 2026-08-11 19:41
+(it predates several of the day's dev merges; every claim below says which
+binary produced it).
+
+A row is a shadow when `image_declaring_method` says the image has the class
+and the target carries `Code` — declared, or inherited with
+`inherited_has_code`. That is the gate's own predicate, re-implemented against
+the same census file.
+
+| file | rows registered | of which `Bridge` shadows |
+|---|---|---|
+| `logging_shims.rs` | 103 | **36** |
+| `logmanager.rs` | 101 | **0** |
+| `util_time.rs` | 0 | 0 |
+| `date_format_fast.rs` | 1 (`Intrinsic`) | 0 |
+
+Windows total for the whole census: 6,079 shadow rows against the frozen
+Linux 6,066 — a +13 platform difference, not a drift, and it is why nothing
+below re-seeds a baseline.
+
+Three of the four files hold **no** shadow rows, and each for a different
+reason worth writing down:
+
+* **`util_time.rs` is `#[cfg(feature = "synthetic-jdk")]`** (`lib.rs`, the
+  `pub mod util_time;` line) and its three registrars are called only from
+  `register_builtins`, the synthetic arm. It is not compiled into the shipped
+  `cratonvm-cli` build at all, so it registers nothing in either JDK mode and
+  **cannot move any of the three ratchets** — all of which take their census in
+  Compatible mode. Its module doc already states the intended disposition
+  ("a fallback, not a parallel implementation"). Retiring shadows there is not
+  this campaign's work; deleting the module when T2.5.15 closes is.
+* **`date_format_fast.rs` registers one `Intrinsic`**, not a `Bridge`:
+  `java/text/DateFormat.format(Ljava/util/Date;)Ljava/lang/String;`. It is a
+  performance intrinsic that cross-checks itself against the real bytecode once
+  per output shape and *returns the bytecode answer* on any disagreement, so it
+  is not a §1.4 shadow in the sense that matters — it cannot give an answer the
+  bytecode would not. See §5.
+* **`logmanager.rs`'s `java/util/logging/` rows are already retired** — the
+  census shows them `synthetic-stub` with `kind_stated: true`, which is
+  `retired_shadow.rs` doing its work. Its remaining 55 `Bridge` rows are on
+  `org/jboss/logging/*` and `org/jboss/logmanager/*`, classes no supported
+  image declares, so they are `class_absent` rows and not shadows. See §4 —
+  the retirement is live and it is **broken**.
+
+---
+
+## 1. The instrument under-reports, and this is the first thing to fix
+
+`CRATONVM_ENFORCE_NATIVE_SHADOW` is the dial the precedent was measured with.
+**It yields at most once per triple, and then hands every later dispatch back
+to the native.** Measured, `--jdk-only`, `CRATONVM_ENFORCE_NATIVE_SHADOW=java/io/PrintStream`:
+
+```java
+System.out.println("one"); System.out.println("two"); System.out.println("three");
+for (int i = 0; i < 3; i++) System.out.println("loop" + i);
+System.out.print("printA"); System.out.print("printB"); System.out.println();
+```
+
+```text
+dial OFF   one two three loop0 loop1 loop2 printAprintB\n
+dial ON        two three loop0 loop1 loop2       printB          <- no trailing newline
+```
+
+`"one"` is lost and `"two"`/`"three"` are not, at three different bytecode
+indices, so this is per-TRIPLE and not per-call-site. `printA` is lost and
+`printB` is not — the same shape on a second triple. `println()V` has exactly
+one dispatch in the program, so it is lost outright, which is why the trailing
+newline is missing. Identical under `--nojit`, so the JIT is not the mechanism.
+
+Source-verified cause: **exactly one dispatch site in the VM consults the
+dial.** `grep -rn jdk_only_enforce_shadow vm/src` finds one live reader,
+`resolve_step1_native` in `vm/src/runtime/interpreter/native_override.rs`.
+Every other path takes the native regardless — `resolve_native_for_dispatch`
+(`vm/src/runtime/interpreter.rs`) hard-codes `compat_native_wins = true` with
+a comment saying so, and `invoke_or_native` (`vm/src/vm/vm_exec.rs`) reaches
+the same answer for a `Bridge` on a concrete JDK method. This is
+`docs/architecture/natives-over-real-jdk-classes.md` §1 read from the other
+side: the chain that *reinstates* the native on warm, cached, reflective and
+JIT paths also reinstates it against the dial.
+
+**Why that matters more than it sounds.** A retirement re-tags the kind at
+registration, and *every* path honours a `SyntheticStub` refusal. So the dial
+is a strictly weaker experiment than the retirement it licenses: it can read
+verdict-neutral on a workload the retirement then breaks. §4 is that exact
+case, live in the tree today. Add it to `W6-5`'s taxonomy of tests that read
+green while measuring nothing.
+
+**How to use it anyway, and how this lane did.** Since the yield lands on the
+*first* dispatch of each triple, a probe in which each triple's first use is
+the case under test gets one honest per-triple verdict per process. Every arm
+below is built that way, and the ones that could not be (a receiver whose
+constructor triple was already spent) are called out where they occur.
+
+---
+
+## 2. `java/io/PrintWriter` — 7 rows, RETIRABLE
+
+All seven `Bridge` rows `register_printstream_fallback_natives` puts on
+`java/io/PrintWriter`. Every one has real bytecode in the image
+(`image_declaring_method.declared && has_code`), and the receiver's state is
+real whichever constructor built it.
+
+| triple | real bytecode? | state real? | observable change | verdict |
+|---|---|---|---|---|
+| `<init>(Ljava/io/OutputStream;)V` | yes | yes | none | retire |
+| `write(Ljava/lang/String;)V` | yes | yes | none | retire |
+| `write(Ljava/lang/String;II)V` | yes | yes | none | retire |
+| `println(Ljava/lang/String;)V` | yes | yes | none | retire |
+| `println()V` | yes | yes | none | retire |
+| `println(I)V` | yes | yes | none | retire |
+| `println(Ljava/lang/Object;)V` | yes | yes | none | retire |
+
+**Why the state is real, and it is not luck.**
+`native_printwriter_init_outputstream` ends with an `invoke_special` chain into
+the real `PrintWriter(OutputStream, boolean)` — which is registered nowhere, so
+it always runs as bytecode and populates `lock`, `out`, `charOut` and `textOut`
+the way the JDK does. A `PrintWriter` over a `Writer` never enters a native at
+all (`PrintWriter(Writer)` is not registered). So both construction paths leave
+a receiver real bytecode can use, and that is what the arms show.
+
+**Measured**, `--jdk-only`, one binary, only the dial differing, verdicts
+written to a **file** because the console is part of what is under test:
+
+```text
+PwProbe — 7 triples over a ByteArrayOutputStream, then over a StringWriter,
+          then a PrintWriter wrapping System.out
+  HotSpot 25.0.3 control                            8/8 ok
+  strict, dial OFF                                  8/8 ok
+  strict, ENFORCE=java/io/PrintWriter               8/8 ok
+  strict, ENFORCE=java/io/PrintWriter,java/io/PrintStream   8/8 ok
+  "PW-OVER-SYSOUT" reached the console in all four arms
+
+PwNativeCtor — the <init> yield spent on a throwaway, so the receiver under
+               test is NATIVE-built while each method's yielded first dispatch
+               lands on it
+  HotSpot control / strict OFF / strict ENFORCE=java/io/PrintWriter   6/6 ok each
+```
+
+The second probe is the one that matters: it is the arm in which a native
+constructor and retired methods meet, and it is green. §3 shows what that arm
+looks like when the state is *not* real.
+
+`PrintWriter(System.out)` is the JUnit ConsoleLauncher shape and the reason
+this cannot be waved through on the OutputStream case alone: it chains real
+`BufferedWriter`/`OutputStreamWriter` bytecode down onto a `PrintStream`
+receiver whose state §3 shows is fabricated. It still works, because what it
+lands on is `PrintStream.write([BII)V`, which stays a native.
+
+### Out-of-file patch (not applied)
+
+`native-api/src/retired_shadow.rs` is the campaign's home for this decision and
+is not this lane's file. Two edits, both mechanical.
+
+1. Widen the prefix discriminator in `triple_is_retired_shadow`, which today
+   short-circuits on `java/util/logging/` alone:
+
+```rust
+pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    // Cheap discriminator: every entry is under one of these prefixes, and
+    // almost no registration is, so the common case costs one prefix compare.
+    // Keep this in sync with the table — a prefix missing here makes every
+    // entry under it answer `false`, which reads as "not retired" and is
+    // invisible. `every_entry_is_reachable_through_the_predicate` is the test
+    // that catches it.
+    if !(class_name.starts_with("java/util/logging/") || class_name.starts_with("java/io/Print")) {
+        return false;
+    }
+    RETIRED_SHADOW_TRIPLES
+        .binary_search(&(class_name, method_name, descriptor))
+        .is_ok()
+}
+```
+
+2. Insert these seven entries in sorted position (`java/io/…` sorts before
+   `java/util/…`, so they go at the head of the table). The table is
+   binary-searched and `the_table_is_sorted_and_unique` asserts the order.
+
+```rust
+    ("java/io/PrintWriter", "<init>", "(Ljava/io/OutputStream;)V"),
+    ("java/io/PrintWriter", "println", "()V"),
+    ("java/io/PrintWriter", "println", "(I)V"),
+    ("java/io/PrintWriter", "println", "(Ljava/lang/Object;)V"),
+    ("java/io/PrintWriter", "println", "(Ljava/lang/String;)V"),
+    ("java/io/PrintWriter", "write", "(Ljava/lang/String;)V"),
+    ("java/io/PrintWriter", "write", "(Ljava/lang/String;II)V"),
+```
+
+`the_table_is_not_empty`'s floor (`>= 80`) still holds; the count becomes 91.
+
+**Ratchet effect — arithmetic, not a measurement. Do not paste these numbers
+into the baselines.** Seven rows move `Bridge` → `SyntheticStub`, so
+`bridge_shadows_bytecode` 6,066 → **6,059** (down 7),
+`bridge_without_acc_native` 8,912 → **8,905** (down 7), and
+`BASELINE_SYNTHETIC_STUBS` (`native-builtins/tests/stub_ratchet.rs`, `SLACK = 0`)
+1,038 → **1,045** (up 7). Both baselines must be re-frozen from one real run on
+the platform they are keyed to — `sh regression-suite/bridge-ratchet.sh
+--update-baseline --note "…"`, which the script re-freezes as a pair on
+purpose. The frozen artefact is keyed `25/linux`; this lane measured on
+Windows and so is not entitled to seed it.
+
+`java/io/Print*` is a Compatible-mode-visible package, so unlike the
+`register_synthetic_overrides`-only registrars these rows *will* move the
+ratchet. A `SyntheticStub` registers and dispatches normally in `Compatible`
+mode, so `--real-jdk` behaviour is unchanged — but that is a property of the
+mechanism, not of this measurement, and §2's arms did not test Compatible.
+Take a Compatible arm of `PwProbe` before landing.
+
+---
+
+## 3. `java/io/PrintStream` — 29 rows, BLOCKED
+
+Same registrar, same file, opposite verdict, and the difference is entirely in
+the receiver.
+
+**The measurement, `--jdk-only`, `ENFORCE=java/io/PrintStream`:**
+
+| receiver | result |
+|---|---|
+| user-constructed, ctor yielded too | **26 of 26 triples ok** |
+| user-constructed by the NATIVE ctor | `close()` → `NullPointerException: Cannot invoke "java.io.BufferedWriter.close()" because "this.textOut" is null` |
+| the VM-minted `System.out` | **every output triple silently produces nothing**, exit 0 |
+
+One process per triple, the operation under test being that triple's first
+dispatch, console captured:
+
+```text
+selector       HotSpot      strict OFF   strict ON
+println(String)  [MARK]       [MARK]       []
+println(int)     [7]          [7]          []
+print(String)    [MARK]       [MARK]       []
+printf           [MARK7]      [MARK7]      []
+write([BII)      [MARK]       [MARK]       []
+append           [MARK]       [MARK]       []
+flush            []           []           []      (no-op either way)
+```
+
+**Why it is silent rather than loud**, and this is the part that makes it
+dangerous. `javap -c java.io.PrintStream` on the JDK 25 image:
+
+```text
+private void writeln(java.lang.String);
+     5: invokevirtual  ensureOpen:()V
+     9: getfield       textOut …
+   Exception table:
+       from  to  target type
+          0  61      74  Class java/io/IOException
+    74: astore_2  75: aload_0  76: iconst_1  77: putfield trouble:Z  80: return
+```
+
+`ensureOpen()` throws `IOException("Stream closed")` when `out == null`, and
+`writeln`'s own exception table catches `java/io/IOException` and sets
+`trouble = true`. **A retired `PrintStream` shadow over `System.out` does not
+fail — it discards.** Nothing in the corpus asserts on stdout's presence, so a
+suite would read green while the VM printed nothing.
+
+**What is not real, measured by reflection** (`--add-opens
+java.base/java.io=ALL-UNNAMED`, HotSpot as control):
+
+| `System.out` field | HotSpot | CratonVM `--jdk-only` |
+|---|---|---|
+| `FilterOutputStream.out` | `BufferedOutputStream` | **null** |
+| `PrintStream.charOut` | `OutputStreamWriter` | **null** |
+| `PrintStream.textOut` | `BufferedWriter` | **null** |
+| `FilterOutputStream.closeLock` | `Object` | **null** |
+| `PrintStream.charset` | `sun.nio.cs.MS1251` | instance of the **abstract** `java.nio.charset.Charset` |
+
+The registrar says so itself, in a comment that has been right the whole time:
+*"Our System.out/err are fd-backed synthetic PrintStreams (slot 0 = fd id);
+their inherited FilterOutputStream `out` field is never populated."* The
+natives were written **because** the state is fake. Retiring them without
+fixing that is the §1.4 order run backwards.
+
+The native constructor is the second half of the same story:
+`native_printstream_init_outputstream` writes `out` and `lock` and nothing
+else, so a receiver it built passes `ensureOpen()` and then NPEs on
+`textOut` — which is the `close()` row above, and is what a *partial*
+retirement of this class looks like. `PrintWriter`'s native constructor chains
+to real bytecode; `PrintStream`'s does not. That one difference is the whole
+verdict split between §2 and §3.
+
+### What must become real first — the blocked list
+
+Retiring the `java/io/PrintStream` rows needs all of these, and the first is
+the whole job:
+
+1. **`System.out` / `System.err` must be constructed, not fabricated.** They
+   need a real `OutputStream` over the process fd in `FilterOutputStream.out`,
+   a real `OutputStreamWriter` in `charOut`, a real `BufferedWriter` in
+   `textOut`, and a plain `Object` in `closeLock` — i.e. the receiver must come
+   out of `PrintStream(OutputStream, boolean, Charset)` rather than out of an
+   allocator. Everything else on this list is downstream of it.
+2. **`PrintStream.charset` must be a concrete `Charset`.** It is currently an
+   instance of the abstract `java.nio.charset.Charset`, which is one of the
+   five blocker families the retired
+   `jdk-only-step1-bytecode-available-RESOLVED-20260806.md` names; real
+   `writeln` reaches it through `charOut`.
+3. **`native_printstream_init_outputstream` must chain to a real constructor**
+   the way `native_printwriter_init_outputstream` already does, or be retired
+   in the same increment as the methods. Retiring the methods and keeping this
+   constructor reproduces the `close()` NPE above on every user-constructed
+   stream.
+4. `PrintStream.write(Ljava/lang/String;)V` is **package-private** in the JDK 25
+   image. It has `Code`, so the census counts it as a shadow and a retirement
+   would be legal, but no probe outside `java.io` can reach it; it must retire
+   with the family or not at all.
+5. `PrintStream.write(Ljava/lang/String;II)V` is **not declared by the image**
+   (`declared: false`) and is therefore *not* in the 29. It must be held back
+   by name, exactly as `retired_shadow.rs` holds back
+   `Logger.log(Level, Supplier, Throwable)`: retiring it replaces a working
+   native with a `NoSuchMethodError`, and the registrar's own comment records
+   that JUnit's ConsoleLauncher calls it.
+
+---
+
+## 4. Live defect: the `java/util/logging` retirement broke strict-mode JUL
+
+This is the precedent this lane was told to follow, and it is a regression.
+
+`Logger.getLogger("x")` — the first call any JUL user makes — throws under
+`--jdk-only`:
+
+```text
+java.lang.NullPointerException: Cannot invoke
+  "java.util.logging.LogManager$LoggerContext.demandLogger(String, String, java.lang.Module)"
+  because the return value of "java.util.logging.LogManager.getSystemContext()" is null
+    at java.util.logging.LogManager.demandSystemLogger(LogManager.java:498)
+    at java.util.logging.Logger.demandLogger(Logger.java:641)
+    at java.util.logging.Logger.getLogger(Logger.java:708)
+```
+
+**Causal A/B, one probe, four binaries, kind read from each binary's own
+census** (`--dump-native-registry`, row
+`java/util/logging/Logger.getLogger(Ljava/lang/String;)Ljava/util/logging/Logger;`):
+
+| binary | that row's kind | `JulProbe --jdk-only` |
+|---|---|---|
+| `CratonVM-a5old-20260811` (19:41-class, pre-retirement) | `bridge` | **16 of 17 ok** |
+| `CratonVM-cmid2-20260811` | `synthetic-stub`, `kind_stated` | NPE on the first call, 0 of 17 |
+| `CratonVM-dim4-20260810` | `synthetic-stub`, `kind_stated` | NPE, 0 of 17 |
+| `CratonVM-a5walk-20260811` | `synthetic-stub`, `kind_stated` | NPE, 0 of 17 |
+| `CratonVM/target/release` (this lane's census binary) | `synthetic-stub`, `kind_stated` | NPE, 0 of 17 |
+
+The split is exactly on the presence of the retirement, and HotSpot 25.0.3 is
+17 of 17. Compatible mode is unaffected (a `SyntheticStub` still dispatches
+there) — 16 of 17, the missing one being §4.1.
+
+**Why the acceptance measurement could not see it**, three reasons and all
+three are reusable:
+
+* **No corpus vector calls `Logger.getLogger`.** The 23/4 that licensed the
+  retirement is a vector-level verdict, and JUL owns no vector.
+* **The dial yields once per triple (§1).** Even a vector that called
+  `getLogger` twice would have taken the native the second time, so the
+  workload the dial measured is not the workload the retirement produces.
+* **The dial and the retirement are not the same experiment.** One dispatch
+  path honours the dial; every path honours the re-tag.
+
+**What must become real first.** `LogManager`'s singleton is allocated, never
+constructed. `allocate_log_manager` (`logmanager.rs`) calls
+`try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)` and writes
+four slots by index; `<init>` never runs. Measured against HotSpot with
+`--add-opens java.logging/java.util.logging=ALL-UNNAMED`, on the singleton
+`LogManager.getLogManager()` returns:
+
+| field | HotSpot | CratonVM (both modes, both binaries) |
+|---|---|---|
+| `props` | `Properties` | **null** |
+| `systemContext` | `LogManager$SystemLoggerContext` | **null** |
+| `userContext` | `LogManager$LoggerContext` | **null** |
+| `rootLogger` | `LogManager$RootLogger` | **null** |
+| `configurationLock` | `ReentrantLock` | **null** |
+| `closeOnResetLoggers` | `CopyOnWriteArrayList` | **null** |
+| `listeners` | `Collections$SynchronizedMap` | **null** |
+| `loggerRefQueue` | `ReferenceQueue` | **null** |
+
+`allocate_log_manager`'s own comment argues the nulls are safe — *"most
+Quarkus/JBoss code reads it via accessors we no-op, so null is safe"* — and
+that was true right up until the retirement stopped no-opping the accessors.
+Until `LogManager` is built by its real constructor, `Logger.getLogger`,
+`Logger.getGlobal`, `LogManager.getProperty`, `readConfiguration` and
+`reset` cannot run as bytecode.
+
+**Two dispositions, and the choice is the orchestrator's, not this lane's.**
+
+* **Hold back the four triples that dereference `systemContext`/`rootLogger`**
+  — `Logger.getLogger(String)`, `Logger.getLogger(String,String)`,
+  `LogManager.getLogManager()`, `LogManager.<init>()V` — from
+  `RETIRED_SHADOW_TRIPLES`, the same way `Logger.log(Level,Supplier,Throwable)`
+  is held back. Cheap, reversible, and restores 16 of 17 today.
+* **Or build the singleton for real**, which is the §1.4-correct answer and is
+  the same shape of work item as §3's list.
+
+Either way `probes/` needs a JUL vector: the probe this lane used is
+17 assertions over `Logger`/`Level`/`LogManager`/`LogRecord` with a `Handler`
+of its own, so it observes records without depending on the console, and it
+separates HotSpot from both CratonVM modes. Its absence is why this shipped.
+
+### 4.1 `Logger.log(Level, Supplier)` drops the record — Compatible mode, pre-existing
+
+Independent of the retirement, and visible on every binary tested including the
+pre-retirement one:
+
+```text
+HotSpot            [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L, INFO:P{0}, INFO:T, INFO:sup]
+CratonVM compat    [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L, INFO:P{0}, INFO:T]
+```
+
+`native_jul_logger_log_supplier` (`logmanager.rs`) resolves the supplier and
+calls `crate::emit_framework_log` — the console sink — and never fans the
+record out to the logger's installed `Handler`s. Its sibling
+`native_jul_logger_log_record`, twenty lines below, does exactly that fan-out
+and says why in its own comment. So an application `Handler` sees seven of
+eight `log` overloads: right in the members with one implementation, wrong in
+the members with the other. Not fixed here — the fix is a Compatible-mode
+behaviour change and this lane's mandate is that Compatible stays
+byte-for-byte unchanged.
+
+---
+
+## 5. `date_format_fast.rs` — one `Intrinsic`, deliberately not a shadow
+
+`java/text/DateFormat.format(Ljava/util/Date;)Ljava/lang/String;` is a native
+in front of real bytecode, and it is not a §1.4 shadow in the sense the ratchet
+counts: it is registered `NativeKind::Intrinsic`, which §1 exempts from the
+strict yield, and it is the only kind that *cannot* give an answer the bytecode
+would not. Every unsupported receiver, calendar, cutover, `zeroDigit` and
+pattern letter falls through to `format(Date, StringBuffer, FieldPosition)` as
+bytecode, and every supported one is cross-checked against that bytecode once
+per output shape, with a mismatch returning the bytecode answer and poisoning
+the fast path permanently. Retiring it buys nothing and costs the 557x it was
+written to close (`org.apache.juli.TestOneLineFormatterPerformance` is a ratio
+test). **Verdict: keep, and it should stay out of any future shadow census as
+an `Intrinsic` rather than be re-argued each wave.**
+
+---
+
+## 6. What is proven and what is not
+
+**Proven by running the existing binary** (`target/release/cratonvm.exe`,
+2026-08-11 19:41, JDK 25.0.3+9, HotSpot control on every arm):
+
+* the census row counts in §0, and that three of the four files hold no
+  shadow rows;
+* the dial's once-per-triple behaviour (§1), reproduced on two triples and
+  under `--nojit`;
+* every `PrintWriter` arm in §2 and every `PrintStream` arm in §3;
+* the JUL regression in §4, with a pre-retirement binary as the control and
+  each binary's own census as the discriminator;
+* the `log(Level, Supplier)` drop in §4.1.
+
+**Not proven, and not claimed.** Nothing was rebuilt. The §2 patch has not been
+compiled, applied or run; "retirable" there means *every arm that can be run
+without a rebuild is verdict-neutral*, not *the retirement was executed*. The
+ratchet deltas are arithmetic. The Compatible-mode arm of `PwProbe` was not
+taken. The strict corpus was not re-run on this branch — the binary is not this
+branch's, and running `regression-suite/run.sh` against a foreign binary would
+attribute its results to source it was not built from.
+
+## 7. Adjacent, not this lane's files
+
+* `native-api/src/retired_shadow.rs` — §2's patch, and §4's hold-back.
+* `native-builtins/tests/stub_ratchet.rs` — `BASELINE_SYNTHETIC_STUBS`, re-freeze
+  from a real run.
+* `scripts/baselines/jdk-only-bridge-ratchet.json` — same, as a pair, on linux.
+* `probes/` — the JUL vector §4 says is missing.
+* `vm/src/runtime/interpreter/native_override.rs` and
+  `vm/src/runtime/interpreter.rs` — if the dial is ever to mean what its
+  documentation says, the second path has to consult it too. Today it does not,
+  and §1 is the cost.
