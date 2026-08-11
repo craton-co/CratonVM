@@ -3,9 +3,13 @@
 > **RESOLVED 2026-08-11 — this doc is retired.** All nine classes now pass on
 > Azure Linux under the default collector at `--Xmx 1500m`, with
 > found/ok/failed/aborted/skipped counts **byte-identical to real HotSpot** on
-> every one. Four separate defects were behind them; none was the
+> every one. Five separate defects were behind them; none was the
 > "G1-TLAB-adjacent / ANTLR native-root" family this doc guessed at, and the
-> `JarVisitorTest` CRASH was not a VM bug at all.
+> `JarVisitorTest` CRASH was not a VM bug at all. Defect 5 was found on a
+> second pass, after this banner's first version had already written the
+> remaining `DefaultCatalogAndSchemaTest` gap off as "a general throughput
+> gap" — see it for why that call was wrong and what would have caught it
+> sooner.
 >
 > ## What each one turned out to be
 >
@@ -79,6 +83,42 @@
 > asked for. **rc=0 with no result line is a parse failure far more often than a
 > VM failure.**
 >
+> **5. `DefaultCatalogAndSchemaTest`'s remaining 43x — the arena span tier was
+> an unbounded first-fit scan.** Filed below as "a general throughput gap, no
+> single remaining hotspot"; that was wrong, and the way it was wrong is worth
+> keeping. The class was profiled AFTER the four fixes above and the profile
+> looked flat — nothing over 3.5% — which is what "general gap" was read off.
+> But the flat profile was the JIT-ON arm, and the decisive lever had not been
+> pulled: **`--nojit` was 3.8x FASTER than JIT-on** (9.95 vs 2.61 progress
+> lines per CPU-second). Profiling the `--nojit` arm instead put **79% of CPU
+> in `Arena::alloc`**, and `perf annotate` put 47% of the whole process on one
+> source line — the first line of `large_fit`'s loop body.
+>
+> `Arena::free_large` was a `Vec<FreeBlock>` scanned first-fit, justified in
+> its own doc comment by "this tier stays short (the post-sweep coalescer
+> merges adjacent holes into a handful of spans)". False whenever holes are
+> walled by live data: the coalescer merges what is ADJACENT, and one survivor
+> between two holes keeps them apart however often it runs. `max_free_upper`'s
+> O(1) fail-fast does not save it either, because `add_free_block` raises that
+> bound again on every block the sweep reclaims. Keyed by size
+> (`BTreeMap<usize, Vec<FreeBlock>>`) the query is `range(need..).next()`:
+> O(log n) hit, O(log n) *authoritative* miss, no scan — and best fit rather
+> than first fit, so a 5 KiB request stops eating a 1 MiB span.
+>
+> Sequential, same box, same heap, 132/132 both sides: **HotSpot 30s,
+> CratonVM 516s** — down from ~2300s, a 4.5x improvement, and JIT-on is faster
+> than `--nojit` again. Guards:
+> `span_tier_serves_best_fit_and_keeps_its_accounting_exact` (verified red),
+> `span_tier_handles_duplicate_sizes_and_the_alignment_window`, and
+> `a_hopeless_request_against_a_huge_span_tier_is_not_a_scan` — the last
+> written so the old code fails it by TIMING OUT, because a plain assertion
+> cannot catch "returns the right answer, just not this decade".
+>
+> The lesson, since it cost a round trip: **a flat profile is not evidence of a
+> general gap until the `--nojit` arm has been profiled too.** With JIT on, the
+> cost was spread across compiled code and every runtime helper; with it off,
+> the single dominant term stood out immediately.
+>
 > ## Verified state (Azure Linux, default collector, `--Xmx 1500m`)
 >
 > | Class | CratonVM now | Real HotSpot |
@@ -88,22 +128,27 @@
 > | `query.hql.StandardFunctionTests` | found=44 ok=44 failed=0, 41s | found=44 ok=44 failed=0 |
 > | `type.temporal.InstantTests` | found=204 ok=112 failed=0 aborted=92, 52s | found=204 ok=112 failed=0 aborted=92, 6.7s |
 > | `sql.exec.SmokeTests` | found=17 ok=16 failed=0 skipped=1, 322s | found=17 ok=16 failed=0 skipped=1, 10s |
-> | `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` | found=132 ok=132 failed=0, 2333s | found=132 ok=132 failed=0, 24s |
+> | `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` | found=132 ok=132 failed=0, 516s | found=132 ok=132 failed=0, 30s |
 > | `hql.ASTParserLoadingTest` | found=106 ok=104 failed=0 skipped=2, 100s | found=106 ok=104 failed=0 skipped=2 |
 > | `bootstrap.scanning.JarVisitorTest` | found=9 ok=9 failed=0, 11s | found=9 ok=9 failed=0, 1.9s |
 > | `hql.HQLTest` | found=169 ok=168 failed=0 skipped=1, 38s | found=169 ok=168 failed=0 skipped=1 |
 >
 > ## What is NOT claimed
 >
-> Three of these are still far slower than HotSpot (`SmokeTests` 322s vs 10s,
-> `ZonedDateTimeTest` 381s vs 17s, `DefaultCatalogAndSchemaTest` 2333s vs 24s)
-> and after the `is_heap_addr` fix the profile is flat — no single remaining
-> hotspot, i.e. a general throughput gap rather than another defect of this
-> shape. All three exceed the suite's flat 300s per-class cap, so
+> Three of these are still far slower than HotSpot — `SmokeTests` 328s vs 10s,
+> `ZonedDateTimeTest` 375s vs 17s, `DefaultCatalogAndSchemaTest` 516s vs 30s.
+> All three exceed the suite's flat 300s per-class cap, so
 > `class-overrides.tsv` carries a documented timeout FLOOR for each (900s /
 > 900s / 3600s); without it a full-suite run reports them HANG again for a
 > reason that has nothing to do with correctness. `SmokeTests`'s entry is new
 > with this fix.
+>
+> What remains at the top of `DefaultCatalogAndSchemaTest`'s post-fix profile is
+> the per-native-call conservative root snapshot — `scan_one_frame` +
+> `ZObjectStarts::contains` + `is_object_address` + `native_stack_has_jit_frame`
+> together ~9%, spread over deep reflective Hibernate stacks. That is a known
+> shape with its own history (the incremental-band memo in
+> `vm/src/jit/conservative_roots.rs`) and is NOT investigated here.
 >
 > The historical investigation below is preserved as written. Note that its
 > cross-reference section guessed wrong on three of the four causes: this is not

@@ -61,6 +61,35 @@ fn io_error(message: impl Into<String>) -> MethodCallFailed {
     }))
 }
 
+/// The leading byte `native-builtins` uses to mark a virtual-filesystem path (a
+/// jar or runtime-image entry). It is `\u{1}`, which no real path can contain.
+///
+/// Duplicated here rather than imported because `native-builtins` depends on
+/// this crate and not the other way round; `phases_late::nio_file` static-asserts
+/// that the two agree, so a change on either side becomes a compile error rather
+/// than a silent divergence.
+pub const VFS_SENTINEL: char = '\u{1}';
+
+/// Render a VM-internal path the way the platform's `Path.toString()` does,
+/// for embedding in a `java.nio.file` exception.
+///
+/// CratonVM stores paths in one internal form that uses `/` everywhere. On
+/// Windows that leaked into every nio exception — `C:/Users/…` where HotSpot
+/// says `C:\Users\…` — even though `Path.toString()` itself was already right.
+/// A virtual-filesystem path is exempt: archive entries are `/`-separated on
+/// every platform, as the JDK's own zipfs and jrtfs report them.
+///
+/// On Unix this is the identity function and costs nothing.
+pub fn exception_path(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if path.contains('/') && !path.starts_with(VFS_SENTINEL) {
+            return std::borrow::Cow::Owned(path.replace('/', "\\"));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Build a REAL `java/nio/file/FileAlreadyExistsException` naming `path`.
 ///
 /// Every file-creating `java.nio.file` entry point (`Files.copy`, `Files.move`,
@@ -100,7 +129,7 @@ pub fn file_already_exists(ctx: &mut dyn NativeContext, path: &str) -> MethodCal
         ctx.new_object("java/nio/file/FileAlreadyExistsException")
     {
         let pin = ctx.pin_native_root(exc);
-        let file_str = ctx.create_string(path);
+        let file_str = ctx.create_string(exception_path(path).as_ref());
         let exc_cur = ctx.read_native_pin(pin, exc);
         let _ = ctx.invoke(
             "java/nio/file/FileAlreadyExistsException",
