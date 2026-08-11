@@ -444,6 +444,51 @@ fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
     Some((params, desc[i + 1..].to_string()))
 }
 
+/// The heap array kind an array whose COMPONENT descriptor is `comp` must have.
+///
+/// Anything that is not one of the eight primitive tokens — including `[…` and
+/// `L…;` — is a reference array, which is also the safe default for a token
+/// this function does not recognise.
+fn array_element_type_of_descriptor(comp: &str) -> cratonvm_types::ArrayElementType {
+    use cratonvm_types::ArrayElementType as A;
+    match comp {
+        DESC_BOOLEAN => A::Boolean,
+        DESC_BYTE => A::Byte,
+        DESC_CHAR => A::Char,
+        DESC_SHORT => A::Short,
+        DESC_INT => A::Int,
+        DESC_LONG => A::Long,
+        DESC_FLOAT => A::Float,
+        DESC_DOUBLE => A::Double,
+        _ => A::Reference,
+    }
+}
+
+/// Apply JLS 5.3 method-invocation widening to one argument that is about to be
+/// stored into a primitive array slot whose component descriptor is `comp`.
+///
+/// This exists because CratonVM's `MethodHandle.asType` is a passthrough shim.
+/// On HotSpot the widening a collector needs is done by the `asType` the
+/// combinator installs, so `asCollector(long[].class, 3).invoke(1, 2, 3)`
+/// reaches the target with three `long`s; here the raw `int`s arrive at the
+/// array store, and `write_prim_element`'s `Long` arm matches only
+/// `Value::Long` and writes 0 for anything else. Narrowing is deliberately NOT
+/// performed: `Z`/`B`/`C`/`S`/`I` all travel as `Value::Int` and
+/// `write_prim_element` already truncates on the store, and a `long` handed to
+/// an `int[]` collector is a type error the JDK refuses rather than silently
+/// truncates.
+fn widen_primitive_to_descriptor(v: Value, comp: &str) -> Value {
+    match (comp, v) {
+        (DESC_LONG, Value::Int(i)) => Value::Long(i as i64),
+        (DESC_FLOAT, Value::Int(i)) => Value::Float(i as f32),
+        (DESC_FLOAT, Value::Long(l)) => Value::Float(l as f32),
+        (DESC_DOUBLE, Value::Int(i)) => Value::Double(i as f64),
+        (DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64),
+        (DESC_DOUBLE, Value::Float(f)) => Value::Double(f as f64),
+        _ => v,
+    }
+}
+
 /// Read a MethodType object's effective JVM descriptor by converting its
 /// `ptypes` (Class[]) and `rtype` (Class) mirrors back to descriptor tokens.
 fn methodtype_to_descriptor(ctx: &mut dyn NativeContext, mt: ObjectRef) -> Option<String> {
@@ -6263,9 +6308,24 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = alloc_mh_carrier(ctx, "__mh_collect_wrapper__", 2);
+            // Slot 2 is the `arrayType` Class mirror, and it is the whole of
+            // W7-19's `asCollector` fix. Without it the `MH_KIND_COLLECT` arm
+            // has no way to learn the collector's ARRAY TYPE — the carrier
+            // held only (target, count) and the arm therefore gathered into an
+            // `Object[]` for every collector, so `sumAll(int[])
+            // .asCollector(int[].class, 3).invoke(1,2,3)` handed `sumAll` a
+            // reference array and answered 0 where HotSpot 25 answers 6.
+            // A mirror is a REFERENCE, so it goes in a carrier slot without
+            // the int-in-an-oop-slot hazard §5 is about; the alternative
+            // (an encoded element-type tag) would be exactly that hazard.
+            let arr_cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            let wrapper = alloc_mh_carrier(ctx, "__mh_collect_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
+            ctx.set_field(wrapper, 2, Value::Object(arr_cls));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter =
                 alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT)?;
@@ -8829,8 +8889,22 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_COLLECT => {
             // asCollector(arrayType, count): collect the trailing `count`
-            // incoming args into a fresh Object[] and append to the leading
-            // args, then dispatch target (whose last param is that array).
+            // incoming args into a fresh array OF THE COLLECTOR'S OWN ARRAY
+            // TYPE and append to the leading args, then dispatch target (whose
+            // last param is that array).
+            //
+            // W7-19: "of the collector's own array type" is the fix. This arm
+            // built an `Object[]` unconditionally, so every primitive-array
+            // collector handed its target a reference array where the target's
+            // bytecode expects `int[]`/`long[]`/… — `iaload` then read an oop
+            // as an int. Measured on the shipped `dev` binary under
+            // `--real-jdk`: `int[]`→0, `byte[]`/`short[]`/`char[]`/
+            // `boolean[]`→0, `float[]`→0.0, `double[]`→NaN, and `long[]`→
+            // -2527743864898872 (a raw heap pointer read as a `long`), against
+            // HotSpot 25's 6/6/60/131/2/3.75/7.0/6. `Object[]` and `String[]`
+            // were already right, which is why the one probe that reached this
+            // combinator did not see it — the same four-of-nine shape as the
+            // FFM carrier defect: one reachable carrier is not the surface.
             let wrapper = match bound {
                 Value::Object(Some(w)) => w,
                 _ => return Ok(Some(Value::Object(None))),
@@ -8844,33 +8918,100 @@ pub(crate) fn mh_dispatch(
                 _ => 0,
             };
             let leading = extra_args.len() - count;
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+            // Slot 2 is the `arrayType` Class mirror the `asCollector` native
+            // captured. Absent (a carrier written before this field existed, or
+            // an `asCollector` call whose Class argument was not an object) the
+            // component descriptor stays `Ljava/lang/Object;` and this arm
+            // behaves exactly as it did before — the pre-existing `Object[]`
+            // path is the fallback, never a new failure mode.
+            let arr_mirror = match ctx.get_field(wrapper, 2) {
+                Value::Object(Some(m)) => Some(m),
+                _ => None,
+            };
+            let comp = match arr_mirror {
+                Some(m) => {
+                    let ad = mirror_to_descriptor(ctx, m);
+                    match ad.strip_prefix('[') {
+                        Some(rest) => rest.to_string(),
+                        // Not an array mirror at all. `asCollector` on a
+                        // non-array type is an `IllegalArgumentException` on
+                        // HotSpot and never reaches dispatch there; here it
+                        // keeps the old container rather than inventing a new
+                        // refusal at invoke time, which would be the wrong
+                        // place for it.
+                        None => DESC_OBJECT.to_string(),
+                    }
+                }
+                None => DESC_OBJECT.to_string(),
+            };
+            let elem_type = array_element_type_of_descriptor(&comp);
+            let arr = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                // A typed reference array where the component class resolves
+                // (`String[]`, not `Object[]`), because the target's parameter
+                // is `String[]` and an `aastore`-checked or reflective consumer
+                // can tell the difference. `Object[]` remains the fallback.
+                let arr_cid = match arr_mirror {
+                    Some(m) => ctx.class_id_from_mirror(m),
+                    None => None,
+                };
+                let comp_cid = match arr_cid {
+                    Some(acid) => ctx.array_component_class_id(acid),
+                    None => None,
+                };
+                match comp_cid {
+                    Some(cid) => ctx.new_ref_array(cid, count),
+                    None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, count),
+                }
+            } else {
+                ctx.new_array(elem_type, count)
+            };
             // GC-safety: `box_value` inside the loop below can trigger a
             // collection that relocates `arr` (created once, before the
             // loop, then written into on every iteration) and `target`
             // (captured earlier, dispatched only after the loop finishes).
             // Pin both and re-read the forwarded references before each use.
+            // The primitive branch allocates nothing per element, but it shares
+            // the loop and the pin costs a forwarding read, not a collection.
             let arr_pin = ctx.pin_native_root(arr);
             let target_pin = ctx.pin_native_root(target);
             for i in 0..count {
-                // Box primitive values into their wrappers — the collector
-                // gathers into an `Object[]`. The indy call site passes raw
-                // primitives (Groovy's `3 * 2` is `invoke(II)Object`), and the
-                // real JDK boxes them via the trailing `asType`; our `asType`
-                // shim is a passthrough, so box here. Without this, `selectMethod`
-                // receives raw `int`s in its `Object[] args` and Groovy's
-                // `args[0].getClass()` (Selector.setGuards) dereferences a raw
-                // int as an object → NPE.
                 let v = extra_args[leading + i];
-                let boxed = match v {
-                    Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
-                    Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
-                    Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
-                    Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
-                    other => other,
+                let elem = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                    // Box primitive values into their wrappers — a reference
+                    // collector gathers into an `Object[]`. The indy call site
+                    // passes raw primitives (Groovy's `3 * 2` is
+                    // `invoke(II)Object`), and the real JDK boxes them via the
+                    // trailing `asType`; our `asType` shim is a passthrough, so
+                    // box here. Without this, `selectMethod` receives raw
+                    // `int`s in its `Object[] args` and Groovy's
+                    // `args[0].getClass()` (Selector.setGuards) dereferences a
+                    // raw int as an object → NPE.
+                    match v {
+                        Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
+                        Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
+                        Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
+                        Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
+                        other => other,
+                    }
+                } else {
+                    // The mirror image, for the same reason: a primitive
+                    // collector's element slot is raw, and an argument that
+                    // arrived boxed (`invokeWithArguments`, or an adapter chain
+                    // that spread an `Object[]`) must be unwrapped or
+                    // `write_prim_element` would see a `Value::Object` and
+                    // store the type's zero. Then apply the widening the JDK's
+                    // trailing `asType` would have applied — `asCollector
+                    // (long[], 3).invoke(1, 2, 3)` passes `int`s and HotSpot
+                    // widens them; our `asType` is a passthrough, so this is
+                    // the only place it can happen.
+                    let raw = match v {
+                        Value::Object(Some(o)) => crate::lang_class::unbox_value(ctx, o),
+                        other => other,
+                    };
+                    widen_primitive_to_descriptor(raw, &comp)
                 };
                 let arr = ctx.read_native_pin(arr_pin, arr);
-                ctx.set_array_element(arr, i, boxed);
+                ctx.set_array_element(arr, i, elem);
             }
             let arr = ctx.read_native_pin(arr_pin, arr);
             let target = ctx.read_native_pin(target_pin, target);
@@ -10104,6 +10245,46 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let recv = args.get(1).copied().unwrap_or(Value::Object(None));
+            // W7-19: `bindTo` must REFUSE a target with no leading reference
+            // parameter. `MethodHandle.bindTo`'s javadoc: "@throws
+            // IllegalArgumentException if the target does not have a leading
+            // parameter type that is a reference type", implemented in
+            // `MethodType.leadingReferenceParameter()` as
+            //   if (ptypes.length == 0 || ptypes[0].isPrimitive())
+            //       throw newIllegalArgumentException("no leading reference parameter");
+            // — so the test is arity-and-primitiveness, nothing else, and the
+            // message is verbatim. Measured on the shipped binary under
+            // `--real-jdk`: `findStatic(…(String,int)int).bindTo("abc")
+            // .bindTo(2)` was ACCEPTED and answered 6, and `(int)int`
+            // .bindTo(3) was accepted too; HotSpot 25 raises
+            // `IllegalArgumentException: no leading reference parameter` for
+            // both. A missing refusal, not a wrong value.
+            //
+            // The parameter list is read from the `type` field ONLY, never
+            // from `mh_type_descriptor`'s `MH_DESC` fallback. That distinction
+            // is the whole safety of this check: `MH_DESC` on a
+            // virtual/special handle omits the receiver `alloc_method_handle`
+            // prepends to `type`, so `Holder.pub`'s `(I)I` would read as a
+            // primitive leading parameter and this would refuse a bind that
+            // HotSpot accepts. No `type` MethodType, or one whose mirrors do
+            // not render, means the leading parameter is UNKNOWN and the bind
+            // is allowed through — a refusal is only ever raised on a positive
+            // reading.
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
+                if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
+                    if let Some((params, _)) = split_descriptor_params(&tdesc) {
+                        let leading_is_reference = params
+                            .first()
+                            .is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+                        if !leading_is_reference {
+                            return Err(RuntimeError::IllegalArgumentException {
+                                message: "no leading reference parameter".to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
             // Clone the MH and set BOUND field
             let class = mh_read_class(ctx, this).unwrap_or_default();
             let name = mh_read_name(ctx, this).unwrap_or_default();
