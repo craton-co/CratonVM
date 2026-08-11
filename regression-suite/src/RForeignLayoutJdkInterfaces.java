@@ -361,7 +361,8 @@ public class RForeignLayoutJdkInterfaces {
         Recorder ms = new Recorder("mbs");
         javax.management.MBeanServer srv = proxy(javax.management.MBeanServer.class, ms);
         check(srv.getMBeanCount() == null, "MBeanServer.getMBeanCount");
-        check(srv.getDefaultDomain() == null, "MBeanServer.getDefaultDomain");
+        check("SENTINEL-mbs-getDefaultDomain".equals(srv.getDefaultDomain()),
+                "MBeanServer.getDefaultDomain");
         check(srv.getDomains() == null, "MBeanServer.getDomains");
         check(srv.queryNames(null, null) == null, "MBeanServer.queryNames");
         check(srv.isRegistered(null) == B, "MBeanServer.isRegistered");
