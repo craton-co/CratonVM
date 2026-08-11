@@ -13682,6 +13682,39 @@ fn create_annotation_proxy_with_type(
     // loader before the first loader-aware annotation-type lookup.
     let container_loader_pin =
         container_loader.map(|loader| ctx.pin_native_root(loader));
+    // W7-12/W7-17 — `ensure_vm_internal_class`, not the compatibility door.
+    //
+    // `java/lang/annotation/AnnotationProxy` is a name NO JDK declares
+    // (`javap java.lang.annotation.AnnotationProxy` against the JDK 25 image →
+    // "class not found"), so no class file can ever back it. It is the
+    // invocation-handler carrier this VM mints for every generated annotation
+    // proxy — the exact sibling of `java/lang/reflect/Proxy$Instance` in
+    // `reflect_annotations.rs`, which took this same door for this same reason
+    // — and contract §1 item 6 lists both among the shapes a conforming JVM
+    // creates without a class file. Minted through
+    // `try_alloc_concurrent_synthetic` alone it looked like a §5 compatibility
+    // stand-in, and `--jdk-only` refused it: measured, that took
+    // `getAnnotation` to null on RReflect/RJdkReflect (the four
+    // `if let Ok(Some(proxy))` sites below swallow the refusal — residual R1 of
+    // the record) and to `NoClassDefFoundError` on RJdkJmx.
+    //
+    // The refusal is the ONLY half that moves. `--dump-native-registry` over a
+    // boot in each mode reports **zero** natives registered under this class
+    // name in Compatible AND in `--jdk-only`, so the second gate a door change
+    // has to clear — `register()` re-tagging a receiver's natives
+    // `SyntheticStub` and `JdkOnly` then dropping them — has nothing to drop
+    // here. That check is per-class and not a general licence: a carrier whose
+    // natives ARE dropped in strict gets an `UnsatisfiedLinkError` at its first
+    // call instead of a `NoClassDefFoundError` at its mint, which is a moved
+    // symptom, not a fix.
+    //
+    // Pre-mint rather than replace: `fabricate_class` returns the existing
+    // `ClassId` for an already-loaded name before it reaches
+    // `admit_compatibility_class`, so the allocation below still does its own
+    // real-vs-requested field-count widening, its W4-4 layout-alias report and
+    // its GC-safe allocation retry, byte-for-byte, in either mode. Only the
+    // class's recorded ORIGIN moves.
+    ctx.ensure_vm_internal_class("java/lang/annotation/AnnotationProxy", ANN_PROXY_FIELDS);
     let mut proxy = try_alloc_concurrent_synthetic(
         ctx,
         "java/lang/annotation/AnnotationProxy",
