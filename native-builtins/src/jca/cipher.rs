@@ -1014,6 +1014,14 @@ fn cipher_family(algo: &str) -> Option<CipherFamily> {
 /// `NoSuchAlgorithmException` at the call site that names the algorithm,
 /// instead of AES ciphertext it will never be able to decrypt anywhere else.
 fn classify_transformation(transformation: &str) -> TransformVerdict {
+    // `Cipher.getInstance`'s own first line, ahead of tokenizing:
+    // `if ((transformation == null) || transformation.isEmpty()) throw new
+    // NoSuchAlgorithmException("Null or empty transformation")`. A null
+    // argument arrives here as an empty string (`read_string` on a null ref),
+    // and the JDK gives both the same message, so one arm covers both.
+    if transformation.is_empty() {
+        return TransformVerdict::InvalidFormat("Null or empty transformation".to_string());
+    }
     let (algo, mode, padding) = match tokenize_transformation(transformation) {
         Ok(parts) => parts,
         Err(msg) => return TransformVerdict::InvalidFormat(msg),
@@ -3141,6 +3149,216 @@ mod tests {
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_128"), Some(16));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_192"), Some(24));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_256"), Some(32));
+    }
+
+    // -----------------------------------------------------------------------
+    // W7-15 — the admission table.
+    //
+    // Every "must raise" below has a measured RED behind it: the transformation
+    // named produced AES ciphertext on this tree's release binary before the
+    // table landed. Every "must still work" is a transformation the same binary
+    // computed correctly and byte-identically to HotSpot 25, so the fix is
+    // pinned on both sides.
+    // -----------------------------------------------------------------------
+
+    fn refuses_algorithm(t: &str) -> bool {
+        matches!(classify_transformation(t), TransformVerdict::NoSuchAlgorithm)
+    }
+
+    fn refuses_padding(t: &str) -> bool {
+        matches!(
+            classify_transformation(t),
+            TransformVerdict::NoSuchPadding(_)
+        )
+    }
+
+    /// MUST RAISE. The headline defect: both ChaCha20 names produced
+    /// AES-256-ECB, byte-identically to `AES/ECB/PKCS5Padding`, with the nonce
+    /// discarded and no AEAD tag.
+    #[test]
+    fn chacha20_is_refused_rather_than_served_as_aes() {
+        assert!(refuses_algorithm("ChaCha20"));
+        assert!(refuses_algorithm("ChaCha20-Poly1305"));
+        assert!(refuses_algorithm("chacha20-poly1305"));
+        assert!(refuses_algorithm("ChaCha20-Poly1305/None/NoPadding"));
+        // An AEAD this engine cannot authenticate must be refused, never
+        // approximated: a cipher that cannot fail on a bad tag is worse than a
+        // missing one, because the caller's integrity guarantee evaporates
+        // silently. The one AEAD that IS implemented stays admitted.
+        assert!(!refuses_algorithm("AES/GCM/NoPadding"));
+    }
+
+    /// MUST RAISE. It was never only ChaCha20 — `cipher_algorithm_known`
+    /// accepted a whole catalogue, and every name in it reached the same ECB
+    /// arm. Measured: `Blowfish` and `RC4` produced the SAME ciphertext as each
+    /// other from a 16-byte key, because both were AES-128-ECB.
+    #[test]
+    fn the_other_names_that_were_silently_aes_are_refused_too() {
+        for t in [
+            "Blowfish", "RC4", "ARCFOUR", "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish",
+            "Serpent", "CAST5", "Salsa20", "Skipjack", "ECIES", "ElGamal", "NULL",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused, not served as AES");
+        }
+        assert!(refuses_algorithm("CRATONVM-NO-SUCH-CIPHER"));
+    }
+
+    /// MUST RAISE. Modes with no implementation here. Each used to be admitted
+    /// by `getInstance` and then die at `doFinal` on an UNCHECKED
+    /// `IllegalStateException` naming "WP6.3 dispatch" — the wrong exception,
+    /// at the wrong call, uncatchable by `catch (GeneralSecurityException)`.
+    #[test]
+    fn unimplemented_modes_are_refused_at_getinstance() {
+        for t in [
+            "AES/CTR/NoPadding",
+            "AES/CTS/NoPadding",
+            "AES/PCBC/PKCS5Padding",
+            "AES/CFB8/NoPadding",
+            "AES/CCM/NoPadding",
+            "AES/KWP/NoPadding",
+            "AES_128/KWP/NoPadding",
+            "DESede/ECB/PKCS5Padding",
+            "DESede",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
+        }
+    }
+
+    /// MUST RAISE, as a PADDING failure specifically — the JDK distinguishes
+    /// the two exceptions and a caller may well catch only one. Measured on
+    /// HotSpot: `AES/CBC/PKCS7Padding` is refused outright, and
+    /// `AES/CBC/ISO10126Padding` is served with RANDOM padding bytes. This
+    /// engine implements PKCS#7-as-PKCS5Padding and nothing else, and served
+    /// BOTH of those as PKCS5.
+    #[test]
+    fn unimplemented_paddings_are_refused_not_aliased_onto_pkcs5() {
+        assert!(refuses_padding("AES/CBC/PKCS7Padding"));
+        assert!(refuses_padding("AES/CBC/ISO10126Padding"));
+        assert!(refuses_padding("AES/ECB/CRATONVM-NO-SUCH-PADDING"));
+        // AEAD and key wrap take NoPadding only.
+        assert!(refuses_padding("AES/GCM/PKCS5Padding"));
+        assert!(refuses_padding("AES/KW/PKCS5Padding"));
+        // RSA admits exactly what `RsaCipherPadding::from_transformation` does.
+        assert!(refuses_padding("RSA/ECB/NoPadding"));
+        assert!(refuses_padding("RSA/ECB/OAEPWithSHA-512AndMGF1Padding"));
+        assert!(refuses_algorithm("RSA/None/PKCS1Padding"));
+    }
+
+    /// MUST STILL WORK — the twin every refusal needs. These are the
+    /// transformations the measured binary computed correctly, several of them
+    /// byte-identically to HotSpot 25; none may become collateral damage.
+    #[test]
+    fn every_transformation_that_worked_before_still_resolves() {
+        for t in [
+            "AES/GCM/NoPadding",
+            "AES",
+            "AES/ECB/PKCS5Padding",
+            "AES/ECB/NoPadding",
+            "AES/CBC/PKCS5Padding",
+            "AES/CBC/NoPadding",
+            "AES/CFB/PKCS5Padding",
+            "AES/OFB/PKCS5Padding",
+            "AES/KW/NoPadding",
+            "AESWrap",
+            "AESWrap_128",
+            "AESWrap_192",
+            "AESWrap_256",
+            "AES_128/GCM/NoPadding",
+            "AES_256/CBC/NoPadding",
+            "DES/CBC/PKCS5Padding",
+            "DESede/CBC/PKCS5Padding",
+            "TripleDES/CBC/PKCS5Padding",
+            "RSA",
+            "RSA/ECB/PKCS1Padding",
+            "RSA/ECB/OAEPWithSHA-256AndMGF1Padding",
+            "RSA/ECB/OAEPPadding",
+            "PBEWithHmacSHA1AndAES_128",
+            "PBEWithHmacSHA256AndAES_256",
+            // JCA lookup is case-insensitive and the JDK trims each token —
+            // measured, `aes / gcm / nopadding` resolves on HotSpot.
+            "aes/gcm/nopadding",
+            "AES / GCM / NoPadding",
+        ] {
+            assert!(
+                transformation_is_serviceable(t),
+                "{t} worked before this lane and must still resolve"
+            );
+        }
+    }
+
+    /// The tokenizer is the JDK's, messages included — these four shapes were
+    /// all accepted before, with `parse_transformation` inventing whatever it
+    /// needed. `"AES/CBC"` became a padded CBC cipher; the JDK calls it invalid.
+    #[test]
+    fn malformed_transformations_carry_the_jdk_messages() {
+        let msg = |t: &str| match classify_transformation(t) {
+            TransformVerdict::InvalidFormat(m) => m,
+            _ => panic!("{t} must be an invalid format"),
+        };
+        assert_eq!(msg("AES/CBC"), "Invalid transformation format:AES/CBC");
+        assert_eq!(
+            msg("AES/CBC/"),
+            "Invalid transformation: missing mode and/or padding-AES/CBC/"
+        );
+        assert_eq!(
+            msg("/CBC/NoPadding"),
+            "Invalid transformation: algorithm not specified-/CBC/NoPadding"
+        );
+        // `getInstance` checks empty BEFORE tokenizing and says so; measured.
+        assert_eq!(msg(""), "Null or empty transformation");
+        // The JDK's own guard for an algorithm with a `/` inside its NAME: the
+        // first slash of `SHA512/224` must not be read as a mode separator.
+        assert_eq!(
+            tokenize_transformation("PBEWithHmacSHA512/224AndAES_128").unwrap(),
+            ("PBEWithHmacSHA512/224AndAES_128".to_string(), None, None)
+        );
+    }
+
+    /// `AES_128` means "AES with a 128-bit key". Before this lane the suffix
+    /// was decorative: measured, `AES_128/GCM/NoPadding` initialised from a
+    /// 256-bit key and encrypted with AES-256.
+    #[test]
+    fn size_pinned_names_pin_the_key_length() {
+        assert_eq!(transformation_pinned_key_len("AES_128/GCM/NoPadding"), Some(16));
+        assert_eq!(transformation_pinned_key_len("AES_192/CBC/NoPadding"), Some(24));
+        assert_eq!(transformation_pinned_key_len("AES_256/ECB/NoPadding"), Some(32));
+        assert_eq!(transformation_pinned_key_len("AES/GCM/NoPadding"), None);
+        // HotSpot's measured wording, both flavours.
+        assert_eq!(
+            aes_key_length_reason("AES_128/GCM/NoPadding", 32).as_deref(),
+            Some("The key must be 16 bytes")
+        );
+        assert_eq!(
+            aes_key_length_reason("AES/GCM/NoPadding", 17).as_deref(),
+            Some("Invalid AES key length: 17 bytes")
+        );
+        // MUST STILL WORK: the legal sizes, and the families this rule does
+        // not govern.
+        assert!(aes_key_length_reason("AES_128/GCM/NoPadding", 16).is_none());
+        for n in [16, 24, 32] {
+            assert!(aes_key_length_reason("AES/CBC/PKCS5Padding", n).is_none());
+        }
+        assert!(aes_key_length_reason("RSA/ECB/PKCS1Padding", 294).is_none());
+        assert!(aes_key_length_reason("PBEWithHmacSHA1AndAES_128", 9).is_none());
+        assert!(aes_key_length_reason("DESede/CBC/PKCS5Padding", 24).is_none());
+        // An unreadable key is a different diagnosis and must not be reported
+        // as a length complaint.
+        assert!(aes_key_length_reason("AES/GCM/NoPadding", 0).is_none());
+    }
+
+    /// A bare `AES` really is `AES/ECB/PKCS5Padding` on SunJCE (measured:
+    /// HotSpot's ciphertext for the two is byte-identical), so that default is
+    /// kept — but it is now a property of the AES arm rather than of every
+    /// algorithm name that reaches `parse_transformation`.
+    #[test]
+    fn the_ecb_default_is_scoped_to_the_family_that_has_one() {
+        assert!(transformation_is_serviceable("AES"));
+        assert!(refuses_algorithm("ChaCha20"));
+        // `AES_128` alone is not a service on SunJCE either — measured,
+        // `Cipher.getInstance("AES_128")` raises while `AES_128/CBC/NoPadding`
+        // resolves — so the default must not manufacture one.
+        assert!(refuses_algorithm("AES_128"));
+        assert!(transformation_is_serviceable("AES_128/CBC/NoPadding"));
     }
 
     #[test]
