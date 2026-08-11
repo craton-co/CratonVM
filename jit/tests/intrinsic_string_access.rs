@@ -29,7 +29,9 @@
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
 use cratonvm_jit_api::JitRuntimeHelpers;
-use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -189,15 +191,60 @@ impl FakeObj {
     }
 }
 
+/// Stamp a header at `base` through `ObjectHeader::new` rather than by writing
+/// its fields at literal offsets.
+///
+/// These fixtures used to poke `kind` at offset 4, `element_type` at offset 5
+/// and the array length at offset 12 — the pre-`header-16` layout. The
+/// 2026-08-07 shrink (24 -> 16) moved every one of them: `shape` now occupies
+/// offsets 4..8 and IS the array length for an array, while `kind` and
+/// `element_type` are no longer bytes at all — they are bit-fields *packed into
+/// one byte* of the mark word (`KIND_TAGS_BYTE_OFFSET`, bits 0..2 and 2..6).
+/// So the old writes set the array's length to `ObjectKind::Array as u8` == 1
+/// and left the element type unset, and the intrinsics read a 1-element array
+/// of the wrong kind.
+///
+/// The constructor knows the packing; a test restating it is what let this
+/// drift silently in the first place.
+///
+/// # Safety
+/// `base` must point to at least `HEADER_SIZE` writable, 8-aligned bytes.
+unsafe fn write_array_header(base: *mut u8, elem: ArrayElementType, length: usize) {
+    std::ptr::write(
+        base as *mut ObjectHeader,
+        ObjectHeader::new(
+            ClassId::new(0), // primitive arrays carry ClassId(0)
+            ObjectKind::Array,
+            elem,
+            length as u32, // Cast: fixture arrays are small
+            0,             // num_slots is unused for an array shape
+        ),
+    );
+}
+
+/// [`write_array_header`] for an instance: `num_slots` fields, no element type.
+///
+/// # Safety
+/// `base` must point to at least `HEADER_SIZE` writable, 8-aligned bytes.
+unsafe fn write_object_header(base: *mut u8, class_id: u32, num_slots: u32) {
+    std::ptr::write(
+        base as *mut ObjectHeader,
+        ObjectHeader::new(
+            ClassId::new(class_id),
+            ObjectKind::Object,
+            ArrayElementType::Reference, // unused for a non-array
+            0,                           // array_length is unused for an object shape
+            num_slots,
+        ),
+    );
+}
+
 /// Build a `byte[]` heap array holding `data`.
 fn make_byte_array(data: &[u8]) -> FakeObj {
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + data.len());
     let base = obj.base();
     unsafe {
-        *base.add(4) = ObjectKind::Array as u8;
-        *base.add(5) = ArrayElementType::Byte as u8;
-        let len_le = (data.len() as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+        write_array_header(base, ArrayElementType::Byte, data.len());
         std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), data.len());
     }
     obj
@@ -218,10 +265,7 @@ fn make_string_with_cid(value_ptr: i64, coder: i32, hash: i32, class_id: u32) ->
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + 3 * SLOT_SIZE);
     let base = obj.base();
     unsafe {
-        // ObjectHeader: class id at offset 0, kind = Object.
-        let cid = class_id.to_le_bytes();
-        std::ptr::copy_nonoverlapping(cid.as_ptr(), base, 4);
-        *base.add(4) = ObjectKind::Object as u8;
+        write_object_header(base, class_id, 3);
         // A `Value` field cell: tag (u32) at offset 0. An 8-byte payload
         // (Object pointer) lives at FIELD_CELL_PAYLOAD64_OFFSET (8); a 4-byte
         // payload (Int) at FIELD_CELL_PAYLOAD32_OFFSET (4).

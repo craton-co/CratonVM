@@ -7041,7 +7041,12 @@ pub(super) fn resolve_step1_native(
     //   `jdk-only-step1-bytecode-available-RESOLVED-20260806.md`
     //   for all five blocker families with their symptoms.
     let strict_bridge = policy.is_jdk_only() && kind == cratonvm_native_api::NativeKind::Bridge;
-    let enforce = strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow();
+    // SCOPED, not global: `jdk_only_enforce_shadow()` answers "is anything
+    // armed at all", which under a prefix list is true for every class. Asking
+    // it here would enforce one subsystem's dial across the whole VM — the 3/46
+    // collapse the scoping exists to avoid. See `enforce_shadow_scope`.
+    let enforce =
+        strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow_for(class_name);
     // When the shadow is only being observed, the walk is worth doing at most
     // once per triple — the sink dedups, so a second walk buys nothing — and
     // not at all once the sink saturates, since it can no longer learn a new

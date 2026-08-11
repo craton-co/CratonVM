@@ -265,6 +265,14 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         None
     };
 
+    // HotSpot's `handleOpen` refuses a directory (EISDIR) for RAF exactly as it
+    // does for FileInputStream/FileOutputStream, so `new RandomAccessFile(dir,
+    // "r")` throws `FileNotFoundException: <path> (Is a directory)` there.
+    // Linux `open(2)` accepts a directory read-only, so the check has to be
+    // explicit — see `reject_directory_open` for why it is per-call-site and
+    // not in the fd table.
+    crate::reject_directory_open(&path_str)?;
+
     // Open through the global fd_table (a FileReadWrite entry) so the RAF and
     // any FileChannel from raf.getChannel() resolve the SAME fd. Any open
     // error surfaces as FileNotFoundException, matching open0's declared throws.

@@ -842,6 +842,34 @@ function Get-EffectiveClassTimeoutSec {
     # throughput gap. Do not paper over it with a timeout; see
     # docs/known-issues/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang.md.
     'core/spring-boot|org.springframework.boot.context.properties.source.ConfigurationPropertySourcesTests' = 5400
+    # EMBEDDED-SERVER-BUDGET.1 (2026-08-11): these two build, start and stop a
+    # fresh embedded container per @Test -- 121 (Tomcat) and ~100 (Jetty)
+    # container starts in one process, each of which runs Jasper's whole TLD
+    # scan over the module's 130-jar test classpath. Both were reported as
+    # HANG at 300s in every full-suite run since 2026-08-06, and the Jetty one
+    # once as `tests=0` at a 2400s ceiling. Neither is stuck. Measured alone
+    # on an idle Windows host, default collector, -Xmx 2g, after the
+    # JarFile-accessor stat fix landed:
+    #   Tomcat 420.2s, 132 tests, 0 failed   (HotSpot 41.1s / 129 tests)
+    #   Jetty  407.0s, 113 tests, 0 failed   (HotSpot 28.6s / 111 tests)
+    # -- see fixed-suite-bugs/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md.
+    # The 10-14x ratio is a real throughput item and is tracked as one
+    # (known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md);
+    # this entry exists so the suite reports 132/132 and 113/113 instead of a
+    # HANG, not to hide the ratio. Headroom over the observed time for
+    # contention when several slow classes share a -Parallel batch.
+    'module/spring-boot-tomcat|org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests' = 900
+    'module/spring-boot-jetty|org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests' = 900
+    # PULSAR-BUDGET.1 (2026-08-11): reported as a deterministic 300s HANG in
+    # the three 2026-08-06/07 full-suite runs. It is not stuck -- the evidence
+    # for "hang" was a 0-byte .out.log (SbRunner prints nothing until the run
+    # finishes, and this class logs nothing of its own) and an identical last
+    # .err.log line, which is the last line of every PASSING run of this class
+    # too. Alone on an idle host it completes 74/74 in 178-204s, and 220-277s
+    # when sharing the box -- right on the 300s boundary, which is why the
+    # suite has always seen it flip between HANG and PASS. See
+    # fixed-suite-bugs/springboot/pulsarautoconfigurationtests-onbeancondition-multivaluemap-classcastexception-flake-FIXED-20260811.md.
+    'module/spring-boot-pulsar|org.springframework.boot.pulsar.autoconfigure.PulsarAutoConfigurationTests' = 900
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {

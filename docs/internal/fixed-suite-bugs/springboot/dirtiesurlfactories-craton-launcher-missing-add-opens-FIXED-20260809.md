@@ -180,7 +180,7 @@ binary would pass these vacuously, since the gate it needs did not exist yet):
 The single non-pass is **not this defect**.
 `TomcatWebServerFactoryCustomizerTests` times out with `tests=0` because it is
 the class tracked by
-`docs/known-issues/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`
+`fixed-suite-bugs/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md`
 — HotSpot runs its 66 tests in 11.5s, CratonVM needs 800s+ of real work once
 its tests actually execute. That is the throughput gap, and it is somebody
 else's page.
@@ -227,7 +227,7 @@ Two controls were run rather than assuming:
   these classes in ~10s each where CratonVM takes 60–415s, so its exposure to
   a flapping port is a fraction of CratonVM's. That is a throughput
   consequence, and it is the subject of a separate open doc
-  (`tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`,
+  (`tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md`,
   ~4–4.5x HotSpot on the same workload) — not something this fix introduced or
   can settle.
 

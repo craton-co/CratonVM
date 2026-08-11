@@ -43,6 +43,36 @@ struct JarState {
     /// first access to avoid paying the cost for jars that only read
     /// one manifest entry.
     name_index: Option<HashMap<String, usize>>,
+    /// Per-index central-directory metadata, filled lazily. See
+    /// [`entry_meta_at`] for why this exists and what it costs without it.
+    meta: Vec<MetaSlot>,
+}
+
+/// The central-directory facts a `ZipEntry` is built from. Every field here
+/// comes out of the record the archive parsed at open time; none of it needs
+/// the entry's *content*, which is the whole point of caching it.
+#[derive(Clone)]
+struct ZipEntryMeta {
+    name: String,
+    method: i64,
+    size: i64,
+    csize: i64,
+    crc: i64,
+    extra: Option<Vec<u8>>,
+    times: ZipEntryTimes,
+}
+
+/// One `meta` slot: not looked at yet, looked at and unreadable, or known.
+///
+/// `Unreadable` is a state rather than a re-derivable absence so a malformed
+/// entry costs one failed read instead of one per lookup, and so `entries()`
+/// (which skips it) and `getEntry` (which raises) keep the different answers
+/// they gave before this cache existed.
+#[derive(Clone)]
+enum MetaSlot {
+    Unread,
+    Unreadable,
+    Ready(ZipEntryMeta),
 }
 
 fn jar_table() -> &'static Mutex<HashMap<i64, JarState>> {
@@ -364,10 +394,12 @@ fn open_and_register(
             message: format!("JarFile: `{path_str}` is not a valid zip: {e}"),
         })
     })?;
+    let meta = vec![MetaSlot::Unread; archive.len()];
     let state = JarState {
         path: PathBuf::from(&validated_path),
         archive,
         name_index: None,
+        meta,
     };
     let handle = next_handle();
     let table_len = {
@@ -390,6 +422,103 @@ fn open_and_register(
     Ok(None)
 }
 
+/// Ensure `state.name_index` is populated, then return it.
+///
+/// `file_names()` walks the already-parsed central directory: no I/O, no
+/// per-entry record re-validation, no decompressor.
+fn ensure_name_index(state: &mut JarState) -> &HashMap<String, usize> {
+    if state.name_index.is_none() {
+        // Perf fix (audit MED): avoid per-entry `by_index`, which re-reads
+        // and re-validates the central-directory record (and would set up a
+        // decompressor) for every entry just to grab the name. `file_names`
+        // walks the already-parsed central directory in O(n) and yields
+        // `&str` slices into the archive's metadata — no I/O, no inflate.
+        let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
+        for (i, name) in state.archive.file_names().enumerate() {
+            idx.insert(name.to_string(), i);
+        }
+        state.name_index = Some(idx);
+    }
+    state
+        .name_index
+        .as_ref()
+        .expect("name_index was just populated")
+}
+
+/// The cached central-directory metadata for `idx`, reading it out of the
+/// archive the first time and never again.
+///
+/// # Why this cache exists
+///
+/// An open archive's central directory does not change, so every field a
+/// `ZipEntry` carries is a constant for the life of the handle — yet both
+/// callers used to re-derive it from the archive on every call.
+///
+/// `getEntry` went through `ZipArchive::by_index`, which does two things
+/// beyond reading the record: it seeks to and parses the entry's LOCAL file
+/// header, and it builds the whole decompressor chain
+/// (`BufReader` + `Decompressor` + `Crc32Reader`) — an inflate window and
+/// trees, tens of KiB allocated and dropped — purely so the call could ask
+/// for `name()` and `size()`. Nothing about that reader is used here.
+///
+/// `by_index_raw` is used for the one real read because it skips
+/// `make_reader`; its `find_content` seek is memoised by the `zip` crate in a
+/// `OnceCell`, and after this cache it happens at most once per entry anyway.
+///
+/// # What this is worth, honestly
+///
+/// No benchmark moved when this landed, and the reason is worth keeping:
+/// `java.util.jar.JarFile` does **not** reach this file. Its natives are
+/// re-registered later by `native-builtins`' `register_p59_jar`, which
+/// `overwrote` these (visible as `"overwrote": "bridge"` in
+/// `--dump-native-registry`), so for a `JarFile` receiver everything here is
+/// dead. The jar-scan cost that prompted the look was in that other
+/// registrar — a `std::fs::metadata` per accessor call, ~20-54 us on Windows;
+/// see `fixed-bugs/jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`.
+///
+/// This is kept because it is strictly less work on the plain
+/// `java.util.zip.ZipFile` path, which this file does still own, not because
+/// a number moved.
+fn entry_meta_at(state: &mut JarState, idx: usize) -> Option<ZipEntryMeta> {
+    if idx >= state.meta.len() {
+        // An archive whose length outran the slot vector (cannot happen for
+        // the handles we build, but the index is caller-supplied): grow
+        // rather than panic.
+        state.meta.resize(state.archive.len().max(idx + 1), MetaSlot::Unread);
+    }
+    match &state.meta[idx] {
+        MetaSlot::Ready(meta) => return Some(meta.clone()),
+        MetaSlot::Unreadable => return None,
+        MetaSlot::Unread => {}
+    }
+    let slot = match state.archive.by_index_raw(idx) {
+        Ok(entry) => MetaSlot::Ready(ZipEntryMeta {
+            name: entry.name().to_string(),
+            // Round-9 HIGH: do NOT collapse non-Deflate methods to
+            // DEFLATED(8). A previous shortcut returned 8 for every
+            // non-stored method; later code paths that select an inflate
+            // decompressor based on `method` then ran zlib on a BZIP2/LZMA
+            // payload, producing corrupt bytes. Map to the standard ZIP
+            // method codes so consumers see the real compression scheme.
+            method: compression_method_code(&entry.compression()),
+            size: entry.size() as i64,
+            csize: entry.compressed_size() as i64,
+            crc: entry.crc32() as i64 & 0xFFFF_FFFFi64,
+            extra: entry
+                .extra_data()
+                .filter(|bytes| !bytes.is_empty())
+                .map(ToOwned::to_owned),
+            times: zip_entry_times(&entry),
+        }),
+        Err(_) => MetaSlot::Unreadable,
+    };
+    state.meta[idx] = slot;
+    match &state.meta[idx] {
+        MetaSlot::Ready(meta) => Some(meta.clone()),
+        _ => None,
+    }
+}
+
 /// `JarFile.getEntry(String)` / `ZipFile.getEntry(String)` → `ZipEntry`.
 fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -410,66 +539,39 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Object(None))),
     };
 
-    if state.name_index.is_none() {
-        // Perf fix (audit MED): avoid per-entry `by_index`, which re-reads
-        // and re-validates the central-directory record (and would set up a
-        // decompressor) for every entry just to grab the name. `file_names`
-        // walks the already-parsed central directory in O(n) and yields
-        // `&str` slices into the archive's metadata — no I/O, no inflate.
-        let mut idx: HashMap<String, usize> = HashMap::with_capacity(state.archive.len());
-        for (i, name) in state.archive.file_names().enumerate() {
-            idx.insert(name.to_string(), i);
-        }
-        state.name_index = Some(idx);
-    }
-    let idx = match state.name_index.as_ref().and_then(|m| m.get(&name)) {
-        Some(i) => *i,
-        None => {
-            // Try with trailing slash (directory semantics) before
-            // giving up — matches JDK ZipFile behavior.
-            let alt = format!("{name}/");
-            match state.name_index.as_ref().and_then(|m| m.get(&alt)) {
-                Some(i) => *i,
-                None => return Ok(Some(Value::Object(None))),
+    let idx = {
+        let index = ensure_name_index(state);
+        match index.get(&name) {
+            Some(i) => *i,
+            None => {
+                // Try with trailing slash (directory semantics) before
+                // giving up — matches JDK ZipFile behavior.
+                let alt = format!("{name}/");
+                match index.get(&alt) {
+                    Some(i) => *i,
+                    None => return Ok(Some(Value::Object(None))),
+                }
             }
         }
     };
 
-    // Materialize the entry metadata.
-    let entry = state.archive.by_index(idx).map_err(|e| {
+    // Materialize the entry metadata (cached per index — see `entry_meta_at`).
+    let meta = entry_meta_at(state, idx).ok_or_else(|| {
         MethodCallFailed::InternalError(VmError::Internal {
-            message: format!("ZipArchive::by_index({idx}) failed: {e}"),
+            message: format!("ZipArchive::by_index_raw({idx}) failed"),
         })
     })?;
-    let entry_name = entry.name().to_string();
-    let size = entry.size() as i64;
-    let csize = entry.compressed_size() as i64;
-    let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-    let extra = entry
-        .extra_data()
-        .filter(|bytes| !bytes.is_empty())
-        .map(ToOwned::to_owned);
-    // Round-9 HIGH: do NOT collapse non-Deflate methods to DEFLATED(8).
-    // A previous shortcut returned 8 for every non-stored method; later
-    // code paths that select an inflate decompressor based on `method`
-    // then ran zlib on a BZIP2/LZMA payload, producing corrupt bytes.
-    // Map to the standard ZIP method codes so consumers see the real
-    // compression scheme. Unknown methods get -1 (not a valid ZIP code)
-    // so they fail loudly rather than being misinterpreted.
-    let method: i64 = compression_method_code(&entry.compression());
-    let times = zip_entry_times(&entry);
-    drop(entry);
     drop(table);
 
     Ok(Some(Value::Object(Some(alloc_zip_entry(
         ctx,
-        &entry_name,
-        method,
-        size,
-        csize,
-        crc,
-        extra,
-        times,
+        &meta.name,
+        meta.method,
+        meta.size,
+        meta.csize,
+        meta.crc,
+        meta.extra,
+        meta.times,
     )?))))
 }
 
@@ -799,7 +901,7 @@ fn build_byte_array_input_stream(
 /// native rather than falling through to real bytecode.
 fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let handle = get_jar_handle(ctx, this);
-    let entries: Vec<(String, i64, i64, i64, i64, Option<Vec<u8>>, ZipEntryTimes)> = {
+    let entries: Vec<ZipEntryMeta> = {
         let mut table = jar_table().lock();
         let state = match table.get_mut(&handle) {
             Some(s) => s,
@@ -813,43 +915,18 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         // which both live in the central-directory record and never need
         // any of that machinery.
         //
-        // Optimisation strategy:
-        //   * Names come from `file_names()` — a pure central-directory
-        //     walk, zero I/O, zero allocation beyond the returned `&str`s.
-        //   * For size/csize/crc/method we still need a per-entry handle
-        //     because the `zip` crate doesn't expose the central-directory
-        //     `ZipFileData` publicly. We use `by_index_raw` instead of
-        //     `by_index`, which skips the decompressor chain (saves the
-        //     Inflate state setup — material for jars with many entries).
-        //     `find_content`'s local-header seek is still paid on the
-        //     first call, but `data_start` is memoised in a `OnceCell`,
-        //     so any subsequent `by_index_raw`/`by_index` for the same
-        //     entry is a single seek + take.
-        //
-        // Future work: if the `zip` crate exposes central-directory
-        // accessors (`size_for_index`, `crc_for_index`, etc.), drop the
-        // `by_index_raw` call entirely.
+        // `entry_meta_at` finishes that job: `by_index_raw` (no decompressor)
+        // is paid at most ONCE per entry for the life of the handle, so a
+        // second `entries()` on the same jar — which Jasper's TLD scan does
+        // once per embedded-container start, 121 times in
+        // `TomcatServletWebServerFactoryTests` — is pure cache reads.
+        // An entry whose record will not read is skipped here exactly as the
+        // old `if let Ok(f)` skipped it.
         let n = state.archive.len();
         let mut v = Vec::with_capacity(n);
         for i in 0..n {
-            if let Ok(f) = state.archive.by_index_raw(i) {
-                // Round-9 HIGH: real ZIP method code, not a DEFLATED stand-in.
-                // See `compression_method_code` for the mapping rationale.
-                let method: i64 = compression_method_code(&f.compression());
-                let extra = f
-                    .extra_data()
-                    .filter(|bytes| !bytes.is_empty())
-                    .map(ToOwned::to_owned);
-                let times = zip_entry_times(&f);
-                v.push((
-                    f.name().to_string(),
-                    method,
-                    f.size() as i64,
-                    f.compressed_size() as i64,
-                    f.crc32() as i64 & 0xFFFF_FFFFi64,
-                    extra,
-                    times,
-                ));
+            if let Some(meta) = entry_meta_at(state, i) {
+                v.push(meta);
             }
         }
         v
@@ -865,8 +942,17 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
-    for (name, method, size, csize, crc, extra, times) in entries {
-        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc, extra, times)?;
+    for meta in entries {
+        let ze = alloc_zip_entry(
+            ctx,
+            &meta.name,
+            meta.method,
+            meta.size,
+            meta.csize,
+            meta.crc,
+            meta.extra,
+            meta.times,
+        )?;
         ctx.invoke(
             al_class,
             "add",

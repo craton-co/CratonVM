@@ -36,7 +36,9 @@
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
 use cratonvm_jit_api::JitRuntimeHelpers;
-use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -191,10 +193,20 @@ fn make_byte_array(data: &[u8]) -> FakeObj {
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + data.len().max(1));
     let base = obj.base();
     unsafe {
-        *base.add(4) = ObjectKind::Array as u8;
-        *base.add(5) = ArrayElementType::Byte as u8;
-        let len_le = (data.len() as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+        // Through the constructor, not at literal offsets — see the note in
+        // `intrinsic_string_access.rs::write_array_header`. The pre-`header-16`
+        // offsets 4/5/12 set the length to `ObjectKind::Array as u8` == 1 and
+        // left the element type unset.
+        std::ptr::write(
+            base as *mut ObjectHeader,
+            ObjectHeader::new(
+                ClassId::new(0),
+                ObjectKind::Array,
+                ArrayElementType::Byte,
+                data.len() as u32, // Cast: fixture arrays are small
+                0,
+            ),
+        );
         if !data.is_empty() {
             std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), data.len());
         }
@@ -208,8 +220,16 @@ fn make_object(class_id: u32, value_ptr: i64, coder: i32, hash: i32) -> FakeObj 
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + 3 * SLOT_SIZE);
     let base = obj.base();
     unsafe {
-        std::ptr::copy_nonoverlapping(class_id.to_le_bytes().as_ptr(), base, 4);
-        *base.add(4) = ObjectKind::Object as u8;
+        std::ptr::write(
+            base as *mut ObjectHeader,
+            ObjectHeader::new(
+                ClassId::new(class_id),
+                ObjectKind::Object,
+                ArrayElementType::Reference, // unused for a non-array
+                0,
+                3, // value, coder, hash
+            ),
+        );
         // A `Value` field cell: tag (u32) at 0; an Object payload at
         // FIELD_CELL_PAYLOAD64_OFFSET (8); an Int payload at
         // FIELD_CELL_PAYLOAD32_OFFSET (4).

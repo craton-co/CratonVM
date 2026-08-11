@@ -5371,6 +5371,44 @@ impl G1Collector {
                 && h.mark_word.load(Ordering::Relaxed) == 0
         };
 
+        // How many bytes an object starting at `addr` may legally occupy here,
+        // or `None` when `addr` cannot be the start of a live object at all.
+        //
+        // Without this the BFS below traversed anything whose address merely
+        // landed inside some region — including a word in the MIDDLE of a live
+        // `byte[]`. `TestChunkedTransferEncodingWithProxy` fills a 1 GB array
+        // with `'A'`, so such an address reads back
+        // `cid=0x41414141 kind=Array len=0x41414141`, and the element loop then
+        // read 1094795585 references from it and walked off the end of the
+        // arena. That is the SIGSEGV in
+        // fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
+        // produced by this diagnostic, in a run that only crashed because the
+        // diagnostic was on.
+        //
+        // The linear-walk sibling (`DBG-ZERO`) has always had this bound —
+        // `if sz < HEADER_SIZE || off + sz > cursor { break }`. The BFS
+        // computed the same `off`/`cursor` pair and used it only to *print*
+        // ` ABOVE-CURSOR` beside a traversal it did anyway. The report carried
+        // the evidence it ignored.
+        let live_extent = |addr: usize| -> Option<usize> {
+            let ridx = self.lookup_region_for_addr(addr)?;
+            let region = &regions[ridx];
+            let off = addr.checked_sub(region.data.as_ptr() as usize)?;
+            let header = unsafe { &*(addr as *const ObjectHeader) };
+            let size = object_total_size(header);
+            if size < HEADER_SIZE {
+                return None;
+            }
+            // A humongous object legitimately runs past its start region's own
+            // buffer into the adjacent continuation regions, so `cursor` is the
+            // wrong bound for it; what IS true is that it starts at offset 0 of
+            // a `HumongousStart` region.
+            if region.region_type == RegionType::HumongousStart {
+                return (off == 0).then_some(size);
+            }
+            (off + size <= region.cursor).then_some(size)
+        };
+
         let mut stack: Vec<usize> = Vec::new();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut bad = 0usize;
@@ -5385,7 +5423,8 @@ impl G1Collector {
                 return;
             }
             let region = self.lookup_region_for_addr(addr);
-            if region.is_none() || is_zeroed(addr) {
+            let no_extent = region.is_some() && live_extent(addr).is_none();
+            if region.is_none() || is_zeroed(addr) || no_extent {
                 *bad += 1;
                 if *bad <= 16 {
                     let (hcid, hkind, hslots, hlen) = if holder != 0 {
@@ -5412,7 +5451,13 @@ impl G1Collector {
                          region={hregion:?} off={hoff:#x} cursor={hcur:#x}{}) -> {addr:#x} is {} \
                          (region={region:?})",
                         if hoff >= hcur { " ABOVE-CURSOR" } else { "" },
-                        if region.is_none() { "WILD" } else { "ZEROED" }
+                        if region.is_none() {
+                            "WILD"
+                        } else if no_extent {
+                            "NOT-AN-OBJECT-START (its size does not fit its region below the cursor)"
+                        } else {
+                            "ZEROED"
+                        }
                     );
                 }
                 return;
@@ -5434,11 +5479,22 @@ impl G1Collector {
             );
         }
         while let Some(addr) = stack.pop() {
+            // Only addresses `check_push` accepted reach this point, so the
+            // extent is known-good; recompute it rather than carry it, since a
+            // `seen` hit can push the same address from two holders.
+            let Some(extent) = live_extent(addr) else {
+                continue;
+            };
             let header = unsafe { &*(addr as *const ObjectHeader) };
             if header.kind() == ObjectKind::Array {
                 if header.element_type() == ArrayElementType::Reference {
                     let data = unsafe { (addr as *const u8).add(ARRAY_DATA_OFFSET) };
-                    for k in 0..header.array_length() as usize {
+                    // Belt and braces over the extent check: read no further
+                    // than the object's own payload even if `array_length()`
+                    // claims more. `array_length()` is a field of the very
+                    // header this walk is trying to decide it can trust.
+                    let capacity = extent.saturating_sub(ARRAY_DATA_OFFSET) / 8;
+                    for k in 0..(header.array_length() as usize).min(capacity) {
                         let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                         check_push(raw, addr, "array-elem", k, &mut stack, &mut seen, &mut bad);
                     }

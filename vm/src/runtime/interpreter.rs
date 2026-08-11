@@ -2672,6 +2672,12 @@ pub fn execute(
                     let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
                     let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
                     let mut ldc_class_info_early: Vec<(usize, u32, u16)> = Vec::new();
+                    // The `ldc`-family pcs whose constant is floating-point.
+                    // Codegen types these by their consuming opcode, but the
+                    // deopt operand-stack snapshot has no consuming opcode to
+                    // ask — see `x64::Compiler::ldc_fp_pcs`.
+                    let mut ldc_fp_pcs_early: rustc_hash::FxHashSet<usize> =
+                        rustc_hash::FxHashSet::default();
                     let mut has_unsupported_ldc = false;
                     if !scan.ldc_ops.is_empty() {
                         let cm_lock = shared.classes.class_manager.read();
@@ -2686,6 +2692,7 @@ pub fn execute(
                                     Some(ConstantPoolEntry::Float(v)) => {
                                         ldc_info_early.push((pc_ldc, v.to_bits() as i64));
                                         // Cast: JIT ABI -- float bits to i64
+                                        ldc_fp_pcs_early.insert(pc_ldc);
                                     }
                                     Some(ConstantPoolEntry::StringReference { string_index })
                                         if class
@@ -2756,7 +2763,10 @@ pub fn execute(
                             for &(pc_ldc, cp_idx) in &scan.ldc2w_ops {
                                 let val = match class.constant_pool.get(cp_idx) {
                                     Some(ConstantPoolEntry::Long(v)) => *v,
-                                    Some(ConstantPoolEntry::Double(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                                    Some(ConstantPoolEntry::Double(v)) => {
+                                        ldc_fp_pcs_early.insert(pc_ldc);
+                                        v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                                    }
                                     _ => continue,
                                 };
                                 ldc2w_info_early.push((pc_ldc, val));
@@ -2855,6 +2865,7 @@ pub fn execute(
                         // StringReference arm in the ldc resolver above.
                         ldc_class_info_early,
                         ldc2w_info_early,
+                        ldc_fp_pcs_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
                         &helpers,
