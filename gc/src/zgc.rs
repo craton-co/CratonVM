@@ -1799,6 +1799,66 @@ impl ZObjectStartBits {
         self.overflow_len.load(Ordering::Acquire) != 0
     }
 
+    /// The greatest recorded start at or below `addr`, or `None`.
+    ///
+    /// This is the whole of interior-pointer resolution. Allocations do not
+    /// overlap, so the ONLY base whose extent can contain `addr` is the
+    /// greatest one `<= addr`: find it, deref one header, compare one extent.
+    /// A forward walk reaches the same candidate — after visiting every base
+    /// below it and dereferencing every one of their headers.
+    ///
+    /// WHY THAT MATTERED. `ZgcRealHeap::is_heap_addr` is not a GC-only path:
+    /// `VmHeap::is_heap_addr`'s ZGC arm feeds it per-slot conservative root
+    /// scanning over ambiguous JVM-long-vs-jobject operand words, so every
+    /// interior pointer and every long bit pattern that happens to land inside
+    /// the arena envelope bought a full walk of the object-start bitmap up to
+    /// the arena's high-water mark. On a heap whose cursor has reached capacity
+    /// that is the entire bitmap — ~3M word loads plus a header dereference per
+    /// set bit, per probe. Measured with `perf record` on
+    /// `type.temporal.InstantTests` (2026-08-11, Azure Linux, default
+    /// collector): **80.7% of all CPU samples in `VmHeap::is_heap_addr`**, with
+    /// another 11.5% in `object_body_size` — the header deref inside that walk.
+    /// The class takes 6.7 s on real HotSpot and had not finished in 1800 s.
+    ///
+    /// Backwards, the scan stops at the first set bit below `addr`, which in a
+    /// populated heap is a handful of words away. It is never worse in shape
+    /// than the forward walk it replaces (both are bounded by the bitmap), and
+    /// it dereferences exactly one header instead of one per live object.
+    ///
+    /// The `overflow` set is deliberately NOT consulted here — it carries no
+    /// ordering, so "greatest at or below" is not a question it can answer. The
+    /// caller keeps the full walk for that arm; see [`Self::has_spill`].
+    fn nearest_base_at_or_below(&self, addr: usize) -> Option<usize> {
+        if self.span == 0 || self.nwords == 0 {
+            return None;
+        }
+        let off = addr.checked_sub(self.base)?;
+        // Past the covered span: the last gridded slot is still the greatest
+        // candidate at or below `addr`.
+        let off = off.min(self.span - 1);
+        let bit = off >> 3; // floor onto the 8-byte grid
+        let mut w = bit >> 6;
+        debug_assert!(w < self.nwords, "bit index is derived from a bounded offset");
+        // Keep only bits at or below `bit` in the first word. `u64::MAX >> k`
+        // has its low `64 - k` bits set, so `k = 63 - (bit & 63)` leaves
+        // exactly bits `0..=(bit & 63)`.
+        let k = 63 - (bit & 63);
+        // SAFETY: `w < self.nwords`, checked above.
+        let mut word = unsafe { (*self.words.add(w)).load(Ordering::Acquire) } & (u64::MAX >> k);
+        loop {
+            if word != 0 {
+                let b = 63 - word.leading_zeros() as usize;
+                return Some(self.base + (((w << 6) | b) << 3));
+            }
+            if w == 0 {
+                return None;
+            }
+            w -= 1;
+            // SAFETY: `w` only decreases from a value `< self.nwords`.
+            word = unsafe { (*self.words.add(w)).load(Ordering::Acquire) };
+        }
+    }
+
     /// Visit every set start, ASCENDING. `f` returns `false` to stop early.
     ///
     /// `end_hint` is a PERFORMANCE BOUND, not a filter: every base strictly
@@ -1973,6 +2033,23 @@ impl ZObjectStarts {
         match &self.kind {
             ZObjectStartsKind::Bits(bits) => bits.has_spill(),
             ZObjectStartsKind::Hash(_) => true,
+        }
+    }
+
+    /// The greatest base at or below `addr` — see
+    /// [`ZObjectStartBits::nearest_base_at_or_below`] for why interior-pointer
+    /// resolution is one backwards bit scan and not a walk.
+    ///
+    /// `None` on the `Hash` arm, and `None` whenever the bitmap has a spill:
+    /// neither can order what it holds, so neither can answer "greatest at or
+    /// below". A `None` means "ask the walk", never "no such base".
+    #[inline]
+    fn nearest_base_at_or_below(&self, addr: usize) -> Option<usize> {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) if !bits.has_spill() => {
+                bits.nearest_base_at_or_below(addr)
+            }
+            _ => None,
         }
     }
 
@@ -2647,7 +2724,26 @@ impl ZgcRealHeap {
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
         let ptr = {
             let mut arena = self.arena.lock();
-            let ptr = match arena.alloc(size, 8) {
+            let mut got = arena.alloc(size, 8);
+            if got.is_none() {
+                // Before this can be called a failure: every live TLAB is
+                // holding a chunk whose unused tail is arena space no allocator
+                // can see. On a non-compacting heap that tail is also the piece
+                // most likely to be ADJACENT to a free hole (a chunk is carved
+                // from one), so handing it back can both supply the bytes and
+                // let `Arena::alloc`'s merge re-form a bigger span.
+                //
+                // Lock order is cell -> arena, never the reverse, so the arena
+                // guard has to go first. Dropping it is safe here: the first
+                // attempt already failed, and a peer that allocates in the
+                // window can only make the retry fail again — which is exactly
+                // the pre-existing answer.
+                drop(arena);
+                self.retire_all_tlabs();
+                arena = self.arena.lock();
+                got = arena.alloc(size, 8);
+            }
+            let ptr = match got {
                 Some(p) => p,
                 None => {
                     // Allocation failure on a NON-COMPACTING heap is not the
@@ -2906,12 +3002,45 @@ impl ZgcRealHeap {
         if !self.registry.has_spill() && (addr < self.arena_base || addr >= self.arena_end) {
             return None;
         }
+        // Screen 3 — the one that removes the walk instead of bounding it.
+        //
+        // Allocations do not overlap, so the only base whose extent can contain
+        // `addr` is the greatest base `<= addr`. On the bitmap arm (no spill)
+        // that is one backwards bit scan and ONE header dereference — see
+        // `ZObjectStartBits::nearest_base_at_or_below` for the `perf record`
+        // that made this the top of the profile (80.7% of all CPU samples on
+        // `type.temporal.InstantTests`, a class HotSpot finishes in 6.7 s).
+        //
+        // Screen 2 below bounded the same walk by the arena high-water mark,
+        // which helps only while the cursor is low; once a long-running heap
+        // has bumped to capacity the bound is the whole bitmap again. This
+        // does not depend on occupancy at all.
+        if let Some(base) = self.registry.nearest_base_at_or_below(addr) {
+            let header = unsafe { &*(base as *const ObjectHeader) };
+            // Same refusal as the walk below: an unsizable header cannot be
+            // said to CONTAIN anything.
+            if let Some(size) = Self::alloc_size(header) {
+                if let Some(end) = base.checked_add(size) {
+                    if addr >= base && addr < end {
+                        // SAFETY: the registry contains only live bases.
+                        return Some(unsafe { ObjectRef::from_raw(base as *mut u8) });
+                    }
+                }
+            }
+            // The nearest base does not cover `addr`, and no LOWER base can
+            // (its extent would have to span across this one). Definitive.
+            return None;
+        }
         // Screen 2 — bound the walk by the arena's high-water mark. Every base
         // ever handed out sits below `arena_base + used` (the cursor only
         // advances, and free-list blocks are carved from below it), so this
         // restores the O(bytes actually allocated) shape the hash iteration
         // had. One uncontended arena acquire, released immediately, on a path
         // that previously took the registry mutex TWICE.
+        //
+        // Reached only on the `Hash` kill-switch arm or after a grid spill —
+        // neither can order what it holds, so neither can answer "greatest at
+        // or below" and both keep the walk.
         let end_hint = self.arena_base.saturating_add(self.arena.lock().used());
         // Interior pointers: fall back to the O(live) extent walk. Same answer
         // as the `FxHashSet` iteration this replaced, and on the bitmap arm it
@@ -3623,16 +3752,48 @@ const ZGC_TLAB_ALIGN: usize = 8;
 
 /// Ceiling on a TLAB chunk carved from the arena.
 ///
-/// Deliberately **below** `crate::tlab::default_tlab_size()` (256 KiB). The
-/// shared default is sized for the generational young arena, which is disjoint
-/// from the accounting this heap performs; here every byte sitting in a live
-/// chunk but not yet handed to an object is a byte `ZgcRealHeap::allocated`
-/// does not know about (see [`ZgcRealHeap::alloc_tlab`] on accounting). That
-/// blind spot is bounded by `live_threads * chunk`, so the chunk is the knob
-/// that bounds it. 64 KiB still amortises the arena mutex over ~600 typical
-/// (104-byte) objects, i.e. a ~600x reduction in arena-lock traffic, at a
-/// quarter of the accounting blind spot a 256 KiB chunk would cost.
-const ZGC_TLAB_MAX_CHUNK: usize = 64 * 1024;
+/// Two forces pull on this number in opposite directions.
+///
+/// DOWN: every byte sitting in a live chunk but not yet handed to an object is
+/// a byte `ZgcRealHeap::allocated` does not know about (see
+/// [`ZgcRealHeap::alloc_tlab`] on accounting). That blind spot is bounded by
+/// `live_threads * chunk`, so the chunk is the knob that bounds it. This was
+/// 64 KiB for that reason alone — deliberately below
+/// `crate::tlab::default_tlab_size()` (256 KiB), which is sized for the
+/// generational young arena and its disjoint accounting.
+///
+/// UP, and this is the force that was missing: **on a non-compacting heap the
+/// chunk size sets the GRANULARITY OF FREE-LIST HOLES.** A chunk is one
+/// `arena.alloc`; the objects inside it are freed individually by the sweep and
+/// merged back by the coalescer, but a single survivor anywhere in a chunk
+/// walls it off from its neighbours. The steady state is therefore a free list
+/// whose largest block is about one chunk — and an allocation LARGER than a
+/// chunk can then never be served again, no matter how much of the heap is
+/// free.
+///
+/// 64 KiB was the worst possible value for that, because a 64 KiB hole is
+/// exactly too small for one of the most common large Java allocations there
+/// is: `new T[8192]` is `8192 * 8 + 16 = 65552` bytes. Measured on the
+/// 2026-08-11 Azure Linux Hibernate run, `sql.exec.SmokeTests` died with
+/// `OutOfMemoryError` on precisely that array — ANTLR's
+/// `ParserATNSimulator.computeTargetState` allocating `DFAState[8192]` — with
+/// the guard line reading `free_list_bytes=1211993376 largest_free_block=65528`:
+/// 1.13 GiB free, short by 24 bytes. The same class passes on the same heap
+/// with `CRATONVM_ZGC_TLAB=0` (no chunks, no walls) and on G1 (which
+/// evacuates).
+///
+/// 512 KiB keeps the hole granularity an order of magnitude above the array
+/// shapes real workloads repeat, and raises `max_tlab_alloc` (`chunk / 8`) from
+/// 8 KiB to 64 KiB so mid-sized arrays stop needing an arena hole at all. The
+/// accounting blind spot it costs is `live_threads * 512 KiB` — a few MiB on
+/// the thread counts this VM runs, against a heap sized in gigabytes — and the
+/// unused tail is returned to the free list at every retire
+/// ([`ZgcRealHeap::tlab_retire_locked`]), so it is a reservation, not waste.
+///
+/// Small heaps are unaffected: [`ZArenaTlabRegistry::chunk_bytes_for_capacity`]
+/// takes `capacity / 1024` first, so this ceiling only binds above ~512 MiB,
+/// which is exactly where the fragmentation it exists to prevent appears.
+const ZGC_TLAB_MAX_CHUNK: usize = 512 * 1024;
 
 /// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
 ///
@@ -5541,27 +5702,11 @@ impl GarbageCollector for ZgcRealHeap {
             // the free list. Merging adjacent (and defensively overlapping)
             // holes rebuilds them into a few large spans that route to the
             // unbounded large tier, restoring reuse.
-            let sorted = arena.free_blocks_sorted();
-            if sorted.len() > 1 {
-                arena.clear_free_list();
-                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
-                for (off, sz) in sorted {
-                    if let Some(last) = merged.last_mut() {
-                        let last_end = last.0 + last.1;
-                        if off <= last_end {
-                            // Adjacent or overlapping: extend to the farther
-                            // end so no span is ever double-served.
-                            let new_end = last_end.max(off + sz);
-                            last.1 = new_end - last.0;
-                            continue;
-                        }
-                    }
-                    merged.push((off, sz));
-                }
-                for (off, sz) in merged {
-                    arena.add_free_block(off, sz);
-                }
-            }
+            //
+            // The merge itself now lives on `Arena` (`coalesce_free_list`), so
+            // this sweep and the last-resort merge `Arena::alloc` runs before
+            // it returns `None` cannot drift apart.
+            arena.coalesce_free_list();
             // Un-bump a wholly-free tail. Coalescing above has made the topmost
             // span maximal, so this is one comparison — and it is the only
             // thing on a non-compacting heap that can restore a large
@@ -7686,6 +7831,60 @@ mod tests {
             assert!(!starts.contains(a), "remove must clear {a:#x}");
         }
         assert!(starts.bases().is_empty());
+    }
+
+    /// The backwards bit scan must answer EXACTLY what a forward walk answers.
+    ///
+    /// `nearest_base_at_or_below` replaces an O(arena-span) forward walk with a
+    /// backwards scan from `addr`, and `is_heap_addr` treats its answer as
+    /// definitive (a lower base cannot cover `addr` without spanning across the
+    /// nearest one). If the scan ever disagreed with the walk, conservative root
+    /// scanning would silently stop rooting an object — a crash, not a
+    /// slowdown. Cross-check it against a brute-force maximum over `bases()`,
+    /// probing every 8-byte slot in the covered span so word boundaries, the
+    /// low bit of a word, the high bit of a word and the empty prefix below the
+    /// first base are all hit.
+    #[test]
+    fn nearest_base_at_or_below_matches_a_brute_force_walk() {
+        let starts = ZObjectStarts::with_bitmap(TEST_BASE, TEST_SPAN, true);
+        // Deliberately awkward spacing: one at the very first slot, a pair
+        // inside one word, a pair straddling a 64-bit word boundary, and a gap
+        // wide enough to force a multi-word backwards scan.
+        let inserted: Vec<usize> = [0usize, 8, 24, 504, 512, 520, 4096]
+            .iter()
+            .map(|d| TEST_BASE + d)
+            .filter(|a| *a < TEST_BASE + TEST_SPAN)
+            .collect();
+        for &a in &inserted {
+            starts.insert(a);
+        }
+        assert!(!starts.has_spill(), "the grid must encode all of these");
+
+        let mut all = starts.bases();
+        all.sort_unstable();
+        assert_eq!(all, inserted, "the fixture itself must be what we think");
+
+        let probe_end = (TEST_SPAN).min(8192);
+        for off in (0..probe_end).step_by(8) {
+            let addr = TEST_BASE + off;
+            let brute = all.iter().copied().filter(|&b| b <= addr).max();
+            assert_eq!(
+                starts.nearest_base_at_or_below(addr),
+                brute,
+                "disagreement at offset {off}",
+            );
+        }
+        // Interior (non-grid) addresses floor onto their slot, which is what
+        // extent containment needs.
+        assert_eq!(
+            starts.nearest_base_at_or_below(TEST_BASE + 519),
+            Some(TEST_BASE + 512),
+        );
+        // A spill removes the ordering guarantee, so the scan must decline and
+        // send the caller back to the walk.
+        starts.insert(TEST_BASE + 12); // off-grid -> overflow
+        assert!(starts.has_spill());
+        assert_eq!(starts.nearest_base_at_or_below(TEST_BASE + 4096), None);
     }
 
     /// `is_heap_addr` still resolves an INTERIOR pointer to its base, and still

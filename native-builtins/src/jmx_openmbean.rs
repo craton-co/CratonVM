@@ -57,6 +57,24 @@
 //!   `java.lang.reflect.Type`), return a String-identity mapping so
 //!   the recursion terminates instead of throwing OpenDataException.
 //!
+//! 2026-08-11 — the two defence-in-depth overlays above are now OFF by default
+//! on a real-JDK run (see `real_mxbean_mapping_enabled`). They cost more than
+//! they bought: typing every unrecognised type as `SimpleType.STRING` and
+//! making `toOpenValue` the identity meant `MBeanServer.getAttribute` handed
+//! back the raw Java value, so `java.lang:type=Memory` / `HeapMemoryUsage`
+//! answered a `java.lang.management.MemoryUsage` where every other JVM answers
+//! a `CompositeDataSupport`.
+//!
+//! The PRIMARY fix — the `getMethods(Class)` Object-method filter described
+//! above — stays registered unconditionally, and it is why the real
+//! `DefaultMXBeanMappingFactory` now terminates here: the `Class` →
+//! `AnnotatedType[]` self-reference that started this whole workaround is
+//! never offered to the mapping factory in the first place. Measured against
+//! JDK 25 on Linux, the real machinery reproduces HotSpot's answers exactly
+//! for every platform-MXBean attribute this VM can serve, and rejects a
+//! genuinely self-referential MXBean type with HotSpot's own
+//! `NotCompliantMBeanException` rather than looping.
+//!
 //! Security posture:
 //! * No `unsafe` code anywhere in this module.
 //! * Filter list is a static set of well-known JDK Object method
@@ -1254,7 +1272,63 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// Anchor: `T19_H14_OPENMBEAN`. Registers the JMX OpenType / MXBean
 /// translation natives that unblock KC16 boot through
 /// `MBeanServer.registerMBean(MemoryMXBean)`.
+/// Should the JDK's own MXBean type-mapping machinery be left alone?
+///
+/// **Default: yes.** The `mappingForType` / `makeMapping` / `toOpenValue` /
+/// `ConvertingMethod.from` overrides below replace
+/// `DefaultMXBeanMappingFactory` with a synthetic mapping that types every
+/// unrecognised Java type as `SimpleType.STRING` and converts nothing
+/// (`toOpenValue` is identity). That is why
+/// `MBeanServer.getAttribute("java.lang:type=Memory", "HeapMemoryUsage")` used
+/// to hand back a raw `java.lang.management.MemoryUsage` where every other JVM
+/// returns a `CompositeDataSupport`, and why `getMBeanInfo` described every
+/// composite attribute as `java.lang.String`.
+///
+/// They were added because the real recursion was believed not to terminate on
+/// this VM (`OpenDataException` through `Class.getAnnotatedInterfaces()`).
+/// Measured 2026-08-11 against JDK 25 on Linux, that is no longer true: with
+/// the real machinery restored, every platform-MXBean attribute this VM can
+/// answer matches HotSpot exactly — `MemoryUsage` and every `MemoryPool`
+/// usage become `CompositeDataSupport`, `SystemProperties` becomes
+/// `TabularDataSupport`, `InputArguments` becomes `String[]`, and
+/// `getMBeanInfo` carries the real `CompositeType`. The recursion terminates:
+/// a self-referential MXBean type is rejected with the same
+/// `NotCompliantMBeanException` HotSpot raises, rather than hanging — where
+/// the synthetic mapping silently *accepted* it and handed back raw Java
+/// objects.
+///
+/// Gate, do not delete. `synthetic-jdk` builds have no real
+/// `com.sun.jmx.mbeanserver` bytecode to fall back to and keep the overrides;
+/// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1` restores them on a real-JDK run,
+/// which is the one-run answer if an application MBean ever does drive the
+/// real factory into a recursion this VM cannot finish.
+///
+/// Mirrors `native-io`'s `real_raf_enabled()`, which flipped the same way for
+/// the same reason.
+pub(crate) fn real_mxbean_mapping_enabled() -> bool {
+    if cfg!(feature = "synthetic-jdk") {
+        return false;
+    }
+    !matches!(
+        std::env::var("CRATONVM_SYNTHETIC_MXBEAN_MAPPING").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
+    register_jmx_openmbean_natives_with(registry, !real_mxbean_mapping_enabled());
+}
+
+/// [`register_jmx_openmbean_natives`] with the type-mapping decision supplied
+/// rather than read from the environment, so a test can exercise both arms
+/// without touching process-wide state.
+///
+/// `synthetic_mapping = true` reinstates the pre-2026-08-11 overlay that types
+/// unrecognised Java types as `SimpleType.STRING` and converts nothing.
+pub fn register_jmx_openmbean_natives_with(
+    registry: &mut NativeMethodRegistry,
+    synthetic_mapping: bool,
+) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T19_H14_OPENMBEAN — primary Object-method filter.
@@ -1276,17 +1350,24 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/List;",
         native_introspector_get_methods,
     );
+    // Defence in depth: short-circuit the OpenType recursion at the
+    // mapping factory level too, so plain MBeans don't hit it.
+    if synthetic_mapping {
     // Defence in depth: if a path still reaches ConvertingMethod.from
     // with an Object method (e.g. tests bypass the introspector),
     // short-circuit by returning null.
+    //
+    // Inside the gate: this override installs an IDENTITY return mapping, so
+    // leaving it registered would keep `getAttribute` handing back the raw
+    // Java value even with the mapping factory restored. The Object-method
+    // filter it also provides is already covered by the `getMethods`
+    // registrations above, which stay unconditional.
     registry.register(
         "com/sun/jmx/mbeanserver/ConvertingMethod",
         "from",
         "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
         native_converting_method_from,
     );
-    // Defence in depth: short-circuit the OpenType recursion at the
-    // mapping factory level too, so plain MBeans don't hit it.
     registry.register(
         "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
         "mappingForType",
@@ -1352,12 +1433,19 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_mxbean_mapping_identity,
     );
+    } // end if synthetic_mapping
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
-    // OpenConverter path. JDK 25 splits the OpenType analysis between
-    // `MXBeanMappingFactory` (entry) and the package-private
-    // `OpenConverter.toConverter(Type)` (cache + recursion). We trap
-    // both with the same cycle-detection wrapper.
+    // OpenConverter path.
+    //
+    // INERT ON JDK 25 (checked 2026-08-11 with `javap --module java.management`):
+    // neither `com.sun.jmx.mbeanserver.OpenConverter` nor `MappedMXBeanType`
+    // exists on that image — both are pre-JDK-7 spellings, and the OpenType
+    // analysis lives entirely in `DefaultMXBeanMappingFactory`. Left registered
+    // rather than deleted because they still name real classes on the older
+    // images this VM is expected to run, and a registration that targets
+    // nothing costs nothing; do not read their presence as evidence that this
+    // path is live.
     registry.register(
         "com/sun/jmx/mbeanserver/OpenConverter",
         "toConverter",
@@ -2079,23 +2167,88 @@ mod tests {
             .is_some());
     }
 
+    /// The type-mapping overlay is the synthetic arm ONLY.
+    ///
+    /// Registered by default, `ConvertingMethod.from` installs an identity
+    /// return mapping and `mappingForType` types everything it does not
+    /// recognise as `SimpleType.STRING`, which is what made
+    /// `MBeanServer.getAttribute` answer a raw `java.lang.management.
+    /// MemoryUsage` instead of a `CompositeDataSupport`.
     #[test]
-    fn test_converting_method_from_registered() {
-        let mut r = NativeMethodRegistry::new();
-        register_jmx_openmbean_natives(&mut r);
-        assert!(r
-            .find(
+    fn type_mapping_overlay_is_synthetic_only() {
+        const MAPPING_OVERLAY: &[(&str, &str, &str)] = &[
+            (
                 "com/sun/jmx/mbeanserver/ConvertingMethod",
                 "from",
-                "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;"
-            )
-            .is_some());
+                "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
+                "mappingForType",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
+                "mappingForType",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/DefaultMXBeanMappingFactory",
+                "makeMapping",
+                "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMapping",
+                "toOpenValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            (
+                "com/sun/jmx/mbeanserver/MXBeanMapping",
+                "fromOpenValue",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+        ];
+
+        let mut real = NativeMethodRegistry::new();
+        register_jmx_openmbean_natives_with(&mut real, false);
+        for (c, m, d) in MAPPING_OVERLAY {
+            assert!(
+                real.find(c, m, d).is_none(),
+                "{c}.{m} must not shadow the real mapping factory by default"
+            );
+        }
+
+        let mut synth = NativeMethodRegistry::new();
+        register_jmx_openmbean_natives_with(&mut synth, true);
+        for (c, m, d) in MAPPING_OVERLAY {
+            assert!(
+                synth.find(c, m, d).is_some(),
+                "{c}.{m} must still be available for synthetic-jdk builds"
+            );
+        }
+
+        // The Object-method filter is the PRIMARY fix, not part of the
+        // overlay: it is what keeps the real factory from being offered the
+        // `Class` -> `AnnotatedType[]` self-reference at all, so it stays
+        // registered in both arms.
+        for r in [&real, &synth] {
+            assert!(r
+                .find(
+                    "com/sun/jmx/mbeanserver/MXBeanIntrospector",
+                    "getMethods",
+                    "(Ljava/lang/Class;)Ljava/util/List;"
+                )
+                .is_some());
+        }
     }
 
     #[test]
     fn test_mapping_for_type_registered() {
+        // Both `mappingForType` spellings belong to the synthetic overlay;
+        // `type_mapping_overlay_is_synthetic_only` above owns the full arm
+        // comparison. This one keeps the synthetic arm's own coverage.
         let mut r = NativeMethodRegistry::new();
-        register_jmx_openmbean_natives(&mut r);
+        register_jmx_openmbean_natives_with(&mut r, true);
         assert!(
             r.find(
                 "com/sun/jmx/mbeanserver/MXBeanMappingFactory",

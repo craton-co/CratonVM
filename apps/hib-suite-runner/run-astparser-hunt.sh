@@ -68,7 +68,7 @@ one_run() {
   CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" \
       "$BIN" "${VMFLAGS[@]}" -Dcraton.batch=1 "$RUNNER_CLASS" "$CLS" >"$log" 2>&1
   local rc=$?
-  local rline; rline=$(grep -m1 "^@@RESULT " "$log")
+  local rline; rline=$(grep -m1 -o "@@RESULT .*" "$log")
   local hits; hits=$(grep -c "$SIG" "$log")
   local ok failed
   ok=$(printf '%s' "$rline"     | grep -o 'ok=[0-9]*'     | cut -d= -f2)

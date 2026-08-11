@@ -126,7 +126,7 @@ printf '%-5s %-5s %-7s %-9s %-6s %s\n' run rc boots warns dumps result
 for ((i=0; i<RUNS; i++)); do
   log="$OUTDIR/run-$i.log"
   rc="$(cat "$OUTDIR/run-$i.rc" 2>/dev/null)"
-  res="$(grep -m1 '^@@RESULT ' "$log" 2>/dev/null | cut -c1-70)"
+  res="$(grep -m1 -o '@@RESULT .*' "$log" 2>/dev/null | cut -c1-70)"
   printf '%-5s %-5s %-7s %-9s %-6s %s\n' "$i" "${rc:-?}" \
       "$(count "$log" 'Database info')" \
       "$(count "$log" 'getTypeName')" \

@@ -1263,9 +1263,17 @@ unsafe fn try_call_compiled_entry(
     // caller's rbp after the callee returns, so a later GC would walk the
     // dead callee frame (see `top_rbp_mirror_write`). Snapshot + restore the
     // mirror around the raw entry call.
+    //
+    // Both halves or neither: the callee's prologue publishes its IDENTITY
+    // beside its rbp, so restoring only the rbp would leave the mirrors naming
+    // two different frames — the caller's rbp with the callee's identity — and
+    // nothing downstream can detect that, because both halves would still read
+    // consistently out of the mirrors. See `top_cm_id_mirror_read`.
     let saved_top_rbp = crate::jit::conservative_roots::top_rbp_mirror_read();
+    let saved_cm_id = crate::jit::conservative_roots::top_cm_id_mirror_read();
     let r = try_call_compiled_entry_inner(entry, needs_ctx, vm_ptr, args_slice);
     crate::jit::conservative_roots::top_rbp_mirror_write(saved_top_rbp);
+    crate::jit::conservative_roots::top_cm_id_mirror_write(saved_cm_id);
     r
 }
 
