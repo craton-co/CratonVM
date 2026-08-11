@@ -52,6 +52,15 @@ public class RJdkLookupIn {
         }
     }
 
+    /**
+     * A PUBLIC nestmate. Distinguishes "same nest" (which decides {@code in()}
+     * from a full-power lookup) from "public and exported" (which decides
+     * whether {@code publicLookup().in()} keeps UNCONDITIONAL). {@link Nested}
+     * answers 31 and 0 to those two; this one answers 31 and 32.
+     */
+    public static class PublicNested {
+    }
+
     private static int secret() {
         return 42;
     }
@@ -99,15 +108,27 @@ public class RJdkLookupIn {
                 + "," + l.in(String.class).lookupModes());
     }
 
-    /** publicLookup() is UNCONDITIONAL(32), and in() never raises it. */
+    /**
+     * publicLookup() is UNCONDITIONAL(32), and in() never raises it — but it
+     * does not carry it everywhere either. UNCONDITIONAL survives {@code in()}
+     * only when the target class is itself PUBLIC and in an unconditionally
+     * exported package; against a package-private target it drops to 0, not to
+     * PUBLIC. Measured on OpenJDK 25 — a floor that manufactures 1 or 32 here
+     * hands out access the JDK withholds.
+     */
     static void publicLookupIsUnconditional() {
         Lookup p = MethodHandles.publicLookup();
         eq(p.lookupModes(), 32, "publicLookup()");
-        eq(p.in(RJdkLookupIn.class).lookupModes(), 32, "publicLookup().in(a class in this package)");
+        eq(p.in(RJdkLookupIn.class).lookupModes(), 32, "publicLookup().in(a PUBLIC class here)");
         eq(p.in(String.class).lookupModes(), 32, "publicLookup().in(a java.base class)");
-        eq(p.in(Nested.class).lookupModes(), 32, "publicLookup().in(a nested class)");
+        eq(p.in(PublicNested.class).lookupModes(), 32, "publicLookup().in(a PUBLIC nested class)");
+        eq(p.in(Nested.class).lookupModes(), 0,
+                "publicLookup().in(a package-private class) is 0, not 32 and not 1");
+        eq(p.in(RJdkLookupInMate.class).lookupModes(), 0,
+                "publicLookup().in(a package-private cousin) is 0");
         System.out.println("CK RJdkLookupIn publicLookup=" + p.lookupModes()
-                + "," + p.in(RJdkLookupIn.class).lookupModes());
+                + "," + p.in(RJdkLookupIn.class).lookupModes()
+                + "," + p.in(Nested.class).lookupModes());
     }
 
     /**
