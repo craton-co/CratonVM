@@ -114,29 +114,64 @@ java.base detector is `RJdkStrict`.
 | `Method.invoke` | `lang_class::native_method_invoke` | **now yes** | FIXED here |
 | `Constructor.newInstance` | `lang_class::native_constructor_new_instance` | yes | correct (wave-4) |
 | `Field/Method/Constructor.setAccessible(true)` | `lang_class::native_*_set_accessible` → `set_accessible_export_carve_out` | yes | correct (threadgroup §3) |
-| `Field.get` / `Field.set` | `lang_class::native_field_get`/`_set` → `enforce_module_check_on_field` | asks `opens` **unconditionally**, including for public fields | **OVER-DENIES** — see below |
-| `Field.getInt/getLong/.../setInt/...` | `field_get_raw` / `field_set_raw` → same helper | same | **OVER-DENIES** — same defect |
+| `Field.get` / `Field.set` | `lang_class::native_field_get`/`_set` → `field_access_phase` → `enforce_module_check_on_field` | asks `exports`, for public and non-public fields alike | **CLOSED 2026-08-07**, not by this lane — see below |
+| `Field.getInt/getLong/.../setInt/...` | `field_get_raw` / `field_set_raw` → the same funnel | same | **CLOSED** with it |
 | `Method.getAnnotation(s)` / `Field.getAnnotation(s)` / parameter annotations | `lang_class::native_*_get_annotation*` | no gate | correct — HotSpot does not access-check annotation reads (measured OK above) |
 | record component accessor | `RecordComponent.getAccessor()` returns a `Method`; invocation goes through `Method.invoke` | inherits the fix | correct |
 | `MethodHandles.Lookup.unreflect` / `unreflectSpecial` / `unreflectGetter` / `unreflectSetter` / `unreflectConstructor` / `findVirtual` / `findStatic` / `findGetter` / … | `lang_invoke.rs` (`lookup_unreflect` &co.) | **no module check of any kind** | **OPEN, same species** — HotSpot throws IllegalAccessException (measured above). Not this lane's file. |
 | `Class.newInstance()` (deprecated) | `lang_class::native_class_new_instance` | no check at all (not even the caller check) | **OPEN**, but synthetic-jdk only — it is registered exclusively in `register_synthetic_overrides`; under `--real-jdk` the real bytecode routes to `Constructor.newInstance` |
 
-### The `Field.get` row, stated precisely
+### The `Field.get` row — ADJUDICATED 2026-08-11: it was already fixed
 
-`enforce_module_check_on_field` calls `check_reflection_module_access`, which is
-the `opens` question, for EVERY field regardless of `ACC_PUBLIC`. On HotSpot 25 a
-public field of a public class in an exported-but-not-opened package reads fine
-without `--add-opens` — `System.out`, `Integer.MAX_VALUE`, `java.awt.Point.x` all
-measured OK above. CratonVM refuses them. This is the mirror image of the defect
-this page fixes — over-denial rather than fabricated success — and it is the same
-one-line shape: the public arm needs
-`check_reflection_export_access_with_target_id` as its widening disjunct, exactly
-as `set_accessible_export_carve_out` is for `setAccessible`.
+**This row was stale.** The body below is the filing as written; read it as
+history, not as a work item.
 
-Deliberately NOT changed here: it is a refusal-removing change on a hot path with
-no vector asserting either direction, so it wants its own A/B and its own probe
-(paired ALLOW/DENY questions, per the method note in the threadgroup page). It is
-recorded rather than fixed so the next lane does not have to rediscover it.
+> `enforce_module_check_on_field` calls `check_reflection_module_access`, which
+> is the `opens` question, for EVERY field regardless of `ACC_PUBLIC`. On
+> HotSpot 25 a public field of a public class in an exported-but-not-opened
+> package reads fine without `--add-opens` — `System.out`,
+> `Integer.MAX_VALUE`, `java.awt.Point.x` all measured OK above. CratonVM
+> refuses them. […] the public arm needs
+> `check_reflection_export_access_with_target_id` as its widening disjunct.
+>
+> Deliberately NOT changed here: it is a refusal-removing change on a hot path
+> with no vector asserting either direction, so it wants its own A/B and its own
+> probe.
+
+Checked against the source before writing anything, per the campaign's standing
+warning that a record's hand-off patch is often already in the tree. It is:
+
+* `enforce_module_check_on_field` (`native-builtins/src/lang_class.rs`) calls
+  **`check_reflection_export_access_with_target_id`**, not
+  `check_reflection_module_access`, and it does so on ONE arm for public and
+  non-public fields alike — the `is_public` split this row asked for was not
+  merely added, it was dissolved.
+* It landed in `dcfe77cb8` ("wave8: four defects reachable from ordinary Java",
+  2026-08-07), i.e. **the same day this page was filed**, from a different lane.
+  `git log -S` on the call expression names exactly that one commit.
+* Its doc comment carries the measurement this row asked for and then some —
+  paired ALLOW/DENY rows on Temurin 25.0.3 establishing that `opens` is not the
+  field-read gate at all (`String.hash` still throws under
+  `--add-opens java.base/java.lang=ALL-UNNAMED`) and that `exports` alone
+  decides it (`Unsafe.INVALID_FIELD_OFFSET` flips under `--add-exports` while
+  the private `Unsafe.theUnsafe` does not move). The vector is
+  `regression-suite/src/RJdkFieldModule.java`, which asserts the positive half.
+* Wave 8 also found the *other* half this row did not see: the public arm
+  returning `Ok` unconditionally would have been an UNDER-denial
+  (`Unsafe.INVALID_FIELD_OFFSET` must throw with no flags at all), so the
+  one-line "add a widening disjunct on the public arm" prescription written
+  above would have fixed the over-deny by opening an under-deny. **A record's
+  prescribed fix can be wrong even when its diagnosis is right.**
+
+What is left is a hazard, not a defect: `enforce_module_check_from_mirror` —
+the helper that asks `check_reflection_module_access` from a mirror slot — is
+now **caller-free** and sits three screens above the live `exports` gate, still
+compiling, still invisible (`dead_code` is allowed crate-wide at
+`native-builtins/src/lib.rs:9`). Two predicates answering the same question
+differently is the shape that produced several defects in this campaign, so it
+now carries a doc comment saying it must not be wired to a `get`/`set`/`invoke`
+path and why. It is kept rather than deleted because it is the surviving
+in-source statement of the `opens`-vs-`exports` distinction.
 
 ## Vectors
 
