@@ -30,6 +30,26 @@
 //! T2.5 unit tests in the bottom of this file exercise the synthetic
 //! path directly; in real-JDK mode the JDK's own JCK-equivalent
 //! test suite exercises the same contract through the bytecode path.
+//!
+//! ## This module holds ZERO contract §1.4 shadow rows, and cannot hold any
+//!
+//! Checked 2026-08-11 against a `--dump-native-registry` census of the shipped
+//! `cratonvm-cli` build: **not one** of its 11,665 registrations names this
+//! file. That is the `#[cfg(feature = "synthetic-jdk")]` on `pub mod
+//! util_time;` doing exactly what it says — the module is not compiled into
+//! the default build at all, and its three registrars are reached only from
+//! `register_builtins`, the synthetic arm. All three shadow ratchets
+//! (`bridge_shadows_bytecode`, `bridge_without_acc_native`,
+//! `BASELINE_SYNTHETIC_STUBS`) take their census in Compatible mode, so
+//! nothing here can move any of them by any amount — the same scoping trap
+//! `docs/architecture/natives-over-real-jdk-classes.md` §7 records for
+//! `regression-suite/bridge-ratchet.sh`.
+//!
+//! A shadow-retirement wave should therefore skip this file rather than
+//! re-derive that from a grep of its `registry.register` calls, which finds
+//! hundreds. The disposition this module actually wants is T2.5.15's — delete
+//! it — not a per-triple retirement. See
+//! docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md §0.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
