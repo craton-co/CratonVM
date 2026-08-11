@@ -18,7 +18,7 @@ which is what HotSpot prints on the same classpath.
 
 This is the root cause of 82 of the 90 test failures in
 `TomcatServletWebServerFactoryTests`, which had been on file as a throughput
-problem (`tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`).
+problem (`tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md`).
 It is a general `HashMap` defect, not a Tomcat or Spring one; that class is
 simply where it was caught.
 

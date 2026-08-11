@@ -209,7 +209,7 @@ passes all twelve:
   `JettyServletWebServerFactoryTests`,
   `CloudFoundryReactiveActuatorAutoConfigurationTests`) — the same throughput
   axis as above, already filed as
-  `known-issues/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`.
+  `fixed-suite-bugs/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-FIXED-20260811.md`.
 - `FileAlreadyExistsException`: **0 occurrences** across the run (was every
   `@WithPackageResources` class).
 - `listen on port 8080`: **0 occurrences** across the run (was every
