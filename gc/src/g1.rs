@@ -10509,6 +10509,95 @@ mod tests {
         );
     }
 
+    /// The root array is over-approximate on purpose (`collect_roots` screens
+    /// operand-stack slots with the RANGE check `is_heap_addr`, because the
+    /// strict probe dropped genuine young / mid-init roots), so a word that is
+    /// not an object start reaches the evacuator. It must neither be evacuated —
+    /// `evacuate_object` would size a memcpy from those bytes and install a
+    /// forwarding entry the VM's post-GC remap applies to the slot, rewriting a
+    /// Java `long` — nor be dropped, since the collector cannot prove it is not
+    /// a reference. Its region is pinned instead.
+    ///
+    /// Measured shape, on `org.h2.test.unit.TestValueMemory`: 6-8 such roots per
+    /// affected pause, every one of them COPIED before this fix.
+    #[test]
+    fn an_interior_pointer_root_pins_its_region_instead_of_being_evacuated() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 4);
+        let interior_addr = holder.as_ptr() as usize + HEADER_SIZE;
+
+        // Fabricate a header at the interior address whose TAG byte does not
+        // decode — the measured verdicts were `BadElementTag` /
+        // `ImplausibleShape`, i.e. bytes that are not a header at all.
+        // `object_total_size` still returns >= HEADER_SIZE for it, which is all
+        // the pre-fix evacuator checked before copying.
+        //
+        // SAFETY: `interior_addr` is the first field cell of a live 4-slot
+        // object this test owns, so both writes are in-bounds.
+        unsafe {
+            std::ptr::write(
+                interior_addr as *mut ObjectHeader,
+                ObjectHeader::new(
+                    ClassId::new(2),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                ),
+            );
+            (interior_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let interior = unsafe { ObjectRef::from_raw(interior_addr as *mut u8) };
+
+        let mut roots = vec![holder, interior];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            roots[1].as_ptr() as usize,
+            interior_addr,
+            "a root that is not an object must not be rewritten: the collector \
+             cannot tell it from a primitive long, and rewriting it changes a \
+             Java value"
+        );
+        assert!(
+            !result.pointer_map.contains_key(&interior_addr),
+            "no forwarding entry may be installed for a non-object address — the \
+             VM's post-GC remap applies the map to the very slot it came from"
+        );
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            holder.as_ptr() as usize,
+            "the cost of the pin, stated: the real object in that region does \
+             not move either"
+        );
+    }
+
+    /// The other arm: an ordinary root must NOT pin its region, or the fix above
+    /// would be satisfied by pinning everything and G1 would stop collecting.
+    #[test]
+    fn an_ordinary_object_root_does_not_pin_its_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = gc
+            .lookup_region_for_addr(obj.as_ptr() as usize)
+            .expect("the allocation is in a region");
+        let regions = gc.regions.lock();
+        assert!(
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[obj])
+                .contains(&idx),
+            "a real object root must leave its region collectable"
+        );
+        let interior =
+            unsafe { ObjectRef::from_raw((obj.as_ptr() as usize + HEADER_SIZE) as *mut u8) };
+        assert!(
+            gc.pinned_region_set_including_non_object_roots(&regions, &[interior])
+                .contains(&idx),
+            "an address inside the object's body is not an object start"
+        );
+    }
+
     /// A self-forwarded SEED handed to `record_outgoing_rset_edges` only has to
     /// be region-RESIDENT to reach the walk — `lookup_region_for_addr` answers
     /// "inside some region's span", not "is an object". A word above the
