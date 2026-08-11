@@ -291,14 +291,24 @@ def main(argv):
                 continue
             binds = dict(bind_re.findall(src))
             for rx in (tuple_re, find_re):
-                for c, m, d in rx.findall(src):
+                for mo in rx.finditer(src):
+                    c, m, d = mo.groups()
                     cls = binds.get(c, c.strip('"'))
                     # Require a class-shaped name and a descriptor-shaped
                     # descriptor. A bare identifier the file never bound is a
                     # local whose value is unknowable here, and guessing would
                     # pin an arbitrary row.
-                    if "/" in cls and d.startswith("("):
-                        pinned.add((cls, m, d))
+                    if "/" not in cls or not d.startswith("("):
+                        continue
+                    # `.find(...).is_none()` is the OPPOSITE of a pin: it
+                    # asserts the triple must NOT be registered. Reading one as
+                    # a pin would protect exactly the rows somebody went to the
+                    # trouble of forbidding — `file_channel.rs` forbids the
+                    # `Object`-tailed `FileChannelImpl.open`, and the first
+                    # version of this parser pinned it.
+                    if "is_none" in src[mo.end():mo.end() + 60]:
+                        continue
+                    pinned.add((cls, m, d))
             for cls in set(loopfind_re.findall(src)):
                 for m, d in pair_re.findall(src):
                     pinned.add((cls, m, d))
