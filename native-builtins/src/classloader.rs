@@ -9431,7 +9431,10 @@ pub(crate) fn lk_class_relation(
 /// `lookup().in(String[].class)` both raise `IllegalArgumentException`;
 /// `lookup().in(null)` raises `NullPointerException`. `regression-suite/src/
 /// RJdkLookupIn.java` is the vector.
-pub(crate) fn lk_check_in_target(ctx: &dyn NativeContext, target: Value) -> Result<(), VmError> {
+pub(crate) fn lk_check_in_target(
+    ctx: &dyn NativeContext,
+    target: Value,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let mirror = match target {
         Value::Object(Some(m)) => m,
         // `in(null)` is an NPE in the JDK, not an IAE and not a silent

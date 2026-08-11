@@ -4,7 +4,7 @@
 """BRIDGE-RATCHET GATE — a one-way ratchet on unadjudicated `Bridge` natives.
 
 Contract §1.5 defines a `Bridge` as what an `ACC_NATIVE` method binds to. The
-schema-3 census (`--dump-native-registry` with `--explain-jdk-only`) makes
+schema-4 census (`--dump-native-registry` with `--explain-jdk-only`) makes
 "does this registration's target actually carry `ACC_NATIVE` in the image?" a
 machine-readable fact, and the answer measured on JDK 25 is that **10,084 of
 10,844 `Bridge` registrations have no `ACC_NATIVE` target**. Nothing stopped
@@ -42,11 +42,13 @@ to not repeat.
 ## What it asserts
 
 1. `bridge.without_acc_native <= baseline` with `SLACK = 0` — the ratchet.
-2. `bridge.shadows_bytecode <= baseline` with `SLACK = 0`. The same ratchet on
+2. `bridge.shadows_bytecode_anywhere <= baseline` with `SLACK = 0`. The same ratchet on
    the subgroup that has already produced a defect: a `Bridge` shadowing
    concrete bytecode can reach §7 step 3's decline, which used to fall through
    to `UnsatisfiedLinkError` instead of to the bytecode (that is how
-   `--jdk-only` came to be unable to start a thread). 4,796 rows can reach it.
+   `--jdk-only` came to be unable to start a thread). 4,796 rows can reach it,
+   plus roughly 1,600 more that shadow bytecode they INHERIT — invisible until
+   schema 4 resolved `image_declaring_method` up the hierarchy.
 3. `total_rows >= MIN_TOTAL_ROWS` — a **collapse detector, not a measurement**.
    Same reasoning as `essential_registry_is_populated` in `stub_ratchet.rs`:
    the ratchet is a ratio argument and the denominator was never asserted, so a
@@ -93,9 +95,18 @@ from collections import Counter
 # file it reads. Bumped only when a *consumer* would misread the old shape.
 BLOCK_SCHEMA = 1
 
-# The census schema that carries `image_declaring_method`. Anything else cannot
-# answer the question this gate asks.
-REQUIRED_CENSUS_SCHEMA = 3
+# The census schema that carries `image_declaring_method` WITH its four
+# `inherited_*` keys. Anything else cannot answer the question this gate asks.
+#
+# Schema 3 carried the column but asked it of ONE class name, so a triple
+# declared `ACC_NATIVE` on a supertype came back `declared: false` and was
+# counted as unadjudicated. Measured on JDK 25.0.4+7/linux, 2026-08-10: 19 rows
+# — eighteen `sun/nio/ch/FileDispatcherImpl.*` inheriting the syscall surface
+# from `UnixFileDispatcherImpl`, plus `ComponentSampleModel.initIDs()V` from
+# `SampleModel`. A schema-3 census scored with this file's arithmetic would be
+# 19 too high, in the direction that reads as "more work outstanding", so the
+# older shape is REFUSED rather than degraded.
+REQUIRED_CENSUS_SCHEMA = 4
 
 # Slack on top of the observed count when freezing a baseline. Zero, and it
 # stays zero: see `stub_ratchet.rs`'s SLACK for the same argument.
@@ -129,11 +140,16 @@ def host_os():
     return sys.platform
 
 
+# Both counts are asked of the WHOLE HIERARCHY, not of the named class. A
+# native over a method the receiver's class inherits is reached by dispatch
+# exactly as one over a method it declares, so scoring only the own-class
+# columns let an inherited shadow in free and counted an inherited ACC_NATIVE
+# bridge as outstanding work.
 RATCHETS = (
     ("without_acc_native", "bridge_without_acc_native",
-     "Bridge registrations with no ACC_NATIVE target"),
-    ("shadows_bytecode", "bridge_shadows_bytecode",
-     "Bridge registrations shadowing concrete bytecode"),
+     "Bridge registrations with no ACC_NATIVE target anywhere in the hierarchy"),
+    ("shadows_bytecode_anywhere", "bridge_shadows_bytecode",
+     "Bridge registrations shadowing concrete bytecode (declared or inherited)"),
 )
 
 
@@ -149,32 +165,50 @@ def _img(row):
 
 
 def adjudicate(doc):
-    """Reduce a schema-3 census to the machine-readable adjudication block.
+    """Reduce a schema-4 census to the machine-readable adjudication block.
 
-    The five `bridge` buckets are disjoint and sum to `bridge.rows`. They are
+    The seven `bridge` buckets are disjoint and sum to `bridge.rows`. They are
     disjoint by construction, not by convention: the emitter derives `has_code`
     as `!native && !abstract` (JVMS §4.6), so `acc_native` and `has_code` can
-    never both be true, and `abstract` is what is left once both are false.
+    never both be true, `abstract` is what is left once both are false, and the
+    three `inherited_*` flags are only ever set on a row whose own class does
+    not declare the method.
+
+    Each bucket names WHERE the declaration is, so "the class declares it
+    ACC_NATIVE" and "a supertype does" stay countable apart even though both
+    discharge a `Bridge` claim.
     """
     rows = doc.get("natives") or []
     kinds = Counter(r.get("kind") for r in rows)
 
     bridges = [r for r in rows if r.get("kind") == "bridge"]
     acc_native = shadow = abstract_ = undeclared = absent = 0
+    inh_native = inh_shadow = inh_abstract = 0
     for row in bridges:
         img = _img(row)
         if not img.get("image_has_class"):
             absent += 1
-        elif not img.get("declared"):
-            undeclared += 1
-        elif img.get("acc_native"):
-            acc_native += 1
-        elif img.get("has_code"):
-            shadow += 1
+        elif img.get("declared"):
+            if img.get("acc_native"):
+                acc_native += 1
+            elif img.get("has_code"):
+                shadow += 1
+            else:
+                abstract_ += 1
+        elif img.get("inherited_acc_native"):
+            inh_native += 1
+        elif img.get("inherited_has_code"):
+            inh_shadow += 1
+        elif img.get("inherited_abstract"):
+            inh_abstract += 1
         else:
-            abstract_ += 1
+            # Genuinely nowhere in the hierarchy. THIS is the bucket that used
+            # to be called `class_present_method_undeclared` and swallowed the
+            # three above it.
+            undeclared += 1
 
-    buckets = (acc_native, shadow, abstract_, undeclared, absent)
+    buckets = (acc_native, shadow, abstract_,
+               inh_native, inh_shadow, inh_abstract, undeclared, absent)
     if sum(buckets) != len(bridges):  # pragma: no cover - structural invariant
         raise AssertionError(
             f"bridge buckets {buckets} sum to {sum(buckets)}, not {len(bridges)} — "
@@ -198,9 +232,20 @@ def adjudicate(doc):
             "acc_native": acc_native,
             "shadows_bytecode": shadow,
             "abstract_method": abstract_,
+            "inherited_acc_native": inh_native,
+            "inherited_shadows_bytecode": inh_shadow,
+            "inherited_abstract_method": inh_abstract,
             "class_present_method_undeclared": undeclared,
             "class_absent": absent,
-            "without_acc_native": len(bridges) - acc_native,
+            # The ratchet population. An inherited ACC_NATIVE declaration
+            # discharges a §1.5 claim exactly as an own one does — dispatch
+            # reaches the registration either way — so it is subtracted here
+            # too. Schema 3 could not see those rows and counted them as work.
+            "without_acc_native": len(bridges) - acc_native - inh_native,
+            # The §1.4 shadow population, likewise over the whole hierarchy. A
+            # native over a method the class inherits concretely shadows just as
+            # much bytecode as one over a method it declares.
+            "shadows_bytecode_anywhere": shadow + inh_shadow,
         },
     }
 
@@ -220,7 +265,10 @@ def render_block(block):
         ("ACC_NATIVE — a genuine bridge (§1.5)", "acc_native"),
         ("concrete bytecode — a shadow", "shadows_bytecode"),
         ("abstract method — intercepts every implementor", "abstract_method"),
-        ("class present, method not declared", "class_present_method_undeclared"),
+        ("INHERITED ACC_NATIVE — a bridge, on a supertype", "inherited_acc_native"),
+        ("INHERITED bytecode — a shadow of what it inherits", "inherited_shadows_bytecode"),
+        ("INHERITED abstract — intercepts every implementor", "inherited_abstract_method"),
+        ("nowhere in the hierarchy", "class_present_method_undeclared"),
         ("class absent from the image", "class_absent"),
     ):
         n = b[key]
@@ -360,11 +408,27 @@ def _row(kind, cls, verdict):
     }
 
 
-_NATIVE = {"image_has_class": True, "declared": True, "acc_native": True, "has_code": False}
-_CODE = {"image_has_class": True, "declared": True, "acc_native": False, "has_code": True}
-_ABSTRACT = {"image_has_class": True, "declared": True, "acc_native": False, "has_code": False}
-_UNDECL = {"image_has_class": True, "declared": False, "acc_native": False, "has_code": False}
-_ABSENT = {"image_has_class": False, "declared": False, "acc_native": False, "has_code": False}
+def _verdict(has_class=True, declared=False, acc_native=False, has_code=False,
+             inherited_from=None, inh_native=False, inh_code=False, inh_abstract=False):
+    return {
+        "image_has_class": has_class, "declared": declared,
+        "acc_native": acc_native, "has_code": has_code,
+        "inherited_from": inherited_from, "inherited_acc_native": inh_native,
+        "inherited_has_code": inh_code, "inherited_abstract": inh_abstract,
+    }
+
+
+_NATIVE = _verdict(declared=True, acc_native=True)
+_CODE = _verdict(declared=True, has_code=True)
+_ABSTRACT = _verdict(declared=True)
+# The three shapes schema 3 could not tell apart. All three answer
+# `declared: false`; only the `inherited_*` keys separate a §1.5 bridge on a
+# supertype from a §1.4 shadow of inherited bytecode from a genuinely dead row.
+_INH_NATIVE = _verdict(inherited_from="p/Super", inh_native=True)
+_INH_CODE = _verdict(inherited_from="p/Super", inh_code=True)
+_INH_ABSTRACT = _verdict(inherited_from="p/Super", inh_abstract=True)
+_UNDECL = _verdict()
+_ABSENT = _verdict(has_class=False)
 
 
 def _synthetic_census(extra=()):
@@ -377,8 +441,8 @@ def _synthetic_census(extra=()):
     natives += [_row("intrinsic", f"p/I{i}", _CODE) for i in range(MIN_TOTAL_ROWS)]
     natives += list(extra)
     return {
-        "schema_version": 3, "image_adjudication": True, "mode": "compatible",
-        "counts": {}, "invocations": {}, "natives": natives,
+        "schema_version": REQUIRED_CENSUS_SCHEMA, "image_adjudication": True,
+        "mode": "compatible", "counts": {}, "invocations": {}, "natives": natives,
     }
 
 
@@ -443,6 +507,13 @@ def selftest():
     old["schema_version"] = 2
     check("schema 2 census is refused", 2, old)
 
+    # Schema 3 carried `image_declaring_method` but asked it of ONE class, so
+    # scoring it here would count every inherited row as unadjudicated. It is
+    # refused, not degraded -- the whole point of the bump.
+    pre_hierarchy = _synthetic_census()
+    pre_hierarchy["schema_version"] = 3
+    check("schema 3 (pre-hierarchy) census is refused", 2, pre_hierarchy)
+
     check("unknown JDK feature is refused", 2, _synthetic_census(), feature=21)
     check("a census from another OS is refused, not scored", 2,
           _synthetic_census(), os_name="windows")
@@ -461,11 +532,34 @@ def selftest():
     # 8. The block itself: buckets disjoint, and the doc's identity holds.
     block = adjudicate(_synthetic_census())
     b = block["bridge"]
-    identity = (b["without_acc_native"] == b["rows"] - b["acc_native"]
+    identity = (b["without_acc_native"]
+                == b["rows"] - b["acc_native"] - b["inherited_acc_native"]
                 == b["shadows_bytecode"] + b["abstract_method"]
+                + b["inherited_shadows_bytecode"] + b["inherited_abstract_method"]
                 + b["class_present_method_undeclared"] + b["class_absent"])
-    checks.append((identity, "the five image buckets are disjoint and sum to the total",
+    checks.append((identity, "the seven image buckets are disjoint and sum to the total",
                    True, identity, []))
+
+    # 9. THE ITEM-1 REGRESSION, shown failing both ways round.
+    #
+    #  (a) a Bridge that inherits an ACC_NATIVE supertype method is ADJUDICATED
+    #      -- it must not trip the ratchet. Under schema 3 it did: this is the
+    #      nineteen `FileDispatcherImpl`/`ComponentSampleModel` rows.
+    check("a Bridge inheriting ACC_NATIVE does not trip the ratchet", 0,
+          _synthetic_census(extra=[_row("bridge", "p/INH", _INH_NATIVE)]))
+
+    #  (b) a Bridge that inherits CONCRETE BYTECODE is a shadow and must trip
+    #      both ratchets. Under schema 3 it landed in `undeclared` and tripped
+    #      only the aggregate one, so the shadow ratchet could not see it.
+    check("a Bridge inheriting concrete bytecode trips the ratchet", 1,
+          _synthetic_census(extra=[_row("bridge", "p/INHC", _INH_CODE)]))
+    tripped_inh = sum(1 for ln in checks[-1][4] if ln.startswith("BRIDGE-RATCHET REGRESSION"))
+    checks.append((tripped_inh == 2,
+                   "the inherited-shadow injection trips BOTH ratchets", 2, tripped_inh, []))
+
+    #  (c) an inherited ABSTRACT declaration is still unadjudicated work.
+    check("a Bridge inheriting an abstract method trips the aggregate ratchet", 1,
+          _synthetic_census(extra=[_row("bridge", "p/INHA", _INH_ABSTRACT)]))
 
     failed = 0
     for ok, name, want, got, lines in checks:
@@ -484,7 +578,9 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--census", help="schema-3 native census JSON (--dump-native-registry)")
+    ap.add_argument("--census",
+                    help=f"schema-{REQUIRED_CENSUS_SCHEMA} native census JSON "
+                         "(--dump-native-registry --explain-jdk-only)")
     ap.add_argument("--baseline", default=DEFAULT_BASELINE,
                     help=f"committed baseline (default: {DEFAULT_BASELINE})")
     ap.add_argument("--jdk-feature", type=int,
