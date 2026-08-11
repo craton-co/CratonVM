@@ -1,46 +1,62 @@
-# Complete Tomcat suite (651 classes) under all 3 GC backends — default is worst, ZGC is healthiest
+# Complete Tomcat suite (651 classes) under all 3 GC backends — the three-way gap has mostly closed
 
 | | |
 |---|---|
-| **Status** | Reference data point, supports `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md` and [g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md) |
-| **Discovered** | 2026-08-10, `dev` merge, 3 parallel 2-shard full-suite runs (one per GC backend), each on its own uniquely-named binary |
+| **Status** | Reference data point, supports `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`. Re-measured 2026-08-11; the G1 crash column it used to carry is now fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md. |
+| **Discovered** | 2026-08-10, `dev` merge, 3 parallel 2-worker full-suite runs (one per GC backend), each on its own uniquely-named binary. Repeated 2026-08-11 in the identical shape. |
 
 ## Method
 
 Same `dev` commit for all three (merged same-day), same Windows fixture,
-same 2-shard parallelism, default 300s per-class timeout, run concurrently
+same 2-worker parallelism, default 300s per-class timeout, run concurrently
 (so all three shared host CPU with each other — a fair three-way comparison,
 though not an isolated-host measurement).
 
-- **Default** (generational): `cratonvm-gcdefault-20260810.exe`, no extra flag.
-- **G1**: `cratonvm-gcg1-20260810.exe`, `-XX:+UseG1GC`.
-- **ZGC**: `cratonvm-gczgc-20260810.exe` (built with `--features zgc`), `-XX:+UseZGC`.
+- **Default** (generational): no extra flag.
+- **G1**: `-XX:+UseG1GC`.
+- **ZGC**: a binary built with `--features zgc`, `-XX:+UseZGC`.
+
+2026-08-10 binaries: `cratonvm-gc{default,g1,zgc}-20260810.exe`.
+2026-08-11 binaries: `cratonvm-g1tom-20260811.exe` (default and G1 arms) and
+`cratonvm-g1tomzgc-20260811.exe`; the G1 arm additionally ran with
+`CRATONVM_DBG=g1-dbg-reach`, which costs nothing measurable (0.89× the 08-10
+per-class time on the 81 classes compared mid-run).
 
 ## Results
 
 | | PASS | FAIL | HANG | CRASH | NOSUMMARY | wall time |
 |---|---|---|---|---|---|---|
-| **Default (generational)** | 519 | 16 | **115** | 0 | 1 | 356.5 min |
-| **G1** | 578 | 35 | 34 | **4** | 0 | 267 min |
-| **ZGC** | **604** | 18 | **29** | 0 | 0 | **247.1 min** |
+| Default 08-10 | 519 | 16 | **115** | 0 | 1 | 356.5 min |
+| **Default 08-11** | **628** | 12 | **11** | 0 | 0 | **177.5 min** |
+| G1 08-10 | 578 | 35 | 34 | **4** | 0 | 267 min |
+| **G1 08-11** | **623** | **7** | 20 | **1** | 0 | 212.9 min |
+| ZGC 08-10 | **604** | 18 | 29 | 0 | 0 | 247.1 min |
+| **ZGC 08-11** | **629** | 11 | **11** | 0 | 0 | 178.4 min |
 
 ## Reading this
 
-- **Default is the worst backend on every axis except FAIL count**: most
-  hangs by far (115 vs. 34/29), a `NOSUMMARY` (the VM died before JUnit could
-  print a summary — worth its own look, not yet identified which class), and
-  the longest wall time despite having the fewest genuine FAILs. This is
-  consistent with — and a much larger-scale confirmation of —
-  `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`'s
-  hypothesis that the generational collector's persistent fallback to a
-  non-moving sweep is a broad throughput problem, not a niche one.
-- **G1 finishes faster and hangs less, but crashes** — see
-  [g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md).
-  The same underlying JIT-frame root-coverage gap that makes the default GC
-  slow makes G1 unsafe instead.
-- **ZGC currently looks healthiest**: fewest hangs, fastest wall time, zero
-  crashes. The caution is right; the reason first given for it was not, and is
-  corrected in "Why ZGC dodges it" below.
+**The 08-10 reading below is superseded on its main point.** It said the default
+collector was "the worst backend on every axis except FAIL count" — 115 hangs
+and 356 min. One day later the same fixture gives it 11 hangs and 177 min, and
+the three backends are within 6 PASSes and 35 minutes of each other. Whatever
+was costing the default collector 100 hangs was fixed in that window, not by
+anything on this page. Treat single-day cross-backend gaps here as perishable.
+
+What still holds:
+
+- **The default collector's `NOSUMMARY` is gone** (0 on all three arms in the
+  re-run), so it was not a standing property of that backend either.
+- **G1 crashed, and that crash is now fixed.** 4 → 1, and the survivor is a
+  different class that was a HANG before — see
+  fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md and
+  [g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md](g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md).
+  The cause was an unaligned G1 TLAB carve, **not** the JIT-frame root-coverage
+  gap this page originally credited.
+- **ZGC is still marginally healthiest** and is still the narrower guarantee,
+  for the reason in "Why ZGC dodges it" below — but with the G1 defect fixed and
+  the default collector's hangs gone, the margin is now 1–6 classes, not 85.
+- **G1 is now the slowest arm** (212.9 min vs 177/178). That is new and
+  unexplained; it is not the diagnostic flag (see Method).
 
 ## Why ZGC dodges it — corrected 2026-08-10
 
@@ -225,7 +241,7 @@ they are carried here too. Re-run on current `dev` under `-XX:+UseG1GC`, with a
 column is down from 6 to 3.
 
 `TestCoyoteAdapterCanonicalization` is the one that belongs to
-[g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md)
+fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md
 and is worth adding to its evidence: **166** `g1::get_field: out-of-bounds field
 read dropped … num_slots=0 class_id=ClassId(0)` guard hits, **0** on both other
 arms of the same class. That is the same zeroed-header-on-a-live-object
