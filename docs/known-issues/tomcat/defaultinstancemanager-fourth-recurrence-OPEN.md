@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **bisected to a named commit**, root cause not yet isolated within it |
+| **Status** | OPEN — **bisected to a named commit**, root cause not yet isolated within it. One conclusion RETRACTED 2026-08-10 (`objects_swept=0`); read that section before acting on this page. |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -137,7 +137,61 @@ these predicates were rewritten onto the mark word "WEAKER, not equivalent".
 The connection is consistent but **not yet proven**; the open question is now
 narrow and mechanical.
 
-## Which skip arm? NONE — and the sweep reclaims nothing at all
+## RETRACTED 2026-08-10 — `objects_swept=0` was a counter read before it is written
+
+The section below concluded, from `objects_swept=0`, that this sweep reclaimed
+nothing, that no young object is reclaimed at all, and that class unloading
+"cannot work by construction". **All three are withdrawn.** `objects_swept` is
+declared at `gen_heap.rs:9439`, printed by the `[MARKWHY] walk ended` line, and
+incremented in exactly one place — the publication loop **345 lines below that
+print**. The number is a structural zero in every run, on every workload,
+whether the sweep reclaimed a million objects or none. It measured the distance
+between two lines of code, not the heap.
+
+Two things follow, and the second is why this matters more than a typo:
+
+* **Class unloading works on this path.**
+  `regression-suite/src/RClassUnloadSweep.java` (new, scheduled) defines a class
+  in a throwaway loader, uses it, drops every strong reference and collects.
+  `payload.class.unloaded=true` on HotSpot and on CratonVM under the default
+  collector, `CRATONVM_NO_MOVING_YOUNG=1`, `-XX:+UseG1GC` and `-XX:+UseZGC`. If
+  the young sweep reclaimed nothing, that vector could not print `true` under
+  `CRATONVM_NO_MOVING_YOUNG=1` — the exact path the section below called inert.
+* **The scope claim went with it.** "This is a young-generation reclamation
+  failure on the `System.gc()` path and should be expected to cost throughput
+  and footprint everywhere else" was the most actionable sentence on the page,
+  and it pointed at a defect that is not there.
+
+The instruments were fixed rather than the line deleted, because the question
+under it — *did this sweep free anything* — is a good one that nothing answered:
+
+* `[MARKWHY] walk ended` now reports the walk-time facts it can actually see:
+  `dead_regions`, `dead_watermark`, and `unwinds`/`unwound_entries`. The five
+  `dead_regions.truncate(dead_watermark)` sites were **silent**, so "found
+  nothing" and "found plenty and unwound all of it on a grid anomaly" printed
+  identically — which is shape 2 of *The open question* below, previously
+  undecidable from any output the VM produced.
+* `[MARKWHY] sweep done` reports `objects_swept`/`bytes_swept` after the
+  publication loop, the only thing that writes them.
+* `[MARKWHY] STRADDLE` names the object whose computed extent swallows the
+  watched base. The pre-existing sweep hook tests `cursor == watch`, so it is
+  silent in precisely the case this page measured — the walk covering the
+  address without stopping at it — and could never name the culprit stride.
+
+**What survives is the whole finding:** the walk covers the evicted loader's
+base and never stops at it. That is measured, it has a live control, and the
+sections above stand. What was wrong was the inference from there to the heap.
+
+One structural point the retraction turns up, because it explains why this
+defect surfaces as a class-unloading failure and never as corruption: the
+phantom-extent guard (`gen_heap.rs`, "a header that SUBSUMES a live object")
+fires only when the swallowed object is in `side_sorted` — i.e. **marked**. An
+over-sized extent that swallows only DEAD objects is invisible to it. A dead
+object inside a retained LIVE extent is never visited, never zeroed, and
+`is_live_young_survivor` (`word0 != 0`) then answers "live" for it forever.
+That is a one-sided guard, and this is the failure it cannot see.
+
+## Which skip arm? NONE (read the retraction above first)
 
 `CRATONVM_DBG_MARK_WHY_CLASS` now also classifies the watched address against
 every stretch the walk can stride over, and reports where the walk ended.
@@ -161,17 +215,16 @@ All three candidates are eliminated:
 So the walk *covers* the address and still never stops at it. Its object grid
 strides over that base: some earlier object's computed size swallows the span.
 
-And the headline number: **`objects_swept=0`**. That counter is incremented in
-the publication loop over `dead_regions` — the real reclamation path, not a
-diagnostic one — so this sweep reclaimed NOTHING. 119,985 objects walked, zero
-dead, in a run that started Tomcat and compiled three JSPs. The same is true in
-the control run on a live JSP, so it is the whole sweep, not this object.
+~~And the headline number: `objects_swept=0`.~~ **WITHDRAWN — see the
+retraction above.** The counter is incremented in the publication loop, which
+runs 345 lines AFTER the line that printed it, so the zero was structural. The
+paragraph that followed it — "no young object is reclaimed at all … class
+unloading cannot work by construction" — is withdrawn with it, and
+`RClassUnloadSweep` is the vector that refutes it.
 
-That subsumes the earlier framing. The mirror is not being retained by a rooting
-decision, a side-table edge, or a skip list. **No young object is reclaimed at
-all**, so no span is ever zeroed, so `is_live_young_survivor` (`word0 != 0`)
-answers "live" for every young address, and class unloading cannot work by
-construction.
+`objects_live=119985` is real, and so is everything above it: the walk covers
+the watched address, no skip arm claims it, and the walk still never stops
+there.
 
 ## The open question
 
@@ -189,10 +242,10 @@ the walk's plausibility screen getting weaker. The probe to write next reports
 `dead_regions.len()` at the watermark and after each truncate, plus the walk's
 per-object stride around the watched offset.
 
-Note the scope this changes: if the young non-moving sweep reclaims nothing,
-`TestDefaultInstanceManager` is the symptom that happened to have an assertion
-on it. This is a young-generation reclamation failure on the `System.gc()` path
-and should be expected to cost throughput and footprint everywhere else.
+~~Note the scope this changes …~~ **WITHDRAWN with the `objects_swept=0`
+reading.** The sweep reclaims; there is no whole-heap reclamation failure to
+expect elsewhere. The scope is what the measured half says it is: one dead
+object whose base the walk strides over.
 
 ## Do not close this without a regression pin
 
