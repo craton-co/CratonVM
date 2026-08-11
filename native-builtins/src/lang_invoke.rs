@@ -10245,6 +10245,46 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let recv = args.get(1).copied().unwrap_or(Value::Object(None));
+            // W7-19: `bindTo` must REFUSE a target with no leading reference
+            // parameter. `MethodHandle.bindTo`'s javadoc: "@throws
+            // IllegalArgumentException if the target does not have a leading
+            // parameter type that is a reference type", implemented in
+            // `MethodType.leadingReferenceParameter()` as
+            //   if (ptypes.length == 0 || ptypes[0].isPrimitive())
+            //       throw newIllegalArgumentException("no leading reference parameter");
+            // — so the test is arity-and-primitiveness, nothing else, and the
+            // message is verbatim. Measured on the shipped binary under
+            // `--real-jdk`: `findStatic(…(String,int)int).bindTo("abc")
+            // .bindTo(2)` was ACCEPTED and answered 6, and `(int)int`
+            // .bindTo(3) was accepted too; HotSpot 25 raises
+            // `IllegalArgumentException: no leading reference parameter` for
+            // both. A missing refusal, not a wrong value.
+            //
+            // The parameter list is read from the `type` field ONLY, never
+            // from `mh_type_descriptor`'s `MH_DESC` fallback. That distinction
+            // is the whole safety of this check: `MH_DESC` on a
+            // virtual/special handle omits the receiver `alloc_method_handle`
+            // prepends to `type`, so `Holder.pub`'s `(I)I` would read as a
+            // primitive leading parameter and this would refuse a bind that
+            // HotSpot accepts. No `type` MethodType, or one whose mirrors do
+            // not render, means the leading parameter is UNKNOWN and the bind
+            // is allowed through — a refusal is only ever raised on a positive
+            // reading.
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
+                if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
+                    if let Some((params, _)) = split_descriptor_params(&tdesc) {
+                        let leading_is_reference = params
+                            .first()
+                            .is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+                        if !leading_is_reference {
+                            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                                message: "no leading reference parameter".to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
             // Clone the MH and set BOUND field
             let class = mh_read_class(ctx, this).unwrap_or_default();
             let name = mh_read_name(ctx, this).unwrap_or_default();
