@@ -3,6 +3,13 @@
 **Status:** FIXED (2026-08-07). Lane W5-2 of the jdk-wave2 pool.
 **Files changed:** `native-io/src/process.rs`, `native-builtins/src/phases_late.rs`.
 
+**AMENDED 2026-08-11**, jdk-only process-natives residual lane, ALSO UNBUILT.
+The two residuals this record left open — `Info.user` null on both platforms,
+`Info.totalTime` `-1` on Linux — are now sourced from the OS. The third
+(`getProcessPids0`'s per-process `OpenProcess` cost on Windows) is untouched and
+still stands; it is a cost, not a defect, and W6-10 owns it. Full per-accessor
+table below. **Nothing here has been built or run.**
+
 ## The failure has no error in it
 
 `regression-suite/run.sh` does not read the exit code alone — it diffs the
@@ -120,6 +127,22 @@ could not if that stub were intercepting. So a real `ProcessHandleImpl` receiver
 runs the JDK's own bytecode, `Info.info(pid, startTime)` is genuinely on the
 path, and it is the right place to fix.
 
+> **Amendment 2026-08-11 — this argument is sound, and its second limb is
+> itself a live defect.** The reasoning above turns on `commandLine()` having
+> "no stub on that class". Confirmed by `javap -p -s
+> 'java.lang.ProcessHandle$Info'`: all six accessors are **abstract**, and
+> `commandLine` is registered nowhere, while the receiver `ProcessHandle.info()`
+> mints is an instance of the interface itself. So the very fact that makes this
+> argument work is an `AbstractMethodError: has no Code attribute` waiting for
+> its first caller on the synthetic path. It has never fired only because
+> nothing has reached that `info()` stub — which is the argument, restated.
+>
+> This is worth keeping as a shape: **an absence used as evidence is still an
+> absence.** A record that reasons "X would have crashed, and it did not, so Y"
+> has proved something about Y and has also just located an unfixed crash.
+> The per-registration verdict, and the patch, are in
+> docs/known-issues/jdk-only/W3-6-processimpl-missing-natives.md.
+
 ## The fix
 
 The invariant is that **three** answers must be one number, because
@@ -175,16 +198,125 @@ direction. Linux keeps sourcing all three from `/proc/<pid>/cmdline`.
 
 ## Residuals (unmeasured by any vector, recorded not fixed)
 
-* `Info.user` is left `null` on both platforms; HotSpot reports
+* ~~`Info.user` is left `null` on both platforms~~ — **CLOSED 2026-08-11**, see
+  below. HotSpot reports
   `DOMAIN\user` on Windows and the account name on Linux. Populating it needs
   `OpenProcessToken`/`GetTokenInformation`/`LookupAccountSidW` (Windows) or a
   `getpwuid` lookup (Linux). No `RJdkProcess` check guards on it.
-* `Info.totalTime` is left `-1` on Linux (`/proc/<pid>/stat` fields 14/15 are
-  not parsed). Windows now reports it.
+  *(Both prescriptions were correct and both were followed.)*
+* ~~`Info.totalTime` is left `-1` on Linux (`/proc/<pid>/stat` fields 14/15 are
+  not parsed).~~ — **CLOSED 2026-08-11.** Windows now reports it.
 * On Windows `getProcessPids0` now performs one `OpenProcess` per enumerated
   process to fill `starttimes[]`. `ProcessHandle.allProcesses()` and
   `descendants()` therefore cost a few ms more per snapshot than the Toolhelp
-  walk alone.
+  walk alone. **STILL OPEN**, and owned by W6-10 as a cost rather than a defect.
+
+## The two residuals, closed (2026-08-11)
+
+### `Info.user` — `os_process_user` (new, `native-io/src/process.rs`)
+
+* **Windows.** `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` ->
+  `OpenProcessToken(TOKEN_QUERY)` -> `GetTokenInformation(TokenUser)` (a size
+  probe first, because `TOKEN_USER` is variable-length — the SID it carries is)
+  -> `LookupAccountSidW`, rendered `DOMAIN\name`. Same call chain and same
+  spelling as HotSpot's `ProcessHandleImpl_md.c`, which is what produced this
+  record's own measured `Optional[CARBON\Victor]`.
+
+  One layout trap worth stating, because it is the kind that only misbehaves
+  under an allocator that happens to under-align: `TOKEN_USER` begins with a
+  `SID_AND_ATTRIBUTES` whose first member is a `PSID`, so the pointer is read
+  from offset 0 of the output buffer. A `Vec<u8>` is 1-aligned, and that read is
+  then an unaligned load. The buffer is a `Vec<u64>` sized
+  `needed.div_ceil(8)`, which gives the allocation 8-byte alignment by
+  construction.
+
+* **Linux.** `/proc/<pid>/status`' `Uid:` line, **first** column. That line has
+  four — real, effective, saved-set, filesystem — and the real uid is the one
+  `ProcessHandleImpl_unix.c` reports. Resolved with `getpwuid_r`, not by reading
+  `/etc/passwd`: `getpwuid_r` goes through NSS, so an LDAP/SSSD account resolves
+  to the same name HotSpot prints. The reentrant form specifically — `getpwuid`
+  returns a pointer into a static another thread's call would overwrite.
+
+### `Info.totalTime` on Linux — `linux_proc_stat_times` (new)
+
+`/proc/<pid>/stat` fields 14 (`utime`) + 15 (`stime`), scaled by
+`sysconf(_SC_CLK_TCK)`. It replaces the body of the Linux `os_process_start_time`
+rather than sitting beside it, so that Linux gets the **same single-probe
+guarantee `win_process_times` already carried**: fields 14, 15 and 22 are three
+columns of one line, and one `read_to_string` cannot attribute them to two
+different processes the way two reads across a pid recycle could. All three
+share the file's existing off-by-three (`after_comm` starts at field 3, so field
+N is index N-3).
+
+`cutime`/`cstime` (fields 16/17) are deliberately **not** summed.
+`totalCpuDuration()` is documented as the accumulated cputime *of the process*,
+and HotSpot's `ProcessHandleImpl_unix.c` sums only the first pair; adding reaped
+children's time would inflate the answer for any process that has ever forked.
+
+`start_time_and_cpu`'s catch-all arm is narrowed from `#[cfg(not(windows))]` to
+`#[cfg(not(any(target_os = "linux", windows)))]`.
+
+## Per-accessor table — the JDK spec, and what this VM answers
+
+`ProcessHandle.Info`'s six accessors, JDK 25.0.3. "JDK sentinel" is the guard in
+the real `ProcessHandleImpl$Info` accessor, read off `javap -c
+java.lang.ProcessHandleImpl$Info`; it is what decides present-vs-empty, and it
+is why *not writing a field* is a complete and correct way to report an absence.
+
+| accessor | JDK sentinel for absent | CratonVM before | CratonVM after | platform |
+| --- | --- | --- | --- | --- |
+| `command()` | `command == null` -> `ofNullable` | Linux: `/proc/<pid>/cmdline` argv[0]. Windows: **empty** | Linux unchanged. Windows: image path, `QueryFullProcessImageNameW` | both (fixed 08-07) |
+| `commandLine()` | `commandLine == null` | Linux: `/proc/<pid>/cmdline` joined. Windows: empty | **unchanged, deliberately** — real HotSpot 25 measures `Optional.empty` on Windows, so filling it would diverge from the oracle | Linux only, matching HotSpot |
+| `arguments()` | `arguments == null` | Linux: `/proc/<pid>/cmdline` tail. Windows: empty | **unchanged, deliberately** — same measurement | Linux only, matching HotSpot |
+| `startInstant()` | `startTime > 0` else empty | `-1` (never written) -> empty, **and it wiped the rest of the record** | `start_time_or_any(pid)`, always written | both (fixed 08-07) |
+| `totalCpuDuration()` | `totalTime != -1` else empty | Windows: `GetProcessTimes`. **Linux: `-1` -> empty** | Linux: `utime+stime` over `_SC_CLK_TCK` | both |
+| `user()` | `user == null` -> `ofNullable` | **`null` on every platform** -> empty | Windows: token SID -> `LookupAccountSidW` -> `DOMAIN\name`. Linux: `Uid:` -> `getpwuid_r` | both |
+
+### Where `Optional.empty()` is the answer, and the sentence that says so
+
+Every remaining absence is specified, not conceded. `ProcessHandle.Info`'s own
+javadoc, quoted from `src.zip` on the JDK 25.0.3 image:
+
+> The attributes of a process vary by operating system and are not available
+> in all implementations. Information about processes is limited by the
+> operating system privileges of the process making the request. The return
+> types are `Optional<T>` allowing explicit tests and actions if the value is
+> available.
+
+That sentence covers each of the following, and each is left absent rather than
+filled:
+
+| decision | the clause it rests on |
+| --- | --- |
+| `user()` empty when `OpenProcess`/`OpenProcessToken` is refused | *"limited by the operating system privileges of the process making the request"* |
+| `user()` empty when `LookupAccountSidW` resolves nothing (deleted account, unreachable DC) | same. Rendering the raw SID string instead would be a value HotSpot never produces |
+| `user()` empty on Linux when the uid has no passwd entry (a container), or `getpwuid_r` returns `ERANGE` | *"not available in all implementations"* |
+| `user()` empty on every other target | *"The attributes of a process vary by operating system"* |
+| `totalCpuDuration()` empty on every target but Windows and Linux | same |
+| `commandLine()` / `arguments()` empty on Windows | same — **and here the oracle agrees**, which is stronger than the spec alone |
+| `startInstant()` empty when the start time is `STARTTIME_ANY` | the JDK's own `startTime > 0` guard |
+
+**The distinction this table exists to draw.** A field left unwritten produces
+`Optional.empty()`, which a caller can test. A field written with a
+plausible-looking substitute produces a **present** `Optional` that no caller
+can tell from a real reading. The three substitutes available here and refused
+were: this VM's own user for `user()` (which is what the `ProcessHandle`
+interface's `parent()` stub does for parentage — see W3-6's verdict table), the
+raw SID string, and a `totalTime` of `0`. That last one is the subtlest: `0` is
+not an absence, because `totalCpuDuration()`'s guard is `!= -1`, so it renders as
+`Optional[PT0S]` — the positive claim that the process has used no CPU at all.
+
+## What this lane could NOT check
+
+This host is Windows. The `target_os = "linux"` arms (`linux_proc_stat_times`,
+the Linux `os_process_user`, the Linux `start_time_and_cpu`) and the
+`not(any(target_os = "linux", windows))` arms are **unverifiable here even in
+principle** — not merely unbuilt, uncompilable. The last of those is kept
+trivial (a bare `None`, a bare `(start_time_or_any(pid), None)`) for exactly
+that reason. The Linux arms are not trivial, because the residual this record
+named was a Linux one; they are plain `std::fs` parsing plus one `libc::getpwuid_r`
+call, and `libc` is already a `cfg(unix)` dependency of this crate with
+`libc::sysconf` and `libc::kill` already used under the same gate.
 
 ## The rule this is an instance of
 
