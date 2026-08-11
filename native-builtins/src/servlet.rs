@@ -2193,19 +2193,64 @@ pub(crate) fn s2_tls_connect(
     connector: &native_tls::TlsConnector,
     host: &str,
     port: u16,
-) -> std::io::Result<i32> {
-    use std::io;
-
+) -> Result<i32, TlsConnectFailure> {
     let addr = format!("{}:{}", host, port);
-    let tcp = TcpStream::connect(&addr)?;
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_tls_connect_on(connector, host, port, tcp)
+}
+
+/// Why a client TLS connect attempt failed, kept apart so the caller can raise
+/// the exception JSSE raises.
+///
+/// `SSLSocketFactory.createSocket` reports a refused/unroutable TCP connect as
+/// a plain `IOException` and a REJECTED HANDSHAKE as
+/// `javax.net.ssl.SSLHandshakeException` — callers `catch` on that type (see
+/// `ensure_layered_handshake_started`'s note about tests asserting on the JSSE
+/// type for an intentionally-rejected connection). Flattening both into one
+/// `IOException` with a `format!`ed message, which is what this path did,
+/// makes the two indistinguishable to a `catch` block.
+pub(crate) enum TlsConnectFailure {
+    /// The TCP connection could not be established.
+    Tcp(std::io::Error),
+    /// TCP succeeded; the TLS handshake did not. Carries the backend's own
+    /// description (for OpenSSL, the certificate-verification error).
+    Handshake(String),
+}
+
+impl std::fmt::Display for TlsConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsConnectFailure::Tcp(e) => write!(f, "{e}"),
+            TlsConnectFailure::Handshake(m) => f.write_str(m),
+        }
+    }
+}
+
+/// [`s2_tls_connect`] over an ALREADY-CONNECTED stream.
+///
+/// `SSLSocket.connect(SocketAddress)` establishes the TCP connection and the
+/// handshake runs later (see [`PENDING_CONNECT_SOCK_ID_BASE`]); the connection
+/// it opened is the one the handshake must run on. Opening a second one
+/// instead is observable to the peer: a server that accepts one connection per
+/// client accepts the FIRST (which carries no ClientHello, so its handshake
+/// reads EOF) and is no longer in `accept()` when the second arrives, which
+/// then waits out the 30 s read timeout below and reports
+/// `HandshakeError::WouldBlock` — "the handshake process was interrupted",
+/// ~30 s after a rejection the peer had already answered.
+pub(crate) fn s2_tls_connect_on(
+    connector: &native_tls::TlsConnector,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
     // Reasonable defaults: non-infinite read/write timeouts so a hung peer
     // never deadlocks the JVM thread calling `SSLSocket.getInputStream().read`.
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let tls_stream = connector.connect(host, tcp).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
-    })?;
+    let tls_stream = connector
+        .connect(host, tcp)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("TLS handshake failed: {}", e)))?;
 
     // T2.7.11: native-tls 0.2's public `TlsStream` API does not expose the
     // server-selected ALPN protocol on all backends (it is absent on 0.2's
@@ -2235,10 +2280,10 @@ pub(crate) fn s2_tls_connect(
         Ok(Some(cert)) => match cert.to_der() {
             Ok(der) => peer_cert_chain_der.push(der),
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("peer certificate DER encode failed: {}", e),
-                ));
+                return Err(TlsConnectFailure::Handshake(format!(
+                    "peer certificate DER encode failed: {}",
+                    e
+                )));
             }
         },
         Ok(None) => {
@@ -2247,10 +2292,10 @@ pub(crate) fn s2_tls_connect(
             // SSLPeerUnverifiedException.
         }
         Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("peer certificate query failed: {}", e),
-            ));
+            return Err(TlsConnectFailure::Handshake(format!(
+                "peer certificate query failed: {}",
+                e
+            )));
         }
     }
 
@@ -2281,29 +2326,40 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     host: &str,
     port: u16,
     trust_root_ders: &[Vec<u8>],
-) -> std::io::Result<i32> {
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_legacy_dsa_tls_connect_on(host, port, trust_root_ders, tcp)
+}
+
+/// [`s2_legacy_dsa_tls_connect`] over an ALREADY-CONNECTED stream — see
+/// [`s2_tls_connect_on`] for why the deferred-handshake path must reuse the
+/// connection `SSLSocket.connect` opened rather than open a second one.
+#[cfg(unix)]
+pub(crate) fn s2_legacy_dsa_tls_connect_on(
+    host: &str,
+    port: u16,
+    trust_root_ders: &[Vec<u8>],
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
     use openssl::x509::{store::X509StoreBuilder, X509VerifyResult, X509};
-    let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)?;
+    let hs = |e: &dyn std::fmt::Display| TlsConnectFailure::Handshake(e.to_string());
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| hs(&e))?;
     builder.set_security_level(0);
     builder
         .set_cipher_list("ALL:@SECLEVEL=0")
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut roots = X509StoreBuilder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| hs(&e))?;
+    let mut roots = X509StoreBuilder::new().map_err(|e| hs(&e))?;
     for der in trust_root_ders {
-        let cert = X509::from_der(der).map_err(|e| std::io::Error::other(e.to_string()))?;
-        roots
-            .add_cert(cert)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let cert = X509::from_der(der).map_err(|e| hs(&e))?;
+        roots.add_cert(cert).map_err(|e| hs(&e))?;
     }
     builder
         .set_verify_cert_store(roots.build())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| hs(&e))?;
     // Spring Boot's historical embedded-LDAP fixture explicitly trusts a
     // self-signed DSA certificate whose validity window ended in 2017.  The
     // JVM trust-manager shim accepts that explicit anchor; retain normal
@@ -2317,19 +2373,14 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
     // server via 127.0.0.1 while the test certificate has no matching IP SAN.
     let connector = builder.build();
-    let mut connection = connector
-        .configure()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut connection = connector.configure().map_err(|e| hs(&e))?;
     connection.set_verify_hostname(false);
-    let stream = connection
-        .connect(host, tcp)
-        .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
+    let stream = connection.connect(host, tcp).map_err(|e| {
+        TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}"))
+    })?;
     let mut peer_cert_chain_der = Vec::new();
     if let Some(cert) = stream.ssl().peer_certificate() {
-        peer_cert_chain_der.push(
-            cert.to_der()
-                .map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
+        peer_cert_chain_der.push(cert.to_der().map_err(|e| hs(&e))?);
     }
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {

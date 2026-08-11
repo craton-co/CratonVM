@@ -651,6 +651,33 @@ impl Compiler {
     /// call is on the sentinel branch only. Emits nothing when the runtime
     /// offers no helper (unit-test compiles), which restores the previous
     /// behaviour exactly.
+    /// CRATONVM_DBG_DEOPT — name a direct JIT-to-JIT call site that gets NO
+    /// callee-deopt service check.
+    ///
+    /// Such a site is where an orphaned deopt frame is born: the callee traps,
+    /// stashes a frame keyed to ITSELF, and returns the `i64::MIN` sentinel;
+    /// with no check here the sentinel reaches this method's shared
+    /// exception-check stub, which reloads the sentinel and returns — so the
+    /// stash travels up to a consumer that cannot attribute it. Printing the
+    /// site, and WHICH of the two preconditions was missing, is what turns "an
+    /// orphan appeared" into a named call site.
+    pub(super) fn dbg_unserviced_direct_call(
+        &self,
+        kind: &str,
+        pc: usize,
+        has_info: bool,
+        has_args_base: bool,
+    ) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_none() {
+            return;
+        }
+        eprintln!(
+            "[cratonvm-deopt] direct {kind} call at {}#{pc} has NO callee-deopt service \
+             (info={has_info} args_base={has_args_base})",
+            self.method_key,
+        );
+    }
+
     pub(super) fn emit_inline_callee_deopt_check(
         &mut self,
         info: *const crate::JitInvokeInfo,

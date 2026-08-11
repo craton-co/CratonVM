@@ -17405,6 +17405,68 @@ fn try_compile_inner(
                                     if callee_needs_ctx {
                                         needs_heap = true;
                                     }
+                                    // A raw JIT-to-JIT CALL has no Rust frame
+                                    // in between, so the ONLY thing that can
+                                    // notice the callee trapped is the
+                                    // callee-deopt service check the codegen
+                                    // emits after the CALL — and that check
+                                    // needs a `JitInvokeInfo` for this pc to
+                                    // name the callee it just invoked. The
+                                    // `continue` below skips the generic
+                                    // fallback registration at the end of this
+                                    // loop, so register one here, exactly as
+                                    // the `ArraycopyPrimitive` arm below does
+                                    // for the same reason.
+                                    //
+                                    // Without it the callee's `i64::MIN`
+                                    // sentinel reached THIS method's shared
+                                    // exception-check stub, which reloads the
+                                    // sentinel and returns — the callee's
+                                    // reconstructed frame stayed in the
+                                    // thread's one stash slot and travelled up
+                                    // to a consumer that could not attribute
+                                    // it. Measured on H2 `TestScript`:
+                                    // `ValueVarchar.get(String,
+                                    // CastDataProvider)` at pc 38 calls
+                                    // `StringUtils.cache`, which guard-bailed
+                                    // at its own bci 54, and the orphan
+                                    // surfaced two frames up
+                                    // (jit-direct-call-mints-an-orphaned-deopt-frame).
+                                    // 582 sites in one run had no service
+                                    // check; every one of them is a place an
+                                    // orphan can be minted.
+                                    //
+                                    // Note the sibling arm below (the
+                                    // INLINE-BAIL FALLBACK) already documents
+                                    // that it deliberately does NOT `continue`
+                                    // so this registration still happens; only
+                                    // this copy of the bind skipped it.
+                                    let class_box: Box<str> =
+                                        class_name.clone().into_boxed_str();
+                                    let method_box: Box<str> =
+                                        method_name.clone().into_boxed_str();
+                                    let desc_box: Box<str> =
+                                        descriptor.clone().into_boxed_str();
+                                    let class_ref = &*class_box as *const str;
+                                    let method_ref = &*method_box as *const str;
+                                    let desc_ref = &*desc_box as *const str;
+                                    owned_strings.push(class_box);
+                                    owned_strings.push(method_box);
+                                    owned_strings.push(desc_box);
+                                    let info = Box::new(JitInvokeInfo {
+                                        class_name: unsafe { &*class_ref },
+                                        method_name: unsafe { &*method_ref },
+                                        descriptor: unsafe { &*desc_ref },
+                                        num_jit_args,
+                                        return_type: ret_type,
+                                        invoke_kind,
+                                        declaring_class_id: cached
+                                            .declaring_class_id
+                                            .as_u32(),
+                                    });
+                                    let info_ptr: *const JitInvokeInfo = &*info;
+                                    owned_invoke_infos.push(info);
+                                    invoke_info.push((pc, info_ptr));
                                     direct_callee_entries.push(entry);
                                     direct_calls.push((
                                         pc,
@@ -25265,6 +25327,125 @@ mod tests {
             compiled_a._jit_invoke_infos.len(),
             1,
             "A -> B must fall back to dispatch once B is marked as a cycle participant"
+        );
+
+        clear_jit_recursive_cycle_methods_for_test();
+    }
+
+    /// A statically-bound JIT-to-JIT direct call MUST still carry a
+    /// `JitInvokeInfo` for its pc.
+    ///
+    /// `emit_inline_callee_deopt_check` is emitted only when the codegen has
+    /// one, and it is the only thing that can notice the raw CALL's callee
+    /// trapped: without it the callee's `i64::MIN` sentinel reaches the
+    /// caller's shared exception-check stub, which reloads the sentinel and
+    /// returns, and the frame the callee stashed under ITS OWN key travels up
+    /// to a consumer that cannot attribute it. Measured on H2 `TestScript`:
+    /// 582 unserviced direct call sites, one of which
+    /// (`ValueVarchar.get(String,CastDataProvider)` → `StringUtils.cache`)
+    /// produced the orphan in
+    /// `jit-direct-call-mints-an-orphaned-deopt-frame`.
+    ///
+    /// The bind used to `continue` straight past the registration at the end
+    /// of the scan loop, so this asserted 0 before the fix.
+    #[test]
+    fn statically_bound_direct_callee_call_still_registers_invoke_info() {
+        crate::x64::set_moving_young_override(Some(false));
+        use std::sync::Arc;
+
+        clear_jit_recursive_cycle_methods_for_test();
+        let _direct_callee_calls = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_JIT_DIRECT_CALLEE_CALLS",
+                Some("1"),
+            )]),
+        );
+
+        let mk = |class: &str, name: &str, id: u32, code: &[u8]| CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(id),
+            class_name: Arc::from(class),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(code),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        };
+        // `d` calls `e` once and returns; `e` is a leaf, so nothing marks it a
+        // recursive-cycle target and the direct bind actually happens.
+        let d_cached = mk("pkg/D", "d", 11, &[0xb8, 0x00, 0x01, 0xb1, 0x00, 0x00]);
+        let e_cached = mk("pkg/E", "e", 12, &[0xb1, 0x00, 0x00]);
+
+        // SAFETY: every helper address is an integer slot. This test only
+        // inspects emitted metadata and never executes the generated code.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let d_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            (cp_idx == 1).then(|| ("pkg/E".to_string(), "e".to_string(), "()V".to_string()))
+        };
+        let callee_compiler =
+            |class_name: &str, method_name: &str, descriptor: &str| -> Option<(usize, bool)> {
+                assert_eq!((class_name, method_name, descriptor), ("pkg/E", "e", "()V"));
+                let compiled_e = try_compile(
+                    &e_cached, None, None, None, None, None, None, None, None, None, &helpers,
+                    None, None, None, None, false, false, false, false, false, false, None,
+                )?;
+                let compiled_e = Box::leak(Box::new(compiled_e));
+                Some((compiled_e.entry_ptr() as usize, compiled_e.needs_context()))
+            };
+
+        let compiled_d = try_compile(
+            &d_cached,
+            None,
+            None,
+            None,
+            Some(&d_resolver),
+            Some(&callee_compiler),
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("D should compile");
+
+        assert!(
+            !jit_direct_call_requires_dispatch("pkg/E", "e", "()V"),
+            "the fixture must exercise the DIRECT bind, not the dispatch fallback"
+        );
+        // Non-vacuity: without this the assertion below passes on a compile
+        // where the site fell back to `jit_invoke_dispatch` (which registers a
+        // `JitInvokeInfo` of its own), i.e. on a fixture that never exercised
+        // the direct bind at all.
+        assert_eq!(
+            compiled_d._direct_callee_entries.len(),
+            1,
+            "the fixture must bind E's compiled entry as a DIRECT call"
+        );
+        assert_eq!(
+            compiled_d._jit_invoke_infos.len(),
+            1,
+            "a direct JIT-to-JIT call must still register a JitInvokeInfo for its pc, \
+             or the codegen cannot emit the callee-deopt service check"
         );
 
         clear_jit_recursive_cycle_methods_for_test();

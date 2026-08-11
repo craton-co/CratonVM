@@ -2887,7 +2887,25 @@ pub unsafe extern "C" fn jit_service_callee_deopt(
         .unwrap_or_else(|| ClassId::new(0));
     match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, args_slice) {
         Some(v) => v,
-        None => i64::MIN,
+        None => {
+            // The sentinel is about to keep propagating. If a stash is STILL
+            // present at this point it is leaving the one call site that could
+            // attribute it — every consumer above here sees a frame belonging
+            // to a method it did not invoke. Name it here rather than at the
+            // sink, where the caller chain is already gone.
+            if cratonvm_jit::deopt::has_last_deopt()
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some()
+            {
+                if let Some((key, bci)) = cratonvm_jit::deopt::peek_last_deopt_identity() {
+                    eprintln!(
+                        "[cratonvm-deopt] ORPHANED at the serviced call site {}{}: \
+                         stash={key} bci={bci}",
+                        info.method_name, info.descriptor,
+                    );
+                }
+            }
+            i64::MIN
+        }
     }
 }
 
@@ -3059,26 +3077,64 @@ unsafe fn try_resume_trapped_callee(
 
     // Resolve the trapping method from ITS OWN declaring class (baked in the
     // key) — mirrors the `callee_compiler` resolution recipe.
+    // Every refusal below is TRACED. They used to be bare `?` / `return None`
+    // against a bound-but-unused `_resolve_trace`, so the five ways resolution
+    // can decline were indistinguishable from "no stash" — and each one leaves
+    // the frame stashed for an outer consumer that cannot attribute it, i.e.
+    // each one MINTS an orphan. A refusal that cannot be named cannot be
+    // counted, which is why the orphan in
+    // `jit-direct-call-mints-an-orphaned-deopt-frame` was attributed to
+    // inlining on no evidence.
     let cached = {
-        let _resolve_trace = &trc;
         let cm = vm.classes.class_manager.read();
         let class_id = if info.declaring_class_id == 0 {
-            cm.find_bootstrap_class_by_name(key_class)?
+            match cm.find_bootstrap_class_by_name(key_class) {
+                Some(id) => id,
+                None => {
+                    trc("stash class not found (bootstrap)", &key);
+                    return None;
+                }
+            }
         } else {
-            cm.find_class_by_name_for_class(key_class, ClassId::new(info.declaring_class_id))?
+            match cm.find_class_by_name_for_class(key_class, ClassId::new(info.declaring_class_id))
+            {
+                Some(id) => id,
+                None => {
+                    trc(
+                        "stash class not found from the call site's loader",
+                        &format_args!("{key} from_class_id={}", info.declaring_class_id),
+                    );
+                    return None;
+                }
+            }
         };
         let store = cm.class_store();
-        let (method, declaring_id) =
-            crate::classloading::find_method_recursive(class_id, key_method, key_desc, store)?;
-        let code_attr = method.code()?;
-        let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+        let Some((method, declaring_id)) =
+            crate::classloading::find_method_recursive(class_id, key_method, key_desc, store)
+        else {
+            trc("stash method not found in its own class", &key);
+            return None;
+        };
+        let Some(code_attr) = method.code() else {
+            trc("stash method has no Code attribute", &key);
+            return None;
+        };
+        let Some(declaring_class_name) = store.get(declaring_id).map(|c| &*c.name) else {
+            trc("stash declaring class has no name", &key);
+            return None;
+        };
         // The key must name the method's OWN declaring class — a mismatch
         // means the name resolution drifted (e.g. class redefinition);
         // refuse rather than resume against different bytecode.
         if declaring_class_name != key_class {
+            trc(
+                "stash key names a different declaring class than resolution found",
+                &format_args!("{key} resolved={declaring_class_name}"),
+            );
             return None;
         }
         if method.is_synchronized() {
+            trc("stash method is ACC_SYNCHRONIZED", &key);
             return None;
         }
         let num_params = crate::runtime::interpreter::count_method_params(key_desc);
