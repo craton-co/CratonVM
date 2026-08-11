@@ -208,6 +208,44 @@ localized — which is exactly the host where this error is routine. Rust's
 `io::Error` Display already goes through `FormatMessage`, so *deleting* the
 special case is what makes the two agree.
 
+## Verification
+
+Both arms re-run on the merged branch (`origin/dev` merged in first, so this is
+what lands, not what was written).
+
+**Windows, `NioExcShape` under both VMs** — all seven cases now agree with
+HotSpot, including the two the probe kept catching after the first pass:
+
+| case | before | after (= HotSpot) |
+|---|---|---|
+| `newByteChannel(missing)` | `C:/…` | `C:\…` |
+| `createDirectory(existing)` | `C:/…` (missed by the first pass) | `C:\…` |
+| `delete(missing)` | `C:/…` | `C:\…` |
+| `delete(non-empty dir)` | `FileSystemException` | `DirectoryNotEmptyException` |
+| `readSymbolicLink(non-link)` | `reason=null` | the OS's own text |
+| `createSymbolicLink` | `link -> target`, `reason=null` | link only, OS reason |
+| `createLink` | (no exception on this host) | unchanged |
+
+**Linux (Azure), all four classes under the merged binary** — `FileWatcherTests`
+15/15, `ConfigTreePropertySourceTests` 23/23, `ApplicationTempTests` 7/7,
+`EmbeddedLdapAutoConfigurationTests` 18/18, every one with
+`aborted=0 skipped=0 containersFailed=0`.
+
+**Linux unit tests**: `cargo test -p cratonvm-native-builtins --lib` 3413
+passed, 0 failed (6 ignored); `cratonvm-native-io` green. Same on Windows.
+
+**Windows, the three symlink classes**: unchanged counts (5, 3, and
+`aborted=1`) — they cannot pass on a host without the privilege, and HotSpot
+does not pass them here either. What changed is that all three now classify
+`ENV-GATED`, checked by feeding the actual run logs through the shipped
+function.
+
+**Windows, `EmbeddedLdapAutoConfigurationTests`**: still 1/17 — the DSA gap is
+a platform limitation, not something this branch claims to fix. Its message now
+ends `-- the server identity carries a DSA key; TLS with a DSA certificate needs
+the TLS_DHE_DSS_* cipher suites, which neither rustls nor Windows SChannel
+provides…` instead of stopping at a localized ASN.1 error.
+
 ## Tests
 
 * `native-builtins`, `exception_shape_tests` (5): the separator conversion and
