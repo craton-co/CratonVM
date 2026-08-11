@@ -1668,6 +1668,86 @@ mod tests {
         assert!(arena.alloc(node, 8).is_none());
     }
 
+    /// An allocation must not fail while the bytes it needs are present and
+    /// merely SPLIT across adjacent free blocks.
+    ///
+    /// Coalescing used to run only in a collector's post-sweep hook, so between
+    /// two sweeps the list accumulated adjacency nothing merged: every `split`
+    /// remainder, and on ZGC every TLAB retire (which returns the unused tail of
+    /// a chunk whose used part the sweep already free-listed object by object).
+    /// The heap then reported `OutOfMemoryError` with a free list holding
+    /// hundreds of times the requested bytes — measured live on the 2026-08-11
+    /// Hibernate run as `free_list_bytes=1211378512 largest_free_block=65528`
+    /// against a 65552-byte request.
+    ///
+    /// The arm order is the point: the request is proved to FAIL before the
+    /// merge and to SUCCEED after it, on the same list. A test that only
+    /// asserted the success would pass on an arena that never fragmented.
+    #[test]
+    fn alloc_merges_adjacent_holes_before_reporting_failure() {
+        let mut arena = Arena::new(256 * 1024);
+        let cap = arena.capacity();
+        arena.alloc(cap, 8).unwrap(); // pin the cursor: the free list is all there is
+
+        // Four abutting 64 KiB-ish holes: 256 KiB of free space, no single
+        // block big enough for a 96 KiB request.
+        let hole = 64 * 1024;
+        for i in 0..4 {
+            arena.add_free_block(i * hole, hole);
+        }
+        assert_eq!(arena.free_list_bytes(), 4 * hole);
+        assert_eq!(
+            arena.largest_free_block(),
+            hole,
+            "pre-merge the list must really be capped at one hole",
+        );
+
+        // RED: the request cannot be served block-by-block...
+        assert!(
+            !arena.has_free_block_at_least(96 * 1024),
+            "no single block may fit — otherwise the merge is not what serves it",
+        );
+        // ...but the bytes are all there, contiguously.
+        let merged_away = arena.coalesce_free_list();
+        assert_eq!(merged_away, 3, "four abutting holes must become one span");
+        assert_eq!(arena.largest_free_block(), 4 * hole);
+        assert_eq!(
+            arena.free_list_bytes(),
+            4 * hole,
+            "merging must not lose or duplicate a byte",
+        );
+
+        // A second merge on an unchanged list is free and a no-op.
+        assert_eq!(arena.coalesce_free_list(), 0);
+
+        // And `alloc` reaches the merge by itself, without a collection: rebuild
+        // the same fragmented state and ask for 96 KiB directly.
+        let mut arena = Arena::new(256 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        for i in 0..4 {
+            arena.add_free_block(i * hole, hole);
+        }
+        assert!(
+            arena.alloc(96 * 1024, 8).is_some(),
+            "alloc must coalesce and retry rather than return None with 256 KiB free",
+        );
+        assert_eq!(arena.free_list_bytes(), 4 * hole - 96 * 1024);
+    }
+
+    /// The merge must not invent contiguity: a live object between two holes is
+    /// a wall, and merging across it would hand the same bytes out twice.
+    #[test]
+    fn coalesce_does_not_merge_across_a_gap() {
+        let mut arena = Arena::new(64 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        arena.add_free_block(0, 4096);
+        arena.add_free_block(4096 + 8, 4096); // 8-byte live wall
+        assert_eq!(arena.coalesce_free_list(), 0);
+        assert_eq!(arena.largest_free_block(), 4096);
+        assert_eq!(arena.free_list_bytes(), 8192);
+        assert!(arena.alloc(8192, 8).is_none());
+    }
+
     /// `largest_free_block` must stay EXACTLY allocatable: `refill_tlab` sizes
     /// a mini-TLAB from it and immediately allocates that many bytes, so an
     /// over-estimate turns into a wedge. Check it against a brute-force

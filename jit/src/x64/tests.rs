@@ -11893,6 +11893,97 @@ fn s31_inline_ctor_non_elided_super_call_bails_cleanly() {
     let _ = compile_with_inlines(&caller_code, caller_len, 1, 1, sites);
 }
 
+/// An `ldc` the [`crate::InlineSite`] cannot describe must REFUSE the splice,
+/// never push zero.
+///
+/// `site.ldc_info` carries only the constants this mini-emitter can materialise
+/// as an x86 immediate — `Integer` and `Float`. A String / Class / MethodHandle
+/// / condy `ldc` names a *reference* built at run time by
+/// `helpers.ldc_string` / `helpers.ldc_class_cp`, which the inline emitter
+/// never calls, so there is no i64 that stands for it and a miss is not a
+/// "value unknown, use 0" case.
+///
+/// It used to be treated as one, on BOTH ends: `build_inline_site` ended its
+/// constant-pool match `_ => 0`, and the emitter's lookup ended
+/// `else { xor rax, rax }`. A one-line
+/// `Dialect.extractPattern(unit) { return "extract(?1 from ?2)"; }` spliced
+/// into `H2Dialect.extractPattern` therefore compiled to `xor eax,eax; ret`,
+/// and every Hibernate HQL `extract()` / `cast()` / `str()` query died in
+/// `PatternRenderer.<init>` with `NullPointerException: ... "pattern" is null`.
+///
+/// THREE arms, so neither half can pass vacuously:
+/// * a site whose `ldc_info` HAS the pc — must splice, and `try_call` returns
+///   the constant, which is what proves the ldc arm is reachable at all;
+/// * the same site with `ldc_info` EMPTY — must be REFUSED;
+/// * a control site of the identical shape (same descriptor, `callee_max_locals`
+///   and `callee_code_len`, so the same frame reservation and buffer estimate)
+///   whose body opens with an opcode the mini-emitter has never had an arm for.
+///   That one is refused by the long-standing catch-all, and arm 2 must emit
+///   byte-for-byte what it emits. Byte equality against a *no-site* compile
+///   would not work and is not the claim: merely HAVING a site changes
+///   `inline_stack_reserve`, hence the frame size, hence several immediates.
+#[test]
+fn s31_inline_refuses_an_ldc_it_has_no_constant_for() {
+    // Caller: `int f() { return k(); }` — invokestatic #1 (pc 0); ireturn.
+    let caller_code: Vec<u8> = vec![
+        0xb8, 0x00, 0x01, // 0: invokestatic #1
+        0xac, // 3: ireturn
+        0, 0, // padding
+    ];
+    let caller_len = 4;
+    // Callee: `static int k() { return <cp#5>; }` — ldc #5 (pc 0); ireturn.
+    let callee_bytes = [0x12, 0x05, 0xac];
+
+    // Arm 1 — the constant IS describable: splice it.
+    let mut resolvable = make_inline_site(&callee_bytes, 0, 0, true, b'I');
+    resolvable.ldc_info = vec![(0, 1234)];
+    let mut sites = HashMap::new();
+    sites.insert(0, resolvable);
+    let spliced = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("a resolvable ldc must inline");
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mapping.
+    unsafe {
+        assert_eq!(
+            spliced.try_call(&[]).expect("test JIT call"),
+            1234,
+            "the spliced body must return the constant the site described — if this \
+             stops holding the ldc arm is no longer reached and arm 2 proves nothing",
+        );
+    }
+
+    // Arm 2 — nothing describes pc 0 (the String / Class / condy case).
+    let unresolvable = make_inline_site(&callee_bytes, 0, 0, true, b'I');
+    assert!(
+        unresolvable.ldc_info.is_empty(),
+        "this arm's whole point is an ldc with no entry",
+    );
+    let mut sites = HashMap::new();
+    sites.insert(0, unresolvable);
+    let refused = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("a refused inline must still compile — it falls back to a real call");
+    assert_ne!(
+        refused.code_bytes(),
+        spliced.code_bytes(),
+        "an unresolvable ldc must not emit the same body as a resolvable one",
+    );
+
+    // Arm 3 — the control refusal: `monitorenter` (0xc2) has never had an arm
+    // in the inline emitter, so this body is refused by the catch-all at
+    // callee pc 0, exactly where the ldc arm must now refuse.
+    let control = make_inline_site(&[0xc2, 0x00, 0xac], 0, 0, true, b'I');
+    let mut sites = HashMap::new();
+    sites.insert(0, control);
+    let control_refused = compile_with_inlines(&caller_code, caller_len, 0, 1, sites)
+        .expect("the control refusal must also still compile");
+    assert_eq!(
+        refused.code_bytes(),
+        control_refused.code_bytes(),
+        "an ldc with no constant must be refused and rolled back, leaving exactly \
+         what any other refusal leaves — pushing 0 (`xor rax,rax`) here is a null \
+         where the callee returns a live reference",
+    );
+}
+
 #[test]
 fn s31_inline_getter_iload_ireturn() {
     // Caller: int f(int x) { return getX(x); }
