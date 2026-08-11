@@ -810,11 +810,44 @@ fn native_lock_support_get_blocker(
 /// came back empty (see
 /// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
 ///
-/// `num_fields < real` is a self-discriminating test for it: a class this call
+/// `num_fields != real` is a self-discriminating test for it: a class this call
 /// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
-/// and nothing is reported. A smaller request means somebody else -- the real
-/// class file, or another native fabricating a wider shape -- already owns the
+/// and nothing is reported. Any inequality means somebody else -- the real class
+/// file, or another native fabricating a different shape -- already owns the
 /// layout.
+///
+/// **Both directions are reported, and the OVER direction is the dangerous one.**
+/// Until 2026-08-11 the test was `num_fields < real`, so the instrument was blind
+/// to exactly the half `docs/architecture/natives-over-real-jdk-classes.md` §5
+/// calls out: *"a slot index against a real layout is not a wrong answer -- it is
+/// heap corruption"*. A request WIDER than the class is the caller stating, in
+/// the one place it is machine-readable, that it holds a slot map with more
+/// entries than the class has fields. Two consequences, and neither is visible
+/// at the allocation:
+///
+/// * The object comes back with `num_fields` slots while its class declares
+///   `real`, so its header disagrees with `num_total_fields`. That is precisely
+///   the condition `vm/src/memory/gc.rs::validate_object_sizes`
+///   (`CRATONVM_DBG_VALIDATE_NEW=1`) prints as `BAD ... num_slots=N EXPECTED=M`
+///   -- it was written for a JIT `new` with a wrong-size header, and this funnel
+///   manufactures the same shape deliberately.
+/// * The same class is then allocated in TWO widths: `real` by every real
+///   bytecode `new` and by the JIT, `num_fields` here. The wide slot map is not
+///   restricted to the objects this funnel made. Any native that applies it to a
+///   receiver it did NOT allocate -- and these natives do receive real-JDK
+///   objects, see `native_cf_complete`'s slot-1 type discriminator below -- reads
+///   or writes past the end of that object.
+///
+/// It is reported, not refused: see the ENABLED note in the body for why turning
+/// it fatal needs a measurement first.
+///
+/// `real == 0` is excluded from BOTH directions, because 0 is overloaded. It
+/// means "class not loaded yet" (the reason the `max` below exists at all) and
+/// it also means "genuinely no instance fields" -- every interface, and
+/// `java/lang/Object`. This funnel is routinely asked for interface names
+/// (`java/util/concurrent/locks/Condition`, `java/util/concurrent/Flow$Subscription`),
+/// where a non-zero request is the intended fabrication and not an alias. Those
+/// sites are therefore UNMEASURED by this census, not cleared by it.
 ///
 /// Deduplicated by (class, requested, caller) so a hot allocation loop reports
 /// once, not once per object.
@@ -841,6 +874,20 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
     // a class appearing in BOTH this census and the `cratonvm::gc::guard`
     // out-of-bounds reads has a live defect. Turn this on, run the failing
     // workload, and intersect the two lists.
+    //
+    // The 49-class / 75-site measurement above was taken while this function
+    // only saw the UNDER direction, so it says nothing about how common the
+    // OVER direction is; that population has never been counted. That is the
+    // whole reason the OVER case reports rather than refuses. Making it fatal
+    // (or even making it default-on) needs the same measurement the UNDER case
+    // already has: run the real suites with this flag on, count distinct
+    // (class, site) pairs in the OVER direction, and intersect them with
+    // `CRATONVM_DBG_VALIDATE_NEW=1`'s `[young-validate] BAD` lines and the
+    // `cratonvm::gc::guard` out-of-bounds reads. A pair in this census with no
+    // guard hit is wide-but-unused and can be narrowed at the call site; a pair
+    // in both is a live defect. Turning it fatal before that count exists would
+    // convert an unknown number of working call sites into `NoClassDefFoundError`
+    // at boot.
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
@@ -875,16 +922,37 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
     if !seen.lock().insert(key) {
         return;
     }
-    tracing::warn!(
-        class = class_name,
-        requested_fields = num_fields,
-        real_fields = real,
-        site = %site,
-        "native allocated a class under its own SMALLER field layout; the slot \
-         count is clamped up to the real one, so these writes alias the real \
-         class's own fields and any native reading a wider layout for this \
-         class reads past the object"
-    );
+    // One channel, one flag, one dedup key, two directions. The `direction`
+    // field is what makes the census sortable -- a consumer that only wants the
+    // corruption-shaped half filters on `over`, and the pre-existing `under`
+    // rows keep their meaning unchanged.
+    if num_fields < real {
+        tracing::warn!(
+            class = class_name,
+            requested_fields = num_fields,
+            real_fields = real,
+            direction = "under",
+            site = %site,
+            "native allocated a class under its own SMALLER field layout; the slot \
+             count is clamped up to the real one, so these writes alias the real \
+             class's own fields and any native reading a wider layout for this \
+             class reads past the object"
+        );
+    } else {
+        tracing::warn!(
+            class = class_name,
+            requested_fields = num_fields,
+            real_fields = real,
+            direction = "over",
+            site = %site,
+            "native allocated a class under its own WIDER field layout; the object \
+             carries more slots than its class declares fields, so its header \
+             disagrees with num_total_fields (what CRATONVM_DBG_VALIDATE_NEW calls \
+             BAD), and the caller's slot map has entries the class does not -- \
+             applied to any instance this site did not allocate (real bytecode new, \
+             or the JIT) those indices write past the object"
+        );
+    }
 }
 
 // The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,
@@ -940,9 +1008,20 @@ pub(crate) fn try_alloc_concurrent_synthetic(
             // room. 0 means the class isn't loaded yet — keep the caller's
             // requested size.
             let real = ctx.class_num_total_fields(cid);
-            if num_fields > 0 && num_fields < real {
+            // `!=`, not `<`, since 2026-08-11 (JDK-only lane W4-4). The old test
+            // reported only the direction that cannot corrupt the heap; the
+            // rationale for widening it, and for excluding `real == 0` rather
+            // than treating it as "declares nothing", is on
+            // `report_layout_alias`.
+            if num_fields > 0 && real > 0 && num_fields != real {
                 report_layout_alias(class_name, num_fields, real);
             }
+            // ALLOCATION IS UNCHANGED by the widening above: still `max`, so an
+            // over-request still gets the slots it asked for and an under-request
+            // is still clamped up. Reporting and refusing are separate changes and
+            // this lane makes only the first -- the over-allocating population has
+            // never been counted (see the ENABLED note), and a funnel with ~2,000
+            // call sites is not where you discover that number by failing.
             let n = num_fields.max(real);
             // `try_alloc_object_gc_safe` first (proactively collects, then walks
             // young -> old gen without aborting): this is the shared allocator
