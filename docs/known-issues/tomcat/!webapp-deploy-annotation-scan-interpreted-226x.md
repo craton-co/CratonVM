@@ -112,6 +112,151 @@
 > the ~116x recorded on Azure, which is a host difference (this host's HotSpot
 > column is 6.7–19.9 us/class) and not progress. Take the
 > CratonVM-vs-CratonVM column, as § Measuring this at all already says.
+>
+> ### The ~350 ns invoke, decomposed under `perf` — with a control arm
+>
+> Azure `20.80.105.49`, `--nojit`, `perf record -F 997`, flat, load average 11
+> (so read the shares, not any wall clock). `InvokeAttributionProbe` reproduces
+> on Linux at **450–455 ns with the call, 94–101 ns without, delta 353–370 ns**,
+> matching the Windows figure.
+>
+> The point of the probe's two arms is that the **`nocall` arm is a control**,
+> and it is a remarkably clean one — three symbols and nothing else:
+>
+> | `nocall` (no invoke at all) | |
+> |---|---:|
+> | `execute_frame_from_index` | 77.40% |
+> | `safepoint_check` | 18.17% |
+> | `try_osr_with_backoff` | 3.07% |
+>
+> **So every other symbol in the `call` arm is the invoke path**, which is what
+> makes the following a decomposition rather than a list:
+>
+> | `call` arm symbol | share | group |
+> |---|---:|---|
+> | `execute_frame_from_index` | 25.67% | *(loop — also in the control)* |
+> | `execute_invokevirtual_cached` | 15.43% | dispatcher body |
+> | `pop_and_recycle_frame_with_reason` | 6.97% | frame lifecycle |
+> | `__memmove_avx512_unaligned_erms` | 6.43% | frame lifecycle |
+> | `safepoint_check` | 4.33% | *(control)* |
+> | `Frame::new_pooled_cached` | 4.25% | frame lifecycle |
+> | `CachedInvokeTarget::clone` | 2.55% | cache |
+> | `InvokeCache::get` | 2.46% | cache |
+> | `VmHeap::is_object_address` | 2.28% | receiver checks |
+> | `ZObjectStarts::contains` | 1.98% | receiver checks |
+> | `init_locals_from_parts` | 1.98% | frame lifecycle |
+> | `try_osr_with_backoff` | 1.70% | *(control)* |
+> | `copy_args_to_locals` | 1.69% | frame lifecycle |
+> | `CompactValue::decode_by_descriptor` | 1.65% | arg decode |
+> | `execute_invokevirtual_cached::{closure#9}` | 1.65% | dispatcher body |
+> | `OrderedPlRwLock<ClassManager>::try_read` / `::read` / guard drop | 1.53 / 1.14 / 0.99% | class-manager lock |
+> | `real_http_url_connection_native` | 1.50% | native-interception chain |
+> | `intercept_force_registered_native_cached` | 1.47% | native-interception chain |
+> | `drop_glue<FrameInner>` | 1.29% | frame lifecycle |
+> | `__memset_avx512_unaligned_erms` | 1.08% | frame lifecycle |
+> | `ValueStack::from_pooled` | 0.99% | frame lifecycle |
+> | `refresh_stale_object_args` | 0.92% | receiver checks |
+> | `VmHeap::class_id_of` / `load_and_forward` | 0.72 / 0.68% | receiver checks |
+> | `push_frame_and_fire_entry` | 0.72% | JVMTI |
+> | `pop_arg_for_descriptor_checked` | 0.63% | arg decode |
+>
+> Grouped, as a share of the whole `call` arm:
+>
+> | group | share |
+> |---|---:|
+> | **frame lifecycle** (construct, fill locals, move in, move out, drop) | **~24.7%** |
+> | dispatcher body (`execute_invokevirtual_cached` + its closure) | ~17.1% |
+> | receiver / heap checks | ~6.6% |
+> | inline-cache lookup + `CachedInvokeTarget::clone` | ~5.0% |
+> | class-manager `RwLock` read, per invoke | ~3.7% |
+> | native-interception chain | ~3.0% |
+> | argument decode | ~2.3% |
+>
+> **The largest single item is not the dispatcher, it is the frame.** A
+> call-graph run (`--call-graph=dwarf`) puts the `memcpy` under
+> `pop_and_recycle_frame_with_reason` → `Vec::pop<Frame>` and under
+> `push_frame_and_fire_entry`: `Frame` is a large by-value struct and it is
+> **moved on every push and every pop**. That is the shape of the remaining
+> gap, and it is a data-structure change to the interpreter's frame stack —
+> the "genuine interpreter rewrite" this page has been calling for, now with a
+> number on it.
+>
+> Two smaller items are ordinary defects rather than architecture, and are the
+> only things here a point fix could reach:
+>
+> * **The native-interception chain, ~3.0%, is per-call-site constant.**
+>   `real_http_url_connection_native` appearing at 1.50% in a probe whose only
+>   call is `int callee(int)` is the tell: a `(class, method, descriptor)`
+>   match chain runs on every inline-cache **hit**. § Correction: it is not
+>   `try_stackless_invoke` already identified this as "where the precomputed
+>   flags half of the project belongs" — it now has a price.
+> * **A class-manager `RwLock` read per invoke, ~3.7%**, the invoke-side twin
+>   of the field-path finding in § The clusters, by mechanism.
+>
+> ### First piece taken: the returning frame is recycled in place
+>
+> The return path opened with `if let Some(f) = thread.frames.pop()`, and `f`
+> then travelled into `recycle_frame_with_shared` and again into
+> `take_pool_parts` — **three moves of a ~300-byte `Frame` to arrive at four
+> `Vec` headers**. Nothing on that path needed the frame anywhere but where it
+> already was. It now reads the dying frame through a borrow, harvests the four
+> buffers by header (`std::mem::take`), and lets `FrameStack::truncate` drop
+> the husk where it lies.
+>
+> **The mechanism moved, and only the mechanism** — same probe, same host, both
+> binaries, `perf` shares (load-independent, which matters: the box was at load
+> 17):
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `__memmove_avx512_unaligned_erms` | 5.75% | **2.64%** |
+> | `pop_and_recycle_frame_with_reason` | 6.10% | **3.92%** |
+> | `execute_invokevirtual_cached` | 15.21% | 14.82% |
+> | `Frame::new_pooled_cached` | 3.84% | 3.87% |
+> | `is_object_address` | 2.40% | 2.45% |
+> | `CachedInvokeTarget::clone` | 2.33% | 2.36% |
+> | `InvokeCache::get` | 2.12% | 2.17% |
+> | `init_locals_from_parts` | 1.88% | 1.89% |
+>
+> **−5.3 percentage points of the invoke arm**, entirely in the two symbols the
+> change targets; every other symbol is flat. A call-graph re-run confirms the
+> `memcpy` under `Vec::pop<Frame>` is gone — what remains is attributed to
+> `intercept_force_registered_native_cached`, i.e. the *other* item on the list
+> above.
+>
+> **On the workload it is ~2%, and this host cannot resolve that.** Four
+> interleaved passes, arms reversed on even passes, `taglibs-standard-impl`
+> us/class: before 579.6 / 699.8 / 751.2 / 846.5 (mean **719.3**), after
+> 673.7 / 703.2 / 724.7 / 717.3 (mean **704.7**), HotSpot 10.7–20.6. The means
+> differ by 2.0% and the ranges overlap, so **the workload figure is a
+> prediction from the mechanism, not a measurement** — which is what the
+> arithmetic says to expect: −5.3 pp of an invoke arm that is about half the
+> scan's interpreted time. The `after` column being much tighter (674–725
+> against 580–847) is suggestive, and is not evidence.
+>
+> Correctness: 2487 `cratonvm-vm` unit tests and the 38-class regression suite
+> green on the changed binary. `regression-suite/perf/c2-reach.sh` and a
+> CratonBench pass were **not** run and are not implicated — this change alters
+> no admission or tier-up decision, so nothing moves between the tiers those
+> gates watch.
+>
+> **What is left of the frame group.** `Frame::new_pooled_cached` (3.87%),
+> `init_locals_from_parts` (1.89%) and `copy_args_to_locals` (1.64%) are the
+> push side, and the symmetric fix — constructing into the slot rather than
+> moving into it — is **not** justified on this evidence:
+> `push_frame_and_fire_entry` no longer appears among the `memcpy` callers at
+> all after this change, so the push-side move is either already elided by the
+> compiler or below 0.5%. Re-measure before building it.
+>
+> **One caution about that call-graph run**, because it nearly cost a session:
+> `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
+> inside `execute_invokevirtual_cached`, which would have been a spectacular
+> find — a debug predicate copying memory on every invoke. It is not real.
+> `dbg_loader_trace()` is `cached_is_ok!`, a memoised `MemoSlot` load that
+> cannot copy anything. `--call-graph=dwarf` mis-nests inlined frames, so an
+> inline attribution has to be checked against the source before it is
+> believed; the two non-inlined attributions in the same output
+> (`Vec::pop<Frame>`, `push_frame_and_fire_entry`) are the trustworthy ones.
 
 > **Update 2026-08-07 — I tried to close this and could not. Here is the
 > measured ceiling, three corrections to what is written below, and a re-scope.**
@@ -250,6 +395,12 @@
 >    `regression-suite/perf/c2-reach.sh` plus a CratonBench pass in scope, as
 >    § Untaken levers already says. Setting a throughput number before that
 >    project scopes itself would be inventing one.
+>
+>    **2026-08-11: that project now has a measured target.** Over half of this
+>    workload's interpreted time is the invoke operation, ~350 ns of it, and
+>    the biggest piece is not dispatch logic but **moving a by-value `Frame`
+>    in and out of the frame stack** (~24.7% of the invoke arm). See the
+>    2026-08-11 update at the top for the control-arm decomposition.
 >
 > `probes/NativeBridgeCostProbe.java` (added with this update) is the tool for
 > the recurring "is this bridge worth it" question: it prices a registered

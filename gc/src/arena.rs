@@ -17,6 +17,7 @@
 /// relocating any survivor (which is what makes the collection
 /// JIT-frame-safe — see `gen_heap::sweep_young_non_moving`).
 use crate::gc_flags;
+use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy)]
 pub struct FreeBlock {
     /// Byte offset from the start of the backing buffer.
@@ -151,11 +152,35 @@ pub struct Arena {
     /// class that can serve this request" and "largest available block"
     /// queries are a handful of word operations rather than a list walk.
     small_mask: [u64; SMALL_MASK_WORDS],
-    /// Reclaimed regions of at least [`LARGE_BLOCK_MIN`] bytes — the
-    /// coalesced spans TLAB refills and array allocations carve from. Stays
-    /// short (the post-sweep coalescer merges adjacent holes into a handful
-    /// of spans), so scanning it is cheap.
-    free_large: Vec<FreeBlock>,
+    /// Reclaimed regions of at least [`LARGE_BLOCK_MIN`] bytes — the spans TLAB
+    /// refills and array allocations carve from — **keyed by exact size**.
+    ///
+    /// WHY A MAP AND NOT A VEC. This was a `Vec<FreeBlock>` scanned first-fit,
+    /// on the stated grounds that "this tier stays short (the post-sweep
+    /// coalescer merges adjacent holes into a handful of spans), so scanning it
+    /// is cheap". That premise is false for any workload whose holes are walled
+    /// by live data: the coalescer merges what is ADJACENT, and one survivor
+    /// between two holes keeps them apart however often it runs. The tier then
+    /// holds thousands of spans and every request scanned all of them — and
+    /// `max_free_upper`'s O(1) fail-fast does not save it, because
+    /// `add_free_block` raises that bound again on every block the sweep
+    /// reclaims.
+    ///
+    /// Measured on `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
+    /// (2026-08-11, Azure Linux, default collector, `--Xmx 1500m`):
+    /// `Arena::alloc` was **76% of all CPU samples**, and `perf annotate`
+    /// attributed 47% of the entire process to one source line — the first line
+    /// of that scan's loop body. The class takes 54s on real HotSpot on the
+    /// same box and was taking ~2300s.
+    ///
+    /// Keyed by size, the same question is `range(need..).next()`: O(log n) for
+    /// a hit, O(log n) for an AUTHORITATIVE miss, and no scan either way. Every
+    /// block inside one bucket has the same size, which is what makes taking
+    /// the head exact rather than merely first-fit.
+    free_large: BTreeMap<usize, Vec<FreeBlock>>,
+    /// Blocks across every [`Self::free_large`] bucket. The map's `len()` counts
+    /// buckets, not blocks, and several invariants here are about blocks.
+    free_large_blocks: usize,
     /// Conservative UPPER BOUND on the size of the largest free-list block
     /// (`actual_max <= max_free_upper` always). Maintained so hot callers can
     /// answer "no block of >= size exists" in O(1) instead of scanning the
@@ -175,19 +200,11 @@ pub struct Arena {
     /// * [`Self::clear_free_list`] / [`Self::reset`] / [`Self::reset_no_zero`]
     ///   zero it alongside the list.
     max_free_upper: usize,
-    /// Memoised EXACT maximum over [`Self::free_large`], or `None` when it
-    /// must be recomputed. Unlike [`Self::max_free_upper`] (a bound that may
-    /// over-estimate) this is the precise value [`Self::largest_free_block`]
-    /// owes its callers — `gen_heap::refill_tlab` sizes a mini-TLAB from it
-    /// and then *allocates* that many bytes, so an over-estimate turns into a
-    /// failed refill and an allocation wedge.
-    ///
-    /// Maintained rather than recomputed because the span tier is the only
-    /// part of the free list a scan still has to walk: a push can only raise
-    /// the maximum (folded in on the spot), and only consuming a block can
-    /// lower it (invalidates). `Cell` because the query takes `&self` —
-    /// `Arena` always lives inside a `Mutex`, which needs `Send`, not `Sync`.
-    large_max_exact: std::cell::Cell<Option<usize>>,
+    // NOTE: the old `large_max_exact: Cell<Option<usize>>` memo is gone. It
+    // existed because the span tier was a Vec whose maximum could only be found
+    // by walking it, so every consuming take invalidated the memo and the next
+    // query re-walked. A size-keyed map answers the same question with its last
+    // key — always exact, never stale, no walk. See `Arena::large_max`.
     /// Running total of bytes currently held across both free-list tiers,
     /// maintained incrementally at every mutation site (`push_block_routed`
     /// adds a pushed block's size; `small_fit`/`large_fit` subtract the
@@ -359,9 +376,9 @@ impl Arena {
             cursor: 0,
             free_small: (0..SMALL_BUCKETS).map(|_| Vec::new()).collect(),
             small_mask: [0u64; SMALL_MASK_WORDS],
-            free_large: Vec::new(),
+            free_large: BTreeMap::new(),
+            free_large_blocks: 0,
             max_free_upper: 0,
-            large_max_exact: std::cell::Cell::new(Some(0)),
             free_bytes_total: 0,
             alloc_anchors: Vec::new(),
             anchor_shift: 0,
@@ -470,13 +487,8 @@ impl Arena {
             self.free_small[k].push(block);
             mask_set(&mut self.small_mask, k);
         } else {
-            self.free_large.push(block);
-            // A push can only RAISE the span-tier maximum; fold it in so the
-            // memo survives (invalidating here would make every sweep's
-            // reclaim cost the next `largest_free_block` a full rescan).
-            if let Some(m) = self.large_max_exact.get() {
-                self.large_max_exact.set(Some(m.max(block.size)));
-            }
+            self.free_large.entry(block.size).or_default().push(block);
+            self.free_large_blocks += 1;
         }
         self.free_bytes_total += block.size;
         // A new block may sit next to one already on the list.
@@ -487,6 +499,45 @@ impl Arena {
     #[inline]
     fn free_is_empty(&self) -> bool {
         self.free_large.is_empty() && self.small_mask.iter().all(|&w| w == 0)
+    }
+
+    /// How many spans the free list holds, and how many distinct sizes they
+    /// come in.
+    ///
+    /// The SHAPE of a fragmented heap, not just its size. `free_list_bytes` and
+    /// `largest_free_block` together say "1.13 GiB free, biggest hole 65528" —
+    /// which leaves open whether that is two dozen holes or twenty thousand,
+    /// and those want completely different fixes. Reported by the ZGC
+    /// allocation-failure guard for exactly that reason.
+    pub fn free_span_shape(&self) -> (usize, usize) {
+        (self.free_large_blocks, self.free_large.len())
+    }
+
+    /// The EXACT largest span, or 0 when the tier is empty.
+    ///
+    /// The map is keyed by size, so this is its last key — no walk, and never
+    /// stale. See the `large_max_exact` note on [`Self::free_large`] for the
+    /// memo this replaced.
+    #[inline]
+    fn large_max(&self) -> usize {
+        self.free_large.keys().next_back().copied().unwrap_or(0)
+    }
+
+    /// Remove one block from bucket `size`, dropping the bucket when it empties
+    /// so [`Self::large_max`] and every `range` query stay exact.
+    #[inline]
+    fn take_from_bucket(&mut self, size: usize, idx: usize) -> FreeBlock {
+        let list = self
+            .free_large
+            .get_mut(&size)
+            .expect("bucket exists: the caller just found it");
+        let block = list.swap_remove(idx);
+        if list.is_empty() {
+            self.free_large.remove(&size);
+        }
+        self.free_large_blocks -= 1;
+        self.free_bytes_total -= block.size;
+        block
     }
 
     /// GUARANTEED-available largest small block: every block in the highest
@@ -618,31 +669,68 @@ impl Arena {
     /// remainder blocks (head alignment padding, tail leftover) for the
     /// caller to re-route by size.
     ///
-    /// Unbounded on purpose: this tier stays short (the post-sweep coalescer
-    /// merges adjacent holes into a handful of spans) and, unlike the small
-    /// tier, a miss here has to be authoritative — [`Self::alloc`] and
-    /// [`Self::has_free_block_at_least`] tighten [`Self::max_free_upper`]
-    /// from it. The O(1) `max_free_upper` fail-fast keeps hopeless requests
-    /// from reaching the loop at all.
+    /// BEST fit over the span tier, in `O(log n)` — and a miss here is
+    /// authoritative, which [`Self::alloc`] and
+    /// [`Self::has_free_block_at_least`] rely on to tighten
+    /// [`Self::max_free_upper`].
+    ///
+    /// Two arms, and the split is the whole soundness argument:
+    ///
+    /// * **`size + align - 1` and up.** Every block in such a bucket covers the
+    ///   request plus the worst-case alignment padding, so the head of the
+    ///   FIRST such bucket fits with no per-block test. Smallest-first, so this
+    ///   is best fit and it stops manufacturing dust the way a first-fit scan
+    ///   over a size-mixed Vec did.
+    /// * **`[size, size + align - 1)`.** Only reachable for `align > 8`: every
+    ///   block on this heap sits on the 8-byte object grid (`alloc` rounds, the
+    ///   sweep only publishes 8-aligned spans, `warn_unaligned_block` fires at
+    ///   any producer that breaks it), so for `align <= 8` the padding is zero
+    ///   and the exact-size bucket is already covered by the arm above. When it
+    ///   IS reachable the buckets in that window are searched per block, because
+    ///   there the fit depends on the block's own offset — and they must be
+    ///   searched, or a miss would stop being authoritative.
+    ///
+    /// This replaced an unbounded first-fit scan of a `Vec<FreeBlock>` whose
+    /// justification ("this tier stays short") does not hold on a fragmented
+    /// heap: see the `free_large` field doc for the 76%-of-CPU profile that
+    /// found it.
     fn large_fit(
         &mut self,
         base: usize,
         size: usize,
         align: usize,
     ) -> Option<(usize, [Option<FreeBlock>; 2])> {
-        for i in 0..self.free_large.len() {
-            let block = self.free_large[i];
+        let worst = size.checked_add(align - 1)?;
+        // Arm 1 — a bucket that covers size + worst-case padding. Head fits.
+        if let Some((&sz, list)) = self.free_large.range(worst..).next() {
+            let block = list[list.len() - 1];
             let block_addr = base + block.offset;
-            let aligned_addr = (block_addr + align - 1) & !(align - 1);
-            let padding = aligned_addr - block_addr;
-            let Some(total_needed) = padding.checked_add(size) else {
-                continue;
-            };
-            if total_needed <= block.size {
-                self.free_large.swap_remove(i);
-                self.free_bytes_total -= block.size;
-                // The consumed block may have been the maximum.
-                self.large_max_exact.set(None);
+            let padding = ((block_addr + align - 1) & !(align - 1)) - block_addr;
+            debug_assert!(
+                padding + size <= sz,
+                "a bucket at or above size+align-1 must cover size plus any padding",
+            );
+            let block = self.take_from_bucket(sz, list.len() - 1);
+            return Some(Self::split(block, padding, size));
+        }
+        // Arm 2 — the alignment window. Empty for every `align <= 8` caller.
+        if worst > size {
+            let candidate = self
+                .free_large
+                .range(size..worst)
+                .find_map(|(&sz, list)| {
+                    list.iter().position(|block| {
+                        let block_addr = base + block.offset;
+                        let padding = ((block_addr + align - 1) & !(align - 1)) - block_addr;
+                        padding.checked_add(size).is_some_and(|need| need <= sz)
+                    })
+                    .map(|idx| (sz, idx))
+                });
+            if let Some((sz, idx)) = candidate {
+                let block = self.free_large[&sz][idx];
+                let block_addr = base + block.offset;
+                let padding = ((block_addr + align - 1) & !(align - 1)) - block_addr;
+                let block = self.take_from_bucket(sz, idx);
                 return Some(Self::split(block, padding, size));
             }
         }
@@ -711,8 +799,7 @@ impl Arena {
             // segregated small tier has no scan budget to hide behind any
             // more), so the miss is a proof: tighten the bound to the exact
             // span-tier maximum folded with the small tier's ceiling.
-            let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
-            self.large_max_exact.set(Some(large_max));
+            let large_max = self.large_max();
             let small_cap = self.small_max_ceil();
             self.max_free_upper = self.max_free_upper.min(large_max.max(small_cap));
         }
@@ -898,8 +985,8 @@ impl Arena {
         }
         self.small_mask = [0u64; SMALL_MASK_WORDS];
         self.free_large.clear();
+        self.free_large_blocks = 0;
         self.max_free_upper = 0;
-        self.large_max_exact.set(Some(0));
         self.free_bytes_total = 0;
         // An empty list holds no adjacency.
         self.free_pushed = 0;
@@ -946,14 +1033,7 @@ impl Arena {
     /// The answer is a value that can actually be ALLOCATED, never an
     /// over-estimate: callers size a subsequent `alloc` from it.
     pub fn largest_free_block(&self) -> usize {
-        let large = match self.large_max_exact.get() {
-            Some(m) => m,
-            None => {
-                let m = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
-                self.large_max_exact.set(Some(m));
-                m
-            }
-        };
+        let large = self.large_max();
         // Any span is >= LARGE_BLOCK_MIN, which is larger than every block in
         // the small tier by construction — so a non-zero span maximum is the
         // overall maximum and the small tier need not be consulted.
@@ -1010,15 +1090,14 @@ impl Arena {
             }
             false
         } else {
-            let mut scan_max = 0usize;
-            for b in &self.free_large {
-                if b.size >= size {
-                    return true;
-                }
-                scan_max = scan_max.max(b.size);
+            // O(log n) and exact: the map is keyed by size, so "is there a span
+            // at least this big" is one range probe and the maximum is the last
+            // key. This used to be a full walk of the span tier, whose miss then
+            // had to publish the maximum it happened to observe.
+            if self.free_large.range(size..).next().is_some() {
+                return true;
             }
-            // The whole span tier was viewed, so its maximum is now exact.
-            self.large_max_exact.set(Some(scan_max));
+            let scan_max = self.large_max();
             // The small tier caps below LARGE_BLOCK_MIN <= size; fold in its
             // (bitmap-derived) ceiling rather than scanning it.
             let ceil = self.small_max_ceil();
@@ -1035,7 +1114,7 @@ impl Arena {
             .free_small
             .iter()
             .flatten()
-            .chain(self.free_large.iter())
+            .chain(self.free_large.values().flatten())
             .map(|b| (b.offset, b.size))
             .collect();
         sort_by_offset(&mut v);
@@ -1814,6 +1893,132 @@ mod tests {
         arena.add_free_block(1024, 1024);
         assert_eq!(arena.coalesce_free_list(), 1);
         assert_eq!(arena.coalesce_threshold, COALESCE_THRESHOLD_MIN);
+    }
+
+    /// The span tier serves BEST fit, and every accounting field stays exact
+    /// across takes and splits.
+    ///
+    /// The tier used to be a `Vec` scanned first-fit, so the block a request got
+    /// depended on push order: a 5 KiB request could consume a 1 MiB span and
+    /// leave a ~1 MiB remainder, which is how a tier that is supposed to hold "a
+    /// handful of spans" ends up holding thousands. Keyed by size, the answer is
+    /// the smallest bucket that fits.
+    #[test]
+    fn span_tier_serves_best_fit_and_keeps_its_accounting_exact() {
+        let mut arena = Arena::new(4 * 1024 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap(); // pin the cursor
+
+        // Pushed largest-first on purpose: a first-fit scan would take the
+        // 1 MiB span for a 5 KiB request.
+        arena.add_free_block(0, 1024 * 1024);
+        arena.add_free_block(2 * 1024 * 1024, 64 * 1024);
+        arena.add_free_block(3 * 1024 * 1024, 8 * 1024);
+        assert_eq!(arena.free_span_shape(), (3, 3));
+        assert_eq!(arena.largest_free_block(), 1024 * 1024);
+        let total = 1024 * 1024 + 64 * 1024 + 8 * 1024;
+        assert_eq!(arena.free_list_bytes(), total);
+
+        // 5 KiB must come out of the 8 KiB span, leaving a 3 KiB remainder that
+        // routes to the SMALL tier (below LARGE_BLOCK_MIN).
+        let want = 5 * 1024;
+        assert!(arena.alloc(want, 8).is_some());
+        assert_eq!(
+            arena.free_span_shape(),
+            (2, 2),
+            "best fit must consume the 8 KiB span, not the 1 MiB one",
+        );
+        assert_eq!(arena.largest_free_block(), 1024 * 1024);
+        assert_eq!(
+            arena.free_list_bytes(),
+            total - want,
+            "the split remainder must stay on the list, exactly",
+        );
+
+        // Exhaust the 1 MiB span exactly: the bucket must disappear, so the
+        // maximum falls to the next span rather than reporting a stale value.
+        assert!(arena.alloc(1024 * 1024, 8).is_some());
+        assert_eq!(arena.largest_free_block(), 64 * 1024);
+        assert_eq!(arena.free_span_shape(), (1, 1));
+
+        // A request past every span is an AUTHORITATIVE miss, and must agree
+        // with the probe.
+        assert!(!arena.has_free_block_at_least(128 * 1024));
+        assert!(arena.alloc(128 * 1024, 8).is_none());
+        assert!(arena.has_free_block_at_least(64 * 1024));
+    }
+
+    /// Two same-size spans in one bucket are two distinct blocks, and the
+    /// alignment window (`align > 8`) still finds a fit only some of them have.
+    ///
+    /// The bucket head is taken without a per-block test, which is exact only
+    /// because every block in a bucket has the same size AND every offset is on
+    /// the 8-byte grid. For `align > 8` neither is enough — the fit depends on
+    /// the block's own offset — so that window is searched per block. If it were
+    /// not, a miss would stop being authoritative and `alloc` would report OOM
+    /// with a usable hole on the list.
+    #[test]
+    fn span_tier_handles_duplicate_sizes_and_the_alignment_window() {
+        let mut arena = Arena::new(256 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        arena.add_free_block(0, 8192);
+        arena.add_free_block(16384, 8192);
+        assert_eq!(
+            arena.free_span_shape(),
+            (2, 1),
+            "two blocks, one size class",
+        );
+        assert_eq!(arena.free_list_bytes(), 16384);
+        assert!(arena.alloc(8192, 8).is_some());
+        assert_eq!(arena.free_span_shape(), (1, 1));
+        assert!(arena.alloc(8192, 8).is_some());
+        assert_eq!(arena.free_span_shape(), (0, 0));
+        assert_eq!(arena.largest_free_block(), 0);
+
+        // Alignment window: one span whose base is 4096-aligned and one whose
+        // base is not. A 4096-aligned request of exactly the span size can only
+        // be served by the first.
+        let mut arena = Arena::new(256 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        let base = arena.base_ptr() as usize;
+        // Offsets chosen so `base + off` alignment differs by construction.
+        let aligned_off = (4096 - (base & 4095)) & 4095;
+        arena.add_free_block(aligned_off + 8192, 4096); // 4096-aligned start
+        arena.add_free_block(aligned_off + 4096 + 8, 4096); // deliberately not
+        let hit = arena.alloc(4096, 4096);
+        assert!(
+            hit.is_some(),
+            "the aligned span must still be found through the alignment window",
+        );
+        assert_eq!(hit.unwrap() as usize & 4095, 0);
+    }
+
+    /// A tier holding many spans must answer a hopeless request without looking
+    /// at all of them.
+    ///
+    /// This is the regression the size-keyed map exists for, written so the old
+    /// implementation FAILS IT BY TIMING OUT rather than by an assertion: 40k
+    /// spans x 40k failing probes is 1.6e9 block visits under the old unbounded
+    /// first-fit scan (minutes), and 40k range probes now (milliseconds). A
+    /// plain assertion could not catch it — the old code returned the right
+    /// answer, just not this decade. `Arena::alloc` was 76% of all CPU on
+    /// `DefaultCatalogAndSchemaTest` because of exactly this shape.
+    #[test]
+    fn a_hopeless_request_against_a_huge_span_tier_is_not_a_scan() {
+        let spans = 40_000usize;
+        let span = 8 * 1024usize;
+        let mut arena = Arena::new(spans * span * 2);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        for i in 0..spans {
+            arena.add_free_block(i * span * 2, span);
+        }
+        assert_eq!(arena.free_span_shape(), (spans, 1));
+        // Every one of these is a proven miss: no span is anywhere near 1 MiB.
+        for _ in 0..spans {
+            assert!(arena.alloc(1024 * 1024, 8).is_none());
+        }
+        // ...and the tier is untouched, so nothing was consumed on the way.
+        assert_eq!(arena.free_span_shape(), (spans, 1));
+        assert_eq!(arena.free_list_bytes(), spans * span);
     }
 
     /// The merge must not invent contiguity: a live object between two holes is

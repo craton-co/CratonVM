@@ -2700,6 +2700,10 @@ impl ZgcRealHeap {
         capacity: usize,
         free_list_bytes: usize,
         largest_free_block: usize,
+        // (spans, distinct sizes) -- the SHAPE of the fragmentation. Without it
+        // "1.13 GiB free, biggest hole 65528" leaves open whether that is two
+        // dozen holes or twenty thousand, and those want different fixes.
+        span_shape: (usize, usize),
     ) {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if WARNED.swap(true, Ordering::Relaxed) {
@@ -2712,6 +2716,8 @@ impl ZgcRealHeap {
             capacity,
             free_list_bytes,
             largest_free_block,
+            free_spans = span_shape.0,
+            free_span_sizes = span_shape.1,
             "zgc: arena allocation failed — this heap does not compact, so the \
              bump cursor never rewinds and reclaimed space returns only as \
              free-list holes. `largest_free_block < request` with a large \
@@ -2769,6 +2775,7 @@ impl ZgcRealHeap {
                         arena.capacity(),
                         arena.free_list_bytes(),
                         arena.largest_free_block(),
+                        arena.free_span_shape(),
                     );
                     // Ask for a collection at the next safepoint. A native
                     // cannot collect where it stands, but `vm_exec`'s

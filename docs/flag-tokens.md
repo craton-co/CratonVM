@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-435 tokens.
+436 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -155,6 +155,7 @@ export inherited from a parent shell.
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
 | `dropped-stubs` | `CRATONVM_DBG_DROPPED_STUBS` |
+| `dupdef` | `CRATONVM_DBG_DUPDEF` |
 | `dump-jit` | `CRATONVM_DBG_DUMP_JIT` |
 | `dupcall-filter` | `CRATONVM_DBG_DUPCALL_FILTER` |
 | `dupclass` | `CRATONVM_DBG_DUPCLASS` |
@@ -726,7 +727,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-25 tokens.
+27 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -741,6 +742,8 @@ export inherited from a parent shell.
 | `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL / CRATONVM_SYNTHETIC_FORKJOINPOOL` |
 | `jca` | `CRATONVM_REAL_JCA` |
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
+| `memoryusage-tostring` | `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING` |
+| `mxbean-mapping` | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` |
 | `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |

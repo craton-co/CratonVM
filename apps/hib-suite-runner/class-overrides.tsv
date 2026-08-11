@@ -36,16 +36,32 @@
 # these accommodations and will misreport the classes below.
 # -----------------------------------------------------------------------------
 
-# DefaultCatalogAndSchemaTest — 132-method @ParameterizedClass matrix whose
-# implicit FK/constraint naming goes through NamingHelper.hashedName ->
-# BigInteger.toString(35) -> java/math/MutableBigInteger. That class is
-# deliberately quarantined to the interpreter (41cdfdf94) to contain a real
-# JIT-corruption AIOOBE, which makes this one class legitimately slower than
-# the suite's flat 300s per-class cap — its clean whole-class runtimes are
-# 620,902-1,804,813 ms. Without a floor it is killed by `timeout` at 300s and
-# reported HANG on every full-suite run, with ms=0 and no @@RESULT, forever.
-# Root cause + evidence: fixed-suite-bugs/hibernate/
-# qualfiedtablenaming-hang-cluster-20260721-FIXED.md
+# DefaultCatalogAndSchemaTest — 132-method @ParameterizedClass matrix, each
+# method bootstrapping a SessionFactory and generating DDL. Legitimately far
+# slower than the suite's flat 300s per-class cap, so it needs a floor; without
+# one `timeout` kills it at 300s and it is reported HANG with ms=0 and no
+# @@RESULT, forever. Root cause of the original hang: fixed-suite-bugs/
+# hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md
+#
+# THE OLD RATIONALE HERE WAS STALE, AND SO WERE ITS NUMBERS. It said the class
+# was "deliberately quarantined to the interpreter (41cdfdf94)" via
+# NamingHelper.hashedName -> BigInteger.toString(35) ->
+# java/math/MutableBigInteger, and quoted clean runtimes of 620,902-1,804,813
+# ms. That quarantine was REMOVED on 2026-07-31 with the last static ban mirrors
+# (see the #[ignore] on `hibernate_biginteger_divide_cluster_is_never_background_enqueued`
+# in jit/src/tiered.rs) — the comment outlived the defect by six weeks and would
+# have sent the next reader hunting a JIT ban that no longer exists.
+#
+# What the time actually was, measured 2026-08-11 on Azure Linux with
+# `perf record`: `Arena::alloc` at 76% of all CPU, i.e. the arena span tier's
+# unbounded first-fit scan (fixed by keying it on size, gc/src/arena.rs). JIT-ON
+# was 3.8x SLOWER than --nojit before that fix and is faster than it after.
+# Sequential, same box, same 1500m heap, 132/132 both sides:
+#   real HotSpot   30s
+#   CratonVM      516s   (was ~2300s)
+# Still 17x, hence the floor stays — but 3600s is now generous rather than
+# barely sufficient, and a full-suite shard run measured 2194s under six-way
+# contention, so do not lower it without re-measuring under load.
 org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest	3600	-
 
 # OffsetDateTimeTest / ZonedDateTimeTest — legitimately slow, not a hang.
