@@ -2321,15 +2321,30 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogger",
         "(Ljava/lang/Class;)Lorg/slf4j/Logger;",
         |ctx, args| {
-            // Extract class name from the Class mirror
+            // JDK-ONLY-LAYOUT: the class name comes from `mirror_class_name`,
+            // not from raw slot 0.
+            //
+            // This read used to be `match get_field(mirror, 0) {
+            // Value::Object(Some(n)) => n, _ => "unknown" }` — it expected a
+            // name String at slot 0, which no mirror this VM builds has ever
+            // held: `get_or_create_class_mirror` puts `Int(class_id)` there and
+            // the name at whatever index `java.lang.Class` declares `name` at.
+            // So the match fell through on EVERY call and every logger obtained
+            // through `getLogger(Foo.class)` was named "unknown". Silent, and
+            // the wrong-field read is the whole family this marker names.
             let name_val = match args.first() {
-                Some(Value::Object(Some(class_mirror))) => match ctx.get_field(*class_mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => {
-                        let s = ctx.create_string("unknown");
-                        Value::Object(Some(s))
+                Some(Value::Object(Some(class_mirror))) => {
+                    match crate::lang_class::mirror_class_name(ctx, *class_mirror) {
+                        Some(n) => {
+                            let s = ctx.create_string(&n.replace('/', "."));
+                            Value::Object(Some(s))
+                        }
+                        None => {
+                            let s = ctx.create_string("unknown");
+                            Value::Object(Some(s))
+                        }
                     }
-                },
+                }
                 _ => {
                     let s = ctx.create_string("unknown");
                     Value::Object(Some(s))
@@ -2814,14 +2829,22 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogger",
         "(Ljava/lang/Class;)Lorg/apache/logging/log4j/Logger;",
         |ctx, args| {
+            // JDK-ONLY-LAYOUT: same wrong-field read as the slf4j shim above,
+            // and the same fix — slot 0 of a Class mirror is the VM's ClassId
+            // Int (or, on a real layout, `cachedConstructor`), never a name.
             let name_val = match args.first() {
-                Some(Value::Object(Some(mirror))) => match ctx.get_field(*mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => {
-                        let s = ctx.create_string("unknown");
-                        Value::Object(Some(s))
+                Some(Value::Object(Some(mirror))) => {
+                    match crate::lang_class::mirror_class_name(ctx, *mirror) {
+                        Some(n) => {
+                            let s = ctx.create_string(&n.replace('/', "."));
+                            Value::Object(Some(s))
+                        }
+                        None => {
+                            let s = ctx.create_string("unknown");
+                            Value::Object(Some(s))
+                        }
                     }
-                },
+                }
                 _ => {
                     let s = ctx.create_string("unknown");
                     Value::Object(Some(s))

@@ -3104,7 +3104,39 @@ fn uri_recompose(
 /// break `getPath()`/`new File(URI)`.
 fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
     let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// Write a URI's components into `uri_obj` under the names the real
+/// `java.net.URI` declares.
+///
+/// JDK-ONLY-LAYOUT. Eleven sites in four files allocate a `java/net/URI` and
+/// then stamp its components in by RAW SLOT INDEX, under three mutually
+/// inconsistent fabricated models (`raw@0 scheme@1 path@4`, `raw@0 raw@4`, and
+/// the `scheme@0 host@1 port@2 path@3 query@4` block that `http2.rs` and
+/// `servlet.rs` used to read). In real-JDK mode every one of those objects is a
+/// genuine `java.net.URI` whose slots are `scheme, fragment, authority,
+/// userInfo, host, port, path, query`, so each write landed on a different
+/// field than it named. It went unnoticed because the accessors read the SAME
+/// wrong slots back: writer and reader agreed, and the object was wrong only
+/// from real bytecode's point of view — which is precisely what
+/// `URI.getAuthority()` is.
+///
+/// `path_override` is for the callers that know a better path than the generic
+/// split produces (a `jar:` inner entry, a Windows drive-letter path).
+///
+/// This function writes ONLY by name. Its callers keep their raw-slot writes
+/// for a receiver that genuinely has a fabricated layout, asked by NAME through
+/// [`uri_has_synthetic_layout`].
+pub(crate) fn uri_publish_named(
+    ctx: &mut dyn NativeContext,
+    uri_obj: ObjectRef,
+    raw: &str,
+    path_override: Option<&str>,
+) {
     let (scheme, authority, path, query, fragment) = uri_split(raw);
+    let path = path_override.map_or(path, str::to_string);
     let ssp = {
         let mut s = String::new();
         if let Some(a) = &authority {
@@ -3118,34 +3150,58 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodC
         }
         s
     };
-    let raw_s = ctx.create_string(raw);
-    // `string` — the volatile full-text cache `uri_raw_string` reads first.
-    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_s)));
-    let set = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
+    // Pin across the whole publish. Every `put` below allocates a String, and a
+    // moving young GC there relocates `uri_obj` and leaves this raw ref stale —
+    // it then resolves to a reused, usually `java/lang/Object`, slot, and the
+    // component lands on a stranger. `make_uri` carried that exposure for one
+    // caller; this function now has eleven, so the pin belongs here rather than
+    // at each of them. `read_native_pin` is handle-authoritative: the stale
+    // local is only its out-of-range fallback.
+    let pin = ctx.pin_native_root(uri_obj);
+    let put = |ctx: &mut dyn NativeContext, name: &str, v: &str| {
+        let s = ctx.create_string(v);
+        let obj = ctx.read_native_pin(pin, uri_obj);
+        ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
+    };
+    let put_opt = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
         if let Some(v) = val {
             let s = ctx.create_string(v);
-            ctx.set_field_by_name(uri_obj, name, Value::Object(Some(s)));
+            let obj = ctx.read_native_pin(pin, uri_obj);
+            ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
         }
     };
-    set(ctx, "scheme", &scheme);
-    set(ctx, "authority", &authority);
-    set(ctx, "query", &query);
-    set(ctx, "fragment", &fragment);
+
+    // `string` — the volatile full-text cache `uri_raw_string` reads first.
+    put(ctx, "string", raw);
+    put_opt(ctx, "scheme", &scheme);
+    put_opt(ctx, "authority", &authority);
+    put_opt(ctx, "query", &query);
+    put_opt(ctx, "fragment", &fragment);
     if !path.is_empty() {
-        let p = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(p)));
-        let dp = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "decodedPath", Value::Object(Some(dp)));
+        put(ctx, "path", &path);
+        put(ctx, "decodedPath", &path);
     }
-    let ssp_s = ctx.create_string(&ssp);
-    ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
-    let dssp = ctx.create_string(&ssp);
-    ctx.set_field_by_name(
-        uri_obj,
-        "decodedSchemeSpecificPart",
-        Value::Object(Some(dssp)),
-    );
-    Ok(uri_obj)
+    put(ctx, "schemeSpecificPart", &ssp);
+    put(ctx, "decodedSchemeSpecificPart", &ssp);
+    // `host`, `userInfo` and `port` come out of the authority, and a real
+    // `java.net.URI` declares all three. Writing them keeps a receiver that
+    // real bytecode reads directly consistent with what the accessors answer.
+    let port = match authority.as_deref().filter(|a| !a.is_empty()) {
+        Some(a) => {
+            let (user_info, host, port) = uri_parse_authority(a);
+            if let Some(h) = host {
+                put(ctx, "host", &h);
+            }
+            if let Some(u) = user_info {
+                put(ctx, "userInfo", &u);
+            }
+            port
+        }
+        None => -1,
+    };
+    let obj = ctx.read_native_pin(pin, uri_obj);
+    ctx.set_field_by_name(obj, "port", Value::Int(port));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
@@ -7654,20 +7710,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
-        let raw_s = ctx.create_string(&url_str);
-        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-                                                           // Parse scheme.
-        if let Some(colon) = url_str.find(':') {
-            let scheme = &url_str[..colon];
-            let scheme_s = ctx.create_string(scheme);
-            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
-            // For file: URIs, the path is everything after "file:".
-            if scheme == "file" {
-                let path = &url_str[colon + 1..];
-                let path_s = ctx.create_string(path);
-                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+        // `java.net.URI` slot 6 is `path` and slot 3 is `userInfo`, so the full
+        // text went into the path and the path into the user information.
+        if uri_has_synthetic_layout(ctx, uri) {
+            let raw_s = ctx.create_string(&url_str);
+            ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+            if let Some(colon) = url_str.find(':') {
+                let scheme = &url_str[..colon];
+                let scheme_s = ctx.create_string(scheme);
+                ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
+                // For file: URIs, the path is everything after "file:".
+                if scheme == "file" {
+                    let path = &url_str[colon + 1..];
+                    let path_s = ctx.create_string(path);
+                    ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+                }
             }
         }
+        // The file: path override preserves this site's own rule: everything
+        // after `file:` is the path, including a Windows `/C:/…` form that the
+        // generic split would treat as an opaque scheme-specific part.
+        let file_path = url_str
+            .strip_prefix("file:")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        uri_publish_named(ctx, uri, &url_str, file_path.as_deref());
         Ok(Some(Value::Object(Some(uri))))
     });
 

@@ -1568,20 +1568,24 @@ fn s1_service_loader_ensure_loaded(
             return empty;
         }
     };
-    // Guard: the mirror must have at least one field (the ClassId slot).
-    // Test mocks may pass a 0-field dummy object.
-    if ctx.object_num_fields(mirror) == 0 {
-        ctx.set_field(sl, 1, Value::Object(Some(empty)));
-        return empty;
-    }
-    let class_id_val = match ctx.get_field(mirror, 0) {
-        Value::Int(v) => v as u32,
-        _ => {
+    // JDK-ONLY-LAYOUT: converted from `get_field(mirror, 0)` to
+    // `mirror_class_id`, which asks the authoritative reverse map first and
+    // only then the legacy Int-at-slot-0 overlay. Slot 0 of a real
+    // `java.lang.Class` is `cachedConstructor`, a reference; this read worked
+    // solely because `get_or_create_class_mirror` deliberately parks the
+    // ClassId there, and it was one of the readers that made that overlay
+    // load-bearing.
+    //
+    // The `object_num_fields == 0` guard went with it: a field count cannot
+    // tell a real mirror from a mock, and `mirror_class_id` answers `None` for
+    // both the empty-object and the no-such-mapping cases anyway.
+    let class_id = match crate::lang_class::mirror_class_id(ctx, mirror) {
+        Some(cid) => cid,
+        None => {
             ctx.set_field(sl, 1, Value::Object(Some(empty)));
             return empty;
         }
     };
-    let class_id = cratonvm_types::ClassId::new(class_id_val);
     let iface_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n.replace('/', "."),
         None => {

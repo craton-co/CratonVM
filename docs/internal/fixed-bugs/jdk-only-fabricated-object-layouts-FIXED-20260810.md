@@ -1,8 +1,10 @@
 # Fabricated object layouts leak into native code — index-based field access breaks silently when the class becomes real
 
-**Status:** OPEN — JDK-only wave-2 work item, filed 2026-07-31, re-verified
-against the re-landed tree the same day. **DANGEROUS: every instance is a
-silent wrong-field read or write, never an exception.**
+**Status: FIXED / RETIRED 2026-08-10.** Every step of "What specifically must
+change" is closed, each with an A/B against the pre-fix binary on Azure Linux
+and Temurin 25.0.3. The record is kept because the *lessons* generalise past
+the sites they came from — read "What this family taught" before writing a new
+positional access.
 
 > **Evidence provenance.** The `drop_real_layout_synthetic` doc and all ten
 > `JDK-ONLY-LAYOUT` markers are pre-existing or re-landed code and were read
@@ -11,7 +13,29 @@ silent wrong-field read or write, never an exception.**
 > names **six** drift families, not five, and the marker table's per-file
 > verdict split was slightly off.
 
-## What changed on 2026-08-04 — step 2 of four
+## What closed it — 2026-08-10
+
+The residuals left on 2026-08-05 were re-measured before being worked, and the
+measurement moved the work list twice. `probes/W2ResidualCensusProbe` was
+written for it, because the standing census workload
+(`probes/JdkOnlyCensusLoadProbe`) defines 151 modelled classes and **none of
+them** are `java/net/URI`, `java/net/Proxy`, `java/util/HashMap$Node`,
+`jdk/internal/math/FloatingDecimal$1` or
+`ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter` — so its silence on those
+rows said nothing at all.
+
+| residual | what it turned out to be | evidence |
+|---|---|---|
+| `java/net/URI` slots 2, 5, 6 | **FIXED.** Eleven construction sites in five files stamped components in by raw index under three mutually inconsistent models; the accessors read the same wrong slots back, so writer and reader agreed and only real bytecode could tell. `URI.getAuthority()` answered **null** where HotSpot answers `user:pw@example.com:8080`. | 15 access-site rows → **0**; `W2ResidualCensusProbe` byte-identical to HotSpot in both modes |
+| `java/net/Proxy` (kind 4) | Already converted on 2026-08-04. What was still broken was next to it: `alloc_proxy_list` wrote the fabricated `(size, elements)` list model, and a real `ArrayList` is `(modCount, elementData, size)`, so `ProxySelector.select()` returned an **empty list** and the caller's `get(0)` threw. **FIXED.** | HotSpot `[DIRECT]`, CratonVM `IndexOutOfBoundsException` → identical |
+| `java/util/HashMap$Node` slot 2 | Not reproducible on any workload; `map_alloc_node`'s key-as-marker fix (2026-08-04) had already removed the writer. Closed as measured-absent. | 0 rows on either probe |
+| `FloatingDecimal$1`, `ThreadLocalHoldCounter` slot 0 | **One writer, not two defects.** Both classes extend `ThreadLocal`, and `native_tl_init` opened with `set_field(this, 0, Object(None))` — write-only storage over `threadLocalHashCode:I`, the one field the real class declares. **Deleted**, because there is no field to relocate to. | 2 rows → **0** |
+| the five `_vmN` java.io Reader/Writer rows | **FIXED**, and measuring which build could reach them changed the fix — see the retired companion record `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. | 5 rows → **0** |
+| step 2, the two `unknown` verdicts | **Adjudicated `safe`**, and the question's premise was wrong: the overlay had **eight** readers, not one, and two of them were reading it wrong (every `getLogger(Foo.class)` logger was named `"unknown"`). Fallback hits over five Spring Framework test classes, 87 tests: **zero**. | `CRATONVM_DBG_OVERLAY=1`, all green |
+| step 3, the two `breaks-under-strict` sites | **FIXED.** `FileInputStream` was already guarded by a by-NAME lookup and is re-verdicted `safe` with a witness. The FFM `ValueLayout` preseed is dropped under `--jdk-only` and the `<clinit>` suppression lifted — and doing that exposed a live wrong-field read the preseed had been masking, so a sixth count-based guard went with it. (The constants are still produced by CratonVM's FFM factory rather than by `ValueLayouts$Of*Impl`; that is the `CompatibilityClassRequested` matter this record names separately, not a slot-numbering one.) | `probes/W2ValueLayoutProbe`: both modes byte-identical to the PRE-FIX binary and to HotSpot on all thirteen layout lines |
+| step 4, `safe` verdicts unchecked | **FIXED.** `SAFE_POSITIONAL_CLAIMS` + `check_positional_claims` re-ask the loaded image at every class definition, deliberately not behind a debug flag. | three tests, incl. the pre-9 `String` layout |
+
+## What changed on 2026-08-04 — step 2, partly (superseded above)
 
 *What specifically must change* lists four steps. Step 2 — **adjudicate the two
 `unknown` verdicts in `vm/src/vm/vm_object.rs`** — is now partly answered, with
@@ -49,7 +73,7 @@ The primitive-mirror sibling (`Int(-1)` over the same slot) rides on that
 finding: it is the easier of the two to retire if check 3 comes back zero,
 because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
-## What is still open — steps 1, 3 and 4, which are the bulk
+## Steps 1, 3 and 4 — the bulk, and how each closed
 
 * **Step 1, the sweep — it has a measured work list now (2026-08-04).** The
   sweep was scoped as "read four crates for index-based field access". It does
@@ -392,8 +416,11 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `probes/L3MemberNameProbe` are byte-identical to HotSpot 25 in `--real-jdk`
     and `--jdk-only`; the Scanner probe fails on the pre-fix binary, which is
     what makes it evidence rather than decoration.
-  * `URI` and `Properties` each mismatch in both directions, which rules out a
-    single off-by-one against one layout.
+  * ~~`URI` and `Properties` each mismatch in both directions, which rules out a
+    single off-by-one against one layout.~~ — **both FIXED**; `Properties` on
+    2026-08-04 (L2), `URI` on 2026-08-10. The observation was right and it was
+    the reason neither could be fixed by shifting an index: `URI` needed every
+    one of its eleven writers converted to by-name, not renumbered.
 
   ~~Two limits, so nobody reads this as complete. The detector covers
   `NativeContextImpl::set_field` only: **reads are uninstrumented, and a
@@ -462,13 +489,13 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     pins all six corrected models against the JDK's declaration order in one
     place, so the family cannot drift back one class at a time.
 
-    ### What is left, and why each one is not a rotation
+    ### What was left, and why none of them was a rotation — ALL CLOSED
 
-    | class | why it is not just a reorder |
-    |---|---|
-    | `java/io/InputStreamReader`, `OutputStreamWriter` | the model names `in`/`out`, which the real classes **do not declare at all** — the wrapped stream lives inside `sd:StreamDecoder` / `se:StreamEncoder`. Kind 3 or 4, and `servlet.rs` has raw slot-0 consumers gated to synthetic mode. |
-    | `java/lang/reflect/Field`, `Method`, `Constructor` | the models are the real layouts minus the inherited `AccessibleObject`/`Executable` fields, so everything from index 1 shifts — across **58 raw slot accesses**, and `MockNativeContext`'s `mock_jdk_field_slot` encodes a **third** mapping that agrees with neither. |
-    | `java/io/BufferedWriter` slot 0 (separate from its model) | `Files.newBufferedWriter` parks an fd `Int` there, i.e. in `Writer.writeBuffer`, and `bw_delegate_out` uses that slot's *value* as a layout discriminator. Kind 3 — wants a side table. Filed as [files-newbufferedwriter-parks-an-fd-in-writebuffer.md](files-newbufferedwriter-parks-an-fd-in-writebuffer.md). |
+    | class | why it was not just a reorder | closed |
+    |---|---|---|
+    | `java/io/InputStreamReader`, `OutputStreamWriter` | the model names `in`/`out`, which the real classes **do not declare at all** — the wrapped stream lives inside `sd:StreamDecoder` / `se:StreamEncoder`. Kind 3 or 4, and `servlet.rs` has raw slot-0 consumers gated to synthetic mode. | **2026-08-10**, with the rest of the `java.io` chain |
+    | `java/lang/reflect/Field`, `Method`, `Constructor` | the models are the real layouts minus the inherited `AccessibleObject`/`Executable` fields, so everything from index 1 shifts — across **58 raw slot accesses**, and `MockNativeContext`'s `mock_jdk_field_slot` encodes a **third** mapping that agrees with neither. | **2026-08-05/06**; the corrected models are pinned by `rotated_models_now_name_fields_at_their_real_indices`, and the 2026-08-10 census shows **zero NAME rows** on any workload |
+    | `java/io/BufferedWriter` slot 0 (separate from its model) | `Files.newBufferedWriter` parks an fd `Int` there, i.e. in `Writer.writeBuffer`, and `bw_delegate_out` uses that slot's *value* as a layout discriminator. Kind 3 — wants a side table. | **2026-08-10**; retired to the companion record `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`, and the answer was NOT a side table — see there |
 
     ### The third worked example — `ProtectionDomain`, and what the mock hid
 
@@ -631,9 +658,9 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   | # | kind | tell | fix | status |
   |---|---|---|---|---|
   | 1 | synthetic slots written onto a real layout | the real class declares a field our model does not have | write the slots only when the layout is ours, keyed on a field name the real class declares | **`VarHandle` fixed** |
-  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup — or, as in `Scanner`, no lookup at all, just our model's index | `resolve_field_index_by_class_id` on the receiver | **`Properties` 5/6/7, 2, 3 and `HashMap` 2 fixed** (L2); **`Scanner` 1/2/3/4 fixed** (L3); `URI` open |
+  | 2 | right field, index computed against the **wrong class** | a hard-coded class name in the index lookup — or, as in `Scanner`, no lookup at all, just our model's index | `resolve_field_index_by_class_id` on the receiver | **all fixed.** `Properties` 5/6/7, 2, 3 and `HashMap` 2 (L2); `Scanner` 1/2/3/4 (L3); **`URI` and the `ArrayList` in `alloc_proxy_list` (2026-08-10)**; **`p67_layout_is_little` (2026-08-10)** |
   | 3 | VM-internal value with **no real field at all** | the constant has no JDK counterpart (`CL_LOADER_ID`) | side table keyed by the object, as `vh_meta_put` does — or no storage at all, if the value never survived its own write | **`ClassLoaders` ×2 fixed** (L1, 2026-08-05); **`Scanner` slot 0 and `MemberName` slot 4 fixed** (L3, 2026-08-05) |
-  | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | `Proxy` open |
+  | 4 | right field, **wrong representation** | real field is a reference, ours is a primitive | convert (`int` → the `Proxy.Type` enum constant) | **`Proxy` fixed** (2026-08-04); re-verified behaviourally 2026-08-10 (`p.type() == Proxy.Type.HTTP`, `NO_PROXY.type() == DIRECT`) |
 
   Kind 3 is the one that cannot be fixed by resolving harder: there is nowhere
   correct in a real layout to put a `CL_LOADER_ID`. Kind 4 likewise — resolving
@@ -690,14 +717,61 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
     `new Hashtable<>(h).equals(h)` is `false`. Each is a semantics change on a
     shared hot path — `native_map_put` backs both `HashMap` and `Hashtable` —
     so each wants its own change and its own A/B.
-* **Step 3**, replacing the two `breaks-under-strict` sites in `vm_util.rs`.
-  Note the `ValueLayout` one cannot be converted at all — the marker is explicit
-  that there are no real fields to name, so it is a
-  `CompatibilityClassRequested` violation, not a slot-numbering bug, and fixing
-  it means letting the real `ValueLayout.<clinit>` run.
-* **Step 4**, making `safe` verdicts checkable rather than asserted. They are
-  claims about JDK 25 that nothing in the build re-checks; a JDK upgrade should
-  fail a test, not corrupt an object.
+* ~~**Step 3**, replacing the two `breaks-under-strict` sites in
+  `vm_util.rs`.~~ — **DONE 2026-08-10**, and the two halves went opposite ways.
+
+  The `FileInputStream` fallback was never `breaks-under-strict`: it is reached
+  only when `find_field_recursive(.., "fd")` answers `None`, i.e. the receiver
+  declares no `fd` anywhere on its chain — which IS the fabricated-layout
+  predicate, asked by NAME, and the shape every fix in this family converged on.
+  A real `java.io.FileInputStream` always declares `fd`. It is re-verdicted
+  `safe`. What was missing was not a guard but a **witness**: the arm had no way
+  to announce itself, so "cannot happen" was an argument rather than an
+  observation, and under `--jdk-only` it now says so.
+
+  The `ValueLayout` preseed is dropped under `--jdk-only` and the real
+  `<clinit>` runs, which is what the marker asked for. Its stated precondition
+  was already met: `post_clinit_fixup` backfills
+  `jdk/internal/misc/UnsafeConstants` with real platform values before
+  `prepare_class` runs.
+
+  **The measurement is the interesting part.** Dropping the preseed made every
+  `ValueLayout` constant report `order() == BIG_ENDIAN` on a little-endian host,
+  while `ByteOrder.nativeOrder()` two lines above answered `LITTLE_ENDIAN`
+  correctly. The cause was not the `<clinit>`: it was
+  `phases_late/foreign_ffm.rs`'s `p67_layout_is_little`, reading raw slot 2 as a
+  little-endian flag behind an `object_num_fields(layout) <= 2` test — **the
+  sixth count-based layout guard this record has had to correct**. On a real
+  `ValueLayouts$AbstractValueLayout` slot 2 is `name:Optional<String>` (the real
+  `order` is at 4), and an unwritten reference slot decodes as `Int(0)` under
+  the R-niche rule, which reads as "big endian". The preseed had been hiding it
+  by handing out objects with exactly two slots, so the guard was right by
+  accident. Converted to a by-name read of `order`, and only then did the mode
+  switch become an improvement rather than a trade.
+
+  That is the whole argument for measuring a workaround's premise before
+  deleting it, and for keeping the pre-fix binary: Compatible mode is
+  byte-identical across the change, so the A/B says exactly which mode moved.
+
+  The probe also surfaced an FFM defect that is **not** this family and is filed
+  on its own: `seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises
+  `AbstractMethodError … has no Code attribute` while the `int`, `long` and
+  `byte` stores beside it succeed. Identical on the pre-fix binary, so
+  pre-existing — see
+  [`memorysegment-set-ofdouble-has-no-code-attribute.md`](../../known-issues/jdk-only/memorysegment-set-ofdouble-has-no-code-attribute.md).
+* ~~**Step 4**, making `safe` verdicts checkable rather than asserted.~~ —
+  **DONE 2026-08-10.** `shadow_layout::SAFE_POSITIONAL_CLAIMS` writes each claim
+  down as `(class, index, name, descriptor, site)` and `check_positional_claims`
+  re-asks the loaded image at every class definition, from
+  `ClassManager::check_safe_positional_claims`.
+
+  Two deliberate choices. It is **not** behind `CRATONVM_DBG_OVERLAY`, unlike
+  the census next door: a census is an instrument you switch on when you are
+  already looking for something, and a tripwire that only fires while you watch
+  is not one. And the **descriptor is part of the claim**, because two adjacent
+  `int`s reorder without a name check noticing anything. Its non-vacuity check
+  is the pre-9 `String` layout (`char[] value; int hash;`) that the marker's own
+  text warns about — it breaks all four `String` claims.
 
 ## What is wrong
 
@@ -788,7 +862,7 @@ exist.** The marker sweep covered `vm/src/vm/`; `native-builtins`,
 `native-collections` and `native-io` — where the great majority of index-based
 field access lives — were not swept.
 
-## Why it was not fixed in wave 1
+## Why it was not fixed in wave 1 (historical)
 
 Wave 1 is measurement, not deletion (contract §10). Two of the three verdicts
 are also not mechanical:
@@ -802,27 +876,72 @@ are also not mechanical:
 * The `safe` verdicts are only safe *against JDK 25*. They are assertions about
   a specific image, and nothing in the build re-checks them.
 
-## What specifically must change
+## What specifically must change — all four DONE
 
-1. **Finish the sweep.** Extend the `JDK-ONLY-LAYOUT:` marker discipline to
-   `native-builtins`, `native-collections`, `native-io` and `vm/src/native/`.
-   Until that is done, the 10 markers understate the problem by an unknown
-   factor.
-2. **Adjudicate the two `unknown` verdicts** in `vm/src/vm/vm_object.rs`.
-3. Replace `breaks-under-strict` sites with name-resolved field access
-   (`find_field_recursive(cid, "fd", &cm.class_store)` — the pattern the
-   `FileInputStream` site already uses on its *primary* path, with the raw slot
-   only as a fallback), or with a structured refusal under
-   `CompatibilityMode::JdkOnly` where there is no real field to name.
-4. Make `safe` verdicts checkable rather than asserted: a startup or test-time
-   assertion that the named field really is at the assumed index for the loaded
-   image, so a JDK upgrade fails a test instead of corrupting an object.
+1. ~~**Finish the sweep.**~~ **DONE.** The `JDK-ONLY-LAYOUT:` marker discipline
+   reaches `native-builtins`, `native-collections` and `native-io`, and — far
+   more importantly — the sweep stopped being a reading exercise and became a
+   measurement: the shadow-layout census plus a workload that reaches the
+   classes in question. The last open rows were closed on 2026-08-10, and the
+   census now shows **zero** NAME rows, **zero** VM rows and zero
+   `java/net/URI` access-site rows on both standing probes.
+2. ~~**Adjudicate the two `unknown` verdicts**~~ **DONE** — `safe`, with the
+   measurement in "What closed it" above. The premise of the question was wrong,
+   which is the finding worth keeping.
+3. ~~Replace `breaks-under-strict` sites~~ **DONE** — see step 3 above.
+4. ~~Make `safe` verdicts checkable~~ **DONE** — see step 4 above.
 
-## How to verify a fix
+## What this family taught
 
+Six things, each paid for at least twice:
+
+1. **A field COUNT never identifies a layout.** Ask for a field NAME the real
+   class declares and a fabricated stub cannot. Six guards in this record were
+   count-based and all six were wrong: the first `VarHandle` predicate,
+   `try_set_jdk_map_field`'s bound, `SecurityManager.getRootGroup`'s `>= 4`,
+   `is_virtual_synthetic`'s `>= 5`, `servlet.rs`'s
+   `object_num_fields(mirror) == 0`, and `p67_layout_is_little`'s `<= 2`. A
+   count test stops an out-of-range write, never a wrong-field one.
+2. **A constructor signature is not a field layout.** `ProtectionDomain` and
+   `CodeSource` were both modelled in constructor-argument order, which is a
+   plausible-looking way to derive a model and produces a rotation rather than
+   a swap.
+3. **Writer and reader agreeing is not evidence.** Every URI accessor read the
+   same wrong slots its constructors wrote, so the object was wrong only from
+   real bytecode's point of view — which is exactly what `getAuthority()` is.
+   Gating only the readers turned `Path.toUri()` into an empty URI instead of
+   fixing it; the two halves have to move together.
+4. **Silence from a census is silence about the workload, not the code.** The
+   standing census probe defines 151 modelled classes and reached none of the
+   five that were still open. Check that the instrument can see the thing before
+   reading its quiet as a verdict.
+5. **A model that declines to make a claim (`_fN`) is not the same as one that
+   says nothing is there.** `_vmN` exists because naming a VM value after the
+   real field makes the diff agree with the overlay, and leaving it anonymous
+   makes the diff go silent about one.
+6. **Measure a workaround's premise before deleting it.** The FFM preseed was
+   masking a live wrong-field read, and dropping it without the by-name
+   conversion would have traded a fabricated layout for a wrong byte order.
+
+## How to check it stays closed
+
+* **The census must stay at zero.** Both standing probes, both modes:
+
+  ```sh
+  CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME" \
+    -cp . W2ResidualCensusProbe 2>&1 | grep -E '\[OVERLAY-LAYOUT\].*(NAME|VM) '
+  ```
+
+  and the same for `JdkOnlyCensusLoadProbe`. Before 2026-08-10 this printed the
+  five `_vmN` rows; it prints nothing now. Check the class you care about was
+  actually LOADED before reading a quiet run as a verdict —
+  `grep '^\[OVERLAY-LAYOUT\] [a-z]' | awk '{print $2}' | sort -u` lists them.
 * Per site: load the real class and assert `find_field_recursive(cid, name)`
   returns the index the code assumes. A `safe` claim that cannot be expressed as
-  such an assertion is not verified, it is remembered.
+  such an assertion is not verified, it is remembered — which is what
+  `shadow_layout::SAFE_POSITIONAL_CLAIMS` now does automatically, at every class
+  definition, for the claims that existed when it was written. **Adding a new
+  `JDK-ONLY-LAYOUT: safe` marker means adding its row there.**
 * End to end: the five `drop_real_layout_synthetic` classes are the ready-made
   regression corpus. A correct fix should let each of them keep its native
   surface *without* the drop — `StringJoiner.add()` moving `size`,
@@ -846,7 +965,10 @@ finding, not a general rule.
 
 ## Related
 
-* `docs/known-issues/jdk-only/README.md` — index.
+* [`docs/known-issues/jdk-only/README.md`](../../known-issues/jdk-only/README.md)
+  — the public index, which carries this record as a **RETIRED** row.
+* [`jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`](jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md)
+  — the `java.io` Reader/Writer half, retired the same day.
 * The `StringJoiner` divergence between the two real-protected-stub allow-lists
   is a *separate* consequence of the same class's layout drift; see
   real-protected-stub allow-lists diverge (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`) (reconciled 2026-08-04).

@@ -2051,8 +2051,14 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
     // uri() -> URI
     r.register(cls, "uri", "()Ljava/net/URI;", |ctx, _args| {
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 2)?;
-        ctx.set_field(uri, 0, Value::Int(0));
-        ctx.set_field(uri, 1, Value::Int(0));
+        // JDK-ONLY-LAYOUT: this placeholder wrote `Int(0)` into slots 0 and 1,
+        // which on a real `java.net.URI` are `scheme` and `fragment` — two
+        // reference fields taking a primitive. The object is a placeholder
+        // either way, so on a real layout it is simply left empty.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+            ctx.set_field(uri, 0, Value::Int(0));
+            ctx.set_field(uri, 1, Value::Int(0));
+        }
         Ok(Some(Value::Object(Some(uri))))
     });
 

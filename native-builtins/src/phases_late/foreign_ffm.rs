@@ -24,7 +24,21 @@ pub(crate) fn p67_layout_object(
     let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
     ctx.set_field(obj, 0, Value::Long(byte_size));
     ctx.set_field(obj, 1, Value::Long(byte_alignment));
-    ctx.set_field(obj, 2, Value::Int(0));
+    // Slot 2 is the little-endian flag, and every `java.lang.foreign` layout
+    // this factory stands in for is built by the JDK from
+    // `ByteOrder.nativeOrder()`. It used to be a hard-coded `Int(0)` — "big
+    // endian" — for every layout on every host, and nothing noticed because
+    // `p67_layout_is_little` short-circuited on a FIELD COUNT: the FFM preseed
+    // hands out two-slot objects, and `object_num_fields <= 2` answered
+    // "little" before the flag was ever read. Measured 2026-08-10 by
+    // `probes/W2ValueLayoutProbe` the moment that preseed stopped running:
+    // every constant reported `order() == BIG_ENDIAN` while
+    // `ByteOrder.nativeOrder()` two lines above answered LITTLE_ENDIAN.
+    ctx.set_field(
+        obj,
+        2,
+        Value::Int(i32::from(cfg!(target_endian = "little"))),
+    );
     ctx.set_field(obj, 3, Value::Object(None));
     Ok(obj)
 }
@@ -350,14 +364,68 @@ pub(crate) fn p67_return_this(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
 }
 
+/// JDK-ONLY-LAYOUT (kind 2): converted from a raw slot-2 read behind a FIELD
+/// COUNT to a by-NAME read on the receiver.
+///
+/// Slot 2 is CratonVM's fabricated `(byteSize, byteAlignment, littleEndianFlag,
+/// name)` value-layout model. On a real `jdk.internal.foreign.layout.
+/// ValueLayouts$AbstractValueLayout` the first two coincide -- `AbstractLayout`
+/// declares `byteSize` and `byteAlignment` in that order -- and slot 2 does
+/// NOT: it is `name:Optional<String>`, with `carrier` and the real `order` at 3
+/// and 4.
+///
+/// The `object_num_fields(layout) <= 2` test in front of it was the SIXTH
+/// count-based layout guard this family has produced, and like the other five
+/// it stopped an out-of-range read rather than a wrong-field one. It answered
+/// correctly only because the FFM preseed hands out exactly two slots; the
+/// moment a real `ValueLayout.<clinit>` builds the constants instead (which is
+/// what `--jdk-only` does since 2026-08-10) the object has six fields, the read
+/// lands on an unwritten `Optional` reference, and the R-niche rule decodes
+/// that as `Int(0)` -- so every layout reported **BIG_ENDIAN** on a
+/// little-endian host while `ByteOrder.nativeOrder()` next to it said
+/// LITTLE_ENDIAN. Measured against Temurin 25.0.3 by
+/// `probes/W2ValueLayoutProbe`.
 pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -> bool {
+    // Real layout: it declares `order`, a `java.nio.ByteOrder` reference, and
+    // that object declares `name`.
+    if let Value::Object(Some(order_obj)) = ctx.get_field_by_name(layout, "order") {
+        if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(order_obj, "name") {
+            if let Some(n) = ctx.read_string(name_obj) {
+                return n != "BIG_ENDIAN";
+            }
+        }
+        // A FABRICATED `java.nio.ByteOrder` carries the flag as an Int at slot
+        // 0 instead of a name -- see `p67_byte_order_object`, which writes both
+        // when the class declares `name` and only the flag when it does not.
+        if let Some(v) = ctx.get_field(order_obj, 0).as_int() {
+            return v != 0;
+        }
+    }
+    // Fabricated layout: slot 2 is the flag, and only OUR model has one. Asked
+    // by NAME, not by count: a real value layout declares `carrier`.
+    let class_id = ctx.class_id_of_object(layout);
+    let is_real = ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && (f.name == "carrier" || f.name == "order"));
+    if is_real {
+        // A real layout with no readable `order` says nothing about byte order;
+        // every JDK constant is built from `ByteOrder.nativeOrder()`.
+        return cfg!(target_endian = "little");
+    }
+    // BOUNDS check, not a layout guard — the layout question was already
+    // settled by name above. The FFM preseed hands out objects sized
+    // `num_total_fields.max(2)`, which have no slot 2 to read; answering the
+    // host's native order is what `p67_layout_object` would have written had
+    // there been room. Keeping the two kinds of test apart is the point: the
+    // old `<= 2` here was doing BOTH jobs, and the layout half of it was wrong.
     if ctx.object_num_fields(layout) <= 2 {
-        return true;
+        return cfg!(target_endian = "little");
     }
     ctx.get_field(layout, 2)
         .as_int()
         .map(|v| v != 0)
-        .unwrap_or(true)
+        .unwrap_or(cfg!(target_endian = "little"))
 }
 
 /// A `java.nio.ByteOrder` for `MemoryLayout.order()`.

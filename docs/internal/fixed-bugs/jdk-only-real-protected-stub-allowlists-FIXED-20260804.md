@@ -285,7 +285,8 @@ scope.
   the Copy B comment, plus a `StringJoiner` whose second and subsequent `add()`
   calls must be observable in `toString()`. A `StringJoiner` that renders only
   prefix+suffix is the layout-drift symptom; see
-  [fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md).
+  [fabricated object layouts leak into native code](jdk-only-fabricated-object-layouts-FIXED-20260810.md)
+  (RETIRED 2026-08-10).
 * **After deletion:** the `--jdk-only` census must show no
   `native-shadows-bytecode` violations for the 11 classes, and the full
   regression suite must be unchanged in `Compatible` mode.

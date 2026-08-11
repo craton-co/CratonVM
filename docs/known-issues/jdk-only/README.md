@@ -119,6 +119,24 @@ unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
 `dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
 which is the gate's third arm doing exactly what it is for.
 
+## 2026-08-10 — two records retired, one added
+
+The object-layout pair is **RETIRED** (see row 2 of the ranked list below):
+index-based field access against fabricated layouts is closed, the shadow-layout
+census is at zero NAME and zero `_vmN` rows on both standing probes, and both
+records moved to the internal tree as
+`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md` and
+`fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`.
+
+[`memorysegment-set-ofdouble-has-no-code-attribute.md`](memorysegment-set-ofdouble-has-no-code-attribute.md)
+— found while verifying the FFM half of that work and filed separately because
+it is **not** a layout defect: every one of the thirteen `ValueLayout`
+properties matches Temurin 25.0.3, and then
+`seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises `AbstractMethodError … has no
+Code attribute` while the `int`, `long` and `byte` stores beside it succeed.
+Identical on the pre-fix binary, so it is pre-existing rather than a regression;
+`probes/W2ValueLayoutProbe` is the reproducer.
+
 ## 2026-08-05 — three records added
 
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
@@ -297,7 +315,7 @@ behaviour** — no exception, no log line, no failing test.
 | # | Record | Why it is dangerous |
 |---|---|---|
 | 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: 9,571 unadjudicated `Bridge` registrations, now in [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md). |
-| 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
+| 2 | Fabricated object layouts leak into native code — **RETIRED 2026-08-10** | Index-based field access against assumed synthetic layouts: on real bytes the index still resolves and points at a different field, with no fault and no log line. Closed across five lanes and a final residual pass. The shadow-layout census is at **zero** NAME rows, **zero** `_vmN` rows and zero `java/net/URI` access-site rows on both standing probes; the last live defects it found were `URI.getAuthority()` answering null, `ProxySelector.select()` returning an empty list, and every `getLogger(Foo.class)` logger being named `"unknown"`. Both `breaks-under-strict` sites and both `unknown` verdicts are adjudicated, and `safe` verdicts are now re-checked against the loaded image at every class definition instead of being remembered. Record retired to the internal tree as `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`, with the companion `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. |
 | 4 | `ensure_synthetic_class` cannot enforce policy, only record it — **RETIRED 2026-08-10** | Returned a bare `ClassId`, so under `--jdk-only` it recorded the violation and fabricated anyway. The entry point is deleted, along with the `NativeSystemAccess` trait method, the `NativeContextImpl` override and all three infallible allocation funnels; the grep gate matches zero sites, tests included. See `fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`. |
 
 Items 5 and 7 left this table on 2026-08-06, together with wave-2 lanes L10 and
