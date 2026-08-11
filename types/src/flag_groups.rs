@@ -312,6 +312,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "debug-stack-tag", on_key: Some("CRATONVM_DEBUG_STACK_TAG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-stackwalk", on_key: Some("CRATONVM_DEBUG_STACKWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "define", on_key: Some("CRATONVM_DBG_DEFINE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "define-census", on_key: Some("CRATONVM_DBG_DEFINE_CENSUS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "deflate", on_key: Some("CRATONVM_DBG_DEFLATE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "deopt", on_key: Some("CRATONVM_DBG_DEOPT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "deopt-eager", on_key: Some("CRATONVM_DEOPT_EAGER"), off_key: None, off_word: None },
@@ -493,6 +494,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "mh-dispatch", on_key: Some("CRATONVM_DBG_MH_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mh-stack", on_key: Some("CRATONVM_DBG_MH_STACK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-prof", on_key: Some("CRATONVM_DBG_MIC_PROF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "root-source", on_key: Some("CRATONVM_DBG_ROOT_SOURCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-trace", on_key: Some("CRATONVM_DBG_MIC_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "minvoke", on_key: Some("CRATONVM_DBG_MINVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mirrorpin", on_key: Some("CRATONVM_DBG_MIRRORPIN"), off_key: None, off_word: None },
@@ -1092,6 +1097,7 @@ pub const INVENTORY: &[E] = &[
     // `adapt_young_trigger_to_pause` reads. Default 200 since 2026-08-11
     // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`); `0` is the opt-out.
     E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
+    E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
     // It already was a comma-separated token list before this refactor —

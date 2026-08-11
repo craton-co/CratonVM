@@ -1036,13 +1036,22 @@ pub(super) fn compile_osr_artifact(
             // Class-`ldc` sites, served at run time by `helpers.ldc_class_cp`.
             // Before this an OSR artifact refused any method containing one.
             let mut ldc_class_info2: Vec<(usize, u32, u16)> = Vec::new();
+            // The `ldc`-family pcs whose constant is floating-point. Codegen
+            // types these by their consuming opcode; the deopt operand-stack
+            // snapshot has none to ask, and without the tag every numeric `ldc`
+            // read as `Unsupported` and refused OSR entry for the whole
+            // artifact — see `x64::Compiler::ldc_fp_pcs`.
+            let mut ldc_fp_pcs2: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
             if !scan.ldc_ops.is_empty() {
                 let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.ldc_ops {
                     let val = match class.constant_pool.get(cp_idx) {
                         Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
-                        Some(ConstantPoolEntry::Float(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        Some(ConstantPoolEntry::Float(v)) => {
+                            ldc_fp_pcs2.insert(pc);
+                            v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                        }
                         Some(ConstantPoolEntry::StringReference { string_index })
                             if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
                         {
@@ -1076,7 +1085,10 @@ pub(super) fn compile_osr_artifact(
                 for &(pc, cp_idx) in &scan.ldc2w_ops {
                     let val = match class.constant_pool.get(cp_idx)? {
                         ConstantPoolEntry::Long(v) => *v,
-                        ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+                        ConstantPoolEntry::Double(v) => {
+                            ldc_fp_pcs2.insert(pc);
+                            v.to_bits() as i64 // Cast: JIT ABI -- float bits to i64
+                        }
                         _ => return None,
                     };
                     ldc2w_info2.push((pc, val));
@@ -1300,6 +1312,7 @@ pub(super) fn compile_osr_artifact(
                 // cm._jit_strings, same retention as the invoke-info strs.
                 ldc_class_info2,
                 ldc2w_info2,
+                ldc_fp_pcs2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints
                 &helpers,

@@ -4338,7 +4338,7 @@ impl SharedVm {
     ///
     /// ```json
     /// {
-    ///   "schema_version": 3,
+    ///   "schema_version": 4,
     ///   "mode": "compatible",
     ///   "image_adjudication": true,
     ///   "counts": { "intrinsic": 2, "bridge": 1, "synthetic-stub": 1, "total": 4 },
@@ -4354,7 +4354,11 @@ impl SharedVm {
     ///       "real_declaring_method": { "loaded": true, "declared": true,
     ///                                  "acc_native": true, "has_code": false },
     ///       "image_declaring_method": { "image_has_class": true, "declared": true,
-    ///                                   "acc_native": true, "has_code": false } }
+    ///                                   "acc_native": true, "has_code": false,
+    ///                                   "inherited_from": null,
+    ///                                   "inherited_acc_native": false,
+    ///                                   "inherited_has_code": false,
+    ///                                   "inherited_abstract": false } }
     ///   ]
     /// }
     /// ```
@@ -4506,7 +4510,13 @@ impl SharedVm {
             };
 
         let mut out = String::with_capacity(256 + 256 * rows.len());
-        out.push_str("{\n  \"schema_version\": 3,\n");
+        // Schema 4 (2026-08-11): `image_declaring_method` gained the four
+        // `inherited_*` keys. The bump is not cosmetic — a reader that scores a
+        // schema-3 census with schema-4 logic silently counts every inherited
+        // row as unadjudicated, which is the exact miscount the keys exist to
+        // end, so `jdk-only-bridge-ratchet.py` refuses the older shape rather
+        // than degrading.
+        out.push_str("{\n  \"schema_version\": 4,\n");
         out.push_str(&format!(
             "  \"image_adjudication\": {},\n",
             image_verdicts.is_some()
@@ -4628,11 +4638,30 @@ impl SharedVm {
                 // this function's `partial` note.
                 None => out.push_str("      \"real_declaring_method\": null,\n"),
             }
-            match image_verdicts.as_ref().map(|v| v[i]) {
+            match image_verdicts.as_ref().map(|v| &v[i]) {
+                // Schema 4 adds the four `inherited_*` keys. They are emitted on
+                // EVERY row — `null`/`false` included — so that "the named class
+                // declares it", "a SUPERTYPE declares it" and "nothing in the
+                // hierarchy does" are three distinguishable answers instead of
+                // one absent key and a guess. Before them, `declared: false` was
+                // read as "dead registration" and was wrong for three quarters
+                // of the bucket; see `ImageMethodVerdict::inherited_from`.
                 Some(v) => out.push_str(&format!(
                     "      \"image_declaring_method\": {{\"image_has_class\": {}, \
-                     \"declared\": {}, \"acc_native\": {}, \"has_code\": {}}}\n",
-                    v.image_has_class, v.declared, v.acc_native, v.has_code
+                     \"declared\": {}, \"acc_native\": {}, \"has_code\": {}, \
+                     \"inherited_from\": {}, \"inherited_acc_native\": {}, \
+                     \"inherited_has_code\": {}, \"inherited_abstract\": {}}}\n",
+                    v.image_has_class,
+                    v.declared,
+                    v.acc_native,
+                    v.has_code,
+                    match &v.inherited_from {
+                        Some(c) => json_escape(c),
+                        None => "null".to_string(),
+                    },
+                    v.inherited_acc_native,
+                    v.inherited_has_code,
+                    v.inherited_abstract,
                 )),
                 None => out.push_str("      \"image_declaring_method\": null\n"),
             }

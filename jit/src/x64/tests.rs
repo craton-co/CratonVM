@@ -547,6 +547,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         Vec::new(), // ldc_string_info
         Vec::new(), // ldc_class_info
         Vec::new(), // ldc2w_info
+        Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
         &helpers,
@@ -4584,6 +4585,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             Vec::new(), // ldc_string_info
             Vec::new(), // ldc_class_info
             Vec::new(), // ldc2w_info
+            Default::default(), // ldc_fp_pcs
             HashMap::new(),
             HashMap::new(),
             helpers,

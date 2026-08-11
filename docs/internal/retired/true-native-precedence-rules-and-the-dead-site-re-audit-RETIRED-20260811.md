@@ -1,3 +1,192 @@
+# The true native-vs-bytecode precedence rules, and the re-audit of every site this campaign called dead — RETIRED 2026-08-11
+
+**Retired because every prediction in it was executed.** The record was filed
+2026-08-07 by a lane that could not build or run the VM: its HotSpot numbers
+were measured, its CratonVM columns were predictions read off Rust source, and
+its five snippets existed so somebody could later turn those predictions into
+measurements. That has now happened, on Azure linux against
+OpenJDK 25.0.4+7, in **both** `--real-jdk` and `--jdk-only`.
+
+The §1 decision procedure and the §2 re-audit table were correct as analysis and
+are preserved below the line. What retires the record is that its open question
+— "is the prediction true?" — has an answer for every row, and each answer now
+lives in a vector that runs on every suite invocation rather than in a snippet
+nobody had run.
+
+---
+
+## What the snippets became
+
+The audit's five snippets are now four scheduled vectors plus two pre-existing
+ones. A snippet that ends in an `EXPECT-REAL:` comment is a measurement waiting
+for a reader; `regression-suite/run.sh` diffs CratonVM against HotSpot on every
+run, so the same assertion becomes a gate.
+
+| snippet | disposition |
+|---|---|
+| **A1** `StampedLock` | `regression-suite/src/RJdkStampedStamps.java` — 48 checks |
+| **A2** `Phaser` | already covered by `RJdkPhaser` (240 checks, `getParent`/`getRoot` included) |
+| **A3** `Lookup.in` / `dropLookupMode` | `regression-suite/src/RJdkLookupIn.java` — 42 checks |
+| **A4** `VarHandle` | already covered by `RJdkHandles` (`findVarHandle`, `varType`, the access modes) |
+| **A5** `ClassLoader.defineClass1/2` | `regression-suite/src/RJdkDefineClass.java` — 40 checks |
+| *(new)* row 7's per-triple check | `regression-suite/src/RJdkX509Intercept.java` — 22 checks |
+
+All four new vectors PASS byte-identical to HotSpot in `--real-jdk` and
+`--jdk-only`.
+
+## Row by row, prediction against measurement
+
+### Row 1 — `StampedLock`, filed URGENT. **Stale, and refuted twice.**
+
+The record predicted `--real-jdk` would answer `writeStamp&255 == 1`,
+`isWriteLockStamp == false`, `isReadLockStamp == true` — the release-the-wrong-
+lock hazard. It does not. `native-builtins/src/stamped_lock.rs` was re-encoded
+to the JDK's own bit layout (`WBIT = 128`, `ORIGIN = 256`, the reader count in
+the low seven bits) on **2026-08-07**, the same day this record was filed, and
+the two never met.
+
+`RJdkStampedStamps` asks through the JDK's own **unregistered** static
+predicates — `isWriteLockStamp`, `isReadLockStamp`, `isLockStamp`,
+`isOptimisticReadStamp`, which no registrar provides, so real JDK bytecode
+decodes whatever the backend hands out. 48/48 in both modes:
+`writeMode=128 readModes=1,2 optMode=0 versionStep=256`.
+
+The record's *second* prediction for this row is also refuted: it warned that a
+hang at `writeLock()` under `--jdk-only` would be "its own finding", since the
+real `StampedLock` bytecode needs `Unsafe` CAS and `LockSupport.park` once the
+stub is refused. It does not hang. The whole surface runs on real bytecode under
+`--jdk-only` and answers identically to `--real-jdk`.
+
+### Row 2 — `MethodHandles.Lookup.in`. **Live, and it was wrong in three ways.**
+
+The record's charge was exact: "correctness is asserted from a comment, not a
+test." Running it found three defects, all live in **both** modes, and all in
+the same direction — GRANTING access the JDK withholds.
+
+1. **`in(int.class)` and `in(String[].class)` returned a Lookup.** The JDK opens
+   `in` with three rejections before any mode arithmetic — null is an NPE, a
+   primitive and an array are each an `IllegalArgumentException`. A native that
+   only computes modes drops all three silently. The test now lives in one
+   place, `classloader::lk_check_in_target`, called by BOTH registrations of the
+   method, for the same reason they already shared `lk_in_modes`.
+
+2. **`publicLookup().in(<a package-private class>)` reported 32.** The old table
+   was measured against public targets only, and read `UNCONDITIONAL` as
+   surviving `in()` unconditionally. Re-measured on OpenJDK 25.0.3:
+
+   | target | modes |
+   |---|---|
+   | a PUBLIC class in the unnamed module | 32 |
+   | a PUBLIC nested class | 32 |
+   | a package-private nested class | **0** |
+   | a package-private top-level class | **0** |
+   | `java.lang.String` | 32 |
+   | `jdk.internal.misc.Unsafe` (public, NOT exported) | **0** |
+
+   The class-public half is now enforced. The export half is not — there is no
+   module graph — and that one divergence is recorded at the site rather than
+   approximated by package prefix.
+
+3. **A zero-mode Lookup admitted every member, public ones included.**
+   `lk_read_allowed_modes` collapsed "the Lookup has no modes" and "this VM
+   could not read the modes" to the same `0`, so every enforcement site had to
+   treat `0` as "unknown, stay permissive". That is right for an unmodelled
+   layout and wrong for `lookup().dropLookupMode(PUBLIC)`, which HotSpot refuses
+   everything from. `lk_read_allowed_modes_opt` keeps them apart: the valve is
+   `None`, not `0`.
+
+   And separately, `publicLookup()`'s rule is about the target CLASS rather than
+   the member, which `lk_enforce_find_access` never looked at — so a public
+   member of a package-private class was reachable from `publicLookup()`.
+
+The four `in(...)` values the record predicted (95 / 31 / 25 / 1) were right and
+are now asserted; what it could not see was that the numbers being right did not
+make the access decisions right.
+
+### Row 3 — `ClassLoader.defineClass0/1/2`. **Live, and one defect, in all six paths.**
+
+The record called the risk correctly: "not shadowing but decode fidelity". The
+`bb_define_layout` fix it worried about had held — the sliced, windowed and
+direct `ByteBuffer` arms all decode correctly — but the **caller's
+`ProtectionDomain` never reached the class**. Every defined class came back
+carrying the synthesised `file:/runtime-defined/<name>.class` code source
+instead of the one the caller passed.
+
+Six copies of an inline decode stood in four files, and every one of them read
+`CodeSource.location` with `read_string`, which fails on a real `java.net.URL`
+because a URL is a different concrete class — one of the copies even carried the
+comment `// Try CodeSource.location at field 0 (URL object) → URL.toString()`,
+describing an intent the code did not implement. The correct reader,
+`classloader::extract_pd_code_source_url`, already existed and no call site used
+it. All six now do.
+
+### Row 4 — `Phaser`. **Dead, as predicted, and it was already a measurement.**
+
+`RJdkPhaser` asserts `getParent()`/`getRoot()` directly (lines 283-286) and has
+since before this record; the natives are dead in every mode the suite runs.
+
+### Row 5 — `VarHandle`. **Both halves confirmed by `RJdkHandles`.**
+
+The live `register_phase54_method_handle` surface (`varType`,
+`coordinateTypes`) and the access modes `register_p59_varhandle` does not serve
+are both exercised there, including `getAndAdd` on six primitive widths.
+
+### Row 6 — `lk_in_method` / `lk_drop_lookup_mode`. **Confirmed, and the control fired.**
+
+`dropLookupMode` has no real-mode registration, so the record proposed it as the
+CONTROL: a divergence there would mean a registration nobody had found. It did
+not diverge — but the HotSpot oracle corrected the *record's own arithmetic*.
+`dropLookupMode`'s opening move is `oldModes & ~(modeToDrop | PROTECTED |
+ORIGINAL)`, so PROTECTED comes off for EVERY argument, and
+`dropLookupMode(UNCONDITIONAL)` on a 95 lookup is **27**, not the 31 the
+`EXPECT-REAL` line predicted. Five of the six values in that line were right;
+the sixth was a model, not a measurement.
+
+### Row 7 — `X509Certificate`. **Verdict survives; now measured per triple.**
+
+The record asked for a per-triple `javap` of `sun.security.x509.X509CertImpl`
+and got one. Seventeen triples are registered on the ABSTRACT
+`java.security.cert.X509Certificate`; **sixteen are declared by `X509CertImpl`
+itself**, so its own bytecode wins and `has_own_bytecode` skips the superclass
+walk entirely. The seventeenth is `getType()`, which is `public final` on
+`java.security.cert.Certificate` two frames up — so `X509CertImpl` declares
+nothing and the native DOES intercept. It answers the constant `"X.509"`, which
+is exactly what `Certificate.getType()` returns for every X.509 certificate
+(`X509CertImpl`'s constructor passes it to `super`). Benign — but benign by
+measurement now, which is what the record asked for. `RJdkX509Intercept` parses
+a fixed self-signed cert and pins all seventeen.
+
+## Two things found while measuring that are NOT this record's
+
+* **A duplicate `defineClass` in one loader does not raise `LinkageError`.**
+  HotSpot does; CratonVM serves the already-defined mirror
+  (`lang_system::same_loader_already_defined_mirror`), which is a deliberate
+  tolerance for delegation gaps. Changing it touches every loader-stacking
+  workload, so it is filed separately rather than folded in here.
+  `RJdkDefineClass` carries the case written out and commented NOT ASSERTED,
+  with the reasoning, so it is not lost.
+* **`Lookup.in` for a cross-module target whose package is not exported** is 0
+  on HotSpot and 1 here. Module-graph-dependent; recorded at
+  `classloader::lk_in_modes` rather than approximated.
+
+## What the record got right that is worth keeping
+
+Its generalisation, stated in "What this re-audit did NOT find", is the durable
+part and it was borne out again here:
+
+> The one urgent finding was missed for a different reason entirely: a lane
+> asked "which registrar wins?" and stopped before "and is the winner right?".
+
+Row 2 is the same shape one level further in. A previous lane asked "does `in()`
+compute the right modes?", answered yes, and stopped before "and does anything
+enforce them?". Three of this session's four fixes live in that gap.
+
+---
+
+The original record follows unchanged.
+
+---
+
 # The true native-vs-bytecode precedence rules, and the re-audit of every site this campaign called dead
 
 Filed 2026-08-07, JDK-only wave 2, lane W8-7. Source-verified only — this lane

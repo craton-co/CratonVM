@@ -198,9 +198,11 @@ When your PR adds a feature, fixes a bug, or changes behavior:
    `SyntheticStub` outright, so a mis-tagged bridge is never registered at all
    and the failure surfaces far from its cause. Background:
    the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
-   (RETIRED 2026-08-06 — the ambient default no longer decides anything; the
-   reclassification it pointed at is in
-   [`docs/known-issues/jdk-only/bridge-reclassification-wave.md`](docs/known-issues/jdk-only/bridge-reclassification-wave.md)).
+   (RETIRED 2026-08-06 — the ambient default no longer decides anything). The
+   reclassification it pointed at was re-homed and then closed: all four of its
+   items landed 2026-08-11, and the population is now five slack-free ratchets
+   scored by `regression-suite/bridge-ratchet.sh` rather than a number in a
+   document. Background: the retired `bridge-reclassification-wave` write-up.
 
    One class of mis-tag is now decided centrally rather than at the site: a
    registration whose receiver class **no supported JDK image declares** cannot

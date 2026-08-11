@@ -26,7 +26,7 @@
 # 10,084 of the 10,844 `Bridge` registrations have no such target, every one of
 # them inherited its kind from an ambient `set_category`, and nothing stopped
 # that number rising. This boots the VM against a real JDK image, takes the
-# schema-3 census, and scores it against the baseline committed in
+# schema-4 census, and scores it against the baseline committed in
 # `scripts/baselines/jdk-only-bridge-ratchet.json`.
 #
 # It lives here, and not in `native-builtins/tests/`, for one reason: the

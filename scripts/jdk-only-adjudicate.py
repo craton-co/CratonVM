@@ -117,21 +117,71 @@ for kind in ("intrinsic", "bridge", "synthetic-stub"):
     stated, inherited = c[(kind, True)], c[(kind, False)]
     print(f"  {kind:<16} stated={stated:<6} inherited={inherited:<6} total={stated + inherited}")
 
-print("\n=== 2. kind x what the IMAGE says ===")
-print(f"  {'kind':<16}{'rows':>7}{'absent':>8}{'undecl':>8}{'native':>8}{'code':>8}{'abstract':>10}")
+# Schema 4 resolves `image_declaring_method` up the hierarchy, so `undecl` is
+# no longer a superset of "dead": a row that inherits a declaration says so on
+# the row, and `nowhere` below is the genuinely-dead bucket. HIERARCHY is True
+# when the census can answer that itself; when it is False every number here is
+# the schema-3 reading and `--inherited` is the only way to split it.
+HIERARCHY = any("inherited_from" in img(r) for r in rows)
+
+
+def declared_anywhere(r):
+    i = img(r)
+    return i.get("declared") or i.get("inherited_from") is not None
+
+
+def acc_native_anywhere(r):
+    """Does the image declare this triple ACC_NATIVE anywhere that ADJUDICATES?
+
+    Not simply "anywhere": `java.lang.Object` declares `hashCode`, `clone`,
+    `getClass`, `notify`, `notifyAll` and `wait` ACC_NATIVE and everything
+    inherits them, so a plain hierarchy answer would discharge any
+    `X.hashCode()I` Bridge on any receiver. The census states the resolution
+    because it is factually right; the ratchet and this script both decline to
+    credit it. `ratchet._inherits_from_object` is the same rule, and the two
+    must not drift.
+    """
+    i = img(r)
+    if i.get("acc_native"):
+        return True
+    return bool(i.get("inherited_acc_native")) and not ratchet._inherits_from_object(i)
+
+
+def has_code_anywhere(r):
+    i = img(r)
+    return i.get("has_code") or i.get("inherited_has_code")
+
+
+print("\n=== 2. kind x what the IMAGE says (hierarchy-resolved: %s) ===" % HIERARCHY)
+print(f"  {'kind':<16}{'rows':>7}{'absent':>8}{'nowhere':>9}{'native':>8}{'code':>8}"
+      f"{'abstract':>10}{'i-native':>10}{'i-code':>8}{'i-abs':>7}")
 for kind in ("intrinsic", "bridge", "synthetic-stub"):
     sel = [r for r in rows if r["kind"] == kind]
     absent = sum(1 for r in sel if not img(r).get("image_has_class"))
-    undecl = sum(1 for r in sel if img(r).get("image_has_class") and not img(r).get("declared"))
+    nowhere = sum(1 for r in sel
+                  if img(r).get("image_has_class") and not declared_anywhere(r))
     nat = sum(1 for r in sel if img(r).get("acc_native"))
     code = sum(1 for r in sel if img(r).get("has_code"))
     abst = sum(1 for r in sel if img(r).get("declared")
                and not img(r).get("acc_native") and not img(r).get("has_code"))
-    print(f"  {kind:<16}{len(sel):>7}{absent:>8}{undecl:>8}{nat:>8}{code:>8}{abst:>10}")
+    inat = sum(1 for r in sel if img(r).get("inherited_acc_native"))
+    icode = sum(1 for r in sel if img(r).get("inherited_has_code"))
+    iabs = sum(1 for r in sel if img(r).get("inherited_abstract"))
+    print(f"  {kind:<16}{len(sel):>7}{absent:>8}{nowhere:>9}{nat:>8}{code:>8}{abst:>10}"
+          f"{inat:>10}{icode:>8}{iabs:>7}")
+if not HIERARCHY:
+    print("  WARNING: this census predates schema 4. `nowhere` above is really")
+    print("  `class present, method not declared HERE`, which is roughly four")
+    print("  times too large, and the three i-* columns are structurally zero.")
 
 bridges = [r for r in rows if r["kind"] == "bridge"]
-bad = [r for r in bridges if not img(r).get("acc_native")]
-print(f"\n  BRIDGE rows with no ACC_NATIVE target in the image: {len(bad)} of {len(bridges)}")
+bad = [r for r in bridges if not acc_native_anywhere(r)]
+print(f"\n  BRIDGE rows with no ACC_NATIVE target ANYWHERE in the hierarchy: "
+      f"{len(bad)} of {len(bridges)}")
+if HIERARCHY:
+    credited = sum(1 for r in bridges if img(r).get("inherited_acc_native"))
+    print(f"    (credited by the hierarchy pass; counted as unadjudicated "
+          f"before schema 4: {credited})")
 inherited_bad = [r for r in bad if not r["kind_stated"]]
 print(f"    ...of which inherited an ambient set_category: {len(inherited_bad)}")
 print(f"    ...and were actually dispatched this run:      "
@@ -165,7 +215,38 @@ else:
     print("       `owns_slot` column, so an unknown share of the rows above own")
     print("       no slot and cannot be dispatched. Re-dump with a current build.")
 
-if INHERITED_TSV:
+if HIERARCHY:
+    print("\n=== 2b. what the rows the class does NOT declare resolve to ===")
+    print("  (from the census itself -- schema 4 walks the hierarchy inside")
+    print("   ClassManager::adjudicate_natives_against_image, so neither")
+    print("   jdk-only-inherited-decl.sh nor a HotSpot run is needed)")
+    split = Counter()
+    creditable = []
+    for r in rows:
+        i = img(r)
+        if not i.get("image_has_class") or i.get("declared"):
+            continue
+        if i.get("inherited_acc_native"):
+            if ratchet._inherits_from_object(i):
+                split["INHERITED native (java.lang.Object - NOT credited)"] += 1
+                continue
+            split["INHERITED native"] += 1
+            creditable.append((r, i.get("inherited_from")))
+        elif i.get("inherited_has_code"):
+            split["INHERITED code"] += 1
+        elif i.get("inherited_abstract"):
+            split["INHERITED abstract"] += 1
+        else:
+            split["NOWHERE"] += 1
+    for bucket, n in sorted(split.items(), key=lambda kv: -kv[1]):
+        print(f"  {bucket:<22}{n:>7}")
+    print(f"\n  ACC_NATIVE on a SUPERTYPE -- section 2 used to count these as "
+          f"unadjudicated and they are not: {len(creditable)}")
+    for r, declarer in creditable[:20]:
+        print(f"    {r['class']}.{r['name']}{r['descriptor']}  ->  {declarer}")
+    if len(creditable) > 20:
+        print(f"    ... and {len(creditable) - 20} more")
+elif INHERITED_TSV:
     # The hierarchy pass, so `undecl` stops being a superset.
     resolved = {}
     try:
@@ -200,11 +281,18 @@ if INHERITED_TSV:
         print(f"    ... and {len(creditable) - 20} more")
 else:
     print("\n=== 2b. hierarchy split of the 'undecl' rows: NOT RUN ===")
-    print("  `undecl` above is a superset of 'dead'. Pass --inherited <tsv>")
-    print("  (from scripts/jdk-only-inherited-decl.sh) to break it out.")
+    print("  This census predates schema 4 and no --inherited TSV was given, so")
+    print("  `nowhere` above is a superset of 'dead'. Re-dump with a current")
+    print("  build (preferred), or pass --inherited <tsv> from")
+    print("  scripts/jdk-only-inherited-decl.sh.")
 
 print("\n=== 3. natives shadowing concrete bytecode (image has_code) ===")
-if INHERITED_TSV:
+if HIERARCHY:
+    extra = sum(1 for r in rows if img(r).get("inherited_has_code"))
+    print(f"  + {extra} more shadow bytecode they INHERIT, counted separately")
+    print("    because the has_code column is a statement about the NAMED class")
+    print(f"    (true shadow population = the total below + {extra})")
+elif INHERITED_TSV:
     # `has_code` is asked of the NAMED class. A native over a method the
     # class inherits concretely is just as much a shadow, and this column
     # cannot see one.
@@ -249,10 +337,26 @@ print(f"  by kind {dict(by_kind)}")
 print("\n=== 3b. rows that STATE Bridge with no ACC_NATIVE target here ===")
 overstated = [r for r in rows
               if r["kind"] == "bridge" and r.get("kind_stated")
-              and not img(r).get("acc_native")]
+              and not acc_native_anywhere(r)]
 print(f"  {len(overstated)} of {sum(1 for r in rows if r['kind'] == 'bridge' and r.get('kind_stated'))} stated Bridge rows")
 if overstated:
-    if INHERITED_TSV:
+    if HIERARCHY:
+        # The inherited-ACC_NATIVE bucket is discharged by the census itself, so
+        # every row left here is EITHER a platform-variant class this image
+        # lacks (correct) OR a statement the image contradicts.
+        print("  Rows that inherit an ACC_NATIVE supertype method are already")
+        print("  discharged. Each row left is EITHER a platform-variant class this")
+        print("  image lacks (correct) OR a statement the image contradicts; only")
+        print("  a second image tells those apart:")
+        print("    python3 scripts/jdk-only-platform-diff.py <this> <other> ...")
+        shadowing = [r for r in overstated if has_code_anywhere(r)]
+        print(f"  {len(shadowing)} of them target CONCRETE BYTECODE on this image --")
+        print("  a contract-1.4 shadow wearing a 1.5 claim, which no image set can")
+        print("  excuse. Those are statements to correct, not registrations to move.")
+        by_class = Counter(r["class"] for r in shadowing)
+        for cls, n in by_class.most_common(12):
+            print(f"    {n:5d}  {cls}")
+    elif INHERITED_TSV:
         unexplained = [
             r for r in overstated
             if "native" not in resolved.get(

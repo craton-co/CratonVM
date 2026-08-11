@@ -40,6 +40,7 @@ mod class_manager;
 /// consumers in `vm-cli` / `difftest` name the type through
 /// `cratonvm_classloading::class_origin::…`.
 pub mod class_origin;
+pub mod define_census;
 mod class_path;
 pub(crate) mod fx_hash;
 pub mod jar_signer;
