@@ -442,16 +442,124 @@ pub fn intrinsics_disabled() -> bool {
 /// All five blocker families, with symptoms, are in
 /// `jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
 ///
+/// ## Scoping it to one subsystem
+///
+/// The all-or-nothing form could not deliver on "one subsystem at a time": the
+/// whole-corpus arming is the only thing it could do, and the whole-corpus
+/// answer is 3/46, which says nothing about any individual family. So the
+/// variable is also a **prefix list**:
+///
+/// ```text
+///   CRATONVM_ENFORCE_NATIVE_SHADOW=1                      every receiver
+///   CRATONVM_ENFORCE_NATIVE_SHADOW=all                    every receiver
+///   CRATONVM_ENFORCE_NATIVE_SHADOW=javax/management/      the JMX subsystem
+///   CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/logging/,javax/management/
+/// ```
+///
+/// A value that is not `1`/`all`/`true`/`yes` is read as a comma-separated list
+/// of INTERNAL class-name prefixes (slashes, not dots), and enforcement applies
+/// to a dispatch only when the receiver's class name starts with one of them.
+/// Empty and `0` stay "off entirely", so the two spellings that already meant
+/// something keep meaning it.
+///
+/// A prefix list is the right granularity rather than a registrar name because
+/// the decision is made at DISPATCH, where the registering file is not
+/// something the VM knows — the census's `registered_by` is a `#[track_caller]`
+/// record of registration, not of dispatch. A subsystem's receivers share a
+/// package prefix; that is the handle dispatch actually has.
+///
 /// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
 #[inline]
 pub fn jdk_only_enforce_shadow() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
-    slot_bool(&CACHE, || {
-        match cratonvm_types::flags::runtime_var("CRATONVM_ENFORCE_NATIVE_SHADOW") {
-            Ok(v) => !v.is_empty() && v != "0",
-            Err(_) => false,
+    slot_bool(&CACHE, || !enforce_shadow_scope().is_off())
+}
+
+/// How `CRATONVM_ENFORCE_NATIVE_SHADOW` was spelled. See
+/// [`jdk_only_enforce_shadow`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnforceShadowScope {
+    /// Unset, empty, or `0` — §1.4 is observed and not acted on.
+    Off,
+    /// `1` / `all` / `true` / `yes` — every receiver.
+    All,
+    /// A comma-separated prefix list; only receivers under one of these
+    /// internal-name prefixes yield to bytecode.
+    Prefixes(Vec<String>),
+}
+
+impl EnforceShadowScope {
+    /// Nothing is enforced.
+    pub fn is_off(&self) -> bool {
+        match self {
+            EnforceShadowScope::Off => true,
+            EnforceShadowScope::All => false,
+            // A value of `,` or `,,` parses to no prefixes, which would enforce
+            // nothing while reading as armed. Say so here rather than letting a
+            // typo produce a silently-inert run that looks like a green result.
+            EnforceShadowScope::Prefixes(p) => p.is_empty(),
         }
+    }
+
+    /// Does enforcement apply to a dispatch on `class_name` (internal form)?
+    pub fn covers(&self, class_name: &str) -> bool {
+        match self {
+            EnforceShadowScope::Off => false,
+            EnforceShadowScope::All => true,
+            EnforceShadowScope::Prefixes(p) => p.iter().any(|pre| class_name.starts_with(pre)),
+        }
+    }
+}
+
+/// The parsed `CRATONVM_ENFORCE_NATIVE_SHADOW`, memoised.
+pub fn enforce_shadow_scope() -> &'static EnforceShadowScope {
+    static CACHE: OnceLock<EnforceShadowScope> = OnceLock::new();
+    memoized_ref(&CACHE, || {
+        parse_enforce_shadow_scope(
+            cratonvm_types::flags::runtime_var("CRATONVM_ENFORCE_NATIVE_SHADOW")
+                .ok()
+                .as_deref(),
+        )
     })
+}
+
+/// The parse behind [`enforce_shadow_scope`], separated so it can be tested
+/// without a process-wide env var — a memoised reader cannot be re-armed once
+/// something in the same process has read it.
+fn parse_enforce_shadow_scope(raw: Option<&str>) -> EnforceShadowScope {
+    let Some(raw) = raw else {
+        return EnforceShadowScope::Off;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "0" {
+        return EnforceShadowScope::Off;
+    }
+    if matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "1" | "all" | "true" | "yes" | "on"
+    ) {
+        return EnforceShadowScope::All;
+    }
+    EnforceShadowScope::Prefixes(
+        raw.split(',')
+            .map(|t| t.trim().replace('.', "/"))
+            .filter(|t| !t.is_empty())
+            .collect(),
+    )
+}
+
+/// [`jdk_only_enforce_shadow`], narrowed to one receiver class.
+///
+/// This is the predicate dispatch must ask. `jdk_only_enforce_shadow()` alone
+/// answers "is anything armed", which is the right question for a banner and
+/// the WRONG one for a dispatch decision: under a prefix list it is true for
+/// every class, and enforcing a subsystem's dial across the whole VM is exactly
+/// the 3/46 collapse the scoping exists to avoid.
+#[inline]
+pub fn jdk_only_enforce_shadow_for(class_name: &str) -> bool {
+    // The common case is Off, and `jdk_only_enforce_shadow` is a memoised bool
+    // read; only an armed run pays for the scope lookup and the prefix scan.
+    jdk_only_enforce_shadow() && enforce_shadow_scope().covers(class_name)
 }
 
 /// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
@@ -1601,5 +1709,65 @@ mod tests {
         assert!(!parse_osr_backedge_enabled(Some("false")));
         assert!(!parse_osr_backedge_enabled(Some("OFF")));
         assert!(!parse_osr_backedge_enabled(Some(" no ")));
+    }
+    /// `CRATONVM_ENFORCE_NATIVE_SHADOW` is a §1.4 dial AND a subsystem
+    /// selector, and the two spellings that already meant something keep
+    /// meaning it.
+    #[test]
+    fn enforce_shadow_scope_parses_the_three_spellings() {
+        assert_eq!(parse_enforce_shadow_scope(None), EnforceShadowScope::Off);
+        assert_eq!(parse_enforce_shadow_scope(Some("")), EnforceShadowScope::Off);
+        assert_eq!(parse_enforce_shadow_scope(Some("  ")), EnforceShadowScope::Off);
+        assert_eq!(parse_enforce_shadow_scope(Some("0")), EnforceShadowScope::Off);
+        for on in ["1", "all", "ALL", "true", "Yes", "on"] {
+            assert_eq!(parse_enforce_shadow_scope(Some(on)), EnforceShadowScope::All, "{on}");
+        }
+        assert_eq!(
+            parse_enforce_shadow_scope(Some("javax/management/")),
+            EnforceShadowScope::Prefixes(vec!["javax/management/".to_string()])
+        );
+        // Dotted spelling and whitespace both normalise, because a reader who
+        // has just been looking at a census (dots) and one who has been looking
+        // at the registry (slashes) must not get different behaviour.
+        assert_eq!(
+            parse_enforce_shadow_scope(Some(" java.util.logging. , javax/management/ ")),
+            EnforceShadowScope::Prefixes(vec![
+                "java/util/logging/".to_string(),
+                "javax/management/".to_string()
+            ])
+        );
+    }
+
+    /// A prefix list that parses to NOTHING must read as off, not as armed —
+    /// otherwise a typo produces an inert run that looks like a clean result.
+    #[test]
+    fn an_empty_prefix_list_is_off_not_vacuously_armed() {
+        let s = parse_enforce_shadow_scope(Some(",  , ,"));
+        assert_eq!(s, EnforceShadowScope::Prefixes(vec![]));
+        assert!(s.is_off(), "an empty prefix list must not read as armed");
+        assert!(!s.covers("javax/management/MBeanServer"));
+    }
+
+    /// `covers` is what dispatch asks, and it must be narrow: arming one
+    /// subsystem must not enforce §1.4 on every other receiver in the VM.
+    #[test]
+    fn enforce_shadow_scope_covers_only_the_named_subsystem() {
+        let all = EnforceShadowScope::All;
+        assert!(all.covers("java/lang/String"));
+        assert!(all.covers("javax/management/MBeanServer"));
+
+        let jmx = parse_enforce_shadow_scope(Some("javax/management/"));
+        assert!(!jmx.is_off());
+        assert!(jmx.covers("javax/management/MBeanServer"));
+        assert!(jmx.covers("javax/management/openmbean/CompositeDataSupport"));
+        assert!(!jmx.covers("java/lang/String"), "the JMX dial must not reach java.lang");
+        assert!(!jmx.covers("java/util/logging/LogManager"));
+
+        let two = parse_enforce_shadow_scope(Some("java/util/logging/,javax/management/"));
+        assert!(two.covers("java/util/logging/LogManager"));
+        assert!(two.covers("javax/management/MBeanServer"));
+        assert!(!two.covers("java/lang/System"));
+
+        assert!(!EnforceShadowScope::Off.covers("javax/management/MBeanServer"));
     }
 }
