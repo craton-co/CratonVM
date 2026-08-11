@@ -101,9 +101,18 @@ public class RJdkX509Intercept {
         String issuer = c.getIssuerX500Principal().getName();
         check("CN=RJdkX509,OU=Craton,O=CratonVM,C=GB".equals(subject), "subject = " + subject);
         check(subject.equals(issuer), "a self-signed cert's issuer is its subject: " + issuer);
-        check(c.getSubjectDN().getName().equals(subject), "getSubjectDN agrees with the principal");
-        check(c.getIssuerDN().getName().equals(issuer), "getIssuerDN agrees with the principal");
+        // getSubjectDN/getIssuerDN return an `X500Name`, whose `getName()`
+        // renders with spaces after the commas — deliberately NOT the same
+        // string as the X500Principal's RFC 2253 form. Both are printed so the
+        // cross-VM diff pins the exact rendering; only the RDN content, which
+        // is what a shim reading a synthetic slot would get wrong, is asserted.
+        String subjectDN = c.getSubjectDN().getName();
+        String issuerDN = c.getIssuerDN().getName();
+        check(subjectDN.contains("CN=RJdkX509") && subjectDN.contains("O=CratonVM"),
+                "getSubjectDN() = " + subjectDN);
+        check(subjectDN.equals(issuerDN), "a self-signed cert's issuer DN is its subject DN");
         System.out.println("CK RJdkX509Intercept subject=" + subject);
+        System.out.println("CK RJdkX509Intercept subjectDN=" + subjectDN);
 
         check(c.getNotBefore().getTime() == 1577836800000L,
                 "getNotBefore() = " + c.getNotBefore().getTime());
