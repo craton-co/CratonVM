@@ -3858,6 +3858,31 @@ pub(crate) fn define_or_get_proxy_class(
         // `ClassLoader`, independent of annotations. See "Residual issue B" in
         // fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md.
         force_loader_faithful_linking: true,
+        // …and, for the interfaces, do not even ask the loader-faithful
+        // *search* to find them: hand over the exact `ClassId`s.
+        //
+        // `force_loader_faithful_linking` only makes `resolve_supertype` PREFER
+        // the defining loader's namespace, and it falls through to the
+        // loader-blind `load_class(name)` when that namespace has no entry —
+        // which is routine, because a child loader's class is registered under
+        // its own namespace only for the copies it defined itself. A proxy over
+        // an interface a child loader merely *sees* therefore linked the
+        // application loader's same-named copy, and `getInterfaces()[0]` was
+        // then a different `Class` object from the one the caller passed to
+        // `newProxyInstance`. Everything downstream compares `Class` by
+        // identity: the generated `<clinit>`'s `getMethod` produced `Method`s
+        // declared by the wrong copy, so Byte Buddy's `JavaDispatcher` — a
+        // `Map<Method, Dispatcher>` keyed off its own `getMethods()` — missed
+        // every lookup and threw `No proxy target found for
+        // …Executable.isInstance(Object)`, taking Mockito's inline mock maker
+        // down with it in `HikariDataSourceConfigurationTests`.
+        //
+        // There is no ambiguity to resolve here: `Proxy.newProxyInstance` was
+        // handed the `Class` objects themselves. The order and length must
+        // match the emitted `interfaces[]`, which `emit_proxy_classfile` dedups
+        // BY NAME (two loaders' same-named interfaces collapse to one entry),
+        // so apply the same name-dedup to the id list.
+        interface_id_overrides: Some(dedup_iface_ids_by_name(&ordered, &spec.interfaces)),
         ..Default::default()
     };
     // Failure mode (3): class definition through the normal loader
@@ -3980,6 +4005,29 @@ pub(crate) fn resolve_serialized_proxy_class(
 /// public abstract + default instance methods, deduplicated by
 /// `(name, descriptor)`. Returns `None` if any ClassId fails to resolve to
 /// a name.
+/// Project `ordered` (deduped by `ClassId`) onto `iface_names` (the spec's
+/// interface names, same order) with the NAME dedup `emit_proxy_classfile`
+/// applies, keeping the first `ClassId` per name.
+///
+/// `DefineClassOptions::interface_id_overrides` is positional against the
+/// emitted `interfaces[]`, and the emitter collapses two loaders' same-named
+/// interfaces into one entry (JVMS §4.1 forbids a repeated interface), so a
+/// raw id list would be rejected for a count mismatch in exactly that case.
+fn dedup_iface_ids_by_name(
+    ordered: &[cratonvm_types::ClassId],
+    iface_names: &[String],
+) -> Vec<cratonvm_types::ClassId> {
+    let mut seen: Vec<&str> = Vec::with_capacity(iface_names.len());
+    let mut ids = Vec::with_capacity(iface_names.len());
+    for (id, name) in ordered.iter().zip(iface_names.iter()) {
+        if !seen.iter().any(|s| *s == name.as_str()) {
+            seen.push(name.as_str());
+            ids.push(*id);
+        }
+    }
+    ids
+}
+
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
@@ -4046,10 +4094,19 @@ fn build_proxy_spec_for(
     // same `(name, descriptor)` key appears with both flavours.
     let mut visited: std::collections::HashSet<cratonvm_types::ClassId> =
         std::collections::HashSet::new();
-    let mut work: Vec<cratonvm_types::ClassId> = ordered_ifaces.to_vec();
+    // Each work item carries the DECLARED interface it was reached from, so a
+    // method inherited from a super-interface still records a root that is an
+    // entry of `ProxyClassSpec::interfaces`. `<clinit>` needs that root to take
+    // the owner `Class` off the generated class's own `getInterfaces()` rather
+    // than off a by-name constant-pool entry — see `ProxyMethod::iface_root`.
+    let mut work: Vec<(cratonvm_types::ClassId, String)> = ordered_ifaces
+        .iter()
+        .zip(iface_names.iter())
+        .map(|(cid, name)| (*cid, name.clone()))
+        .collect();
     let mut by_key: std::collections::HashMap<(String, String), ProxyMethod> =
         std::collections::HashMap::new();
-    while let Some(cid) = work.pop() {
+    while let Some((cid, root)) = work.pop() {
         if !visited.insert(cid) {
             continue;
         }
@@ -4077,6 +4134,7 @@ fn build_proxy_spec_for(
                 iface_owner: owner.clone(),
                 param_class_names,
                 exception_types,
+                iface_root: Some(root.clone()),
             });
             if !is_default {
                 entry.is_default = false;
@@ -4084,7 +4142,7 @@ fn build_proxy_spec_for(
         }
         for super_iface in ctx.class_interfaces(cid) {
             if !visited.contains(&super_iface) {
-                work.push(super_iface);
+                work.push((super_iface, root.clone()));
             }
         }
     }
@@ -4118,6 +4176,7 @@ fn build_proxy_spec_for(
                 iface_owner: "java/lang/Object".to_string(),
                 param_class_names: params,
                 exception_types: Vec::new(),
+                iface_root: None,
             });
     }
 

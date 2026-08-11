@@ -1094,7 +1094,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: None },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
-    // `adapt_young_trigger_to_pause` reads, `0` (the default) being off.
+    // `adapt_young_trigger_to_pause` reads. Default 200 since 2026-08-11
+    // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`); `0` is the opt-out.
     E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },

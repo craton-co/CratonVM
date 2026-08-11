@@ -138,7 +138,7 @@ both Spring classes still show zero unresolved targets.
 timeout against its own localhost mock server. An interleaved A/B (arms
 alternating inside one window, so both see the same host load) fails it on the
 UNFIXED control too. See
-`docs/known-issues/springboot/oauth2-issuer-uri-mock-server-read-timeout-flake-20260803.md`.
+`fixed-suite-bugs/springboot/oauth2-issuer-uri-mock-server-read-timeout-flake-FIXED-20260811.md`.
 
 The three fixtures are real guards — on the unfixed tree
 `a_self_tail_call_may_not_swallow_a_branch_targeted_return` and

@@ -1052,7 +1052,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_STRESS` | GC | `CRATONVM_GC=stress` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` | GC | `CRATONVM_GC=sweep-anchor-stride` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_GC_VERIFY_STALE` | DBG | `CRATONVM_DBG=gc-verify-stale` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_GC_YOUNG_PAUSE_MS` | GC | `CRATONVM_GC=young-pause-goal-ms` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_GC_YOUNG_PAUSE_MS` | GC | `CRATONVM_GC=young-pause-goal-ms` | opt-out | 200 | behaviour | snapshot | gc |
 | `CRATONVM_GPU_CRITICAL_LEASE_MS` | GC | `CRATONVM_GC=gpu-critical-lease-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_CRITICAL_WAIT_MS` | GC | `CRATONVM_GC=gpu-critical-wait-ms` | opt-in | off | behaviour | snapshot | cuda-bridge |
 | `CRATONVM_GPU_NO_ZEROCOPY` | GC | `CRATONVM_GC=gpu-zerocopy` | opt-out | on | behaviour | snapshot | vm |
