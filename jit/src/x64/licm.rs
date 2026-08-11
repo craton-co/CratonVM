@@ -260,6 +260,17 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 ///
 /// When off, no Stage 3 codegen is emitted (byte-identical legacy path); when on,
 /// bintrees16/18 == golden (14985902 / 68332206), MinRegexProbe A3 repro green.
+/// ## The opt-out does not turn safepoint emission off while moving-young is on
+///
+/// The decision the codegen actually makes is
+/// `precise_jit_maps_enabled() || moving_young_enabled()` (`x64.rs`), and
+/// moving-young is default-ON — a moving young generation cannot be served by
+/// the conservative fallback, so the OR is correct. The consequence is that
+/// `CRATONVM_NO_PRECISE_JIT_MAPS=1` alone changes nothing about safepoint
+/// emission, and used to do so **silently**: an A/B on it reads as "precise
+/// maps cost nothing" when what actually happened is that both arms had them.
+/// That is how an inert lever produces a confident wrong answer, so the
+/// override now says so once, and names the flag that really turns it off.
 pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -267,7 +278,18 @@ pub fn precise_jit_maps_enabled() -> bool {
         // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
         // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
         // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
+        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_JIT_MAPS")
+            .is_none();
+        if !enabled && moving_young_enabled() {
+            eprintln!(
+                "[cratonvm] WARN: CRATONVM_NO_PRECISE_JIT_MAPS is set but a moving young \
+                 generation is enabled, and moving-young requires precise safepoint maps — \
+                 the codegen gate is `precise_jit_maps_enabled() || moving_young_enabled()`, \
+                 so precise maps stay ON and this flag changes nothing. Add \
+                 CRATONVM_NO_MOVING_YOUNG=1 to actually turn them off."
+            );
+        }
+        enabled
     })
 }
 
