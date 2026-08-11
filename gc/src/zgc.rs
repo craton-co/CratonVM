@@ -2427,6 +2427,17 @@ impl ZgcRealHeap {
         }
     }
 
+    /// Bytes committed for the Java heap — this collector's arena envelope.
+    /// See [`crate::vm_heap::VmHeap::committed_bytes`] for what the quantity is
+    /// for and why it must not track live bytes.
+    ///
+    /// Fixed for the collector's lifetime: the arena is allocated once in
+    /// [`Self::with_capacity`] and never grown, which is the same property that
+    /// makes `arena_base`/`arena_end` safe to read without the lock.
+    pub fn committed_bytes(&self) -> usize {
+        self.arena_end.saturating_sub(self.arena_base)
+    }
+
     /// Create a heap with the default capacity ([`ZGC_REAL_DEFAULT_HEAP`]).
     pub fn new() -> Self {
         Self::with_capacity(ZGC_REAL_DEFAULT_HEAP)

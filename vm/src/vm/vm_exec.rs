@@ -11808,6 +11808,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.allocated_bytes()
     }
 
+    fn committed_heap_bytes(&self) -> usize {
+        self.shared.mem.heap.committed_bytes()
+    }
+
     // -- WP0.2 ObjectStreamClass cache --
 
     fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {

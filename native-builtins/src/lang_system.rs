@@ -1747,18 +1747,58 @@ pub(crate) fn native_runtime_max_memory(
     Ok(Some(Value::Long(ctx.max_heap_bytes())))
 }
 
+/// `Runtime.totalMemory()` — bytes currently committed for the Java heap.
+///
+/// These two were hardcoded 64 MiB / 32 MiB and never moved: not on
+/// allocation, not across `Runtime.gc()`. That left the VM giving two different
+/// answers for one quantity — `maxMemory()` already returned the real `-Xmx`,
+/// and the JMX heap `MemoryUsage` already reported a real `used` from
+/// `heap_allocated_bytes()` — and any application that sizes a cache or buffer
+/// from the free heap got a constant. H2's `Utils.getMemoryUsed()` is
+/// `totalMemory() - freeMemory()`, so `TestLIRSMemoryConsumption` printed a
+/// memory delta of exactly 0 on every row where HotSpot prints real numbers.
+///
+/// `committed_heap_bytes` is a CAPACITY and must stay one — see
+/// `gc::vm_heap::VmHeap::committed_bytes` for why a value that moved on every
+/// collection would be a behavioural change for callers that gc until
+/// `totalMemory()` settles.
 pub(crate) fn native_runtime_total_memory(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(64 * 1024 * 1024))) // 64 MB estimate
+    Ok(Some(Value::Long(runtime_committed_heap(ctx))))
 }
 
+/// `Runtime.freeMemory()` — committed minus used, both from the live heap.
+///
+/// Saturating: `heap_allocated_bytes` and `committed_heap_bytes` are sampled
+/// separately and without a lock, so a concurrent allocation can make used
+/// exceed the committed figure read a moment earlier. HotSpot never reports a
+/// negative free heap; report 0 rather than a wrapped `Long`.
 pub(crate) fn native_runtime_free_memory(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
+    let committed = runtime_committed_heap(ctx);
+    let used = ctx.heap_allocated_bytes() as i64;
+    Ok(Some(Value::Long(committed.saturating_sub(used).max(0))))
+}
+
+/// Committed heap for the `Runtime` accessors, clamped into `[used, -Xmx]`.
+///
+/// Two clamps, both for the same reason — a report that contradicts one of the
+/// VM's OWN other answers is worse than a coarse one:
+///
+/// * never below `used`, so `freeMemory()` cannot be 0 while the heap is
+///   plainly serving allocations (a collector that reports a fixed arena is
+///   already above `used`; the clamp is for the growable one, sampled mid-grow);
+/// * never above `maxMemory()`, which is the configured `-Xmx` and is the
+///   ceiling every caller compares against.
+fn runtime_committed_heap(ctx: &mut dyn NativeContext) -> i64 {
+    let used = ctx.heap_allocated_bytes() as i64;
+    let max = ctx.max_heap_bytes();
+    let committed = ctx.committed_heap_bytes() as i64;
+    committed.max(used).min(max.max(used))
 }
 
 /// The four real `java.lang.Runtime$Version` field values, parsed out of a
