@@ -30180,8 +30180,23 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
-    // node-iterating bytecode runs against our overlay structure (where the
-    // JDK `first` field is always null) and returns an array full of nulls.
+    // node-iterating bytecode runs against our overlay structure and returns an
+    // array full of nulls.
+    //
+    // CORRECTED 2026-08-11: the original of this comment gave the reason as
+    // *"the JDK `first` field is always null"*, and that has not been true
+    // since `ll_set` began mirroring the overlay into the real fields (see
+    // `ll_get`'s overlay-MISS arm). Measured reflectively under
+    // `--add-opens java.base/java.util=ALL-UNNAMED`, a native `LinkedList`
+    // carries a real `size` and a real `first`/`last` node chain whose
+    // `item`/`next`/`prev` walk matches HotSpot's exactly, and
+    // `descendingIterator()` — which nothing here intercepts — runs real
+    // `LinkedList$ListItr` bytecode over it successfully. The registration is
+    // still right, for a different reason: the overlay stays AUTHORITATIVE for
+    // `size` on read, so real bytecode that MUTATES the list leaves the two
+    // owners disagreeing (`native_ll_iterator` records the reproducer). Keep
+    // the natives the single writer; do not "simplify" this away on the
+    // strength of the old reason.
     registry.register(
         c,
         "toArray",
@@ -30198,11 +30213,26 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         native_ll_spliterator,
     );
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
-    // fields via getfield; our overlay-based LL never writes those, so
-    // `List.sort` default-method path crashes with NoSuchElementException
-    // inside Spring's `processDeferredImportSelectors`. Override
-    // `listIterator()` / `listIterator(I)` to return a snapshot-array iterator
-    // with cursor + list_ref so `next`/`hasNext`/`set` work via our overlay.
+    // fields via getfield; the `List.sort` default-method path crashed with
+    // NoSuchElementException inside Spring's `processDeferredImportSelectors`.
+    // Override `listIterator()` / `listIterator(I)` to return a snapshot-array
+    // iterator with cursor + list_ref so `next`/`hasNext`/`set` work via our
+    // overlay.
+    //
+    // CORRECTED 2026-08-11: this comment used to blame *"our overlay-based LL
+    // never writes those"*, and that reason is stale — `ll_set` mirrors both
+    // fields, and the whole real node chain reads back correctly (see the
+    // `toArray(T[])` note above). The registration is still correct because the
+    // overlay wins on READ while real bytecode writes the heap, so a real
+    // `ListItr` that mutates leaves the two disagreeing. UNDER `--jdk-only`
+    // THIS PAIR IS AN OPEN GAP, not a fix: `cratonvm/internal/
+    // LinkedListSnapshotListItr` is refused, so `listIterator()` and every real
+    // `AbstractList` method that reaches it (`equals`, `hashCode`, `indexOf`
+    // against a foreign list) raise `NoClassDefFoundError` there. A real
+    // `Arrays$ArrayItr` cannot stand in — it has no `previous`/`set`/`add` —
+    // and a real `ArrayList$ListItr` over a snapshot would drop `set()` writes
+    // silently, which is worse. Reasoned in
+    // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
     registry.register(
         c,
         "listIterator",
