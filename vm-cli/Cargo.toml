@@ -47,6 +47,9 @@ cratonvm-vm = { path = "../vm", version = "0.3.0" }
 # `tiered::dump_method_stats_to_stderr` (CRATONVM_DBG_JIT_METHOD_STATS=1)
 # without routing through cratonvm-vm.
 cratonvm-jit = { path = "../jit", version = "0.3.0" }
+# Direct dep so the pre-exit hook can dump the class-definition census
+# (`CRATONVM_DBG=define-census`) beside the other self-gated tallies.
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 # Direct dep so `main()` can expand the ten grouped `CRATONVM_*` variables into
 # the per-knob keys before anything reads one. See `cratonvm_types::flag_groups`.

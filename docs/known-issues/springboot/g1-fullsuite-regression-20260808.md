@@ -753,14 +753,17 @@ Two things deliberately left open, neither implicated in the corruption:
 ## 5b. The Tomcat G1 SIGSEGVs were this same defect — CONFIRMED 2026-08-11
 
 Re-running the exact 651-class, three-collector, 2-worker shape that found them
-on a binary carrying §3c's fix takes G1's crash column from **4 to 1**, and the
-survivor is a different class (`TestChunkedTransferEncodingWithProxy`, a HANG
-before) that passes under both other collectors in the same run. Across that
-whole G1 arm, `CRATONVM_DBG=g1-dbg-reach` reported **zero** `[g1][WALKBRK]` in
-135 processes that evacuated. Retired to
-fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md; the
-survivor has its own page,
-known-issues/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811.md.
+on a binary carrying §3c's fix takes G1's crash column from **4 to 0**. Across
+that whole G1 arm, `CRATONVM_DBG=g1-dbg-reach` reported **zero** `[g1][WALKBRK]`
+in 135 processes that evacuated. Retired to
+fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md.
+
+It read as 4 → 1 at first. The survivor,
+`TestChunkedTransferEncodingWithProxy`, turned out not to be a VM crash: it
+faulted *inside* `dbg_verify_reachable_integrity`, the verifier that same
+`g1-dbg-reach` flag enables — and the flag was set on the G1 arm only. Flag
+off, the class passes 3/3. See
+fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md.
 
 That page, while open, reported 4 of 651 Tomcat classes taking a native
 `EXCEPTION_ACCESS_VIOLATION` under `-XX:+UseG1GC` — three at the *same*

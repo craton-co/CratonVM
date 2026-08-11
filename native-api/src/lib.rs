@@ -20,6 +20,11 @@ pub mod native_ring;
 /// Receiver classes no supported JDK image declares — the measured table that
 /// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
 pub mod no_image_receiver;
+// Registrations retired as contract-1.4 shadows, one measured subsystem at a
+// time. Sibling of `no_image_receiver`: both are class/triple-scoped kind
+// decisions made centrally because they are MEASUREMENTS against a JDK image
+// that no registration site can know.
+pub mod retired_shadow;
 pub mod plain_server_socket;
 pub mod registry;
 pub mod server_socket_ports;

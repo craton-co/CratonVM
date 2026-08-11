@@ -22,7 +22,7 @@ CRATONVM_BIN=scripts/cratonvm-prefix-args.sh \
 OUTROOT=<out> apps/h2database-suite-runner/run-h2-suite.sh run --category all --count 60
 ```
 
-`scripts/cratonvm-prefix-args.sh` exists because the runner has no hook for VM
+`../../../scripts/cratonvm-prefix-args.sh` exists because the runner has no hook for VM
 flags but does take the binary path from `CRATONVM_BIN`. **Verify the policy
 actually reached the VM** — 60/60 strict logs carry the `--jdk-only` banner and
 0/60 real logs do. A run.sh that stops honouring the variable turns this into a
@@ -84,5 +84,5 @@ cd $(mktemp -d)   # H2's TestBase.BASE_TEST_DIR is "./data" and error.lock is CW
 Hibernate, Spring Boot and Tomcat. Each needs its own three-arm pass; the
 runners all resolve their binary from an environment variable
 (`CRATONVM_EXE` for Tomcat, `CV_BIN` for Hibernate), so
-`scripts/cratonvm-prefix-args.sh` drives them the same way with no runner edit.
+`../../../scripts/cratonvm-prefix-args.sh` drives them the same way with no runner edit.
 Do it on a quiet host, or the HANG column will again be about the host.

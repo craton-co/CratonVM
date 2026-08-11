@@ -4224,19 +4224,18 @@ pub(crate) fn native_classloader_define_class1(
         }
         _ => 0,
     };
-    // Optional PD at arg 5.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(5) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(5) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     // JVMS В§5.3.5 вЂ” resolve direct supertypes through the DEFINING loader before
     // linking. `define_class_full` resolves the superclass/interfaces only via the
@@ -4317,18 +4316,18 @@ pub(crate) fn native_classloader_define_class2(
         _ => 0,
     };
 
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(5) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(5) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     if let Some(Value::Object(Some(loader_obj))) = args.first() {
         preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
@@ -4408,19 +4407,18 @@ pub(crate) fn native_classloader_define_class0(
         _ => 0,
     };
 
-    // PD at arg 6.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(6) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(6) {
+        Some(Value::Object(Some(pd))) => crate::classloader::extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     // `init` (boolean) at arg 7: run <clinit> after define.
     let initialize = matches!(args.get(7), Some(Value::Int(v)) if *v != 0);

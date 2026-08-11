@@ -1,5 +1,94 @@
 # The H2 UPDATE path costs ~30-60x HotSpot's CPU per update, and ~87x over the whole class
 
+## Re-measured 2026-08-11 — read this before any older profile on this page
+
+Everything below the "Settled 2026-08-08" heading was measured on a **16-core**
+host against a **generational young/old** default collector. Both have changed.
+This host's `nproc` is now **8**, so every 8- and 25-thread arm on this page is
+oversubscribed in a way it was not when written, and the default young collector
+is now ZGC. A fresh profile is not a refinement of the old one, it is a
+different list.
+
+`H2UpdateScaleProbe 1 20000 10000`, `--Xmx 1g`, `sudo -n perf record -F 199`,
+flat self-attribution, quiet host (load 3-6), dev `92b35f1e5`:
+
+| self | symbol | on the old 1-thread list |
+| ---: | --- | --- |
+| 4.31 % | `interpreter::execute_frame_from_index` | 3.75 % |
+| 2.92 % | `dispatch_virtual::execute_invokevirtual_cached` | 2.29 % |
+| 2.62 % | `vm_exec::invoke_on_class_shared_inner` | 1.49 % |
+| 2.50 % | `__memcmp_evex_movbe` | 3.26 % |
+| **2.39 %** | `zgc::ZObjectStarts::contains` | **not on it** (different collector) |
+| 2.37 % | `VmHeap::is_object_address` | 5.80 % |
+| 1.68 % | `NativeMethodRegistry::slot_for_exact` | 1.16 % |
+| 1.47 % | `jit::validate_code_ptr` | 0.94 % |
+| 1.12 % | `jit_bridge::jit_method_calls_native_shadowed` | not on it |
+| 1.06 % | `JitCache::invalidate_for_class` | 1.60 % |
+
+**Two of this page's named targets are gone, and nobody aimed at them:**
+
+* **`Arena::free_blocks_sorted` does not appear at all**, at 1 or 4 threads,
+  against the 24.34 % self that the section below calls "the single largest
+  symbol". This workload no longer takes the arena free-list path.
+  The "What is still there: the same function, at 24 %" section is **obsolete**;
+  do not start work there.
+* **`is_object_address` is 2.37 %, not 5.80 %.** The conservative root scan is
+  still on the list and still real, but it is no longer "the clearest single
+  target on the list".
+
+`load_class_concurrent_for` is 0.87 % at 1 thread against 2.06 % at 4, so the
+2026-08-08 reclassification of it as a contention term rather than class-loading
+work is the one older conclusion the fresh profile CONFIRMS rather than replaces.
+
+The flat shape is unchanged, and so is this page's thesis: the top symbol is
+4.31 %, no cluster is a wall, and removing the entire visible list is well under
+2x against a ~10x interpreter-to-interpreter gap.
+
+### Nothing invalidates compiled code in steady state — the counter now exists to say so
+
+The old profile put `JitCache::invalidate_for_class` at 1.60 % on a
+single-threaded run long past warm-up, and this page asked the obvious question:
+*something is invalidating compiled code in steady state; find out what.*
+Nothing is.
+
+That was unanswerable because the only instrument was
+`runtime::diagnostics::classes_loaded`, which was declared, initialised, reset,
+formatted into the diagnostic report and unit-tested — and **incremented by
+nothing**, so it reported `Classes loaded: 0` on every run. A counter that never
+moves reads as a measurement. It is now served by
+`classloading::define_census`, which counts at the single choke point every
+`define_class*` entry funnels through, and `CRATONVM_DBG=define-census` dumps a
+per-name tally.
+
+Same probe, same binary, two arms:
+
+| arm | class definitions | distinct names |
+| --- | ---: | ---: |
+| setup only (`1 0 10000`) | 933 | 933 |
+| setup + 20 000 updates, 50 s of work (`1 20000 10000`) | **936** | 936 |
+
+**Twenty thousand updates cause three class definitions**, each of a distinct
+name, each defined once. `invalidate_for_class` runs on class definition and
+nowhere else, so it is a *startup* cost that a whole-run profile smears across
+the run — not steady-state churn. The question is answered and closed.
+
+The cost was real, though, and is fixed: each of those 936 calls walked all 128
+shards' method and OSR maps to conclude nothing, because almost no definition
+invalidates a CHA assumption. `JitCache` now keeps the set of class names that
+appear in some published body's `inlined_methods` and refuses before the scan
+when the name is absent — an over-approximation, so a name present only costs
+the old scan, and a name absent is a proof the scan would return 0.
+`invalidate_unloaded_class` deliberately keeps no such early-out (it also
+matches on `declaring_class_id`, which the set says nothing about), and a test
+pins that.
+
+**Priced honestly: the symbol leaves the profile, the run does not move.**
+`invalidate_for_class` goes from 1.06 % to below the 0.5 % report floor. On four
+ABBA-interleaved pairs of the full probe the CPU delta is -3.9 % mean, 3 wins
+out of 4 with one +8.4 s opposite — **not separable from zero at this n**, which
+is what a ~1 % change looks like on a workload whose run-to-run spread is 20 %.
+Quote the symbol, not the run.
+
 ## Status
 **OPEN (2026-08-02).** Successor to the retired
 `bug-h2-testmultithread-concurrent-update-timeout` write-up, which is retired
@@ -129,8 +218,16 @@ factor.
 
 ### Refreshed profile — flat, and MVStore's
 
-`perf` is unavailable on this host (`perf_event_paranoid=4`), so the page's
-original method cannot be repeated. The in-VM sampler is the supported
+**That first sentence is wrong, and a later section of this same page quietly
+contradicts it** by running `sudo -n perf record` — see the 2026-08-11
+re-measurement at the top. `perf_event_paranoid` is 4 AND `sudo` is passwordless
+here, so `sudo -n perf record` works; do not change the sysctl, it is shared.
+The in-VM sampler is the right tool for a Java-frame question and the wrong one
+for "which Rust function is burning CPU". The sampler profile below is still
+valid for what it measured — H2's own bytecode — and is kept for that.
+
+~~`perf` is unavailable on this host (`perf_event_paranoid=4`), so the page's
+original method cannot be repeated.~~ The in-VM sampler is the supported
 substitute and its own flag documentation says to pair it with `--nojit`, since
 JIT frames never reach the dispatch loop. `--nojit --stack-sample-ms 20`,
 4 threads x 3000 updates, 7314 samples, aggregated on the DEEPEST frame per
@@ -172,6 +269,11 @@ Worth recording for whoever picks it up: `runtime::diagnostics::classes_loaded`
 is declared, reset, formatted and unit-tested, and is **never incremented by
 the class loader**. A counter that is never incremented reads as a confident
 zero, which is why this item survived unmeasured for so long.
+**FIXED 2026-08-11** — `classloading::define_census` counts at the single choke
+point every `define_class*` funnels through, `summary().classes_loaded` reads it
+instead of the dead cell, and `CRATONVM_DBG=define-census` names the classes.
+Its first answer is in the re-measurement at the top: 933 definitions for setup,
+936 with 20 000 updates on top.
 
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
@@ -300,7 +402,13 @@ new ones asserting the radix branch and the comparison branch both agree with
 the old `sort_by_key` (including on duplicate keys, which free blocks never
 have, so both branches are stable).
 
-### What is still there: the same function, at 24 %
+### What is still there: the same function, at 24 % — OBSOLETE 2026-08-11
+
+**Do not start here.** `Arena::free_blocks_sorted` does not appear anywhere in a
+fresh profile at 1 or 4 threads: this workload no longer takes the arena
+free-list path at all (the default young collector changed). Kept for the
+argument, which is still a good one if that path is ever hot again. See the
+re-measurement at the top of this page.
 
 Re-profiled with the fix, `Arena::free_blocks_sorted` is **still the single
 largest symbol at 24.34 % self** — the sort is gone but the *materialisation*
@@ -513,6 +621,11 @@ and so are the next targets:
 
 * **`load_class_concurrent` at 1.4 % in steady state**, hundreds of seconds after
   warm-up. Nothing should be resolving classes then; find out what is.
+  **ANSWERED 2026-08-11: almost nothing is.** 20 000 updates over 50 s produce
+  three class definitions. The 1.4 % is contention on the `ClassManager` read
+  lock in the invoke fast path — which the 2026-08-07 single-threaded profile
+  already argued from the 1.4 % ÷ 0.64 % split, and the definition census now
+  confirms directly rather than by inference. The work item is the lock.
 * **the conservative root scan** is per-thread-stack work per collection, so it
   grows with (threads × collections). Every young collection in this workload
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,

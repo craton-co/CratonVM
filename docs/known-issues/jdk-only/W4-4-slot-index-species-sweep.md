@@ -51,8 +51,16 @@ fields `_f0.._fN`, so a by-name resolve misses there and falls through.
 > native" comes *"did the registrar that registers it ever run in this mode"*,
 > and after it comes *"does this mode refuse the registration"*. The full
 > three-gate procedure, the per-path table, and the re-audit of every site this
-> campaign called dead are in
-> [*The true native-vs-bytecode precedence rules*](true-native-precedence-rules-and-the-dead-site-re-audit.md).
+> campaign called dead are in the retired
+> `true-native-precedence-rules-and-the-dead-site-re-audit` write-up (RETIRED
+> 2026-08-11: every prediction in it was executed, and its five snippets are now
+> the scheduled vectors `RJdkStampedStamps`, `RJdkLookupIn`, `RJdkDefineClass`
+> and `RJdkX509Intercept`). **Row 7 of its re-audit is this record's
+> `X509Certificate` row, and it is now measured**: sixteen of the seventeen
+> registered triples are declared by `sun.security.x509.X509CertImpl` itself, so
+> its own bytecode wins; the seventeenth, `getType()`, IS intercepted through
+> the superclass walk and answers the constant `"X.509"`, which is what
+> `Certificate.getType()` returns for every X.509 certificate.
 > Two clauses of the correction above are load-bearing and now confirmed against
 > a third path each lane missed:
 >

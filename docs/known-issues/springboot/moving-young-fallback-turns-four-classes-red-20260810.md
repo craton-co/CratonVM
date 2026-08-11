@@ -451,6 +451,13 @@ every result on this page:
   frames essentially always, and moving-young is unreachable *regardless* of any
   other obligation being repaired.
 
+> **Superseded for two of the three classes, 2026-08-11.** `cross-thread-jit-peer`
+> is no longer in every real cycle: it is in 103/103 of Quartz's and **0** of
+> Log4J2's (419) and Integration's (931). Multithreadedness is therefore not the
+> universal discriminator this bullet makes it — a Spring class can be as
+> multithreaded as any other and still have no cross-thread obligation on the
+> cycles that fall back. See the corrected pricing above.
+
 So the honest framing is not "there is a bug making these four classes fall
 back". It is that **moving-young does not currently survive contact with a
 multithreaded workload**, and the four classes are just where that showed up as
@@ -469,6 +476,65 @@ before being built:
    refusal into a bounded cost.
 3. **Keep threads out of JIT frames while blocked** — narrows the window without
    closing it.
+
+### CORRECTED 2026-08-11: the indirect-call repair now converts 100% of Log4J2, and the binding obligation is PER CLASS
+
+**Everything in the section below was true when measured and is false now for
+two of the three classes.** Re-measured on dev `892ab4f40` with
+`CRATONVM_DBG=gc-fallback-reasons` under `-XX:+UseGenerationalGC`, one class at
+a time, tallying the full per-cycle obligation SET (not the first-wins label):
+
+| Class | cycles | obligation present in EVERY cycle | attributable to innermost-rbp |
+|---|---:|---|---:|
+| `Log4J2LoggingSystemTests` | 419 | `innermost-rbp` + `compiled-frame-band-unbounded`, **and nothing else** | **419 — 100%** |
+| `IntegrationAutoConfigurationTests` | 931 | `unregistered-jit-frame-on-stack` | 0 |
+| `QuartzEndpointWebIntegrationTests` | 103 | `cross-thread-jit-peer` **and** `xt-helper-window-conservative-scan` | 0 |
+
+Log4J2 has exactly ONE distinct obligation set across all 419 cycles. The
+`xt-helper-window-conservative-scan` that made this 0% below is **gone** from
+its cycles, and with it the reason this repair was declined. The same
+measurement that priced the repair at nothing now prices it at everything —
+for that class.
+
+So the section below is right about Quartz and wrong about Log4J2, and the
+generalisation it draws ("the discriminator is peer threads, which every one of
+the four affected classes has") no longer holds: on this commit **each class
+has its own stable binding obligation**, which also revises "the reason is not
+a property of the class" under "Mechanism" above.
+
+Consequences for whoever picks this up — three separate repairs, not one:
+
+* **Log4J2 → publish the callee's identity at frame push.** Converts 419/419.
+  This is the repair "Mechanism" already specifies. Design obstacle found while
+  scoping it: the prologue must embed the identity as an immediate, and the
+  `CompiledMethod` does not exist until after codegen, so the id has to be
+  RESERVED before compilation and back-filled. That reaches the compile
+  pipeline, not just the five `emit_mov_tls_disp32_rbp` sites
+  (`ir_lower::emit_frame_record`, `ir_lower::emit_post_call_frame_record`,
+  `x64::frames::emit_prologue`, `x64::frames::emit_post_call_rbp_republish`,
+  `runtime_lowering::emit_post_call_frame_republish`). A dense u32 id stored as
+  `mov dword <seg>:[disp2], imm32` needs no scratch register, which is what the
+  RAX-preserving republish paths require.
+* **Integration → a frame walk.** `unregistered-jit-frame-on-stack` is in
+  931/931 cycles; 322 of them carry NOTHING else, so a correct A5 answer alone
+  converts 35%, and with the Log4J2 repair 464/931 = 50%. A byte-level filter
+  cannot get there: the hits are genuine return addresses that have already
+  returned, sitting in the uninitialised part of a live frame, which is why
+  `is_plausible_return_pc` did not move the count.
+* **Quartz → the drain, not the compaction.** `xt-helper-window` sets
+  `unrewritable_peer_state`, which clears `selective_on` — the non-moving
+  sweep's ONLY young->old drain. Quartz is therefore not merely failing to
+  compact; it has no drain at all, which is `HIB-GCOVERHEAD-HALFFULL.1` reached
+  through a different door. Narrowing that gate needs conservative pinning to
+  accept INTERIOR pointers first (`is_object_address` accepts only exact object
+  starts, and a suspended peer's register may hold a derived pointer). There is
+  no address->containing-object lookup in `gc/` today — the "object grid" in
+  `arena.rs` is 8-byte alignment, not a start bitmap — so this wants a young
+  object-start bitmap before it is safe.
+
+None of the three is a small change, and the promotion gate in particular has a
+documented OOM-regression history. Price each against the table above rather
+than against the (now stale) 0% below.
 
 ### Measured: repairing the indirect-call path would convert NOTHING in a real workload
 

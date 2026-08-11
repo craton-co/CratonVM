@@ -21,7 +21,7 @@ use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
 use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::narrow_oop;
-use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectHeader, ObjectKind, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
 
 unsafe extern "C" fn noop_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
@@ -115,10 +115,21 @@ fn make_byte_array(data: &[u8]) -> FakeObj {
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + data.len());
     let base = obj.base();
     unsafe {
-        *base.add(4) = ObjectKind::Array as u8;
-        *base.add(5) = ArrayElementType::Byte as u8;
-        let len_le = (data.len() as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+        // Through the constructor, not at literal offsets: the 2026-08-07
+        // `header-16` shrink moved `shape` to 4..8 (it IS the array length) and
+        // packed `kind`/`element_type` into one byte of the mark word, so the
+        // old offset-4/5/12 writes set the length to `ObjectKind::Array as u8`
+        // == 1 and left the element type unset.
+        std::ptr::write(
+            base as *mut ObjectHeader,
+            ObjectHeader::new(
+                ClassId::new(0),
+                ObjectKind::Array,
+                ArrayElementType::Byte,
+                data.len() as u32, // Cast: fixture arrays are small
+                0,
+            ),
+        );
         std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), data.len());
     }
     obj

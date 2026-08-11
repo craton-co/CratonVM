@@ -79,13 +79,20 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RClassUnloadSweep"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RClassUnloadSweep"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
 # *expected* to fail where --real-jdk passes, so these must not move the green
 # baseline of a plain `bash regression-suite/run.sh`.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure"
+#
+# RJdkStampedStamps / RJdkLookupIn / RJdkDefineClass landed 2026-08-11 as the
+# executable form of the three predictions in the native-precedence re-audit
+# that no existing vector covered. Each asks a question only an UNREGISTERED
+# decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
+# a defined class read back through java.lang.Class — so a registered surface
+# agreeing with itself cannot make them pass.
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
