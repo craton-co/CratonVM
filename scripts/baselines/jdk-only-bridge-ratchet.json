@@ -2,31 +2,31 @@
   "jdk": {
     "25/linux": {
       "bridge_shadows_bytecode": 4555,
-      "bridge_without_acc_native": 9026,
+      "bridge_without_acc_native": 9032,
       "jdk_version": "25.0.4",
       "mode": "compatible",
-      "note": "Restores 65 registrations dc55e8057 deleted: 49 Bridge here, 16 SyntheticStub on receivers no image declares. Its dead-sweep scored them method-nowhere (class on the image, method not), which is also exactly what CratonVM's own additions to a real class look like: a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists precisely because the JDK declares only the BiFunction form. 24 tests across two crates named the triples they pin and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36, same six pre-existing failures. scripts/jdk-only-dead-sweep.py --pinned now walks a DIRECTORY: pins 38 -> 2488, and all eight restored triples leave the deletion list. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md",
+      "note": "Re-frozen on the merge with 892ab4f40. Two contributions, and they are not the same change: this branch restores 65 registrations dc55e8057 deleted (49 Bridge, 16 SyntheticStub on no-image receivers) taking the count 8977 -> 9026, and merging origin/dev's 892ab4f40 adds 6 more (native-builtins/src/lang_reflect.rs) taking it to 9032. The +6 is dev's and dev is red on its own baseline without this branch: the same tree measures 9026 before the merge and 9032 after, with nothing else differing. On the restores: the dead-sweep scored them method-nowhere, which is also what CratonVM's own additions to a real class look like -- a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists because the JDK declares only the BiFunction form. 24 tests across two crates pinned them and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md",
       "observed": {
         "bridge": {
           "abstract_method": 1327,
           "acc_native": 780,
           "class_absent": 872,
-          "class_present_method_undeclared": 2272,
-          "rows": 9806,
+          "class_present_method_undeclared": 2278,
+          "rows": 9812,
           "shadows_bytecode": 4555,
-          "without_acc_native": 9026
+          "without_acc_native": 9032
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 9806,
+          "bridge": 9812,
           "intrinsic": 663,
           "synthetic-stub": 1158
         },
         "schema": 1,
-        "total_rows": 11627
+        "total_rows": 11633
       },
       "os": "linux",
       "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"

@@ -7,9 +7,9 @@
 # jdk_version: 25.0.4
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11627
+# rows: 11633
 # unchosen: 0
-# note: Restores 65 registrations dc55e8057 deleted: 49 Bridge here, 16 SyntheticStub on receivers no image declares. Its dead-sweep scored them method-nowhere (class on the image, method not), which is also exactly what CratonVM's own additions to a real class look like: a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists precisely because the JDK declares only the BiFunction form. 24 tests across two crates named the triples they pin and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36, same six pre-existing failures. scripts/jdk-only-dead-sweep.py --pinned now walks a DIRECTORY: pins 38 -> 2488, and all eight restored triples leave the deletion list. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md
+# note: Re-frozen on the merge with 892ab4f40. Two contributions, and they are not the same change: this branch restores 65 registrations dc55e8057 deleted (49 Bridge, 16 SyntheticStub on no-image receivers) taking the count 8977 -> 9026, and merging origin/dev's 892ab4f40 adds 6 more (native-builtins/src/lang_reflect.rs) taking it to 9032. The +6 is dev's and dev is red on its own baseline without this branch: the same tree measures 9026 before the merge and 9032 after, with nothing else differing. On the restores: the dead-sweep scored them method-nowhere, which is also what CratonVM's own additions to a real class look like -- a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists because the JDK declares only the BiFunction form. 24 tests across two crates pinned them and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -4215,7 +4215,9 @@ java/lang/reflect/Field	setInt	(Ljava/lang/Object;I)V	0	bridge	0	1
 java/lang/reflect/Field	setLong	(Ljava/lang/Object;J)V	0	bridge	0	1
 java/lang/reflect/Field	setShort	(Ljava/lang/Object;S)V	0	bridge	0	1
 java/lang/reflect/Field	trySetAccessible	()Z	0	bridge	0	1
+java/lang/reflect/GenericArrayType	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/GenericArrayType	getGenericComponentType	()Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/reflect/GenericArrayType	hashCode	()I	0	bridge	0	1
 java/lang/reflect/InaccessibleObjectException	<init>	()V	0	bridge	0	1
 java/lang/reflect/InaccessibleObjectException	<init>	()V	1	bridge	0	1
 java/lang/reflect/InaccessibleObjectException	<init>	(Ljava/lang/String;)V	0	bridge	0	1
@@ -4301,9 +4303,11 @@ java/lang/reflect/Parameter	getAnnotatedType	()Ljava/lang/reflect/AnnotatedType;
 java/lang/reflect/Parameter	isImplicit	()Z	0	bridge	0	1
 java/lang/reflect/Parameter	isNamePresent	()Z	0	bridge	0	1
 java/lang/reflect/Parameter	isSynthetic	()Z	0	bridge	0	1
+java/lang/reflect/ParameterizedType	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/ParameterizedType	getActualTypeArguments	()[Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/ParameterizedType	getOwnerType	()Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/ParameterizedType	getRawType	()Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/reflect/ParameterizedType	hashCode	()I	0	bridge	0	1
 java/lang/reflect/Proxy	getInvocationHandler	(Ljava/lang/Object;)Ljava/lang/reflect/InvocationHandler;	0	bridge	0	1
 java/lang/reflect/Proxy	getProxyClass	(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/Class;	0	bridge	0	1
 java/lang/reflect/Proxy	isProxyClass	(Ljava/lang/Class;)Z	0	bridge	0	1
@@ -4332,8 +4336,10 @@ java/lang/reflect/TypeVariable	getName	()Ljava/lang/String;	0	bridge	0	1
 java/lang/reflect/TypeVariable	getTypeName	()Ljava/lang/String;	0	bridge	0	1
 java/lang/reflect/TypeVariable	hashCode	()I	0	bridge	0	1
 java/lang/reflect/TypeVariable	toString	()Ljava/lang/String;	0	bridge	0	1
+java/lang/reflect/WildcardType	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
 java/lang/reflect/WildcardType	getLowerBounds	()[Ljava/lang/reflect/Type;	0	bridge	0	1
 java/lang/reflect/WildcardType	getUpperBounds	()[Ljava/lang/reflect/Type;	0	bridge	0	1
+java/lang/reflect/WildcardType	hashCode	()I	0	bridge	0	1
 java/math/BigDecimal	<init>	(D)V	0	intrinsic	0	1
 java/math/BigDecimal	<init>	(Ljava/math/BigInteger;)V	0	intrinsic	0	1
 java/math/BigDecimal	add	(Ljava/math/BigDecimal;)Ljava/math/BigDecimal;	0	intrinsic	0	1
