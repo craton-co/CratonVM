@@ -6951,6 +6951,53 @@ fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> 
 // SAFETY: Caller must ensure vm_ptr (via `vm`) is a valid SharedVm reference and obj_ref is
 // derived from a live heap object. Only short-lived class_manager read/write locks are held;
 // the heap is never reborrowed. The null case must be handled by the caller before entry.
+/// `CRATONVM_DBG=typecheck-filter=<substring>` — name the branch that decided a
+/// compiled `checkcast`/`instanceof` whose TARGET class name contains the
+/// substring.
+///
+/// A compiled type check leaves no other trace. By the time anything observable
+/// happens the answer has already collapsed into a taken/not-taken branch, so a
+/// disagreement with the interpreter surfaces only as a wrong result far
+/// downstream. `CRATONVM_JIT_DENY=<Class>.<method>` says WHICH compiled body is
+/// wrong; this says WHY, by printing the ids actually compared.
+///
+/// Prints the RECEIVER's class id and name beside the target so a two-ids-one-name
+/// split is visible directly, which is the failure this was written to catch.
+fn jit_typecheck_trace(
+    vm: &SharedVm,
+    obj_class_id: ClassId,
+    class_name: &str,
+    lenient: bool,
+    stage: &str,
+    target: Option<ClassId>,
+) {
+    let Some(filter) = cratonvm_types::flags::loader_flags().dbg_typecheck_filter.as_deref() else {
+        return;
+    };
+    if !class_name.contains(filter) {
+        return;
+    }
+    let cm = vm.classes.class_manager.read();
+    let obj_name = cm
+        .get_class(obj_class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let target_desc = match target {
+        Some(t) => format!(
+            "{} (id={})",
+            cm.get_class(t)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            t.as_u32()
+        ),
+        None => "<none>".to_string(),
+    };
+    eprintln!(
+        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={}) resolved_target={target_desc}",
+        obj_class_id.as_u32()
+    );
+}
+
 unsafe fn jit_typecheck_resolve(
     vm: &SharedVm,
     obj_class_id: ClassId,
@@ -7053,6 +7100,7 @@ unsafe fn jit_typecheck_resolve(
     // does not has its own carve-outs at the bottom of this function
     // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
     // comparison cannot reproduce.
+    jit_typecheck_trace(vm, obj_class_id, class_name, lenient, "enter", None);
     if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
         .filter(|_| !recv_is_array)
     {
@@ -7062,6 +7110,18 @@ unsafe fn jit_typecheck_resolve(
             cm.get_class(target_class_id)
                 .is_some_and(|c| &*c.name == class_name)
         };
+        jit_typecheck_trace(
+            vm,
+            obj_class_id,
+            class_name,
+            lenient,
+            if names_this_site {
+                "site-recorded"
+            } else {
+                "site-recorded-names-OTHER-class"
+            },
+            Some(target_class_id),
+        );
         if names_this_site {
             if obj_class_id == target_class_id {
                 return true;
@@ -7089,6 +7149,14 @@ unsafe fn jit_typecheck_resolve(
             ) {
                 return true;
             }
+            jit_typecheck_trace(
+                vm,
+                obj_class_id,
+                class_name,
+                lenient,
+                "REFUSED-by-recorded-site",
+                Some(target_class_id),
+            );
             return false;
         }
     }
@@ -7129,6 +7197,14 @@ unsafe fn jit_typecheck_resolve(
         }
         resolved
     };
+    jit_typecheck_trace(
+        vm,
+        obj_class_id,
+        class_name,
+        lenient,
+        "by-name-fallback",
+        target_class_id_opt,
+    );
     if let Some(target_class_id) = target_class_id_opt {
         if obj_class_id == target_class_id {
             return true;

@@ -337,6 +337,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dupclass", on_key: Some("CRATONVM_DBG_DUPCLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass-bt", on_key: Some("CRATONVM_DBG_DUPCLASS_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass-filter", on_key: Some("CRATONVM_DBG_DUPCLASS_FILTER"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "typecheck-filter", on_key: Some("CRATONVM_DBG_TYPECHECK_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-methods", on_key: Some("CRATONVM_DBG_DUPX_METHODS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ecwatch", on_key: Some("CRATONVM_DBG_ECWATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ecwatch-native", on_key: Some("CRATONVM_DBG_ECWATCH_NATIVE"), off_key: None, off_word: None },
