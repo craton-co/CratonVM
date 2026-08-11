@@ -4035,19 +4035,47 @@ fn lk_write_allowed_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i3
 /// and — compounding with the old `Lookup.in` default — turned that 0 into
 /// FULL_POWER on the way out of `in()`.
 fn lk_read_allowed_modes(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    lk_read_allowed_modes_opt(ctx, this).unwrap_or(0)
+}
+
+/// [`lk_read_allowed_modes`], with "0" and "could not read" kept APART.
+///
+/// This is the distinction the whole access-control valve rests on.
+/// `lk_read_allowed_modes` collapses them to `0`, so every enforcement site had
+/// to treat `0` as "unknown, stay permissive" — and that is correct for a
+/// Lookup whose layout the VM does not model, but a genuine zero-mode Lookup is
+/// one the JDK refuses EVERYTHING, public members included:
+///
+/// ```text
+///   MethodHandles.lookup().dropLookupMode(PUBLIC).lookupModes()  ->  0
+///   …that Lookup .findStatic(<a public method of a public class>)
+///                                        ->  IllegalAccessException
+/// ```
+///
+/// Measured on OpenJDK 25.0.3. CratonVM admitted it, because the two zeroes
+/// were the same value. `Some(0)` is the JDK's zero and is refused; `None` is
+/// "this VM could not read the field" and stays permissive, which keeps the
+/// one failure mode a new refusal path must not have — turning every Lookup
+/// shape the VM does not model into an `IllegalAccessException`.
+///
+/// The two `None` arms are exactly the fall-throughs: a resolvable
+/// `allowedModes` slot that reads back as something other than an `Int`, and an
+/// object with no such field whose synthetic slot is likewise not an `Int`.
+/// Every other path returns a value the VM actually read.
+fn lk_read_allowed_modes_opt(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
     if let Some(slot) = lk_allowed_modes_slot(ctx, this) {
         if let Value::Int(m) = ctx.get_field(this, slot) {
-            return m;
+            return Some(m);
         }
         if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
-            return m;
+            return Some(m);
         }
-        return 0;
+        return None;
     }
     if let Value::Int(m) = ctx.get_field(this, LK_SYNTHETIC_ALLOWED_MODES) {
-        return m;
+        return Some(m);
     }
-    0
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4160,14 +4188,33 @@ fn lk_enforce_find_access(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(()),
     };
-    let modes = lk_read_allowed_modes(ctx, this);
-    if modes == 0 || (modes & LK_MODE_PRIVATE) != 0 {
+    // `None` is "could not read the modes" and stays permissive; `Some(0)` is
+    // the JDK's zero-mode Lookup, which is refused EVERY member including a
+    // public one. See `lk_read_allowed_modes_opt` for why the two must not be
+    // the same value here.
+    let modes = match lk_read_allowed_modes_opt(ctx, this) {
+        None => return Ok(()),
+        Some(m) => m,
+    };
+    if (modes & LK_MODE_PRIVATE) != 0 {
         return Ok(());
     }
     let target = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(()),
     };
+    if modes == 0 {
+        // Refuse before the member walk: a zero-mode Lookup's answer does not
+        // depend on the member's modifiers, and the walk allocates.
+        let owner = mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no access: {} from Lookup with modes 0x0000 (no lookup modes remain)",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
     let name: String = match literal {
         Some(n) => n.to_string(),
         None => match args.get(name_idx) {
@@ -4291,19 +4338,19 @@ const LK_MODE_PRIVATE_AND_MODULE: i32 = LK_MODE_PRIVATE | LK_MODE_MODULE;
 ///   short-circuit in the same place.
 /// * primitive / array target — `IllegalArgumentException`, JDK wording.
 /// * `(modes & PRIVATE|MODULE) != PRIVATE|MODULE` — `IllegalAccessException`,
-///   **except** when `modes == 0`.
+///   **except** when the mode word could not be read at all.
 ///
-/// `modes == 0` is the house valve, the same one [`lk_enforce_find_access`]
-/// takes and for the same reason: `lk_read_allowed_modes` answers 0 both for a
-/// Lookup that genuinely has no modes AND for one whose modes we could not
-/// read (unresolvable class, fabricated stand-in, a layout we do not model).
-/// The JDK refuses a true 0; refusing our "cannot tell" 0 would turn every
-/// Lookup CratonVM does not model into an `IllegalAccessException`, which is
-/// the one failure mode a new exception path on this method must not have.
-/// So the refusal fires only on a POSITIVELY read, nonzero, weak mode word —
-/// which in this VM means exactly `publicLookup()` (0x20), an explicit
-/// `dropLookupMode`, and a narrowing `Lookup.in` (1/17/25). All three are
-/// cases HotSpot refuses too.
+/// The valve is "could not read", not "reads zero", and the two used to be the
+/// same value: [`lk_read_allowed_modes`] answered 0 both for a Lookup that
+/// genuinely has no modes AND for one whose layout the VM does not model.
+/// Refusing the "cannot tell" 0 would turn every unmodelled Lookup into an
+/// `IllegalAccessException`, which is the one failure mode a new exception path
+/// on this method must not have; admitting the genuine 0 let
+/// `lookup().dropLookupMode(PUBLIC)` through, which HotSpot refuses.
+/// [`lk_read_allowed_modes_opt`] separates them, so the refusal now fires on a
+/// POSITIVELY read weak mode word — `publicLookup()` (0x20), an explicit
+/// `dropLookupMode` (including the 0 case), and a narrowing `Lookup.in`
+/// (0/1/17/25). All of them are cases HotSpot refuses too.
 ///
 /// **Not enforced** (one-directional — can only admit what HotSpot refuses,
 /// never refuse what HotSpot admits): the module `canRead`/`isOpen` pair, and
@@ -4329,7 +4376,10 @@ fn pli_enforce(
             .into());
         }
     };
-    let modes = lk_read_allowed_modes(ctx, caller_ref);
+    // `None` (unreadable) keeps the permissive valve; `Some(0)` is a real
+    // zero-mode Lookup and is refused. See `lk_read_allowed_modes_opt`.
+    let read_modes = lk_read_allowed_modes_opt(ctx, caller_ref);
+    let modes = read_modes.unwrap_or(0);
     // (2) TRUSTED short-circuits the whole method, primitive/array included.
     if modes == -1 {
         return Ok(());
@@ -4376,7 +4426,7 @@ fn pli_enforce(
         }
     }
     // (5) the mode gate, with the `modes == 0` valve documented above.
-    if modes != 0 && (modes & LK_MODE_PRIVATE_AND_MODULE) != LK_MODE_PRIVATE_AND_MODULE {
+    if read_modes.is_some() && (modes & LK_MODE_PRIVATE_AND_MODULE) != LK_MODE_PRIVATE_AND_MODULE {
         return Err(RuntimeError::IllegalAccessException {
             message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
         }
