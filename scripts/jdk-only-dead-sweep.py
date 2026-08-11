@@ -237,13 +237,73 @@ def main(argv):
     # `StampedLock.isLocked()` is. A contract test pinning the triple is the
     # statement of intent; the census cannot see it, and deleting such a row
     # breaks the test that exists to say so.
+    #
+    # `--pinned` takes a FILE OR A DIRECTORY, and pointing it at one file is how
+    # 179 registrations were deleted on 2026-08-10 with 24 tests pinning them.
+    # `registry_contracts.rs` is not the only place the tree states this intent:
+    # `.find(class, method, descriptor)` inside an `assert!` is the idiom, and it
+    # appears in `preconditions.rs`, `shared_secrets_bridge.rs`,
+    # `file_channel.rs`, `deprecated_verify.rs`, `http_client.rs`,
+    # `inet_address.rs`, `jca/provider_chain.rs` and `native-io/src/lib.rs` among
+    # others. Given a directory this walks every `.rs` under it.
+    #
+    # Two literal shapes are read, because the tree uses both:
+    #   ("class", "method", "descriptor")           -- tuple tables
+    #   .find(class_or_binding, "method", "desc")   -- direct assertions
+    # `const`/`let` string bindings are resolved within the same file, which is
+    # what `let fci = "sun/nio/ch/FileChannelImpl";` needs.
+    #
+    # A pin is a CLAIM, not proof. `file_channel.rs` pinned an
+    # `…ZZZLjava/lang/Object;` spelling of `FileChannelImpl.open` that no JDK
+    # declares, so the pin and the registration agreed with each other and with
+    # nothing else, and JDK 21 went uncovered for as long as both stood. Pins
+    # keep a row off the deletion list; they do not make it right.
     pinned = set()
     if args.pinned:
+        import os as _os
         import re as _re
-        src = open(args.pinned, encoding="utf-8").read()
-        consts = dict(_re.findall(r'const (\w+): &str = "([^"]+)"', src))
-        for c, m, d in _re.findall(r'\((\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)"\)', src):
-            pinned.add((consts.get(c, c.strip('"')), m, d))
+        if _os.path.isdir(args.pinned):
+            paths = [_os.path.join(root, f)
+                     for root, _dirs, files in _os.walk(args.pinned)
+                     for f in files if f.endswith(".rs")]
+        else:
+            paths = [args.pinned]
+        # The trailing `,?` is not cosmetic: rustfmt breaks a three-element
+        # tuple across four lines and leaves a comma before the `)`, which is
+        # how `shared_secrets_bridge.rs`'s 15-owner table is written. Without it
+        # this parser read 38 pins where the tree states 1,775.
+        tuple_re = _re.compile(r'\(\s*(\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)",?\s*\)')
+        find_re = _re.compile(r'\.find\(\s*(\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)",?\s*\)')
+        # The other shape a pin takes: a table of (method, descriptor) PAIRS
+        # looped over a class named once, as a literal, in the `.find` itself —
+        # `preconditions.rs` and `native-io/src/lib.rs` both do this. The class
+        # is recoverable, the pairs are, and nothing else in these files looks
+        # like a `("name", "(descriptor)")` tuple, so the pairs are attributed
+        # to every literal class the file probes. Over-pinning is the safe
+        # direction: a pin only keeps a row OFF the deletion list.
+        loopfind_re = _re.compile(r'\.find\(\s*"([^"]+/[^"]+)",\s*\w+,\s*\w+\s*\)')
+        pair_re = _re.compile(r'\(\s*"([A-Za-z_$<][\w$<>]*)",\s*"(\([^"]*)"\s*,?\s*\)')
+        bind_re = _re.compile(r'(?:const|let)\s+(\w+)(?:\s*:\s*&\s*\'?\w*\s*str)?\s*=\s*"([^"]+)"')
+        for path in paths:
+            try:
+                src = open(path, encoding="utf-8").read()
+            except OSError:
+                continue
+            binds = dict(bind_re.findall(src))
+            for rx in (tuple_re, find_re):
+                for c, m, d in rx.findall(src):
+                    cls = binds.get(c, c.strip('"'))
+                    # Require a class-shaped name and a descriptor-shaped
+                    # descriptor. A bare identifier the file never bound is a
+                    # local whose value is unknowable here, and guessing would
+                    # pin an arbitrary row.
+                    if "/" in cls and d.startswith("("):
+                        pinned.add((cls, m, d))
+            for cls in set(loopfind_re.findall(src)):
+                for m, d in pair_re.findall(src):
+                    pinned.add((cls, m, d))
+        print("pinned:     %d triples from %d file(s) under %s"
+              % (len(pinned), len(paths), args.pinned))
 
     absent, nowhere, live, gated = [], [], [], []
     for i in range(n):
