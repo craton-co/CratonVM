@@ -6216,7 +6216,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 _ => 0,
             };
             let values = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, values);
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -6263,7 +6263,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_collect_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
@@ -6315,7 +6315,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_spread_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
@@ -6854,6 +6854,81 @@ const MH_NAME: usize = MH_BASE + 1;
 const MH_DESC: usize = MH_BASE + 2;
 const MH_KIND: usize = MH_BASE + 3;
 const MH_BOUND: usize = MH_BASE + 4;
+
+/// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
+/// points at.
+///
+/// Ten of them exist (`insert`, `collect`, `collect_args`, `spread`, `fold`,
+/// `filter`, `retfilter`, `catch`, `permute`, `guard`) and not one is a
+/// stand-in for anything. Each is a 2- or 3-slot tuple holding the state one
+/// `MethodHandles` combinator captured — the target handle, a filter/guard
+/// handle or `MethodHandle[]`, and an `int` position or count — so the matching
+/// `MH_KIND_*` arm of `mh_dispatch` can apply the combinator at invoke time.
+/// No native is registered on any of these names, no bytecode ever names one,
+/// and no entry in the JDK 25 module image declares one (checked with `javap`
+/// and against the full `jimage list`, 2026-08-11).
+///
+/// # Why this is not `try_alloc_concurrent_synthetic`
+///
+/// That funnel is the **compatibility stand-in** door: it asks
+/// `try_ensure_synthetic_class`, which stamps `ClassOrigin::CompatibilityStub`,
+/// and a stand-in is the one thing `--jdk-only` forbids. Every carrier site
+/// used it, so a strict run recorded ten `compatibility-class-requested`
+/// violations reading *"VM-requested stand-in: ensure_synthetic_class called
+/// with no class file on any classpath entry"* and then threw
+/// `NoClassDefFoundError: __mh_insert_wrapper__` out of
+/// `MethodHandles.insertArguments`. The `NoClassDefFoundError` is only the
+/// FIRST carrier the workload reaches, never the only one: a probe that reaches
+/// each combinator independently, catching per step, named all ten on one run
+/// (2026-08-11) while `dropArguments` and `asVarargsCollector` — the two whose
+/// state is a single reference and which therefore need no carrier at all —
+/// passed.
+///
+/// The classification was simply wrong, and the census says so in its own
+/// `reason` string: there is no class file for these names on any classpath
+/// because there is no class. Contract §1 item 6 makes a class the VM creates
+/// without any class file legitimate in **both** modes, and
+/// `ensure_vm_internal_class` is its door — the same one
+/// `vm_exec::heap_alloc_object` takes for `cratonvm/synthetic/AnonymousObject$N`
+/// on word-for-word this reasoning ("a VM bookkeeping type, not a compatibility
+/// substitution"). That door is demonstrably open in strict mode rather than
+/// merely declared to be: a `--jdk-only` run of the shipped binary under
+/// `CRATONVM_DBG_ANONALLOC=1` minted 16 `AnonymousObject$N` and its census
+/// recorded a violation for none of them.
+///
+/// This is not a way around the policy. The question the trait declaration
+/// poses is whether the JVM specification says a class file must exist for the
+/// name; for a carrier CratonVM invented to hold its own combinator state, it
+/// does not.
+///
+/// # What each mode sees
+///
+/// * `JdkOnly` — the refusal disappears and the ten violations leave the
+///   census. This is the whole change.
+/// * `Compatible` — unchanged; that mode fabricates through either door. The
+///   two second-order differences both run the safe way: `fabricate_class`
+///   stops running a full-classpath rescan per carrier looking for real bytes
+///   that cannot exist, and the carriers stop being counted against a
+///   zero-stub census they were never evidence for.
+///
+/// Infallible because `ensure_vm_internal_class` is — the door that never
+/// refuses is the point — so the call sites drop the `?` they carried for a
+/// refusal that was never theirs to propagate.
+#[track_caller]
+fn alloc_mh_carrier(ctx: &mut dyn NativeContext, name: &str, num_fields: usize) -> ObjectRef {
+    let cid = ctx.ensure_vm_internal_class(name, num_fields);
+    // The width clamp is `try_alloc_concurrent_synthetic`'s, kept verbatim: if
+    // the resolved class declares MORE slots than this site asks for,
+    // allocating the smaller number leaves every carrier write past the
+    // requested width silently discarded. The carriers have no
+    // `synthetic_stub_fields` arm, so the class declares 0 and `max` is the
+    // caller's own number — the same arithmetic the old funnel performed for
+    // them, kept rather than simplified away because the day someone adds that
+    // arm is the day dropping it becomes a truncating write.
+    let n = num_fields.max(ctx.class_num_total_fields(cid));
+    ctx.try_alloc_object_gc_safe(cid, n)
+        .unwrap_or_else(|| ctx.alloc_object(cid, n))
+}
 
 /// Returns true if a method descriptor has exactly two parameters.
 /// Used to distinguish instance setters "(Lowner;value)V" (2 params)
@@ -7822,7 +7897,7 @@ fn make_fold_adapter(
     // before each use.
     let target_pin = ctx.pin_native_root(target);
     let combiner_pin = ctx.pin_native_root(combiner_ref);
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_fold_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
@@ -7916,7 +7991,7 @@ fn make_collect_args_adapter(
     // each use.
     let target_pin = ctx.pin_native_root(target);
     let filter_pin = ctx.pin_native_root(filter_ref);
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_collect_args_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
@@ -10052,7 +10127,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             {
                 let values = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                 ctx.set_array_element(values, 0, recv);
-                let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
+                let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
                 ctx.set_field(wrapper, 0, Value::Object(Some(this)));
                 ctx.set_field(wrapper, 1, Value::Object(Some(values)));
                 ctx.set_field(wrapper, 2, Value::Int(0));
@@ -10591,7 +10666,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filters → behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_filter_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filters)));
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -10625,7 +10700,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filter -> behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_retfilter_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
             // The adapter's parameter types match the target's; its return
@@ -10691,7 +10766,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             };
             let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
             let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_catch_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, catch_type);
             ctx.set_field(wrapper, 2, handler);
@@ -11190,7 +11265,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let target_pin = ctx.pin_native_root(target_mh);
     let reorder_pin = ctx.pin_native_root(reorder_arr);
     // Create a wrapper synthetic to hold (target_mh, reorder_arr)
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_permute_wrapper__", 2);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
     let reorder_arr = ctx.read_native_pin(reorder_pin, reorder_arr);
@@ -11279,7 +11354,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let target_pin = ctx.pin_native_root(target_mh);
     let fallback_pin = ctx.pin_native_root(fallback_mh);
     // Create a wrapper synthetic to hold (test, target, fallback)
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_guard_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let test_mh = ctx.read_native_pin(test_pin, test_mh);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
