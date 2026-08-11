@@ -1,6 +1,51 @@
 # Azure Linux `common.args` is missing the bytecode-enhancement sysprop — 246+ false FAILs
 
-**Status:** OPEN (2026-08-11), workaround identified and verified. Found while
+> **RESOLVED 2026-08-11 — this doc is retired.** The sysprop now has an
+> authoritative home in git, and the reference file on the host has been
+> patched.
+>
+> The real defect this doc describes is not "one host's `common.args` is missing
+> a line" — it is that a line the suite **cannot run without** had nowhere
+> authoritative to live. `common.args` is generated and untracked (hand-built,
+> or dumped by `cratonvm-dump.gradle`, which only ever emits a classpath and
+> never sysprops), so the sysprop was absent by default on every fresh host and
+> its absence cost a whole 4579-class run: `FAIL=305` against `FAIL=4` for the
+> equivalent Windows run, 246 of them one `IllegalStateException` thrown by
+> Hibernate's own JUnit extension before any test body — identical under real
+> HotSpot, i.e. not a VM finding at all.
+>
+> **The fix:** `apps/hib-suite-runner/required-sysprops.tsv`, tracked next to
+> `run-hib.sh` (same reasoning as `class-overrides.tsv` and
+> `known-benign-aborts.tsv`, and force-added past the `apps/` ignore the same
+> way). It is a tab-separated `<property> <value> <why>` table; `run-hib.sh`
+> injects every entry the argfile does not already carry, ahead of the argfile,
+> and prints `sysprops=N (M injected)` in the mode header and in `SUMMARY.txt`.
+> An entry already present in `common.args` at any value is left alone, so a
+> deliberate local override still wins. Inspect it with:
+>
+> ```
+> ./run-hib.sh sysprops       # dumps the table and says which lines THIS host is missing
+> ./run-hib.sh ... --no-sysprops   # disables injection, for an A/B
+> ```
+>
+> Two entries seeded: the bytecode-enhancement engine sysprop below, and
+> `java.awt.headless=true`.
+>
+> **"Not yet done" is now done.** The reference `common.args` at
+> `/data/cratonvm/apps/hib-suite-runner/` on the Azure host was appended to on
+> 2026-08-11 (backup left beside it as `common.args.bak-20260811`). It was
+> deliberately left alone when this doc was written, on the grounds that other
+> sessions might be using it concurrently; the line is purely additive — it
+> enables Hibernate's own test engine and nothing else — so the concurrency risk
+> is not real, and leaving it meant any session invoking `java @common.args`
+> directly (rather than through `run-hib.sh`) still hit the same wall.
+>
+> Companion doc:
+> `hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811-FIXED.md` — the genuine
+> nine-class residual this fix uncovered, all nine of which now match HotSpot
+> exactly.
+
+**Status:** RESOLVED (2026-08-11); originally filed OPEN the same day. Found while
 running the full Hibernate ORM suite on the Azure Linux host
 (`/data/cratonvm-hib-linux-20260811`, branch `test/hib-linux-20260811`), first
 time this host's harness was exercised end to end for a full-suite run this
@@ -69,7 +114,7 @@ Verified: rerunning the 396 classes in `others.txt` (the full non-passed
 set from the broken run) with this line added produced `PASS=295`,
 collapsing `FAIL` from 305 to 7 and `HANG` from 4 to 2, leaving only the
 genuine CratonVM-vs-HotSpot residual (see the companion doc,
-`hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md`).
+`hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811-FIXED.md`).
 
 ## Not yet done
 
@@ -98,6 +143,6 @@ test runs, on both CratonVM and real HotSpot.
 
 ## Related
 
-- `hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md` — the genuine
+- `hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811-FIXED.md` — the genuine
   CratonVM-specific residual left after this fix, verified against real
   HotSpot on the same host/classpath.
