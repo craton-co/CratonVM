@@ -1783,27 +1783,9 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     );
     r.register(
         "java/nio/Bits",
-        "reserveMemory",
-        "(JI)V",
-        bits_reserve_memory,
-    );
-    r.register(
-        "java/nio/Bits",
         "unreserveMemory",
         "(JJ)V",
         bits_unreserve_memory,
-    );
-    r.register(
-        "java/nio/Bits",
-        "unreserveMemory",
-        "(JI)V",
-        bits_unreserve_memory,
-    );
-    r.register(
-        "java/nio/Bits",
-        "getMaxDirectMemory",
-        "()J",
-        bits_get_max_direct_memory,
     );
 
     // VM.maxDirectMemory() also exists in real-JDK as
@@ -1827,34 +1809,10 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // DirectByteBuffer constructor installs its non-null Cleaner.
 
     // Cleaner natives.
-    r.register(
-        "jdk/internal/ref/Cleaner",
-        "create0",
-        "(Ljava/lang/Object;JJ)I",
-        cleaner_create0,
-    );
     // Round-5 Fix 6: GC-driven Cleaner runnable for `dbb_allocate_direct0`'s
     // bucketed pool path. Pairs with the discover_reference call inside that
     // function so the ref processor drains and fires this on phantom-clear.
-    r.register(
-        "jdk/internal/ref/BucketDirectBufferDeallocator",
-        "run",
-        "()V",
-        bucket_dealloc_run,
-    );
-    r.register(
-        "jdk/internal/ref/Cleaner",
-        "cleanerExpired0",
-        "(I)V",
-        cleaner_expired0,
-    );
     // The 8u/16+ name is `clean`; register alias.
-    r.register(
-        "sun/misc/Cleaner",
-        "create0",
-        "(Ljava/lang/Object;JJ)I",
-        cleaner_create0,
-    );
 
     // `Util$BufferCache` is normally ThreadLocal. VM worker threads can
     // currently share it, so make each ring operation atomic while retaining
@@ -1930,8 +1888,6 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         unsafe_free_memory,
         cratonvm_native_api::NativeKind::Bridge,
     );
-    r.register("sun/misc/Unsafe", "allocateMemory0", "(J)J", unsafe_allocate_memory);
-    r.register("sun/misc/Unsafe", "freeMemory0", "(J)V", unsafe_free_memory);
 
     // Synthetic helper used by JDK-side Cleaner runnables that
     // capture (addr, size) at allocation time — see module docs.

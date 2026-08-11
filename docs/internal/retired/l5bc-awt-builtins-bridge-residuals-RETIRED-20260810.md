@@ -106,7 +106,9 @@ method, so `--jdk-only` admits every one of them on a claim nobody has checked.
 >   than deferring. This family has the foreign-layout fallback. Also: **10**
 >   such rows are registered in real-JDK mode, not 97 or 214 — those are source
 >   grep counts. See
->   [`abstract-collection-natives-are-inert-for-foreign-layouts.md`](abstract-collection-natives-are-inert-for-foreign-layouts.md),
+>   the retired `abstract-collection-natives-are-inert-for-foreign-layouts` record
+>   (its probe is now the scheduled vector
+>   `regression-suite/src/RForeignLayoutCollections.java`),
 >   which also states the generalisable test: does the native ask the receiver,
 >   or index into a layout it assumes?
 >

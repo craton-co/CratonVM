@@ -1,7 +1,10 @@
 # Spring Framework full-suite GC-variant run — RETIRED: three defects, not one "classpath gap"
 
-**Status: RETIRED 2026-08-10.** Supersedes
-`docs/known-issues/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810.md`.
+**Status: RETIRED 2026-08-10.** Supersedes the known-issues page
+`gc-variant-fullsuite-classpath-gap-and-fails-20260810.md`, deleted in the same
+commit that added this one; its full text as authored is in git history at
+`84f681b31`, which committed it unchanged so this retirement would be a
+reviewable diff rather than a disappearance.
 Every finding on that page is either fixed or superseded below, and the
 full 2848-class × 3-GC-variant sweep has been re-run against a binary and
 harness carrying all three fixes.
@@ -398,10 +401,10 @@ the check.
 
 ## Related
 
-* `../../../known-issues/h2/gc-corruption-guard-fixed-by-dev-merge-20260810.md`
+* `fixed-suite-bugs/h2-suite-bugs/gc-corruption-guard-fixed-by-dev-merge-20260810.md`
   — the `dev`-merge story that prompted this run. Its "No regression check"
   caveat is now closed **for spring-framework**: this sweep re-ran all 2848
   classes, not just the previously-non-passing set.
-* `../../../known-issues/h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md`
+* `fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`
   — H2's half of the same sweep, where the non-passing set *is* dominated by
   real CratonVM defects.

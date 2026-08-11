@@ -119,6 +119,24 @@ unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
 `dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
 which is the gate's third arm doing exactly what it is for.
 
+## 2026-08-10 — two records retired, one added
+
+The object-layout pair is **RETIRED** (see row 2 of the ranked list below):
+index-based field access against fabricated layouts is closed, the shadow-layout
+census is at zero NAME and zero `_vmN` rows on both standing probes, and both
+records moved to the internal tree as
+`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md` and
+`fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`.
+
+[`memorysegment-set-ofdouble-has-no-code-attribute.md`](memorysegment-set-ofdouble-has-no-code-attribute.md)
+— found while verifying the FFM half of that work and filed separately because
+it is **not** a layout defect: every one of the thirteen `ValueLayout`
+properties matches Temurin 25.0.3, and then
+`seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises `AbstractMethodError … has no
+Code attribute` while the `int`, `long` and `byte` stores beside it succeed.
+Identical on the pre-fix binary, so it is pre-existing rather than a regression;
+`probes/W2ValueLayoutProbe` is the reproducer.
+
 ## 2026-08-05 — three records added
 
 **Both L5 records left this directory on 2026-08-10** —
@@ -161,7 +179,9 @@ measured rather than assumed — that the tree's only `bridge` marker outside
 `native-collections` has **zero** rows a migration could ever state, and that
 `ABSENT` on a platform-named class means "not measured here", not "dead".
 
-[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md)
+The census asks one class, on one platform — **RETIRED 2026-08-10**, its five
+open items closed under
+`fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`
 — and then the two instruments that answer both of those. The census asks about
 one class in one image, so **1,939 of the 2,542 "method not declared" rows are
 actually inherited** (19 of them from an `ACC_NATIVE` supertype) and **59
@@ -318,8 +338,8 @@ behaviour** — no exception, no log line, no failing test.
 | # | Record | Why it is dangerous |
 |---|---|---|
 | 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: **9,296** unadjudicated `Bridge` registrations (8,319 of them owning a slot), now in [`bridge-reclassification-wave.md`](bridge-reclassification-wave.md). The 2026-08-10 re-tag of the receivers no supported image declares took 246 rows out of it and is done; the rest is blocked on item 4, measured — arming `CRATONVM_ENFORCE_NATIVE_SHADOW=1` takes the strict corpus from 32/17 to 3/46. |
-| 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
-| 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
+| 2 | Fabricated object layouts leak into native code — **RETIRED 2026-08-10** | Index-based field access against assumed synthetic layouts: on real bytes the index still resolves and points at a different field, with no fault and no log line. Closed across five lanes and a final residual pass. The shadow-layout census is at **zero** NAME rows, **zero** `_vmN` rows and zero `java/net/URI` access-site rows on both standing probes; the last live defects it found were `URI.getAuthority()` answering null, `ProxySelector.select()` returning an empty list, and every `getLogger(Foo.class)` logger being named `"unknown"`. Both `breaks-under-strict` sites and both `unknown` verdicts are adjudicated, and `safe` verdicts are now re-checked against the loaded image at every class definition instead of being remembered. Record retired to the internal tree as `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`, with the companion `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. |
+| 4 | `ensure_synthetic_class` cannot enforce policy, only record it — **RETIRED 2026-08-10** | Returned a bare `ClassId`, so under `--jdk-only` it recorded the violation and fabricated anyway. The entry point is deleted, along with the `NativeSystemAccess` trait method, the `NativeContextImpl` override and all three infallible allocation funnels; the grep gate matches zero sites, tests included. See `fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`. |
 
 Items 5 and 7 left this table on 2026-08-06, together with wave-2 lanes L10 and
 L11 item 7:
@@ -390,7 +410,7 @@ violations live, and a run that ends in `System.exit` leaves a census behind.
 
 | # | Record | Contents |
 |---|---|---|
-| 11 | [Additional wave-2 markers not in the original inventory](additional-wave2-markers-not-in-the-original-inventory.md) | 13 further findings, re-verified and re-scored against the re-land. Four of them moved materially: the JIT's inline caches are now closed-by-refusal under `JdkOnly` rather than unchecked; the JIT's by-name native fast paths are policy-checked and counted; `build_helpers` now publishes the policy before the first compile; and the three documentation-gap items are all closed. Still open: the process-global JIT policy and `JNI_NATIVE_METHODS`, the seven thin direct-call ladders (two of them in the `String` family), the interface-substitution map, the `redefine_immune_*` predicates, `check_override`'s 217-disjunct / ~2,650-line chain, and three stale doc paths in load-bearing comments. |
+| 11 | Additional wave-2 markers not in the original inventory — **RETIRED 2026-08-10**, record moved out of the public tree | 13 further findings, re-verified and re-scored against the re-land. Four of them moved materially: the JIT's inline caches are now closed-by-refusal under `JdkOnly` rather than unchecked; the JIT's by-name native fast paths are policy-checked and counted; `build_helpers` now publishes the policy before the first compile; and the three documentation-gap items are all closed. All of it is now closed: the two process globals moved or were threaded per compilation, the interface-substitution map is refused under strict, the `redefine_immune_*` predicates collapsed onto the aggregate, `check_override`'s chain is down to 179 disjuncts and is not consulted at all under `--jdk-only`, and the doc paths were repointed. The direct-call ladders' literals stay, adjudicated: they are the recognition map, not a policy list. |
 
 ---
 

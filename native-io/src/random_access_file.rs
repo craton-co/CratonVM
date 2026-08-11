@@ -580,7 +580,6 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
     registry.register_with_kind(raf, "setLength0", "(J)V", native_setLength0, NativeKind::Bridge);
     // Not ACC_NATIVE — not declared by JDK 25's RandomAccessFile at all.
     // Left on the ambient category deliberately; see the marker above.
-    registry.register(raf, "close0", "()V", native_close0);
     registry.set_category(__prev_cat);
 }
 

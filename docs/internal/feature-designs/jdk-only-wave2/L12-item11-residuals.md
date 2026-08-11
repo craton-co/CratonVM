@@ -4,7 +4,7 @@
 **Gated on:** partly. §4 wants L5's kinds to be true first.
 **Effort:** L in aggregate; each section is S–M and several are independently
 claimable.
-**Evidence:** [`additional-wave2-markers-not-in-the-original-inventory.md`](../../known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md)
+**Evidence:** [`additional-wave2-markers-not-in-the-original-inventory.md`](additional-wave2-markers-not-in-the-original-inventory.md) (retired here 2026-08-10; every section fixed or closed as answered)
 
 ## Sections, and who can take them at once
 

@@ -1,10 +1,45 @@
 # Additional `JDK-ONLY-WAVE2` findings not in the original wave-2 inventory
 
-**Status:** OPEN — JDK-only wave-2 work items, filed 2026-07-31, re-verified
-against the re-landed tree the same day. These were found while verifying the
-eleven inventoried findings. They are recorded here so wave 2 does not
-rediscover them, and because two of them (§1 and §4) are the same defect shape
-as items that *were* inventoried, in code nobody was looking at.
+**Status:** RETIRED to this tree 2026-08-10. Every section is now either fixed
+or closed as *answered* with the measurement that retired it — the "Done when"
+this lane's plan (`L12-item11-residuals.md`) set. Read the dated status blocks
+below in reverse chronological order for how it got here.
+
+## 2026-08-10 — the last residuals, and what closed each
+
+| § | Was | Now |
+|---|---|---|
+| §2 | `jit_entry_publishable` still read the process-global latch | **FIXED** — the policy is an argument, passed by the VM publication sites that hold a `SharedVm`. That was the last dispatch-affecting reader of `JIT_COMPATIBILITY_MODE`; only `try_compile`'s VM-less legacy wrapper still consults it. |
+| §3 item 1 | the Matcher leaf dispatched **uncounted**, and strict skipped it wholesale | **FIXED** — the per-triple memo this record specified: eight `NativeCallSite` cells for the census handle plus a per-VM generation-keyed strict verdict. And **measured**, which the record never did: `MATCHER_LEAF_HITS` reports **0** on a regex-hot workload while the native census is already exact (4.2M and 8.4M calls, both binaries), so the gap has magnitude zero on the evidence available — the same shape as §1's "tax". |
+| §3 item 4 | `cp_elidable_init_resolver` skipped a native-shadowed `<init>` | **FIXED** — `elidable_ctor_native_would_run` asks `resolve_native_dispatch_wave1` instead of `find`, with `bytecode_available` established by `init.code()` rather than assumed. Compatible is bit-for-bit the old predicate; strict stops refusing an elision over a bridge that would lose anyway. Pinned in all four corners by `ctor_elision_asks_policy_not_just_registration`. |
+| §6 | `bridge_invocations` under-counted JNI bridges | **FIXED** without minting a fake `NativeMethodId`: both dispatch sites bump a per-VM counter and the report adds it to `bridge_invocations`, where a real function in a real library belongs. Measured on `JdkOnlyPlatformProbe`: 13,069 → 13,103, i.e. **34 dispatches that were invisible**. |
+| §11 | the whole chain ran in both modes | **Strict half FIXED** — this section's own prescription (*"what must replace the whole chain: nothing"*) finally enforced. Under `--jdk-only` only `method.is_abstract()` is consulted, and every name refusal is recorded as a `check-override-name` observation so the two modes' difference is nameable. Measured on the 23-vector strict corpus: **12 triples admitted by name → 0**, `chain_true` up to 1,935 per vector → **0 on every vector**, and **no vector changed verdict** (19 passed / 4 failed, the same four). Compatible untouched. |
+| §4, §10 | "wave 2 should…" | **Closed as answered**, with the verdicts written onto the markers themselves rather than left here. §4's literals are the *recognition* map (which `*_DIRECT_FN` cell a triple maps to), which no `NativeKind` can answer; only the policy was name-based and only the policy moved. §10's constant is faithful, the observation a `false` would produce is still recorded one level down, and the per-site verdict it asks for does not exist until §11's Compatible-mode lists collapse. |
+
+**What is deliberately NOT done, and why it is not a residual.** §11's
+Compatible-mode deletion of the remaining 179 disjuncts stays. That is not an
+unfinished task — it is what this lane's standing rule *requires*. "The end
+state is two modes, and it is a rename": today's `--real-jdk` becomes
+`--synthetic-jdk`, and **a native that is load-bearing in either surviving mode
+must survive**. The chain is a policy artefact in strict mode, which is now
+gated off and measured; in compatibility mode it is the support list the
+surviving synthetic mode needs, so deleting it there would delete an
+implementation rather than a policy. Three static tranches already took it from
+217 disjuncts to 179 (381 lines) without moving the admitted set, and the
+seventh pass recorded that the static seam is exhausted.
+
+**Verification covering all of the above:** regression suite 34/34 core and
+19 passed / 4 failed jdk-only, identical to the pre-change binary on both;
+`scripts/jdk-only-strict-probes.sh` PASS on both arms, every transcript
+byte-identical to HotSpot in both modes.
+
+---
+
+Filed 2026-07-31, re-verified against the re-landed tree the same day. These
+were found while verifying the eleven inventoried findings. They are recorded
+here so wave 2 does not rediscover them, and because two of them (§1 and §4) are
+the same defect shape as items that *were* inventoried, in code nobody was
+looking at.
 
 Each item states where the marker lives so it can be re-read in full. **Anchor
 on the marker text, not the line number** — the re-land moved most of these.

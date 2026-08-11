@@ -1437,6 +1437,19 @@ const ZGC_REAL_DEFAULT_HEAP: usize = 64 * 1024 * 1024;
 /// total capacity.
 const ZGC_REAL_GC_THRESHOLD_PERCENT: usize = 75;
 
+/// Collect once the arena can no longer serve a request this large, however
+/// few LIVE bytes there are — see [`ZgcRealHeap::headroom_low`].
+///
+/// The margin has to cover the largest request a workload makes between two
+/// native-call boundaries, because a native cannot collect where it stands: the
+/// boundary hook in `vm/src/vm/vm_exec.rs` is the first place a collection can
+/// run on its behalf. `capacity/128` with an 8 MiB floor is 16 MiB at
+/// `-Xmx 2g` — under 1% of the heap, against a failure mode that costs the
+/// whole run.
+fn zgc_headroom_margin(capacity: usize) -> usize {
+    (capacity / 128).max(8 * 1024 * 1024)
+}
+
 /// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
 const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 
@@ -2208,6 +2221,36 @@ pub struct ZgcRealHeap {
     /// observes the store one boundary late merely defers a collection to the
     /// next boundary.
     native_alloc_pressure: AtomicBool,
+    /// "The arena can no longer serve a request of [`headroom_margin`] bytes."
+    ///
+    /// # Why the live-bytes trigger is not enough on THIS backend
+    ///
+    /// [`needs_gc`](GarbageCollector::needs_gc) asks `allocated >= gc_threshold`,
+    /// and the sweep stores *retained* bytes back into `allocated` — so it is a
+    /// LIVE-BYTES question. On a compacting heap that is the right question,
+    /// because live bytes and allocatable space move together.
+    ///
+    /// This heap does not compact. The arena's bump cursor never rewinds, and
+    /// reclaimed space comes back only as free-list holes. Allocatable space is
+    /// therefore `max(capacity - cursor, largest_free_block)`, and it falls as
+    /// the *garbage* grows — a quantity `allocated` cannot see, because the
+    /// sweep subtracts exactly that garbage from it.
+    ///
+    /// The two diverge by however much garbage there is, and the divergence is
+    /// not academic: on `ZipContentTests` at `-Xmx 2g`, ten collections ran and
+    /// an 8 KB array allocation still failed with live at **1,434,932,032 of
+    /// 2,147,483,648 bytes** — 66.8%, well under the 75% threshold. `needs_gc`
+    /// answered "no collection needed" while the allocation that raised
+    /// `OutOfMemoryError` was failing, because it was answering about live
+    /// bytes and the wall the workload hit was allocatable space.
+    ///
+    /// Armed from [`Self::alloc_raw`] under the arena lock, consulted by
+    /// `needs_gc`, cleared by the sweep. It is gated by the same `gc_rearm`
+    /// floor as the threshold term, so it cannot re-create the GC storm that
+    /// field exists to prevent: right after a sweep `gc_rearm` exceeds
+    /// `allocated`, so a still-low headroom simply waits for genuinely new
+    /// allocation instead of firing a cycle per allocation.
+    headroom_low: AtomicBool,
     /// Lifetime collection counter (observability).
     gc_count: AtomicUsize,
     /// `--verbose:gc` per-collection logging gate — see
@@ -2422,6 +2465,7 @@ impl ZgcRealHeap {
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
+            headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
             ref_processor: Mutex::new(ReferenceProcessor::new()),
@@ -2556,12 +2600,95 @@ impl ZgcRealHeap {
         }
     }
 
+    /// One-shot report of an arena allocation failure, with the occupancy that
+    /// says whether the heap was full or merely fragmented.
+    ///
+    /// One-shot on purpose: the failure repeats for every subsequent request
+    /// once the arena is out, and a per-failure line would bury the run in
+    /// stderr exactly when it is least readable.
+    fn warn_alloc_failed_once(
+        size: usize,
+        used: usize,
+        capacity: usize,
+        free_list_bytes: usize,
+        largest_free_block: usize,
+    ) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request = size,
+            used,
+            capacity,
+            free_list_bytes,
+            largest_free_block,
+            "zgc: arena allocation failed — this heap does not compact, so the \
+             bump cursor never rewinds and reclaimed space returns only as \
+             free-list holes. `largest_free_block < request` with a large \
+             `free_list_bytes` means fragmentation, not exhaustion.",
+        );
+    }
+
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
         let ptr = {
             let mut arena = self.arena.lock();
-            let ptr = arena.alloc(size, 8)?;
+            let ptr = match arena.alloc(size, 8) {
+                Some(p) => p,
+                None => {
+                    // Allocation failure on a NON-COMPACTING heap is not the
+                    // same event as "full of live data", and the two want
+                    // different fixes. Say which, once, with the numbers that
+                    // separate them:
+                    //
+                    //   used ~ capacity, free list small  -> genuinely full
+                    //   used ~ capacity, free list LARGE  -> fragmented: the
+                    //                                        bytes are there,
+                    //                                        no hole this big
+                    //   largest_free_block < size         -> why THIS request
+                    //                                        failed
+                    //
+                    // Without it an `OutOfMemoryError` raised from here is
+                    // undiagnosable after the fact, which is what it was when
+                    // `ZipContentTests` began failing at the Spring Boot
+                    // suite's default `-Xmx 2g` on the day ZGC became the
+                    // default collector.
+                    Self::warn_alloc_failed_once(
+                        size,
+                        arena.used(),
+                        arena.capacity(),
+                        arena.free_list_bytes(),
+                        arena.largest_free_block(),
+                    );
+                    // Ask for a collection at the next safepoint. A native
+                    // cannot collect where it stands, but `vm_exec`'s
+                    // native-boundary hook acts on this latch — and a request
+                    // that just failed is stronger evidence that a cycle is due
+                    // than the `allocated >= gc_threshold` predicate, which
+                    // counts LIVE bytes and therefore cannot see the bump space
+                    // this heap never rewinds.
+                    self.native_alloc_pressure.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            };
+            // Arm the ALLOCATABLE-SPACE trigger (see `headroom_low`). Two
+            // reasons this is here rather than in `needs_gc`: the arena lock is
+            // already held, and `needs_gc` is polled far more often than
+            // allocation happens.
+            //
+            // Cheap by construction. The un-bumped tail is two field reads, and
+            // while it is above the margin — which is the whole of a normal run
+            // — nothing else is consulted. Only once the tail is genuinely low
+            // does the free-list probe run, and `has_free_block_at_least` is
+            // O(1) for exactly the "no" answer that matters here.
+            let margin = zgc_headroom_margin(arena.capacity());
+            let tail = arena.capacity().saturating_sub(arena.used());
+            if tail < margin && !arena.has_free_block_at_least(margin) {
+                self.headroom_low.store(true, Ordering::Relaxed);
+            }
             // The arena bump path hands out memory from a zeroed Vec, but a
             // reused free-list block may contain stale bytes — zero it so a
             // fresh header/fields start clean.
@@ -5066,7 +5193,22 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn needs_gc(&self) -> bool {
         let a = self.allocated.load(Ordering::Relaxed);
-        a >= self.gc_threshold && a >= self.gc_rearm.load(Ordering::Relaxed)
+        // Two independent reasons to collect, behind one shared anti-storm
+        // floor:
+        //
+        //   * `a >= gc_threshold` — the classic LIVE-BYTES trigger.
+        //   * `headroom_low`      — the arena can no longer serve a
+        //                           `zgc_headroom_margin` request. On a heap
+        //                           that never compacts this is the constraint
+        //                           that actually binds, and it can be reached
+        //                           with live bytes far below the threshold:
+        //                           measured at 66.8% on `ZipContentTests`
+        //                           while an 8 KB allocation was failing.
+        //
+        // Both keep the `gc_rearm` floor, so neither can fire a cycle per
+        // allocation against a live set parked above the threshold.
+        a >= self.gc_rearm.load(Ordering::Relaxed)
+            && (a >= self.gc_threshold || self.headroom_low.load(Ordering::Relaxed))
     }
 
     fn collect_garbage(
@@ -5409,6 +5551,23 @@ impl GarbageCollector for ZgcRealHeap {
                     arena.add_free_block(off, sz);
                 }
             }
+            // Un-bump a wholly-free tail. Coalescing above has made the topmost
+            // span maximal, so this is one comparison — and it is the only
+            // thing on a non-compacting heap that can restore a large
+            // CONTIGUOUS region. Objects die young, so the top of the arena is
+            // usually all garbage; without this the cursor is a one-way ratchet
+            // and a 16 MB array becomes unservable forever once the process has
+            // allocated its capacity, with 1.8 GB free and 15% live. See
+            // `Arena::retract_cursor_into_free_tail`.
+            let reclaimed_tail = arena.retract_cursor_into_free_tail();
+            if reclaimed_tail != 0 {
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = reclaimed_tail,
+                    cursor = arena.used(),
+                    "zgc sweep: retracted the bump cursor into a free tail",
+                );
+            }
         }
 
         if unsizable != 0 {
@@ -5446,6 +5605,17 @@ impl GarbageCollector for ZgcRealHeap {
             bytes_copied.saturating_add((headroom / 4).max(64 * 1024)),
             Ordering::Relaxed,
         );
+        // Lower the allocatable-space latch: the sweep above has just
+        // free-listed every dead object and coalesced the result into maximal
+        // spans, so whatever headroom this heap can have, it has now.
+        //
+        // Cleared unconditionally rather than recomputed. If headroom is STILL
+        // below the margin the very next allocation re-arms it — and that path
+        // is correct where a recompute would be fragile, because it re-measures
+        // the arena the caller actually failed against instead of a snapshot
+        // taken here. Re-arming cannot storm: `gc_rearm` was just set above
+        // `allocated`, so the trigger waits for genuinely new allocation.
+        self.headroom_low.store(false, Ordering::Relaxed);
         // Disarm the native-allocation-pressure latch here, at the same point
         // `gc_rearm` is recomputed: the collection the latch asked for has now
         // happened, and the re-arm floor just published above is the only thing

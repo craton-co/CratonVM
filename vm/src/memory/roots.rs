@@ -136,15 +136,42 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // including static methods that carry no receiver oop. Interpreter frames
     // expose ClassId directly; compiled activations are counted globally by
     // JitEntryGuard so cross-thread STW scans see them too.
+    // TEMP-DIAG (CRATONVM_DBG_MIRRORPIN_WHY): name WHICH activation is rooting
+    // a user loader. Both of these push a loader with no heap referrer, so a
+    // retention-path walk cannot see them at all.
+    let act_dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN_WHY").is_some();
+    let act_name = |cid: u32| -> String {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(cratonvm_types::ClassId::new(cid))
+            .map(|c| c.name.to_string())
+            .unwrap_or_default()
+    };
     for frame in &thread.frames {
         if let Some(loader) =
             cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, frame.class_id.as_u32())
         {
+            if act_dbg {
+                eprintln!(
+                    "[MIRRORWHY] root via FRAME class={:?} loader={:#x}",
+                    act_name(frame.class_id.as_u32()),
+                    loader.as_ptr() as usize
+                );
+            }
             roots.push(loader);
         }
     }
     for class_id in cratonvm_types::jit_activation::active_class_ids() {
         if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(shared.vm_identity, class_id) {
+            if act_dbg {
+                eprintln!(
+                    "[MIRRORWHY] root via JIT_ACTIVATION class={:?} loader={:#x}",
+                    act_name(class_id),
+                    loader.as_ptr() as usize
+                );
+            }
             roots.push(loader);
         }
     }
@@ -389,6 +416,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // which is exactly what that machinery wants.
     {
         let class_mirrors = shared.classes.class_mirrors.read();
+        // TEMP-DIAG (CRATONVM_DBG_MIRRORPIN): name the DECISION, not just the
+        // outcome. "The mirror was still marked" is compatible with both
+        // "rooted unconditionally here" and "genuinely reachable from a live
+        // edge", and those want opposite fixes.
+        let mirror_dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+        if mirror_dbg {
+            eprintln!(
+                "[DBG_MIRRORPIN] roots: conditional_metadata={conditional_metadata} mirrors={}",
+                class_mirrors.len()
+            );
+        }
         if conditional_metadata {
             let cm = shared.classes.class_manager.read();
             for (&class_id, obj_ref) in class_mirrors.iter() {
@@ -417,12 +455,22 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 // entire retained JSP-compiler graph, and an explicit
                 // `System.gc()` was the run's first collection, so nothing had
                 // ever been promoted.
-                if is_user_defined
-                    && shared
-                        .mem
-                        .heap
-                        .mirror_pin_deferrable(obj_ref.as_ptr() as usize)
-                {
+                let deferrable = shared
+                    .mem
+                    .heap
+                    .mirror_pin_deferrable(obj_ref.as_ptr() as usize);
+                if mirror_dbg && is_user_defined {
+                    let name = cm
+                        .get_class(class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[DBG_MIRRORPIN] roots: user class={name:?} mirror={:#x} deferrable={deferrable} => {}",
+                        obj_ref.as_ptr() as usize,
+                        if deferrable { "DEFERRED" } else { "ROOTED" }
+                    );
+                }
+                if is_user_defined && deferrable {
                     continue;
                 }
                 roots.push(*obj_ref);

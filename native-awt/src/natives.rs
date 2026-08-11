@@ -3379,12 +3379,6 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
     // Headless behaviour: with no display to type into, the input dialog
     // returns an empty string without blocking. This is a fixed
     // no-interaction result, not a real prompt.
-    registry.register(
-        "javax/swing/JOptionPane",
-        "showInputDialog",
-        "(Ljava/awt/Component;Ljava/lang/Object;)Ljava/lang/Object;",
-        |ctx, _args| obj_ok(ctx.create_string("")),
-    );
 
     registry.register(
         "javax/swing/SwingUtilities",

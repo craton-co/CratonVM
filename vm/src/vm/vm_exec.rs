@@ -278,6 +278,28 @@ pub fn dump_canonical_census() {
     }
 }
 
+/// Record a `--jdk-only` refusal of a `check_override` **name** disjunct.
+///
+/// The chain's name entries all say "prefer our native over the real JDK's
+/// concrete bytecode", which §1.4 forbids under strict policy. Refusing them is
+/// what the wave-2 record prescribes as the strict replacement for the whole
+/// chain; recording the refusal is what keeps the two modes' difference
+/// nameable rather than silent, and it is the same shape §8's
+/// interface-substitution refusal uses.
+///
+/// The free-text `native_kind` tag distinguishes these rows from the
+/// interpreter's `NativeKind`-tagged shadow observations and from the JIT's
+/// `"jit-thin-direct-helper"` rows: all three are different facts about the
+/// same method and all three belong in the report.
+///
+/// Like §8's, this deliberately does NOT bump `JDK_ONLY_NATIVE_SHADOW_ATTEMPTS`.
+/// That counter surfaces as `interpreter_bytecode_preferred` and means "a
+/// registered native yielded to bytecode at dispatch"; this is a resolution-time
+/// refusal to mark the method native at all, one step earlier.
+pub fn record_check_override_strict_refusal(class_name: &str, method_name: &str, descriptor: &str) {
+    offer_native_shadow_observation(class_name, method_name, descriptor, "check-override-name");
+}
+
 /// JDK-ONLY-WAVE2 §11 census: which `check_override` disjuncts actually admit
 /// a native, keyed by the triple that reached the branch.
 ///
@@ -623,9 +645,17 @@ fn record_native_shadows_bytecode(
 /// bytecode to shadow. `SyntheticStub` is still refused here under `JdkOnly`,
 /// so §1.3 is enforced on this branch too.
 ///
-/// Wave-2 note: the right long-term shape is for the abstract declaration to
-/// resolve to the *implementing* class's method before reaching here, at which
-/// point step 3 covers it and this branch can go.
+/// **Do not "fix" this to match §7's literal wording.** It is a reviewed,
+/// justified, self-documented deviation, and reverting it stops the VM booting
+/// in both modes — which makes it a very fast way to discover that the wording
+/// was the thing that was wrong. The wave-2 record that adjudicated it (§11a)
+/// is retired; this banner is the surviving statement.
+///
+/// The right long-term shape is for the abstract declaration to resolve to the
+/// *implementing* class's method before reaching here, at which point step 3
+/// covers it and this branch can go. That is a **resolution-order** change with
+/// no defect behind it — nothing observable is wrong today — so it is an
+/// architectural cleanup and not a bug to be scheduled.
 pub fn resolve_dispatch<'a>(
     policy: cratonvm_types::compat::ExecutionPolicy,
     class: &crate::classloading::Class,
@@ -14942,49 +14972,43 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         self.shared.system_properties.write().remove(&normalized)
     }
 
+    /// Mint a VM-generated class — contract §1 item 6's shapes, which are legal
+    /// in every mode.
+    ///
+    /// Infallible on purpose: `ClassManager::ensure_generated_class` records no
+    /// violation and refuses nothing, because a lambda body, a `$ProxyN` and
+    /// its `Proxy$Instance` superclass, an array shape or a reflection accessor
+    /// is a class a conforming JVM creates without a class file. This is NOT a
+    /// way around the policy — see the warning on the trait declaration.
     #[track_caller]
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        // Prefer the real class if it can be loaded — `ensure_synthetic_class`
-        // returns the existing id when the name is already registered, so a
-        // successful load here keeps native allocations on the real layout.
+    fn ensure_vm_internal_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        // Same real-class preference as the fallible sibling: a name that
+        // resolves to real bytes is not a fabrication at all.
         if let Ok(cid) = self.shared.load_class_concurrent(name) {
             return cid;
         }
-        // Real class unavailable: register a minimal synthetic class that
-        // declares `num_fields` instance fields. This guarantees the object
-        // header's `class_id` points at a class whose `num_total_fields`
-        // matches the allocated slot count, instead of `ClassId::new(0)`
-        // (`java/lang/Object`, zero declared fields) which the GC's
-        // `get_field` bounds guard rejects as an undersized layout.
-        //
-        // Still the infallible spelling: this signature has no way to report
-        // the one case the class manager now refuses (a name two or more
-        // distinct classes already carry). For that case `ClassManager::
-        // ensure_synthetic_class` hands back a distinctly-named, correctly
-        // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
-        // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/feature-designs/synthetic-class-fallibility.md` for the migration
-        // that removes this method's callers.
         self.shared
             .classes
             .class_manager
             .write()
-            .ensure_synthetic_class(name, num_fields)
+            .ensure_generated_class(
+                name,
+                num_fields,
+                cratonvm_classloading::ClassOrigin::VmInternal,
+            )
     }
 
-    /// The fallible spelling: the same operation, with the refusal the
-    /// infallible one cannot express.
+    /// Mint a compatibility stand-in, with the refusal `--jdk-only` requires.
     ///
-    /// Two differences from [`Self::ensure_synthetic_class`], both intended:
+    /// The infallible `ensure_synthetic_class` twin this used to sit beside was
+    /// deleted on 2026-08-10 (JDK-only wave 2, step 3). It recorded the
+    /// violation and fabricated anyway, so:
     ///
-    /// 1. it can return [`ClassIdentityError::AmbiguousName`] instead of a
-    ///    stand-in, so a native that can fail gets to fail;
+    /// 1. this can return [`ClassIdentityError::AmbiguousName`] instead of a
+    ///    silently-substituted stand-in, so a native that can fail gets to fail;
     /// 2. it goes through `ClassManager::try_ensure_synthetic_class`, which
-    ///    **enforces** `--jdk-only` (the infallible one only records the
-    ///    violation and fabricates anyway). Under the default `Compatible`
-    ///    mode the two are identical; under `--jdk-only` a call site migrated
-    ///    to this spelling starts refusing, which is exactly step 2 of the
-    ///    JDK-ONLY-WAVE2 recipe in `class_manager.rs`.
+    ///    **enforces** `--jdk-only`. Under the default `Compatible` mode the
+    ///    behaviour is byte-for-byte what the twin did.
     ///
     /// The error is re-derived from the name index rather than pattern-matched
     /// out of the returned `VmError`: the classifier is the authority on
@@ -20854,20 +20878,47 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     //
                     // JDK-ONLY-WAVE2: the `check_override` chain header. Of the
-                    // ~250 disjuncts below, exactly ONE survives contract §7:
+                    // disjuncts below, exactly ONE survives contract §7:
                     // `method.is_abstract()`, which is §7 step 3b (no `Code`,
                     // so a registered native is the only thing there is to run
                     // — the documented deviation in `resolve_dispatch`'s
                     // banner). Every other disjunct is a class-name exception
                     // saying "prefer our native over the real JDK's concrete
-                    // bytecode", which is precisely what §1.4 forbids. What
-                    // must replace the whole chain: nothing — under
-                    // `--jdk-only` `resolve_dispatch` step 3 returns
-                    // `Bytecode` for all of them. Removing them under
-                    // `Compatible` is a separate, per-family exercise; each
-                    // entry is load-bearing for a real boot today.
-                    let check_override = method.is_abstract()
-                        || class_name == "java/io/ByteArrayInputStream"
+                    // bytecode", which is precisely what §1.4 forbids.
+                    //
+                    // **Strict half CLOSED 2026-08-10.** The record's own answer
+                    // to "what must replace the chain" was *nothing*, and that
+                    // is now enforced: under `--jdk-only` the name half is not
+                    // consulted, every refusal is recorded by triple, and §7
+                    // step 3 answers `Bytecode` for all of them. Measured on the
+                    // 23-vector strict corpus: the chain admitted TWELVE triples
+                    // by name there and no vector changed verdict when they
+                    // stopped being admitted.
+                    //
+                    // Removing them under `Compatible` remains a separate,
+                    // per-family exercise; each entry is load-bearing for a real
+                    // boot today, and three static-analysis tranches
+                    // (unreachability, then redundancy) already took the chain
+                    // from 217 disjuncts to 179 without moving the admitted set.
+                    // Under `JdkOnly` the name half of this chain is not
+                    // consulted at all. Every disjunct below `is_abstract()`
+                    // says "prefer our native over the real JDK's CONCRETE
+                    // bytecode", which is exactly what §1.4 forbids, and the
+                    // wave-2 record's own answer to "what must replace the
+                    // chain" is *nothing*: §7 step 3 returns `Bytecode` for all
+                    // of them. `method.is_abstract()` stays in BOTH modes — it
+                    // is §7 step 3b, the documented deviation in
+                    // `resolve_dispatch`'s banner (no `Code`, so a registered
+                    // native is the only body there is), and removing it would
+                    // stop the VM booting in either mode.
+                    //
+                    // Shaped as one boolean rather than a `!jdk_only_strict &&`
+                    // threaded through 179 disjuncts so the census below can
+                    // still see what the chain WOULD have admitted, and record
+                    // the strict refusal by name. A refusal nobody can name is
+                    // the failure mode this whole lane exists to remove.
+                    let jdk_only_strict = crate::vm::dispatch_policy(shared).is_jdk_only();
+                    let name_override = class_name == "java/io/ByteArrayInputStream"
                         // Jandex constructs a real-JDK BufferedInputStream around
                         // a resource stream.  Its registered native methods use
                         // the inherited `in` field, so its constructor must use
@@ -23143,6 +23194,26 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
+                    let check_override =
+                        method.is_abstract() || (!jdk_only_strict && name_override);
+                    // A name disjunct wanted this native and strict policy said
+                    // no. Record it where every other §1.4 observation goes, so
+                    // `--jdk-only-report` names the triple instead of leaving a
+                    // silent behaviour difference between the two modes. Gated
+                    // on a registration existing because a disjunct that finds
+                    // nothing registered was inert in both modes and refusing it
+                    // is not an event.
+                    if jdk_only_strict
+                        && name_override
+                        && !method.is_abstract()
+                        && shared
+                            .natives
+                            .native_methods
+                            .find(class_name, method_name, descriptor)
+                            .is_some()
+                    {
+                        record_check_override_strict_refusal(class_name, method_name, descriptor);
+                    }
                     if check_override_census_on() {
                         CHECK_OVERRIDE_REACHED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -24730,6 +24801,16 @@ fn invoke_on_class_shared_inner(
                 )));
             }
 
+            // §4 census — the JNI half. `record_invocation` cannot serve this
+            // edge (it keys on a `NativeMethodId`, and only
+            // `NativeMethodRegistry` issues one; a `dlsym` result has none), so
+            // the count lives on the table's own realm and the report adds it
+            // to `bridge_invocations`. Counted here, after the arity check, so
+            // a refused unsafe dispatch is not counted as one.
+            shared
+                .natives
+                .jni_bridge_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Safety: fn_ptr was stored from a trusted RegisterNatives / JNI_OnLoad call.
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(
@@ -24819,6 +24900,13 @@ fn invoke_on_class_shared_inner(
                 )));
             }
 
+            // §4 census — the auto-resolved (dlsym) half of the same edge; see
+            // the `RegisterNatives` arm above for why the count lives on the
+            // realm rather than going through `record_invocation`.
+            shared
+                .natives
+                .jni_bridge_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(
                     fn_ptr, env, receiver, call_args, descriptor,
@@ -27437,7 +27525,7 @@ mod tests {
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
             let mut cm = shared.classes.class_manager_write();
-            cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
+            cm.try_ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         // Sanity: that class is a stub.
         {

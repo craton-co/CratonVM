@@ -3120,23 +3120,6 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // because synthetic-jdk mode has no `java/sql/Types` bytecode to read the
     // static finals from.
     let types = "java/sql/Types";
-    r.register(types, "INTEGER", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
-    r.register(types, "VARCHAR", "I", |_ctx, _args| {
-        Ok(Some(Value::Int(12)))
-    });
-    r.register(types, "BIGINT", "I", |_ctx, _args| Ok(Some(Value::Int(-5))));
-    r.register(types, "DOUBLE", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
-    r.register(types, "FLOAT", "I", |_ctx, _args| Ok(Some(Value::Int(6))));
-    r.register(types, "BOOLEAN", "I", |_ctx, _args| {
-        Ok(Some(Value::Int(16)))
-    });
-    r.register(types, "BLOB", "I", |_ctx, _args| Ok(Some(Value::Int(2004))));
-    r.register(types, "CLOB", "I", |_ctx, _args| Ok(Some(Value::Int(2005))));
-    r.register(types, "NULL", "I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(types, "TIMESTAMP", "I", |_ctx, _args| {
-        Ok(Some(Value::Int(93)))
-    });
-    r.register(types, "DATE", "I", |_ctx, _args| Ok(Some(Value::Int(91))));
 
     // =========================================================================
     // NEW-14.N4 — DatabaseMetaData real fields

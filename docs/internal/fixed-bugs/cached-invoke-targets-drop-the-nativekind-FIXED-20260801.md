@@ -240,7 +240,7 @@ widening the cache entry was out of scope.
   — the list this hit path pre-filters on.
 * [The forced-native `String` policy, FIXED 2026-08-04](forced-native-string-policy-two-lists-that-disagree-FIXED-20260804.md)
   — the same cold-path/warm-path split, with a worse outcome.
-* [Additional wave-2 markers §1](additional-wave2-markers-not-in-the-original-inventory.md)
+* [Additional wave-2 markers §1](../feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md)
   — the JIT's MIC and PIC slots have the same missing-kind shape. The re-land
   bought time there by refusing to publish native entries under `JdkOnly`;
   fix both together or the JIT's refusal becomes permanent.
