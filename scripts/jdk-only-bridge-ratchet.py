@@ -54,7 +54,14 @@ to not repeat.
    the column every reader treats as "somebody checked this against the image".
    Nothing asked whether a STATED claim is true, so 24 rows shadowing concrete
    bytecode sat under a §1.5 claim for months, visible only to a `print`.
-4. `total_rows >= MIN_TOTAL_ROWS` — a **collapse detector, not a measurement**.
+4. `superseded.kind_disagreements <= baseline` and
+   `superseded.stub_lost_to_admitted <= baseline`, both `SLACK = 0`. A
+   superseded registration can never be dispatched, so its kind normally
+   decides nothing — EXCEPT when it disagrees with the winner's, because then
+   the kind that ships was chosen by call order in `vm_init` rather than by
+   anyone. 52 rows disagree; 4 of them are a `SyntheticStub` shipping as a
+   `Bridge`, which `--jdk-only` then admits.
+5. `total_rows >= MIN_TOTAL_ROWS` — a **collapse detector, not a measurement**.
    Same reasoning as `essential_registry_is_populated` in `stub_ratchet.rs`:
    the ratchet is a ratio argument and the denominator was never asserted, so a
    wiring break that dropped nine thousand registrations would leave the
@@ -151,13 +158,25 @@ def host_os():
 # columns let an inherited shadow in free and counted an inherited ACC_NATIVE
 # bridge as outstanding work.
 RATCHETS = (
-    ("without_acc_native", "bridge_without_acc_native",
+    ("bridge.without_acc_native", "bridge_without_acc_native",
      "Bridge registrations with no ACC_NATIVE target anywhere in the hierarchy"),
-    ("shadows_bytecode_anywhere", "bridge_shadows_bytecode",
+    ("bridge.shadows_bytecode_anywhere", "bridge_shadows_bytecode",
      "Bridge registrations shadowing concrete bytecode (declared or inherited)"),
-    ("stated_shadows_bytecode", "bridge_stated_shadows_bytecode",
+    ("bridge.stated_shadows_bytecode", "bridge_stated_shadows_bytecode",
      "Bridge registrations that STATE their kind and shadow concrete bytecode"),
+    ("superseded.kind_disagreements", "superseded_kind_disagreements",
+     "superseded registrations whose KIND disagrees with the winner's"),
+    ("superseded.stub_lost_to_admitted", "superseded_stub_lost_to_admitted",
+     "SyntheticStub registrations superseded by a Bridge/Intrinsic (admitted under --jdk-only)"),
 )
+
+
+def _at(block, path):
+    """`block["bridge"]["rows"]` for the path `"bridge.rows"`."""
+    cur = block
+    for part in path.split("."):
+        cur = cur[part]
+    return cur
 
 
 def _img(row):
@@ -252,6 +271,36 @@ def adjudicate(doc):
             "the census emitter changed the meaning of image_declaring_method"
         )
 
+    # --- the superseded population ------------------------------------------
+    #
+    # A registration that no longer owns its slot can never be dispatched, so
+    # its KIND normally decides nothing and it is not reclassification work.
+    # There is one exception and it is the whole reason this is counted: when
+    # the superseded row and the winner state DIFFERENT kinds, the kind that
+    # ships was decided by CALL ORDER in `vm_init`, and kind drives three
+    # policies (`--jdk-only` refuses a SyntheticStub, `CRATONVM_NO_STUBS` drops
+    # one, and only a SyntheticStub is subject to the yield arbitration).
+    #
+    # Measured on JDK 25.0.4/linux, 2026-08-11: 1,215 superseded rows, of which
+    # 1,163 agree with the winner and 52 do not. Four of the 52 are the
+    # dangerous direction — a registrar tagged the triple SyntheticStub and a
+    # later one ships it as a Bridge, so `--jdk-only` ADMITS a registration
+    # somebody classified as a fake.
+    superseded = [r for r in rows if not r.get("owns_slot", True)]
+    winners = {}
+    for r in rows:
+        if r.get("owns_slot", True):
+            winners[(r.get("class"), r.get("name"), r.get("descriptor"))] = r
+    disagreements = 0
+    stub_lost = 0
+    for r in superseded:
+        w = winners.get((r.get("class"), r.get("name"), r.get("descriptor")))
+        if w is None or w.get("kind") == r.get("kind"):
+            continue
+        disagreements += 1
+        if r.get("kind") == "synthetic-stub" and w.get("kind") in ("bridge", "intrinsic"):
+            stub_lost += 1
+
     return {
         "schema": BLOCK_SCHEMA,
         "census_schema_version": doc.get("schema_version"),
@@ -301,6 +350,11 @@ def adjudicate(doc):
             # is a 25th arriving unnoticed.
             "stated_shadows_bytecode": stated_shadow,
         },
+        "superseded": {
+            "rows": len(superseded),
+            "kind_disagreements": disagreements,
+            "stub_lost_to_admitted": stub_lost,
+        },
     }
 
 
@@ -331,6 +385,20 @@ def render_block(block):
         f"  {'BRIDGE rows with no ACC_NATIVE target':<48}"
         f"{b['without_acc_native']:>7}{100.0 * b['without_acc_native'] / rows:>7.0f}%"
     )
+    sup = block.get("superseded")
+    if sup:
+        lines.append("")
+        lines.append(
+            f"  superseded registrations (own no slot, never dispatch): {sup['rows']}"
+        )
+        lines.append(
+            f"    …whose KIND disagrees with the winner's:              "
+            f"{sup['kind_disagreements']}"
+        )
+        lines.append(
+            f"    …of those, a SyntheticStub shipping as Bridge/Intrinsic: "
+            f"{sup['stub_lost_to_admitted']}"
+        )
     return "\n".join(lines)
 
 
@@ -425,7 +493,7 @@ def gate(block, baseline, jdk_feature, os_name):
         ]
 
     for block_key, base_key, human in RATCHETS:
-        observed = block["bridge"][block_key]
+        observed = _at(block, block_key)
         frozen = entry[base_key]
         if observed > frozen + slack:
             failed = True
@@ -467,12 +535,12 @@ def gate(block, baseline, jdk_feature, os_name):
 # permanent version of the same check, and it needs no JDK, no VM and no build.
 # ---------------------------------------------------------------------------
 
-def _row(kind, cls, verdict):
+def _row(kind, cls, verdict, owns_slot=True, name="m"):
     return {
-        "class": cls, "name": "m", "descriptor": "()V", "kind": kind,
+        "class": cls, "name": name, "descriptor": "()V", "kind": kind,
         "registered_by": None, "overwrote": None, "invocations": 0,
         "kind_stated": False, "real_declaring_method": None,
-        "image_declaring_method": verdict,
+        "owns_slot": owns_slot, "image_declaring_method": verdict,
     }
 
 
@@ -520,7 +588,9 @@ def _selftest_baseline():
         "jdk": {"25/linux": {"mode": "compatible", "os": "linux",
                              "bridge_without_acc_native": 8,
                              "bridge_shadows_bytecode": 4,
-                             "bridge_stated_shadows_bytecode": 0}},
+                             "bridge_stated_shadows_bytecode": 0,
+                             "superseded_kind_disagreements": 0,
+                             "superseded_stub_lost_to_admitted": 0}},
     }
 
 
@@ -589,7 +659,7 @@ def selftest():
     # value. Defaulting to 0 fires on every run; defaulting to the observed
     # number freezes whatever is there today as acceptable, silently.
     stale_baseline = _selftest_baseline()
-    del stale_baseline["jdk"]["25/linux"]["bridge_stated_shadows_bytecode"]
+    del stale_baseline["jdk"]["25/linux"]["superseded_kind_disagreements"]
     check("a baseline missing a ratchet key is refused", 2, _synthetic_census(),
           baseline=stale_baseline)
     check("a census from another OS is refused, not scored", 2,
@@ -664,6 +734,32 @@ def selftest():
     stated_inh["kind_stated"] = True
     check("a STATED Bridge over INHERITED bytecode trips it too", 1,
           _synthetic_census(extra=[stated_inh]))
+
+    # 11. THE SUPERSEDED RATCHETS. A superseded row is normally inert -- it can
+    #     never be dispatched -- so an AGREEING pair must not fire anything.
+    agree = [_row("bridge", "p/AGREE", _NATIVE, owns_slot=False, name="dup"),
+             _row("bridge", "p/AGREE", _NATIVE, owns_slot=True, name="dup")]
+    check("a superseded row agreeing with the winner fires nothing", 0,
+          _synthetic_census(extra=agree))
+
+    #     A DISAGREEING pair does fire: which kind ships was decided by call
+    #     order, and kind drives three policies.
+    disagree = [_row("intrinsic", "p/DIS", _NATIVE, owns_slot=False, name="dup"),
+                _row("bridge", "p/DIS", _NATIVE, owns_slot=True, name="dup")]
+    check("a superseded row DISAGREEING with the winner trips the ratchet", 1,
+          _synthetic_census(extra=disagree))
+
+    #     And the dangerous direction trips BOTH superseded ratchets: a
+    #     registrar called it a stub, a later one ships it as a Bridge, and
+    #     `--jdk-only` then ADMITS it.
+    stub_lost = [_row("synthetic-stub", "p/STUBLOST", _NATIVE, owns_slot=False, name="dup"),
+                 _row("bridge", "p/STUBLOST", _NATIVE, owns_slot=True, name="dup")]
+    check("a SyntheticStub superseded by a Bridge trips both superseded ratchets", 1,
+          _synthetic_census(extra=stub_lost))
+    tripped_sup = sum(1 for ln in checks[-1][4]
+                      if ln.startswith("BRIDGE-RATCHET REGRESSION") and "superseded" in ln)
+    checks.append((tripped_sup == 2, "the stub-lost injection trips both superseded ratchets",
+                   2, tripped_sup, []))
 
     failed = 0
     for ok, name, want, got, lines in checks:
@@ -773,7 +869,7 @@ def main(argv=None):
         # own-class count while the gate scored the hierarchy-wide one, which
         # would have fired on a tree nobody had changed.
         for block_key, base_key, _ in RATCHETS:
-            entry[base_key] = block["bridge"][block_key]
+            entry[base_key] = _at(block, block_key)
         baseline.setdefault("jdk", {})[key] = entry
         os.makedirs(os.path.dirname(os.path.abspath(args.baseline)), exist_ok=True)
         with open(args.baseline, "w", encoding="utf-8") as fh:
