@@ -2953,6 +2953,28 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")?))
         },
     );
+    // …and the two rendering accessors, which `pti_real`/`tvi_real` above both
+    // have and this one did not. In a synthetic-library build there is no
+    // `WildcardTypeImpl` bytecode to fall back on, so `wildcard.toString()`
+    // raised `NoSuchMethodError: …WildcardTypeImpl.getTypeName()` and printed
+    // `…WildcardTypeImpl@6`, where HotSpot prints `? extends java.lang.Number`.
+    // `render_type_name` knows the shape (it grew a matching arm for this
+    // class); route both names to it, exactly as `pti_real` does.
+    registry.register(wti_real, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    registry.register(
+        wti_real,
+        "getTypeName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
     let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";
     registry.register(
         gat_real,

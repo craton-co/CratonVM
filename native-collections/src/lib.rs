@@ -13600,11 +13600,36 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // fixed-size list defensively rather than abort.
         _ => alloc_ref_array(ctx, 0),
     };
-    ctx.new_object_initialized(
+    let arr_pin = ctx.pin_native_root(arr);
+    let list = ctx.new_object_initialized(
         "java/util/Arrays$ArrayList",
         "([Ljava/lang/Object;)V",
         &[Value::Object(Some(arr))],
-    )
+    )?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
+    // "…and `Arrays$ArrayList(E[])` stores the array" is true of the REAL
+    // nested class only. In a synthetic-library build there is no
+    // `java/util/Arrays$ArrayList` class file: the name is fabricated by
+    // `ensure_synthetic_class`, its declared constructor set is empty, and the
+    // `invokespecial` above therefore stores nothing at all. Every accessor
+    // then read a backing array that was never written —
+    // `arrays_array_list_backing` returned `None`, `size()` answered 0, and
+    // `Arrays.asList("x","y","z").size() != 3` was pinned in
+    // `KNOWN_SYNTHETIC_JDK_GAPS` as a missing `Arrays.asList`. The method was
+    // not missing; the constructor delegation this native was rewritten to use
+    // only carries the array on the real-JDK path.
+    //
+    // Storing it here covers both paths without a native `<init>` on a real
+    // JDK class (which would shadow the real constructor for every instance):
+    // on the real-JDK path the constructor has already run, the read below
+    // finds the array, and this is a no-op.
+    if let Some(Value::Object(Some(l))) = list {
+        if arrays_array_list_backing(ctx, l).is_none() {
+            ctx.set_field_by_name(l, "a", Value::Object(Some(arr)));
+        }
+    }
+    Ok(list)
 }
 
 fn arrays_array_list_backing(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
