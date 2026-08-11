@@ -2744,6 +2744,35 @@ mod tests {
     }
 
     #[test]
+    fn only_cratonvm_built_carriers_are_answered_by_the_carrier_natives() {
+        let mut ctx = mock_ctx();
+
+        // A carrier this crate minted carries CONTENTS_FIELD/OPEN_TYPE_FIELD,
+        // so the natives must keep answering for it (synthetic-jdk mode has no
+        // bytecode to fall back to).
+        let carrier = build_composite_data(&mut ctx, None, &[("used".to_string(), Value::Long(1))])
+            .unwrap();
+        assert!(is_synthetic_carrier(&ctx, carrier));
+        assert!(!delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
+
+        let table = build_tabular_data(&mut ctx, None).unwrap();
+        assert!(is_synthetic_carrier(&ctx, table));
+        assert!(!delegates_to_bytecode(&ctx, table, TDS_CLASS));
+
+        // An instance the application constructed through the JDK's own
+        // bytecode has neither field. Answering it from the carrier fields
+        // returned null for everything — `getCompositeType()` in particular,
+        // which made `CompositeType.isValue()` reject a value against its own
+        // declared type. It must be handed back to the bytecode instead.
+        let real = match ctx.new_object(CDS_CLASS) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate a plain instance: {other:?}"),
+        };
+        assert!(!is_synthetic_carrier(&ctx, real));
+        assert!(delegates_to_bytecode(&ctx, real, CDS_CLASS));
+    }
+
+    #[test]
     fn build_string_keyed_map_synthetic_fallback_roundtrips() {
         // Drive the synthetic parallel-array fallback by forcing the
         // real-HashMap path to be skipped: the mock's `invoke` returns

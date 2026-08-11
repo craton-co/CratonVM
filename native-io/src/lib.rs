@@ -20291,6 +20291,33 @@ mod io_tests {
     }
 
     #[test]
+    fn reject_directory_open_rejects_a_directory_with_the_hotspot_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        match reject_directory_open(&path) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::FileNotFoundException { path: msg },
+            ))) => {
+                // The payload IS the Java exception message; HotSpot's
+                // `handleOpen` renders exactly `<path> (Is a directory)`.
+                assert_eq!(msg, format!("{path} (Is a directory)"));
+            }
+            other => panic!("expected FileNotFoundException for a directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_directory_open_allows_a_regular_file_and_a_missing_path() {
+        let f = temp_file_with_content("hello");
+        let path = f.path().to_string_lossy().to_string();
+        assert!(reject_directory_open(&path).is_ok());
+        // A path that does not exist is NOT this check's business — the open
+        // itself reports it, exactly as HotSpot's `open(2)` does. Rejecting it
+        // here would change a "No such file" into "Is a directory".
+        assert!(reject_directory_open("/tmp/cratonvm_no_such_path_xyzzy/inner").is_ok());
+    }
+
+    #[test]
     fn throw_input_mismatch_creates_error() {
         let err = throw_input_mismatch("bad token");
         // Should be some kind of error; just verify it is an error
