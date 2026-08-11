@@ -119,7 +119,7 @@ for ((i = 1; i <= N; i++)); do
   a=$(grep -c "points into RECLAIMED memory" "$LOG")
   m=$(grep -c "NoSuchMethodError" "$LOG")
   q=$(grep -c "^Hibernate: " "$LOG")
-  r=$(grep -m1 "^@@RESULT " "$LOG")
+  r=$(grep -m1 -o "@@RESULT .*" "$LOG")
 
   [ "$s" -gt 0 ] && hits_stale=$((hits_stale + 1))
   [ "$a" -gt 0 ] && hits_audit=$((hits_audit + 1))
