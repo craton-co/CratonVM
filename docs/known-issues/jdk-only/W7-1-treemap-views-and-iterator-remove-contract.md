@@ -1,6 +1,12 @@
 # Four families the widened differential found: TreeMap views, `Iterator.remove`, `String.format` floats, and a stream that kills the run
 
-**Status: OPEN.** Found 2026-08-10 by the widened
+**Status: families 1 and 2 CHANGED 2026-08-11, NOT VERIFIED. Families 3 and 4
+still OPEN and untouched.** Nothing below has been built or run — the source
+changes landed on `fix/jdk-only-treemap-views-and-iterator-contract-20260811`
+and the differential has not been re-taken. See "What landed" at the end for
+what changed, what deliberately did not, and what still needs measuring.
+
+Found 2026-08-10 by the widened
 `probes/ShadowDifferentialProbe.java`, in **`--real-jdk` mode** — so this is a
 compatibility defect, not a strict-mode one. It is the first thing that probe
 found after being widened past `java.util`'s immutable factories, which is the
@@ -91,3 +97,136 @@ section is fenced: a section that throws prints one `SECTION-DIED.<name>` line
 instead of removing every line after it from the transcript. That fence is what
 turned `IntStream.summaryStatistics()` from "the probe stops at line 284" into a
 named defect.
+
+## What landed, 2026-08-11 — families 1 and 2 only
+
+All of it in `native-collections/src/lib.rs`. **Not built, not run, not
+verified.** No row of either table above has been re-measured.
+
+### Family 1 — the navigable views are now genuinely backed
+
+The view is a real `java.util.TreeMap` object whose own storage is a CACHE, not
+the truth. A `TmViewSpec` side table names the backing map, the range and the
+direction, and `tm_sync_native_state` — the funnel every TreeMap content native
+already called on entry — rebuilds the cache from the backing map before that
+native reads it.
+
+That shape is what made the change small. Every READ native (`get`, `size`,
+`firstKey`, `ceilingEntry`, `keySet`, `entrySet`, `values`, `forEach`,
+`toString`, the iterator) became view-correct **without being edited**, because
+they all already went through that one call. Only the mutators needed a branch:
+
+  * `put` — redirects to the backing map, and raises `IllegalArgumentException`
+    for a key outside the range, as `NavigableSubMap.put` does;
+  * `remove` — redirects, and answers `null` (not an exception) for an
+    out-of-range key, as `NavigableSubMap.remove` does;
+  * `clear` — deletes the view's entries **from the backing map**;
+  * `pollFirstEntry` / `pollLastEntry` — take the end entry in the VIEW's order
+    and delete its key from the backing map;
+  * `putIfAbsent` — was the one conditional mutator writing the array itself
+    (`computeIfAbsent` and `merge` already route through `get` + `put`, so they
+    inherited the redirect for free).
+
+The six range-view natives — `headMap`/`tailMap`/`subMap`, both arities — are
+now one call each into a single `tm_new_range_view`, which is what stops their
+bound-comparison edge cases from drifting apart again.
+
+**`descendingMap()` and `descendingKeySet()` had no native registration at
+all.** That is the whole of the first two rows: the call reached the real
+`TreeMap` bytecode, which builds a `DescendingSubMap` over the `root` field, and
+a natively-managed TreeMap never populates `root` — hence `{}` and `[]`. Both
+are registered now (on `java/util/TreeMap` and on the `NavigableMap` interface),
+as an unbounded view with `descending = true`. `navigableKeySet` was registered
+alongside them: same missing-native shape, not measured by the probe.
+
+A descending view stores `Collections.reverseOrder(sourceComparator)` in its own
+comparator slot. That single field is what makes `firstKey`, `ceilingKey`,
+`pollFirstEntry` and the binary search all agree with the view's iteration order
+without a second code path for descending.
+
+The spec table is wired into all four overlay GC hooks (root scan, post-move
+remap, dead-key prune, recycled-identity sweep) exactly like
+`snapshot_itr_backing_table`, because it holds three references — the backing
+map and the two bound keys — that are reachable no other way.
+
+### Family 2 — `Iterator.remove()` has a state machine
+
+**The ArrayList half was a single missing store, and it explains four rows, not
+two.** `alloc_arraylist_iterator` wrote `this$0` and `cursor` and left `lastRet`
+at whatever `alloc_object` zero-initialises an `int` to — **0**, which
+`native_al_itr_remove` reads as "`next()` returned index 0". So
+`l.iterator().remove()` with no `next()` in front of it did not throw: it
+deleted `l.get(0)`, and every later `next(); remove()` pair was one element out
+of step.
+
+That cascade is the whole of the `ListIterator.set` + `add` row.
+`[B, B2, d]` against HotSpot's `[B, B2, c, d]` is not a `set`/`add` defect:
+`set` and `add` were operating correctly on a list that the earlier
+`Iterator.remove` had already left one element short. **Nothing was changed in
+`set` or `add`.** If that row still diverges after a rebuild, it is a second,
+genuinely separate defect and should be filed as one.
+
+`ConcurrentModificationException` is now possible: `al_set_size` — the one
+funnel every structural modification of an ArrayList-layout receiver passes
+through — bumps the real `AbstractList.modCount`, the iterator seeds
+`expectedModCount` from it at creation, and `next()`/`remove()` compare
+(`hasNext()` deliberately does not, matching the JDK, which is why the failure
+surfaces on the iteration after the offending `add`).
+
+The `TreeSet$Itr` snapshot iterator gained a fourth slot, `lastRet`. Its old
+guard was `cursor <= 0`, which catches `remove()` before any `next()` but not
+`remove()` twice in a row: the snapshot does not shift when the backing set
+loses an element, so the second call found the cursor unchanged and silently
+re-deleted. The `--jdk-only` stand-in for that iterator (a real
+`Arrays$ArrayItr` with `SnapshotItrBacking::last_removed_cursor`) already had
+the equivalent and was already correct.
+
+### What deliberately did NOT change
+
+  * **Families 3 and 4 — `String.format` floats, `StringBuilder.delete` bounds,
+    `IntStream.summaryStatistics()` killing the run.** Out of scope for this
+    branch and untouched. `SECTION-DIED.streamsSurface` is still live.
+  * **`HashMap$KeyItr`'s state machine.** It was already correct — `lastRet` is
+    seeded to `-1` at every creation site and reset by `remove()`. It is not the
+    broken snapshot iterator.
+  * **`native_map_key_itr_next` returning `null` past the end** where the JDK
+    throws `NoSuchElementException`. Real, adjacent, and not on either table
+    above; left alone rather than widened into.
+  * **`sort` / `replaceAll` do not bump `modCount`.** The JDK bumps there and we
+    do not, so those two remain undetected. Under-reporting is the safe
+    direction — it is exactly the pre-fix behaviour — where a spurious bump
+    would fail a loop the real JDK runs to completion.
+  * **No version stamp on the view cache.** It is rebuilt on every operation.
+    A stamp has to be bumped at every site that mutates a TreeMap's contents,
+    and a site missed there is a silently stale view — the exact defect class
+    this record is about.
+
+### What still needs measuring
+
+  1. **Re-take the differential.** Nothing here is verified. The eight rows
+     above are the acceptance list; the `String.format` and stream rows must
+     still fail.
+  2. **Does the CME change break a workload?** This is the one change with real
+     blast radius: code that mutates a list while iterating it used to get away
+     with it on CratonVM and now will not. Correct code cannot trip it (HotSpot
+     would already have thrown), so the risk is *our own* natives performing a
+     structural modification behind a user's iteration. Spring Boot and Tomcat
+     are the arms that would show it.
+  3. **View cost on a RETAINED view.** `tm.headMap(k)` used to cost one
+     allocation plus N comparator-driven `put`s at CREATION (O(N log N)), where
+     a rebuild is one allocation plus N bound comparisons — so the common
+     build-and-discard shape should be no worse, and probably better. A view
+     that is held and read repeatedly is the case that got more expensive, and
+     nobody has measured how common that is.
+  4. **A descending view in an image with no usable `java.util.Collections`**
+     falls back to the source comparator and therefore iterates ASCENDING rather
+     than failing. That is the same trade `native_ts_descending_set` already
+     makes; it has not been exercised.
+  5. **`descendingMap().headMap(k)` and the other view-of-a-view compositions.**
+     Bounds are recorded in the immediate source's ordering and a view of a view
+     records its parent, so composition should fall out without interval
+     arithmetic. Untested — the probe does not build one.
+  6. **`TreeSet$Itr` is now allocated with four fields instead of three.**
+     `native_ts_itr_remove` falls back to the old cursor heuristic for a
+     3-field shape, so a foreign construction path would degrade rather than
+     read past the object, but no such path is known to exist.

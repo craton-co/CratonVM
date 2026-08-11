@@ -1,8 +1,14 @@
 # Windows process enumeration: one snapshot per tree node, and one `OpenProcess` too many per `info()`
 
-**Status:** FIXED for the two structural costs (2026-08-07). Lane W6-10 of the
-jdk-wave2 pool. One finding is left OPEN and documented below rather than fixed.
+**Status:** FIXED. The two structural costs on 2026-08-07; finding 4 — the last
+open item, a snapshot failure indistinguishable from an empty machine — on
+2026-08-11. Lane W6-10 of the jdk-wave2 pool.
 **Files changed:** `native-io/src/process.rs`.
+
+**Not verified.** Nothing has been built or run for the 2026-08-11 change: it is
+a source change only, and the claims below are, as in the rest of this record,
+provable by reading the code. The Windows arm is the only one this dev host
+could compile even in principle — see "Which arm could not be compiled".
 
 This lane is a follow-up on a cost that this campaign introduced. Wave 3
 (`W3-6-processimpl-missing-natives.md`) gave Windows real process enumeration —
@@ -126,15 +132,15 @@ arrays at 100 and **retries** whenever the returned count exceeds that. On a
 machine with `N > 100` processes, `allProcesses()` therefore takes 2 snapshots
 and `100 + N` opens, the first 100 of whose results the caller discards.
 
-## Finding 4 (OPEN, not fixed) — a snapshot failure is indistinguishable from an empty machine
+## Finding 4 (FIXED 2026-08-11) — a snapshot failure was indistinguishable from an empty machine
 
-`os_snapshot_processes` returns `Vec<(i64, i64)>` and returns it **empty** when
-`CreateToolhelp32Snapshot` fails (null or `INVALID_HANDLE_VALUE`) or when
-`Process32FirstW` fails. Its callers are infallible, so:
+`os_snapshot_processes` **returned** `Vec<(i64, i64)>` and returned it **empty** when
+`CreateToolhelp32Snapshot` failed (null or `INVALID_HANDLE_VALUE`) or when
+`Process32FirstW` failed. Its callers were infallible, so:
 
-* `getProcessPids0` reports `0` found -> `ProcessHandle.allProcesses()` is an
+* `getProcessPids0` reported `0` found -> `ProcessHandle.allProcesses()` is an
   empty stream, `children()` is an empty stream;
-* `parent0` reports `-1` -> `ProcessHandle.parent()` is `Optional.empty()`.
+* `parent0` reported `-1` -> `ProcessHandle.parent()` is `Optional.empty()`.
 
 Those are exactly the answers a machine running nothing and a process with no
 parent would produce. This is the campaign's dominant defect species — a
@@ -148,28 +154,148 @@ HotSpot does not do this. `ProcessHandleImpl_md.c` (Windows) throws
 fails. `allProcesses()` being *restricted* is documented and legal; a list
 *truncated by an error* is a different thing and is not.
 
-Not fixed here for two reasons, both about blast radius rather than doubt:
+### What landed
 
-1. `RuntimeError` (`types/src/error.rs`) has no plain `RuntimeException` variant.
-   The nearest existing variant, `IllegalStateException`, is a `RuntimeException`
-   *subclass* — catchable by the same `catch`, but the wrong `getClass()`, and
-   this repo has a standing finding that a subclass is not good enough when the
-   spec names a class.
-2. Making the answer fallible has to travel through `os_snapshot_processes` ->
-   `os_parent_pid` / `os_list_processes` -> `getProcessPids0` / `parent0` /
-   `collect_descendant_pids`, across three `cfg` arms each, including the Linux
-   arm whose `read_dir("/proc")` failure has the identical shape.
+A `ProcessScanError` — a struct carrying one message string — is now the return
+channel every enumeration primitive in `process.rs` uses to say "the syscall did
+not run", and it is a *different value* from `Ok(vec![])` / `Ok(-1)`, which is the
+whole of the fix. Every signature that used to answer with the ambiguous value:
 
-The follow-up is therefore: add `RuntimeError::RuntimeException`, make
-`os_list_processes` return `Option<Vec<..>>` on both real arms, and have
-`getProcessPids0` throw rather than report `0`.
+| function | `cfg` arms | before | after |
+|---|---|---|---|
+| `os_snapshot_processes` | windows | `Vec<(i64,i64)>` | `Result<Vec<(i64,i64)>, ProcessScanError>` |
+| `os_parent_pid` | linux, windows, other | `i64` | `Result<i64, ProcessScanError>` |
+| `os_list_processes` | linux, windows, other | `Vec<(i64,i64)>` | `Result<Vec<(i64,i64)>, ProcessScanError>` |
+| `direct_child_pids` | linux, other | `Vec<i64>` | `Result<Vec<i64>, ProcessScanError>` |
+| `collect_descendant_pids` | windows, not(windows) | `Vec<i64>` | `Result<Vec<i64>, ProcessScanError>` |
 
-A related, smaller shape is left as-is deliberately: the enumeration loop ends
+and the three natives that reach them now throw instead of answering:
+
+* `native_proc_handle_get_process_pids0` (`ProcessHandleImpl.getProcessPids0`) —
+  `allProcesses()` / `children()`;
+* `native_proc_handle_parent0` (`ProcessHandleImpl.parent0`) — its `_ctx`
+  parameter had to become a real `ctx`, since throwing needs one;
+* `native_process_descendants` (`java.lang.Process.descendants()`).
+
+`os_parent_pid`'s Linux arm is `Result` for the signature's sake only and never
+returns `Err`: `ProcessHandleImpl_unix.c` throws for a failed `opendir("/proc")`
+but its `parent0` returns `-1` for a process it cannot read, because one
+unreadable `/proc/<pid>/status` means that process is gone, not that procfs is.
+The uniform return type is what keeps `parent0` a single un-`cfg`'d body. The
+same reasoning keeps a failed `/proc/<pid>/task` read inside `direct_child_pids`
+an `Ok` empty expansion — a descendant that dies mid-walk must not abort the
+walk.
+
+**The exception.** `RuntimeError` (`types/src/error.rs`) still has no plain
+`RuntimeException` variant, and the objection to `IllegalStateException` stands:
+it is a *subclass*, so it is catchable by the same `catch` but has the wrong
+`getClass()`. Rather than add a variant in a file this lane does not own, the
+throwable is constructed directly — `new_object` + pinned `<init>` +
+`MethodCallFailed::ExceptionThrown` — which is the mechanism this crate already
+uses for every exception class `RuntimeError` cannot spell (`stream_decoder.rs`'s
+`UnsupportedEncodingException`, `socket_channel.rs`'s `java.nio.channels`
+family, `nio_native.rs`'s `FileAlreadyExistsException`). No new mechanism, and
+no out-of-file change. `IllegalStateException` survives only as the fallback for
+a run in which `java/lang/RuntimeException` itself cannot be constructed.
+
+The message names the syscall and carries the OS error
+(`std::io::Error::last_os_error()` on Windows, the `io::Error` from `read_dir` on
+Linux) because "the snapshot failed" alone cannot be triaged from a log:
+`ERROR_ACCESS_DENIED` and `ERROR_BAD_LENGTH` — the latter a snapshot taken while
+the process table churns, which a caller may legitimately retry — are the same
+sentence without it. On the `Process32FirstW` path the error is captured
+*before* `CloseHandle`, which succeeds and would otherwise reset the thread's
+last-error.
+
+`Process32FirstW` failing is now thrown on unconditionally, `ERROR_NO_MORE_FILES`
+included. That is what HotSpot does, and a Toolhelp snapshot always contains at
+least the System process, so there is no honest empty case being suppressed.
+
+### The `not(any(linux, windows))` arms changed too, deliberately
+
+`os_list_processes`, `os_parent_pid` and `direct_child_pids` all had a
+platform-of-last-resort arm answering the empty list / `-1`. That is the same
+fabrication wave 3 removed from Windows *by implementing it*, and it is not
+oracle-faithful either: HotSpot has a `sysctl(KERN_PROC_ALL)` implementation on
+macOS/BSD and answers a real tree there. Those arms now return `Err` naming the
+missing probe, so `allProcesses()` / `parent()` / `descendants()` throw on such a
+host instead of claiming a machine with nothing running.
+
+This is a **behaviour change on a platform this campaign does not run**, and it
+is worth being explicit about: the macOS CI job is compile-only and advisory
+(`.github/workflows/cross-platform.yml`, `continue-on-error: true`), so nothing
+measured changes. The correct end state is a real arm, not a thrown exception;
+until someone writes it, the exception is the honest report.
+
+### Related shapes left as-is deliberately
+
+The enumeration loop ends
 on the first `Process32NextW` that returns FALSE without checking for
 `ERROR_NO_MORE_FILES`, so a mid-walk failure would silently truncate. A Toolhelp
 snapshot is a frozen copy, so `ERROR_NO_MORE_FILES` is the only realistic
 terminator, and HotSpot's loop has the identical shape — diverging here would be
 stricter than the oracle.
+
+## The rest of the file's error paths, swept
+
+Finding 4 is the shape "an OS failure is reported as a legitimate answer". Every
+other primitive in `process.rs` that can fail was re-read for it. Only the
+enumeration family was defective; the rest degrade to a value the JDK *itself*
+defines as "unknown", which is a different thing and is what the oracle does.
+
+| primitive | on failure | verdict |
+|---|---|---|
+| `win_process_times` (`OpenProcess` + `GetProcessTimes`) | `None` -> `start_time_or_any` -> `STARTTIME_ANY` (0) | **OK.** 0 is `ProcessHandleImpl`'s own "exists, start time unavailable", distinct from `STARTTIME_PROCESS_UNKNOWN` (-1), and every comparison against it is short-circuited. HotSpot's `getStatInfo` likewise leaves the fields unset. |
+| `os_process_image_name` (`QueryFullProcessImageNameW`) | `None` -> `Info.command` left null | **OK.** Every `Info` field is an `Optional`; `Optional.empty()` is the JDK's word for "not available", and HotSpot's Windows `getCmdlineInfo` does exactly this when the query fails. |
+| `foreign_pid_is_alive` (`GetExitCodeProcess`) | `queried && code == STILL_ACTIVE`, so a failed query reads as NOT alive | **OK, and deliberate.** `isAlive0` has no throwing contract — its whole vocabulary is a start time or `-1`. Note the asymmetry is already handled one level up: `ERROR_ACCESS_DENIED` from the `OpenProcess` is reported *alive*, because that means the process exists and we lack rights. |
+| `os_process_start_time` / `boot_time_millis` / `clock_ticks_per_second` (`/proc/<pid>/stat`, `/proc/stat`) | `None` -> `STARTTIME_ANY` | **OK.** Same as `win_process_times`; `ProcessHandleImpl_unix.c` returns `-1` from `os_getParentPidAndTimings` and its callers treat it as unknown rather than throwing. |
+| `os_process_cmdline` (`/proc/<pid>/cmdline`) | `None` -> `command`/`arguments` left null | **OK.** Same `Optional` reasoning. |
+| `start_time_matches` | an unreadable start time counts as a MATCH | **OK, documented at the site.** "Unknown is not disagreement" — the alternative is refusing to signal a live child because `/proc` was momentarily unreadable. |
+
+The one that is a judgement call rather than a clear pass is
+`foreign_pid_is_alive`: a `GetExitCodeProcess` that fails on a handle
+`OpenProcess` just returned is reported as "not alive", which is a fabricated
+*negative*. It is left alone because the native's return type cannot express
+anything else and HotSpot's cannot either — recorded here so the next reader does
+not have to re-derive it.
+
+## Which arm could not be compiled
+
+Nothing was built for this change (the lane is source-only), but the distinction
+worth stating is which arm this dev host could not have compiled **even in
+principle**, because a prior lane in this campaign was caught rewriting `cfg`
+arms the driving host never compiles (commit 7f59676f3, "the sweep rewrites cfg
+arms the driving host never compiles"):
+
+* **Windows** — the host's own target. Compilable here in principle.
+* **`target_os = "linux"`** — NOT compilable on this host. `os_parent_pid`,
+  `os_list_processes`, `direct_child_pids` and the `not(windows)`
+  `collect_descendant_pids`.
+* **`not(any(target_os = "linux", windows))`** — NOT compilable on this host, and
+  not on the Linux fixture host either. `os_parent_pid`, `os_list_processes`,
+  `direct_child_pids`.
+
+Mitigation, since a type error there is invisible until someone else builds: the
+three uncompilable arms were kept as trivial as the change allows. Every one of
+them is either a `return Ok(x)` where a bare `x` used to be, or a single
+`Err(ProcessScanError::new(..))` body with no borrowed state; the only arm with
+real new control flow (the captured-then-`CloseHandle` ordering on the
+`Process32FirstW` failure) is the Windows one. `ProcessScanError::new` is
+constructed on all three platforms, so no arm leaves it `dead_code`.
+
+## Out-of-file addition (not applied)
+
+`docs/known-issues/jdk-only/W2-7-fabricated-success-where-the-spec-mandates-failure.md`
+is the inventory for this defect species and is not this lane's file to edit. Its
+table should gain a row:
+
+| # | Symptom | Spec answer | Site | Disposition |
+|---|---------|-------------|------|-------------|
+| 6 | A failed process enumeration (`CreateToolhelp32Snapshot`/`Process32First`/`opendir("/proc")`) reported as an empty machine — `allProcesses()`/`children()`/`descendants()` empty, `parent()` `Optional.empty()` | `java.lang.RuntimeException` | `native-io/src/process.rs::os_snapshot_processes` and its callers | FIXED 2026-08-11 (W6-10 finding 4) |
+
+Worth noting for the inventory's own argument: this instance entered through the
+ERROR path of code that wave 3 had *already* fixed on its default path. The
+species does not stay fixed by fixing the happy path.
 
 ## Not changed, and why
 

@@ -27,6 +27,34 @@ fn serialization_not_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
     .into())
 }
 
+/// A real `java.io.NotSerializableException` for `class_name`, thrown as an
+/// object rather than as an `IOException` that names the class in its text.
+///
+/// HotSpot's `ObjectOutputStream.writeObject0` ends with
+/// `throw new NotSerializableException(cl.getName())`, and the message is the
+/// class name alone. Code catching it does so BY CLASS
+/// (`catch (NotSerializableException e)`), which no `IOException` carrying the
+/// name in a string can satisfy.
+///
+/// Falls back to the old `IOException` shape if the exception class cannot be
+/// constructed: the write must fail either way, and a wrong-classed failure is
+/// strictly better than a silent success.
+fn not_serializable_exception(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
+    let dotted = class_name.replace('/', ".");
+    let msg = ctx.create_string(&dotted);
+    match ctx.new_object_initialized(
+        "java/io/NotSerializableException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IOException {
+            message: format!("java.io.NotSerializableException: {dotted}"),
+        }
+        .into(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization byte-buffer registry (M24)
 //
@@ -1398,15 +1426,16 @@ fn oos_write_value(ctx: &mut dyn NativeContext, addr: usize, val: &Value) -> Met
         return Ok(None);
     }
 
-    // Reject non-Serializable classes the way the JDK does.
+    // Reject non-Serializable classes the way the JDK does — as a real
+    // `java.io.NotSerializableException` whose message is the offending class
+    // name, not as a plain `IOException` that merely NAMES that class in its
+    // text. `catch (NotSerializableException)` and any `instanceof` test are
+    // written against the class, and both answered "no" to the message form.
+    // `java/io/NotSerializableException` extends `ObjectStreamException`
+    // extends `IOException` in `jdk_superclass`, so the coarser handlers still
+    // match.
     if !class_is_serializable(ctx, class_id) {
-        return Err(RuntimeError::IOException {
-            message: format!(
-                "java.io.NotSerializableException: {}",
-                class_name.replace('/', ".")
-            ),
-        }
-        .into());
+        return Err(not_serializable_exception(ctx, &class_name));
     }
 
     // Assign the wire handle *before* writing fields so a self-referential
@@ -1662,6 +1691,14 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 4, Value::Int(1)); // block_mode on
         ctx.set_field(this, 5, Value::Int(0)); // enable_replace off
         let addr = this.as_ptr() as usize;
+        // Same recycled-address hazard as `ObjectInputStream.<init>` (see the
+        // note there): `write_stream_header` APPENDS through `oos_buf_write`,
+        // so without this reset a stream constructed at an address a previous,
+        // collected stream used would emit that stream's bytes ahead of its
+        // own magic — a second `AC ED 00 05` in the middle of the wire form.
+        // The handle table below was already re-initialised; the byte buffer
+        // was not.
+        oos_buf_reset(addr);
         write_stream_header(addr);
         // Initialize handle tracking for this stream
         {
@@ -2629,6 +2666,28 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
     // <init>(InputStream)V — if wrapping a ByteArrayInputStream, pre-load data
     r.register(cls, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Every side table in this module is keyed by the stream object's raw
+        // ADDRESS, and an address is recycled: the heap reuses one after the
+        // previous `ObjectInputStream` there is collected, and a test process
+        // that builds hundreds of VMs recycles whole arenas. So a fresh stream
+        // can inherit a DEAD stream's state unless construction wipes it.
+        //
+        // The wire-handle table is the one that bites: `ois_handles` maps
+        // handle → already-materialised object, so a stale table makes a
+        // `TC_REFERENCE` resolve to an object from the previous stream. Seen
+        // as `ClassCastException: cratonvm.SerializeBasic$Nested cannot be
+        // cast to cratonvm.SerializeBasic` — `SerializeBasic.testNestedObject`
+        // ran first, its `Nested` stayed behind under handle 0, and
+        // `testSimpleRoundTrip` read it back. Isolated, both pass; only the
+        // full corpus recycles the address.
+        //
+        // Clear on CONSTRUCTION rather than only on `close()`: a stream that
+        // is never closed (both of those fixtures, and most real code that
+        // wraps a `ByteArrayInputStream`) never reaches the close path at all.
+        let addr = this.as_ptr() as usize;
+        ois_clear_handles(addr);
+        ois_clear_filter_state(addr);
+        ois_buf_load(addr, Vec::new());
         if let Some(Value::Object(Some(stream))) = args.get(1) {
             ctx.set_field(this, 0, Value::Object(Some(*stream)));
             // Bridge: load bytes from ByteArrayInputStream into OIS buffer
@@ -4872,19 +4931,31 @@ fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
 // Registration entry point
 // ---------------------------------------------------------------------------
 
-/// REACHABILITY (traced wave 4 — read this before judging anything above).
+/// REACHABILITY (traced wave 4; the second gate came off 2026-08-11 — read
+/// this before judging anything above).
 ///
 /// This function has exactly one call site outside tests,
-/// `native-builtins/src/lib.rs`, and it is gated TWICE:
-///   * `#[cfg(feature = "experimental-serialization")]` — default-off; and
-///   * it sits inside `register_synthetic_overrides`, which is itself
-///     `#[cfg(feature = "synthetic-jdk")]`.
-/// So every registration below is dead in the default real-JDK build, and live
-/// only under `--synthetic-jdk` **plus** `experimental-serialization`. The one
-/// entry point of this module on the real-JDK path is
+/// `native-builtins/src/lib.rs`, and it is now gated ONCE: it sits inside
+/// `register_synthetic_overrides`, which is `#[cfg(feature =
+/// "synthetic-jdk")]`. So every registration below is dead in the default
+/// real-JDK build and live in every synthetic-library build.
+///
+/// It used to carry a second `#[cfg(feature = "experimental-serialization")]`
+/// at that call site, and the pair was a hole rather than a policy. In a
+/// synthetic build `java/io/ObjectOutputStream` and `ObjectInputStream` are
+/// fabricated stubs with no bytecode behind them, so withholding the natives
+/// left them present-but-INERT rather than absent: `writeObject` wrote
+/// nothing, `readObject` handed back a blank instance whose every field read
+/// null, and writing a non-`Serializable` raised nothing. That is precisely
+/// what `KNOWN_SYNTHETIC_JDK_GAPS` pinned as four "serialization gaps" in the
+/// class library — with the 7.6k lines of implementation they were said to be
+/// missing already compiled into the same binary (this module's own `#[cfg]`
+/// is `any(experimental-serialization, synthetic-jdk)`).
+///
+/// The one entry point of this module on the real-JDK path is
 /// `register_reflection_factory_serialization`, called from
-/// `register_essential_natives_with_shims` — and that call is
-/// `experimental-serialization`-gated too.
+/// `register_essential_natives_with_shims` — and that call is still
+/// `experimental-serialization`-gated.
 ///
 /// `register_byte_array_output_stream` is the near-exception: it is called a
 /// second time from lib.rs WITHOUT the serialization feature gate, but still
@@ -7537,11 +7608,21 @@ mod marshal_tests {
 
         let err = oos_write_value(&mut ctx, addr, &Value::Object(Some(obj)))
             .expect_err("non-Serializable must raise NotSerializableException");
-        let msg = format!("{:?}", err);
+        // The rejection is a THROWN `java.io.NotSerializableException` object
+        // now, not an `IOException` naming the class in its text, so assert on
+        // the class of what was thrown. `{:?}` on `ExceptionThrown` prints
+        // `ExceptionThrown(ObjectRef { ptr: 0x… })` — an address with no class
+        // — so a `msg.contains("NotSerializableException")` check would pass
+        // only for the fallback shape and silently accept a wrong class.
+        let thrown_class = match &err {
+            MethodCallFailed::ExceptionThrown(exc) => ctx
+                .class_name_of_id(ctx.class_id_of_object(*exc))
+                .unwrap_or_default(),
+            other => format!("{other:?}"),
+        };
         assert!(
-            msg.contains("NotSerializableException"),
-            "error should be NotSerializableException: {}",
-            msg
+            thrown_class.contains("NotSerializableException"),
+            "error should be NotSerializableException, got: {thrown_class}"
         );
     }
 

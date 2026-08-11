@@ -89,6 +89,14 @@ use std::path::{Path, PathBuf};
 /// and the change removes no lock construction at all. Recorded here rather than
 /// silently adjusted, because a baseline moved by someone other than the author
 /// of the improvement is the bookkeeping this ratchet exists to keep honest.
+///
+/// Held at 432 on 2026-08-11 while converting one lock. `jar_manifest`'s
+/// `mtime_memo` landed as a raw `Mutex` on 2026-08-10 (14f3eb6e0) and took the
+/// count to 433, i.e. `dev` was red; converting it to `OrderedPlMutex` at
+/// `LockLevel::Scratch` pays that back exactly. So this number is unchanged and
+/// the ratchet is green again — a conversion that lowered it would have been
+/// the wrong bookkeeping, because no lock has been retired below the frozen
+/// figure.
 const BASELINE_RAW_LOCKS: usize = 432;
 
 /// Minimum number of source lines the scan must see before its count means

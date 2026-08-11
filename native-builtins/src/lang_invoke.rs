@@ -4191,8 +4191,6 @@ fn lk_enforce_find_access(
     literal: Option<&str>,
     is_field: bool,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC};
-
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(()),
@@ -4261,17 +4259,8 @@ fn lk_enforce_find_access(
         Some(f) => f,
         None => return Ok(()),
     };
-    if (flags & ACC_PUBLIC) != 0 {
-        return Ok(());
-    }
-    let required = if (flags & ACC_PRIVATE) != 0 {
-        LK_MODE_PRIVATE
-    } else if (flags & ACC_PROTECTED) != 0 {
-        LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE
-    } else {
-        LK_MODE_PRIVATE | LK_MODE_PACKAGE
-    };
-    if (modes & required) != 0 {
+    let required = lk_modes_required_for_member(i32::from(flags));
+    if required == 0 || (modes & required) != 0 {
         return Ok(());
     }
     let kind = if is_field { "field" } else { "method" };
@@ -4283,6 +4272,253 @@ fn lk_enforce_find_access(
         message: format!(
             "no access: {kind} {owner}.{name} (modifiers 0x{flags:04x}) \
              from Lookup with modes 0x{modes:04x}"
+        ),
+    }
+    .into())
+}
+
+/// Which `allowedModes` bits admit a member whose access flags are `flags`?
+/// **Any one** of the returned bits is enough. `0` means "no mode bit is
+/// required" — the member is `public`, and only the target class's own
+/// accessibility can still refuse it.
+///
+/// Shared by [`lk_enforce_find_access`] and [`lk_enforce_unreflect_access`] on
+/// purpose. `Lookup.findVirtual(C, "m", t)` and
+/// `Lookup.unreflect(C.getDeclaredMethod("m"))` are the same access question
+/// asked two ways — the JDK routes both into the same `getDirectMethod`
+/// (`MethodHandles.java`) — so the two gates must not be able to drift apart.
+/// Two predicates answering one question differently is the shape that produced
+/// several defects in this campaign.
+fn lk_modes_required_for_member(flags: i32) -> i32 {
+    use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC};
+    if (flags & i32::from(ACC_PUBLIC)) != 0 {
+        return 0;
+    }
+    if (flags & i32::from(ACC_PRIVATE)) != 0 {
+        LK_MODE_PRIVATE
+    } else if (flags & i32::from(ACC_PROTECTED)) != 0 {
+        LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE
+    } else {
+        LK_MODE_PRIVATE | LK_MODE_PACKAGE
+    }
+}
+
+/// How an `unreflect*` entry point treats the reflective object's
+/// `setAccessible` flag. The three arms are not a style choice — the JDK 25
+/// javadoc states a different rule for each, and the two that differ from the
+/// common case are stated explicitly *because* they differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LkUnreflectKind {
+    /// `unreflect(Method)`, `unreflectConstructor(Constructor)`,
+    /// `unreflectGetter(Field)`, `unreflectSetter(Field)`.
+    ///
+    /// > "If the method's `accessible` flag is not set, access checking is
+    /// > performed immediately on behalf of the lookup class."
+    ///
+    /// — and the implementation is the literal reading of that sentence:
+    /// `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;`. `IMPL_LOOKUP`
+    /// is the TRUSTED lookup, so a set flag does not soften the check, it
+    /// replaces the Lookup that performs it. Nothing is refused.
+    AccessibleWaives,
+    /// `unreflectVarHandle(Field)`.
+    ///
+    /// > "Access checking is performed immediately on behalf of the lookup
+    /// > class, **regardless of the value of the field's `accessible` flag**."
+    ///
+    /// The JDK body reads `f.isAccessible()` nowhere, unlike `unreflectField`
+    /// three methods above it.
+    AccessibleIgnored,
+    /// `unreflectSpecial(Method, Class)`.
+    ///
+    /// > "Before method resolution, if the explicitly specified caller class is
+    /// > not identical with the lookup class, or if this lookup object does not
+    /// > have private access privileges, the access fails."
+    ///
+    /// `checkSpecialCaller` runs before anything else and the body carries the
+    /// comment `// ignore m.isAccessible:  this is a new kind of access`. Only
+    /// the private-access half is enforced here — see the note in
+    /// [`lk_enforce_unreflect_access`] on why the `specialCaller` half is not.
+    Special,
+}
+
+/// Refuse an `unreflect*` conversion the Lookup's `allowedModes` does not
+/// permit — the reflection-shaped twin of [`lk_enforce_find_access`], and the
+/// gate the `unreflect` family never had.
+///
+/// ## Why this is a real hole and not a theoretical one
+///
+/// `Lookup.find*` has consulted `allowedModes` since the W4-1 fix, so
+/// `publicLookup().findVirtual(Holder.class, "secret", …)` is refused. The
+/// `unreflect` family reached the identical member with the identical Lookup
+/// and was admitted, because it never asked: one line of Java
+/// (`pub.unreflect(Holder.class.getDeclaredMethod("secret", int.class))`)
+/// walked around the whole check. The two entry points must answer alike; the
+/// JDK funnels them into the same `getDirectMethod`/`getDirectField`, which is
+/// where its own check lives.
+///
+/// ## The rule, and what it deliberately does not ask
+///
+/// **Mode bits only**, exactly as [`lk_enforce_find_access`], and sharing
+/// [`lk_modes_required_for_member`] so the two cannot drift:
+///
+/// * modes unreadable (`None`) -> allow. The valve. A Lookup shape this VM does
+///   not model must never become an `IllegalAccessException`.
+/// * `PRIVATE` set -> allow, before touching the member. `MethodHandles.lookup()`
+///   (0x5F), `privateLookupIn` (0x1F) and the JDK's TRUSTED lookup (-1) all land
+///   here, which is every Lookup Spring / Hibernate / Jackson / Groovy /
+///   ByteBuddy / `LambdaMetafactory` ever hold. They cannot be refused by this
+///   check at all.
+/// * the reflective object's `accessible` flag, for the arms whose javadoc says
+///   it waives the check -> allow.
+/// * `modes == 0` -> refuse everything, public members included (measured in
+///   [`lk_read_allowed_modes_opt`]: `lookup().dropLookupMode(PUBLIC)` is 0 and
+///   refuses a public method of a public class).
+/// * `UNCONDITIONAL` alone (`publicLookup()`, 0x20) -> the target CLASS must be
+///   public. Same rule, same measurement, as the find* gate.
+/// * otherwise the member's own modifier picks the required bit.
+/// * member modifiers unreadable -> allow.
+///
+/// **`lookupClass` is not consulted, here or in the find* gate.** Ours comes
+/// from a stack walk in the `MethodHandles.lookup()` native; a wrong answer
+/// there must never turn into a refusal. That is what keeps the whole nestmate
+/// / same-package / `protected`-receiver family out of this function, and it is
+/// also why `unreflectSpecial`'s `specialCaller != lookupClass()` conjunct is
+/// NOT enforced — only its `(lookupModes() & PRIVATE) == 0` half is. Both
+/// omissions are one-directional: they can admit something HotSpot refuses,
+/// never refuse something HotSpot admits.
+///
+/// **Mode scope: every mode.** This is JDK reflection semantics, not a
+/// strictness policy, so it is not gated on `--jdk-only` — the same reasoning
+/// under which the `find*` gate, the `setAccessible` gate and the `exports`
+/// gate all run unconditionally. In `Compatible` (`--real-jdk`) mode the only
+/// behaviour it can change is a case CratonVM answered differently from HotSpot
+/// 25, and the PRIVATE short-circuit above means no framework Lookup reaches
+/// the refusal. It cannot fire at all in `--synthetic-jdk`: there,
+/// `register_classloader_natives` runs LAST and its `lk_unreflect` /
+/// `lk_unreflect_special` win the registration, so these natives are not even
+/// the live ones (see the ordering note in
+/// `classloader.rs::register_classloader_natives`); the four this file alone
+/// registers still route here, and answer from the same mode bits.
+///
+/// Called as the FIRST statement of each native for the same reason
+/// [`lk_enforce_find_access`] is: `args` still holds the ObjectRefs the VM
+/// handed over and nothing has had a chance to allocate and move them. Every
+/// read below is a field/flags read; none allocates on the Java heap.
+fn lk_enforce_unreflect_access(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    kind: LkUnreflectKind,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(()),
+    };
+    // `None` is "could not read the modes" and stays permissive; `Some(0)` is
+    // the JDK's zero-mode Lookup, which refuses every member.
+    let modes = match lk_read_allowed_modes_opt(ctx, this) {
+        None => return Ok(()),
+        Some(m) => m,
+    };
+    // The overwhelmingly common answer, and the cheapest: short-circuit before
+    // reading anything off the reflective object.
+    if (modes & LK_MODE_PRIVATE) != 0 {
+        return Ok(());
+    }
+    let member = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        // A null/absent member is the native's own error to raise (NPE on
+        // HotSpot); it is not an access decision.
+        _ => return Ok(()),
+    };
+
+    if kind == LkUnreflectKind::Special {
+        // `checkSpecialCaller`: `if (allowedModes == TRUSTED) return;` —
+        // covered by the PRIVATE short-circuit above, since TRUSTED is -1 —
+        // `if ((lookupModes() & PRIVATE) == 0 || …) throw`. Reaching here means
+        // the PRIVATE bit is clear, so the first disjunct has already decided.
+        let owner = match ctx.get_field_by_name(member, "clazz") {
+            Value::Object(Some(m)) => mirror_class_name(ctx, m).unwrap_or_default(),
+            _ => String::new(),
+        };
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no private access for invokespecial: class {}, from Lookup with \
+                 modes 0x{modes:04x}",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
+
+    // JDK: `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;`. The flag
+    // does not weaken the check, it hands it to the TRUSTED lookup — so a set
+    // flag is an unconditional allow, and reading it is only worth doing on the
+    // arms whose javadoc says so.
+    if kind == LkUnreflectKind::AccessibleWaives
+        && crate::lang_class::accessible_override_is_set(ctx, member)
+    {
+        return Ok(());
+    }
+
+    let declaring = match ctx.get_field_by_name(member, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let owner = || {
+        declaring
+            .and_then(|m| mirror_class_name(ctx, m))
+            .unwrap_or_else(|| "?".to_string())
+            .replace('/', ".")
+    };
+
+    if modes == 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "no access: {} from Lookup with modes 0x0000 (no lookup modes remain)",
+                owner()
+            ),
+        }
+        .into());
+    }
+    // UNCONDITIONAL's rule is about the TARGET CLASS, not the member:
+    // `publicLookup()` reaches public members of PUBLIC types only. Identical
+    // to the find* gate's arm, including its measurement.
+    if modes == LK_MODE_UNCONDITIONAL
+        && declaring.is_some_and(|m| !crate::lang_class::mirror_is_public(ctx, m))
+    {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "symbolic reference class is not accessible: class {}, from public Lookup",
+                owner()
+            ),
+        }
+        .into());
+    }
+
+    // The member's own flags are already on the reflective object — no
+    // `declared_methods` walk, unlike the find* gate which only has a name.
+    // An unreadable `modifiers` slot is the same valve as an unresolvable
+    // member there: allow.
+    let Value::Int(flags) = ctx.get_field_by_name(member, "modifiers") else {
+        return Ok(());
+    };
+    let required = lk_modes_required_for_member(flags);
+    if required == 0 || (modes & required) != 0 {
+        return Ok(());
+    }
+    let member_name = match ctx.get_field_by_name(member, "name") {
+        // A `Constructor` has no `name` field; `get_field_by_name` answers
+        // `Object(None)` and the JDK's own name for the member is `<init>`.
+        Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_else(|| "<init>".to_string()),
+        _ => "<init>".to_string(),
+    };
+    // A REAL `java.lang.IllegalAccessException` (checked) — what every
+    // `unreflect*` overload declares, and what callers catch.
+    Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+        message: format!(
+            "no access: {}.{member_name} (modifiers 0x{flags:04x}) \
+             from Lookup with modes 0x{modes:04x}",
+            owner()
         ),
     }
     .into())
@@ -10537,6 +10773,8 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     // args[0] = this (Lookup), args[1] = Method object
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
@@ -10579,6 +10817,10 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`. This one
+    // needs PRIVATE and does NOT honour `m.isAccessible()`; the JDK body says
+    // so in as many words.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::Special)?;
     // args[0] = Lookup, args[1] = Method, args[2] = specialCaller class
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
@@ -10647,6 +10889,8 @@ fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (clazz/name/type at hierarchy-adjusted slots 2/4/5) rather than on
     // our legacy synthetic-slot layout. See the C5 fix in
     // `lang_class.rs::create_field_object` for details.
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -10682,6 +10926,15 @@ fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    //
+    // NOT enforced here, and still open: `unreflectSetter` must also refuse a
+    // TRUSTED-final field ("fields which are both `static` and `final` may
+    // never be set"). That is `MemberName.isTrustedFinalField`, a different
+    // question from lookup modes, and guessing at it would refuse the
+    // `setAccessible`-then-`unreflectSetter` idiom that deserialization
+    // frameworks depend on. Recorded in W6-8 rather than written blind.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -10718,6 +10971,11 @@ fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 /// `MethodHandles.Lookup.unreflectVarHandle(Field)`.
 fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`. This is
+    // the one arm that must NOT honour the `accessible` flag: "Access checking
+    // is performed immediately on behalf of the lookup class, regardless of the
+    // value of the field's `accessible` flag."
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleIgnored)?;
     const ACC_STATIC: i32 = 0x0008;
     let field_obj = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
@@ -10871,6 +11129,8 @@ fn access_mode_name(ctx: &mut dyn NativeContext, mode: ObjectRef) -> String {
 }
 
 fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose — see `lk_enforce_unreflect_access`.
+    lk_enforce_unreflect_access(ctx, args, LkUnreflectKind::AccessibleWaives)?;
     // args[0] = Lookup, args[1] = java.lang.reflect.Constructor
     let ctor_obj = match args.get(1) {
         Some(Value::Object(Some(c))) => *c,

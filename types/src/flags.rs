@@ -1718,6 +1718,12 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_FORKJOINPOOL`
     pub synthetic_forkjoinpool: bool,
 
+    /// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — answer
+    /// `java.lang.management.MemoryUsage.toString()` from the shim instead of
+    /// the class's own bytecode. On a real-JDK run the real bytecode is the
+    /// default. [`parse::one_true_yes_exact`].
+    pub synthetic_memoryusage_tostring: bool,
+
     /// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1|true|yes` — opt back into the
     /// synthetic JMX MXBean type mapping that types every unrecognised Java
     /// type as `SimpleType.STRING` and converts nothing. The real JDK
@@ -1915,6 +1921,10 @@ impl NativeFlags {
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
             synthetic_forkjoinpool: present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL"),
+            synthetic_memoryusage_tostring: one_true_yes_exact(
+                src,
+                "CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING",
+            ),
             synthetic_mxbean_mapping: one_true_yes_exact(
                 src,
                 "CRATONVM_SYNTHETIC_MXBEAN_MAPPING",
@@ -2470,6 +2480,43 @@ mod tests {
             Some(OsString::from("enabled"))
         );
         assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    /// `synthetic_memoryusage_tostring` is served by the snapshot, and reads
+    /// the same three truth words its siblings do.
+    ///
+    /// `native-builtins`' `memoryusage_tostring_shim_enabled` read this name
+    /// with a raw `std::env::var` and a bespoke `Ok("1") | Ok("true")` table
+    /// when it landed, so the value the VM acted on came from the live process
+    /// environment — invisible to `with_thread_overrides`, unreachable from
+    /// `CRATONVM_REAL=-memoryusage-tostring`, and silently the developer's
+    /// ambient environment in any test that tried to arrange it. This pins the
+    /// parse; `flag_groups::tests::the_20260811_declarations_expand_from_their_group_spelling`
+    /// pins the grouped spelling that feeds it.
+    #[test]
+    fn synthetic_memoryusage_tostring_is_snapshot_backed_and_reads_one_true_yes() {
+        assert!(
+            !VmFlags::from_source(&MapSource::empty())
+                .natives
+                .synthetic_memoryusage_tostring,
+            "the real JDK bytecode is the default",
+        );
+        for word in ["1", "true", "yes"] {
+            assert!(
+                VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must turn the shim back on",
+            );
+        }
+        for word in ["0", "false", "no", ""] {
+            assert!(
+                !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must leave the default alone",
+            );
+        }
     }
 
     #[test]

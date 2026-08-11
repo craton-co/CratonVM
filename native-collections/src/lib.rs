@@ -896,6 +896,13 @@ fn clear_overlay_entries_for_key(key: usize, owner_addr: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
+    // A navigable view's spec. Without this sweep a later TreeMap that recycled
+    // a dead view's identity hash would inherit the view marker and silently
+    // redirect its own `put`/`remove` into somebody else's map.
+    tm_view_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     // `lhm_ptr_cache` maps raw pointer -> packed key; drop any entry pointing at
     // the cleared key so a stale pointer can't resolve back to it.
     lhm_ptr_cache()
@@ -2208,6 +2215,20 @@ enum SnapshotItrRoute {
     /// A native `TreeSet` (including the descending snapshot), removed through
     /// the sorted array + size bookkeeping in [`ts_remove_element`].
     TreeSet,
+    /// A native `LinkedList`, removed through [`native_ll_remove_object`].
+    ///
+    /// This is the one route whose `remove()` is not the same operation the
+    /// fabricated iterator performed: `LinkedList$Itr` is node-live and unlinks
+    /// the node `next()` returned, while this deletes the FIRST occurrence of
+    /// that element. The two differ only for a list holding duplicates, and
+    /// only on the `--jdk-only` path — where the alternative is not a
+    /// better-behaved `remove()` but a `NoClassDefFoundError` before `next()`.
+    LinkedList,
+    /// A native `ArrayDeque`, removed through
+    /// [`native_ad_remove_first_occurrence`] — which is the same call
+    /// `native_ad_itr_remove` already makes for the fabricated `ArrayDeque$Itr`,
+    /// so this route changes the class name and nothing else.
+    ArrayDeque,
 }
 
 /// The live collection a snapshot iterator's `remove()` must delete from.
@@ -3858,11 +3879,69 @@ fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
     ctx.set_field(this, data_slot, Value::Object(Some(buf)));
 }
 
+/// The `AbstractList.modCount` slot of a list receiver, or `None` when there is
+/// no slot this crate may write.
+///
+/// `modCount` only exists in the real-JDK layout, where `AbstractList`
+/// contributes it ahead of `ArrayList.elementData`/`size`. In synthetic-jdk mode
+/// `al_slots_for` falls back to `(data = 0, size = 1)`, so a resolver that
+/// answered `Some(0)` there would have us store an `Int` over the backing-array
+/// REFERENCE — the same heap corruption `tm_obj_key`'s doc block describes for
+/// the TreeMap slots, and the GC would then decode a garbage discriminant out of
+/// a reference slot. Hence the two exclusions: the slot has to be in range for
+/// this receiver AND distinct from the two slots the list natives already own.
+///
+/// `None` degrades to the pre-2026-08-11 behaviour (no comodification detection
+/// at all), which is the safe direction: an iterator that never throws
+/// `ConcurrentModificationException` is what every CratonVM list iterator did
+/// before this, so a build with no resolvable `modCount` loses nothing.
+#[inline]
+fn al_mod_count_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    let slot = ctx.resolve_field_index("java/util/AbstractList", "modCount")?;
+    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
+    if slot == data_slot || slot == size_slot || slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    Some(slot)
+}
+
+/// Current `modCount` of `this`, or `None` when the receiver has no usable slot.
+#[inline]
+fn al_mod_count(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    match ctx.get_field(this, al_mod_count_slot(ctx, this)?) {
+        Value::Int(v) => Some(v),
+        _ => None,
+    }
+}
+
 #[inline]
 fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     let (_, size_slot, _) = al_slots_for(ctx, this);
     if size_slot >= ctx.object_num_fields(this) {
         return;
+    }
+    // W7-1 family 2: `for (String s : l) l.add(s)` raised no
+    // `ConcurrentModificationException` on CratonVM because nothing in this
+    // crate had ever written `modCount` — the field the JDK's
+    // `checkForComodification` compares against. Every structural modification
+    // of an ArrayList-layout receiver changes its logical size and every such
+    // change lands here, so this is the one funnel that sees all of them; a
+    // same-value write is not a structural change and must not bump (callers
+    // re-assert the current size on paths like `resync_values_view`).
+    //
+    // Deliberately UNDER-reports relative to the JDK: `sort` and `replaceAll`
+    // bump `modCount` there and do not change the size here, so they stay
+    // undetected. Under-reporting is the safe direction — it is exactly the old
+    // behaviour — whereas a spurious bump would fail a loop that the real JDK
+    // runs to completion.
+    if !matches!(ctx.get_field(this, size_slot), Value::Int(n) if n == size) {
+        if let Some(mod_slot) = al_mod_count_slot(ctx, this) {
+            let cur = match ctx.get_field(this, mod_slot) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(this, mod_slot, Value::Int(cur.wrapping_add(1)));
+        }
     }
     ctx.set_field(this, size_slot, Value::Int(size));
 }
@@ -5389,6 +5468,21 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 /// Build an ArrayList iterator without retaining either the list or the new
 /// iterator as a raw Rust local across allocation/reference stores.
+///
+/// W7-1 family 2 (2026-08-11): this used to write only `this$0` and `cursor`
+/// and leave `lastRet` at whatever `alloc_object` zero-initialises an `int` to,
+/// i.e. **0** — which `native_al_itr_remove` reads as "`next()` returned index
+/// 0". So `l.iterator().remove()` with no `next()` in front of it did not raise
+/// `IllegalStateException`: it silently deleted `l.get(0)`, and every later
+/// `next(); remove()` pair was then one element out of step. That single missing
+/// store is what produced four of the record's measured rows —
+/// `Iterator.removeBeforeNext`, `Iterator.afterRemove` (`[c, d]` for `[b, c, d]`)
+/// and, purely as a cascade of the list already being one element short,
+/// `ListIterator.afterSetAdd` (`[B, B2, d]` for `[B, B2, c, d]`). `set`/`add`
+/// were never wrong themselves.
+///
+/// `expectedModCount` is seeded from the list's live `modCount` for the same
+/// reason the real constructor does it — see `al_itr_check_comod`.
 fn alloc_arraylist_iterator(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
     let roots_base = ctx.pin_native_root(list);
@@ -5399,6 +5493,18 @@ fn alloc_arraylist_iterator(ctx: &mut dyn NativeContext, list: ObjectRef) -> Res
     ctx.set_field(itr, list_slot, Value::Object(Some(list)));
     let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.set_field(itr, cursor_slot, Value::Int(0));
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    // `-1` is the JDK's "no element has been returned yet" sentinel, and the
+    // value `ArrayList$Itr.remove()` restores after every successful removal.
+    let last_ret_slot = al_itr_last_ret_slot(ctx);
+    if last_ret_slot < ctx.object_num_fields(itr) {
+        ctx.set_field(itr, last_ret_slot, Value::Int(-1));
+    }
+    let itr = ctx.read_native_pin(itr_pin, itr);
+    if let Some(expected_slot) = al_itr_expected_mod_count_slot(ctx, itr) {
+        let seen = al_mod_count(ctx, list).unwrap_or(0);
+        ctx.set_field(itr, expected_slot, Value::Int(seen));
+    }
     let itr = ctx.read_native_pin(itr_pin, itr);
     ctx.unpin_native_roots(roots_base);
     Ok(itr)
@@ -13134,6 +13240,66 @@ fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
         .unwrap_or(AL_ITR_FIELD_LAST_RET)
 }
 
+/// Resolve the `expectedModCount` slot of `itr`, or `None` when this build has
+/// no slot to keep it in.
+///
+/// Same three exclusions as [`al_mod_count_slot`], and for the same reason: the
+/// synthetic `ArrayList$Itr` layout is `(list, cursor, lastRet)` with no fourth
+/// field, so a resolver answering an index that collides with one of those would
+/// clobber the iterator's own position. `None` means "no comodification
+/// detection on this iterator", which is the pre-fix behaviour.
+#[inline]
+fn al_itr_expected_mod_count_slot(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<usize> {
+    let slot = ctx.resolve_field_index("java/util/ArrayList$Itr", "expectedModCount")?;
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    if slot == cursor_slot
+        || slot == list_slot
+        || slot == al_itr_last_ret_slot(ctx)
+        || slot >= ctx.object_num_fields(itr)
+    {
+        return None;
+    }
+    Some(slot)
+}
+
+/// The JDK's `ArrayList$Itr.checkForComodification()`: fail the iteration if the
+/// list was structurally modified through any path other than this iterator.
+///
+/// W7-1 family 2. `for (String s : l) { l.add(s); }` is *specified* to die here,
+/// and the probe that measured this had to bound the loop precisely because a VM
+/// that never throws grows the list until the heap is gone. Both halves are
+/// `Option`: an iterator with no `expectedModCount` slot, or a list with no
+/// `modCount` slot, keeps the old never-throw behaviour rather than guessing.
+fn al_itr_check_comod(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+    list: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let expected = match al_itr_expected_mod_count_slot(ctx, itr) {
+        Some(slot) => match ctx.get_field(itr, slot) {
+            Value::Int(v) => v,
+            _ => return Ok(()),
+        },
+        None => return Ok(()),
+    };
+    match al_mod_count(ctx, list) {
+        Some(actual) if actual != expected => {
+            Err(cratonvm_types::error::RuntimeError::ConcurrentModificationException.into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Re-seed `itr`'s `expectedModCount` from `list` after a removal THROUGH the
+/// iterator — the JDK's `expectedModCount = modCount` line. Without it the
+/// iterator's own `remove()` would trip the check it just installed.
+fn al_itr_sync_mod_count(ctx: &mut dyn NativeContext, itr: ObjectRef, list: ObjectRef) {
+    if let Some(slot) = al_itr_expected_mod_count_slot(ctx, itr) {
+        let seen = al_mod_count(ctx, list).unwrap_or(0);
+        ctx.set_field(itr, slot, Value::Int(seen));
+    }
+}
+
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
@@ -13222,6 +13388,10 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(l)) => l,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `ArrayList$Itr.next()` opens with `checkForComodification()`; `hasNext()`
+    // deliberately does not, which is why the JDK's failure surfaces on the
+    // iteration AFTER the offending `add`, not on the `hasNext` before it.
+    al_itr_check_comod(ctx, this, list)?;
     let (data, size) = al_state(ctx, list);
     if cursor >= size {
         // Fix (item 3): `Iterator.next()` past the end must throw
@@ -13281,6 +13451,11 @@ fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(l)) => l,
         _ => return Ok(None),
     };
+    // `ArrayList$Itr.remove()` checks for comodification after the `lastRet`
+    // guard above and before touching the list — same order as the JDK, so a
+    // stale iterator reports `IllegalStateException` where the JDK does and
+    // `ConcurrentModificationException` where the JDK does.
+    al_itr_check_comod(ctx, this, list)?;
     // Live `values()` view: capture the element about to be removed and, after
     // removing it from the snapshot, delete the matching entry from the source
     // map. Captured before removal because the shift clobbers the slot.
@@ -13293,13 +13468,35 @@ fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // Delegate to the list's own native removal so backing-array shifting and
     // size bookkeeping stay in one place.
-    native_al_remove_at(ctx, &[Value::Object(Some(list)), Value::Int(last_ret)])?;
-    if let (Some(source), Some(value)) = (view_src, removed) {
-        propagate_list_removal(ctx, source, value)?;
+    //
+    // GC-SAFETY: `native_al_remove_at`/`propagate_list_removal` dispatch
+    // `equals` and allocate, so both `this` and `list` — bare Rust locals — can
+    // move under them. The three field writes below and the `modCount` re-read
+    // must all use post-move addresses; the `modCount` re-read is new here, so
+    // the pin is too.
+    let itr_pin = ctx.pin_native_root(this);
+    let list_pin = ctx.pin_native_root(list);
+    // Unpin on the failure paths too: `unpin_native_roots(itr_pin)` unwinds
+    // `list_pin` with it (it was pushed later), so one handle releases both.
+    if let Err(e) = native_al_remove_at(ctx, &[Value::Object(Some(list)), Value::Int(last_ret)]) {
+        ctx.unpin_native_roots(itr_pin);
+        return Err(e);
     }
-    // Real-JDK: cursor = lastRet; lastRet = -1;
+    if let (Some(source), Some(value)) = (view_src, removed) {
+        if let Err(e) = propagate_list_removal(ctx, source, value) {
+            ctx.unpin_native_roots(itr_pin);
+            return Err(e);
+        }
+    }
+    let this = ctx.read_native_pin(itr_pin, this);
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(itr_pin);
+    // Real-JDK: cursor = lastRet; lastRet = -1; expectedModCount = modCount.
+    // The last of the three is what stops the removal we just performed from
+    // failing this iterator's own next `next()`.
     ctx.set_field(this, cursor_slot, Value::Int(last_ret));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    al_itr_sync_mod_count(ctx, this, list);
     Ok(None)
 }
 
@@ -13600,11 +13797,36 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // fixed-size list defensively rather than abort.
         _ => alloc_ref_array(ctx, 0),
     };
-    ctx.new_object_initialized(
+    let arr_pin = ctx.pin_native_root(arr);
+    let list = ctx.new_object_initialized(
         "java/util/Arrays$ArrayList",
         "([Ljava/lang/Object;)V",
         &[Value::Object(Some(arr))],
-    )
+    )?;
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
+    // "…and `Arrays$ArrayList(E[])` stores the array" is true of the REAL
+    // nested class only. In a synthetic-library build there is no
+    // `java/util/Arrays$ArrayList` class file: the name is fabricated by
+    // `ensure_synthetic_class`, its declared constructor set is empty, and the
+    // `invokespecial` above therefore stores nothing at all. Every accessor
+    // then read a backing array that was never written —
+    // `arrays_array_list_backing` returned `None`, `size()` answered 0, and
+    // `Arrays.asList("x","y","z").size() != 3` was pinned in
+    // `KNOWN_SYNTHETIC_JDK_GAPS` as a missing `Arrays.asList`. The method was
+    // not missing; the constructor delegation this native was rewritten to use
+    // only carries the array on the real-JDK path.
+    //
+    // Storing it here covers both paths without a native `<init>` on a real
+    // JDK class (which would shadow the real constructor for every instance):
+    // on the real-JDK path the constructor has already run, the read below
+    // finds the array, and this is a no-op.
+    if let Some(Value::Object(Some(l))) = list {
+        if arrays_array_list_backing(ctx, l).is_none() {
+            ctx.set_field_by_name(l, "a", Value::Object(Some(arr)));
+        }
+    }
+    Ok(list)
 }
 
 fn arrays_array_list_backing(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
@@ -29958,8 +30180,23 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
-    // node-iterating bytecode runs against our overlay structure (where the
-    // JDK `first` field is always null) and returns an array full of nulls.
+    // node-iterating bytecode runs against our overlay structure and returns an
+    // array full of nulls.
+    //
+    // CORRECTED 2026-08-11: the original of this comment gave the reason as
+    // *"the JDK `first` field is always null"*, and that has not been true
+    // since `ll_set` began mirroring the overlay into the real fields (see
+    // `ll_get`'s overlay-MISS arm). Measured reflectively under
+    // `--add-opens java.base/java.util=ALL-UNNAMED`, a native `LinkedList`
+    // carries a real `size` and a real `first`/`last` node chain whose
+    // `item`/`next`/`prev` walk matches HotSpot's exactly, and
+    // `descendingIterator()` — which nothing here intercepts — runs real
+    // `LinkedList$ListItr` bytecode over it successfully. The registration is
+    // still right, for a different reason: the overlay stays AUTHORITATIVE for
+    // `size` on read, so real bytecode that MUTATES the list leaves the two
+    // owners disagreeing (`native_ll_iterator` records the reproducer). Keep
+    // the natives the single writer; do not "simplify" this away on the
+    // strength of the old reason.
     registry.register(
         c,
         "toArray",
@@ -29976,11 +30213,26 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         native_ll_spliterator,
     );
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
-    // fields via getfield; our overlay-based LL never writes those, so
-    // `List.sort` default-method path crashes with NoSuchElementException
-    // inside Spring's `processDeferredImportSelectors`. Override
-    // `listIterator()` / `listIterator(I)` to return a snapshot-array iterator
-    // with cursor + list_ref so `next`/`hasNext`/`set` work via our overlay.
+    // fields via getfield; the `List.sort` default-method path crashed with
+    // NoSuchElementException inside Spring's `processDeferredImportSelectors`.
+    // Override `listIterator()` / `listIterator(I)` to return a snapshot-array
+    // iterator with cursor + list_ref so `next`/`hasNext`/`set` work via our
+    // overlay.
+    //
+    // CORRECTED 2026-08-11: this comment used to blame *"our overlay-based LL
+    // never writes those"*, and that reason is stale — `ll_set` mirrors both
+    // fields, and the whole real node chain reads back correctly (see the
+    // `toArray(T[])` note above). The registration is still correct because the
+    // overlay wins on READ while real bytecode writes the heap, so a real
+    // `ListItr` that mutates leaves the two disagreeing. UNDER `--jdk-only`
+    // THIS PAIR IS AN OPEN GAP, not a fix: `cratonvm/internal/
+    // LinkedListSnapshotListItr` is refused, so `listIterator()` and every real
+    // `AbstractList` method that reaches it (`equals`, `hashCode`, `indexOf`
+    // against a foreign list) raise `NoClassDefFoundError` there. A real
+    // `Arrays$ArrayItr` cannot stand in — it has no `previous`/`set`/`add` —
+    // and a real `ArrayList$ListItr` over a snapshot would drop `set()` writes
+    // silently, which is worse. Reasoned in
+    // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
     registry.register(
         c,
         "listIterator",
@@ -31168,7 +31420,51 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (this, itr) = rooted_across1(ctx, this, |ctx| {
         try_alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3)
     });
-    let itr = itr?;
+    // `java/util/LinkedList$Itr` is a name no JDK image declares (the real one
+    // is `LinkedList$ListItr`), so `--jdk-only` refuses it and every
+    // `linkedList.iterator()` — including the one real
+    // `AbstractCollection.toString()` reaches — died with
+    // `NoClassDefFoundError: java/util/LinkedList$Itr` before `hasNext()`.
+    //
+    // The obvious alternative was to drop the interception and let real
+    // `LinkedList` bytecode run, and unlike the other collections here that is
+    // genuinely available: the natives mirror their overlay into the real
+    // `first`/`last`/`size` fields (`ll_set`; see `ll_get`'s overlay-MISS arm),
+    // and `linkedList.descendingIterator()` — which nothing intercepts —
+    // already walks that chain and answers `[c,b,a]` under `--jdk-only` today.
+    // The two registrar comments below claiming *"the JDK `first` field is
+    // always null"* and *"our overlay-based LL never writes those"* have been
+    // outlived by that mirror.
+    //
+    // It is still the wrong answer, and one run says why. Drive a real
+    // `ListItr.remove()` (via `descendingIterator()`) against a native
+    // LinkedList and the two owners disagree: real `unlink` decrements the real
+    // `size` and re-links the real nodes, `ll_get` reads the OVERLAY first and
+    // still answers the old size, and the NEXT real iteration walks off the end
+    // — `NullPointerException: Cannot read field "item"` at
+    // `LinkedList$ListItr.previous`, reproducible in `Compatible` mode on an
+    // unmodified binary. Handing iteration to real bytecode would put a second
+    // writer on state the natives own. The snapshot keeps one owner.
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there and the
+    // node-live `LinkedList$Itr` is still what `--real-jdk` hands back, with
+    // its `remove()`-unlinks-the-node-just-returned semantics intact.
+    let itr = match itr {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            if head_pin != usize::MAX {
+                ctx.unpin_native_roots(head_pin);
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let snap = ll_snapshot_array(ctx, this);
+            let n = ctx.array_length(snap);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real =
+                real_snapshot_iterator(ctx, snap, n, Some((this, SnapshotItrRoute::LinkedList)));
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let head = read_pinned_elem(ctx, head_pin, head);
     if head_pin != usize::MAX {
         ctx.unpin_native_roots(head_pin);
@@ -33550,7 +33846,42 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let value = read_pinned_elem(ctx, elem_pins[i], *e);
         ctx.set_array_element(arr, i, value);
     }
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3)?;
+    // No JDK image declares `java/util/ArrayDeque$Itr` — the real one is
+    // `ArrayDeque$DeqIterator` — so `--jdk-only` refuses it and, before this
+    // arm, `new ArrayDeque<>(..).iterator()` raised
+    // `NoClassDefFoundError: java/util/ArrayDeque$Itr` before `hasNext()`.
+    // Land on the real `Arrays$ArrayItr` instead, exactly as the HashSet and
+    // TreeSet sites do. The trade is smaller here than anywhere else: this
+    // iterator is ALREADY snapshot-backed (field 0 is the copy taken above,
+    // not the ring buffer), and `native_ad_itr_remove`'s whole body is the
+    // `native_ad_remove_first_occurrence` call that `SnapshotItrRoute::ArrayDeque`
+    // makes — so the two shapes differ in the class name and nothing else.
+    //
+    // Letting real `ArrayDeque.iterator()` bytecode run instead is NOT an
+    // option, and the measurement says why: real `DeqIterator` derives its
+    // bounds from `head`/`tail`, and a CratonVM-native deque leaves `tail` at 0
+    // — reflectively, a two-element deque reads `elements=Object[2] head=0
+    // tail=0`, so real bytecode computes size 0 and iterates nothing. (The same
+    // unwritten `tail` is why `ArrayDeque.stream().count()` answers 0 in BOTH
+    // modes today; that one is not this arm's to fix — see
+    // `docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md`.)
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there.
+    let itr = match try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                elems.len(),
+                Some((this, SnapshotItrRoute::ArrayDeque)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let arr = ctx.read_native_pin(arr_pin, arr);
@@ -35858,6 +36189,18 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     let elem = ctx.get_array_element(arr, cursor as usize);
     ctx.set_field(this, 1, Value::Int(cursor + 1));
+    // W7-1 family 2: record the index just returned so `native_ts_itr_remove`
+    // can enforce the `IllegalStateException` half of the `Iterator.remove()`
+    // contract. Scoped to `TreeSet$Itr` BY CLASS NAME on purpose: this native is
+    // also the `java/util/Iterator` / `Enumeration` / `ListIterator` interface
+    // fallback, so it runs over shapes whose slot 3 belongs to somebody else
+    // (`PriorityQueue$Itr`, `ArrayDeque$Itr`, any real iterator whose first
+    // field happens to be an `Object[]`) — writing it unconditionally would
+    // corrupt them. `HashMap$KeyItr` already left through the dedicated route
+    // at the top of this function, which keeps its own `lastRet`.
+    if cn == "java/util/TreeSet$Itr" && ctx.object_num_fields(this) > TS_ITR_FIELD_LAST_RET {
+        ctx.set_field(this, TS_ITR_FIELD_LAST_RET, Value::Int(cursor));
+    }
     Ok(Some(elem))
 }
 
@@ -36123,6 +36466,467 @@ fn tm_child(ctx: &dyn NativeContext, n: ObjectRef, idx: usize) -> Option<ObjectR
         Value::Object(o) => o,
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Navigable views — `headMap` / `tailMap` / `subMap` / `descendingMap`
+// ---------------------------------------------------------------------------
+//
+// W7-1 family 1 (2026-08-11). `SortedMap.headMap` and its neighbours are
+// specified as VIEWS: a write through one is a write to the backing map, and a
+// write to the backing map is visible through the view. CratonVM answered a
+// detached SNAPSHOT — `native_tm_head_map` allocated a second TreeMap and
+// replayed the matching entries into it with `native_tm_put` — so
+// `tm.headMap("c").remove("a")` deleted from a map nobody else could see and
+// `tm` still read `{a=1, b=2, c=3, d=4}`. The record's `pollFirstEntry` row is
+// that same miss, one line later, not a second defect.
+//
+// An empty or detached view is the failure mode that reads as a PASS everywhere
+// a caller only iterates, which is why it survived so long and why
+// `probes/JdkOnlyCollectionViewProbe` was written to report CONTENT.
+//
+// THE SHAPE OF THE FIX. The view is a real `java.util.TreeMap` object whose own
+// storage is a CACHE, not the truth: a [`TmViewSpec`] in the side table below
+// names the backing map and the range, and [`tm_sync_native_state`] — the funnel
+// every content native already calls on entry — rebuilds the cache from the
+// backing map before that native reads it. So every read native
+// (`get`/`size`/`firstKey`/`ceilingEntry`/`entrySet`/`toString`/…) becomes
+// view-correct without being touched, and only the mutators need a branch that
+// redirects the write to the backing map.
+//
+// The view's own comparator slot holds the source comparator, REVERSED for a
+// descending view (`Collections.reverseOrder`). That one field is what makes
+// `firstKey`, `ceilingKey`, `pollFirstEntry` and `tm_binary_search` all agree
+// with the view's iteration order without a second code path for descending.
+//
+// COST. The cache is rebuilt on every operation rather than being invalidated by
+// a version stamp. That is deliberate: a stamp has to be bumped at every site
+// that mutates a TreeMap's contents, and a site missed there is a silently stale
+// view — the exact defect class this record is about. It is also not a
+// regression on the common shape: `tm.headMap(k)` used to cost one allocation
+// plus N comparator-driven `native_tm_put`s (O(N log N)) at CREATION, where a
+// rebuild is one allocation plus N bound comparisons. Only a view that is
+// RETAINED and read repeatedly pays more than before. See the record's
+// "still needs measuring" section.
+
+/// The backing map and range of one navigable view.
+///
+/// Bounds are expressed in the IMMEDIATE source's ordering, and a view of a view
+/// records its parent rather than the root map. That is what makes composition
+/// work without any interval arithmetic: `descendingMap().headMap(k)` filters
+/// "up to `k`" using the descending view's own (reversed) comparator, which is
+/// exactly what the JDK's `DescendingSubMap.headMap` means by it.
+#[derive(Clone, Copy)]
+struct TmViewSpec {
+    source: ObjectRef,
+    /// Lower bound in the source's ordering. `lo_bounded == false` means
+    /// unbounded; the `Value` is then unused. The flag is separate from a null
+    /// `Value` because a custom Comparator may legitimately order a null key.
+    lo: Value,
+    lo_bounded: bool,
+    lo_inclusive: bool,
+    hi: Value,
+    hi_bounded: bool,
+    hi_inclusive: bool,
+    /// Iteration order is the reverse of the source's.
+    descending: bool,
+}
+
+/// Has any navigable view been created in this process?
+///
+/// [`tm_view_spec`] runs at the top of every TreeMap content native, on every
+/// receiver, so a run that never calls `headMap`/`descendingMap` must not pay a
+/// mutex acquisition for it. Monotone by design — the GC prune and the
+/// recycled-identity sweep remove ENTRIES without decrementing this — so it is a
+/// "have views ever existed" hint, never a count. Once one view exists the flag
+/// stays set and the lock is taken; that is the same bargain
+/// `tm_force_array_set` makes.
+static TM_VIEWS_EVER_CREATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// View `ObjectRef` (as a GC-stable [`widened_obj_key`]) -> backing map + range.
+///
+/// GC CONTRACT — holds three heap references (`source`, and the two bound keys)
+/// that are reachable no other way, so it is wired into all four overlay hooks
+/// exactly like [`snapshot_itr_backing_table`]: [`for_each_overlay_ref`] (root +
+/// post-move remap), [`push_overlay_roots_for_keys`] (the per-owner rule, keyed
+/// on the VIEW, so the backing map is retained precisely while the view is),
+/// [`gc_prune_dead_collection_overlays`] and [`clear_overlay_entries_for_key`].
+fn tm_view_table() -> &'static Mutex<StdHashMap<usize, TmViewSpec>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TmViewSpec>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// The view spec for `this`, or `None` for an ordinary TreeMap.
+fn tm_view_spec(ctx: &dyn NativeContext, this: ObjectRef) -> Option<TmViewSpec> {
+    if !TM_VIEWS_EVER_CREATED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let key = tm_obj_key(ctx, this);
+    tm_view_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+}
+
+/// Record `view` as a live view of `spec.source`. `view` and every `ObjectRef`
+/// inside `spec` must be POST-allocation addresses.
+fn tm_register_view(ctx: &dyn NativeContext, view: ObjectRef, spec: TmViewSpec) {
+    let key = tm_obj_key(ctx, view);
+    tm_view_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, spec);
+    TM_VIEWS_EVER_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Views currently being rebuilt on this thread.
+    ///
+    /// [`tm_resync_view`] dispatches the key's real `compareTo` /
+    /// `Comparator.compare`, which is arbitrary Java and may read the very view
+    /// being rebuilt. Re-entering would recurse without bound; the guard makes
+    /// the inner call a no-op, so the nested read sees the view's PREVIOUS
+    /// contents (stale by at most the mutation in flight) instead of a stack
+    /// overflow. Same shape as `SNAPITR_FALLBACK`'s shadow-recursion guard.
+    static TM_VIEW_RESYNC: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `Collections.reverseOrder(cmp)` — the view comparator of a descending view.
+///
+/// Degrades to `cmp` in an image with no usable `java.util.Collections`, which
+/// leaves `descendingMap()` iterating ASCENDING rather than failing the call.
+/// That is the same trade `native_ts_descending_set` already makes, and it is
+/// the lesser evil: the alternative is that a descending view cannot be built at
+/// all, which is the pre-fix behaviour (an empty map) with an exception on top.
+fn tm_reverse_comparator(
+    ctx: &mut dyn NativeContext,
+    cmp: Value,
+) -> Result<Value, MethodCallFailed> {
+    let reversed = match cmp {
+        Value::Object(Some(c)) => ctx.invoke(
+            "java/util/Collections",
+            "reverseOrder",
+            "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+            &[Value::Object(Some(c))],
+        )?,
+        _ => ctx.invoke(
+            "java/util/Collections",
+            "reverseOrder",
+            "()Ljava/util/Comparator;",
+            &[],
+        )?,
+    };
+    Ok(match reversed {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => cmp,
+    })
+}
+
+/// Is `key` inside `spec`'s range, judged by the SOURCE's ordering?
+///
+/// The JDK's `NavigableSubMap.inRange`. Used by the mutators, which have to
+/// decide before delegating: `put` outside the range is
+/// `IllegalArgumentException`, `remove` outside it is a plain `null`.
+fn tm_view_in_range(
+    ctx: &mut dyn NativeContext,
+    spec: &TmViewSpec,
+    key: Value,
+) -> Result<bool, MethodCallFailed> {
+    // GC-SAFETY: each `tree_compare` dispatches interpreted Java and can move
+    // the key, the bounds and the comparator, all of which are bare Rust locals
+    // here. Pin them once and read every one back before each use.
+    let mut cmp = tm_get_slot(ctx, spec.source, TM_FIELD_COMPARATOR);
+    let cmp_pin = pin_value(ctx, cmp);
+    let mut key = key;
+    let key_pin = pin_value(ctx, key);
+    let mut lo = spec.lo;
+    let lo_pin = pin_value(ctx, lo);
+    let mut hi = spec.hi;
+    let hi_pin = pin_value(ctx, hi);
+    let unpin_base = [cmp_pin, key_pin, lo_pin, hi_pin]
+        .into_iter()
+        .filter(|h| *h != usize::MAX)
+        .min()
+        .unwrap_or(usize::MAX);
+
+    let mut verdict = Ok(true);
+    if spec.lo_bounded {
+        match tree_compare(ctx, &cmp, key, lo) {
+            Ok(c) => {
+                if c < 0 || (c == 0 && !spec.lo_inclusive) {
+                    verdict = Ok(false);
+                }
+            }
+            Err(e) => verdict = Err(e),
+        }
+        cmp = read_pinned_elem(ctx, cmp_pin, cmp);
+        key = read_pinned_elem(ctx, key_pin, key);
+        lo = read_pinned_elem(ctx, lo_pin, lo);
+        hi = read_pinned_elem(ctx, hi_pin, hi);
+    }
+    let _ = lo;
+    if matches!(verdict, Ok(true)) && spec.hi_bounded {
+        match tree_compare(ctx, &cmp, key, hi) {
+            Ok(c) => {
+                if c > 0 || (c == 0 && !spec.hi_inclusive) {
+                    verdict = Ok(false);
+                }
+            }
+            Err(e) => verdict = Err(e),
+        }
+    }
+    if unpin_base != usize::MAX {
+        ctx.unpin_native_roots(unpin_base);
+    }
+    verdict
+}
+
+/// Rebuild `view`'s cached storage from its backing map.
+///
+/// Called from [`tm_sync_native_state`], i.e. on entry to every TreeMap content
+/// native, so a view is never read while stale. A no-op for an ordinary map.
+fn tm_resync_view(ctx: &mut dyn NativeContext, view: ObjectRef) -> Result<(), MethodCallFailed> {
+    let spec = match tm_view_spec(ctx, view) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let key = tm_obj_key(ctx, view);
+    if !TM_VIEW_RESYNC.with(|s| s.borrow_mut().insert(key)) {
+        // Already rebuilding this view further up the stack — see the guard's
+        // doc comment.
+        return Ok(());
+    }
+    let result = tm_resync_view_inner(ctx, view, &spec);
+    TM_VIEW_RESYNC.with(|s| {
+        s.borrow_mut().remove(&key);
+    });
+    result
+}
+
+fn tm_resync_view_inner(
+    ctx: &mut dyn NativeContext,
+    view: ObjectRef,
+    spec: &TmViewSpec,
+) -> Result<(), MethodCallFailed> {
+    // GC-SAFETY, and the pin ORDER matters. Everything below allocates —
+    // `tm_collect_pairs` re-boxes a fast-mode map's keys, `tree_compare`
+    // dispatches interpreted Java, `alloc_ref_array` collects — and `view`, the
+    // source and the two bounds are all bare Rust locals copied out of the side
+    // table, which the collector remaps IN THE TABLE and not in our copy. So
+    // every one of them is pinned BEFORE the first GC point, and `view_pin` goes
+    // first so a single `unpin_native_roots(view_pin)` unwinds the lot.
+    let view_pin = ctx.pin_native_root(view);
+    let src_pin = ctx.pin_native_root(spec.source);
+    let mut lo = spec.lo;
+    let lo_pin = pin_value(ctx, lo);
+    let mut hi = spec.hi;
+    let hi_pin = pin_value(ctx, hi);
+
+    // A view of a view: bring the parent up to date first. Terminates because a
+    // view's source always predates it, so the chain is finite and acyclic.
+    if let Err(e) = tm_sync_native_state(ctx, spec.source) {
+        ctx.unpin_native_roots(view_pin);
+        return Err(e);
+    }
+    let source = ctx.read_native_pin(src_pin, spec.source);
+    let pairs = tm_collect_pairs(ctx, source);
+    let source = ctx.read_native_pin(src_pin, source);
+
+    // Select by INDEX rather than accumulating `Value`s, so the kept entries are
+    // re-read through their pins at copy time instead of being carried across
+    // the comparisons.
+    let pinned = PinnedPairs::new(ctx, &pairs);
+    let mut cmp = tm_get_slot(ctx, source, TM_FIELD_COMPARATOR);
+    let cmp_pin = pin_value(ctx, cmp);
+    lo = read_pinned_elem(ctx, lo_pin, lo);
+    hi = read_pinned_elem(ctx, hi_pin, hi);
+
+    let mut kept: Vec<usize> = Vec::with_capacity(pinned.len());
+    for i in 0..pinned.len() {
+        // Only the key is compared; `_v` exists because `refresh` re-reads the
+        // pair as a unit.
+        let (mut k, mut _v) = pinned.get(&*ctx, i);
+        let mut keep = true;
+        if spec.lo_bounded {
+            pinned.refresh(&*ctx, i, &mut k, &mut _v);
+            let c = match tree_compare(ctx, &cmp, k, lo) {
+                Ok(c) => c,
+                Err(e) => {
+                    ctx.unpin_native_roots(view_pin);
+                    return Err(e);
+                }
+            };
+            cmp = read_pinned_elem(ctx, cmp_pin, cmp);
+            lo = read_pinned_elem(ctx, lo_pin, lo);
+            hi = read_pinned_elem(ctx, hi_pin, hi);
+            if c < 0 || (c == 0 && !spec.lo_inclusive) {
+                keep = false;
+            }
+        }
+        if keep && spec.hi_bounded {
+            pinned.refresh(&*ctx, i, &mut k, &mut _v);
+            let c = match tree_compare(ctx, &cmp, k, hi) {
+                Ok(c) => c,
+                Err(e) => {
+                    ctx.unpin_native_roots(view_pin);
+                    return Err(e);
+                }
+            };
+            cmp = read_pinned_elem(ctx, cmp_pin, cmp);
+            lo = read_pinned_elem(ctx, lo_pin, lo);
+            hi = read_pinned_elem(ctx, hi_pin, hi);
+            if c > 0 || (c == 0 && !spec.hi_inclusive) {
+                keep = false;
+            }
+        }
+        if keep {
+            kept.push(i);
+        }
+    }
+    let _ = (lo, hi, cmp);
+
+    // Publish. The source's order is ascending, so a descending view is the same
+    // selection read back to front — and the view's comparator slot (set once at
+    // creation, never touched here) is already the reversed one, so the array
+    // stays consistent with what `tm_binary_search` will assume about it.
+    let n = kept.len();
+    let buf = alloc_ref_array(ctx, (n * 2).max(TM_DEFAULT_CAPACITY * 2));
+    for (out, src_idx) in kept.iter().enumerate() {
+        let slot = if spec.descending { n - 1 - out } else { out };
+        let (k, v) = pinned.get(&*ctx, *src_idx);
+        ctx.set_array_element(buf, slot * 2, k);
+        ctx.set_array_element(buf, slot * 2 + 1, v);
+    }
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(view_pin);
+    // A view never uses the fast-mode BTreeMap: its ordering can be a reversed
+    // comparator, which `TreeKey`'s derived `Ord` cannot express.
+    tm_fast_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&tm_obj_key(ctx, view));
+    tm_set_force_array(ctx, view);
+    tm_set_slot(ctx, view, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, view, TM_FIELD_SIZE, Value::Int(n as i32));
+    Ok(())
+}
+
+/// Allocate a live navigable view of `source` and return it.
+///
+/// The single constructor behind `headMap` / `tailMap` / `subMap` (both arities)
+/// and `descendingMap`; each of those natives is now just this call with the
+/// right bounds, which is what keeps their six bound-comparison edge cases from
+/// drifting apart again.
+fn tm_new_range_view(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    lo: Option<(Value, bool)>,
+    hi: Option<(Value, bool)>,
+    descending: bool,
+) -> MethodCallResult {
+    // GC-SAFETY: the allocation, `Collections.reverseOrder` and the resync all
+    // collect, and `source` and the two bound keys are bare Rust locals that end
+    // up STORED in the side table — a from-space address recorded there would
+    // outlive the collection that produced it.
+    let src_pin = ctx.pin_native_root(source);
+    let lo_key = lo.map(|(k, _)| k).unwrap_or(Value::Object(None));
+    let lo_pin = pin_value(ctx, lo_key);
+    let hi_key = hi.map(|(k, _)| k).unwrap_or(Value::Object(None));
+    let hi_pin = pin_value(ctx, hi_key);
+
+    let view = match try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(src_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let source = ctx.read_native_pin(src_pin, source);
+    let src_cmp = tm_get_slot(ctx, source, TM_FIELD_COMPARATOR);
+    let view_cmp = if descending {
+        match tm_reverse_comparator(ctx, src_cmp) {
+            Ok(c) => c,
+            Err(e) => {
+                ctx.unpin_native_roots(src_pin);
+                return Err(e);
+            }
+        }
+    } else {
+        src_cmp
+    };
+    let view = ctx.read_native_pin(view_pin, view);
+    let source = ctx.read_native_pin(src_pin, source);
+    // Order first, contents second: `tm_resync_view` writes the array assuming
+    // this comparator is already in place.
+    tm_set_slot(ctx, view, TM_FIELD_COMPARATOR, view_cmp);
+    tm_set_slot(ctx, view, TM_FIELD_SIZE, Value::Int(0));
+    tm_set_force_array(ctx, view);
+    // Read the bounds back through their pins BEFORE the call, not inside the
+    // struct literal: the allocation and `Collections.reverseOrder` above may
+    // have moved either key, and a from-space address recorded in the table
+    // would be what every later rebuild compared against.
+    let lo_cur = read_pinned_elem(ctx, lo_pin, lo_key);
+    let hi_cur = read_pinned_elem(ctx, hi_pin, hi_key);
+    tm_register_view(
+        ctx,
+        view,
+        TmViewSpec {
+            source,
+            lo: lo_cur,
+            lo_bounded: lo.is_some(),
+            lo_inclusive: lo.map(|(_, inc)| inc).unwrap_or(false),
+            hi: hi_cur,
+            hi_bounded: hi.is_some(),
+            hi_inclusive: hi.map(|(_, inc)| inc).unwrap_or(false),
+            descending,
+        },
+    );
+    let view = ctx.read_native_pin(view_pin, view);
+    // Populate eagerly so the view is correct even for a reader that reaches it
+    // without going through `tm_sync_native_state` (nothing does today; the
+    // guarantee is cheap and it makes the object self-consistent on return).
+    if let Err(e) = tm_sync_native_state(ctx, view) {
+        ctx.unpin_native_roots(src_pin);
+        return Err(e);
+    }
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(src_pin);
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// Bring `this`'s native state up to date, and the single thing every TreeMap
+/// content native calls on entry.
+///
+/// Two jobs, deliberately behind ONE call:
+///
+///   1. [`tm_resync_view`] — if `this` is a `headMap`/`tailMap`/`subMap`/
+///      `descendingMap` view, rebuild its cached storage from the backing map.
+///      Putting it here is what makes every read native view-correct without
+///      being edited: `get`, `size`, `firstKey`, `ceilingEntry`, `keySet`,
+///      `entrySet`, `toString` and the rest all already called this funnel.
+///   2. [`tm_materialize_deser_array`] — if `this` is a *deserialized* TreeMap
+///      whose real red-black tree has never been mirrored into the side table,
+///      mirror it.
+///
+/// Ordering matters: a resynced view leaves a non-empty side-table entry, which
+/// is exactly the condition step 2 treats as "already materialized", so a view
+/// is never also walked as a deserialized tree.
+///
+/// Fallible since 2026-08-11: step 1 dispatches the key's real `compareTo` /
+/// `Comparator.compare` to test the range bounds, and a comparator that throws
+/// must surface at the call, not be swallowed into a silently short view.
+fn tm_sync_native_state(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    tm_resync_view(ctx, this)?;
+    tm_materialize_deser_array(ctx, this);
+    Ok(())
 }
 
 /// `&mut` companion to `tm_materialize_deser_if_needed` for the cases it can't
@@ -36525,6 +37329,21 @@ const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
 const TS_NUM_FIELDS: usize = 3;
 const TS_DEFAULT_CAPACITY: usize = 16;
 
+// `java/util/TreeSet$Itr` — the fabricated snapshot iterator `native_ts_iterator`
+// and `native_ts_descending_iterator` hand back (the real iterator behind
+// `TreeSet.iterator()` is `TreeMap$KeyIterator`, so under `--jdk-only` this shape
+// is refused and `real_snapshot_iterator` stands in instead).
+//
+// `LAST_RET` is the fourth slot, added 2026-08-11 for W7-1 family 2. The
+// snapshot does not shift when the backing set loses an element, so `cursor`
+// alone cannot distinguish "next() has been called" from "remove() already
+// consumed that element" — see `native_ts_itr_remove`.
+const TS_ITR_FIELD_DATA: usize = 0;
+const TS_ITR_FIELD_CURSOR: usize = 1;
+const TS_ITR_FIELD_OWNER: usize = 2;
+const TS_ITR_FIELD_LAST_RET: usize = 3;
+const TS_ITR_NUM_FIELDS: usize = 4;
+
 /// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
 /// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
 /// field layout, so the synthetic slots 0/1/2 do not exist. All state —
@@ -36780,6 +37599,23 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&'static str, &mut 
             .unwrap_or_else(|e| e.into_inner());
         for st in backings.values_mut() {
             f("snapshot-itr/backing", &mut st.backing);
+        }
+    }
+    // Navigable-view specs (W7-1 family 1). Three refs each and all three are
+    // reachable only here: the backing map (a view keeps its source alive for
+    // exactly as long as the view is itself reachable) and the two bound keys,
+    // which are compared against on every rebuild and so must survive and be
+    // repointed like any other side-table key.
+    {
+        let mut views = tm_view_table().lock().unwrap_or_else(|e| e.into_inner());
+        for spec in views.values_mut() {
+            f("tm-view/source", &mut spec.source);
+            if let Value::Object(Some(r)) = &mut spec.lo {
+                f("tm-view/lo", r);
+            }
+            if let Value::Object(Some(r)) = &mut spec.hi {
+                f("tm-view/hi", r);
+            }
         }
     }
 }
@@ -37087,6 +37923,24 @@ fn push_overlay_roots_for_keys(keys: &[usize], roots: &mut Vec<ObjectRef>) {
         for key in keys {
             if let Some(state) = table.get(key) {
                 roots.push(state.backing);
+            }
+        }
+    }
+    {
+        // A navigable view's backing map and range bounds. The owner is the
+        // VIEW, so `headMap`'s result keeps the map it is a view OF alive for
+        // precisely as long as the view can still be read — which is the JDK's
+        // reachability too, since there the view holds a hard reference to `m`.
+        let table = tm_view_table().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(spec) = table.get(key) {
+                roots.push(spec.source);
+                if let Value::Object(Some(r)) = spec.lo {
+                    roots.push(r);
+                }
+                if let Value::Object(Some(r)) = spec.hi {
+                    roots.push(r);
+                }
             }
         }
     }
@@ -37402,6 +38256,16 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
             .unwrap_or_else(|e| e.into_inner());
         for (k, _) in &dead_keys {
             backings.remove(k);
+        }
+    }
+    // Navigable-view specs, keyed by the VIEW's packed `widened_obj_key`. Each
+    // entry roots a whole backing map, so a missed sweep pins collections rather
+    // than a few words — the same reason the iterator table above cannot be
+    // skipped.
+    {
+        let mut views = tm_view_table().lock().unwrap_or_else(|e| e.into_inner());
+        for (k, _) in &dead_keys {
+            views.remove(k);
         }
     }
     // `lhm_ptr_cache` is keyed by the *raw* object pointer (not the packed
@@ -38014,9 +38878,49 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    // W7-1 family 1: a write through a navigable view is a write to the BACKING
+    // MAP. Redirect it, and refuse an out-of-range key the way
+    // `NavigableSubMap.put` does — `IllegalArgumentException`, not a silent
+    // insert into a view that could never contain it.
+    //
+    // GC-SAFETY: `tm_view_in_range` dispatches the key's comparator, so
+    // everything held across it moves — including the `spec` copy, whose
+    // `source` the collector remaps IN THE TABLE and not in our stack copy.
+    // Hence: pin `this`/`key`/`value`, and re-read the spec afterwards rather
+    // than reusing the pre-comparison one.
+    if tm_view_spec(ctx, this).is_some() {
+        let this_pin = ctx.pin_native_root(this);
+        let key_pin = pin_value(ctx, key);
+        let value_pin = pin_value(ctx, value);
+        let verdict = match tm_view_spec(ctx, this) {
+            Some(spec) => tm_view_in_range(ctx, &spec, key),
+            None => Ok(true),
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        let result = match (verdict, tm_view_spec(ctx, this)) {
+            (Err(e), _) => Err(e),
+            (Ok(false), _) => Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "key out of range".to_string(),
+                }
+                .into(),
+            ),
+            (Ok(true), Some(spec)) => {
+                native_tm_put(ctx, &[Value::Object(Some(spec.source)), key, value])
+            }
+            // The view entry vanished under us (only reachable if the GC pruned
+            // it, which means the view is dead) — nothing sane to write to.
+            (Ok(true), None) => Ok(Some(Value::Object(None))),
+        };
+        ctx.unpin_native_roots(this_pin);
+        return result;
+    }
 
     // Family-1 stale-AT-STORE fix (cce0079 follow-up): `key` and `value`
     // must be pinned BEFORE any GC-capable step in this function — the
@@ -38140,7 +39044,7 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38172,8 +39076,33 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // W7-1 family 1. This is the row the record measured directly:
+    // `tm.headMap("c").remove("a")` used to delete from a detached snapshot and
+    // leave `tm` reading `{a=1, b=2, c=3, d=4}`. The JDK's
+    // `NavigableSubMap.remove` is `!inRange(key) ? null : m.remove(key)` — an
+    // out-of-range key is a plain miss, NOT the `IllegalArgumentException` that
+    // `put` raises. Same pin-and-re-read contract as `native_tm_put` above.
+    if tm_view_spec(ctx, this).is_some() {
+        let this_pin = ctx.pin_native_root(this);
+        let key_pin = pin_value(ctx, key);
+        let verdict = match tm_view_spec(ctx, this) {
+            Some(spec) => tm_view_in_range(ctx, &spec, key),
+            None => Ok(true),
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let result = match (verdict, tm_view_spec(ctx, this)) {
+            (Err(e), _) => Err(e),
+            (Ok(true), Some(spec)) => {
+                native_tm_remove(ctx, &[Value::Object(Some(spec.source)), key])
+            }
+            _ => Ok(Some(Value::Object(None))),
+        };
+        ctx.unpin_native_roots(this_pin);
+        return result;
+    }
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let (old, new_size) = tm_fast_with(ctx, this, |bt| {
@@ -38210,7 +39139,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38235,7 +39164,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
@@ -38291,7 +39220,7 @@ fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -38304,7 +39233,7 @@ fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -38317,6 +39246,28 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // W7-1 family 1: `NavigableSubMap.clear()` is `iterator().remove()` over the
+    // range, i.e. it deletes the view's entries FROM THE BACKING MAP and leaves
+    // everything outside the range alone. Sync first so the key list is the
+    // current one, then delete each key through the ordinary view `remove`
+    // (which redirects and re-checks the range for us).
+    if tm_view_spec(ctx, this).is_some() {
+        tm_sync_native_state(ctx, this)?;
+        let pairs = tm_collect_pairs(ctx, this);
+        let this_pin = ctx.pin_native_root(this);
+        let pinned = PinnedPairs::new(ctx, &pairs);
+        let mut this = this;
+        for i in 0..pinned.len() {
+            let (k, _) = pinned.get(&*ctx, i);
+            if let Err(e) = native_tm_remove(ctx, &[Value::Object(Some(this)), k]) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+            this = ctx.read_native_pin(this_pin, this);
+        }
+        ctx.unpin_native_roots(this_pin);
+        return Ok(None);
+    }
     // Fast-mode side-table needs clearing too — without this an iter
     // helper would return stale entries from before the clear. Remove the
     // entry directly instead of going through `tm_fast_with`: comparator-backed
@@ -38341,7 +39292,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             )
         }
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
         match first {
@@ -38385,7 +39336,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             )
         }
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
         match last {
@@ -38422,7 +39373,7 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38463,7 +39414,7 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38504,7 +39455,7 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38555,7 +39506,7 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38641,7 +39592,7 @@ fn native_tm_ceiling_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38685,7 +39636,7 @@ fn native_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38729,7 +39680,7 @@ fn native_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38783,7 +39734,7 @@ fn native_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -38835,7 +39786,7 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| {
             bt.iter().next().map(|(k, v)| (k.clone(), *v))
@@ -38866,7 +39817,7 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| {
             bt.iter().next_back().map(|(k, v)| (k.clone(), *v))
@@ -38898,7 +39849,10 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
+    if tm_view_spec(ctx, this).is_some() {
+        return tm_view_poll_entry(ctx, this, true);
+    }
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let first = bt.iter().next().map(|(k, _)| k.clone())?;
@@ -38929,12 +39883,50 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(entry))))
 }
 
+/// `pollFirstEntry` / `pollLastEntry` on a navigable view: take the end entry in
+/// the VIEW's order and delete its key from the backing map.
+///
+/// The view's cached array is already sorted by the view's own (possibly
+/// reversed) comparator, so "first" is index 0 for an ascending and a descending
+/// view alike — there is no second code path for descending, which is the whole
+/// point of storing the reversed comparator on the view.
+fn tm_view_poll_entry(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    first: bool,
+) -> MethodCallResult {
+    let (data_opt, size, _) = tm_state(ctx, this);
+    let data = match data_opt {
+        Some(d) if size > 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = if first { 0 } else { (size as usize) - 1 };
+    let k = ctx.get_array_element(data, idx * 2);
+    let v = ctx.get_array_element(data, idx * 2 + 1);
+    // GC-SAFETY: the removal dispatches the comparator and allocates, so `k` and
+    // `v` — needed afterwards to build the returned entry — are pinned across
+    // it. `this` is pinned because the redirect re-reads its spec.
+    let this_pin = ctx.pin_native_root(this);
+    let k_pin = pin_value(ctx, k);
+    let v_pin = pin_value(ctx, v);
+    let removed = native_tm_remove(ctx, &[Value::Object(Some(this)), k]);
+    let k = read_pinned_elem(ctx, k_pin, k);
+    let v = read_pinned_elem(ctx, v_pin, v);
+    ctx.unpin_native_roots(this_pin);
+    let _ = removed?;
+    let entry = tm_make_entry(ctx, k, v)?;
+    Ok(Some(Value::Object(Some(entry))))
+}
+
 fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
+    if tm_view_spec(ctx, this).is_some() {
+        return tm_view_poll_entry(ctx, this, false);
+    }
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
@@ -38972,7 +39964,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     // Family-1 stale-ObjectRef fix (2026-07-31): the two allocations below can
@@ -39130,7 +40122,7 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     // Live view: the ArrayList stashes the source TreeMap so
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
@@ -39144,7 +40136,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
@@ -39187,7 +40179,7 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -39228,7 +40220,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let default0 = args.get(2).copied().unwrap_or(Value::Object(None));
     let default_pin = pin_value(ctx, default0);
     let this_pin = ctx.pin_native_root(this);
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
     let key = read_pinned_elem(ctx, key_pin, key0);
     let first_pin = if key_pin == usize::MAX {
@@ -39277,9 +40269,37 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // W7-1 family 1. Unlike `computeIfAbsent`/`merge` — which already route
+    // through `native_tm_get` + `native_tm_put` and so inherit the view
+    // redirect for free — this native writes the backing array itself, so a
+    // `put` through a view would land in the view's CACHE and be discarded by
+    // the next rebuild. `get` + `put` is the JDK's own default body for
+    // `putIfAbsent`, and both halves are already view-aware.
+    if tm_view_spec(ctx, this).is_some() {
+        let this_pin = ctx.pin_native_root(this);
+        let key_pin = pin_value(ctx, key);
+        let value_pin = pin_value(ctx, value);
+        let existing = match native_tm_get(ctx, &[Value::Object(Some(this)), key]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        if !matches!(existing, Value::Object(None)) {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(existing));
+        }
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        let value = read_pinned_elem(ctx, value_pin, value);
+        let result = native_tm_put(ctx, &[Value::Object(Some(this)), key, value]);
+        ctx.unpin_native_roots(this_pin);
+        return result;
+    }
     // Fast-mode eligibility check mirrors `native_tm_put`.
     if tm_has_no_comparator(ctx, this) && !tm_force_array_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -39353,7 +40373,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let source0 = args.get(1).copied().unwrap_or(Value::Object(None));
     let source_base = pin_value(ctx, source0);
     let this_pin_early = ctx.pin_native_root(this);
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let this = ctx.read_native_pin(this_pin_early, this);
     let source = match read_pinned_elem(ctx, source_base, source0) {
         Value::Object(Some(r)) => r,
@@ -39419,7 +40439,7 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Family-1 stale-ObjectRef fix (2026-07-31): `obj_to_display_string`
     // dispatches each element's real `toString()`, which allocates — every
@@ -39447,9 +40467,22 @@ fn native_tm_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    tm_materialize_deser_array(ctx, this);
+    tm_sync_native_state(ctx, this)?;
     Ok(Some(tm_get_slot(ctx, this, TM_FIELD_COMPARATOR)))
 }
+
+// The six range-view natives below, plus `descendingMap`/`descendingKeySet`,
+// are one call each into `tm_new_range_view` — see the "Navigable views" block
+// above `TmViewSpec` for what changed and why.
+//
+// What they used to be: each allocated a second TreeMap and replayed the
+// matching entries into it with `native_tm_put`, producing a detached SNAPSHOT.
+// The comment that stood here recorded the *previous* defect in the same
+// functions — `tm_state()` reading a fast-mode map's never-written array and so
+// answering `size` phantom nulls, which made `headMap` compare `null` on the
+// first entry and `break` (spuriously empty) and made `tailMap` `put(null, ..)`
+// repeatedly. `tm_collect_pairs` fixed that, and it is still what the resync
+// reads with, so the fast/array-mode hazard stays closed.
 
 // headMap: entries with keys strictly < toKey
 fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -39458,59 +40491,7 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // BUGFIX (bug-h2-treemap-tailmap-headmap-view-corruption.md): the source
-    // map's entries must be read via `tm_collect_pairs`, the SAME fast/array-
-    // mode-aware helper `keySet`/`values`/`entrySet`/`forEach`/`iterator` use.
-    // `tm_state()` alone reads only the array-mode `TM_FIELD_DATA` side-table
-    // slot, which for a natural-order/fast-mode map (the common case: no
-    // custom Comparator, String/Integer/Long keys) is the harmless-looking
-    // but never-written 32-null-slot buffer `native_tm_init` eagerly
-    // allocates on construction -- `TM_FIELD_SIZE` IS mirrored for fast-mode
-    // maps (so legacy size readers work), but that empty buffer is not, so
-    // `tm_state()` returned a real (mirrored) `size` paired with `size` worth
-    // of phantom null keys read out of an array that fast-mode puts never
-    // touched. Iterating those phantom nulls made `headMap` compare `null`
-    // against `to_key` on the very first entry and immediately `break`
-    // (spuriously-empty view), and made `tailMap` repeatedly `put(null, ...)`
-    // into the result (each such put replacing the prior null entry, since
-    // they all compare equal), producing a corrupt one-entry-with-null-key
-    // result instead of the real matching entries.
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut to_key = to_key;
-    let to_key_pin = pin_value(ctx, to_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp = tree_compare(ctx, &comparator, k, to_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        if cmp >= 0 {
-            break;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(ctx, this, None, Some((to_key, false)), false)
 }
 
 // tailMap: entries with keys >= fromKey
@@ -39520,43 +40501,7 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
-    // aware `tm_collect_pairs`, not `tm_state()` directly.
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut from_key = from_key;
-    let from_key_pin = pin_value(ctx, from_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp = tree_compare(ctx, &comparator, k, from_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        if cmp >= 0 {
-            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        }
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(ctx, this, Some((from_key, true)), None, false)
 }
 
 // subMap: entries with keys >= fromKey and < toKey
@@ -39567,57 +40512,13 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
-    // aware `tm_collect_pairs`, not `tm_state()` directly.
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut from_key = from_key;
-    let from_key_pin = pin_value(ctx, from_key);
-    let mut to_key = to_key;
-    let to_key_pin = pin_value(ctx, to_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        if cmp_lo < 0 {
-            continue;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        if cmp_hi >= 0 {
-            break;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(
+        ctx,
+        this,
+        Some((from_key, true)),
+        Some((to_key, false)),
+        false,
+    )
 }
 
 // --- NavigableMap range views (`headMap`/`tailMap`/`subMap` with inclusive
@@ -39627,13 +40528,10 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // TreeMap keeps its entries in the `tm_fast_table`/`tm_array_table`
 // side-tables (see the fast/array-mode doc block above `TM_FIELD_DATA`) and
 // never populates the real red-black tree, so that bytecode sees an
-// always-null `root` and the resulting view is unconditionally empty
-// (same family as `bug-h2-treemap-tailmap-headmap-view-corruption.md`'s
-// 1-arg headMap/tailMap/subMap gap, just reached via real bytecode instead
-// of a wrong native read). Drive these from `tm_collect_pairs` exactly like
-// the 1-arg `native_tm_head_map`/`tail_map`/`sub_map` above, mirroring the
-// `native_ts_*_set_inclusive` pattern already used for TreeSet's NavigableSet
-// views.
+// always-null `root` and the resulting view is unconditionally empty.
+// `descendingMap` / `descendingKeySet` had no native at all and so were exactly
+// that: the real bytecode built a `DescendingSubMap` over a null `root` and
+// answered `{}` / `[]`, which is the record's first two rows.
 fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -39641,44 +40539,7 @@ fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut to_key = to_key;
-    let to_key_pin = pin_value(ctx, to_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp = tree_compare(ctx, &comparator, k, to_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        // Ascending order: once we pass the upper bound, stop.
-        let stop = if inclusive { cmp > 0 } else { cmp >= 0 };
-        if stop {
-            break;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(ctx, this, None, Some((to_key, inclusive)), false)
 }
 
 fn native_tm_tail_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -39688,42 +40549,7 @@ fn native_tm_tail_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut from_key = from_key;
-    let from_key_pin = pin_value(ctx, from_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp = tree_compare(ctx, &comparator, k, from_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
-        if keep {
-            pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        }
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(ctx, this, Some((from_key, inclusive)), None, false)
 }
 
 fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -39735,65 +40561,43 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_key = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
-    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
-    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
-    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
-    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    // Family-1 stale-ObjectRef fix (2026-07-31): `pairs` is a bare Rust Vec of
-    // raw ObjectRefs. `tree_compare` below dispatches the key's real,
-    // interpreted compareTo/Comparator.compare and `native_tm_put` allocates —
-    // either can run a young collection that relocates every entry this walk
-    // has not consumed yet. Pin the snapshot and refresh k/v before each use.
-    let pairs = tm_collect_pairs(ctx, this);
-    let result_pin = ctx.pin_native_root(result);
-    let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let mut comparator = comparator;
-    let comparator_pin = pin_value(ctx, comparator);
-    let mut from_key = from_key;
-    let from_key_pin = pin_value(ctx, from_key);
-    let mut to_key = to_key;
-    let to_key_pin = pin_value(ctx, to_key);
-    for __i in 0..pinned_pairs.len() {
-        let (mut k, mut v) = pinned_pairs.get(&*ctx, __i);
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        let below = if from_inclusive {
-            cmp_lo < 0
-        } else {
-            cmp_lo <= 0
-        };
-        if below {
-            continue;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        let above = if to_inclusive {
-            cmp_hi > 0
-        } else {
-            cmp_hi >= 0
-        };
-        if above {
-            break;
-        }
-        pinned_pairs.refresh(&*ctx, __i, &mut k, &mut v);
-        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-        result = ctx.read_native_pin(result_pin, result);
-        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-    }
-    ctx.unpin_native_roots(result_pin);
-    Ok(Some(Value::Object(Some(result))))
+    tm_new_range_view(
+        ctx,
+        this,
+        Some((from_key, from_inclusive)),
+        Some((to_key, to_inclusive)),
+        false,
+    )
+}
+
+/// `TreeMap.descendingMap()` — a live NavigableMap over the same entries in the
+/// reverse of this map's ordering.
+///
+/// W7-1 family 1: there was no native for this at all, so the call reached the
+/// real `TreeMap.descendingMap()` bytecode, which builds a `DescendingSubMap`
+/// over the `root` field — and a natively-managed TreeMap never populates
+/// `root`, so the answer was `{}` where HotSpot has `{d=4, c=3, b=2, a=1}`. An
+/// unbounded descending view is the whole implementation.
+fn native_tm_descending_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    tm_new_range_view(ctx, this, None, None, true)
+}
+
+/// `TreeMap.descendingKeySet()` — the JDK's own definition is
+/// `descendingMap().navigableKeySet()`, and that is what this is: the descending
+/// view, then its `keySet`, which `native_tm_key_set` already builds as a live
+/// TreeSet carrying the source map in its trailing array slot. So removing
+/// through the returned set reaches the descending view, and the view redirects
+/// it to the backing map.
+fn native_tm_descending_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let view = match native_tm_descending_map(ctx, args)? {
+        Some(v @ Value::Object(Some(_))) => v,
+        other => return Ok(other),
+    };
+    native_tm_key_set(ctx, &[view])
 }
 
 fn native_tm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -39935,6 +40739,10 @@ fn native_tm_key_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     // Both fast and array modes go through the shared snapshot helper so
     // the iterator sees sorted-order keys regardless of backing store.
+    // W7-1 family 1: this was the one content native that did NOT open with the
+    // state funnel, so a navigable view would have been iterated from whatever
+    // its cache last held.
+    tm_sync_native_state(ctx, this)?;
     let pairs = tm_collect_pairs(ctx, this);
     // Family-1 stale-ObjectRef fix (2026-07-31): both allocations below can
     // collect and move the snapshotted keys (and the snapshot array itself).
@@ -40491,7 +41299,7 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class
     // — and then hand back the snapshot through a real iterator anyway.
     let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
-        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", TS_ITR_NUM_FIELDS)
     });
     let itr = match refused {
         Ok(itr) => itr,
@@ -40506,21 +41314,32 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             )
         }
     };
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
+    ctx.set_field(itr, TS_ITR_FIELD_DATA, Value::Object(Some(snap)));
+    ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
+    ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(Some(Value::Object(Some(itr))))
 }
 
 /// `TreeSet$Itr.remove()` — delete the last element returned by `next()` from
-/// the owning `TreeSet`. The snapshot iterator stores the owning set in field
-/// 2; the last-returned element is the snapshot entry at `cursor - 1`.
+/// the owning `TreeSet`. The snapshot iterator stores the owning set in
+/// [`TS_ITR_FIELD_OWNER`]; the last-returned element is the snapshot entry at
+/// [`TS_ITR_FIELD_LAST_RET`].
+///
+/// W7-1 family 2 (2026-08-11): the guard used to be `cursor <= 0`, which catches
+/// `remove()` before any `next()` but NOT `remove()` twice in a row — the cursor
+/// is not rewound (the snapshot does not shift under a backing-set removal), so
+/// a second call found it unchanged, re-deleted the element it had already
+/// deleted, and reported success where the JDK raises `IllegalStateException`.
+/// A `lastRet` slot expresses both halves of the contract with one value, which
+/// is why the JDK has one and why the `--jdk-only` stand-in already carried the
+/// equivalent (`SnapshotItrBacking::last_removed_cursor`).
 fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let arr = match ctx.get_field(this, 0) {
+    let arr = match ctx.get_field(this, TS_ITR_FIELD_DATA) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
             return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -40529,20 +41348,27 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .into())
         }
     };
-    let cursor = match ctx.get_field(this, 1) {
-        Value::Int(v) => v,
-        _ => 0,
+    // Iterators minted before the `lastRet` slot existed (or by a foreign path
+    // that built a 3-field shape) fall back to the old cursor heuristic rather
+    // than reading past the object.
+    let last_ret = if ctx.object_num_fields(this) > TS_ITR_FIELD_LAST_RET {
+        match ctx.get_field(this, TS_ITR_FIELD_LAST_RET) {
+            Value::Int(v) => v,
+            _ => -1,
+        }
+    } else {
+        match ctx.get_field(this, TS_ITR_FIELD_CURSOR) {
+            Value::Int(v) => v - 1,
+            _ => -1,
+        }
     };
-    // `next()` advances the cursor past the element it returned, so the
-    // last-returned element lives at `cursor - 1`. A cursor of 0 means
-    // `next()` was never called (or `remove()` was already invoked).
-    if cursor <= 0 {
+    if last_ret < 0 {
         return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "remove".to_string(),
         }
         .into());
     }
-    let owner = match ctx.get_field(this, 2) {
+    let owner = match ctx.get_field(this, TS_ITR_FIELD_OWNER) {
         Value::Object(Some(o)) => o,
         _ => {
             // No owning set recorded — nothing to remove from. Stay silent
@@ -40550,8 +41376,19 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return Ok(None);
         }
     };
-    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
-    ts_remove_element(ctx, owner, last)
+    let last = ctx.get_array_element(arr, last_ret as usize);
+    // GC-SAFETY: `ts_remove_element` dispatches the element's `compareTo` /
+    // `Comparator.compare` and can allocate, so read the iterator back through
+    // its pin before clearing `lastRet`.
+    let this_pin = ctx.pin_native_root(this);
+    let removed = ts_remove_element(ctx, owner, last);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    let _ = removed?;
+    if ctx.object_num_fields(this) > TS_ITR_FIELD_LAST_RET {
+        ctx.set_field(this, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
+    }
+    Ok(None)
 }
 
 /// Delete `last` from the live TreeSet `owner` — the write-through half of
@@ -41088,7 +41925,7 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // `java.util.TreeSet$Itr`; the real iterator is `TreeMap$KeyIterator`
     // behind `TreeSet.iterator()`. Refuse under `--jdk-only`, naming the class.
     let refused = rooted_across(ctx, &mut [&mut this, &mut snap], |ctx| {
-        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3)
+        try_alloc_synthetic(ctx, "java/util/TreeSet$Itr", TS_ITR_NUM_FIELDS)
     });
     let itr = match refused {
         Ok(itr) => itr,
@@ -41099,9 +41936,10 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
             return real_snapshot_iterator(ctx, snap, n, Some((this, SnapshotItrRoute::TreeSet)))
         }
     };
-    ctx.set_field(itr, 0, Value::Object(Some(snap)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    ctx.set_field(itr, 2, Value::Object(Some(this)));
+    ctx.set_field(itr, TS_ITR_FIELD_DATA, Value::Object(Some(snap)));
+    ctx.set_field(itr, TS_ITR_FIELD_CURSOR, Value::Int(0));
+    ctx.set_field(itr, TS_ITR_FIELD_OWNER, Value::Object(Some(this)));
+    ctx.set_field(itr, TS_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -41388,6 +42226,28 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
         native_tm_sub_map_inclusive,
     );
+    // W7-1 family 1: these three had NO registration, so they reached the real
+    // `TreeMap` bytecode, which navigates the `root` field a natively-managed
+    // TreeMap never populates — `descendingMap()` answered `{}` and
+    // `descendingKeySet()` answered `[]`.
+    registry.register(
+        c,
+        "descendingMap",
+        "()Ljava/util/NavigableMap;",
+        native_tm_descending_map,
+    );
+    registry.register(
+        c,
+        "descendingKeySet",
+        "()Ljava/util/NavigableSet;",
+        native_tm_descending_key_set,
+    );
+    registry.register(
+        c,
+        "navigableKeySet",
+        "()Ljava/util/NavigableSet;",
+        native_tm_key_set,
+    );
     registry.register(
         c,
         "computeIfAbsent",
@@ -41530,6 +42390,24 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
         "subMap",
         "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
         native_tm_sub_map_inclusive,
+    );
+    registry.register(
+        nm,
+        "descendingMap",
+        "()Ljava/util/NavigableMap;",
+        native_tm_descending_map,
+    );
+    registry.register(
+        nm,
+        "descendingKeySet",
+        "()Ljava/util/NavigableSet;",
+        native_tm_descending_key_set,
+    );
+    registry.register(
+        nm,
+        "navigableKeySet",
+        "()Ljava/util/NavigableSet;",
+        native_tm_key_set,
     );
     registry.set_category(__prev_cat);
 }
@@ -44793,34 +45671,53 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    // THE LAST MINT SITE ON THE INFALLIBLE FUNNEL — migrated 2026-08-10, and
-    // the trade it makes is not the one the two previous notes describe.
+    // Fallible since 2026-08-10; the refusal ARM below was added 2026-08-11,
+    // and the reason the arm was missing is worth keeping because it was a
+    // correct argument that its own file had already outgrown.
     //
-    // Every other snapshot iterator LANDS on a real `Arrays$ArrayItr` when
-    // `--jdk-only` refuses the fabricated shape, and that trade was argued as
-    // free: "on the strict path the alternative was never a working `remove()`
-    // — it was an iteration that did not reach `next()`". That argument does
-    // NOT hold here, and `RChmKeySetView` is what measured it: HotSpot's
-    // `ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
-    // `remove()` writes through to the map, the test exercises exactly that,
-    // and a fixed-size list's iterator answers
-    // `UnsupportedOperationException: remove`. So this site still must NOT be
-    // landed on the array iterator, and it is not.
+    // The 2026-08-10 note said this site must refuse rather than land on a real
+    // `Arrays$ArrayItr`, because HotSpot's `KeySetView.iterator()` returns a
+    // `KeyIterator` whose `remove()` writes through to the map, `RChmKeySetView`
+    // exercises exactly that, and a fixed-size list's iterator answers
+    // `UnsupportedOperationException: remove`. Every clause of that was true
+    // when it was written and the last one no longer is: `real_snapshot_iterator`
+    // takes a `backing` argument, [`snapshot_itr_backing_table`] carries the
+    // pointer the real two-field class has no slot for, and
+    // `native_snapshot_itr_remove`'s `SetLike` arm ALREADY discriminates a key-set
+    // view (`if is_key_set_view(ctx, backing) { native_ksv_remove(..) }`) — the
+    // write-through this site was held back for was built for this receiver and
+    // then not wired to it. Measured on the pre-fix binary: `--jdk-only`
+    // `RChmKeySetView` died at `surface():140` with
+    // `NoClassDefFoundError: java/util/HashMap$KeyItr` on the plain `for (String
+    // x : s)`, i.e. the refusal cost the whole iteration, not just `remove()`.
     //
-    // REFUSING is a different thing from landing, and it is what step 3 needs.
-    // In the default `Compatible` mode `try_alloc_synthetic` is byte-for-byte
-    // what the infallible spelling did, so `RChmKeySetView` and every ordinary
-    // run are unchanged. Under `--jdk-only` the fabrication of
-    // `java/util/HashMap$KeyItr` — a name NO JDK image declares — now raises a
-    // `NoClassDefFoundError` naming that class instead of silently running a
-    // synthetic collection iterator in place of `java.base`'s bytecode, which
-    // is what contract §11 asks for and what `counts.compatibility_classes`
-    // was reporting as its last non-zero row.
+    // What is NOT available here, and why the refusal cannot simply be dropped:
+    // real `KeySetView.iterator()` bytecode reads `ConcurrentHashMap.table`, and
+    // on a CratonVM-native CHM that field is null — measured reflectively under
+    // `--add-opens java.base/java.util.concurrent=ALL-UNNAMED`: `table = null`,
+    // `baseCount = 0` for a map with one entry, against `Node[16]`/`1` on
+    // HotSpot. Letting the real iterator run would iterate EMPTY, which is the
+    // failure mode that reads as a pass. The snapshot keeps the natives the one
+    // owner of the state; only the class name becomes honest.
     //
-    // The capability is recovered, not traded away, when CratonVM's
-    // `ConcurrentHashMap` carries a real `table[]` its own `KeyIterator` can
-    // walk — the collections reclassification wave, not this one.
-    let itr = try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)?;
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there, so this
+    // arm never runs and the fabricated `HashMap$KeyItr` is still what
+    // `--real-jdk` hands back.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                total,
+                Some((this, SnapshotItrRoute::SetLike)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
@@ -50223,6 +51120,12 @@ fn native_snapshot_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             }
         }
         SnapshotItrRoute::TreeSet => ts_remove_element(ctx, state.backing, last),
+        SnapshotItrRoute::LinkedList => {
+            native_ll_remove_object(ctx, &[Value::Object(Some(state.backing)), last])
+        }
+        SnapshotItrRoute::ArrayDeque => {
+            native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(state.backing)), last])
+        }
     };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
