@@ -764,10 +764,16 @@ def main(argv=None):
             "jdk_version": args.jdk_version,
             "workload": args.workload,
             "note": args.note,
-            "bridge_without_acc_native": block["bridge"]["without_acc_native"],
-            "bridge_shadows_bytecode": block["bridge"]["shadows_bytecode"],
             "observed": block,
         }
+        # Every RATCHET's frozen value, from the ONE list that defines them.
+        # The three used to be written out by hand here, so adding a ratchet
+        # left its baseline key absent and `gate` raised a KeyError on the next
+        # run — and `bridge_shadows_bytecode` was being frozen from the
+        # own-class count while the gate scored the hierarchy-wide one, which
+        # would have fired on a tree nobody had changed.
+        for block_key, base_key, _ in RATCHETS:
+            entry[base_key] = block["bridge"][block_key]
         baseline.setdefault("jdk", {})[key] = entry
         os.makedirs(os.path.dirname(os.path.abspath(args.baseline)), exist_ok=True)
         with open(args.baseline, "w", encoding="utf-8") as fh:
