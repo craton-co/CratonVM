@@ -20,6 +20,14 @@ By participating, you are expected to uphold this code.
    cargo build --all-targets
    cargo test --all
    ```
+4. Optional, recommended — enable the repository's hooks:
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+   Currently one `pre-push` hook, running the ~1.8 s flag-surface guards. CI
+   already runs them, but branches here are merged into `dev` and pushed
+   directly, so CI reports a red surface rather than preventing one. See
+   [docs/contributing/flag-surface-hook.md](docs/contributing/flag-surface-hook.md).
 
 ## Development Workflow
 
