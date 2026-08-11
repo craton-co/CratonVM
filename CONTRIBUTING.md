@@ -200,7 +200,15 @@ When your PR adds a feature, fixes a bug, or changes behavior:
    the retired `native-kind-is-ambient-and-defaults-to-syntheticstub` write-up
    (RETIRED 2026-08-06 — the ambient default no longer decides anything; the
    reclassification it pointed at is in
-   [`docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md`](docs/known-issues/jdk-only/l5bc-awt-builtins-bridge-residuals.md)).
+   [`docs/known-issues/jdk-only/bridge-reclassification-wave.md`](docs/known-issues/jdk-only/bridge-reclassification-wave.md)).
+
+   One class of mis-tag is now decided centrally rather than at the site: a
+   registration whose receiver class **no supported JDK image declares** cannot
+   bind to an `ACC_NATIVE` method, so `register()` re-tags it `SyntheticStub`
+   from the measured table in `native-api/src/no_image_receiver.rs`. If you are
+   adding a native on a class the VM mints — an iterator stand-in, a functional
+   combinator, a `cratonvm/…` receiver — check that table before choosing a
+   kind; it is probably already deciding for you.
 
 4. **Use `NativeContext`** — the `ctx` parameter provides:
    - `ctx.alloc_object(class_id)` — allocate a new object

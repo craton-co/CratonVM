@@ -260,7 +260,39 @@ use cratonvm_types::compat::CompatibilityMode;
 /// command — is **byte-identical to HotSpot 25**. Compatible `--real-jdk` mode
 /// is byte-identical to the build before the change; it keeps every one of
 /// these registrations and still answers with the VM's own process object.
-const BASELINE_SYNTHETIC_STUBS: usize = 689;
+///
+/// # 689 -> 923, 2026-08-10 (the receivers no supported image declares)
+///
+/// Two hundred and thirty-four, and for the fourth time in this history **no new
+/// fake was added.** This is the 2026-08-06 `cratonvm/synthetic/Process*` retag
+/// above applied to the rest of its own family instead of to one cluster: a
+/// registration whose receiver class is declared by **no** supported JDK image
+/// cannot bind to an `ACC_NATIVE` method, so §1.5 does not admit it as a
+/// `Bridge` under any reading. `native-api/src/no_image_receiver.rs` carries the
+/// table, the six images (21 and 25 × linux, windows, macos) it was measured
+/// against, and the two exclusions.
+///
+/// The count differs from the 248 a real-JDK boot census reports, and the
+/// difference is this file's registry rather than the change: the ratchet runs
+/// the default registration passes with no image, so it registers some triples a
+/// real boot does not and misses others. Both numbers cover the same receiver
+/// classes.
+///
+/// Measured, in both directions:
+///
+///  * `--jdk-only` regression corpus **52 passed / 6 failed** and compatible
+///    mode **35 passed / 0 failed** — both **identical** to a binary built from
+///    `dev` without the change, run on the same host against the same images.
+///  * The `CRATONVM_NO_STUBS` drop list grows by exactly the 248 retagged rows
+///    with **nothing else moving in either direction** — the check the
+///    2026-07-14 `java.util.Properties` regression would have failed.
+///  * One exclusion survives: the proxy machinery, as a reviewed VM service.
+///    Four more were held back at first because strict mode still *created*
+///    those classes, and were released when `ensure_synthetic_class` was deleted
+///    the same day. The corpus found two of the five; the other three were
+///    latent and came from a class-origin census, because no vector builds an
+///    atomic field updater.
+const BASELINE_SYNTHETIC_STUBS: usize = 923;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
@@ -536,7 +568,28 @@ fn essential_registry_is_populated() {
 /// registry ever drops under it, `set_compatibility_mode` is refusing far more
 /// than the stubs, and "zero synthetic stubs" would be true only because the
 /// registry is empty.
-const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_500;
+///
+/// # 10,500 -> 10,200, 2026-08-10
+///
+/// Lowered by 300 for a strict registry of 10,449, and the number it is
+/// tracking moved for two independent reasons on the same day: 179
+/// registrations were deleted with `ensure_synthetic_class`, and 248 were
+/// re-tagged `SyntheticStub` because no supported JDK image declares their
+/// receiver class (`native-api/src/no_image_receiver.rs`). Strict mode refuses
+/// the second group by design — that is the re-tag's whole point.
+///
+/// **Lowering a collapse detector is exactly the move it exists to make
+/// suspicious, so it is justified by the evidence the detector cannot see.**
+/// Against a binary built from `dev` without the re-tag, on the same host and
+/// the same images: the `--jdk-only` corpus is 52 passed / 6 failed on **both**
+/// arms and compatible mode is 35 / 0 on both, and the `CRATONVM_NO_STUBS` drop
+/// list grows by exactly 248 entries with **zero** entries moving the other way.
+/// A registry shedding whole modules does not produce that diff.
+///
+/// The 300 of headroom is deliberate and is not a prediction: it keeps the
+/// detector a detector after the next re-tag of this size, which
+/// `docs/known-issues/jdk-only/bridge-reclassification-wave.md` expects.
+const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_200;
 
 /// Build the default native registry the way `--jdk-only` does: set the
 /// VM-scoped strict policy *first*, then run the same boot sequence

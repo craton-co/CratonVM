@@ -1107,11 +1107,19 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 //     inherits it from `UnixFileDispatcherImpl`. Either way it is an
 //     ACC_NATIVE target, so it states its kind.
 //   * `sun/nio/ch/WindowsFileDispatcherImpl` **exists on neither image.** The
-//     Windows JDK calls its class `FileDispatcherImpl` too. All 28 rows under
-//     that spelling are dead on every JDK 25 platform — they are not stated,
-//     and they are deletion candidates for the stub-removal wave.
+//     Windows JDK calls its class `FileDispatcherImpl` too.
 //
-// Per-row table: docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// RE-ADJUDICATED 2026-08-10, six images (21.0.12+8 and 25.0.4+7 × linux,
+// windows, macos). The `WindowsFileDispatcherImpl` rows — 30, not 28 — are
+// declared by none of them, so §1.5 has no `ACC_NATIVE` method for them to bind
+// to and they are `SyntheticStub`, tagged centrally by
+// `cratonvm_native_api::no_image_receiver`. They are **not** deletion
+// candidates and the previous sentence saying so was wrong for the whole
+// bucket: under `--synthetic-jdk` the VM mints a stand-in for this class on
+// demand and these registrations are its only implementation.
+//
+// Per-row table: retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+// Disposition: fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md
 /// The leaf dispatcher class, present on every JDK 25 image.
 pub(crate) const FD_LEAF: &str = "sun/nio/ch/FileDispatcherImpl";
 /// The Unix-image declarer. Absent from a Windows image.
