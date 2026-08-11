@@ -1254,6 +1254,29 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// Anchor: `T19_H14_OPENMBEAN`. Registers the JMX OpenType / MXBean
 /// translation natives that unblock KC16 boot through
 /// `MBeanServer.registerMBean(MemoryMXBean)`.
+/// Should the JDK's own MXBean type-mapping machinery be left alone?
+///
+/// The `mappingForType`/`makeMapping`/`toOpenValue` overrides below replace
+/// `DefaultMXBeanMappingFactory` with a synthetic mapping that types every
+/// unrecognised Java type as `SimpleType.STRING` and converts nothing
+/// (`toOpenValue` is identity). That is why
+/// `MBeanServer.getAttribute("java.lang:type=Memory", "HeapMemoryUsage")`
+/// hands back a raw `java.lang.management.MemoryUsage` where every other JVM
+/// returns a `CompositeDataSupport`.
+///
+/// Gate, do not delete: the overrides were added because the real recursion
+/// was believed not to terminate on this VM. `CRATONVM_REAL_MXBEAN_MAPPING`
+/// lets a run answer that empirically without a rebuild.
+pub(crate) fn real_mxbean_mapping_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CRATONVM_REAL_MXBEAN_MAPPING").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1276,17 +1299,24 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/List;",
         native_introspector_get_methods,
     );
+    // Defence in depth: short-circuit the OpenType recursion at the
+    // mapping factory level too, so plain MBeans don't hit it.
+    if !real_mxbean_mapping_enabled() {
     // Defence in depth: if a path still reaches ConvertingMethod.from
     // with an Object method (e.g. tests bypass the introspector),
     // short-circuit by returning null.
+    //
+    // Inside the gate: this override installs an IDENTITY return mapping, so
+    // leaving it registered would keep `getAttribute` handing back the raw
+    // Java value even with the mapping factory restored. The Object-method
+    // filter it also provides is already covered by the `getMethods`
+    // registrations above, which stay unconditional.
     registry.register(
         "com/sun/jmx/mbeanserver/ConvertingMethod",
         "from",
         "(Ljava/lang/reflect/Method;)Lcom/sun/jmx/mbeanserver/ConvertingMethod;",
         native_converting_method_from,
     );
-    // Defence in depth: short-circuit the OpenType recursion at the
-    // mapping factory level too, so plain MBeans don't hit it.
     registry.register(
         "com/sun/jmx/mbeanserver/MXBeanMappingFactory",
         "mappingForType",
@@ -1352,6 +1382,7 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_mxbean_mapping_identity,
     );
+    } // end !real_mxbean_mapping_enabled()
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
     // OpenConverter path. JDK 25 splits the OpenType analysis between
