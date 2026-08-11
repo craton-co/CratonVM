@@ -2828,9 +2828,16 @@ fn native_proc_handle_current_pid0(
 /// The `long` returned is a start-time, not a boolean: `ProcessHandleImpl`
 /// reads it as `STARTTIME_PROCESS_UNKNOWN` (-1) for "no such process",
 /// `STARTTIME_ANY` (0) for "exists, start time unavailable", and any positive
-/// value as the start time itself. We have no cheap start time, so alive is
-/// reported as the constant 1 — `isAlive()` compares it against the value it
-/// cached at construction, and a constant compares equal to itself.
+/// value as the start time itself. A live process is reported as
+/// `start_time_or_any(pid)` — the real OS start time where the platform has a
+/// probe, `STARTTIME_ANY` (0) where it does not.
+///
+/// (This paragraph used to say "we have no cheap start time, so alive is
+/// reported as the constant 1". That stopped being true when `os_process_start_time`
+/// gained its Windows and Linux arms, and the body below has not returned a
+/// constant since. Left corrected rather than deleted: a stale comment that
+/// describes a defect the code no longer has is how the next reader concludes
+/// the fix never landed.)
 ///
 /// The distinction between 0 and -1 is load-bearing. Returning 0 for a process
 /// that does not exist reads as "exists, unknown start time"; the reaper's
