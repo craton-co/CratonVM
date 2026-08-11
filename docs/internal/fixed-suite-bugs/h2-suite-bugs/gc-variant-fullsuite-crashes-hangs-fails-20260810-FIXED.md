@@ -192,10 +192,23 @@ org/h2/expression/function/StringFunction1.getValue(...) at bci 54
 inline callers 0, reason UnreachedCode); refusing side-effecting replay
 ```
 
-`CRATONVM_DBG_DEOPT=1` named the producer: a deopt inside an **inlined** callee
-stashes a frame keyed to the inlinee with an empty caller chain, so no call site
-on the dispatch path can claim it and it is orphaned in the thread-local. The
-sink then took someone else's frame and killed the VM over it.
+`CRATONVM_DBG_DEOPT=1` showed a frame keyed `StringUtils.cache` reaching a
+consumer that could not attribute it while `ValueVarchar.get` was on the
+dispatch path, and it is orphaned in the thread-local — the sink then took
+someone else's frame and killed the VM over it.
+
+> **This section originally diagnosed that as a trap inside an INLINED callee,
+> and that was wrong.** `try_emit_inline_site` rolls back any splice that
+> publishes deopt metadata, and `build_and_record_deopt_point` bakes the
+> *caller's* key, so an inlined trap cannot produce a callee-keyed frame. The
+> real producer is a statically-bound JIT→JIT direct call that skipped
+> `invoke_info.push`, leaving the emitter with no `JitInvokeInfo` and therefore
+> no callee-deopt service check after the `CALL`. Root-caused and fixed the same
+> day — see `../jit-direct-call-mints-an-orphaned-deopt-frame-20260810-FIXED.md`,
+> which also made this sink's `deoptimize` call conditional (it was making two
+> methods not-compilable per orphan, one of them innocent). The `inline callers
+> 0` field in the message above is consistent with a separately-compiled callee;
+> reading it as evidence of inlining was the mistake.
 
 Fixed narrowly, by aligning the outlier with its own sibling: when the stash is
 foreign, de-speculate the frame's real owner, drop the orphan, and let this
@@ -206,8 +219,8 @@ the same case.
 **Both classes go CRASH → HANG, not CRASH → PASS.** They stop killing the VM and
 then run out the 300 s cap — `TestScript` was dying at ~212 s, so surviving the
 orphan buys it more work, not a pass. That residual is the throughput programme
-in §4, not this defect. **The orphan-producing defect is upstream and still
-open**; it has its own page (see Related).
+in §4, not this defect. The orphan-producing defect was upstream and is now
+closed (see the note above).
 
 ## 4. The FAILs — a HotSpot control settles most of them
 
