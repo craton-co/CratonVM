@@ -1,32 +1,32 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4579,
-      "bridge_without_acc_native": 9296,
+      "bridge_shadows_bytecode": 4555,
+      "bridge_without_acc_native": 8977,
       "jdk_version": "25.0.4",
       "mode": "compatible",
-      "note": "246 registrations re-tagged Bridge -> SyntheticStub because no supported JDK image declares their receiver class (six images: 21.0.12+8 and 25.0.4+7 on linux, windows and macos), so contract 1.5 has no ACC_NATIVE method for them to bind to. Table, exclusions and measurement in native-api/src/no_image_receiver.rs. Two exclusions kept Bridge: the proxy machinery as a reviewed VM service, and four receivers strict mode still fabricates. jdk-only corpus 52/5 unchanged, compatible 34/0 unchanged, CRATONVM_NO_STUBS drop list grows by exactly 246 with nothing else moving.",
+      "note": "248 registrations re-tagged Bridge -> SyntheticStub because no supported JDK image declares their receiver class (six images: Temurin 21.0.12+8 and 25.0.4+7 on linux, windows and macos), so contract 1.5 has no ACC_NATIVE method for them to bind to. Table, exclusion and measurement in native-api/src/no_image_receiver.rs; the one exclusion is the proxy machinery, kept Bridge as a reviewed VM service. Verified against a binary built from dev without the change, same host and images: --jdk-only corpus 52 passed / 6 failed and compatible 35 / 0 on BOTH arms, and the CRATONVM_NO_STUBS drop list grows by exactly 248 with nothing moving the other way. Taken on the merge with dc55e8057, which deleted ensure_synthetic_class and 179 registrations, so the row total falls to 11555 for reasons that are not this change.",
       "observed": {
         "bridge": {
           "abstract_method": 1318,
           "acc_native": 780,
-          "class_absent": 907,
-          "class_present_method_undeclared": 2492,
-          "rows": 10076,
-          "shadows_bytecode": 4579,
-          "without_acc_native": 9296
+          "class_absent": 872,
+          "class_present_method_undeclared": 2232,
+          "rows": 9757,
+          "shadows_bytecode": 4555,
+          "without_acc_native": 8977
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10076,
-          "intrinsic": 665,
-          "synthetic-stub": 1133
+          "bridge": 9757,
+          "intrinsic": 663,
+          "synthetic-stub": 1135
         },
         "schema": 1,
-        "total_rows": 11874
+        "total_rows": 11555
       },
       "os": "linux",
       "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"

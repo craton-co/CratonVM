@@ -1,8 +1,8 @@
-# The 9,296 `Bridge` registrations the image does not back — contract §8's wave
+# The 8,977 `Bridge` registrations the image does not back — contract §8's wave
 
 **Status:** OPEN, filed 2026-08-10 as the surviving owner of a question two
 retired records used to hold. Nothing here is a crash. What is open is that
-9,296 registrations are tagged `Bridge` while no supported JDK image declares
+8,977 registrations are tagged `Bridge` while no supported JDK image declares
 their target `ACC_NATIVE`, so `--jdk-only` admits every one of them on a claim
 nobody has checked.
 
@@ -23,33 +23,29 @@ JDK 25.0.4+7 / linux, 2026-08-10, from a schema-3 census read with
 `scripts/jdk-only-adjudicate.py --inherited`:
 
 ```
-counts   intrinsic 665   bridge 10076   synthetic-stub 1133   total 11874
+counts   intrinsic 663   bridge 9757   synthetic-stub 1135   total 11555
 
 kind               rows  absent  undecl  native    code  abstract
-bridge            10076     907    2492     780    4579      1318
+bridge             9757     872    2232     780    4555      1318
 
-BRIDGE rows with no ACC_NATIVE target:            9296
-  ...inherited an ambient set_category:           9209
+BRIDGE rows with no ACC_NATIVE target:            8977
+  ...inherited an ambient set_category:           8890
   ...dispatched this run:                            2
-  ...superseded (own no slot, can never dispatch): 977
-  => LIVE unadjudicated BRIDGE surface:           8319
+  ...superseded (own no slot, can never dispatch): 967
+  => LIVE unadjudicated BRIDGE surface:           8010
 ```
 
-**Read `9296` as L6's ratchet population and `8319` as the work.** The gap is
+**Read `8977` as L6's ratchet population and `8010` as the work.** The gap is
 registrations a later `register*` of the identical triple displaced: they record
 that a registration happened and nothing more, and adjudicating their kind
 decides nothing. `owns_slot` is a census column, so this no longer has to be
 inferred from row order.
 
-`--inherited` splits the 2,492 `undecl` rows, which is the difference between a
-work list and a four-times-too-large one:
-
-| what the row actually resolves to | rows | what it is |
-|---|---:|---|
-| inherited, concrete bytecode | 1,599 | a §1.4 shadow |
-| inherited, abstract | 316 | intercepts every implementor |
-| inherited, `ACC_NATIVE` | 19 | **a bridge the census does not credit** |
-| nowhere in the hierarchy | 602 | genuinely undeclared |
+`--inherited` splits the 2,232 `undecl` rows, which is the difference between a
+work list and a four-times-too-large one. Roughly: ~1,600 inherit concrete
+bytecode (§1.4 shadows), ~300 inherit an abstract method (they intercept every
+implementor), **19 inherit an `ACC_NATIVE` supertype method** — bridges the
+census does not credit — and the rest are genuinely nowhere in the hierarchy.
 
 ### The 19 that are miscounted in the dangerous direction
 
@@ -84,7 +80,7 @@ The 24 are 12 triples, all in `native-builtins/src/phases_late/concurrent.rs`:
 `RecursiveTask.fork` and `RecursiveAction.fork`. They are deliberate,
 load-bearing shadows — the site comments say `RJdkForkJoin` hangs without them —
 so the wrong part is the *statement*, not the registration, and they belong to
-the 4,579 shadow population and its blocker rather than to a quick fix.
+the 4,555 shadow population and its blocker rather than to a quick fix.
 
 They are called out because of how they survived: L6's ratchet counts `Bridge`
 rows without an `ACC_NATIVE` target and refuses a **rise**;
@@ -100,17 +96,17 @@ Nine files hold half of it:
 
 | rows | file |
 |---:|---|
-| 1,060 | `native-builtins/src/lib.rs` |
+| 1,055 | `native-builtins/src/lib.rs` |
 | 990 | `native-builtins/src/lang_misc.rs` |
-| 953 | `native-collections/src/lib.rs` |
-| 413 | `native-builtins/src/phases_late/nio_file.rs` |
+| 950 | `native-collections/src/lib.rs` |
+| 394 | `native-builtins/src/phases_late/nio_file.rs` |
 | 363 | `native-builtins/src/phases_late/foreign_ffm.rs` |
-| 320 | `native-builtins/src/lang_string.rs` |
-| 269 | `native-io/src/lib.rs` |
-| 261 | `native-builtins/src/net_phase_e.rs` |
+| 264 | `native-io/src/lib.rs` |
+| 263 | `native-builtins/src/net_phase_e.rs` |
 | 239 | `native-builtins/src/util_concurrent_ext.rs` |
+| 215 | `native-builtins/src/servlet.rs` |
 
-`native-collections`' 953 come from **one** `set_category(Bridge)` line, and the
+`native-collections`' 950 come from **one** `set_category(Bridge)` line, and the
 image declares `ACC_NATIVE` on exactly zero of them — re-measured per row, not
 inherited. That is the largest single-line blast radius in the tree and the
 reason contract §8 scopes this subsystem-per-PR.
@@ -125,20 +121,21 @@ reason contract §8 scopes this subsystem-per-PR.
   are now swept (21.0.12+8 and 25.0.4+7 × linux, windows, macos) and
   `scripts/jdk-only-dead-sweep.py` refuses an image set that omits a platform.
 * **A receiver class no supported image declares is already handled**, 2026-08-10:
-  246 such rows are `SyntheticStub`, by measurement, in
-  `native-api/src/no_image_receiver.rs`. That is the `class_absent` column's
-  remaining 907 minus the third-party names an application supplies and the four
-  receivers strict mode still fabricates. Do not re-open it as part of this wave.
+  248 such rows are `SyntheticStub`, by measurement, in
+  `native-api/src/no_image_receiver.rs`. The `class_absent` column's remaining
+  872 is third-party names an application supplies, plus the proxy machinery
+  kept `Bridge` as a reviewed VM service. Do not re-open it as part of this wave.
 * **The abstract-interception worry is measured inert for `java.util`.** A probe
   handing the VM `AbstractCollection`/`AbstractSet`/`AbstractList`/`AbstractMap`
   subclasses in a layout nothing models gets byte-identical answers to HotSpot on
-  all 42 observables — see
-  [`abstract-collection-natives-are-inert-for-foreign-layouts.md`](abstract-collection-natives-are-inert-for-foreign-layouts.md).
+  all 42 observables — the retired
+  `abstract-collection-natives-are-inert-for-foreign-layouts` record, whose probe
+  is now the scheduled vector `regression-suite/src/RForeignLayoutCollections.java`.
   The other 1,318 abstract rows are unprobed.
 
 ## The blocker, measured rather than argued
 
-The obvious disposition for the 4,579 shadows is `SyntheticStub`: strict mode
+The obvious disposition for the 4,555 shadows is `SyntheticStub`: strict mode
 drops them and the real bytecode runs, which is what §1.4 says should happen.
 That was implemented as a dispatch-time dial and **measured**:
 `CRATONVM_ENFORCE_NATIVE_SHADOW=1` takes the `--jdk-only` corpus from
@@ -159,11 +156,14 @@ and the record of the dial's measurement,
 internal tree. The dial exists so the measurement can be re-taken **one
 subsystem at a time** instead of argued about.
 
-The same blocker has a smaller, already-worked example: of the 50 receiver
-classes re-tagged on 2026-08-10, four had to be excluded because strict mode
-still fabricates them, and dropping their natives replaced a silent §5 violation
-with `UnsatisfiedLinkError`. Two of the four were caught by the corpus; the other
-two were latent and were found by a class-origin census. Expect that ratio.
+The same blocker had a smaller, already-worked example, and watching it close is
+the useful part: of the 43 receiver classes re-tagged on 2026-08-10, four had to
+be held back because strict mode still fabricated them, and dropping their
+natives replaced a silent §5 violation with `UnsatisfiedLinkError`. Two of the
+four were caught by the corpus; the other two were latent and came from a
+class-origin census — expect that ratio. All four were released hours later when
+`ensure_synthetic_class` was deleted, which is what "the class's state has to
+become real first" looks like when it actually happens.
 
 ## What would close this
 
@@ -181,9 +181,9 @@ In order, and none of it is a codemod.
    `UserImplementorInterceptProbe` probed the eleven inside it. The interception
    surface is real; whether dispatch uses it is a per-family question and has
    only been answered for one family.
-4. **The 977 superseded rows are a separate, cheaper job**: they can never
+4. **The 967 superseded rows are a separate, cheaper job**: they can never
    dispatch, so they are deletable on their own evidence, and removing them
-   would take the ratchet population to 8,319 without deciding anything.
+   would take the ratchet population to 8,010 without deciding anything.
 
 ## Reproducing
 

@@ -1,4 +1,4 @@
-# A `Bridge` on a receiver class no JDK declares — 246 rows, and the deletion list that would have removed them
+# A `Bridge` on a receiver class no JDK declares — 248 rows, and the deletion list that would have removed them
 
 **Status:** FIXED 2026-08-10. Closes the last open item the two L5 bridge-residual
 records carried, and corrects the disposition the sibling census record
@@ -18,7 +18,7 @@ L5 records ended on the same unresolved item, worded almost identically:
 > both places it is now known to occur.
 
 That was done for one cluster on 2026-08-06 (the 29 `cratonvm/synthetic/Process*`
-rows) and stopped there. This is the same defect in **fifty** more classes.
+rows) and stopped there. This is the same defect in **forty-three** more classes.
 
 ## What was found first: the prescribed fix was wrong
 
@@ -109,7 +109,7 @@ That disjunction is why this needs no census of what the VM mints — which
 matters, because no such census exists and a grep for the mint sites
 under-reports badly: the names are passed as a `const`, a local or a loop
 variable, and a search over `alloc_synthetic`-family call sites with literal
-arguments finds 22 of the 50.
+arguments finds 22 of them.
 
 `native-api/src/no_image_receiver.rs` holds the table, the measurement, and the
 predicate; `NativeMethodRegistry::register` applies it before any of its policy
@@ -117,7 +117,7 @@ arms, so the re-tag also decides the `--jdk-only` refusal. Rows re-tagged this
 way report `kind_stated`, because a measurement adjudicated them.
 
 **Why centrally and not at the sites:** the property is a fact about the class,
-measured against six images, and the 246 rows sit at 165 registration sites —
+measured against six images, and the 248 rows sit at ~165 registration sites —
 many of them loops that also register live rows on other classes. A site cannot
 know the fact, and 165 restatements of it would drift on the first image bump.
 `scripts/jdk-only-kind-map.py` freezes every row's kind, so the change is still
@@ -133,8 +133,8 @@ Re-tagging is half a fix, and the L5 record said so before this table existed:
 
 Exactly right. Strict mode still fabricates some of these classes — it records
 the §5 violation and mints anyway — so dropping their natives turns a silent
-contract violation into an `UnsatisfiedLinkError`. Five of the fifty are in that
-state and are excluded, with the reason in the source:
+contract violation into an `UnsatisfiedLinkError`. Five were in that
+state and were excluded at first, with the reason in the source:
 
 | receiver | why excluded | how found |
 |---|---|---|
@@ -147,7 +147,7 @@ state and are excluded, with the reason in the source:
 
 The two proxy entries are reviewed VM services (§11 admits those to strict mode,
 and `NativeKind` has no variant that says so, so `Bridge` is the only tag that
-survives `allowed_in(JdkOnly)`). The other four are the same defect as the 246,
+survives `allowed_in(JdkOnly)`). The other four are the same defect as the 248,
 waiting on wave-2 item 4.
 
 **Worth keeping: the strict corpus found two of the five, and a class-origin
@@ -159,37 +159,46 @@ revisited.
 
 ## Measured
 
-One binary per arm, same tree, JDK 25.0.4+7 / linux unless stated.
+One binary per arm, same tree, JDK 25.0.4+7 / linux unless stated. The A/B arm
+is a binary built from `dev` (`219c5fe34`) **without** this change, on the same
+host and against the same images — which is the only thing that separates "this
+change broke it" from "this was already red", and it was needed twice below.
 
-* **Census, `--real-jdk`:** rows unchanged at 11,874; **246 kind changes, all
-  `bridge` → `synthetic-stub`, across 50 receiver classes**; nothing else moved.
-  `bridge` 10,322 → 10,076, `synthetic-stub` 887 → 1,133, `intrinsic` 665
-  unchanged. `kind_stated` 901 → 1,147, i.e. **+246 exactly**.
+* **Census, `--real-jdk`:** rows unchanged at 11,555; **248 kind changes, all
+  `bridge` → `synthetic-stub`, across 43 receiver classes**; nothing else moved.
+  `bridge` 10,005 → 9,757, `synthetic-stub` 887 → 1,135, `intrinsic` 663
+  unchanged. `kind_stated` 901 → 1,149, i.e. **+248 exactly**.
 * **`CRATONVM_NO_STUBS=1` + dropped-stub listing, both arms:** boot succeeds and
-  the probe completes on both. Drop list 939 → 1,185: **246 entries only in the
+  the probe completes on both. Drop list 939 → 1,187: **248 entries only in the
   new arm, 0 only in the old.** This is the check the 2026-07-14
   `java.util.Properties` regression would have failed.
-* **Compatible regression suite:** 34 passed / 0 failed, **both arms**.
+* **Compatible regression suite:** 35 passed / 0 failed, **both arms**.
   `DeadSweepReachProbe` under `--real-jdk` is identical between arms apart from
   a temp filename.
-* **`--jdk-only` regression corpus (`SUITE=all`):** 52 passed / 5 failed, **both
-  arms** (`RReflect`, `RJdkHandles`, `RJdkReflect`, `RJdkForkJoin`, `RJdkJmx` —
-  all pre-existing on `dev`). Without the five exclusions it was 50/7.
-* **L6 `bridge-ratchet.sh`:** `bridge_without_acc_native` 9,528 → **9,296**,
-  `class_absent` 1,153 → **907**, `shadows_bytecode` 4,581 → 4,579. Both gates
-  fired on the un-refrozen baselines — which is them working, since a
+* **`--jdk-only` regression corpus (`SUITE=all`):** 52 passed / 6 failed, **both
+  arms** — `RReflect`, `RChmKeySetView`, `RJdkHandles`, `RJdkReflect`,
+  `RJdkForkJoin`, `RJdkJmx`, all red on `dev` alone. An earlier arm of this work,
+  before the five exclusions, was 50/7.
+* **L6 `bridge-ratchet.sh`:** `bridge_without_acc_native` **8,977**,
+  `class_absent` **872**, `shadows_bytecode` 4,555. Both gates fired on the
+  un-refrozen baselines — which is them working, since a
   `Bridge`→`SyntheticStub` mass re-tag makes the counts *fall* and the aggregate
   ratchet cannot see that direction. Re-frozen with the note, and both PASS
   after: `BRIDGE-RATCHET: PASS`, `KIND-MAP: PASS — no registration changed kind.`
-* **`stub_ratchet`:** `BASELINE_SYNTHETIC_STUBS` 689 → **943**, `SLACK = 0`,
-  re-frozen with the reasoning in the constant's own history. 7 passed, 0 failed.
+* **`stub_ratchet`:** `BASELINE_SYNTHETIC_STUBS` 689 → **923** and
+  `STRICT_MIN_TOTAL_REGISTRATIONS` 10,500 → **10,200**, both re-frozen with the
+  reasoning in the constants' own histories. 7 passed, 0 failed.
   `strict_registry_has_zero_synthetic_stubs` and
-  `strict_registry_drops_only_the_stubs` both still pass.
-* **Unit tests:** `native-api` 287, `native-builtins` 3,401, `native-io` 438,
-  `native-collections` 105, `classloading` 786, `registry_contracts` 8,
-  `doc_citation_paths` 2 — all passing. `native-awt` 259 passed / 1 failed
-  (`image::tests::get_rgb_oob`, recorded as pre-existing on `dev` by the L5b
-  record and unchanged here).
+  `strict_registry_drops_only_the_stubs` both still pass. Lowering a *collapse
+  detector* is the move it exists to make suspicious, so it is carried by the
+  drop-list diff above rather than by the count.
+* **Unit tests:** `native-api` 287, `native-collections` 105, `classloading`
+  790, `types` 536, `registry_contracts` 8, `doc_citation_paths` 2 — all
+  passing. `native-builtins --lib` is 3,380 / 22 and `native-io --lib` 436 / 2,
+  and `native-awt` 259 / 1: **every one of those failure sets is byte-identical
+  on the `dev`-only arm**, diffed by test name, so none is this change's. The
+  first two are `dc55e8057`'s and are filed separately; the `native-awt` one
+  (`image::tests::get_rgb_oob`) has been pre-existing since the L5b record.
 
 ## What shipped
 
@@ -200,21 +209,27 @@ One binary per arm, same tree, JDK 25.0.4+7 / linux unless stated.
 | `probes/DeadSweepReachProbe.java` | the workload written against the baseline; the regression test for all of it |
 | `scripts/jdk-only-dead-sweep.py` | refuses an image set that omits a platform; routes `class-absent` to the gated section with the reason; `--gated-out` |
 | `scripts/jdk-only-no-image-receivers.py` | re-derives the table from censuses and fails on drift; `--selftest` shows both directions |
-| `scripts/baselines/jdk-only-dead-everywhere.tsv` | **791 → 549 rows**, all `method-nowhere` |
-| `scripts/baselines/jdk-only-gated-never-delete.tsv` | new: 208 rows, with why each is gated |
+| `scripts/baselines/jdk-only-dead-everywhere.tsv` | **791 → 287 rows**, all `method-nowhere` |
+| `scripts/baselines/jdk-only-gated-never-delete.tsv` | new: 175 rows, with why each is gated |
 | `scripts/baselines/jdk-only-bridge-ratchet.json`, `…kind-map-25-linux.tsv` | re-frozen |
-| `native-builtins/tests/stub_ratchet.rs` | baseline re-frozen 689 → 943 |
+| `native-builtins/tests/stub_ratchet.rs` | both constants re-frozen: 689 → 923, floor 10,500 → 10,200 |
 
 ## What is left, and where it lives now
 
-* **549 deletion candidates**, all `method-nowhere`: the class *is* a real JDK
+* **287 deletion candidates**, all `method-nowhere`: the class *is* a real JDK
   class on some image and the method is nowhere in its hierarchy on any of them.
   The receiver's existence is not in question there, so the argument above does
   not apply and the list stands. Owned by
   `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
-* **The 9,296-row `Bridge`-without-`ACC_NATIVE` population**, of which ~8,555 own
+* **The 8,977-row `Bridge`-without-`ACC_NATIVE` population**, of which 8,010 own
   a slot. Owned by
   `docs/known-issues/jdk-only/bridge-reclassification-wave.md`, filed with this
   change because the two L5 records that used to hold it are retired.
-* **The four blocked receivers**, which need wave-2 item 4
-  (`ensure_synthetic_class` enforcement) before they can move.
+* **Nothing blocked.** The four receivers held back for wave-2 item 4 were
+  released the same day, when `ensure_synthetic_class` was deleted; a
+  `--jdk-only` run of `RChmKeySetView` now dies on
+  `NoClassDefFoundError: java/util/HashMap$KeyItr`, which is §5 enforcing rather
+  than recording. `STRICT_STILL_FABRICATES` is an empty table kept for the shape.
+  One wrong turn on the way is recorded in that constant's doc: the vector
+  reddening was briefly read as this change's doing, and it reddens on
+  unmodified `dev` too.

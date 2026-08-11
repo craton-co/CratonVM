@@ -28,26 +28,27 @@ crash.
 >   `--synthetic-jdk`**, where the VM mints a `compatibility-stub` on demand and
 >   these registrations are its only implementation.
 >
-> The disposition is a kind, not a deletion: **246 registrations across 50
+> The disposition is a kind, not a deletion: **248 registrations across 43
 > receiver classes are `SyntheticStub`**, applied centrally in
 > `native-api/src/no_image_receiver.rs` from a six-image measurement. The list is
-> 549 rows now, all of them the genuinely different `method-nowhere` case.
-> `--jdk-only` corpus 52/5 unchanged, compatible 34/0 unchanged, drop list +246
-> and nothing else. Record:
+> 287 rows now, all of them the genuinely different `method-nowhere` case.
+> Against a binary built from `dev` without the change: `--jdk-only` corpus 52/6
+> and compatible 35/0 on **both** arms, drop list +248 and nothing the other way.
+> Record:
 > `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
 >
 > **The reclassification wave is re-homed, not dropped.** This record said "This
 > record now owns the reclassification question", and retiring it silently would
 > have orphaned a measured population. It is
-> `docs/known-issues/jdk-only/bridge-reclassification-wave.md` — 9,296 rows
-> (8,319 owning a slot), broken down per registering file, with the blocker
+> `docs/known-issues/jdk-only/bridge-reclassification-wave.md` — 8,977 rows
+> (8,010 owning a slot), broken down per registering file, with the blocker
 > stated as the measurement that established it rather than as a worry:
 > `CRATONVM_ENFORCE_NATIVE_SHADOW=1` takes the strict corpus from 32/17 to 3/46,
 > so the class's state has to become real before its shadow can be retired.
 >
-> Two of this record's numbers moved and are corrected there: `bridge` is 10,076
-> (not 10,434) and the unadjudicated population 9,296 (not 9,656), both after the
-> 246 re-tags.
+> Two of this record's numbers moved and are corrected there: `bridge` is 9,757
+> (not 10,434) and the unadjudicated population 8,977 (not 9,656), after the 248
+> re-tags and the 179 registrations `dc55e8057` deleted the same day.
 >
 > **One of its claims does not survive re-measurement.** Both records say L5's
 > criterion — a row may state `Bridge` exactly when the image declares that

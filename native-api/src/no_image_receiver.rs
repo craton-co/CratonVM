@@ -67,33 +67,49 @@
 //!   and are enumerated in [`VM_SERVICE_RECEIVERS`] with the reason. Tagging
 //!   them here would take `-javaagent`, dynamic proxies, the TLS self-test and
 //!   the JDBC SPI probe out of `--jdk-only`.
-//! * **Four receivers strict mode still fabricates**, in
-//!   [`STRICT_STILL_FABRICATES`]. Their natives are not bridges either, and
-//!   they cannot be re-tagged yet for a reason that is not about them.
+//! * **Receivers strict mode still creates**, in [`STRICT_STILL_FABRICATES`].
+//!   Their natives are not bridges either; they cannot be re-tagged yet for a
+//!   reason that is not about them.
 //!
-//! # The half of this that is blocked, and on what
+//! # The other half, and the two ways it was measured wrong
 //!
 //! Re-tagging is only half a fix, and the L5 record said so before this table
-//! existed: a `Bridge` whose receiver class §5 forbids is held together by
-//! `ensure_synthetic_class` recording the violation and fabricating anyway.
-//! Drop the natives without closing that, and strict mode mints the object and
-//! then cannot dispatch on it — `UnsatisfiedLinkError` where it used to work.
+//! existed: a `Bridge` whose receiver class §5 forbids is held together by the
+//! fabrication path recording the violation and minting the class anyway. Drop
+//! the natives without closing that, and strict mode mints the object and then
+//! cannot dispatch on it — `UnsatisfiedLinkError` where it used to work.
 //!
-//! Measured 2026-08-10 rather than reasoned about: a `--dump-class-origins`
-//! census of three strict runs says **five** of the 56 classes here are still
-//! created under `--jdk-only`. Two are the proxy machinery and belong in
-//! [`VM_SERVICE_RECEIVERS`]; the other four carry origin `compatibility-stub`,
-//! which is §5's violation by name, and are in [`STRICT_STILL_FABRICATES`].
-//!
+//! **First measurement.** A `--dump-class-origins` census of three strict runs
+//! said **five** of the 56 classes here were still created under `--jdk-only`:
+//! the two proxy names (`vm-internal`, reviewed VM services) and
+//! `HashMap$KeyItr` plus the three `Atomic*FieldUpdater$RustJvmImpl`
+//! (`compatibility-stub`, §5's violation by name). Those four were held back.
 //! Worth recording how they were found, because the cheaper instrument missed
-//! most of them: the strict regression corpus caught **two** (`RJdkProxy`,
-//! `RChmKeySetView`) and the other three were latent — the corpus never builds
-//! an atomic field updater. A corpus run says "nothing I exercise broke"; the
-//! class-origin census answers the question that was actually being asked.
+//! most of them: the strict corpus caught **two** (`RJdkProxy`,
+//! `RChmKeySetView`) and the other three were latent — no vector builds an
+//! atomic field updater.
+//!
+//! **Then the blocker went away.** `ClassManager::ensure_synthetic_class` was
+//! deleted the same day
+//! (`fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`), and
+//! with the infallible funnel gone strict mode creates none of the four: a
+//! `--jdk-only` run of `RChmKeySetView` dies on
+//! `NoClassDefFoundError: java/util/HashMap$KeyItr`, which is §5 enforcing
+//! instead of recording. All four moved into the re-tag and
+//! [`STRICT_STILL_FABRICATES`] is empty.
+//!
+//! One wrong turn on the way, kept because the correction is the useful part:
+//! `RChmKeySetView` reddening was first read as this table's doing, and
+//! `HashMap$KeyItr` was put back on the strength of it. That vector reddens on
+//! unmodified `dev` too, for the refusal above. **Attribute a corpus failure by
+//! running the same vector on a binary without the change** — that one step is
+//! what separated the two readings, and neither the census nor the corpus could
+//! do it alone:
 //!
 //!     cratonvm --jdk-only --java-home <JDK> --dump-class-origins cls.json \
 //!         -cp probes DeadSweepReachProbe
-//!     # any name from the tables below appearing in cls.json is blocked
+//!     CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh
+//!     # then re-run any red vector on a build WITHOUT this table
 
 /// JDK-namespaced receiver classes declared by none of the six swept images.
 ///
@@ -217,39 +233,45 @@ pub const VM_SERVICE_RECEIVERS: &[&str] = &[
 /// `--jdk-only` still creates the class and would then have no implementation
 /// for it.
 ///
-/// These are not a different kind of registration. They are the same defect as
-/// everything in [`NO_IMAGE_JDK_RECEIVERS`], waiting on the other half of it:
-/// `ClassManager::ensure_synthetic_class` records a `--jdk-only` violation and
-/// fabricates the class anyway, so strict mode holds an object of a class §5
-/// forbids. Re-tagging the natives first turns a silent contract violation into
-/// a loud `UnsatisfiedLinkError`, which is worse for users and no better for
-/// the contract.
+/// Such a receiver is not a different kind of registration. It is the same
+/// defect as everything in [`NO_IMAGE_JDK_RECEIVERS`], waiting on the other
+/// half of it: while a fabrication funnel records the `--jdk-only` violation
+/// and mints the class anyway, strict mode holds an object of a class §5
+/// forbids, and re-tagging its natives first turns a silent contract violation
+/// into a loud `UnsatisfiedLinkError` — worse for users and no better for the
+/// contract.
 ///
-/// Measured under `--jdk-only` with `--dump-class-origins`, 2026-08-10 — all
-/// four come back `compatibility-stub`:
+/// **To add an entry:** take a `--dump-class-origins` census under `--jdk-only`
+/// (see the module docs) and list any table class that appears in it. Do not
+/// wait for a corpus vector to go red: when this list held four entries, the
+/// corpus reached one of them.
 ///
-/// | receiver | what creates it in strict mode | corpus vector |
-/// |---|---|---|
-/// | `java/util/HashMap$KeyItr` | `native-collections`' `keySet().iterator()` | `RChmKeySetView` |
-/// | `AtomicIntegerFieldUpdater$RustJvmImpl` | `newUpdater` in `atomic_updater.rs` | none — latent |
-/// | `AtomicLongFieldUpdater$RustJvmImpl` | likewise | none — latent |
-/// | `AtomicReferenceFieldUpdater$RustJvmImpl` | likewise | none — latent |
+/// **To retire one:** make strict mode stop creating the class, confirm the
+/// real JDK bytecode services the call, then delete the line and re-run both
+/// the strict corpus and the class-origin census.
+/// **Empty since 2026-08-10**, when `ClassManager::ensure_synthetic_class` was
+/// deleted (`fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`).
+/// It had held `java/util/HashMap$KeyItr` and the three
+/// `Atomic*FieldUpdater$RustJvmImpl` classes. With the infallible funnel gone,
+/// strict mode creates none of them — a `--jdk-only` run of `RChmKeySetView`
+/// now dies on `NoClassDefFoundError: java/util/HashMap$KeyItr`, which is §5
+/// enforcing rather than recording — so their natives are unreachable there and
+/// re-tagging them costs nothing.
 ///
-/// Three of the four are reached by no corpus vector. They were found by the
-/// class-origin census, not by a test going red, which is the argument for
-/// re-running that census rather than trusting a green corpus when this list
-/// is next revisited.
+/// Kept as an empty table rather than deleted, because the shape recurs: the
+/// two halves of this defect are the registration's kind and the class's
+/// existence, and moving the first without the second turns a silent §5
+/// violation into an `UnsatisfiedLinkError`.
 ///
-/// **To retire an entry:** make strict mode refuse to create the class (wave-2
-/// item 4, the `ensure_synthetic_class` enforcement record), confirm the real
-/// JDK bytecode services the call, then delete the line here and re-run the
-/// strict corpus and the class-origin census.
-pub const STRICT_STILL_FABRICATES: &[&str] = &[
-    "java/util/HashMap$KeyItr",
-    "java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl",
-    "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl",
-    "java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl",
-];
+/// **To add an entry:** take a `--dump-class-origins` census under `--jdk-only`
+/// and list any table class that appears in it. Do not wait for a corpus vector
+/// to go red — when this list held four entries the corpus reached one — and do
+/// not read one going red as proof either. `RChmKeySetView` reddens on
+/// unmodified `dev` for the refusal above, and it was briefly misread here as
+/// this table's doing. **Attribute a corpus failure by running the same vector
+/// on a binary without the change**, which is the whole of what separated those
+/// two readings.
+pub const STRICT_STILL_FABRICATES: &[&str] = &[];
 
 /// Whether a registration on `class_name` can possibly bind to an `ACC_NATIVE`
 /// method on any supported JDK image.
@@ -338,6 +360,8 @@ mod tests {
     #[test]
     fn named_receivers_answer_correctly() {
         for yes in [
+            "java/util/HashMap$KeyItr",
+            "java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl",
             "java/util/TreeSet$Itr",
             "java/util/Enumeration$Impl",
             "java/util/function/Predicate$$Lambda$And",
@@ -347,10 +371,8 @@ mod tests {
             assert!(receiver_declared_by_no_supported_image(yes), "{yes}");
         }
         for no in [
-            // the two exclusion families, asserted from the other side by
+            // the VM-service exclusion, asserted from the other side by
             // `strict_fabricated_receivers_are_listed_but_not_retagged`
-            "java/util/HashMap$KeyItr",
-            "java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl",
             "java/lang/reflect/Proxy$Instance",
             // the real classes whose names the entries above are built from
             "java/util/HashMap",
@@ -382,7 +404,8 @@ mod tests {
     fn strict_fabricated_receivers_are_listed_but_not_retagged() {
         for name in STRICT_STILL_FABRICATES {
             assert!(
-                NO_IMAGE_JDK_RECEIVERS.contains(name),
+                NO_IMAGE_JDK_RECEIVERS.contains(name)
+                    || VM_MINTED_STAND_IN_RECEIVERS.contains(name),
                 "{name} is excluded by omission rather than by rule"
             );
             assert!(

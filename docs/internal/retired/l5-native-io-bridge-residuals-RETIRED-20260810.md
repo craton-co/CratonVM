@@ -11,30 +11,32 @@ closed. Nothing here was ever a crash.
 > **as a class of defect, in both places it is now known to occur** — and the
 > 2026-08-06 change did one cluster, the 29 `cratonvm/synthetic/Process*` rows.
 >
-> There were **fifty** such classes. 246 registrations across them are
-> `SyntheticStub` now, by measurement against six images (Temurin 21.0.12+8 and
+> There were **forty-three** more such classes. 248 registrations across them
+> are `SyntheticStub` now, by measurement against six images (Temurin 21.0.12+8 and
 > 25.0.4+7 × linux, windows, macos), applied centrally in
-> `native-api/src/no_image_receiver.rs`. `--jdk-only` corpus 52 passed / 5 failed
-> unchanged, compatible 34/0 unchanged, and the `CRATONVM_NO_STUBS` drop list
-> grows by exactly 246 with nothing else moving in either direction.
+> `native-api/src/no_image_receiver.rs`. Against a binary built from `dev`
+> without the change: `--jdk-only` corpus 52 passed / 6 failed and compatible
+> 35 / 0 on **both** arms, and the `CRATONVM_NO_STUBS` drop list grows by exactly
+> 248 with nothing moving the other way.
 >
 > This record's own framing of item 1 turned out to be right in a way its author
-> could not check at the time: *"Neither half can be fixed alone."* Four of the
-> fifty had to be excluded because strict mode still fabricates the class, so
-> dropping the natives replaces a silent §5 violation with an
-> `UnsatisfiedLinkError`. They are named in the source and blocked on wave-2
-> item 4.
+> could not check at the time: *"Neither half can be fixed alone."* Four classes
+> had to be held back because strict mode still fabricated them, so dropping the
+> natives replaces a silent §5 violation with an `UnsatisfiedLinkError` — and
+> then all four were released hours later, when `ensure_synthetic_class` was
+> deleted and §5 started enforcing instead of recording. The prediction and its
+> discharge are both in `native-api/src/no_image_receiver.rs`.
 >
 > **What the handoff would have cost if taken at face value.** The successor item
 > was a 791-row deletion list. **30 of its rows are dispatched by one probe**, 13
 > are on a macOS image nobody had swept, and all 14 remaining legacy names
-> resolve under `--synthetic-jdk`. The list is now 549 rows and a different
+> resolve under `--synthetic-jdk`. The list is now 287 rows and a different
 > question. Full record:
 > `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
 >
-> **Re-homed rather than dropped:** the 9,296 `Bridge` rows the image does not
-> back — the question this record's sibling used to own — are now
-> `docs/known-issues/jdk-only/bridge-reclassification-wave.md`, with the per-file
+> **Re-homed rather than dropped:** the `Bridge` rows the image does not back
+> (8,977 after this change) — the question this record's sibling used to
+> own — are now `docs/known-issues/jdk-only/bridge-reclassification-wave.md`, with the per-file
 > breakdown and the measured blocker.
 >
 > **One claim in the 08-06 banner below does not survive re-measurement.** "L5's
