@@ -18206,132 +18206,171 @@ pub(crate) fn proxy_invoke_handler_shared(
         );
     }
 
-    // WP2.5 вЂ” build the Method object using **field-name-based** writes.
-    // See `proxy_method_set_field_by_name` for the rationale; mirrors the
-    // fix applied to `proxy_invoke_handler` above.
-    let method_class_id = shared
-        .classes
-        .class_manager
-        .write()
-        .load_class("java/lang/reflect/Method")
-        .unwrap_or(ClassId::new(0));
-    let total_fields = shared
-        .classes
-        .class_manager
-        .read()
-        .get_class(method_class_id)
-        .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
-        .unwrap_or(8);
-    // S111r11 — see `proxy_invoke_handler` above.
-    const METHOD_EXTRA_SLOTS: usize = 3;
-    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
-    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
-    let method_obj = shared
-        .mem
-        .heap
-        .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
-    let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
-    // Resolve the actual declaring-interface mirror for the synthesized
-    // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
-    // for why `ClassId(0)` (== `Object` in production) is unsafe here.
-    let declaring_mirror =
-        proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
-    let name_str = super::create_java_string(shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors —
-    // see `proxy_invoke_handler` above for rationale.
+    // needed either way below (arg-boxing uses `param_descs` regardless of
+    // whether the Method object itself is served from cache).
     let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
-    let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
-    let param_count = param_descs.len();
-    let param_arr = shared.mem.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        param_count,
+
+    // Proxy-dispatch Method cache (see `proxy_method_cache`'s doc comment in
+    // `class_realm.rs`): real JDK dynamic-proxy classes build this Method
+    // object ONCE per interface method in their static initializer, not per
+    // call. Before this cache, CratonVM rebuilt a fresh Method + two arrays +
+    // two strings on every single reflective dispatch — on
+    // allocation-heavy, reflection-driven workloads (ByteBuddy's
+    // `JavaDispatcher.INVOKER` in particular) that generated enough
+    // short-lived garbage to fragment the non-compacting old-gen arena and
+    // OOM even with most of the heap nominally free.
+    let proxy_class_id = shared.mem.heap.class_id_of(proxy);
+    let cache_key = (
+        proxy_class_id,
+        method_name.to_string(),
+        descriptor.to_string(),
     );
-    for (i, pdesc) in param_descs.iter().enumerate() {
-        let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
-        shared
-            .mem
-            .heap
-            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
-            .ok();
-    }
-    let desc_str = super::create_java_string(shared, descriptor);
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "clazz",
-        Value::Object(Some(declaring_mirror)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "returnType",
-        Value::Object(Some(return_type_mirror)),
-    );
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "parameterTypes",
-        Value::Object(Some(param_arr)),
-    );
-    // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
-    // observe a non-null, accurately populated Method.exceptionTypes array.
-    let exception_arr =
-        proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "exceptionTypes",
-        Value::Object(Some(exception_arr)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "signature",
-        Value::Object(Some(desc_str)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
-    // S111r11 — see `proxy_invoke_handler` above for rationale.
-    proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
-    if total_fields < 8 {
-        // Synthetic-mode fallback (no JDK Method class loaded): keep the
-        // old hard-coded layout so callers reading raw slots still find
-        // the values.
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 1, Value::Object(Some(name_str)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 3, Value::Object(Some(param_arr)));
-        shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 5, Value::Object(Some(desc_str)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 6, Value::Int(param_count as i32));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
-    }
-    // Silence "zero_mirror unused" — kept above to preserve the original
-    // allocation flow.
-    let _ = zero_mirror;
+    let cached_method_obj = shared
+        .classes
+        .proxy_method_cache
+        .read()
+        .get(&cache_key)
+        .copied();
+    let method_obj = match cached_method_obj {
+        Some(obj) => obj,
+        None => {
+            // WP2.5 вЂ” build the Method object using **field-name-based** writes.
+            // See `proxy_method_set_field_by_name` for the rationale; mirrors the
+            // fix applied to `proxy_invoke_handler` above.
+            let method_class_id = shared
+                .classes
+                .class_manager
+                .write()
+                .load_class("java/lang/reflect/Method")
+                .unwrap_or(ClassId::new(0));
+            let total_fields = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(method_class_id)
+                .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
+                .unwrap_or(8);
+            // S111r11 — see `proxy_invoke_handler` above.
+            const METHOD_EXTRA_SLOTS: usize = 3;
+            const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+            let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+            let method_obj = shared
+                .mem
+                .heap
+                .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
+            let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
+            // Resolve the actual declaring-interface mirror for the synthesized
+            // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
+            // for why `ClassId(0)` (== `Object` in production) is unsafe here.
+            let declaring_mirror =
+                proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
+            let name_str = super::create_java_string(shared, method_name);
+            let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
+            let param_count = param_descs.len();
+            let param_arr = shared.mem.heap.alloc_array(
+                ClassId::new(0),
+                crate::memory::heap::ArrayElementType::Reference,
+                param_count,
+            );
+            for (i, pdesc) in param_descs.iter().enumerate() {
+                let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
+                shared
+                    .mem
+                    .heap
+                    .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+                    .ok();
+            }
+            let desc_str = super::create_java_string(shared, descriptor);
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "clazz",
+                Value::Object(Some(declaring_mirror)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "name",
+                Value::Object(Some(name_str)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "returnType",
+                Value::Object(Some(return_type_mirror)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "parameterTypes",
+                Value::Object(Some(param_arr)),
+            );
+            // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
+            // observe a non-null, accurately populated Method.exceptionTypes array.
+            let exception_arr =
+                proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "exceptionTypes",
+                Value::Object(Some(exception_arr)),
+            );
+            proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "signature",
+                Value::Object(Some(desc_str)),
+            );
+            proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
+            // S111r11 — see `proxy_invoke_handler` above for rationale.
+            proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
+            if total_fields < 8 {
+                // Synthetic-mode fallback (no JDK Method class loaded): keep the
+                // old hard-coded layout so callers reading raw slots still find
+                // the values.
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 1, Value::Object(Some(name_str)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 3, Value::Object(Some(param_arr)));
+                shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 5, Value::Object(Some(desc_str)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 6, Value::Int(param_count as i32));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
+            }
+            // Silence "zero_mirror unused" — kept above to preserve the original
+            // allocation flow.
+            let _ = zero_mirror;
+            shared
+                .classes
+                .proxy_method_cache
+                .write()
+                .insert(cache_key, method_obj);
+            method_obj
+        }
+    };
 
     // Build Object[] of args вЂ” box primitives. Per
     // `java.lang.reflect.InvocationHandler.invoke` contract, when the
