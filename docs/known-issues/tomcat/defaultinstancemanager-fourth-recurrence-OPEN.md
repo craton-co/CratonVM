@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **root source NAMED 2026-08-10: `collection-overlays`.** Re-measured on dev; the mechanism moved. Everything from *What is measured* down to *The open question* describes a tree that no longer behaves that way; start at *RE-MEASURED ON dev*. |
+| **Status** | OPEN — **root-caused**, fix not yet written |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -15,27 +15,6 @@ apps\tomcat-suite-runner\run-one.ps1 `
   -Class org.apache.catalina.core.TestDefaultInstanceManager `
   -Exe <cratonvm.exe> -TimeoutSec 900
 ```
-
-**Before 2026-08-10 this did not reach the assertion at all.** The fixture died
-in `LifecycleBase.start` with
-
-```
-Unable to create WebResourceSet from [<docBase>\file:\C:\…\WEB-INF\lib\bug69135-lib.jar]
-```
-
-which is a **different defect that masks this one**: `URL.toURI()` allocated a
-real `java/net/URI` and wrote only the SYNTHETIC positional slots into it, so
-the field the real bytecode reads (`string`) stayed null and every
-`url.toURI()` stringified to empty. `StandardRoot.processWebInfLib`'s
-`new File(uri)` then produced a File whose path was the whole URL text, which
-is not absolute, so it was resolved against the doc base. Fixed by populating
-the named fields the way `File.toURI()` always has (`url_parse` +
-`uri_store_named`); `probes/FileUrlShapeProbe.java` is the differential and is
-byte-identical to HotSpot on both platforms now.
-
-Worth knowing before trusting a green run here: **any** webapp test with a
-`WEB-INF/lib/*.jar` was failing at startup, so a Tomcat suite result from
-before that fix is not evidence about this test's own assertion.
 
 ## It is NOT the defect that was fixed three times
 
@@ -73,7 +52,7 @@ BAD   1d2817c75  feat(types,gc,vm,jit): delete identity_hash_code from ObjectHea
 The switchover to the mark word is **good**; deleting the header field is bad.
 That is worth stating explicitly because the opposite is the natural guess.
 
-## STALE (pre-2026-08-10) — What is measured, and what it rules out
+## What is measured, and what it rules out
 
 All from the failing run, via `CRATONVM_DBG_MIRRORPIN=1 CRATONVM_DBG_MIRRORPIN_WHY=1`
 (this branch wires callers for `VmHeap::root_held_paths` / `find_referrers`,
@@ -121,123 +100,7 @@ Also eliminated:
   `mark_and_push_rescues_a_walked_base_the_plausibility_screen_rejects` passes
   on dev.
 
-## 2026-08-10 RE-MEASURED ON dev: none of the chain below still holds
-
-Every row in *What is measured* and in the two sections after it was re-taken on
-today's `dev` with the same instrument (`CRATONVM_DBG_MIRRORPIN=1
-CRATONVM_DBG_MIRRORPIN_WHY=1`) and the same fixture, and **the measurements
-invert**:
-
-| question | this page | dev, 2026-08-10 |
-|---|---|---|
-| young-marker edges reaching the evicted loader | **0** | `is_marked=true`, `loader_marked=true` |
-| `young_survivor` arm for the mirror | **true** | **false** |
-| `live_instances_of_this_loader` | **0** | **1** |
-| `root_held_paths` for the loader | 1 (the target itself) | **8** |
-| non-moving young sweeps | "exactly 1, the `System.gc()`" | **zero — the cycle never runs** |
-
-The last row is the one that dismantles the chain. `[MARKWHY] sweep enter` is
-new and prints whenever a watch is ARMED, with no from-space condition; the
-arming line prints and the sweep line never does, on the default collector and
-under `CRATONVM_NO_MOVING_YOUNG=1` alike. `CRATONVM_DBG=heap-trace` agrees
-independently — `run_non_moving_young_cycle`'s own trace line never fires.
-**There is no non-moving young sweep in this test on dev**, so "the walk covers
-the address and strides over it" is not a live statement about anything.
-
-Read *The marker is innocent* and *Which skip arm* below as a record of a tree
-that no longer exists, not as findings to build on.
-
-## What dev shows instead: an ordinary reachability chain, and Jasper's JDT compiler is holding it
-
-The mirror is retained because the class has a **live instance**, whose loader
-`loader_pin` therefore keeps alive, whose mirror `mirror_pin` therefore keeps
-alive. That is the pin machinery working exactly as designed. The question is
-why an instance of an EVICTED JSP is still reachable, and the instrument
-renders the paths:
-
-```
-StackMapFrame -> VerificationTypeInfo -> VerificationTypeInfo
-  -> SourceTypeBinding -> LookupEnvironment
-  -> JDTCompiler$1 -> JDTCompiler
-  -> JspCompilationContext   -> <the evicted loader>
-  -> JspServletWrapper       -> <the evicted annotations_jsp instance>
-```
-
-Seven of the loader's eight paths are that chain; the eighth is
-`java/lang/Class -> loader`, i.e. the mirror pin itself. The LIVE control
-(`bug36923_jsp`) has the same JDT chain **plus** a legitimate one:
-
-```
-ArrayList -> Object -> StandardWrapper -> JspServlet -> JspRuntimeContext
-  -> FastRemovalDequeue -> FastRemovalDequeue$Entry -> JspServletWrapper -> instance
-```
-
-`FastRemovalDequeue` is Jasper's `maxLoadedJsps` LRU. The evicted JSP is
-correctly **absent** from it — eviction worked. What did not go away is the JDT
-compiler's own graph.
-
-So the open question is now the opposite of this page's premise, and it is a
-question about **roots**, the family this page declared innocent:
-
-> Every rendered path is headed by an `org.eclipse.jdt.internal.compiler`
-> object — `StackMapFrame`, or an `ArrayList` — with no parent. Those are
-> transient objects the JSP compiler produces while emitting a class file and
-> should be garbage the moment compilation ends. **What roots them?**
-
-### Answered, by measurement: `collection-overlays`
-
-`CRATONVM_DBG_ROOT_SOURCE=1` is new and records which NAMED entry of
-`VM_ROOT_SOURCES` contributed each root; `[MIRRORWHY]` now prints
-`[root=<source>]` on every rendered path. For the evicted JSP, over two runs:
-
-```
-  33 [root=collection-overlays]        11 [root=collection-overlays]
-   6 [root=<not-a-direct-root>]         2 [root=<not-a-direct-root>]
-```
-
-Every JDT-headed path is rooted by **`collection-overlays`** —
-`native_roots::scan_collection_overlays` → `external_roots::scan_external_roots`.
-The `<not-a-direct-root>` remainder is the mirror itself and the
-`java/lang/Class -> loader` pin edge, i.e. the pin machinery working as
-designed on top of a root that should not be there.
-
-**So this page's own *Also eliminated* entry was wrong.** It reads:
-
-> **Overlay over-rooting (`roots.rs` step 17).** … It has since been gated:
-> `native_roots::scan_collection_overlays` skips the unconditional scan when
-> `major_gc_requested()` under Generational, which is precisely this test's
-> path. … it cannot be the default-collector mechanism.
-
-The gate exists and its condition is right, but it does not cover the
-collection whose root set retains this cluster — the roots are contributed
-anyway, on the default collector, in the failing run. The entry was eliminated
-by reading the gate rather than by asking which source rooted the object, which
-is the question nothing could answer until now. Its own earlier evidence
-("21 direct hits" on exactly this JSP cluster, `gc_and_alloc.rs:2062`) was
-pointing at the answer the whole time.
-
-### What to do next, and the trap in doing it
-
-The obvious move — widen the gate so the overlay scan skips here too — is the
-one to be careful with. `scan_external_roots` exists because an overlay's
-backing array can be the ONLY reference to a live object; skipping it wholesale
-trades this over-retention for under-retention, which is a use-after-free rather
-than a failing assertion. The gate's shape (`is_active() ||
-unregistered_jit_frame_on_stack() || major_gc_requested()`) is a
-safety-conditional, not a feature flag.
-
-Two things to establish first, both one run each now that the source is
-nameable:
-
-1. **Which collection contributes them.** If it is a young/old cycle outside
-   the `System.gc()` window, the gate is simply not being consulted then, and
-   the question is whether that cycle can afford to skip.
-2. **Whether the overlay entries are stale.** A JDT `StackMapFrame` reachable
-   only from an overlay after compilation has finished suggests the overlay is
-   retaining entries whose Java-side owner is gone — in which case the fix is
-   pruning the overlay, not skipping the scan, and it costs nothing in safety.
-
-## STALE (pre-2026-08-10) — The marker is innocent. The SWEEP never visits the span.
+## The marker is innocent. The SWEEP never visits the span.
 
 `CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` arms a watch on that class's
 loader (the address is not knowable before the class is defined) and labels
@@ -268,67 +131,11 @@ The live loader is the control that proves the instrument can fire. So:
 That is a complete chain from a false premise to the assertion, and it explains
 why every rooting lever was inert: nothing about rooting is wrong.
 
-Note the premise is the one the bisected commit is documented as having
-weakened — "a fresh header is never all-zero" died when the hash went lazy, and
-these predicates were rewritten onto the mark word "WEAKER, not equivalent".
-The connection is consistent but **not yet proven**; the open question is now
-narrow and mechanical.
+The premise involved is the one the bisected commit is documented as having
+killed — "a fresh header is never all-zero" died when the hash went lazy. The
+section after next PROVES the connection rather than leaving it plausible.
 
-## RETRACTED 2026-08-10 — `objects_swept=0` was a counter read before it is written
-
-The section below concluded, from `objects_swept=0`, that this sweep reclaimed
-nothing, that no young object is reclaimed at all, and that class unloading
-"cannot work by construction". **All three are withdrawn.** `objects_swept` is
-declared at `gen_heap.rs:9439`, printed by the `[MARKWHY] walk ended` line, and
-incremented in exactly one place — the publication loop **345 lines below that
-print**. The number is a structural zero in every run, on every workload,
-whether the sweep reclaimed a million objects or none. It measured the distance
-between two lines of code, not the heap.
-
-Two things follow, and the second is why this matters more than a typo:
-
-* **Class unloading works on this path.**
-  `regression-suite/src/RClassUnloadSweep.java` (new, scheduled) defines a class
-  in a throwaway loader, uses it, drops every strong reference and collects.
-  `payload.class.unloaded=true` on HotSpot and on CratonVM under the default
-  collector, `CRATONVM_NO_MOVING_YOUNG=1`, `-XX:+UseG1GC` and `-XX:+UseZGC`. If
-  the young sweep reclaimed nothing, that vector could not print `true` under
-  `CRATONVM_NO_MOVING_YOUNG=1` — the exact path the section below called inert.
-* **The scope claim went with it.** "This is a young-generation reclamation
-  failure on the `System.gc()` path and should be expected to cost throughput
-  and footprint everywhere else" was the most actionable sentence on the page,
-  and it pointed at a defect that is not there.
-
-The instruments were fixed rather than the line deleted, because the question
-under it — *did this sweep free anything* — is a good one that nothing answered:
-
-* `[MARKWHY] walk ended` now reports the walk-time facts it can actually see:
-  `dead_regions`, `dead_watermark`, and `unwinds`/`unwound_entries`. The five
-  `dead_regions.truncate(dead_watermark)` sites were **silent**, so "found
-  nothing" and "found plenty and unwound all of it on a grid anomaly" printed
-  identically — which is shape 2 of *The open question* below, previously
-  undecidable from any output the VM produced.
-* `[MARKWHY] sweep done` reports `objects_swept`/`bytes_swept` after the
-  publication loop, the only thing that writes them.
-* `[MARKWHY] STRADDLE` names the object whose computed extent swallows the
-  watched base. The pre-existing sweep hook tests `cursor == watch`, so it is
-  silent in precisely the case this page measured — the walk covering the
-  address without stopping at it — and could never name the culprit stride.
-
-**What survives is the whole finding:** the walk covers the evicted loader's
-base and never stops at it. That is measured, it has a live control, and the
-sections above stand. What was wrong was the inference from there to the heap.
-
-One structural point the retraction turns up, because it explains why this
-defect surfaces as a class-unloading failure and never as corruption: the
-phantom-extent guard (`gen_heap.rs`, "a header that SUBSUMES a live object")
-fires only when the swallowed object is in `side_sorted` — i.e. **marked**. An
-over-sized extent that swallows only DEAD objects is invisible to it. A dead
-object inside a retained LIVE extent is never visited, never zeroed, and
-`is_live_young_survivor` (`word0 != 0`) then answers "live" for it forever.
-That is a one-sided guard, and this is the failure it cannot see.
-
-## Which skip arm? NONE (read the retraction above first)
+## Which skip arm? NONE
 
 `CRATONVM_DBG_MARK_WHY_CLASS` now also classifies the watched address against
 every stretch the walk can stride over, and reports where the walk ended.
@@ -352,37 +159,86 @@ All three candidates are eliminated:
 So the walk *covers* the address and still never stops at it. Its object grid
 strides over that base: some earlier object's computed size swallows the span.
 
-~~And the headline number: `objects_swept=0`.~~ **WITHDRAWN — see the
-retraction above.** The counter is incremented in the publication loop, which
-runs 345 lines AFTER the line that printed it, so the zero was structural. The
-paragraph that followed it — "no young object is reclaimed at all … class
-unloading cannot work by construction" — is withdrawn with it, and
-`RClassUnloadSweep` is the vector that refutes it.
+So the mirror is not retained by a rooting decision, a side-table edge, or a
+skip list. The next section shows what does it: the walk identifies the span as
+dead and then UNWINDS that decision, and re-anchors past it.
 
-`objects_live=119985` is real, and so is everything above it: the walk covers
-the watched address, no skip arm claims it, and the walk still never stops
-there.
+## ROOT CAUSE: the sweep's all-zero-span anomaly screen fires on live objects
 
-## The open question
+`dead_regions` is not empty because the walk finds nothing dead. It finds
+27,252 dead objects and then throws almost all of them away. Per-unwind-site
+census on the failing run:
 
-Why is `dead_regions` empty? Two shapes, distinguishable:
+```
+side_marked=118647  late_pinned=0  forwarded=0  header_marked=0
+dead_pushed=27252   unwinds=83  sites=[0, 83, 0, 0]
+unwound_entries=27285  dead_regions_final=51  side_sorted=132548
+```
 
-1. the walk classifies every object LIVE (its grid is desynced, so it never
-   lands on a dead object's base — which is exactly what the watched address
-   shows), or
-2. the walk collects dead spans and then UNWINDS them: `dead_regions.truncate`
-   back to `dead_watermark` on an anomaly, which is silent without a debug gate.
+**All 83 unwinds come from one site**, and its trigger is:
 
-Both are consistent with the bisected commit, whose layout changes moved
-`ARRAY_LENGTH_OFFSET`/`NUM_SLOTS_OFFSET` 12 -> 8 and whose own message records
-the walk's plausibility screen getting weaker. The probe to write next reports
-`dead_regions.len()` at the watermark and after each truncate, plus the walk's
-per-object stride around the watched offset.
+```rust
+let word0 = unsafe { *(obj_ptr as *const u64) };
+if word0 == 0 {
+    // "unlisted all-zero span" -> anomaly evidence
+    dead_regions.truncate(dead_watermark);   // drop every reclaim decision
+    // ... then re-anchor at the next FREE BLOCK, abandoning everything between
+```
 
-~~Note the scope this changes …~~ **WITHDRAWN with the `objects_swept=0`
-reading.** The sweep reclaims; there is no whole-heap reclamation failure to
-expect elsewhere. The scope is what the measured half says it is: one dead
-object whose base the walk strides over.
+That screen exists because an all-zero header used to be proof of reclaimed
+memory. It rests on the premise the bisected commit is documented as killing,
+in its own words:
+
+> The stale-pointer detector and the zeroed-region screens keyed on "a fresh
+> header is never all-zero, because a hash is stamped at allocation". That
+> premise is dead: the hash is lazy now, so a live never-hashed never-locked
+> bare `new Object()` reads all-zero exactly like reclaimed memory.
+
+With `HEADER_SIZE` 16, `word0` is `class_id` (0..4) + `shape` (4..8). A live,
+never-hashed, never-locked object with `ClassId(0)` and no shape bits reads
+all-zero — indistinguishable from a reclaimed span by header bytes alone. So
+ordinary live objects now trip an anomaly screen **83 times per sweep**, and
+each hit discards every reclaim decision taken since the last anchor.
+
+That is the whole defect, and it produces the symptom twice over:
+
+1. **The unwind** throws away the evicted JSP loader's own reclaim decision
+   along with ~27k others, so its span is never zeroed and
+   `is_live_young_survivor` (`word0 != 0` — the loader has a real class id)
+   answers "live".
+2. **The resume** re-anchors at the next free block, "abandoning everything in
+   between" — which is why the earlier probe never saw the walk stop at that
+   base at all. The site's own comment already calls this resume behaviour
+   wrong and records it costing 233 MB of a 256 MB young generation on the H2
+   UPDATE path.
+
+## Scope
+
+This is not a Tomcat bug. The non-moving young sweep publishes **51 reclaimed
+regions out of 27,252 identified** on the `System.gc()` path.
+`TestDefaultInstanceManager` is simply the test that happens to assert on a
+consequence; everywhere else it costs throughput and footprint while failing
+nothing, which is why it went unnoticed from 08-07.
+
+(Correcting an earlier reading on this page: I first reported `objects_swept=0`
+as "the sweep reclaims nothing". That counter is incremented in the publication
+loop, and my probe printed before it. The accurate statement is the ratio
+above.)
+
+## The fix, and the constraint on it
+
+The screen must stop treating "all-zero header" as evidence of anything. The
+commit that broke it also closed the obvious repair: minting a hash eagerly to
+restore the invariant is not available, because a non-zero mark word loses the
+thin-lock CAS and every `synchronized` block in the program would inflate.
+
+The discriminator that IS available is the one the sweep already has:
+`side_sorted`, the complete live set (132,548 entries here). A span that is
+all-zero and NOT side-marked is legitimately reclaimable; the anomaly is
+all-zero AND on a stretch the grid cannot vouch for. Any fix must keep the
+double-free protection the site was written for — the comment above it records
+a real UAF from parsing zero spans as 40-byte phantom objects — so the
+conservative arm has to survive, just stop firing on live never-hashed objects.
 
 ## Do not close this without a regression pin
 
@@ -390,3 +246,85 @@ Three prior fixes, three recurrences, and the 08-01 page's own lesson was that
 the predicate it repaired **had no test**, which is how a one-line default flip
 disarmed it in silence. Whatever closes this needs a vector that runs in
 `regression-suite` — not a `probes/` reproducer that nothing schedules.
+
+## Two independent additions, 2026-08-10 (separate session)
+
+Both were found while working the same page from the sweep side, and neither
+changes the root cause above. They are recorded because one of them contradicts
+a row this page still carries, and the other names a second retention path.
+
+### `objects_swept` on the `walk ended` line is a structural zero
+
+`objects_swept` is declared at `gen_heap.rs:9439`, printed by
+`[MARKWHY] walk ended`, and incremented in exactly one place — the publication
+loop several hundred lines below that print. It reads 0 in every run on every
+workload, whatever the sweep reclaimed.
+
+An earlier revision of this page took that 0 as "this sweep reclaimed NOTHING",
+and from there to "no young object is reclaimed at all" and "class unloading
+cannot work by construction". The disposition census above settles it the other
+way — `dead_pushed=27252` — and so does
+`regression-suite/src/RClassUnloadSweep.java` (new, scheduled): a class defined
+in a throwaway loader, used, dropped and collected is unloaded on HotSpot and on
+CratonVM under the default collector, `CRATONVM_NO_MOVING_YOUNG=1`,
+`-XX:+UseG1GC` and `-XX:+UseZGC`.
+
+The line now reports the walk-time facts it can see and a new
+`[MARKWHY] sweep done` reports `objects_swept`/`bytes_swept` after the loop that
+writes them. Two further instruments came from the same reading:
+
+* `[MARKWHY] sweep enter` — prints whenever a watch is ARMED, with **no**
+  from-space condition. Every other MARKWHY line is gated on the watch being in
+  from-space, so they go silent together, and that silence has three causes
+  wanting three different next steps ("the sweep never ran", "it ran and the
+  object is elsewhere", "it ran and the walk never reached the object"). Only
+  the third is about the object.
+* `[MARKWHY] STRADDLE` — names the object whose computed extent swallows the
+  watched base. The pre-existing sweep hook tests `cursor == watch`, so it is
+  silent in exactly the case *The marker is innocent* measures, and cannot name
+  the culprit stride. `par_prefix_end` / `watch_in_par_prefix` are on the
+  `walk ended` line for the same reason: every sweep hook lives in the
+  SEQUENTIAL walk, so a watch inside the accepted parallel prefix is one the
+  sequential walk never visits by construction.
+
+### A second retention path: `collection-overlays` roots the JDT compiler graph
+
+`CRATONVM_DBG_ROOT_SOURCE=1` is new and records which named entry of
+`VM_ROOT_SOURCES` contributed each root; `[MIRRORWHY]` now prints
+`[root=<source>]` on each rendered path. Measured twice on the failing run, for
+the evicted `annotations_jsp`:
+
+```
+  33 [root=collection-overlays]        11 [root=collection-overlays]
+   6 [root=<not-a-direct-root>]         2 [root=<not-a-direct-root>]
+```
+
+with every attributed path of the shape
+
+```
+StackMapFrame -> VerificationTypeInfo -> SourceTypeBinding -> LookupEnvironment
+  -> JDTCompiler$1 -> JDTCompiler
+  -> JspCompilationContext / JspServletWrapper -> loader / instance
+```
+
+**This contradicts two rows this page still carries.** *What is measured* records
+`live_instances_of_this_loader=0` and `root_held_paths=1`; today's dev reports
+**1** and **8**, with `is_marked=true` on the loader. And *Also eliminated*
+dismisses overlay over-rooting because the gate skips under
+`major_gc_requested()` — but the roots are contributed anyway, on the default
+collector, in the failing run. That entry was eliminated by reading the gate
+rather than by asking which source rooted the object, which nothing could do
+until now; its own "21 direct hits on exactly this JSP cluster" was the answer.
+
+Whether this is a *second* defect or the same one seen from the other end is
+not settled here: an object the marker marked is reachable, which is a different
+statement from "dead but unreclaimed". Worth resolving before the fix above
+lands, because if the mirror is genuinely rooted then repairing the all-zero
+screen will not clear this assertion on its own.
+
+The trap in the obvious fix, if it turns out to be needed:
+`scan_external_roots` exists because an overlay backing array can be the ONLY
+reference to a live object, so widening the gate trades over-retention for a
+use-after-free. A JDT `StackMapFrame` reachable only from an overlay after
+compilation finished suggests stale overlay ENTRIES, in which case pruning is
+the fix and costs nothing in safety.

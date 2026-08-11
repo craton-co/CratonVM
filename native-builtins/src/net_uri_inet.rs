@@ -857,6 +857,10 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 6)?;
     url_parse(ctx, uri, &full);
+    // `url_parse` writes the URL-shaped names; a `java.net.URI` additionally
+    // needs `string`, `schemeSpecificPart` and `authority`, and those are what
+    // `uri_raw_string` and `getAuthority` read on a real layout.
+    net_phase_e::uri_publish_named(ctx, uri, &full, None);
     Ok(Some(Value::Object(Some(uri))))
 }
 

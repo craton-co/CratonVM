@@ -760,6 +760,20 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
 
     // Real-JDK bytecode resolves the covariant ValueLayout descriptors rather
     // than the erased Object signature above.
+    //
+    // All nine of each. `java.lang.foreign.MemorySegment` declares nine
+    // `get`/`set` pairs and every one of the eighteen is `public abstract`, so
+    // a descriptor nobody registers is not a slow path — it is
+    // `AbstractMethodError: … has no Code attribute`, thrown at the interface
+    // method itself.
+    //
+    // The `set` half of this loop did not exist. Only the erased
+    // `(ValueLayout;JLjava/lang/Object;)V` above was registered, and real
+    // bytecode never emits that; `phases_late/foreign_ffm.rs` separately
+    // covered Byte/Short/Int/Long, which is why four of the nine worked and
+    // `set(JAVA_DOUBLE, …)` raised. Keeping the two lists adjacent and
+    // identical is the point: an asymmetry between them is exactly the defect,
+    // and it is only visible when they are read together.
     for desc in [
         "(Ljava/lang/foreign/ValueLayout$OfBoolean;J)Z",
         "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
@@ -772,6 +786,19 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/foreign/AddressLayout;J)Ljava/lang/foreign/MemorySegment;",
     ] {
         r.register(ms, "get", desc, pe_segment_get);
+    }
+    for desc in [
+        "(Ljava/lang/foreign/ValueLayout$OfBoolean;JZ)V",
+        "(Ljava/lang/foreign/ValueLayout$OfByte;JB)V",
+        "(Ljava/lang/foreign/ValueLayout$OfChar;JC)V",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;JS)V",
+        "(Ljava/lang/foreign/ValueLayout$OfInt;JI)V",
+        "(Ljava/lang/foreign/ValueLayout$OfLong;JJ)V",
+        "(Ljava/lang/foreign/ValueLayout$OfFloat;JF)V",
+        "(Ljava/lang/foreign/ValueLayout$OfDouble;JD)V",
+        "(Ljava/lang/foreign/AddressLayout;JLjava/lang/foreign/MemorySegment;)V",
+    ] {
+        r.register(ms, "set", desc, pe_segment_set);
     }
     r.register(
         ms,
@@ -1550,6 +1577,29 @@ fn pe_segment_check_scope(ctx: &dyn NativeContext, seg: ObjectRef) -> Result<(),
     Ok(())
 }
 
+/// The zero-length `MemorySegment` that `get(AddressLayout, long)` returns.
+///
+/// The JDK's contract for an address read is a segment of size 0 at that
+/// address -- the caller must `reinterpret` it before dereferencing, which is
+/// precisely the safety property that makes the read legal at all. It carries
+/// no arena, so `pe_arena_close` never frees memory this VM did not allocate.
+///
+/// Shape matches `pe_arena_allocate_impl`: `[0]=ptr, [1]=size, [2]=arena,
+/// [3]=readOnly, [4]=alive, [5]=offset`.
+fn pe_zero_length_segment(
+    ctx: &mut dyn NativeContext,
+    addr: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+    ctx.set_field(seg, 0, Value::Long(addr));
+    ctx.set_field(seg, 1, Value::Long(0));
+    ctx.set_field(seg, 2, Value::Object(None));
+    ctx.set_field(seg, 3, Value::Int(0));
+    ctx.set_field(seg, 4, Value::Int(1));
+    ctx.set_field(seg, 5, Value::Long(0));
+    Ok(seg)
+}
+
 /// Validate a single-element access (get/set) against the segment's declared
 /// size and compute the target address with checked arithmetic.
 ///
@@ -1679,15 +1729,36 @@ fn pe_segment_get_impl(
     // is implicit from the segment.
     let value = unsafe {
         match kind {
-            LAYOUT_BYTE | LAYOUT_BOOLEAN => Value::Int(*(addr as *const i8) as i32),
-            LAYOUT_SHORT | LAYOUT_CHAR => Value::Int(*(addr as *const i16) as i32),
+            LAYOUT_BYTE => Value::Int(*(addr as *const i8) as i32),
+            // A `boolean` is 0 or 1, never the raw byte: the JDK reads the byte
+            // and compares it to zero, so a stray 2 in the segment is `true`.
+            // Passing the raw byte through hands Java bytecode a `Z` value
+            // outside its domain.
+            LAYOUT_BOOLEAN => Value::Int(i32::from(*(addr as *const i8) != 0)),
+            LAYOUT_SHORT => Value::Int(*(addr as *const i16) as i32),
+            // `char` is UNSIGNED. Sign-extending it makes every code point
+            // above 0x7FFF negative, which is not a `char` at all.
+            LAYOUT_CHAR => Value::Int(i32::from(*(addr as *const u16))),
             LAYOUT_INT => Value::Int(*(addr as *const i32)),
-            LAYOUT_LONG | LAYOUT_ADDRESS => Value::Long(*(addr as *const i64)),
+            LAYOUT_LONG => Value::Long(*(addr as *const i64)),
             LAYOUT_FLOAT => Value::Float(*(addr as *const f32)),
             LAYOUT_DOUBLE => Value::Double(*(addr as *const f64)),
+            // ADDRESS is handled after the unsafe block: its declared return
+            // type is `Ljava/lang/foreign/MemorySegment;`, so it has to
+            // ALLOCATE, which `Value::Long` cannot stand in for -- a reference
+            // slot receiving a primitive is the one shape this tree keeps
+            // paying for.
+            LAYOUT_ADDRESS => Value::Long(*(addr as *const i64)),
             _ => Value::Int(0),
         }
     };
+    if kind == LAYOUT_ADDRESS {
+        let raw = match value {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        return Ok(Some(Value::Object(Some(pe_zero_length_segment(ctx, raw)?))));
+    }
     if crate::nbflags().dbg_mh_dispatch && kind == LAYOUT_FLOAT && offset == 0 {
         eprintln!(
             "[PANAMA_GET_FLOAT] runtime={} ptr={:?} base_offset={:?} value={value:?}",
@@ -1731,6 +1802,17 @@ fn pe_segment_set_impl(
     // size, and the address arithmetic was overflow-checked (see
     // pe_segment_access_addr). The kind determines the write width so alignment
     // is implicit from the segment.
+    // `set(ADDRESS, off, seg)` takes a MemorySegment, not a long: its address
+    // is what gets stored. Without this the value arrives as `Value::Object`,
+    // misses every arm below and the write is a SILENT no-op -- which is the
+    // quieter half of the same defect as the missing registration.
+    let value = match (kind, value) {
+        (LAYOUT_ADDRESS, Value::Object(Some(target))) => {
+            Value::Long(crate::panama_libffi::segment_address(ctx, target))
+        }
+        (LAYOUT_ADDRESS, Value::Object(None)) => Value::Long(0),
+        _ => value,
+    };
     unsafe {
         match (kind, value) {
             (LAYOUT_BYTE | LAYOUT_BOOLEAN, Value::Int(v)) => *(addr as *mut i8) = v as i8,

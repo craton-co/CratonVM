@@ -1105,7 +1105,8 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // as an invalid reference (effectively null) — safe because the field is
     // always read under an `if (cachedConstructor == null)` guard.
     //
-    // JDK-ONLY-LAYOUT: unknown — needs runtime evidence, ranked HIGH.
+    // JDK-ONLY-LAYOUT: safe (was `unknown`, ranked HIGH; adjudicated
+    // 2026-08-10 — see the three checks below, all now run).
     //
     // This is an *overlay*: a VM-internal value deliberately written on top of
     // a real JDK field, which is a different hazard from a mis-numbered slot.
@@ -1147,16 +1148,36 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      misses. If the census shows zero fallback hits under a real JDK, the
     //      correct wave-2 fix is to DELETE the slot-0 write (and the slot-1
     //      name read in `mirror_class_name`) rather than relocate it.
-    //      **INSTRUMENTED, not yet answered.** `mirror_class_id` now reports
-    //      its first fallback hit under the same `CRATONVM_DBG_OVERLAY` flag,
-    //      so this is one broad real-JDK run away from decidable. Do not delete
-    //      the overlay on the strength of a small probe: silence over a
-    //      ten-class workload is not silence over Spring Boot.
+    //      **ANSWERED 2026-08-10, and the question's premise was wrong.**
+    //      `mirror_class_id` is NOT the only reader: grepping
+    //      `get_field(mirror, 0)` finds eight in `native-builtins`. Two were
+    //      reading it *wrong* — the slf4j and log4j `getLogger(Class)` shims
+    //      expected a name String at slot 0, which no mirror this VM builds has
+    //      ever held, so every such logger was named "unknown" — and both now
+    //      go through `mirror_class_name`. `servlet.rs`'s ServiceLoader lookup
+    //      took the ClassId straight from slot 0 behind an
+    //      `object_num_fields == 0` guard and now goes through
+    //      `mirror_class_id`. The rest already asked the reverse map first.
     //
-    // What 1 and 2 do and do not establish: they rule out the overlay being
-    // *destructive* on a real image, which was the ranked-HIGH worry. They say
-    // nothing about whether it is still *needed* — that is check 3, and it is
-    // the question whose answer removes code rather than reassuring about it.
+    //      With that done, the fallback was measured on a broad real-JDK
+    //      workload rather than a probe: five Spring Framework test classes
+    //      (`AutowiredAnnotationBeanRegistrationAotContribution`,
+    //      `BeanDefinitionMethodGenerator`,
+    //      `CommonAnnotationBeanRegistrationAotContribution`,
+    //      `ConfigurationClassPostProcessorAotContribution`,
+    //      `InitDestroyMethodLifecycle`), 87 tests, all green, under
+    //      `CRATONVM_DBG_OVERLAY=1`. **Zero fallback hits.** The reverse map
+    //      answers every runtime lookup.
+    //
+    // What that settles, and what it does not. The overlay is not destructive
+    // (1 and 2) and not load-bearing at RUNTIME (3), so the verdict moves from
+    // `unknown` to `safe`. The write nevertheless stays, because it is still
+    // load-bearing for `MockNativeContext`: the unit-test mirrors in
+    // `native-builtins/src/test_utils.rs` and `vm/src/vm/tests.rs` encode their
+    // ClassId as exactly this `Int` at slot 0 and have no reverse map at all.
+    // Deleting it is a test-infrastructure change with no runtime benefit, and
+    // it would also remove the only cover for a reverse-map miss — so it is a
+    // deliberate keep, not an unexamined one.
     shared
         .mem
         .heap
@@ -1343,20 +1364,19 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy
     // VM-internal convention, not a JDK field — fixed slot).
     //
-    // JDK-ONLY-LAYOUT: unknown — same overlay hazard as the class-mirror
+    // JDK-ONLY-LAYOUT: safe (was `unknown`) — same overlay as the class-mirror
     // populator above (slot 0 of a real `java.lang.Class` is
-    // `cachedConstructor`, a reference). Resolve both together; a primitive
-    // mirror additionally has no legitimate `cachedConstructor` reader, so if
-    // the evidence says the overlay is destructive, this site can move to the
-    // `primitive_mirrors` side table with no JDK-visible consequence.
+    // `cachedConstructor`, a reference), and the marker said to resolve the two
+    // together. Adjudicated with it on 2026-08-10: not destructive (checks 1
+    // and 2) and not load-bearing at runtime (check 3, zero fallback hits over
+    // 87 Spring Framework tests).
     //
-    // 2026-08-04: the evidence gathered for the sibling site (see its checks 1
-    // and 2, both clean) says the overlay is NOT destructive on a real image,
-    // so the "move it to the side table" branch above is not forced. This site
-    // is nonetheless the easier of the two to retire if check 3 ever comes back
-    // zero, precisely because a primitive mirror has no legitimate reader:
-    // `Int(-1)` is a sentinel nothing but this VM asks for, so relocating it
-    // needs no census of its own — only the sibling's.
+    // This site is the easier of the two to retire, precisely because a
+    // primitive mirror has no legitimate `cachedConstructor` reader: `Int(-1)`
+    // is a sentinel nothing but this VM asks for. What keeps it is the same
+    // thing that keeps its sibling — `MockNativeContext`'s mirrors encode their
+    // identity here and have no reverse map — so the two still move together,
+    // and moving them is a test-infrastructure change rather than a fix.
     shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.

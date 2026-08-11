@@ -294,18 +294,24 @@ throughput, not correctness.
    not fixed; 69 detections. The enriched report is landed for whoever picks it
    up. Related in family to the G1 page's "a full, never-recycled Eden region is
    not walkable".
-2. **The inlined-callee deopt frame with no caller chain** —
-   `docs/known-issues/h2/jit-inlined-callee-deopt-frame-has-no-caller-chain-20260810.md`.
+2. **The orphaned deopt frame** — CLOSED 2026-08-10, and it was not inlining:
+   a statically-bound JIT-to-JIT direct call carried no `JitInvokeInfo`, so no
+   callee-deopt service check was emitted and the callee's stash propagated
+   past the only site that could attribute it. See
+   `../jit-direct-call-mints-an-orphaned-deopt-frame-20260810-FIXED.md`.
 3. **The G1 region-aligned evacuation SIGSEGV** — 4 classes, G1 only. Findings
    added to `docs/known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`,
    including a cheaper H2 repro than the Hibernate one it had.
 4. **Interpreter throughput against hardcoded fixture budgets** —
    `TestTransaction`, `TestBnf`, `TestWeb`. Measured above; the fix is the
    throughput programme.
-5. **The HANG cluster** — unchanged and separately tracked in
-   `docs/known-issues/h2/bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807.md`.
-   HotSpot hangs on six of the same classes on this host, so part of that
-   cluster may be fixture/host rather than VM; needs an idle-host control.
+5. **The HANG cluster** — the three classes split out of it are RESOLVED
+   2026-08-10 (`bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807-RESOLVED-20260810.md`,
+   this folder): none is stuck, two PASS and one (`TestSynth`) is a `while
+   (true)` fuzzer that never terminates on any JVM. The suspicion recorded here
+   — that HotSpot hangs on six of the same classes, so part of the cluster is
+   fixture rather than VM — is confirmed for that one and refuted for the other
+   two, which are the throughput factor with a call-density multiplier.
 
 ## Reproducing the verification
 
@@ -328,8 +334,9 @@ JDK25=/data/toolchain/jdk-25 OUTROOT=/tmp/out \
   folder) — the HotSpot control, now confirmed, for the FAIL cluster.
 - `../../../known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`
   — the G1 region-aligned SIGSEGV, still OPEN, updated with this sweep's data.
-- `../../../known-issues/h2/jit-inlined-callee-deopt-frame-has-no-caller-chain-20260810.md`
-  — the orphaned-deopt-frame residual.
+- `../jit-direct-call-mints-an-orphaned-deopt-frame-20260810-FIXED.md`
+  — the orphaned-deopt-frame residual, now closed (and re-titled: the page this
+  sweep spawned blamed inlining, which was not the mechanism).
 - `../s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md` and
   `../nio-buffer-address-indexed-slot-aliasing-FIXED.md` — the two previous
   passes over this same `s2_bb_*` storage-resolution surface. This one closes

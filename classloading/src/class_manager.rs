@@ -6085,6 +6085,7 @@ impl ClassManager {
         // its name, the two layouts are now both known and can be diffed once,
         // here, instead of guessed at per access.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         // T10.5 — Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
@@ -6591,6 +6592,39 @@ impl ClassManager {
             return;
         }
         eprint!("{}", diff.render());
+    }
+
+    /// Re-check every `JDK-ONLY-LAYOUT: safe` positional claim about a class
+    /// that has just been defined from real bytes.
+    ///
+    /// Wave-2 step 4. A `safe` verdict is an assertion about one specific JDK
+    /// image, made once by a person reading `javap`, and nothing in the build
+    /// re-checked it -- so a JDK upgrade that reordered a private field would
+    /// not fail a test, it would silently corrupt an object.
+    ///
+    /// Deliberately NOT behind `CRATONVM_DBG_OVERLAY`, unlike the census next
+    /// door. The census is a research instrument you switch on when you are
+    /// already looking for something; this is a tripwire, and a tripwire that
+    /// only fires while you are watching is not one. It costs a name compare
+    /// against a six-row table per class definition, and only a class named in
+    /// that table walks any fields at all.
+    ///
+    /// `debug_assert` on top of the log, so a broken claim fails the test suite
+    /// rather than merely printing during it.
+    fn check_safe_positional_claims(&self, id: ClassId) {
+        let broken = crate::shadow_layout::check_positional_claims(&self.class_store, id);
+        for message in &broken {
+            tracing::error!(
+                target: "cratonvm::layout",
+                "JDK-ONLY-LAYOUT `safe` claim broken by this image: {message}"
+            );
+            eprintln!("[LAYOUT-CLAIM] BROKEN: {message}");
+        }
+        debug_assert!(
+            broken.is_empty(),
+            "a JDK-ONLY-LAYOUT `safe` claim does not hold for the loaded image:\n{}",
+            broken.join("\n")
+        );
     }
 
     /// Re-parent a loaded class.
@@ -9822,6 +9856,7 @@ impl ClassManager {
         // The ClassId is deliberately reused, so every native holding a
         // positional index for the old model now addresses the new one.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         Ok(())
     }
@@ -11438,51 +11473,83 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
-        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
-        // `lock` and `skipBuffer` from `java.io.Reader`. There is no `in` on it
-        // anywhere — the wrapped stream lives inside the `StreamDecoder`. The
-        // model used to name slot 0 `in`, which is `Reader.lock`.
+        // ── the java.io Reader/Writer chain, and why slot 0 is spelled two
+        //    different ways in the two builds ────────────────────────────────
         //
-        // The synthetic ISR natives (`native_isr_init` and friends, all
-        // `#[cfg(feature = "synthetic-jdk")]`) park an fd-or-stream at slot 0
-        // and the raw stream at slot 1, so neither slot can be named honestly:
-        // both are `_vmN`. That keeps them in the census as kind 3 rather than
-        // silently agreeing with `lock`/`skipBuffer`.
+        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
+        // `lock` and `skipBuffer` from `java.io.Reader`; a real
+        // `OutputStreamWriter` declares `se` under `writeBuffer` and `lock`;
+        // `BufferedReader` and `BufferedWriter` put `in`/`out` at index 2 for
+        // the same reason. Naming any of them at 0 puts it on `Reader.lock` or
+        // `Writer.writeBuffer`, which is what these four models used to do.
+        //
+        // Slot 0 — and, for `InputStreamReader`, slot 1 — is ALSO where the
+        // synthetic Reader/Writer natives park an fd or a wrapped stream. That
+        // is kind 3: a VM-internal value with no real JDK field to live in.
+        // Every one of those writers is `#[cfg(feature = "synthetic-jdk")]`,
+        // the build in which these classes are ALWAYS fabricated stubs and slot
+        // 0 belongs to nobody else. So the honest model differs by build, and
+        // it is split here rather than papered over with one spelling that is
+        // wrong in one of them:
+        //
+        // * under `synthetic-jdk` the slots stay `_vmN`, which is what keeps
+        //   the overlay COUNTED — an anonymous `_fN` reads as an innocuous
+        //   `pad`, and that is how `Files.newBufferedWriter`'s fd hid inside
+        //   `Writer.writeBuffer` for a day;
+        // * in the default build there is no writer AND no reader. The last
+        //   reader was the `BufferedWriter` natives' fd fast path, and it moved
+        //   behind the same gate `bw_delegate_out` already carried (see
+        //   `native-builtins`'s `phases_late::bw_synthetic_fd`). So the model
+        //   names the real fields, and the census is clean because nothing is
+        //   parked there — not because the model stopped saying so.
+        //
+        // Ungating a registration without moving its slot cannot pass silently
+        // as a result: the natives read slot 0 only under the feature, and this
+        // table is what `shadow_layout`'s production-model test diffs against
+        // the JDK's declaration order.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/InputStreamReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/InputStreamReader" => vec![
             vm_internal_field(0),
             vm_internal_field(1),
             named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
         ],
-        // `in` is at 2 on a real `BufferedReader`: `java.io.Reader` declares
-        // `lock` and `skipBuffer` ahead of it. Naming it at 0 put it on `lock`.
-        // Slot 0 is where `native_br_init` copies the wrapped reader's fd, so it
-        // is `_vm0`, not anonymous.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("in", "Ljava/io/Reader;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedReader" => vec![
             vm_internal_field(0),
             named_field("skipBuffer", "[C"),
             named_field("in", "Ljava/io/Reader;"),
         ],
-        // Same shape as `InputStreamReader`: a real `OutputStreamWriter`
-        // declares only `se`, and inherits `writeBuffer` and `lock` from
-        // `java.io.Writer`. `native_osw_init` writes an fd Int at slot 0 —
-        // `writeBuffer`, a `char[]` — and `native_osw_write/flush/close` all
-        // read it back expecting an `Int`, returning silently when it is not.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/OutputStreamWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("se", "Lsun/nio/cs/StreamEncoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/OutputStreamWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),
             named_field("se", "Lsun/nio/cs/StreamEncoder;"),
         ],
-        // `out` is at 2 on a real `BufferedWriter`: `java.io.Writer` declares
-        // `writeBuffer` and `lock` ahead of it. Naming it at 0 put it on
-        // `writeBuffer`, a `char[]`.
-        //
-        // Slot 0 is `_vm0`, not `writeBuffer` and not anonymous:
-        // `Files.newBufferedWriter` parks a VM-internal fd there and
-        // `bw_delegate_out` uses "is slot 0 an Int?" to tell its own fd-backed
-        // object from a real one. That overlay is a separate defect (kind 3 —
-        // a VM value with no real field, which belongs in a side table); naming
-        // the slot `_vm0` is what keeps it *counted* until it is fixed. It spent
-        // a day as an anonymous `_f0`, which reads as an innocuous `pad`.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("out", "Ljava/io/Writer;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),
@@ -11864,7 +11931,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // one way no value-tag census can see: a `ThreadGroup` reference over a
         // `String` reference and an `int` over an `int` both type-check. The
         // L4 shadow-layout diff reported all four
-        // (`docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`).
+        // (`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
         //
         // The natives in `native-builtins/src/phases_late/concurrent.rs`
         // resolve these by NAME first and only fall back to a hard-coded index,
@@ -11898,15 +11965,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // ThreadLocal native semantics live in side tables, but slot 0 remains
-        // part of the synthetic compatibility layout.
+        // ThreadLocal native semantics live in side tables keyed by identity
+        // hash; the object itself carries nothing.
+        //
+        // The model used to name slot 0 `value:Ljava/lang/Object;`, which a
+        // real `java.lang.ThreadLocal` declares as `threadLocalHashCode:I` --
+        // its ONE instance field, and the int the real `ThreadLocalMap` hashes
+        // with. Naming the real field is what it is: the fabricated stub gets
+        // one unused int, and the shadow-layout diff agrees with the image
+        // instead of reporting a slot nobody uses.
         "java/lang/ThreadLocal" | "java/lang/InheritableThreadLocal" => {
-            vec![ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("value"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-                attributes: vec![],
-            }]
+            vec![named_field("threadLocalHashCode", "I")]
         }
         "java/lang/Thread$State" => pad_to(
             vec![

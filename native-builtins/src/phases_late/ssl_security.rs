@@ -851,6 +851,22 @@ pub(crate) struct PendingConnectSocket {
     extra_roots: Vec<Vec<u8>>,
     java_tm_key: Option<u64>,
     max_protocol: Option<native_tls::Protocol>,
+    /// The connection `SSLSocket.connect` ESTABLISHED, parked for the deferred
+    /// handshake to run on.
+    ///
+    /// `connect` used to open a connection, drop it, and let the later
+    /// handshake open a fresh one. The peer then sees TWO connections for one
+    /// `SSLSocket`: a server that accepts exactly one per client accepts the
+    /// first (whose handshake reads EOF, because the client never speaks on
+    /// it) and has left `accept()` by the time the second arrives — so that
+    /// one waits out the client's 30 s socket timeout and reports
+    /// `HandshakeError::WouldBlock`, "the handshake process was interrupted".
+    /// Measured end to end against H2's own `NetUtils` in one process: server
+    /// failed at 629 ms, client at 30 980 ms.
+    ///
+    /// `None` only when the established stream could not be handed over, in
+    /// which case the handshake reconnects exactly as it did before.
+    tcp: Option<std::net::TcpStream>,
 }
 
 /// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of all three
@@ -904,18 +920,27 @@ pub(crate) fn drop_pending_connect_socket_if_any(tls_id: i32) {
     }
 }
 
-/// TCP-connect and immediately drop the connection -- `SSLSocket.connect` has
-/// to fail HERE for an unreachable peer (JSSE does the real TCP connect at
-/// this point), but the TLS handshake is deferred, so the connection this
-/// proves is not the one the handshake will use.
+/// TCP-connect and KEEP the connection -- `SSLSocket.connect` has to fail HERE
+/// for an unreachable peer (JSSE does the real TCP connect at this point), and
+/// the deferred TLS handshake then runs on THIS connection.
 ///
-/// H2 `TcpServer.isRunning()` is the caller that makes the distinction
-/// visible: it needs "the port answers" to be decided by connect(), and it
-/// needs "the certificate is untrusted" NOT to be.
-fn new13_tcp_reachability_probe(host: &str, port: u16, timeout_ms: i32) -> std::io::Result<()> {
+/// It used to drop the stream (`.map(|_| ())`) and let the handshake dial
+/// again. Two connections per `SSLSocket` is observable to the peer, and
+/// against a one-`accept()`-per-client server it costs the client a full 30 s
+/// socket timeout — see `PendingConnectSocket::tcp`.
+///
+/// H2 `TcpServer.isRunning()` is the caller that makes the connect/handshake
+/// split visible in the first place: it needs "the port answers" to be decided
+/// by connect(), and it needs "the certificate is untrusted" NOT to be. That
+/// still holds — the connection is established here, only the handshake waits.
+fn new13_tcp_reachability_probe(
+    host: &str,
+    port: u16,
+    timeout_ms: i32,
+) -> std::io::Result<std::net::TcpStream> {
     use std::net::{TcpStream, ToSocketAddrs};
     if timeout_ms <= 0 {
-        return TcpStream::connect((host, port)).map(|_| ());
+        return TcpStream::connect((host, port));
     }
     let mut last = std::io::Error::new(
         std::io::ErrorKind::AddrNotAvailable,
@@ -924,7 +949,7 @@ fn new13_tcp_reachability_probe(host: &str, port: u16, timeout_ms: i32) -> std::
     for addr in (host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(timeout_ms as u64))
         {
-            Ok(_) => return Ok(()),
+            Ok(s) => return Ok(s),
             Err(e) => last = e,
         }
     }
@@ -970,18 +995,22 @@ pub(crate) fn new13_ssl_socket_connect(
     ctx.begin_blocking_region();
     let probe = new13_tcp_reachability_probe(&host, port as u16, timeout_ms);
     ctx.end_blocking_region();
-    if let Err(e) = probe {
-        return Err(RuntimeError::IOException {
-            message: format!("Connection refused: {host}:{port}: {e}"),
+    let tcp = match probe {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("Connection refused: {host}:{port}: {e}"),
+            }
+            .into());
         }
-        .into());
-    }
+    };
     let pending_id = stash_pending_connect_socket(PendingConnectSocket {
         host: host.clone(),
         port: port as u16,
         extra_roots,
         java_tm_key,
         max_protocol,
+        tcp: Some(tcp),
     });
     let pending_tls_id = crate::servlet::PENDING_CONNECT_SOCK_ID_BASE + pending_id;
     // Same field/side-table bookkeeping as `new13_finish_socket`, minus the
@@ -1131,6 +1160,22 @@ pub(crate) fn new13_connect_and_handshake(
     java_tm_key: Option<u64>,
     max_protocol: Option<native_tls::Protocol>,
 ) -> Result<i32, MethodCallFailed> {
+    new13_connect_and_handshake_on(ctx, host, port, extra_root_ders, java_tm_key, max_protocol, None)
+}
+
+/// [`new13_connect_and_handshake`], optionally over a connection the caller
+/// already established (`SSLSocket.connect`'s deferred-handshake path — see
+/// [`PendingConnectSocket::tcp`]). `None` connects here, as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new13_connect_and_handshake_on(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: u16,
+    extra_root_ders: &[Vec<u8>],
+    java_tm_key: Option<u64>,
+    max_protocol: Option<native_tls::Protocol>,
+    established: Option<std::net::TcpStream>,
+) -> Result<i32, MethodCallFailed> {
     #[cfg(unix)]
     let legacy_dsa_context = extra_root_ders.iter().any(|der| {
         openssl::x509::X509::from_der(der)
@@ -1157,17 +1202,42 @@ pub(crate) fn new13_connect_and_handshake(
     // still fire from ordinary allocation churn on OTHER threads.
     ctx.begin_blocking_region();
     #[cfg(unix)]
-    let connect_result = if legacy_dsa_context {
-        crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders)
-    } else {
-        crate::servlet::s2_tls_connect(&connector, host, port)
+    let connect_result = match (legacy_dsa_context, established) {
+        (true, Some(tcp)) => {
+            crate::servlet::s2_legacy_dsa_tls_connect_on(host, port, extra_root_ders, tcp)
+        }
+        (true, None) => crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders),
+        (false, Some(tcp)) => crate::servlet::s2_tls_connect_on(&connector, host, port, tcp),
+        (false, None) => crate::servlet::s2_tls_connect(&connector, host, port),
     };
     #[cfg(not(unix))]
-    let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
+    let connect_result = match established {
+        Some(tcp) => crate::servlet::s2_tls_connect_on(&connector, host, port, tcp),
+        None => crate::servlet::s2_tls_connect(&connector, host, port),
+    };
     ctx.end_blocking_region();
-    let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
-        message: e.to_string(),
-    })?;
+    // A REJECTED HANDSHAKE is `javax.net.ssl.SSLHandshakeException` on JSSE —
+    // callers `catch` that type, and a bare `java.io.IOException` does not
+    // match it. Only a failure to reach the peer stays an `IOException`. The
+    // message carries the backend's own text (for OpenSSL, the certificate
+    // verification error), which is the JSSE analogue of HotSpot's "PKIX path
+    // building failed: ... unable to find valid certification path".
+    let tls_id = match connect_result {
+        Ok(id) => id,
+        Err(crate::servlet::TlsConnectFailure::Tcp(e)) => {
+            return Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into());
+        }
+        Err(crate::servlet::TlsConnectFailure::Handshake(msg)) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &msg,
+            ));
+        }
+    };
 
     // FIX (netty-https-client-trust): native verification was disabled above
     // when the context carries Java TrustManagers — they are the ONLY
@@ -2082,13 +2152,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // below documents: it parks in native code for a long time and a
             // moving young collection there relocates `socket`.
             let socket_pin = ctx.pin_native_root(socket);
-            let handshake = new13_connect_and_handshake(
+            // Hand the connection `connect()` established to the handshake —
+            // NOT a second one. See `PendingConnectSocket::tcp`.
+            let handshake = new13_connect_and_handshake_on(
                 ctx,
                 &p.host,
                 p.port,
                 &p.extra_roots,
                 p.java_tm_key,
                 p.max_protocol,
+                p.tcp,
             );
             let socket = ctx.read_native_pin(socket_pin, socket);
             ctx.unpin_native_roots(socket_pin);

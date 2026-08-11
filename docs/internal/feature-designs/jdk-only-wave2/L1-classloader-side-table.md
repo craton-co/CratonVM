@@ -8,7 +8,7 @@ measured*.
 **Owns:** `native-builtins/src/classloader.rs`, `native-builtins/src/classloader_real.rs`
 **Gated on:** nothing.
 **Effort:** M — mechanical once the store exists.
-**Evidence:** [`fabricated-object-layouts-leak-into-native-code.md`](../../known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md)
+**Evidence:** [`jdk-only-fabricated-object-layouts-FIXED-20260810.md`](../../fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md) (RETIRED 2026-08-10)
 
 ## Goal
 

@@ -1451,8 +1451,16 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => s,
             _ => ctx.create_string(""),
         };
+        let raw = ctx.read_string(uri_str).unwrap_or_default();
         let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 1)?;
-        ctx.set_field(uri_obj, 0, Value::Object(Some(uri_str)));
+        // JDK-ONLY-LAYOUT: slot 0 is OUR model's raw-text slot; on a real
+        // `java.net.URI` it is `scheme`, so the full text used to be stored as
+        // the scheme. The by-name publish is what a real receiver reads.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri_obj) {
+            let s = ctx.create_string(&raw);
+            ctx.set_field(uri_obj, 0, Value::Object(Some(s)));
+        }
+        crate::net_phase_e::uri_publish_named(ctx, uri_obj, &raw, None);
         Ok(Some(Value::Object(Some(uri_obj))))
     });
     r.register(
@@ -1526,8 +1534,16 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => s,
             _ => ctx.create_string(""),
         };
+        let raw = ctx.read_string(uri_str).unwrap_or_default();
         let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 1)?;
-        ctx.set_field(uri_obj, 0, Value::Object(Some(uri_str)));
+        // JDK-ONLY-LAYOUT: slot 0 is OUR model's raw-text slot; on a real
+        // `java.net.URI` it is `scheme`, so the full text used to be stored as
+        // the scheme. The by-name publish is what a real receiver reads.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri_obj) {
+            let s = ctx.create_string(&raw);
+            ctx.set_field(uri_obj, 0, Value::Object(Some(s)));
+        }
+        crate::net_phase_e::uri_publish_named(ctx, uri_obj, &raw, None);
         Ok(Some(Value::Object(Some(uri_obj))))
     });
     r.register(cls, "version", "()Ljava/util/Optional;", |ctx, args| {

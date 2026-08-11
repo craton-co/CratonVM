@@ -415,6 +415,30 @@ fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Objec
     }
 }
 
+/// The file descriptor a **`synthetic-jdk`** `java/io/BufferedWriter` is backed
+/// by, or `None`.
+///
+/// JDK-ONLY-LAYOUT (kind 3). The `BufferedWriter` write/flush/close natives all
+/// carried their own `match ctx.get_field(this, 0) { Value::Int(fd) => … }` fd
+/// fast path, reached whenever [`bw_delegate_out`] finds no wrapped `out`. In
+/// the DEFAULT build that read only ever addresses `java.io.Writer.writeBuffer`
+/// — a `char[]` the JDK owns and lazily allocates for `Writer.write(String)` —
+/// because nothing has parked an fd in a BufferedWriter since
+/// `Files.newBufferedWriter`'s fd path was deleted on 2026-08-05.
+///
+/// Gated to the build where slot 0 belongs to the fabricated model, which is
+/// the same gate `bw_delegate_out` already carries and the reason the model can
+/// stop spelling that slot `_vm0` in the default build: with no writer AND no
+/// reader left, there is no overlay to count.
+#[allow(unused_variables)]
+pub(crate) fn bw_synthetic_fd(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u32> {
+    #[cfg(feature = "synthetic-jdk")]
+    if let Value::Int(fd) = ctx.get_field(this, 0) {
+        return Some(fd as u32);
+    }
+    None
+}
+
 // ── Keycloak Gap 6: real `@ConfigMapping` resolution via SmallRye ─────────────
 //
 // `SmallRyeConfig.getConfigMapping(Class, String)` returns the config-mapping
