@@ -4360,15 +4360,22 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
 /// sibling `getInit`/`getUsed`/`getCommitted`/`getMax` natives hand back.
 ///
 /// `synthetic-jdk` builds have no such bytecode and keep the shim;
-/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1` restores it on a real-JDK run.
+/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — or the grouped
+/// `CRATONVM_REAL=-memoryusage-tostring` — restores it on a real-JDK run.
+///
+/// Read from the latched snapshot, not from `std::env`. It was a raw
+/// `std::env::var` when it landed, which is the defect
+/// `flag_declaration_guard` exists to catch: an undeclared name is served by a
+/// live `getenv`, so the grouped spelling could not reach it at all and
+/// `flags::with_thread_overrides` could not arrange it in a test — a
+/// flag-dependent test would have silently measured the developer's ambient
+/// environment. Same fix, same day, as its sibling
+/// `jmx_openmbean::real_mxbean_mapping_enabled`.
 fn memoryusage_tostring_shim_enabled() -> bool {
     if cfg!(feature = "synthetic-jdk") {
         return true;
     }
-    matches!(
-        std::env::var("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    crate::nbflags().synthetic_memoryusage_tostring
 }
 
 fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> ClassId {
