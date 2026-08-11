@@ -765,12 +765,25 @@ fn resolve_native_for_dispatch(
         method_name,
         method_descriptor,
         Some((callback, kind)),
-        // JDK-ONLY-WAVE2: hard-coded `true` reproduces the pre-§7 "a registered
-        // native unconditionally wins here" of the `find` calls this replaces.
-        // Wave 2 replaces it with the real per-site compatibility verdict once
+        // JDK-ONLY-WAVE2 §10 — AUDITED 2026-08-06, not a live defect, and
+        // deliberately still a constant.
+        //
+        // The `true` reproduces the pre-§7 "a registered native unconditionally
+        // wins here" of the `find` calls this adapter replaced, and that is
+        // faithful rather than lazy: `resolve_native_dispatch_wave1` uses the
+        // flag only to choose between "the site preferred bytecode" and the
+        // kind-based ladder, and this site never preferred bytecode. The
+        // `NativeShadowsBytecode` observation a `false` would have produced is
+        // still recorded — by the `Bridge if bytecode_available` arm one level
+        // down — so nothing is lost from the report either.
+        //
+        // The record asks for "the real per-site compatibility verdict once
         // `force_native_over_real_jdk_bytecode` and the forced-native `String`
-        // list (both in `vm/src/runtime/interpreter/invoke.rs` /
-        // `vm/src/vm/vm_exec.rs`) are unified.
+        // list are unified". That unification is §11's exercise, not this
+        // site's: until those name lists collapse there is no per-site verdict
+        // to read, and inventing one here would be a THIRD answer for methods
+        // that already have two. Revisit when §11's Compatible-mode deletion
+        // lands; under `JdkOnly` the chain is already not consulted.
         true,
         bytecode_available,
     ) {
@@ -3397,22 +3410,6 @@ pub fn execute(
                                         .find(|dp| dp.bci == rframe_for_despec.bci)
                                         .map(|dp| dp.reason)
                                         .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
-                                    let _ =
-                                        crate::jit::helpers::DeoptimizationController::deoptimize(
-                                            shared,
-                                            &class_name_str,
-                                            method_name,
-                                            method_descriptor,
-                                            deopt_reason,
-                                            rframe_for_despec.bci,
-                                        );
-                                    // This first-call tier-up sink historically
-                                    // discarded the reconstructed frame and
-                                    // restarted the method at bci 0. That
-                                    // duplicates every side effect committed
-                                    // before the guard. Build the same cached
-                                    // metadata the hot callsites use and resume
-                                    // the captured frame directly.
                                     // Which of the three independent gates
                                     // refused is the whole diagnosis, and they
                                     // need completely different fixes — record
@@ -3424,12 +3421,45 @@ pub fn execute(
                                         method_name,
                                         method_descriptor,
                                     );
+                                    // De-speculate THIS method only when the
+                                    // frame is this method's. It used to run
+                                    // unconditionally, so a stash belonging to
+                                    // a nested compiled callee blacklisted the
+                                    // innocent method whose tier-up happened to
+                                    // be running — while the `!key_matches`
+                                    // branch below ALSO de-speculated the
+                                    // frame's real owner. Two methods made
+                                    // not-compilable per foreign frame, one of
+                                    // them for no reason: on `TestScript` that
+                                    // is `StringFunction1.getValue`, a
+                                    // per-row expression evaluator.
+                                    if key_matches {
+                                        let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                                            shared,
+                                            &class_name_str,
+                                            method_name,
+                                            method_descriptor,
+                                            deopt_reason,
+                                            rframe_for_despec.bci,
+                                        );
+                                    }
+                                    // This first-call tier-up sink historically
+                                    // discarded the reconstructed frame and
+                                    // restarted the method at bci 0. That
+                                    // duplicates every side effect committed
+                                    // before the guard. Build the same cached
+                                    // metadata the hot callsites use and resume
+                                    // the captured frame directly.
                                     // The stash belongs to a DIFFERENT method — a
-                                    // nested compiled callee (often an INLINEE:
-                                    // `caller_frames` is empty and the key names the
-                                    // inlined body, so no call site on the dispatch
-                                    // path can attribute it) whose sentinel bubbled
-                                    // out to here. THIS method never trapped, so the
+                                    // nested compiled callee whose sentinel bubbled
+                                    // out to here because the call site that invoked
+                                    // it emitted no callee-deopt service check (the
+                                    // statically-bound JIT-to-JIT direct-call gap
+                                    // fixed in jit/src/lib.rs; it was NOT inlining —
+                                    // the x64 inliner rolls back any body that
+                                    // publishes deopt metadata, and an inlined deopt
+                                    // point carries the CALLER's method_key anyway).
+                                    // THIS method never trapped, so the
                                     // "refusing side-effecting replay" arm below does
                                     // not apply to it: that refusal is about a frame
                                     // proving OUR OWN native code ran past bci 0, and
@@ -3508,14 +3538,16 @@ pub fn execute(
                                     if !key_matches {
                                         // The stash is a DIFFERENT method's — a
                                         // nested compiled callee whose sentinel
-                                        // bubbled out to here, in practice an
-                                        // INLINEE (`caller_frames` empty, key naming
-                                        // the inlined body, so no call site on the
-                                        // dispatch path can attribute it and
-                                        // `try_resume_trapped_callee` leaves it
-                                        // stashed for an "outer consumer that CAN
-                                        // attribute it" — which for an inlinee never
-                                        // arrives).
+                                        // bubbled out to here because the call site
+                                        // that invoked it had no callee-deopt service
+                                        // check, so `try_resume_trapped_callee` never
+                                        // ran there and the frame kept travelling
+                                        // outward looking for the "outer consumer that
+                                        // CAN attribute it" — which, once the sentinel
+                                        // has passed through the callee's own caller,
+                                        // no longer exists. This arm is now defence in
+                                        // depth: the emission gap it was written for
+                                        // is fixed in jit/src/lib.rs.
                                         //
                                         // The refusal below does NOT apply to it: it
                                         // exists because a frame belonging to THIS

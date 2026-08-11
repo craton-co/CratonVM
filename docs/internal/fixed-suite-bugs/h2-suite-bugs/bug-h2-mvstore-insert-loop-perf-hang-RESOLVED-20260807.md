@@ -261,9 +261,11 @@ Drop `--nojit` and it OOMs — see the regression record above, not this page.
   this page's numbers fall inside.
 * `docs/known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md` —
   the regression that currently masks the throughput factor on this class.
-* `docs/known-issues/h2/bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807.md`
-  — the three classes split out of this page whose stuck locus is elsewhere.
-  Still OPEN, still single-sample.
+* `bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807-RESOLVED-20260810.md`
+  (this folder) — the three classes split out of this page whose sampled locus
+  is elsewhere. RESOLVED 2026-08-10: none of them is stuck. Two complete and are
+  this page's constant factor with a call-density multiplier on top; the third
+  (`TestSynth`) is a `while (true)` fuzzer that never terminates on any JVM.
 * `bug-h2-testoutofmemory-sigabrt-young-old-gen-both-exhausted-FIXED.md` — the
   SIGABRT whose fix turned `TestOutOfMemory` from a crash into this page's
   second confirmed instance.

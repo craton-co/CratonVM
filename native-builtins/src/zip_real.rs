@@ -1197,7 +1197,6 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
 
     // Deflater
     let dl = "java/util/zip/Deflater";
-    r.register(dl, "initIDs", "()V", defl_init_ids);
     r.register_with_kind(dl, "init", "(IIZ)J", defl_init, NativeKind::Bridge);
     r.register_with_kind(dl, "setDictionary", "(J[BII)V", defl_set_dictionary, NativeKind::Bridge);
     r.register_with_kind(

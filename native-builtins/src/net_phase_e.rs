@@ -2340,14 +2340,42 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
 // We register our own implementations that parse the raw URI string stored
 // at field 6 of our synthetic URI objects (scheme=0, host=1, port=2,
 // path=3, query=4, fragment=5, raw=6).
+//
+// JDK-ONLY-LAYOUT: that seven-slot model is a FABRICATION and none of its
+// indices survive on a real `java.net.URI`, which declares
+// `scheme, fragment, authority, userInfo, host, port, path, query, …`. So
+// every raw-slot access below is gated on [`uri_has_synthetic_layout`], asked
+// by NAME. Measured 2026-08-10 with `CRATONVM_DBG=overlay,overlay-all`:
+// eleven reads of slot 6 (`path`) and three of slot 2 (`authority`) per run of
+// `probes/W2ResidualCensusProbe`, all on real-layout receivers.
 // ===========================================================================
 
-/// Read the raw URI string from a synthetic URI object.
-/// Tries field 6 (alternate "raw" slot used by some JDK-shaped synthetics),
-/// then field 5 (`URL_FIELD_FULL` from `url_parse` / `native_url_to_uri`),
-/// then field 0 only when it looks like a complete URI (contains `:` after
-/// the scheme), so we don't mistake a bare `"file"` scheme token for the
-/// full `file:/C:/...` string.
+/// Does `uri` have OUR fabricated seven-slot `java/net/URI` layout rather than
+/// the real class's?
+///
+/// Asked by NAME, never by field count: `alloc_concurrent_synthetic` returns at
+/// least the requested slot count either way, and `define_class_with_options`
+/// pads a real `URI` up to the model's width, so a count test cannot separate
+/// the two layouts. That mistake shipped completely inert once already, in the
+/// first `VarHandle` guard.
+///
+/// A real `java.net.URI` declares `schemeSpecificPart`; a VM-fabricated stub has
+/// generated `_fN` placeholders and declares nothing of the sort.
+pub(crate) fn uri_has_synthetic_layout(ctx: &dyn NativeContext, uri: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(uri);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "schemeSpecificPart")
+}
+
+/// Read the raw URI string from a URI object.
+///
+/// The real-JDK `string` field is tried first, by name. The raw-slot fallbacks
+/// (field 6, then 5, then 0) address OUR fabricated model and are reached only
+/// when the receiver actually has it — on a real `java.net.URI` slot 6 is
+/// `path` and slot 5 is `port`, so reading them answers the wrong field and,
+/// for slot 5, a primitive where a `String` was expected.
 pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     // Real-JDK `java.net.URI` caches its full text in the `string` field.
     // Reading it by NAME works regardless of the instance-field slot order
@@ -2358,6 +2386,9 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
                 return r;
             }
         }
+    }
+    if !uri_has_synthetic_layout(ctx, uri) {
+        return String::new();
     }
     for &idx in &[6usize, 5usize] {
         match ctx.get_field(uri, idx) {
@@ -2380,6 +2411,88 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
             String::new()
         }
         _ => String::new(),
+    }
+}
+
+/// The `//authority` component of `uri`, or `None` when it has none.
+///
+/// The raw string is authoritative — it is what every sibling accessor in this
+/// registrar parses — with the real class's own `authority` field as the
+/// fallback for a `java.net.URI` that arrived fully constructed from real
+/// bytecode and never cached its text.
+///
+/// An EMPTY authority is `None`, not `Some("")`: `new URI("file:///tmp/x")`
+/// has a zero-length authority between the `//` and the path, and both the JDK
+/// and this VM must answer `null` for it.
+pub(crate) fn uri_authority_component(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<String> {
+    let raw = uri_raw_string(ctx, uri);
+    if !raw.is_empty() {
+        return uri_split(&raw).1.filter(|a| !a.is_empty());
+    }
+    match ctx.get_field_by_name(uri, "authority") {
+        Value::Object(Some(s)) => ctx.read_string(s).filter(|a| !a.is_empty()),
+        _ => None,
+    }
+}
+
+/// The connection-relevant components of a `java.net.URI`, read WITHOUT a
+/// hand-numbered slot index.
+///
+/// `native-builtins/src/http2.rs` and `native-builtins/src/servlet.rs` each
+/// carried an identical private copy of the fabricated
+/// `scheme=0, host=1, port=2, path=3, query=4` model and read their URI
+/// receivers through it. Two copies of a layout is how the
+/// `real_protected_stub` allow-lists drifted, and on a real `java.net.URI`
+/// every one of those indices names a different field (`fragment`,
+/// `authority`, `userInfo`, `host`), so the readers were reporting the wrong
+/// component with no fault and no log line — an HTTP client dialling the
+/// fragment as its host.
+///
+/// One helper, parsing the same raw string the registered accessors parse, so
+/// there is no second model left to drift.
+pub(crate) struct UriComponents {
+    pub scheme: Option<String>,
+    pub host: Option<String>,
+    /// `-1` when the URI carries no explicit port, matching `URI.getPort()`.
+    pub port: i32,
+    pub path: String,
+    pub query: Option<String>,
+}
+
+pub(crate) fn uri_components(ctx: &dyn NativeContext, uri: ObjectRef) -> UriComponents {
+    let raw = uri_raw_string(ctx, uri);
+    if !raw.is_empty() {
+        let (scheme, authority, path, query, _) = uri_split(&raw);
+        let (host, port) = match authority.as_deref() {
+            Some(a) if !a.is_empty() => {
+                let (_, h, p) = uri_parse_authority(a);
+                (h, p)
+            }
+            _ => (None, -1),
+        };
+        return UriComponents {
+            scheme,
+            host,
+            port,
+            path,
+            query,
+        };
+    }
+    // No cached text: a real `java.net.URI` built by real bytecode. Its own
+    // fields are the answer, by name.
+    let str_field = |name: &str| match ctx.get_field_by_name(uri, name) {
+        Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()),
+        _ => None,
+    };
+    UriComponents {
+        scheme: str_field("scheme"),
+        host: str_field("host"),
+        port: match ctx.get_field_by_name(uri, "port") {
+            Value::Int(p) => p,
+            _ => -1,
+        },
+        path: str_field("path").unwrap_or_default(),
+        query: str_field("query"),
     }
 }
 
@@ -2803,7 +2916,7 @@ fn uri_remove_dot_segments(path: &str) -> Result<String, MethodCallFailed> {
 
 /// Split a URI string into (scheme, authority, path, query, fragment).
 /// `authority` is `None` when the URI has no `//` authority component.
-fn uri_split(
+pub(crate) fn uri_split(
     s: &str,
 ) -> (
     Option<String>,
@@ -2991,7 +3104,39 @@ fn uri_recompose(
 /// break `getPath()`/`new File(URI)`.
 fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
     let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// Write a URI's components into `uri_obj` under the names the real
+/// `java.net.URI` declares.
+///
+/// JDK-ONLY-LAYOUT. Eleven sites in four files allocate a `java/net/URI` and
+/// then stamp its components in by RAW SLOT INDEX, under three mutually
+/// inconsistent fabricated models (`raw@0 scheme@1 path@4`, `raw@0 raw@4`, and
+/// the `scheme@0 host@1 port@2 path@3 query@4` block that `http2.rs` and
+/// `servlet.rs` used to read). In real-JDK mode every one of those objects is a
+/// genuine `java.net.URI` whose slots are `scheme, fragment, authority,
+/// userInfo, host, port, path, query`, so each write landed on a different
+/// field than it named. It went unnoticed because the accessors read the SAME
+/// wrong slots back: writer and reader agreed, and the object was wrong only
+/// from real bytecode's point of view — which is precisely what
+/// `URI.getAuthority()` is.
+///
+/// `path_override` is for the callers that know a better path than the generic
+/// split produces (a `jar:` inner entry, a Windows drive-letter path).
+///
+/// This function writes ONLY by name. Its callers keep their raw-slot writes
+/// for a receiver that genuinely has a fabricated layout, asked by NAME through
+/// [`uri_has_synthetic_layout`].
+pub(crate) fn uri_publish_named(
+    ctx: &mut dyn NativeContext,
+    uri_obj: ObjectRef,
+    raw: &str,
+    path_override: Option<&str>,
+) {
     let (scheme, authority, path, query, fragment) = uri_split(raw);
+    let path = path_override.map_or(path, str::to_string);
     let ssp = {
         let mut s = String::new();
         if let Some(a) = &authority {
@@ -3005,34 +3150,58 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodC
         }
         s
     };
-    let raw_s = ctx.create_string(raw);
-    // `string` — the volatile full-text cache `uri_raw_string` reads first.
-    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_s)));
-    let set = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
+    // Pin across the whole publish. Every `put` below allocates a String, and a
+    // moving young GC there relocates `uri_obj` and leaves this raw ref stale —
+    // it then resolves to a reused, usually `java/lang/Object`, slot, and the
+    // component lands on a stranger. `make_uri` carried that exposure for one
+    // caller; this function now has eleven, so the pin belongs here rather than
+    // at each of them. `read_native_pin` is handle-authoritative: the stale
+    // local is only its out-of-range fallback.
+    let pin = ctx.pin_native_root(uri_obj);
+    let put = |ctx: &mut dyn NativeContext, name: &str, v: &str| {
+        let s = ctx.create_string(v);
+        let obj = ctx.read_native_pin(pin, uri_obj);
+        ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
+    };
+    let put_opt = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
         if let Some(v) = val {
             let s = ctx.create_string(v);
-            ctx.set_field_by_name(uri_obj, name, Value::Object(Some(s)));
+            let obj = ctx.read_native_pin(pin, uri_obj);
+            ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
         }
     };
-    set(ctx, "scheme", &scheme);
-    set(ctx, "authority", &authority);
-    set(ctx, "query", &query);
-    set(ctx, "fragment", &fragment);
+
+    // `string` — the volatile full-text cache `uri_raw_string` reads first.
+    put(ctx, "string", raw);
+    put_opt(ctx, "scheme", &scheme);
+    put_opt(ctx, "authority", &authority);
+    put_opt(ctx, "query", &query);
+    put_opt(ctx, "fragment", &fragment);
     if !path.is_empty() {
-        let p = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(p)));
-        let dp = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "decodedPath", Value::Object(Some(dp)));
+        put(ctx, "path", &path);
+        put(ctx, "decodedPath", &path);
     }
-    let ssp_s = ctx.create_string(&ssp);
-    ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
-    let dssp = ctx.create_string(&ssp);
-    ctx.set_field_by_name(
-        uri_obj,
-        "decodedSchemeSpecificPart",
-        Value::Object(Some(dssp)),
-    );
-    Ok(uri_obj)
+    put(ctx, "schemeSpecificPart", &ssp);
+    put(ctx, "decodedSchemeSpecificPart", &ssp);
+    // `host`, `userInfo` and `port` come out of the authority, and a real
+    // `java.net.URI` declares all three. Writing them keeps a receiver that
+    // real bytecode reads directly consistent with what the accessors answer.
+    let port = match authority.as_deref().filter(|a| !a.is_empty()) {
+        Some(a) => {
+            let (user_info, host, port) = uri_parse_authority(a);
+            if let Some(h) = host {
+                put(ctx, "host", &h);
+            }
+            if let Some(u) = user_info {
+                put(ctx, "userInfo", &u);
+            }
+            port
+        }
+        None => -1,
+    };
+    let obj = ctx.read_native_pin(pin, uri_obj);
+    ctx.set_field_by_name(obj, "port", Value::Int(port));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
@@ -3056,11 +3225,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Fast path: scheme field (0) if it was set during construction.
-        if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
-            if let Some(v) = ctx.read_string(s) {
-                if !v.is_empty() && !v.contains(':') {
-                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+        // Fast path: OUR model's scheme slot (0) if it was set during
+        // construction. Slot 0 happens to be `scheme` on a real `URI` too, but
+        // the guard stays: this is the fabricated model's index, and it is the
+        // model that must own it.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                if let Some(v) = ctx.read_string(s) {
+                    if !v.is_empty() && !v.contains(':') {
+                        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                    }
                 }
             }
         }
@@ -3201,8 +3375,18 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(host));
         }
         // No authority section in the raw string → fall back to an explicit host
-        // slot set during construction.
-        if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+        // slot set during construction. Slot 1 is OUR model's `host`; on a real
+        // `java.net.URI` it is `fragment`, so ask before reading it, and prefer
+        // the real class's own `host` field when the receiver has one.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+                if let Some(v) = ctx.read_string(s) {
+                    if !v.is_empty() {
+                        return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                    }
+                }
+            }
+        } else if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "host") {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
@@ -3216,7 +3400,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // authority. Absent port is -1 (java.net.URI contract), not the int-default 0.
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Int(p) = ctx.get_field(this, 2) {
+        // Slot 2 is OUR model's `port`; on a real `java.net.URI` it is
+        // `authority`, a `String`, so this read used to answer a reference
+        // where an `Int` was expected on every real-layout receiver.
+        if uri_has_synthetic_layout(ctx, this) {
+            if let Value::Int(p) = ctx.get_field(this, 2) {
+                if p > 0 {
+                    return Ok(Some(Value::Int(p)));
+                }
+            }
+        } else if let Value::Int(p) = ctx.get_field_by_name(this, "port") {
             if p > 0 {
                 return Ok(Some(Value::Int(p)));
             }
@@ -3227,6 +3420,38 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(port)));
         }
         Ok(Some(Value::Int(-1)))
+    });
+
+    // getAuthority() / getRawAuthority() → the `//authority` component.
+    //
+    // These were the two accessors in the family with NO native, so they fell
+    // through to real `java.net.URI` bytecode, which reads the `authority`
+    // field — and `native_uri_init`/`uri_store_named` never wrote it. Measured
+    // 2026-08-10 against Temurin 25.0.3:
+    // `new URI("http://user:pw@example.com:8080/a/b?q=1#frag").getAuthority()`
+    // answered **null** where HotSpot answers `user:pw@example.com:8080`. It is
+    // the same shape as `getUserInfo` before it was registered, and the same
+    // parse: authority is whatever `uri_split` puts between `//` and the path.
+    //
+    // `getAuthority` returns the DECODED form and `getRawAuthority` the literal
+    // one, exactly as the JDK's `decodedAuthority`/`authority` pair does; for an
+    // authority with no escapes the two coincide.
+    r.register(uri, "getAuthority", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match uri_authority_component(ctx, this) {
+            Some(a) => {
+                let decoded = uri_percent_decode(&a);
+                Value::Object(Some(ctx.create_string(&decoded)))
+            }
+            None => Value::Object(None),
+        }))
+    });
+    r.register(uri, "getRawAuthority", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(match uri_authority_component(ctx, this) {
+            Some(a) => Value::Object(Some(ctx.create_string(&a))),
+            None => Value::Object(None),
+        }))
     });
 
     // getUserInfo() → decoded user-information from the raw authority. Was
@@ -7485,20 +7710,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
-        let raw_s = ctx.create_string(&url_str);
-        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-                                                           // Parse scheme.
-        if let Some(colon) = url_str.find(':') {
-            let scheme = &url_str[..colon];
-            let scheme_s = ctx.create_string(scheme);
-            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
-            // For file: URIs, the path is everything after "file:".
-            if scheme == "file" {
-                let path = &url_str[colon + 1..];
-                let path_s = ctx.create_string(path);
-                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+        // `java.net.URI` slot 6 is `path` and slot 3 is `userInfo`, so the full
+        // text went into the path and the path into the user information.
+        if uri_has_synthetic_layout(ctx, uri) {
+            let raw_s = ctx.create_string(&url_str);
+            ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+            if let Some(colon) = url_str.find(':') {
+                let scheme = &url_str[..colon];
+                let scheme_s = ctx.create_string(scheme);
+                ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
+                // For file: URIs, the path is everything after "file:".
+                if scheme == "file" {
+                    let path = &url_str[colon + 1..];
+                    let path_s = ctx.create_string(path);
+                    ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+                }
             }
         }
+        // The file: path override preserves this site's own rule: everything
+        // after `file:` is the path, including a Windows `/C:/…` form that the
+        // generic split would treat as an opaque scheme-specific part.
+        let file_path = url_str
+            .strip_prefix("file:")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        uri_publish_named(ctx, uri, &url_str, file_path.as_deref());
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -12330,14 +12567,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             #[cfg(unix)]
             let connect_result = if legacy_dsa_client {
                 crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+                    .map_err(|e| e.to_string())
             } else {
                 crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                     .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
-                    .map_err(std::io::Error::other)
+                    .map_err(|e| e.to_string())
             };
             #[cfg(not(unix))]
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
-                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                .map_err(|e| e.to_string());
             ctx.end_blocking_region();
             let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;

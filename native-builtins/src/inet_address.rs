@@ -563,21 +563,12 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
         get_local_host_name_impl,
         NativeKind::Bridge,
     );
-    r.register(INET4_IMPL, "isReachable0", "([BII[BI)Z", is_reachable0_impl);
-    r.register(INET4_IMPL, "isReachable0", "([BII)Z", is_reachable0_impl);
     // KEEP the no-op: HotSpot's `Inet4AddressImpl.init()` only caches JNI
     // field/method IDs for the C side, which has no analogue here. It has no
     // observable effect, and the registration exists purely so `<clinit>` does
     // not die with UnsatisfiedLinkError. Same for every other `init()V` below.
-    r.register(INET4_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
     // ---- Inet6AddressImpl ----
-    r.register(
-        INET6_IMPL,
-        "lookupAllHostAddr",
-        "(Ljava/lang/String;)[Ljava/net/InetAddress;",
-        |ctx, args| lookup_all_host_addr_impl(ctx, args, None),
-    );
     r.register_with_kind(
         INET6_IMPL,
         "getHostByAddr",
@@ -599,7 +590,6 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
         is_reachable0_impl,
         NativeKind::Bridge,
     );
-    r.register(INET6_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
     // ---- InetAddress static init ----
     // The public `getAllByName` etc. are owned by `net_phase_e.rs`. Here we
@@ -645,18 +635,6 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // JDK 17 declares the host-family probes on InetAddressImplFactory instead
     // of InetAddress. Register both owners so real-JDK boot code can choose the
     // address implementation without tripping UnsatisfiedLinkError.
-    r.register(
-        INET_IMPL_FACTORY,
-        "isIPv6Supported",
-        "()Z",
-        native_inet_address_is_ipv6_supported,
-    );
-    r.register(
-        INET_IMPL_FACTORY,
-        "isIPv4Available",
-        "()Z",
-        native_inet_address_is_ipv4_available,
-    );
 
     // ---- Inet4Address / Inet6Address class-load `init` ----
     // Inet4Address.java and Inet6Address.java each declare a private static

@@ -1266,25 +1266,10 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     // `allocationGranularity0` and `initIDs` remain — none of those
     // have a "real" counterpart and they are otherwise harmless.
     let fci = "sun/nio/ch/FileChannelImpl";
-    r.register(
-        fci,
-        "position0",
-        "(Ljava/io/FileDescriptor;J)J",
-        native_fc_position0,
-    );
-    r.register(
-        fci,
-        "allocationGranularity0",
-        "()J",
-        native_fc_allocation_granularity0,
-    );
     // NOT an `initIDs()V` no-op despite the name: `FileChannelImpl.<clinit>`
     // does `allocationGranularity = initIDs();` — the JNI body returns the
     // host's mmap granularity. Answer it from the host instead of a hardcoded
     // 64 KiB (wrong on every 4 KiB-page Unix).
-    r.register(fci, "initIDs", "()J", |_c, _a| {
-        Ok(Some(Value::Long(host_allocation_granularity())))
-    });
 
     // --- NativeThread ---
     let nt = "sun/nio/ch/NativeThread";

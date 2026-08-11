@@ -391,6 +391,12 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
+/// striding OVER the watched base, inside some earlier object's computed
+/// extent. Bounds the log: a desynced grid can straddle one watched address on
+/// many consecutive objects.
+static MARKWHY_STRADDLE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of forwarded young objects whose
 /// forwarding target failed validation (not inside old gen). Such a header is
 /// a phantom write from a desynced walk or corruption; the span is retained
@@ -7725,6 +7731,8 @@ impl GenerationalHeap {
             loader_pin_on: cratonvm_types::loader_pin::loader_pinning_enabled(),
             overlay_owners: crate::external_roots::external_owner_addrs(),
             metadata_pins: cratonvm_types::metadata_pin::snapshot(),
+            // Snapshotted once per collection; see `YoungMarkCtx::mark_why`.
+            mark_why: crate::heap::young_mark_watch(),
         };
         // ----- Oracle resolution accounting (H2-CID0, 2026-08-01) -----------
         //
@@ -7761,6 +7769,13 @@ impl GenerationalHeap {
                           worklist: &mut Vec<usize>,
                           bits: &crate::young_mark::YoungMarkBits| {
             let addr = ptr as usize;
+            // The conservative arm: a root-vector entry or a finalizable
+            // address. Reported BEFORE base resolution, because "a root
+            // pointed INTO this object" and "a root pointed AT it" are
+            // different answers and only the raw address distinguishes them.
+            if mark_ctx.mark_why != 0 && addr == mark_ctx.mark_why {
+                report_young_mark_why(addr, "conservative-root");
+            }
             if !in_young(addr) {
                 return;
             }
@@ -8019,7 +8034,13 @@ impl GenerationalHeap {
                 // SAFETY: `optr`/`oh` form a valid live object.
                 unsafe {
                     for_each_ref_slot(optr, oh, |raw, _slot| {
-                        mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                        mark_edge_precise(
+                            raw as usize,
+                            &mark_ctx,
+                            &side_bits,
+                            &mut worklist,
+                            "full-old-scan",
+                        );
                     });
                 }
             }
@@ -8055,7 +8076,13 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(
+                        raw as usize,
+                        &mark_ctx,
+                        &side_bits,
+                        &mut worklist,
+                        "dirty-card",
+                    );
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -8064,7 +8091,13 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(
+                        raw as usize,
+                        &mark_ctx,
+                        &side_bits,
+                        &mut worklist,
+                        "dirty-card",
+                    );
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -8077,6 +8110,7 @@ impl GenerationalHeap {
                         &mark_ctx,
                         &side_bits,
                         &mut worklist,
+                        "dirty-card",
                     );
                 }
             }
@@ -8102,6 +8136,7 @@ impl GenerationalHeap {
                 &mark_ctx,
                 &side_bits,
                 &mut worklist,
+                "overlay-old-owner",
             );
         }
 
@@ -8118,7 +8153,13 @@ impl GenerationalHeap {
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
                     for_each_ref_slot(op, oh, |r, _| {
-                        mark_edge_precise(r as usize, &mark_ctx, &side_bits, &mut worklist)
+                        mark_edge_precise(
+                            r as usize,
+                            &mark_ctx,
+                            &side_bits,
+                            &mut worklist,
+                            "full-old-scan",
+                        )
                     });
                 }
             }
@@ -8196,7 +8237,7 @@ impl GenerationalHeap {
                     resolve_candidate_bases(from_base, used_bytes, &exact_skips, &unresolved);
                 late_resolved_bases = bases.len();
                 for base in bases {
-                    mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist, "late-base");
                 }
                 if !worklist.is_empty() {
                     crate::young_mark::drain_parallel(
@@ -9331,6 +9372,56 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = merge_skips(young_from.free_blocks_sorted());
+        // MARKWHY: which SKIP ARM covers the watched address? The walk never
+        // stopped at the evicted JSP loader's base, so its span is inside a
+        // stretch the walk strides over. There are three candidates and they
+        // want three different fixes, so name the one that actually applies
+        // instead of inferring it from the absence of desync markers.
+        //
+        // `existing_free` is already the MERGE of the arena free list and the
+        // JIT TLAB reservations, so the two are tested separately here — a
+        // reserved TLAB tail and a genuine free block are not the same finding.
+        // MARKWHY: this sweep RAN, and here is where the watch is relative to it.
+        //
+        // Every other MARKWHY line is gated on the watch being inside
+        // from-space, so all of them go silent together — and that silence has
+        // three causes wanting three different next steps: this sweep never
+        // ran; it ran and the watched object is not in from-space (promoted, or
+        // in the other semispace); or it ran with the object in range and the
+        // walk never reached it. Only the third is a statement about the
+        // object. Reading it off an absence is how a fact about the collector's
+        // schedule becomes a measurement about the heap — which is exactly what
+        // happened here: the fourth-recurrence writeup's central chain rests on
+        // a sweep that, measured, does not run in that test at all.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 {
+                let used_now = young_from.used();
+                eprintln!(
+                    "[MARKWHY] sweep enter: watch={w:#x} from_base={from_base:#x} used={used_now:#x}                      in_from_space={} cycle={sweep_zero_cycle}",
+                    w >= from_base && w < from_base + used_now,
+                );
+            }
+        }
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base && w < from_base + young_from.used() {
+                let off = w - from_base;
+                let in_free = young_from
+                    .free_blocks_sorted()
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                let in_jit = jit_skips
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                eprintln!(
+                    "[MARKWHY] skip-arm probe: watch={w:#x} off={off:#x} used={:#x}                      in_free_block={in_free:?} in_jit_tlab_skip={in_jit:?}",
+                    young_from.used(),
+                );
+            }
+        }
         // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
         // sweep start? `existing_free` is built only from prior sweeps' coalesced
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here
@@ -9386,8 +9477,26 @@ impl GenerationalHeap {
         let mut last_anchor_off: usize = 0;
         let mut objects_since_anchor: usize = 0;
         let mut prev_obj: (usize, usize, u32, u8) = (0, 0, 0, 0);
+        // MARKWHY census: `dead_regions` comes out empty and there are exactly
+        // two ways that happens — the walk classified everything LIVE, or it
+        // collected spans and UNWOUND them. These counters separate the two in
+        // one run instead of another round of inference. Free: five `usize`
+        // increments on a path that already does far more per object.
+        let mut mw_side = 0usize;
+        let mut mw_late = 0usize;
+        let mut mw_fwd = 0usize;
+        let mut mw_hdr_marked = 0usize;
+        let mut mw_dead_pushed = 0usize;
+        let mut mw_unwinds = 0usize;
+        // Per-unwind-site tally: [0]=free-block overshoot, [1]=oversized-object
+        // clamp, [2]=implausible-header resync, [3]=free-list overlap.
+        let mut mw_site = [0usize; 4];
+        let mut mw_unwound_entries = 0usize;
+
         let mut objects_live: usize = 0;
 
+        // See `YoungMarkCtx::mark_why`; read once, not per object.
+        let sweep_mark_why = crate::heap::young_mark_watch();
         let mut cursor: usize = 0;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
@@ -9510,6 +9619,15 @@ impl GenerationalHeap {
             }
         }
         report_phase("sweep-walk-parallel-prefix");
+        // How much of from-space the PARALLEL prefix consumed.
+        //
+        // Every MARKWHY sweep hook lives in the SEQUENTIAL walk. When the
+        // prefix is accepted it consumes `[0, sweep_anchors.last())` and the
+        // sequential walk starts there, so a watched address inside the prefix
+        // is one the sequential walk never visits BY CONSTRUCTION — and "the
+        // walk never stops at that base" would then be a property of where the
+        // instrument is rather than of the object grid.
+        let par_prefix_end = cursor;
 
         // H2-CID0: anchor-validity probe. The parallel sweep prefix splits
         // from-space at `sweep_anchors` and starts an independent chain at each
@@ -9548,7 +9666,7 @@ impl GenerationalHeap {
                     // it may cover a live object's interior. Unwind them
                     // (they have not been zeroed or published yet;
                     // over-retention is always safe under this sweep).
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[0] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                 }
                 if resynced {
                     // A free block's end is ground truth — a fresh anchor.
@@ -9651,7 +9769,7 @@ impl GenerationalHeap {
                     // Reclaim decisions taken since the last anchor were taken
                     // on a grid this span calls into question -- drop them. That
                     // half was always right.
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[1] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                     // What was wrong is the RESUME. Re-anchoring at the next
                     // FREE BLOCK abandons everything in between, and when the
                     // free list is empty there is no anchor at all, so the
@@ -9896,7 +10014,7 @@ impl GenerationalHeap {
                 // decisions made since the last anchor — they may cover a
                 // live object's interior. They have not been zeroed or
                 // published yet (deferred to the publication loop).
-                dead_regions.truncate(dead_watermark);
+                { mw_unwinds += 1; mw_site[2] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                 if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                     tracing::warn!(
                         "non-moving sweep: re-anchored at next free block (offset {}); \
@@ -9940,7 +10058,7 @@ impl GenerationalHeap {
                     // decisions since the last anchor are suspect — unwind
                     // them (over-retention safe) before re-anchoring at the
                     // hole, where the skip loop takes over.
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[3] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                     cursor = foff;
                     continue;
                 }
@@ -10105,7 +10223,60 @@ impl GenerationalHeap {
                 hit
             };
 
+            // MARKWHY: the young marker's edge trace answers "was it marked".
+            // This answers the different question the sweep decides — "will
+            // its span be reclaimed and zeroed" — which is what
+            // `is_live_young_survivor` (word0 != 0) later reports as liveness.
+            // The two can disagree: `late_pinned` retains a span from an
+            // INTERIOR conservative candidate, an address that never equals
+            // the object base and so never trips the edge trace.
+            // MARKWHY, the STRADDLE case — the one that matters when the hook
+            // below never fires. "The walk covers the address and never stops
+            // at it" is a statement about SOME OTHER object: the base is inside
+            // an extent computed for an object that starts earlier. The hook
+            // below tests EQUALITY with the base, so it is silent in exactly
+            // that case and cannot name the culprit stride. This prints the raw
+            // header words the stride was computed from, not a re-read — a
+            // re-read after the fact is what a desync corrupts.
+            if sweep_mark_why != 0 {
+                let base = from_base + cursor;
+                if base < sweep_mark_why && sweep_mark_why < base + total_size {
+                    let n = MARKWHY_STRADDLE_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        // SAFETY: `cursor + HEADER_SIZE <= used` for any object
+                        // the walk sized, so both header words are in bounds.
+                        let (raw0, raw1) = unsafe {
+                            (*(obj_ptr as *const u64), *((obj_ptr as *const u64).add(1)))
+                        };
+                        eprintln!(
+                            "[MARKWHY] STRADDLE: object @{base:#x} off={cursor:#x} size={total_size}                              swallows watch={sweep_mark_why:#x} (+{} into it) class_id={}                              kind={:?} elem={:?} shape={} compact={} body_size={} array_len={}                              raw0={raw0:#018x} raw1={raw1:#018x} since_anchor={objects_since_anchor}                              anchor={last_anchor_off:#x} prev=({:#x},{},{},{})",
+                            sweep_mark_why - base,
+                            header.class_id.as_u32(),
+                            header.kind(),
+                            header.element_type(),
+                            header.shape,
+                            is_compact_object(header),
+                            object_body_size(header),
+                            header.array_length(),
+                            prev_obj.0,
+                            prev_obj.1,
+                            prev_obj.2,
+                            prev_obj.3,
+                        );
+                    }
+                }
+            }
+            if sweep_mark_why != 0 && from_base + cursor == sweep_mark_why {
+                eprintln!(
+                    "[MARKWHY] sweep @{:#x} size={total_size} side_marked={side_marked_survivor}                      late_pinned={late_pinned} forwarded={} header_marked={}",
+                    from_base + cursor,
+                    header.is_forwarded(),
+                    header.gc_flags() & GC_FLAG_MARKED != 0,
+                );
+            }
+
             if header.is_forwarded() {
+                mw_fwd += 1;
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
                 // reclaim (and zero) the young slot. (A "don't zero" variant was
@@ -10151,6 +10322,7 @@ impl GenerationalHeap {
                                 ));
                             }
                         } else {
+                            mw_dead_pushed += 1;
                             dead_regions.push((
                                 cursor,
                                 total_size,
@@ -10170,6 +10342,11 @@ impl GenerationalHeap {
                     }
                 }
             } else if side_marked_survivor || late_pinned {
+                if side_marked_survivor {
+                    mw_side += 1;
+                } else {
+                    mw_late += 1;
+                }
                 // Side-marked survivor: pure retention, no header writes.
                 // `late_pinned` joins it here for the same reason — a
                 // conservative root points into this object, and the header
@@ -10199,6 +10376,7 @@ impl GenerationalHeap {
                     evac_map.insert(addr, addr);
                 }
             } else if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                mw_hdr_marked += 1;
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
                 // (selective promotion). Saturating so a long-lived pinned
@@ -10244,6 +10422,7 @@ impl GenerationalHeap {
                             last.1 += total_size;
                             last.4 += 1;
                         } else {
+                            mw_dead_pushed += 1;
                             dead_regions.push((
                                 cursor,
                                 total_size,
@@ -10539,6 +10718,35 @@ impl GenerationalHeap {
                         "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
                     );
                 }
+            }
+        }
+
+        // MARKWHY: where did the walk actually END? If the watched offset is
+        // above this, the walk abandoned before reaching it and the span was
+        // retained by the "skipped stretch retained until a moving cycle
+        // resets from-space" arm rather than by any skip list.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    // NOT `objects_swept`: its only increment is in the
+                    // publication loop several hundred lines below, so reading
+                    // it here prints a structural zero on every run and every
+                    // workload. It did exactly that, and the zero was read as
+                    // "this sweep reclaimed NOTHING" — a whole-VM reclamation
+                    // failure inferred from a counter not yet written. The real
+                    // total is on the `sweep done` line after the loop.
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} dead_regions={} par_prefix_end={par_prefix_end:#x}                      watch_in_par_prefix={}",
+                    w - from_base,
+                    dead_regions.len(),
+                    (w - from_base) < par_prefix_end,
+                );
+                eprintln!(
+                    "[MARKWHY] disposition census: side_marked={mw_side} late_pinned={mw_late}                      forwarded={mw_fwd} header_marked={mw_hdr_marked} dead_pushed={mw_dead_pushed}                      unwinds={mw_unwinds} sites={mw_site:?} unwound_entries={mw_unwound_entries}                      dead_regions_final={} side_sorted={} late_pins={}",
+                    dead_regions.len(),
+                    side_sorted.len(),
+                    late_pins.len(),
+                );
             }
         }
 
@@ -10921,6 +11129,19 @@ impl GenerationalHeap {
             );
         }
         report_phase("zero-and-publish");
+
+        // MARKWHY: what this sweep ACTUALLY reclaimed, read after the only
+        // place that writes it. Companion to the note on `walk ended` above.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] sweep done: objects_swept={objects_swept} bytes_swept={bytes_swept}                      dead_regions={} reclaimed_regions={} deferred={defer_reclamation}",
+                    dead_regions.len(),
+                    reclaimed_regions.len(),
+                );
+            }
+        }
 
         // DBG (CRATONVM_DBG_SWEEP_CENSUS): per-cycle census of what this sweep
         // reclaimed, by class. A continuously-live workload class (e.g. the
@@ -15006,6 +15227,10 @@ struct YoungMarkCtx {
     overlay_owners: Option<std::collections::HashSet<usize>>,
     /// Loader-owned metadata roots; `None` when the registry is empty.
     metadata_pins: Option<FxHashMap<usize, Vec<usize>>>,
+    /// [`crate::heap::young_mark_watch`], snapshotted once per collection so
+    /// the per-edge test is a field compare and not an atomic load. `0`
+    /// disables it, which is the default and the only value in a normal run.
+    mark_why: usize,
 }
 
 /// Precise-edge marker: mark + enqueue a value read out of an actual
@@ -15017,13 +15242,35 @@ struct YoungMarkCtx {
 /// is a semantic no-op for them and is skipped. Keeps the same header
 /// plausibility + extent rejection and the same never-write-through side-mark
 /// channel: nothing here writes to the heap.
+/// Report one young-mark edge that reached the watched address.
+///
+/// `#[cold]` and out of line so the armed test in `mark_edge_precise` costs a
+/// predictable not-taken branch on the hot path. Prints every arrival, not just
+/// the first: the question is which edges reach the object, and the second one
+/// is as interesting as the first when the first turns out to be legitimate.
+#[cold]
+#[inline(never)]
+fn report_young_mark_why(addr: usize, reason: &'static str) {
+    eprintln!("[MARKWHY] young marker reached {addr:#x} via {reason}");
+}
+
+/// `reason` names the EDGE that led here — `"field"` for an ordinary reference
+/// slot, and one of the side-table labels otherwise. It is a `&'static str`, so
+/// it costs nothing to pass; it is read only when `ctx.mark_why` is armed. The
+/// old-gen BFS has labelled its edges since it was written and the young marker
+/// had no equivalent, which is the whole reason a mirror kept being reported as
+/// "marked, by nothing visible".
 #[inline]
 fn mark_edge_precise(
     addr: usize,
     ctx: &YoungMarkCtx,
     bits: &crate::young_mark::YoungMarkBits,
     worklist: &mut Vec<usize>,
+    reason: &'static str,
 ) {
+    if ctx.mark_why != 0 && addr == ctx.mark_why {
+        report_young_mark_why(addr, reason);
+    }
     if addr < ctx.from_base || addr >= ctx.from_end || addr & 0x7 != 0 {
         return;
     }
@@ -15079,7 +15326,7 @@ fn scan_young_object(
     // SAFETY: `obj_ptr`/`header` are a validated young object.
     unsafe {
         for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-            mark_edge_precise(ref_ptr as usize, ctx, bits, worklist);
+            mark_edge_precise(ref_ptr as usize, ctx, bits, worklist, "field");
         });
     }
     // Collection-overlay liveness pin: an overlay is an out-of-heap edge owned
@@ -15101,7 +15348,7 @@ fn scan_young_object(
             obj_addr,
             Some(header.class_id.as_u32()),
         ) {
-            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
+            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist, "overlay-owner");
         }
     }
     // HIB-CV-24: also mark this object's defining ClassLoader so a live
@@ -15110,7 +15357,7 @@ fn scan_young_object(
         if let Some(loader_addr) =
             cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
         {
-            mark_edge_precise(loader_addr, ctx, bits, worklist);
+            mark_edge_precise(loader_addr, ctx, bits, worklist, "loader_pin");
         }
     }
     // Class-mirror liveness pin (companion to loader_pin): if this object IS
@@ -15119,7 +15366,7 @@ fn scan_young_object(
     // `ClassLoader.classes` field gives for free.
     if let Some(mirror_addrs) = cratonvm_types::mirror_pin::mirrors_for_loader(obj_addr) {
         for mirror_addr in mirror_addrs {
-            mark_edge_precise(mirror_addr, ctx, bits, worklist);
+            mark_edge_precise(mirror_addr, ctx, bits, worklist, "mirror_pin");
         }
     }
     // Loader-owned metadata roots (static reference fields, class monitor,
@@ -15131,7 +15378,7 @@ fn scan_young_object(
         .and_then(|pins| pins.get(&obj_addr))
     {
         for &metadata_addr in metadata_addrs {
-            mark_edge_precise(metadata_addr, ctx, bits, worklist);
+            mark_edge_precise(metadata_addr, ctx, bits, worklist, "metadata_pin");
         }
     }
 }

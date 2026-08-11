@@ -218,7 +218,7 @@ The in-code comment still points at the pre-move path
 `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md`,
 which no longer exists — a stale reference worth fixing in the same change. It
 survived the re-land; the same stale-path family is catalogued in
-[additional wave-2 markers §13](additional-wave2-markers-not-in-the-original-inventory.md).
+[additional wave-2 markers §13](../feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md).
 
 ## Not two copies — one list, one derived list, and four inline predicates
 
@@ -285,7 +285,8 @@ scope.
   the Copy B comment, plus a `StringJoiner` whose second and subsequent `add()`
   calls must be observable in `toString()`. A `StringJoiner` that renders only
   prefix+suffix is the layout-drift symptom; see
-  [fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md).
+  [fabricated object layouts leak into native code](jdk-only-fabricated-object-layouts-FIXED-20260810.md)
+  (RETIRED 2026-08-10).
 * **After deletion:** the `--jdk-only` census must show no
   `native-shadows-bytecode` violations for the 11 classes, and the full
   regression suite must be unchanged in `Compatible` mode.

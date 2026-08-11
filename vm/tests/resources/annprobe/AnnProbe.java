@@ -150,7 +150,35 @@ public class AnnProbe {
         }
 
         System.out.println();
+        System.out.println("=== STEP 6: the SAME member read from an APP-loaded holder stays in the app world ===");
+        // The other direction of STEP 5, and the shape that dropped log4j's
+        // whole <Logger> configuration: STEP 5 left AnnProbeRefType defined
+        // ONLY by the child loader, so a loader-blind "who has this name"
+        // lookup answers with the child's copy. An app-loaded holder must
+        // still get the APPLICATION copy — its own loader can load the class
+        // itself, and handing it the child's builds a world that exists on no
+        // real JVM: an app-world caller reaching a child-world callee, and a
+        // ClassCastException at the first honest checkcast.
+        ClassLoader app = AnnProbe.class.getClassLoader();
+        Class<?> appWithRef = Class.forName("AnnProbeWithRef", false, app);
+        Annotation appRefAnn = appWithRef.getAnnotations()[0];
+        Method appRefValue = appRefAnn.annotationType().getMethod("value");
+        boolean s6;
+        try {
+            Class<?> rv = (Class<?>) appRefValue.invoke(appRefAnn);
+            s6 = (rv.getClassLoader() == app);
+            System.out.println("holder loadedBy=" + appWithRef.getClassLoader()
+                    + " value()=" + rv.getName() + " loadedBy=" + rv.getClassLoader()
+                    + "  " + (s6 ? "[PASS]" : "[FAIL - app holder handed the child loader's copy]"));
+        } catch (Throwable t) {
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException) ? t.getCause() : t;
+            System.out.println("value() THREW " + c.getClass().getName() + "  [FAIL]");
+            s6 = false;
+        }
+
+        System.out.println();
         System.out.println("SUMMARY: S1=" + (s1?"PASS":"FAIL") + " S2=PASS S3=" + (s3?"PASS":"FAIL")
-                + " S4=" + (s4?"PASS":"FAIL") + " S5=" + (s5?"PASS":"FAIL"));
+                + " S4=" + (s4?"PASS":"FAIL") + " S5=" + (s5?"PASS":"FAIL")
+                + " S6=" + (s6?"PASS":"FAIL"));
     }
 }

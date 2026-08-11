@@ -326,7 +326,7 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Re
     // never received the value reads back 0 — "no access at all" — and throws
     // nothing. If the named write did not land, fall through to the synthetic
     // indices rather than returning a powerless Lookup.
-    let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
+    let obj = crate::try_alloc_concurrent_synthetic(ctx, LK_CLASS, 4)?;
     // Slot 0 is `lookupClass` in BOTH layouts.
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
     ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(lookup_mirror)));

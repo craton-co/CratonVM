@@ -4691,6 +4691,54 @@ fn widen_primitive_value(value: Value, src_prim: &str, dst_prim: &str) -> Option
     })
 }
 
+/// Whether the argument reaches the expected type **by NAME** — one binary
+/// name carrying two `ClassId`s, which is a loader split and not a type error.
+///
+/// This is the reflective-coercion twin of the `aastore` predicate's by-name
+/// walk, and it exists for the same reason: CratonVM materialises a second
+/// "world" for a library when a user-defined loader has already loaded it, and
+/// that world can end up partly aliased to the first one. HotSpot never
+/// produces the mix, so there is no HotSpot behaviour to diverge from here —
+/// only our own imprecision to avoid manufacturing an exception out of.
+///
+/// Measured 2026-08-10 on spring-framework's
+/// `TestContextAotGeneratorIntegrationTests`: log4j's plugin builder ran in the
+/// APPLICATION world (receiver, declaring class and field type all
+/// `ClassLoaderId::Application`) and was handed a `Level` from a
+/// `@CompileWithForkedClassLoader` world, because `TypeConverterRegistry`,
+/// `TypeConverters` and `PluginAttributeVisitor` exist ONLY in the forked
+/// worlds — the application loader never got copies of its own. Every
+/// `<Logger>` element of `log4j2-test.xml` was then dropped with
+/// `Could not create plugin of type … LoggerConfig: argument type mismatch`,
+/// 28 times per run, and the suite ran at a log level HotSpot never selects.
+///
+/// **Deliberately narrow.** It fires only when the argument's own superclass
+/// chain carries the expected type's exact binary name. A genuine mismatch —
+/// an `Integer` handed to a `String` field — has no such name anywhere in its
+/// chain, so the refusal that the rest of this function exists for is
+/// untouched. `expected_cid` is passed so a same-`ClassId` argument (already
+/// accepted by `is_subclass` above) can never reach here and make the walk
+/// look load-bearing when it is not.
+fn argument_reaches_expected_by_name(
+    ctx: &dyn NativeContext,
+    arg_cid: ClassId,
+    expected_cid: ClassId,
+    expected_internal: &str,
+) -> bool {
+    if arg_cid == expected_cid {
+        return false;
+    }
+    let mut cur = Some(arg_cid);
+    for _ in 0..32 {
+        let Some(c) = cur else { return false };
+        if ctx.class_name_of_id(c).as_deref() == Some(expected_internal) {
+            return true;
+        }
+        cur = ctx.superclass_of(c);
+    }
+    false
+}
+
 /// Strict version of `unbox_arg`: coerces an incoming Object reference to
 /// the primitive expected by `expected_desc`, validating that the wrapper
 /// class matches (possibly after widening). On mismatch throws
@@ -4833,7 +4881,14 @@ pub(crate) fn coerce_arg_strict(
                         if let Some(expected_cid) = resolved {
                             if !ctx.is_interface_class(expected_cid) {
                                 let arg_cid = ctx.class_id_of_object(obj);
-                                if !ctx.is_subclass(arg_cid, expected_cid) {
+                                if !ctx.is_subclass(arg_cid, expected_cid)
+                                    && !argument_reaches_expected_by_name(
+                                        ctx,
+                                        arg_cid,
+                                        expected_cid,
+                                        internal,
+                                    )
+                                {
                                     if crate::nbflags().dbg_coerce {
                                         let arg_name =
                                             ctx.class_name_of_id(arg_cid).unwrap_or_default();
@@ -6382,7 +6437,33 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // RANK 6 вЂ” strictly coerce the value if the field expects a primitive
     // (including widening); this raises IllegalArgumentException if the wrapper
     // type cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
-    let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set", Some(class_id))?;
+    let coerced = match coerce_arg_strict(ctx, new_value, &descriptor, "Field.set", Some(class_id))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // DIAG (`CRATONVM_DBG=coerce`): the refusal itself names the FIELD's
+            // declaring class and the VALUE's class. On a loader split those two
+            // are the same name under different loaders, and the pair alone
+            // cannot say which side picked the wrong copy. The RECEIVER is what
+            // decides: a receiver from the value's world means the Field object
+            // came from the wrong copy, a receiver from the declaring class's
+            // world means the value did.
+            if crate::nbflags().dbg_coerce {
+                if let Some(recv) = receiver {
+                    let recv_cid = ctx.class_id_of_object(recv);
+                    eprintln!(
+                        "[DBG_COERCE] Field.set: receiver={} (cid={recv_cid:?}, loader={}) \
+declaring={} (cid={class_id:?}, loader={})",
+                        ctx.class_name_of_id(recv_cid).unwrap_or_default(),
+                        ctx.loader_id_of_class(recv_cid),
+                        ctx.class_name_of_id(class_id).unwrap_or_default(),
+                        ctx.loader_id_of_class(class_id),
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
@@ -14123,10 +14204,50 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 let scoped = container_class_id
                     .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
+                // A `Class`-valued member names a type the CONTAINER refers to,
+                // so it resolves with the container's initiating loader
+                // (HotSpot: `parseClassValue` -> `Class.forName(n, false,
+                // container.getClassLoader())`). `class_id_by_name_near` covers
+                // that loader's own namespace and the built-in delegation chain
+                // it inherits, but only for names ALREADY resolved there;
+                // driving the container's loader covers the first use too. The
+                // sibling `Enum` arm has taken that step since the
+                // `SpringBootContextLoaderAotTests` fix — this arm had not, and
+                // fell straight through to the loader-BLIND `class_id_by_name`
+                // instead.
+                //
+                // That fallback answers with whatever single loader happens to
+                // have the name, which under `@CompileWithForkedClassLoader` is
+                // the FORK: an Application-loaded log4j `@PluginAttribute`
+                // (loader 2) was handed the fork's (loader 3)
+                // `PluginAttributeVisitor`, and every class reached from there
+                // — `AbstractPluginVisitor`, `TypeConverters`,
+                // `TypeConverterRegistry` — was forked too, so an app-world
+                // `ConfigurationStrSubstitutor` could not be cast to the
+                // visitor's fork-world `StrSubstitutor`. log4j then dropped
+                // every `<Logger>` element of its configuration.
+                let driven = scoped.is_none().then(|| {
+                    container_class_id.and_then(|holder| {
+                        ctx.class_id_by_name_via_referencing_class(holder, class_name).ok()
+                    })
+                }).flatten();
+                if let Some(cid) = scoped.or(driven).or_else(|| ctx.class_id_by_name(class_name)) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
-                        eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
+                        eprintln!(
+                            "ANN-CLASS desc={desc} class={class_name} already-loaded ok \
+                             holder={:?}/L{:?} via={} answer=L{}",
+                            container_class_id.map(|h| h.as_u32()),
+                            container_class_id.map(|h| ctx.loader_id_of_class(h)),
+                            if scoped.is_some() {
+                                "scoped"
+                            } else if driven.is_some() {
+                                "container-loader"
+                            } else {
+                                "GLOBAL"
+                            },
+                            ctx.loader_id_of_class(cid),
+                        );
                     }
                     return Ok(Value::Object(Some(mirror)));
                 }
@@ -14409,6 +14530,17 @@ pub(crate) fn annotation_element_to_java_typed(
                 .or_else(|| {
                     container_class_id
                         .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
+                })
+                // Same step the scalar `Class` arm takes: `class_id_by_name_near`
+                // only sees names the container's loader has ALREADY resolved,
+                // so drive that loader before conceding to the loader-blind
+                // lookup below — otherwise a component this container has never
+                // touched is answered by whichever single loader happens to
+                // have it.
+                .or_else(|| {
+                    container_class_id.and_then(|holder| {
+                        ctx.class_id_by_name_via_referencing_class(holder, &comp_name_owned).ok()
+                    })
                 })
                 .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
@@ -22497,6 +22629,81 @@ mod tests {
         let ctx = mock_ctx();
         let r = coerce_arg_strict(&ctx, Value::Object(None), "I", "test", None);
         assert!(r.is_err(), "null cannot be coerced to primitive");
+    }
+
+    /// A reflective write of the OTHER loader's copy of the field's own type is
+    /// a loader split, not an `argument type mismatch`.
+    ///
+    /// # The run this comes from
+    ///
+    /// spring-framework's `TestContextAotGeneratorIntegrationTests`, 2026-08-10.
+    /// log4j's plugin builder ran in the APPLICATION world — receiver,
+    /// declaring class and field type all `ClassLoaderId::Application`,
+    /// confirmed by `CRATONVM_DBG=coerce` — and was handed a `Level` from a
+    /// `@CompileWithForkedClassLoader` world, because `TypeConverterRegistry`,
+    /// `TypeConverters` and `PluginAttributeVisitor` exist ONLY in the forked
+    /// worlds. Every `<Logger>` element of `log4j2-test.xml` was dropped with
+    /// `Could not create plugin of type … LoggerConfig: argument type
+    /// mismatch`, 28 times per run. HotSpot keeps that library in one world and
+    /// never produces the mix, so the refusal had no HotSpot behaviour behind
+    /// it — only our own loader modelling.
+    ///
+    /// # Both arms, because the lenient one alone is a degenerate `Ok`
+    ///
+    /// The negative is the control: an unrelated class must still be refused.
+    /// Without it this test passes against a coercion that accepts everything,
+    /// which is precisely the mistake to avoid on a check whose whole job is to
+    /// reject. `is_subclass` is asserted `false` first so the acceptance cannot
+    /// be legitimate subtyping in disguise.
+    #[test]
+    fn a_same_named_copy_from_another_loader_is_not_an_argument_type_mismatch() {
+        const LEVEL: &str = "org/apache/logging/log4j/Level";
+        let mut ctx = mock_ctx();
+
+        // The copy by-name resolution finds — the field's declared type.
+        let expected = ctx.ensure_class_initialized(LEVEL).expect("expected copy");
+        // The other loader's copy, which is what the value is an instance of.
+        let other_copy = ctx.declare_second_copy(LEVEL);
+        assert_ne!(expected, other_copy, "the two copies must be distinct ids");
+        assert!(
+            !ctx.is_subclass(other_copy, expected),
+            "identity must refuse the two copies — otherwise the arm under test \
+             never runs and this measures nothing",
+        );
+
+        let value = ctx.alloc_object(other_copy, 0);
+        assert!(
+            coerce_arg_strict(
+                &ctx,
+                Value::Object(Some(value)),
+                "Lorg/apache/logging/log4j/Level;",
+                "Field.set",
+                None,
+            )
+            .is_ok(),
+            "the other loader's copy of the field's own type must be accepted — \
+             refusing it is the `argument type mismatch` that silently dropped \
+             every <Logger> element of log4j's configuration",
+        );
+
+        // THE CONTROL. A genuinely unrelated class carries the expected name
+        // nowhere in its chain and must still be refused.
+        let unrelated = ctx
+            .ensure_class_initialized("cratonvm/test/NotALevel")
+            .expect("unrelated class");
+        let wrong = ctx.alloc_object(unrelated, 0);
+        assert!(
+            coerce_arg_strict(
+                &ctx,
+                Value::Object(Some(wrong)),
+                "Lorg/apache/logging/log4j/Level;",
+                "Field.set",
+                None,
+            )
+            .is_err(),
+            "an unrelated class must still be an argument type mismatch — if \
+             this starts passing, reflective coercion has stopped checking",
+        );
     }
 
     #[test]

@@ -1597,12 +1597,6 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         };
     r.register(
         cls,
-        "isThreadCpuTimeSupported",
-        "()Z",
-        other_thread_cpu_time,
-    );
-    r.register(
-        cls,
         "isOtherThreadCpuTimeSupported",
         "()Z",
         other_thread_cpu_time,
@@ -1775,10 +1769,6 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // REAL: "resets the peak thread count to the current number of live
     // threads" (JMM). There IS peak state to reset now — the old comment's
     // premise was the missing high-water mark, not a spec exemption.
-    r.register(cls, "resetPeakThreadCount", "()V", |ctx, _args| {
-        reset_peak_thread_count(ctx);
-        Ok(None)
-    });
 
     // -- VMManagementImpl uptime + processor count --
     //
@@ -2549,15 +2539,6 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     // reaches the native and an unregistered one would be an
     // UnsatisfiedLinkError. Both shapes are registered; the `[J` pair is kept
     // for any JDK that declares the older form.
-    r.register(
-        cls,
-        "findMonitorDeadlockedThreads0",
-        "()[J",
-        |ctx, _args| deadlocked_threads_result(ctx),
-    );
-    r.register(cls, "findDeadlockedThreads0", "()[J", |ctx, _args| {
-        deadlocked_threads_result(ctx)
-    });
     r.register_with_kind(
         cls,
         "findMonitorDeadlockedThreads0",
@@ -3032,7 +3013,6 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // every one of ours answers independently (from the `-1` "metric
     // unavailable" sentinel), so there is no state a body here could set up
     // that anything would later read. It exists purely so `<clinit>` links.
-    r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
 
     // JDK 9+ moved the platform OS-bean implementation to
     // `com.sun.management.internal.OperatingSystemImpl` (the old
@@ -3129,27 +3109,10 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     // `HotSpotDiagnosticMXBean.dumpHeap` propagates that, so failing here is
     // both spec-legal and the honest answer. BEHAVIOUR CHANGE: a caller that
     // previously "succeeded" now sees an IOException.
-    r.register(cls, "dumpHeap0", "(Ljava/lang/String;Z)V", |_ctx, _args| {
-        Err(jmx_ioex(
-            "heap dump unavailable: CratonVM has no HPROF writer",
-        ))
-    });
 
     // getDiagnosticOptions()Ljava/util/List; — empty ArrayList matches
     // "no manageable VM options exposed". JBoss only iterates this for
     // diagnostic display.
-    r.register(
-        cls,
-        "getDiagnosticOptions",
-        "()Ljava/util/List;",
-        |ctx, _args| {
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-            let backing = ctx.new_ref_array(ClassId::new(0), 0);
-            ctx.set_field(list, 0, Value::Object(Some(backing))); // elementData
-            ctx.set_field(list, 1, Value::Int(0)); // size
-            Ok(Some(Value::Object(Some(list))))
-        },
-    );
     r.set_category(__prev_cat);
 }
 
@@ -3309,32 +3272,11 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/Flag";
 
-    r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
 
-    r.register(
-        cls,
-        "getAllFlagNames",
-        "()[Ljava/lang/String;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
 
     // Empty Flag[] — same reference-array pattern as getAllFlagNames; the
     // element type is `Lsun/management/Flag;` but our synthetic ref-array
     // doesn't carry the element class beyond ClassId::new(0).
-    r.register(
-        cls,
-        "getAllFlags",
-        "()[Lsun/management/Flag;",
-        |ctx, _args| {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
 
     // JDK 9+ exposes the management-flag backend as
     // `com.sun.management.internal.Flag`. This is the live surface, and it is

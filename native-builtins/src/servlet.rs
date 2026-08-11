@@ -1568,20 +1568,24 @@ fn s1_service_loader_ensure_loaded(
             return empty;
         }
     };
-    // Guard: the mirror must have at least one field (the ClassId slot).
-    // Test mocks may pass a 0-field dummy object.
-    if ctx.object_num_fields(mirror) == 0 {
-        ctx.set_field(sl, 1, Value::Object(Some(empty)));
-        return empty;
-    }
-    let class_id_val = match ctx.get_field(mirror, 0) {
-        Value::Int(v) => v as u32,
-        _ => {
+    // JDK-ONLY-LAYOUT: converted from `get_field(mirror, 0)` to
+    // `mirror_class_id`, which asks the authoritative reverse map first and
+    // only then the legacy Int-at-slot-0 overlay. Slot 0 of a real
+    // `java.lang.Class` is `cachedConstructor`, a reference; this read worked
+    // solely because `get_or_create_class_mirror` deliberately parks the
+    // ClassId there, and it was one of the readers that made that overlay
+    // load-bearing.
+    //
+    // The `object_num_fields == 0` guard went with it: a field count cannot
+    // tell a real mirror from a mock, and `mirror_class_id` answers `None` for
+    // both the empty-object and the no-such-mapping cases anyway.
+    let class_id = match crate::lang_class::mirror_class_id(ctx, mirror) {
+        Some(cid) => cid,
+        None => {
             ctx.set_field(sl, 1, Value::Object(Some(empty)));
             return empty;
         }
     };
-    let class_id = cratonvm_types::ClassId::new(class_id_val);
     let iface_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n.replace('/', "."),
         None => {
@@ -2189,19 +2193,64 @@ pub(crate) fn s2_tls_connect(
     connector: &native_tls::TlsConnector,
     host: &str,
     port: u16,
-) -> std::io::Result<i32> {
-    use std::io;
-
+) -> Result<i32, TlsConnectFailure> {
     let addr = format!("{}:{}", host, port);
-    let tcp = TcpStream::connect(&addr)?;
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_tls_connect_on(connector, host, port, tcp)
+}
+
+/// Why a client TLS connect attempt failed, kept apart so the caller can raise
+/// the exception JSSE raises.
+///
+/// `SSLSocketFactory.createSocket` reports a refused/unroutable TCP connect as
+/// a plain `IOException` and a REJECTED HANDSHAKE as
+/// `javax.net.ssl.SSLHandshakeException` — callers `catch` on that type (see
+/// `ensure_layered_handshake_started`'s note about tests asserting on the JSSE
+/// type for an intentionally-rejected connection). Flattening both into one
+/// `IOException` with a `format!`ed message, which is what this path did,
+/// makes the two indistinguishable to a `catch` block.
+pub(crate) enum TlsConnectFailure {
+    /// The TCP connection could not be established.
+    Tcp(std::io::Error),
+    /// TCP succeeded; the TLS handshake did not. Carries the backend's own
+    /// description (for OpenSSL, the certificate-verification error).
+    Handshake(String),
+}
+
+impl std::fmt::Display for TlsConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsConnectFailure::Tcp(e) => write!(f, "{e}"),
+            TlsConnectFailure::Handshake(m) => f.write_str(m),
+        }
+    }
+}
+
+/// [`s2_tls_connect`] over an ALREADY-CONNECTED stream.
+///
+/// `SSLSocket.connect(SocketAddress)` establishes the TCP connection and the
+/// handshake runs later (see [`PENDING_CONNECT_SOCK_ID_BASE`]); the connection
+/// it opened is the one the handshake must run on. Opening a second one
+/// instead is observable to the peer: a server that accepts one connection per
+/// client accepts the FIRST (which carries no ClientHello, so its handshake
+/// reads EOF) and is no longer in `accept()` when the second arrives, which
+/// then waits out the 30 s read timeout below and reports
+/// `HandshakeError::WouldBlock` — "the handshake process was interrupted",
+/// ~30 s after a rejection the peer had already answered.
+pub(crate) fn s2_tls_connect_on(
+    connector: &native_tls::TlsConnector,
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
     // Reasonable defaults: non-infinite read/write timeouts so a hung peer
     // never deadlocks the JVM thread calling `SSLSocket.getInputStream().read`.
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let tls_stream = connector.connect(host, tcp).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("TLS handshake failed: {}", e))
-    })?;
+    let tls_stream = connector
+        .connect(host, tcp)
+        .map_err(|e| TlsConnectFailure::Handshake(format!("TLS handshake failed: {}", e)))?;
 
     // T2.7.11: native-tls 0.2's public `TlsStream` API does not expose the
     // server-selected ALPN protocol on all backends (it is absent on 0.2's
@@ -2231,10 +2280,10 @@ pub(crate) fn s2_tls_connect(
         Ok(Some(cert)) => match cert.to_der() {
             Ok(der) => peer_cert_chain_der.push(der),
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("peer certificate DER encode failed: {}", e),
-                ));
+                return Err(TlsConnectFailure::Handshake(format!(
+                    "peer certificate DER encode failed: {}",
+                    e
+                )));
             }
         },
         Ok(None) => {
@@ -2243,10 +2292,10 @@ pub(crate) fn s2_tls_connect(
             // SSLPeerUnverifiedException.
         }
         Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("peer certificate query failed: {}", e),
-            ));
+            return Err(TlsConnectFailure::Handshake(format!(
+                "peer certificate query failed: {}",
+                e
+            )));
         }
     }
 
@@ -2277,29 +2326,40 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     host: &str,
     port: u16,
     trust_root_ders: &[Vec<u8>],
-) -> std::io::Result<i32> {
+) -> Result<i32, TlsConnectFailure> {
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr).map_err(TlsConnectFailure::Tcp)?;
+    s2_legacy_dsa_tls_connect_on(host, port, trust_root_ders, tcp)
+}
+
+/// [`s2_legacy_dsa_tls_connect`] over an ALREADY-CONNECTED stream — see
+/// [`s2_tls_connect_on`] for why the deferred-handshake path must reuse the
+/// connection `SSLSocket.connect` opened rather than open a second one.
+#[cfg(unix)]
+pub(crate) fn s2_legacy_dsa_tls_connect_on(
+    host: &str,
+    port: u16,
+    trust_root_ders: &[Vec<u8>],
+    tcp: TcpStream,
+) -> Result<i32, TlsConnectFailure> {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
     use openssl::x509::{store::X509StoreBuilder, X509VerifyResult, X509};
-    let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr)?;
+    let hs = |e: &dyn std::fmt::Display| TlsConnectFailure::Handshake(e.to_string());
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).map_err(|e| hs(&e))?;
     builder.set_security_level(0);
     builder
         .set_cipher_list("ALL:@SECLEVEL=0")
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut roots = X509StoreBuilder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| hs(&e))?;
+    let mut roots = X509StoreBuilder::new().map_err(|e| hs(&e))?;
     for der in trust_root_ders {
-        let cert = X509::from_der(der).map_err(|e| std::io::Error::other(e.to_string()))?;
-        roots
-            .add_cert(cert)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let cert = X509::from_der(der).map_err(|e| hs(&e))?;
+        roots.add_cert(cert).map_err(|e| hs(&e))?;
     }
     builder
         .set_verify_cert_store(roots.build())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| hs(&e))?;
     // Spring Boot's historical embedded-LDAP fixture explicitly trusts a
     // self-signed DSA certificate whose validity window ended in 2017.  The
     // JVM trust-manager shim accepts that explicit anchor; retain normal
@@ -2313,19 +2373,14 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
     // server via 127.0.0.1 while the test certificate has no matching IP SAN.
     let connector = builder.build();
-    let mut connection = connector
-        .configure()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut connection = connector.configure().map_err(|e| hs(&e))?;
     connection.set_verify_hostname(false);
-    let stream = connection
-        .connect(host, tcp)
-        .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
+    let stream = connection.connect(host, tcp).map_err(|e| {
+        TlsConnectFailure::Handshake(format!("legacy DSA TLS handshake: {e}"))
+    })?;
     let mut peer_cert_chain_der = Vec::new();
     if let Some(cert) = stream.ssl().peer_certificate() {
-        peer_cert_chain_der.push(
-            cert.to_der()
-                .map_err(|e| std::io::Error::other(e.to_string()))?,
-        );
+        peer_cert_chain_der.push(cert.to_der().map_err(|e| hs(&e))?);
     }
     let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
@@ -7290,14 +7345,6 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 // NOTE: HTTPS is supported via native-tls for TLS connections.
 // =============================================================================
 
-/// URI field indices (same layout as registered at line ~32569)
-const URI_SCHEME: usize = 0;
-const URI_HOST: usize = 1;
-const URI_PORT: usize = 2;
-const URI_PATH: usize = 3;
-const URI_QUERY: usize = 4;
-// field 5 = fragment, field 6 = raw — also useful for fallback
-
 /// HttpRequest field indices
 const HR_URI: usize = 0;
 const HR_METHOD: usize = 1;
@@ -7357,14 +7404,6 @@ pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
     ()
 }
 
-/// Extract a plain Rust String from a Java String field of an object, or return `None`.
-fn s3_read_str_field(ctx: &dyn NativeContext, obj: ObjectRef, field: usize) -> Option<String> {
-    match ctx.get_field(obj, field) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    }
-}
-
 /// Core HTTP/1.1 send implementation.
 fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use std::io::{Read, Write};
@@ -7383,22 +7422,26 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     // ---- Extract URI components ----
-    let scheme = s3_read_str_field(ctx, uri_ref, URI_SCHEME)
+    //
+    // JDK-ONLY-LAYOUT: converted from raw slot indices to
+    // `net_phase_e::uri_components`. This block used to read a private
+    // `scheme=0, host=1, port=2, path=3, query=4` model — an exact duplicate of
+    // the one in `http2.rs` — which on a real `java.net.URI` names `scheme`,
+    // `fragment`, `authority`, `userInfo` and `host`. Only slot 0 was right,
+    // and the rest failed silently: a well-typed `String` from the wrong field.
+    let parts = crate::net_phase_e::uri_components(ctx, uri_ref);
+    let scheme = parts
+        .scheme
         .unwrap_or_else(|| "http".to_string())
         .to_lowercase();
-    let host = s3_read_str_field(ctx, uri_ref, URI_HOST).unwrap_or_default();
-    let port_field = ctx.get_field(uri_ref, URI_PORT).as_int().unwrap_or(-1);
-    let path = s3_read_str_field(ctx, uri_ref, URI_PATH).unwrap_or_else(|| "/".to_string());
-    let query = s3_read_str_field(ctx, uri_ref, URI_QUERY);
-
-    // If host is empty, try the raw URL string (field 6)
-    let (host, port_field, path, query, scheme) = if host.is_empty() {
-        // Fall back: parse raw URL
-        let raw = s3_read_str_field(ctx, uri_ref, 6).unwrap_or_default();
-        s3_parse_raw_url(&raw)
+    let host = parts.host.unwrap_or_default();
+    let port_field = parts.port;
+    let path = if parts.path.is_empty() {
+        "/".to_string()
     } else {
-        (host, port_field, path, query, scheme)
+        parts.path
     };
+    let query = parts.query;
 
     if host.is_empty() {
         return s3_stub_response(ctx, 400, "Cannot determine target host from URI");
@@ -7514,39 +7557,6 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     ctx.set_field(response, 2, Value::Object(None)); // headers not parsed
 
     Ok(Some(Value::Object(Some(response))))
-}
-
-/// Parse a raw URL string like "http://host:port/path?query" into components.
-/// Returns (host, port, path, query, scheme).
-fn s3_parse_raw_url(raw: &str) -> (String, i32, String, Option<String>, String) {
-    let (scheme, rest) = if let Some(pos) = raw.find("://") {
-        (raw[..pos].to_lowercase(), &raw[pos + 3..])
-    } else {
-        ("http".to_string(), raw)
-    };
-    let (authority, path_and_rest) = if let Some(pos) = rest.find('/') {
-        (&rest[..pos], &rest[pos..])
-    } else {
-        (rest, "/")
-    };
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        if let Ok(p) = authority[colon + 1..].parse::<i32>() {
-            (authority[..colon].to_string(), p)
-        } else {
-            (authority.to_string(), -1i32)
-        }
-    } else {
-        (authority.to_string(), -1i32)
-    };
-    let (path, query) = if let Some(qmark) = path_and_rest.find('?') {
-        (
-            path_and_rest[..qmark].to_string(),
-            Some(path_and_rest[qmark + 1..].to_string()),
-        )
-    } else {
-        (path_and_rest.to_string(), None)
-    };
-    (host, port, path, query, scheme)
 }
 
 /// Extract HTTP status code from the first line of a response.

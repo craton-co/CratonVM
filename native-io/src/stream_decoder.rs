@@ -50,7 +50,7 @@
 //! motion is transparent).
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use std::collections::VecDeque;
@@ -116,7 +116,7 @@ pub(crate) fn alloc_stream_decoder(
     is: ObjectRef,
     charset_name: &str,
     prop: Option<PropState>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // GC-safety: `is` is a Rust local the caller extracted from its own args
     // slice before calling in (see `native_sd_for_isr_charset`/`_name`), and
     // `ensure_class_initialized` below runs `<clinit>` bytecode — arbitrary,
@@ -141,10 +141,18 @@ pub(crate) fn alloc_stream_decoder(
         // `BufferedReader`/`InputStreamReader` chain happened to construct a
         // fresh decoder at the wrong moment (observed in
         // TestFormAuthenticatorA/B/C's SimpleHttpClient.readLine). Use the
-        // documented `ensure_synthetic_class` fallback instead -- it always
-        // returns a class that actually declares the requested fields, so
-        // the object stays usable even on the rare initialization race.
-        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamDecoder", 9),
+        // documented synthetic fallback instead -- it retries the real load
+        // first and otherwise returns a class that actually declares the
+        // requested fields, so the object stays usable even on the rare
+        // initialization race.
+        //
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3), and the
+        // race this arm exists for is unaffected: the fallible spelling
+        // still re-attempts `load_class_concurrent` first, so a transient
+        // `<clinit>` failure resolves to the REAL `sun.nio.cs.StreamDecoder`
+        // exactly as before. Only a genuine "this class is nowhere" reaches
+        // the policy, and there `--jdk-only` refusing is the point.
+        Err(_) => crate::refused_class(ctx, "sun/nio/cs/StreamDecoder", 9)?,
     };
     // `alloc_object` clamps the slot count up to the resolved real class's
     // total declared instance-field count, so `0` here is fine — the object
@@ -165,7 +173,7 @@ pub(crate) fn alloc_stream_decoder(
             prop,
         },
     );
-    obj
+    Ok(obj)
 }
 
 /// Detect a `sun.util.PropertyResourceBundleCharset` charset (or its inner
@@ -217,7 +225,7 @@ fn native_sd_for_isr_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => None,
     };
     let name = resolve_name(ctx, charset_obj, args.get(2));
-    let sd = alloc_stream_decoder(ctx, is, &name, prop);
+    let sd = alloc_stream_decoder(ctx, is, &name, prop)?;
     Ok(Some(Value::Object(Some(sd))))
 }
 
@@ -239,7 +247,7 @@ fn native_sd_for_isr_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(n) => n,
         None => return Err(throw_unsupported_encoding(ctx, &name_str)),
     };
-    let sd = alloc_stream_decoder(ctx, is, &norm, None);
+    let sd = alloc_stream_decoder(ctx, is, &norm, None)?;
     Ok(Some(Value::Object(Some(sd))))
 }
 

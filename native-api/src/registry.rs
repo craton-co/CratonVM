@@ -3928,14 +3928,22 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// forwards the call — which is what the 2026-08-05 census found (all
     /// seven native-minted classes attributed to `vm_exec.rs:13670`). The
     /// attribute is free at runtime for callers that never fabricate.
-    #[track_caller]
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        self.try_ensure_synthetic_class(name, num_fields)
-            .unwrap_or(ClassId::new(0))
-    }
-
-    /// The fallible spelling of [`Self::ensure_synthetic_class`] — same
-    /// operation, with a channel for the two answers that are not a `ClassId`.
+    ///
+    /// # The infallible spelling is GONE
+    ///
+    /// `ensure_synthetic_class` — same operation, no error channel — was
+    /// deleted on 2026-08-10 by JDK-only wave 2 step 3, along with
+    /// `ClassManager::ensure_synthetic_class` behind it. It recorded the
+    /// `--jdk-only` violation and then fabricated anyway, so a strict run
+    /// reported a violation while continuing in the exact state contract §5
+    /// forbids, and no signature in the workspace could say otherwise. Every
+    /// caller now either propagates the refusal, absorbs it at a site that
+    /// documents why, or — if what it wants is a VM-generated shape rather than
+    /// a compatibility stand-in — asks [`Self::ensure_vm_internal_class`],
+    /// which is a different question with a different answer.
+    ///
+    /// This is the fallible spelling: the same operation, with a channel for
+    /// the two answers that are not a `ClassId`.
     ///
     /// # The ambiguity contract
     ///
@@ -3945,7 +3953,7 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `?`, or re-ask with an initiating loader
     /// ([`NativeClassAccess::class_id_by_name_and_loader`],
     /// [`NativeClassAccess::class_id_by_name_via_referencing_class`]) if it has
-    /// one. It must not fall back to `ensure_synthetic_class`, to
+    /// one. It must not fall back to a fabrication, to
     /// `ClassId::new(0)`, or to any same-named class of its own choosing:
     /// every one of those is the guess the refusal exists to prevent, and two
     /// distinct classes treated as one is type confusion — it defeats the
@@ -3965,13 +3973,10 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ///
     /// # Default implementation
     ///
-    /// `Ok(ClassId::new(0))` — the same answer the infallible default has
-    /// always given, so mocks and non-VM contexts are unaffected. A context
-    /// that overrides only `ensure_synthetic_class` (several test harnesses
-    /// do) keeps working: this default is what *its* callers get, unchanged
-    /// from before this method existed.
+    /// `Ok(ClassId::new(0))` — the answer the deleted infallible default always
+    /// gave, so mocks and non-VM contexts are unaffected.
     ///
-    /// `#[track_caller]` for the same reason as the infallible spelling above.
+    /// `#[track_caller]` for the reason stated above.
     #[track_caller]
     fn try_ensure_synthetic_class(
         &mut self,
@@ -3980,6 +3985,37 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     ) -> Result<ClassId, ClassIdentityError> {
         let _ = (name, num_fields);
         Ok(ClassId::new(0))
+    }
+
+    /// Register (or look up) a **VM-generated** class — the other half of the
+    /// §5 API boundary, and the reason deleting the infallible compatibility
+    /// spelling did not have to break dynamic proxies.
+    ///
+    /// [`Self::try_ensure_synthetic_class`] mints *compatibility stand-ins*,
+    /// the one thing `--jdk-only` forbids. This mints the classes a conforming
+    /// JVM creates without any class file — array-adjacent shapes, lambda and
+    /// proxy implementation classes and their superclasses, reflection
+    /// accessors, and the VM's own internal allocation shapes. Contract §1 item
+    /// 6 permits those in every mode, so **this never refuses and never records
+    /// a violation**, and it is infallible for that reason rather than by
+    /// oversight.
+    ///
+    /// **Do not reach for it to silence a refusal.** Contract §11's
+    /// zero-stub census becomes unfalsifiable if a compatibility stand-in is
+    /// minted through this door: the substitution continues and the report goes
+    /// green. `ClassManager::ensure_generated_class` behind it `debug_assert`s
+    /// on a `CompatibilityStub` origin, which a release build will not catch —
+    /// the assertion is a backstop, not the decision. The decision is whether
+    /// the JVM specification says a class file must exist for this name.
+    ///
+    /// # Default implementation
+    ///
+    /// `ClassId::new(0)`, matching the fallible sibling's default, so mocks and
+    /// non-VM contexts compile unchanged. Real VM contexts override it.
+    #[track_caller]
+    fn ensure_vm_internal_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let _ = (name, num_fields);
+        ClassId::new(0)
     }
 
     /// Check if a ClassId represents an interface.
@@ -4634,7 +4670,7 @@ pub struct NativeCensusEntry {
     ///
     /// This is the fourth distinct way this census has been misread; the other
     /// three are in
-    /// `docs/known-issues/jdk-only/census-asks-one-class-on-one-platform.md`.
+    /// `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
     pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in

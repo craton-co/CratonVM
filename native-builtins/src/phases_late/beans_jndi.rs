@@ -1398,42 +1398,6 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     r.register(
         pcs,
         "firePropertyChange",
-        "(Ljava/lang/String;ILjava/lang/Object;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let prop_name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let old_int = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-            // Pin across the box/event allocs below — a moving young GC there
-            // would relocate them (native stale-local family).
-            let this_pin = ctx.pin_native_root(this);
-            let prop_pin = pinned_object_value(ctx, prop_name);
-            let new_pin = pinned_object_value(ctx, new_val);
-            let old_box = pcs_box_int(ctx, old_int)?;
-            let old_box_pin = ctx.pin_native_root(old_box);
-            let new_val = read_pinned_object_value(ctx, new_pin, new_val);
-            if pcs_values_equal(&Value::Object(Some(old_box)), &new_val) {
-                ctx.unpin_native_roots(this_pin);
-                return Ok(None);
-            }
-            let this_cur = ctx.read_native_pin(this_pin, this);
-            let source = ctx.get_field(this_cur, 0);
-            let source_pin = pinned_object_value(ctx, source);
-            let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
-            ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
-            ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
-            let old_box = ctx.read_native_pin(old_box_pin, old_box);
-            ctx.set_field(event, 2, Value::Object(Some(old_box)));
-            ctx.set_field(event, 3, read_pinned_object_value(ctx, new_pin, new_val));
-            let this = ctx.read_native_pin(this_pin, this);
-            ctx.unpin_native_roots(this_pin);
-            pcs_dispatch(ctx, this, event);
-            Ok(None)
-        },
-    );
-    r.register(
-        pcs,
-        "firePropertyChange",
         "(Ljava/lang/String;ZZ)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;

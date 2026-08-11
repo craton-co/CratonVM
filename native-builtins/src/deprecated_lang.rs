@@ -404,12 +404,6 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
     );
 
     // T8.1.7 — System.runFinalizersOnExit
-    r.register(
-        "java/lang/System",
-        "runFinalizersOnExit",
-        "(Z)V",
-        native_run_finalizers_on_exit,
-    );
 
     // T8.1.8 — SecurityManager is already registered in security_manager.rs.
     // No action needed here; see security_manager::register_security_manager_natives.
@@ -424,26 +418,6 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
 
     // T8.1.10 — Compiler (removed in JDK 9, legacy stubs)
     let compiler = "java/lang/Compiler";
-    r.register(
-        compiler,
-        "compileClass",
-        "(Ljava/lang/Class;)Z",
-        native_compiler_compile_class,
-    );
-    r.register(
-        compiler,
-        "compileClasses",
-        "(Ljava/lang/String;)Z",
-        native_compiler_compile_classes,
-    );
-    r.register(compiler, "enable", "()V", native_compiler_noop);
-    r.register(compiler, "disable", "()V", native_compiler_noop);
-    r.register(
-        compiler,
-        "command",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_compiler_command,
-    );
     r.set_category(__prev_cat);
 }
 

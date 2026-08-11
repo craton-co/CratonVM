@@ -634,7 +634,14 @@ fn spawn_and_wrap_with_redirects(
     // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
     // ahead of them belong to java.lang.Process's own reader/writer caches and
     // are deliberately left null — see JAVA_PROCESS_FIELD_COUNT.
-    let proc_class = ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT);
+    //
+    // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `cratonvm/synthetic/Process`
+    // is a compatibility stand-in for `java.lang.ProcessImpl` — the class this
+    // VM hands back from `ProcessBuilder.start()` in compatible mode — so a
+    // strict run refuses it and `start()` raises `NoClassDefFoundError` naming
+    // it, instead of returning a process object no `java.lang.Process`
+    // bytecode can read.
+    let proc_class = crate::refused_class(ctx, SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT)?;
     let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
     ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
     ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(spawned.fds.stdin_fd));
@@ -2976,8 +2983,22 @@ fn spawn_exit_waiter(
     let process_pin = ctx.pin_native_root(process);
     let future_pin = ctx.pin_native_root(future);
 
-    let waiter_class =
-        ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_EXIT_WAITER, EXIT_WAITER_FIELD_COUNT);
+    // Fallible since 2026-08-10 (JDK-only wave 2, step 3), and the refusal is
+    // ABSORBED here rather than propagated, deliberately: this function's
+    // failure channel is `false`, which it already answers when the reaper
+    // thread cannot be created, and the caller's documented response is to
+    // complete the future itself. A refused exit-waiter shape gets that same
+    // answer. `refused_class` has recorded the violation upstream, so a strict
+    // census still reports the request.
+    let waiter_class = match ctx
+        .try_ensure_synthetic_class(SYNTHETIC_PROCESS_EXIT_WAITER, EXIT_WAITER_FIELD_COUNT)
+    {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(process_pin);
+            return false;
+        }
+    };
     let waiter = ctx.alloc_object(waiter_class, EXIT_WAITER_FIELD_COUNT);
     let waiter_pin = ctx.pin_native_root(waiter);
     ctx.set_field(
@@ -3179,7 +3200,7 @@ fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Long(p) => p,
         _ => -1,
     };
-    Ok(Some(Value::Object(Some(build_process_handle(ctx, pid)))))
+    Ok(Some(Value::Object(Some(build_process_handle(ctx, pid)?))))
 }
 
 /// Build a 1-field `java/lang/ProcessHandle` (field 0 = pid) — the exact
@@ -3189,33 +3210,42 @@ fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// Mirrors `native-builtins`'s `alloc_concurrent_synthetic` (not reusable
 /// here directly: `native-io` sits below `native-builtins` in the crate
 /// dependency graph).
-fn alloc_process_handle(ctx: &mut dyn NativeContext, pid: Value) -> ObjectRef {
+fn alloc_process_handle(
+    ctx: &mut dyn NativeContext,
+    pid: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = match ctx.ensure_class_initialized("java/lang/ProcessHandle") {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
             let n = 1usize.max(real);
             ctx.alloc_object(cid, n)
         }
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 1-field
+        // stand-in for the `java.lang.ProcessHandle` INTERFACE is a
+        // compatibility substitution. On a complete image the `Ok` arm runs.
         Err(_) => {
-            let cid = ctx.ensure_synthetic_class("java/lang/ProcessHandle", 1);
+            let cid = crate::refused_class(ctx, "java/lang/ProcessHandle", 1)?;
             ctx.alloc_object(cid, 1)
         }
     };
     ctx.set_field(obj, 0, pid);
-    obj
+    Ok(obj)
 }
 
 /// Build a ProcessHandle for a bare pid, preferring a real
 /// java.lang.ProcessHandleImpl(pid, startTime) and falling back to the
 /// 1-field synthetic java/lang/ProcessHandle layout when no real class is
 /// loadable. Shared by Process.toHandle() and Process.descendants().
-fn build_process_handle(ctx: &mut dyn NativeContext, pid: i64) -> ObjectRef {
+fn build_process_handle(
+    ctx: &mut dyn NativeContext,
+    pid: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.new_object_initialized(
         "java/lang/ProcessHandleImpl",
         "(JJ)V",
         &[Value::Long(pid), Value::Long(0)],
     ) {
-        Ok(Some(Value::Object(Some(handle)))) => handle,
+        Ok(Some(Value::Object(Some(handle)))) => Ok(handle),
         _ => alloc_process_handle(ctx, Value::Long(pid)),
     }
 }
@@ -3373,7 +3403,7 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
     for cpid in descendant_pids {
-        let handle = build_process_handle(ctx, cpid);
+        let handle = build_process_handle(ctx, cpid)?;
         ctx.invoke(
             al_class,
             "add",
@@ -3410,11 +3440,18 @@ fn pipe_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCal
     }
 }
 
-fn alloc_pipe_stream(ctx: &mut dyn NativeContext, class_name: &str, fd_id: i32) -> Value {
-    let class_id = ctx.ensure_synthetic_class(class_name, 1);
+/// Fallible since 2026-08-10 (JDK-only wave 2, step 3): the pipe streams are
+/// `cratonvm/synthetic/*` stand-ins for `java.lang.ProcessImpl`'s own pipe
+/// streams, so a strict run must refuse them rather than substitute.
+fn alloc_pipe_stream(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    fd_id: i32,
+) -> Result<Value, MethodCallFailed> {
+    let class_id = crate::refused_class(ctx, class_name, 1)?;
     let stream = ctx.alloc_object(class_id, 1);
     ctx.set_field(stream, 0, Value::Int(fd_id));
-    Value::Object(Some(stream))
+    Ok(Value::Object(Some(stream)))
 }
 
 fn pipe_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
@@ -3724,7 +3761,7 @@ fn process_stream(
             }
         }
     }
-    Ok(Some(alloc_pipe_stream(ctx, stream_class, fd_id)))
+    Ok(Some(alloc_pipe_stream(ctx, stream_class, fd_id)?))
 }
 
 // `captured_string_stream` / `legacy_captured_stream` lived here.
@@ -4346,12 +4383,6 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "(JZ)I",
         native_proc_handle_wait_for_process_exit0,
         NativeKind::Bridge,
-    );
-    registry.register(
-        "java/lang/ProcessHandleImpl",
-        "destroyProcess0",
-        "(JZ)Z",
-        native_proc_handle_destroy_process0,
     );
     // Real JDK 25 signature: destroy0(pid, startTime, forcibly) -> boolean.
     registry.register_with_kind(
