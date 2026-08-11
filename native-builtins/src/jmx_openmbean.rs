@@ -1256,22 +1256,45 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// `MBeanServer.registerMBean(MemoryMXBean)`.
 /// Should the JDK's own MXBean type-mapping machinery be left alone?
 ///
-/// The `mappingForType`/`makeMapping`/`toOpenValue` overrides below replace
+/// **Default: yes.** The `mappingForType` / `makeMapping` / `toOpenValue` /
+/// `ConvertingMethod.from` overrides below replace
 /// `DefaultMXBeanMappingFactory` with a synthetic mapping that types every
 /// unrecognised Java type as `SimpleType.STRING` and converts nothing
 /// (`toOpenValue` is identity). That is why
-/// `MBeanServer.getAttribute("java.lang:type=Memory", "HeapMemoryUsage")`
-/// hands back a raw `java.lang.management.MemoryUsage` where every other JVM
-/// returns a `CompositeDataSupport`.
+/// `MBeanServer.getAttribute("java.lang:type=Memory", "HeapMemoryUsage")` used
+/// to hand back a raw `java.lang.management.MemoryUsage` where every other JVM
+/// returns a `CompositeDataSupport`, and why `getMBeanInfo` described every
+/// composite attribute as `java.lang.String`.
 ///
-/// Gate, do not delete: the overrides were added because the real recursion
-/// was believed not to terminate on this VM. `CRATONVM_REAL_MXBEAN_MAPPING`
-/// lets a run answer that empirically without a rebuild.
+/// They were added because the real recursion was believed not to terminate on
+/// this VM (`OpenDataException` through `Class.getAnnotatedInterfaces()`).
+/// Measured 2026-08-11 against JDK 25 on Linux, that is no longer true: with
+/// the real machinery restored, every platform-MXBean attribute this VM can
+/// answer matches HotSpot exactly — `MemoryUsage` and every `MemoryPool`
+/// usage become `CompositeDataSupport`, `SystemProperties` becomes
+/// `TabularDataSupport`, `InputArguments` becomes `String[]`, and
+/// `getMBeanInfo` carries the real `CompositeType`. The recursion terminates:
+/// a self-referential MXBean type is rejected with the same
+/// `NotCompliantMBeanException` HotSpot raises, rather than hanging — where
+/// the synthetic mapping silently *accepted* it and handed back raw Java
+/// objects.
+///
+/// Gate, do not delete. `synthetic-jdk` builds have no real
+/// `com.sun.jmx.mbeanserver` bytecode to fall back to and keep the overrides;
+/// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1` restores them on a real-JDK run,
+/// which is the one-run answer if an application MBean ever does drive the
+/// real factory into a recursion this VM cannot finish.
+///
+/// Mirrors `native-io`'s `real_raf_enabled()`, which flipped the same way for
+/// the same reason.
 pub(crate) fn real_mxbean_mapping_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("CRATONVM_REAL_MXBEAN_MAPPING").as_deref(),
+        if cfg!(feature = "synthetic-jdk") {
+            return false;
+        }
+        !matches!(
+            std::env::var("CRATONVM_SYNTHETIC_MXBEAN_MAPPING").as_deref(),
             Ok("1") | Ok("true")
         )
     })
@@ -1385,10 +1408,16 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
     } // end !real_mxbean_mapping_enabled()
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
-    // OpenConverter path. JDK 25 splits the OpenType analysis between
-    // `MXBeanMappingFactory` (entry) and the package-private
-    // `OpenConverter.toConverter(Type)` (cache + recursion). We trap
-    // both with the same cycle-detection wrapper.
+    // OpenConverter path.
+    //
+    // INERT ON JDK 25 (checked 2026-08-11 with `javap --module java.management`):
+    // neither `com.sun.jmx.mbeanserver.OpenConverter` nor `MappedMXBeanType`
+    // exists on that image — both are pre-JDK-7 spellings, and the OpenType
+    // analysis lives entirely in `DefaultMXBeanMappingFactory`. Left registered
+    // rather than deleted because they still name real classes on the older
+    // images this VM is expected to run, and a registration that targets
+    // nothing costs nothing; do not read their presence as evidence that this
+    // path is live.
     registry.register(
         "com/sun/jmx/mbeanserver/OpenConverter",
         "toConverter",
