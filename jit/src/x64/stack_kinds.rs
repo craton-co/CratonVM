@@ -127,6 +127,21 @@ pub(super) struct StackKindInputs<'a> {
     pub(super) calls: FxHashMap<usize, (usize, u8)>,
     /// `pc`s whose `ldc` pushes a reference (String / Class).
     pub(super) ldc_refs: &'a FxHashSet<usize>,
+    /// `pc`s in the `ldc` family whose constant is floating-point: a
+    /// `CONSTANT_Float` for `ldc`/`ldc_w`, a `CONSTANT_Double` for `ldc2_w`.
+    ///
+    /// The two opcode families have disjoint pcs and the opcode at the pc says
+    /// which is which, so one set types both: an `ldc` pc present is `Float`
+    /// and absent is `Int`; an `ldc2_w` pc present is `Double` and absent is
+    /// `Long`. "Absent" is only allowed to mean "the other one" for a pc the
+    /// resolver actually answered — see [`Self::ldc_resolved`].
+    pub(super) ldc_fp: &'a FxHashSet<usize>,
+    /// `pc`s in the `ldc` family the constant-pool resolver reduced to an
+    /// immediate. Without this, a pc the resolver never saw (no resolver wired
+    /// at all, or a site it declined) would read as "absent from `ldc_fp`,
+    /// therefore `Int`" — a guess, which rule 2 of this module's safety
+    /// argument forbids. A pc that is not here stays `Unknown`.
+    pub(super) ldc_resolved: &'a FxHashSet<usize>,
 }
 
 /// Run the analysis. `None` results are normal: an unmodelled construct poisons
@@ -392,15 +407,30 @@ fn transfer(
         0x0e | 0x0f => push!(StackKind::Double),    // dconst_0/1
         0x10 | 0x11 => push!(StackKind::Int),       // bipush / sipush
         0x12 | 0x13 => {
-            // ldc / ldc_w: a String or Class literal is a ref; an int-or-float
-            // literal is depth-1 of unknown type.
+            // ldc / ldc_w: a String or Class literal is a ref; a numeric
+            // literal is `CONSTANT_Integer` or `CONSTANT_Float`, and the
+            // constant-pool tag the resolver already read says which.
             push!(if inputs.ldc_refs.contains(&pc) {
                 StackKind::Ref
-            } else {
+            } else if !inputs.ldc_resolved.contains(&pc) {
                 StackKind::Unknown
+            } else if inputs.ldc_fp.contains(&pc) {
+                StackKind::Float
+            } else {
+                StackKind::Int
             });
         }
-        0x14 => push!(StackKind::Unknown), // ldc2_w — long or double, one entry
+        0x14 => {
+            // ldc2_w — `CONSTANT_Long` or `CONSTANT_Double`, one compact entry
+            // either way, so only the KIND was ever in doubt.
+            push!(if !inputs.ldc_resolved.contains(&pc) {
+                StackKind::Unknown
+            } else if inputs.ldc_fp.contains(&pc) {
+                StackKind::Double
+            } else {
+                StackKind::Long
+            });
+        }
         0x15 => push!(StackKind::Int),     // iload
         0x16 => push!(StackKind::Long),    // lload
         0x17 => push!(StackKind::Float),   // fload
@@ -572,11 +602,39 @@ mod tests {
 
     fn run(code: &[u8], calls: FxHashMap<usize, (usize, u8)>) -> StackKindMap {
         let (ldc_refs, types, _) = no_meta();
+        // No resolver ran, so no `ldc` pc is resolved and every one of them
+        // stays `Unknown` — the pre-fix behaviour these cases were written
+        // against. `run_with_ldc` is the arm that supplies the tags.
         let inputs = StackKindInputs {
             field_types: types.clone(),
             static_types: types,
             calls,
             ldc_refs: &ldc_refs,
+            ldc_fp: &FxHashSet::default(),
+            ldc_resolved: &FxHashSet::default(),
+        };
+        analyze(code, code.len(), &inputs)
+    }
+
+    /// [`run`] with the `ldc`-family constant-pool tags the compiler resolves:
+    /// `resolved` is every `ldc`/`ldc2_w` pc reduced to an immediate, `fp` the
+    /// subset whose constant is a `CONSTANT_Float`/`CONSTANT_Double`.
+    fn run_with_ldc(
+        code: &[u8],
+        calls: FxHashMap<usize, (usize, u8)>,
+        resolved: &[usize],
+        fp: &[usize],
+    ) -> StackKindMap {
+        let (ldc_refs, types, _) = no_meta();
+        let resolved: FxHashSet<usize> = resolved.iter().copied().collect();
+        let fp: FxHashSet<usize> = fp.iter().copied().collect();
+        let inputs = StackKindInputs {
+            field_types: types.clone(),
+            static_types: types,
+            calls,
+            ldc_refs: &ldc_refs,
+            ldc_fp: &fp,
+            ldc_resolved: &resolved,
         };
         analyze(code, code.len(), &inputs)
     }
@@ -647,6 +705,82 @@ mod tests {
         assert_eq!(m.get(0), Some(&[][..]));
         assert_eq!(m.get(1), Some(&[StackKind::Int][..]));
         assert_eq!(m.get(4), None, "the jsr's successor must have no answer");
+    }
+
+    /// The defect behind `osr-refused-for-a-loop-inline-in-main-20260810`: a
+    /// numeric `ldc` answered `Unknown`, the deopt snapshot recorded it
+    /// `Unsupported`, and `osr_exit_policy`'s artifact-wide veto then refused
+    /// OSR entry at every pc of the method — 180 ns/iter against 1 compiled.
+    /// The constant-pool tag is known, so the entry must be typed.
+    #[test]
+    fn a_resolved_numeric_ldc_is_typed_from_its_constant_pool_tag() {
+        // 0: ldc #1   2: ldc #2   4: return
+        let code: Vec<u8> = vec![0x12, 0x01, 0x12, 0x02, 0xb1];
+
+        // pc 0 is a CONSTANT_Integer, pc 2 a CONSTANT_Float.
+        let m = run_with_ldc(&code, FxHashMap::default(), &[0, 2], &[2]);
+        assert_eq!(m.get(2), Some(&[StackKind::Int][..]));
+        assert_eq!(m.get(4), Some(&[StackKind::Int, StackKind::Float][..]));
+    }
+
+    /// `ldc2_w` is one compact entry either way, so only the KIND was ever in
+    /// doubt — and the same tag answers it.
+    #[test]
+    fn a_resolved_ldc2w_is_typed_from_its_constant_pool_tag() {
+        // 0: ldc2_w #1   3: ldc2_w #2   6: return
+        let code: Vec<u8> = vec![0x14, 0x00, 0x01, 0x14, 0x00, 0x02, 0xb1];
+
+        let m = run_with_ldc(&code, FxHashMap::default(), &[0, 3], &[3]);
+        assert_eq!(m.get(3), Some(&[StackKind::Long][..]));
+        assert_eq!(m.get(6), Some(&[StackKind::Long, StackKind::Double][..]));
+    }
+
+    /// Rule 2 of the module's safety argument: `Unknown` is not a guess. A pc
+    /// the resolver never answered must NOT default to the non-floating-point
+    /// member of its pair just because it is absent from the `fp` set.
+    #[test]
+    fn an_unresolved_ldc_stays_unknown_rather_than_defaulting_to_int() {
+        // 0: ldc #1   2: ldc2_w #2   5: return
+        let code: Vec<u8> = vec![0x12, 0x01, 0x14, 0x00, 0x02, 0xb1];
+
+        let m = run_with_ldc(&code, FxHashMap::default(), &[], &[]);
+        assert_eq!(m.get(2), Some(&[StackKind::Unknown][..]));
+        assert_eq!(
+            m.get(5),
+            Some(&[StackKind::Unknown, StackKind::Unknown][..]),
+            "no resolver answer means no kind, for both ldc families"
+        );
+    }
+
+    /// The exact operand stack the refusal named: a `long` static under an
+    /// `ldc` int argument, at the `invokestatic` that carries the deopt point.
+    /// Both entries must be describable, or OSR is refused for the whole
+    /// artifact.
+    #[test]
+    fn a_long_static_under_an_ldc_int_argument_is_fully_typed() {
+        // 0: getstatic #1 (J)   3: ldc #2 (int)   5: invokestatic #3 (I)J
+        let code: Vec<u8> = vec![0xb2, 0x00, 0x01, 0x12, 0x02, 0xb8, 0x00, 0x03, 0xb1];
+        let mut statics: FxHashMap<usize, u8> = FxHashMap::default();
+        statics.insert(0, b'J');
+        let mut calls: FxHashMap<usize, (usize, u8)> = FxHashMap::default();
+        calls.insert(5, (1, b'J'));
+
+        let ldc_resolved: FxHashSet<usize> = [3usize].into_iter().collect();
+        let inputs = StackKindInputs {
+            field_types: FxHashMap::default(),
+            static_types: statics,
+            calls,
+            ldc_refs: &FxHashSet::default(),
+            ldc_fp: &FxHashSet::default(),
+            ldc_resolved: &ldc_resolved,
+        };
+        let m = analyze(&code, code.len(), &inputs);
+
+        assert_eq!(
+            m.get(5),
+            Some(&[StackKind::Long, StackKind::Int][..]),
+            "the deopt point's operand stack must have no Unknown entry"
+        );
     }
 
     /// Two paths that disagree about DEPTH cannot be merged, and the answer

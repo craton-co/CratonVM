@@ -1203,6 +1203,7 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(), // ldc_fp_pcs
         HashMap::new(),
         HashMap::new(),
         &JitRuntimeHelpers::default(),
