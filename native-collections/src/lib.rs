@@ -3576,24 +3576,42 @@ fn group_key_equal(
 /// cheap structural check first, then fall back to the search target's real
 /// Java `equals`. JDK `List.indexOf` semantics call `o.equals(es[i])` — i.e.
 /// `target.equals(elem)` — so the real-equals receiver is the search `target`.
-fn list_element_matches(ctx: &mut dyn NativeContext, elem: &Value, target: &Value) -> bool {
+///
+/// Fallible for the same reason as [`group_key_equal`] and [`map_keys_equal`]:
+/// `if let Ok(..)` mapped a thrown or refused `equals` onto "these two are not
+/// equal", and every caller below is a `contains` / `indexOf` / `remove` /
+/// `retainAll` / `frequency`, so the swallow does not merely lose the answer —
+/// it produces the *opposite* one and lets the caller act on it (`remove`
+/// reports "not present" and mutates nothing; `retainAll` drops the element).
+/// The real JDK propagates out of `List.contains`, since the whole method body
+/// is `indexOf(o) >= 0` over `o.equals(es[i])`.
+///
+/// A non-exceptional contract violation — the callee returned something that
+/// is not an `Int` — still answers `false`, as in the two helpers above.
+fn list_element_matches(
+    ctx: &mut dyn NativeContext,
+    elem: &Value,
+    target: &Value,
+) -> Result<bool, MethodCallFailed> {
     // Cheap structural path: identity, unboxed primitives, String, enum, null.
     if values_equal(&*ctx, elem, target) {
-        return true;
+        return Ok(true);
     }
     // Distinct objects whose value-equality the structural check can't see:
     // defer to the target's real `equals(elem)`.
     if let (Value::Object(Some(t)), Value::Object(Some(e))) = (target, elem) {
-        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+        return match ctx.invoke_virtual(
             *t,
             "equals",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(*e))],
         ) {
-            return v != 0;
-        }
+            Ok(Some(Value::Int(v))) => Ok(v != 0),
+            Err(err) => Err(err),
+            _ => Ok(false),
+        };
     }
-    false
+    Ok(false)
 }
 
 /// GC-safe linear scan of `buf[0..len]` for an element matching `target`
@@ -3613,15 +3631,25 @@ fn pinned_array_search(
     buf: ObjectRef,
     len: usize,
     target: Value,
-) -> (Option<usize>, ObjectRef, Value) {
+) -> Result<(Option<usize>, ObjectRef, Value), MethodCallFailed> {
     let buf_pin = ctx.pin_native_root(buf);
     let th = pin_value(ctx, target);
     let mut buf = buf;
     let mut target = target;
     let mut found = None;
+    // A refused/throwing element `equals` is recorded and the loop left by the
+    // ordinary `break`, so `unpin_native_roots(buf_pin)` still runs — an early
+    // `?` here would skip the truncate this helper exists to guarantee.
+    let mut failed: Option<MethodCallFailed> = None;
     for i in 0..len {
         let elem = ctx.get_array_element(buf, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = match list_element_matches(ctx, &elem, &target) {
+            Ok(m) => m,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -3630,7 +3658,10 @@ fn pinned_array_search(
         }
     }
     ctx.unpin_native_roots(buf_pin);
-    (found, buf, target)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok((found, buf, target)),
+    }
 }
 
 // ===========================================================================
@@ -4900,7 +4931,7 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // then shift through the REFRESHED references.
     let this_pin = ctx.pin_native_root(this);
     let vh = view_src.map(|v| ctx.pin_native_root(v));
-    let (found, data, _target) = pinned_array_search(ctx, data, size, target);
+    let (found, data, _target) = pinned_array_search(ctx, data, size, target)?;
     let this = ctx.read_native_pin(this_pin, this);
     let view_src = match (view_src, vh) {
         (Some(v), Some(h)) => Some(ctx.read_native_pin(h, v)),
@@ -4989,7 +5020,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(data) = data {
         // Family-1 fix (cce0079): pinned scan — the `equals()` dispatch can
         // move `data`/`target` mid-walk.
-        let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+        let (found, _, _) = pinned_array_search(ctx, data, size as usize, target)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
@@ -5017,7 +5048,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let mut found = false;
         for (i, orig) in elems.iter().enumerate() {
             let elem = read_pinned_elem(ctx, handles[i], *orig);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             target = read_pinned_elem(ctx, th, target);
             if matched {
                 found = true;
@@ -5048,7 +5079,7 @@ pub fn native_al_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => return Ok(Some(Value::Int(-1))),
     };
     // Family-1 fix (cce0079): pinned scan.
-    let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+    let (found, _, _) = pinned_array_search(ctx, data, size as usize, target)?;
     Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
 }
 
@@ -5073,7 +5104,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let mut found = None;
     for i in (0..size).rev() {
         let elem = ctx.get_array_element(data, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -10425,7 +10456,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         let mut target = target;
         for (i, val_orig) in values.iter().enumerate() {
             let val = read_pinned_elem(ctx, v_handles[i], *val_orig);
-            let matched = list_element_matches(ctx, &val, &target);
+            let matched = list_element_matches(ctx, &val, &target)?;
             target = read_pinned_elem(ctx, target_pin, target);
             if matched {
                 found = true;
@@ -10457,7 +10488,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 }
                 let node_pin = ctx.pin_native_root(node);
                 let value = get_node_value(ctx, node);
-                let matched = list_element_matches(ctx, &value, &target);
+                let matched = list_element_matches(ctx, &value, &target)?;
                 let node = ctx.read_native_pin(node_pin, node);
                 b = ctx.read_native_pin(b_pin, b);
                 target = read_pinned_elem(ctx, target_pin, target);
@@ -11979,7 +12010,7 @@ fn remove_source_entry_by_value(
     let mut result = Ok(());
     for i in 0..keys.len() {
         let v = read_pinned_elem(ctx, v_handles[i], vals[i]);
-        let matched = list_element_matches(ctx, &v, &value);
+        let matched = list_element_matches(ctx, &v, &value)?;
         source = ctx.read_native_pin(src_pin, source);
         value = read_pinned_elem(ctx, vh, value);
         if matched {
@@ -20407,7 +20438,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         for (u_idx, u) in unique.iter().enumerate() {
             let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
             let u = read_pinned_elem(ctx, unique_handles[u_idx], *u);
-            if list_element_matches(ctx, &elem, &u) {
+            if list_element_matches(ctx, &elem, &u)? {
                 dup = true;
                 break;
             }
@@ -31375,11 +31406,14 @@ fn ll_pinned_find(
     this: ObjectRef,
     target: Value,
     from_tail: bool,
-) -> (Option<ObjectRef>, ObjectRef) {
+) -> Result<(Option<ObjectRef>, ObjectRef), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let th = pin_value(ctx, target);
     let mut this = this;
     let mut target = target;
+    // See `pinned_array_search`: recorded, not returned early, so the two
+    // `unpin_native_roots` below still run.
+    let mut failed: Option<MethodCallFailed> = None;
     let start_field = if from_tail { "tail" } else { "head" };
     let step_slot = if from_tail {
         LL_NODE_PREV
@@ -31394,7 +31428,14 @@ fn ll_pinned_find(
     while let Some(cur) = cur_opt {
         let cur_pin = ctx.pin_native_root(cur);
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = match list_element_matches(ctx, &elem, &target) {
+            Ok(m) => m,
+            Err(e) => {
+                failed = Some(e);
+                ctx.unpin_native_roots(cur_pin);
+                break;
+            }
+        };
         let cur = ctx.read_native_pin(cur_pin, cur);
         this = ctx.read_native_pin(this_pin, this);
         target = read_pinned_elem(ctx, th, target);
@@ -31410,7 +31451,10 @@ fn ll_pinned_find(
         ctx.unpin_native_roots(cur_pin);
     }
     ctx.unpin_native_roots(this_pin);
-    (found, this)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok((found, this)),
+    }
 }
 
 fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -31420,7 +31464,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     // Family-1 fix (cce0079): walk via the pinned chain-find helper.
-    let (found, _) = ll_pinned_find(ctx, this, target, false);
+    let (found, _) = ll_pinned_find(ctx, this, target, false)?;
     Ok(Some(Value::Int(if found.is_some() { 1 } else { 0 })))
 }
 
@@ -31443,7 +31487,7 @@ fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // using the REFRESHED node/receiver (the equals dispatches inside the
     // walk can move both — relinking through stale copies corrupted the
     // list structure).
-    let (found, this) = ll_pinned_find(ctx, this, target, false);
+    let (found, this) = ll_pinned_find(ctx, this, target, false)?;
     if let Some(cur) = found {
         ll_unlink_node(ctx, this, cur);
         return Ok(Some(Value::Int(1)));
@@ -31525,7 +31569,7 @@ fn native_ll_remove_last_occurrence(
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     // Family-1 fix (cce0079): same as `native_ll_remove_object`, walking
     // tail→head.
-    let (found, this) = ll_pinned_find(ctx, this, target, true);
+    let (found, this) = ll_pinned_find(ctx, this, target, true)?;
     if let Some(cur) = found {
         ll_unlink_node(ctx, this, cur);
         return Ok(Some(Value::Int(1)));
@@ -33120,7 +33164,7 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     while let Value::Object(Some(node)) = cur {
         let node_pin = ctx.pin_native_root(node);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let matched = list_element_matches(ctx, &val, &target);
+        let matched = list_element_matches(ctx, &val, &target)?;
         let node = ctx.read_native_pin(node_pin, node);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -33932,7 +33976,7 @@ fn native_ad_remove_first_occurrence(
     for k in 0..size as usize {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
@@ -33982,7 +34026,7 @@ fn native_ad_remove_last_occurrence(
     for k in (0..size as usize).rev() {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
@@ -34116,7 +34160,7 @@ fn native_ad_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         for i in 0..(size as usize) {
             let idx = (head as usize + i) % cap;
             let elem = ctx.get_array_element(buf, idx);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             target = read_pinned_elem(ctx, th, target);
             if matched {
@@ -34754,7 +34798,7 @@ fn native_pq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // element into a stale array. Pin the receiver, search through the
     // pinned helper, and act on the refreshed addresses it returns.
     let this_pin = ctx.pin_native_root(this);
-    let (found_idx, buf, _target) = pinned_array_search(ctx, buf, size as usize, target);
+    let (found_idx, buf, _target) = pinned_array_search(ctx, buf, size as usize, target)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let idx = match found_idx {
@@ -34785,7 +34829,7 @@ fn native_pq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Family-1 fix (cce0079): the naive loop walked a `buf` left stale
         // by the per-element `equals()` dispatch; search via the pinned
         // helper instead.
-        let (found, _, _) = pinned_array_search(ctx, buf, size as usize, target);
+        let (found, _, _) = pinned_array_search(ctx, buf, size as usize, target)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
@@ -35157,7 +35201,7 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let mut found = None;
         for i in (0..(size as usize)).rev() {
             let elem = ctx.get_array_element(buf, i);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             target = read_pinned_elem(ctx, th, target);
             if matched {
@@ -35937,7 +35981,7 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut in_coll = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &elem);
+            let matched = list_element_matches(ctx, &ce, &elem)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             elem = read_pinned_elem(ctx, eh, elem);
             if matched {
@@ -36022,7 +36066,7 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut in_coll = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &elem);
+            let matched = list_element_matches(ctx, &ce, &elem)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             elem = read_pinned_elem(ctx, eh, elem);
             if matched {
@@ -36194,7 +36238,7 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut should_keep = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &e);
+            let matched = list_element_matches(ctx, &ce, &e)?;
             e = read_pinned_elem(ctx, cur_handles[i], e);
             if matched {
                 should_keep = true;
@@ -39572,7 +39616,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let mut found = false;
         for (i, v_orig) in values.iter().enumerate() {
             let v = read_pinned_elem(ctx, handles[i], *v_orig);
-            let matched = list_element_matches(ctx, &v, &target);
+            let matched = list_element_matches(ctx, &v, &target)?;
             target = read_pinned_elem(ctx, th, target);
             if matched {
                 found = true;
@@ -39599,7 +39643,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let mut found = false;
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i * 2 + 1);
-        let matched = list_element_matches(ctx, &v, &target);
+        let matched = list_element_matches(ctx, &v, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -46475,7 +46519,7 @@ fn native_ksv_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let mut should_keep = false;
         for j in 0..keep.len() {
             let k = read_pinned_elem(ctx, keep_handles[j], keep[j]);
-            let matched = list_element_matches(ctx, &k, &e);
+            let matched = list_element_matches(ctx, &k, &e)?;
             e = read_pinned_elem(ctx, cur_handles[i], e);
             if matched {
                 should_keep = true;
@@ -49967,7 +50011,7 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -51026,7 +51070,7 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let mut found = false;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         arr = ctx.read_native_pin(arr_pin, arr);
         target = read_pinned_elem(ctx, th, target);
@@ -51074,7 +51118,7 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let mut found_i = None;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         arr = ctx.read_native_pin(arr_pin, arr);
         target = read_pinned_elem(ctx, th, target);
@@ -54398,7 +54442,7 @@ fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this_pin = ctx.pin_native_root(this);
     let lock_val = lock_obj.map_or(Value::Object(None), |o| Value::Object(Some(o)));
     let lock_h = pin_value(ctx, lock_val);
-    let (found, arr, elem) = pinned_array_search(ctx, arr, len, elem);
+    let (found, arr, elem) = pinned_array_search(ctx, arr, len, elem)?;
     let mut this = ctx.read_native_pin(this_pin, this);
     let mut lock_obj = match read_pinned_elem(ctx, lock_h, lock_val) {
         Value::Object(o) => o,
@@ -54447,7 +54491,7 @@ fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `CopyOnWriteArrayList.contains` uses `o.equals(elem)`.
     if let Some((arr, len)) = cowal_read_snapshot(ctx, this) {
         // Family-1 fix (cce0079): pinned scan.
-        let (found, _, _) = pinned_array_search(ctx, arr, len, needle);
+        let (found, _, _) = pinned_array_search(ctx, arr, len, needle)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
