@@ -3817,6 +3817,31 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 ///
 /// The 64M cap is a runaway guard; a well-behaved iterator terminates long
 /// before it.
+///
+/// # This signature launders a `--jdk-only` refusal into a wrong answer
+///
+/// `-> Vec<Value>` has no error channel, so both `match` arms below map *every*
+/// failure of `iterator()` / `hasNext()` / `next()` to "no more elements". For
+/// a foreign collection that genuinely cannot be walked that is the intended
+/// best effort. For a strict-mode policy refusal it is not: measured
+/// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9,
+///
+///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+///
+/// answers `true` on HotSpot and in `Compatible`, and **`false`** under
+/// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
+/// java/util/LinkedList$Itr` raised by the `invoke_virtual` below arrives here
+/// as `Vec::new()` and `native_al_equals` then compares 3 elements against 0.
+///
+/// A refusal that reaches a caller with nowhere to put it stops being a
+/// refusal, which is the one failure mode contract §5 cannot tolerate: the
+/// census still records the violation, so the run looks *measured* while the
+/// program is handed a wrong answer. Not fixed here — every caller of this
+/// helper would need an error channel, and this branch cannot rebuild to
+/// verify one — but recorded at the source rather than only in the record, so
+/// the next reader of a "strict says false, Compatible says true" report finds
+/// the mechanism instead of re-deriving it. Reasoned in
+/// docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
 fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let pin_base = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(pin_base, this);
@@ -30233,6 +30258,45 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // and a real `ArrayList$ListItr` over a snapshot would drop `set()` writes
     // silently, which is worse. Reasoned in
     // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
+    //
+    // 2026-08-11, the third candidate that record did not consider: mint the
+    // carrier through `ensure_vm_internal_class` (`ClassOrigin::VmInternal`),
+    // the door ten `MethodHandles` combinator carriers were moved to the same
+    // day (docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md). The
+    // class qualifies — no image declares `cratonvm/internal/*`, no class file
+    // could exist for it, and it is a 3-slot tuple of the VM's own state — but
+    // **the door alone does not fix this site**, and that is the finding worth
+    // keeping. Two independent gates refuse this carrier, not one:
+    //
+    //   1. the class:  `try_alloc_synthetic` stamps `CompatibilityStub`, which
+    //      §5 forbids. The `VmInternal` door clears this.
+    //   2. its natives: `cratonvm/internal/LinkedListSnapshotListItr` is on
+    //      `VM_MINTED_STAND_IN_RECEIVERS` in native-api/src/no_image_receiver.rs,
+    //      so `register()` re-tags all nine registrations below from the
+    //      ambient `Bridge` to `SyntheticStub` BEFORE the `JdkOnly` arm reads
+    //      the kind — and that arm then returns without inserting them. The
+    //      door does not touch this.
+    //
+    // Clearing 1 without 2 leaves strict holding a well-formed carrier with no
+    // implementation: the failure moves from `NoClassDefFoundError` at
+    // `listIterator()` to `UnsatisfiedLinkError` at the first `hasNext()` —
+    // later, further from the cause, and no better for the contract. That is
+    // the exact trap `STRICT_STILL_FABRICATES` is kept as an empty table to
+    // name ("the two halves of this defect are the registration's kind and the
+    // class's existence"), running in the other direction. So this site is left
+    // refusing until both halves can land together; the companion retag is
+    // written out verbatim in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+    //
+    // What that record also measures, and what makes the current refusal worse
+    // than it looks: it is NOT loud everywhere. `new ArrayList<>(List.of("a",
+    // "b","c")).equals(linkedList)` answers **false** under `--jdk-only` — no
+    // exception, just the wrong answer. The launderer is ours and is in this
+    // file: `native_al_equals`'s cross-layout arm calls
+    // `collection_elements_generic`, whose signature is `-> Vec<Value>` with no
+    // error channel, so the `NoClassDefFoundError` its `iterator()` call raises
+    // becomes `Vec::new()` and the two sides differ in length. A refusal that
+    // reaches a caller with nowhere to put it does not stay a refusal.
     registry.register(
         c,
         "listIterator",
@@ -33185,6 +33249,9 @@ const AD_FIELD_DATA: usize = 0; // Object[] circular buffer
 const AD_FIELD_HEAD: usize = 1; // Int head index
 const AD_FIELD_TAIL: usize = 2; // Int tail index
 const AD_FIELD_SIZE: usize = 3; // Int element count
+/// Elements a default-constructed deque holds before the first grow. The
+/// *array* is one slot longer — see [`ad_ensure_capacity`] for why that spare
+/// slot is not an optimisation but the JDK's own emptiness invariant.
 const AD_DEFAULT_CAPACITY: usize = 16;
 
 fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32, i32) {
@@ -33207,13 +33274,54 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     (data, head, tail, size)
 }
 
+/// Grow the ring buffer so it can hold `min_cap` elements **and still leave one
+/// slot free**.
+///
+/// The spare slot is the whole of the 2026-08-11 `stream()` fix, so it is worth
+/// stating why it is not slack. Slots 0..2 of our overlay are not ours: the real
+/// `java.util.ArrayDeque` declares exactly `elements`/`head`/`tail` in that
+/// order, and `synthetic_stub_fields` pads the class to four so our `size` can
+/// live at slot 3. Everything real JDK bytecode reads about this deque it
+/// derives from `head`/`tail` alone — `size()` is `sub(tail, head,
+/// elements.length)` — and that arithmetic has no way to distinguish full from
+/// empty. The JDK resolves the ambiguity by never letting the buffer fill:
+/// `new ArrayDeque()` is `new Object[16 + 1]`, `new ArrayDeque(n)` is
+/// `new Object[n + 1]`, and `grow` runs one element early. `head == tail` then
+/// means empty, always.
+///
+/// This function used to grow only when the buffer was *over*full
+/// (`min_cap <= old_cap` returned early), so a deque whose element count
+/// reached its capacity wrapped `tail` right back onto `head` — a perfectly
+/// consistent state for our natives, which read `size` from slot 3, and an
+/// EMPTY deque to everything else. Measured on the pre-fix binary against
+/// HotSpot 25, two elements from `new ArrayDeque<>(List.of("a","b"))`:
+///
+/// ```text
+/// HotSpot   elements=[a, b, null]  head=0  tail=2
+/// CratonVM  elements=[a, b]        head=0  tail=0
+/// ```
+///
+/// with `size()`, `toString()`, `contains()`, `getFirst()` and `forEach()` all
+/// answering correctly beside it — those are ours — while `stream().count()`,
+/// `parallelStream()`, `spliterator()` and `toArray(T[])` (which we do not
+/// register, so it is real bytecode) all answered for an empty deque. Sixteen
+/// elements in a default deque did the same thing, and `[a,b]` in a
+/// 16-slot buffer did not, which is why this hid: it fires only when the count
+/// happens to land exactly on the capacity.
+///
+/// `docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md`
+/// is why it was found at all — an empty collection reads as a pass at every
+/// caller that only iterates, so the probe that caught this prints element
+/// CONTENT for every member rather than a verdict.
 fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
     let (data, head, _tail, size) = ad_state(ctx, this);
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
-    if min_cap <= old_cap {
+    // `<`, not `<=`: an array of exactly `min_cap` slots is full at `min_cap`
+    // elements, and full is what we must never be.
+    if min_cap < old_cap {
         return;
     }
-    let new_cap = std::cmp::max(old_cap * 2, min_cap);
+    let new_cap = std::cmp::max(old_cap * 2, min_cap + 1);
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
     let mut this = this;
@@ -33328,7 +33436,15 @@ fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     // GC-safety: see `rooted_across` — `this` must survive the allocation.
-    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, AD_DEFAULT_CAPACITY));
+    //
+    // `+ 1` is the JDK's own expression: `ArrayDeque()` is literally
+    // `elements = new Object[16 + 1]`, and HotSpot 25 prints `elements.len=17`
+    // for a fresh deque. The spare slot is the emptiness invariant real
+    // bytecode reads this object through — `ad_ensure_capacity` has the full
+    // reasoning and the measurement.
+    let (this, buf) = rooted_across1(ctx, this, |ctx| {
+        alloc_ref_array(ctx, AD_DEFAULT_CAPACITY + 1)
+    });
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
@@ -33341,9 +33457,24 @@ fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // The real `ArrayDeque(int)` body, transcribed rather than approximated:
+    //
+    //     elements = new Object[(numElements < 1) ? 1
+    //                         : (numElements == Integer.MAX_VALUE) ? Integer.MAX_VALUE
+    //                         : numElements + 1];
+    //
+    // The `+ 1` matters here more than anywhere else in this file, because this
+    // constructor is the one `ArrayDeque(Collection)` calls: `this(c.size())`
+    // then `copyElements(c)`. With the old `max(n, 1)` a deque built from a
+    // 2-element collection got a 2-slot buffer, filled it, and wrapped `tail`
+    // onto `head` — `new ArrayDeque<>(List.of("a","b")).stream().count()`
+    // answered 0 against HotSpot's 2, in BOTH compatibility modes. See
+    // `ad_ensure_capacity`.
     let cap = match args.get(1) {
-        Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
-        _ => AD_DEFAULT_CAPACITY,
+        Some(Value::Int(c)) if *c < 1 => 1,
+        Some(Value::Int(c)) if *c == i32::MAX => i32::MAX as usize,
+        Some(Value::Int(c)) => (*c as usize) + 1,
+        _ => AD_DEFAULT_CAPACITY + 1,
     };
     // HotSpot throws a catchable OutOfMemoryError for an over-large element
     // array rather than aborting; mirror that instead of the panicking alloc.
@@ -33475,6 +33606,16 @@ fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         ctx.get_array_element(buf, head as usize)
     });
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    // Null the vacated slot, as the real `pollFirst` does (`es[h] = null`).
+    // `ad_remove_at_logical` already did this for the interior case and gives
+    // the retention reason; the head/tail cases were the two that did not, so a
+    // polled deque kept its dropped elements alive and printed them where
+    // HotSpot prints `null` (`elements=[a, b]` vs `[null, b, null]` after one
+    // `poll()`). Nothing reads outside `head..head+size`, so this was invisible
+    // to every accessor — which is exactly why it survived.
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, head as usize, Value::Object(None));
+    }
     let new_head = (head + 1) % cap;
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
@@ -33500,6 +33641,10 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let elem = data.map_or(Value::Object(None), |buf| {
         ctx.get_array_element(buf, new_tail as usize)
     });
+    // Null the vacated slot — same reason as `native_ad_remove_first`.
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
+    }
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
@@ -33782,6 +33927,22 @@ fn native_ad_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Null the live range before resetting the cursors, mirroring the real
+    // `clear()`'s `circularClear(elements, head, tail)`. Resetting the three
+    // ints alone left every cleared element strongly reachable from the buffer
+    // with nothing able to reach it back — `clear()` is the one call a caller
+    // makes *specifically* to drop references, so this is the site where the
+    // leak is least acceptable and was least visible.
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    if let Some(buf) = data {
+        let cap = ctx.array_length(buf);
+        if cap > 0 {
+            for i in 0..(size.max(0) as usize).min(cap) {
+                let idx = (head as usize + i) % cap;
+                ctx.set_array_element(buf, idx, Value::Object(None));
+            }
+        }
+    }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
@@ -33857,14 +34018,29 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `native_ad_remove_first_occurrence` call that `SnapshotItrRoute::ArrayDeque`
     // makes — so the two shapes differ in the class name and nothing else.
     //
-    // Letting real `ArrayDeque.iterator()` bytecode run instead is NOT an
-    // option, and the measurement says why: real `DeqIterator` derives its
-    // bounds from `head`/`tail`, and a CratonVM-native deque leaves `tail` at 0
-    // — reflectively, a two-element deque reads `elements=Object[2] head=0
-    // tail=0`, so real bytecode computes size 0 and iterates nothing. (The same
-    // unwritten `tail` is why `ArrayDeque.stream().count()` answers 0 in BOTH
-    // modes today; that one is not this arm's to fix — see
-    // `docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md`.)
+    // Letting real `ArrayDeque.iterator()` bytecode run instead was rejected on
+    // the strength of a reflective read — `elements=Object[2] head=0 tail=0` on
+    // a two-element deque, so real `DeqIterator` derives size 0 and iterates
+    // nothing.
+    //
+    // CORRECTED 2026-08-11: the observation was right and the diagnosis under
+    // it was wrong, in a way worth keeping. `tail` was never unwritten —
+    // `native_ad_add_last` writes it on every call. What that reading missed is
+    // the modulus: the deque came from `new ArrayDeque<>(List.of("a","b"))`,
+    // whose 2-slot buffer the two adds filled exactly, wrapping `tail` back
+    // onto `head`. The same deque built with the no-arg constructor reads
+    // `head=0 tail=2` and streams correctly, which is the control that names
+    // the real defect. Fixed at its source in `ad_ensure_capacity` and the two
+    // constructors: the buffer now always keeps the JDK's spare slot, so
+    // `head == tail` means empty and nothing else.
+    //
+    // The registration is still right, for the reason it always should have
+    // given: no JDK image declares `java/util/ArrayDeque$Itr`, and
+    // `native_ad_itr_remove` must keep our slot-3 `size` in step with a removal
+    // that real `delete(...)` bytecode knows nothing about. `--jdk-only` still
+    // lands on the real `Arrays$ArrayItr` below, which keeps the gap on the
+    // census. Re-measured in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
     //
     // `Compatible` is untouched: `try_alloc_synthetic` succeeds there.
     let itr = match try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3) {
@@ -56836,10 +57012,24 @@ mod tests {
         assert_eq!(AD_FIELD_HEAD, 1);
         assert_eq!(AD_FIELD_TAIL, 2);
         assert_eq!(AD_FIELD_SIZE, 3);
+        // Slots 0..2 are the REAL `java.util.ArrayDeque` layout
+        // (`elements`/`head`/`tail`, in that declaration order, confirmed with
+        // `javap -p java.util.ArrayDeque` on Temurin 25.0.3). Only slot 3 is
+        // ours, reached because `synthetic_stub_fields` pads the class to four.
+        // That is why real bytecode reading this receiver sees a coherent deque
+        // at all — and why `head`/`tail` have to obey the JDK's invariant.
         assert_eq!(AD_DEFAULT_CAPACITY, 16);
+        // The array is `AD_DEFAULT_CAPACITY + 1` slots, never a power of two,
+        // and that is deliberate: the JDK's own `ArrayDeque()` allocates
+        // `new Object[16 + 1]` so that `head == tail` can mean empty and only
+        // empty. The former assertion here required a power of two, which read
+        // as a claim that the index arithmetic masks — it does not. Every site
+        // in this file uses `% cap`, so a non-power-of-two length is correct as
+        // well as required. Assert the shape that is actually load-bearing.
         assert!(
-            AD_DEFAULT_CAPACITY.is_power_of_two(),
-            "AD default capacity must be power of 2"
+            !(AD_DEFAULT_CAPACITY + 1).is_power_of_two(),
+            "the allocated ring buffer is CAPACITY + 1 (the JDK's spare slot), \
+             so it is not a power of two and no site may mask instead of `%`"
         );
     }
 
