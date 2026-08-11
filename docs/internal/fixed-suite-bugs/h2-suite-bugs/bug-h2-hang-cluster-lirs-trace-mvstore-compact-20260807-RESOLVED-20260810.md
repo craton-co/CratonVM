@@ -56,10 +56,28 @@ The page's "same general family" reading is the right one, with a correction:
 at **28.6x interpreter-to-interpreter** this class is ~3x the flat 9.9-10.7x
 band the throughput pages measured, not inside it. §4 says why.
 
-*Found in passing, filed separately:* `Runtime.totalMemory()` and
-`freeMemory()` are hardcoded constants (64 MiB / 32 MiB) that never move, so
-every memory delta this class prints is `0` where HotSpot prints real numbers.
-The class only prints them, so nothing fails.
+*Found in passing, FIXED 2026-08-11:* `Runtime.totalMemory()` and
+`freeMemory()` were hardcoded constants (64 MiB / 32 MiB) that never moved — not
+on allocation, not across `Runtime.gc()` — so every memory delta this class
+printed was `0` where HotSpot prints real numbers. They now report the real
+committed heap and committed-minus-used (`VmHeap::committed_bytes`, across all
+three collectors). This class's second column, per cache size:
+
+| cache MiB | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| before | 0 | 0 | 0 | 0 | 0 |
+| after | 1 | 3 | 6 | 11 | 23 |
+| HotSpot 25 | 1 | 2 | 5 | 9 | 19 |
+
+It cost nothing: ABBA-interleaved on this class, per-PROCESS CPU, 359.8 / 348.9 s
+before against 352.7 / 358.3 s after — +0.3% on the means, all four `rc=0`. The
+risk worth checking first was that `Utils.getMemoryUsed()` calls
+`Utils.collectGarbage()`, which in some H2 versions loops `runtime.gc()` until
+`totalMemory()` stops changing: a value that tracked occupancy would have turned
+one collection into a fixed run of full ones. **This H2's `collectGarbage()`
+polls the JMX collection COUNT, not `totalMemory()`** — so the coupling does not
+exist here, and `committed_bytes` is a capacity by construction, so it would not
+fire where it does.
 
 ## 2. `TestBtreeIndex` — progressing, and `Trace.isEnabled` is not special
 
