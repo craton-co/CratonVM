@@ -212,14 +212,37 @@ fn young_trigger_debug(used: usize, free_list: usize, live: usize, threshold: us
     );
 }
 
+/// Which occupancy fires the next young collection.
+///
+/// `pause_goal_armed` is what makes [`GenerationalHeap::adapt_young_trigger_to_pause`]
+/// anything other than a counter that moves. Without it the adapted value is
+/// consulted ONLY on the moving branch, and the branch is chosen by
+/// [`next_young_gc_is_guaranteed_non_moving`] — which, on any JIT-heavy
+/// workload, answers "non-moving" at essentially every allocation because an
+/// unregistered compiled frame is on the stack. `CRATONVM_DBG_YOUNG_TRIGGER`
+/// on the OAuth2 6-lane repro prints `threshold=460MB non_moving=true` for the
+/// whole run while `[gcpause]` reports the trigger dutifully adapting
+/// `262144KB -> 131072KB -> 65536KB -> 32768KB` and every collection still
+/// arriving with `young_bytes_before` ~272 MB. The prediction is not even
+/// right: those cycles run the MOVING path (they report `cheney_drain`).
+///
+/// A pause goal is a promise about the PAUSE, not about which code path takes
+/// it, so when one is armed the adapted value bounds both branches. With no
+/// goal (the default) this is byte-for-byte the previous behaviour.
 #[inline]
 const fn young_gc_trigger_bytes(
     capacity: usize,
     moving_threshold: usize,
     non_moving_young: bool,
+    pause_goal_armed: bool,
 ) -> usize {
     if non_moving_young {
-        capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100
+        let non_moving = capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100;
+        if pause_goal_armed && moving_threshold < non_moving {
+            moving_threshold
+        } else {
+            non_moving
+        }
     } else {
         moving_threshold
     }
@@ -1005,14 +1028,47 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Default young-collection pause goal, in milliseconds.
+///
+/// Matches `G1CollectorConfig::max_gc_pause_ms` (and HotSpot's own
+/// `-XX:MaxGCPauseMillis` default), so the two collectors in this VM answer
+/// the same question the same way. Before this had a value, the generational
+/// young collector had no pause target at all: on the OAuth2 issuer-URI
+/// workload at `--Xmx 2g` it collected a ~272 MB young generation in
+/// **469-629 ms** (median 553, 24 samples over the 100 ms print threshold),
+/// against a 500 ms socket read budget that Spring Security hard-codes and
+/// that HotSpot meets — the whole `SocketTimeoutException: Read timed out`
+/// flake. With the goal armed the same repro measures **median 147 ms, and 2
+/// of 170 collections over 500 ms** (both of them the pre-adaptation cycles
+/// that run before the feedback loop has seen a pause).
+const DEFAULT_YOUNG_PAUSE_GOAL_MS: u64 = 200;
+
 /// `CRATONVM_GC_YOUNG_PAUSE_MS=N` — young-collection pause goal in ms, driving
-/// [`GenerationalHeap::adapt_young_trigger_to_pause`]. `0` (the default) is off.
+/// [`GenerationalHeap::adapt_young_trigger_to_pause`]. `0` turns it off.
+///
+/// **Default [`DEFAULT_YOUNG_PAUSE_GOAL_MS`]**, changed from off on 2026-08-11.
+/// The reason it was off is on record — this collector has a history of
+/// young-sizing changes that helped one workload and cost another
+/// (`with_capacity`'s note: capping the initial semi was a NET REGRESSION for
+/// large-`-Xmx` workloads) — so the flip is backed by the throughput control
+/// that objection asks for, `bench/BinTreesClassic.java`, run interleaved
+/// A,B,B,A so host drift cannot be read as an effect:
+///
+/// | arm | bt18 `--Xmx 2g` (n=3) | bt20 `--Xmx 4g` (n=2) |
+/// |---|---|---|
+/// | goal off | mean 4.05 s | mean 16.77 s |
+/// | goal 200 | mean 4.10 s | mean 17.30 s |
+///
+/// Both differences sit inside the run-to-run drift of the block they came
+/// from, so no throughput cost is established — and the feedback loop cannot
+/// touch a workload whose pauses are already inside the goal, which is the
+/// structural reason it cannot repeat the earlier regression.
 fn young_pause_goal_ms() -> u64 {
     static GOAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GOAL.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_GC_YOUNG_PAUSE_MS")
             .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<u64>().ok()))
-            .unwrap_or(0)
+            .unwrap_or(DEFAULT_YOUNG_PAUSE_GOAL_MS)
     })
 }
 
@@ -4863,6 +4919,7 @@ impl GenerationalHeap {
             from.capacity(),
             *self.young_gc_threshold.lock(),
             non_moving_young,
+            young_pause_goal_ms() > 0,
         );
         young_trigger_debug(used, from.free_list_bytes(), live, threshold, non_moving_young);
         // Anti-livelock floor. Sample `live` once per completed collection (the
@@ -5094,11 +5151,15 @@ impl GenerationalHeap {
     /// measured cannot repeat that mistake — a workload whose cycles are
     /// already inside the goal is never touched.
     ///
-    /// **Default OFF** (`goal == 0`). `CRATONVM_GC_YOUNG_PAUSE_MS=N` opts in.
-    /// Off by default because the correct default is a policy question the
-    /// measurement above does not settle, and this collector has a documented
-    /// history of young-sizing changes that helped one workload and cost
-    /// another.
+    /// **Default [`DEFAULT_YOUNG_PAUSE_GOAL_MS`]** since 2026-08-11;
+    /// `CRATONVM_GC_YOUNG_PAUSE_MS=0` opts out. See `young_pause_goal_ms` for
+    /// the throughput control behind the flip.
+    ///
+    /// The adapted value only reaches the collector through
+    /// [`young_gc_trigger_bytes`], which until 2026-08-11 consulted it on the
+    /// MOVING branch only — so on a JIT-heavy workload, where the trigger
+    /// predicts "non-moving" at essentially every allocation, this whole
+    /// feedback loop moved a number nothing read.
     fn adapt_young_trigger_to_pause(&self, pause_ms: u64, goal_ms: u64) {
         let capacity = self.young_from.lock().capacity();
         if capacity == 0 {
@@ -7253,8 +7314,21 @@ impl GenerationalHeap {
                 );
                 // young_to is empty after reset+swap, safe to grow
                 young_to.grow(new_cap);
-                // Update threshold based on the upcoming larger from-space
-                *self.young_gc_threshold.lock() = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
+                // Update threshold based on the upcoming larger from-space.
+                //
+                // When a pause goal is armed the threshold is NOT a function of
+                // capacity any more — `adapt_young_trigger_to_pause` drove it
+                // down from pauses it measured. Restoring the capacity
+                // percentage here would undo that on every expansion, so take
+                // the smaller of the two: the goal keeps its say, and the new
+                // capacity still supplies the ceiling.
+                let default_for_new_cap = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
+                let mut threshold = self.young_gc_threshold.lock();
+                *threshold = if young_pause_goal_ms() > 0 {
+                    (*threshold).min(default_for_new_cap)
+                } else {
+                    default_for_new_cap
+                };
             }
         }
 
@@ -9747,7 +9821,17 @@ impl GenerationalHeap {
                     .unwrap_or(used)
                     .min(used);
                 let run_end = zero_run_end(from_base, cursor, limit);
-                if run_end - cursor >= HEADER_SIZE {
+                // `side_sorted` is this cycle's independently-computed live
+                // set (object bases, ascending). Since HEADER_SIZE 16 made the
+                // hash lazy, a live, never-hashed, never-locked object with
+                // `ClassId(0)` and no shape bits reads all-zero — indistinguishable
+                // from reclaimed memory by header bytes alone. An address the
+                // marker vouches for is not anomaly evidence, whatever its
+                // header reads: fall through and parse it as a normal live
+                // header below, instead of unwinding every reclaim decision
+                // taken since the last anchor for an ordinary live object.
+                let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                if run_end - cursor >= HEADER_SIZE && !vouched_live {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
                         tracing::warn!(
@@ -9802,10 +9886,11 @@ impl GenerationalHeap {
                     }
                     break;
                 }
-                // Zero run shorter than a header: a real `ClassId(0)` ad-hoc
-                // container's header legitimately starts with zero words
-                // (class_id=0, kind=Object, hash=0) but has a non-zero
-                // `num_slots`/`gc_flags` word — parse it normally below.
+                // Either the zero run is shorter than a header (a real
+                // `ClassId(0)` ad-hoc container's header legitimately starts
+                // with zero words but has a non-zero `num_slots`/`gc_flags`
+                // word), or the marker vouches for this address — parse it
+                // normally below either way.
             }
             let total_size = gen_object_total_size(header);
             // Defensive: a corrupt / zero-size header would desynchronise
@@ -17472,14 +17557,31 @@ mod tests {
         let capacity = 1000;
         let moving_threshold = 500;
         assert_eq!(
-            young_gc_trigger_bytes(capacity, moving_threshold, false),
+            young_gc_trigger_bytes(capacity, moving_threshold, false, false),
             500,
             "moving young must retain its configured Cheney-copy headroom",
         );
         assert_eq!(
-            young_gc_trigger_bytes(capacity, moving_threshold, true),
+            young_gc_trigger_bytes(capacity, moving_threshold, true, false),
             900,
             "non-moving young should defer the O(heap) sweep until 90% occupancy",
+        );
+        // With a pause goal armed, the adapted (moving) threshold bounds the
+        // non-moving branch too. Without this the goal is INERT on any
+        // JIT-heavy workload, where the branch is predicted non-moving at
+        // essentially every allocation — and predicted wrongly, since those
+        // cycles run the moving path.
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, true, true),
+            500,
+            "an armed pause goal must bound the non-moving trigger as well",
+        );
+        // …but only downward. A goal that has given the trigger room back
+        // above the non-moving threshold must not RAISE it.
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, 950, true, true),
+            900,
+            "an armed pause goal must never raise the non-moving trigger",
         );
         let ordinary_cycle =
             next_young_gc_is_guaranteed_non_moving(false, false, false, false, false);

@@ -374,46 +374,67 @@ impl Compiler {
                 // `try_jit_compile_callee`), NOT the CP index. Match on
                 // `cpc` — the prior CP-index lookup silently missed and
                 // pushed 0 for the constant.
+                //
+                // A MISS IS A REFUSAL, NEVER A ZERO. Those tables carry only
+                // the constants this emitter can model as an immediate —
+                // `Integer` and `Float`. Every other `ldc` kind (String, Class,
+                // MethodHandle, MethodType, condy) names a constant whose value
+                // is a *reference*, materialised at run time by
+                // `helpers.ldc_string` / `helpers.ldc_class_cp`, which this
+                // mini-emitter does not call. Substituting 0 for one is wrong
+                // code: it pushes `null` where the callee's body pushes a live
+                // object. That is not theoretical — it shipped. A one-line
+                // `Dialect.extractPattern(unit) { return "extract(?1 from ?2)"; }`
+                // inlined into `H2Dialect.extractPattern` compiled to
+                // `xor eax,eax; ret`, so every Hibernate HQL `extract()` /
+                // `cast()` / `str()` query died in
+                // `PatternRenderer.<init>` with
+                // `NullPointerException: ... because "pattern" is null` — 17 of
+                // the 34 method failures across FunctionTests /
+                // StandardFunctionTests / ASTParserLoadingTest / HQLTest on the
+                // 2026-08-11 Linux full-suite run, all green under `--nojit`.
+                // Refusing costs one real call; this cost correct answers.
                 0x12 => {
                     if cpc + 1 >= callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
-                        self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
-                    } else {
-                        self.emit_xor_reg_self(RAX);
-                    }
+                    let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     self.push_from_rax();
                     cpc += 2;
                 }
 
-                // ldc_w
+                // ldc_w — same contract as `ldc` above.
                 0x13 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
-                        self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
-                    } else {
-                        self.emit_xor_reg_self(RAX);
-                    }
+                    let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     self.push_from_rax();
                     cpc += 3;
                 }
 
-                // ldc2_w
+                // ldc2_w — same contract. Only `Long` and `Double` are
+                // modellable here; anything else is a refusal, not a zero.
                 0x14 => {
                     if cpc + 2 >= callee_len {
                         self.next_spill_offset = callee_local_base;
                         return false;
                     }
-                    if let Some((_, val)) = site.ldc2w_info.iter().find(|(p, _)| *p == cpc) {
-                        self.emit_mov_imm64(RAX, *val);
-                    } else {
-                        self.emit_xor_reg_self(RAX);
-                    }
+                    let Some((_, val)) = site.ldc2w_info.iter().find(|(p, _)| *p == cpc) else {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    };
+                    self.emit_mov_imm64(RAX, *val);
                     self.push_from_rax();
                     cpc += 3;
                 }

@@ -378,6 +378,12 @@ impl Compiler {
             // inline mechanism as the prologue. This is value-equivalent to
             // `jit_frame_record(rbp)` and preserves RAX without a save/restore.
             self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
+            // The callee published ITS identity too, so restoring only the RBP
+            // would leave the pair naming two different frames. Both halves
+            // move together or neither does.
+            if self.inline_cm_tls_disp != 0 {
+                self.emit_mov_tls_disp32_imm32(self.inline_cm_tls_disp as u32, self.compile_id);
+            }
             return;
         }
         self.buf.emit_byte(0x50); // PUSH RAX (callee return value)
@@ -580,6 +586,12 @@ impl Compiler {
                 // truth via `inline_rbp_tls_disp()`), so the GC root walk sees
                 // the innermost RBP exactly as with the helper path.
                 self.emit_mov_tls_disp32_rbp(self.inline_rbp_tls_disp as u32);
+                // …and the identity of the frame that RBP names, so the GC does
+                // not have to decode the call that created it — which it cannot
+                // do when the caller reached us through `CALL R11`.
+                if self.inline_cm_tls_disp != 0 {
+                    self.emit_mov_tls_disp32_imm32(self.inline_cm_tls_disp as u32, self.compile_id);
+                }
                 // Debug self-check: also call the verify helper (wired into
                 // `frame_record` by `build_helpers` when the knob is on), which
                 // reads the slot back and asserts it equals RBP.

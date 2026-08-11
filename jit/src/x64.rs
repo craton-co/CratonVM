@@ -950,6 +950,16 @@ struct Compiler {
     /// `call jit_frame_record`. Cached from `inline_rbp_tls_disp()` at
     /// construction so codegen reads it once.
     inline_rbp_tls_disp: usize,
+    /// Segment-relative displacement of the compile-id mirror — the identity
+    /// half of the frame record, written beside `inline_rbp_tls_disp` so the GC
+    /// can name the method owning the innermost RBP without decoding the call
+    /// that created the frame. 0 when unavailable → nothing is published and
+    /// the scan keeps its old decode path.
+    inline_cm_tls_disp: usize,
+    /// This compilation's identity, reserved BEFORE codegen because the
+    /// immediate must be encoded into the prologue while the `CompiledMethod`
+    /// that will own it does not exist yet. 0 → publish nothing.
+    compile_id: u32,
     /// Step 1 debug self-check (`CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD`) —
     /// when set AND inline frame-record is active, also emit the verify call.
     verify_inline_frame_record: bool,
@@ -1911,6 +1921,19 @@ impl Compiler {
         } else {
             0
         };
+        // Identity is only publishable where the RBP mirror is: the pair is
+        // what makes `(rbp, id)` describe one frame. Reserve the id here, at
+        // the start of this compilation, so the prologue can encode it.
+        let inline_cm_tls_disp = if inline_rbp_tls_disp != 0 {
+            crate::x64::inline_cm_tls_disp()
+        } else {
+            0
+        };
+        let compile_id = if inline_cm_tls_disp != 0 {
+            crate::reserve_compile_id()
+        } else {
+            0
+        };
         let verify_inline_frame_record = verify_inline_frame_record_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
         // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
@@ -2357,6 +2380,8 @@ impl Compiler {
             slot_mirror_suppressed: false,
             precise_maps,
             inline_rbp_tls_disp,
+            inline_cm_tls_disp,
+            compile_id,
             verify_inline_frame_record,
             sp_id_slot_off,
             safepoint_reg_spill,
