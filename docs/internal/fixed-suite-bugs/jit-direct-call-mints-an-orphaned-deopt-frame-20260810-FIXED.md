@@ -117,6 +117,29 @@ not any inlined shape.
    (`StringFunction1.getValue`, a per-row expression evaluator). Now conditional
    on the frame being this method's.
 
+## What it costs
+
+Registering a `JitInvokeInfo` for these sites means the codegen now emits, per
+direct call: the service-arg copy (`n` stores) and a `MOV imm64` + `CMP` +
+not-taken `JNE`. Plus the 90 tail sites on `TestScript` become ordinary calls.
+
+ABBA-interleaved on `org.h2.test.db.TestIndex`, per-PROCESS CPU, pre-fix binary
+against post-fix binary:
+
+| | rep 1 | rep 2 |
+| --- | --- | --- |
+| before | 174.5 s | 181.3 s |
+| after | 178.1 s | 199.3 s |
+
+The rep-1 pair — the two runs closest in time — is **+2.1%**. Read rep 2 as host
+drift rather than signal: the *before* arm alone rose 174.5 → 181.3 over the
+same window, and its wall time rose 150 s → 175 s as another agent's suite run
+started on the same box. Every run PASSes on both arms.
+
+Do not A/B this on `org.h2.test.synth.TestCrashAPI`: it is a random fuzzer, and
+the same class took 64 s in one run and blew a 600 s cap on BOTH arms in
+another.
+
 ## What is left, and why it is not a hole
 
 131 direct call sites on `TestScript` still emit no service check. Every one is
