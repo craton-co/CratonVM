@@ -1873,9 +1873,9 @@ fn loaded_by(
         // nothing above consumes the handle on this road.
         None => Ok(None),
         Some(owner) if owner == loader => Ok(None),
-        // Message reproduced verbatim from `NativeLibraries.loadLibrary`;
-        // applications match on it (the JDK's own text is the only contract a
-        // caller can key off, the exception carrying no other detail).
+        // Message reproduced verbatim from `NativeLibraries.loadLibrary`. The
+        // exception carries no other detail, so the text is the whole of what a
+        // caller — or a HotSpot-versus-CratonVM transcript diff — can see.
         Some(_) => Err(RuntimeError::UnsatisfiedLinkError {
             message: format!("Native Library {key} already loaded in another classloader"),
         }
