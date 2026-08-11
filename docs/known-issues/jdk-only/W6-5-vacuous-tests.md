@@ -5,6 +5,14 @@ Status: **four fixed in this lane** (`RChannelInterrupt`, `RSocketChannelInterru
 HotSpot 25.0.3 and mutation-checked. **Two further findings reported, not fixed**
 — they are outside this lane's files. Wave 6, lane W6-5.
 
+> **2026-08-11 — §3.1 is CLOSED.** `RPriorityQueueGc` and `RTreeRangeGc` are in
+> `CORE_CLASSES`, with the `class_cv_args` hook they are inert without already
+> in place; §4's proposed patch has fully landed. §3.2 (`apps/` is gitignored,
+> eleven missing probe fixtures) and §3.3 (`CRATONVM_REQUIRE_E2E` is set by no
+> workflow) **remain open** and are still the larger findings by count.
+> Neither the registration nor the new vector added in §3.4 has been run under
+> CratonVM.
+
 Predecessors: `L10-rjdkprocess-vector-overassertion.md` (the opposite failure —
 an over-asserting vector), `W3-4-forkjointask-status-flags-and-the-eager-default.md`
 (which is where the vacuous FJP tests were first written down),
@@ -215,7 +223,31 @@ no code change and is the durable home. **Recommended.**
 
 ## 3. Other tests shaped the same way — inventory
 
-### 3.1 CONFIRMED, high value: two documented "permanent gates" that no longer run
+### 3.1 RESOLVED 2026-08-11: two documented "permanent gates" that no longer ran
+
+> **UPDATED 2026-08-11 — both classes are now in `CORE_CLASSES`, and the
+> residual this section tracked is closed.** `RPriorityQueueGc` and
+> `RTreeRangeGc` were moved out of `UNREGISTERED_CLASSES` into `CORE_CLASSES`;
+> `class_cv_args()` (which already carried `--nojit --Xmx 64m` and `--Xmx 64m`
+> respectively) is unchanged and is now load-bearing on every default run. The
+> ordering was the point: the hook existed first, so the registration could not
+> manufacture the green-forever gate this section warned about. `run.sh`'s
+> comments were rewritten to record the change and the reason, replacing the
+> note that called scheduling them "a task for a lane that can build and run the
+> VM". §4 below is superseded — see its header for what landed instead.
+>
+> **Not verified.** This lane could not build or run a CratonVM binary, so the
+> first CratonVM run of either vector under these flags is still ahead. The
+> plumbing was checked structurally instead: `class_cv_args` is called at
+> `run.sh:366` inside `for c in $CLASSES` (`run.sh:364`), a single loop over the
+> already-selected set, with no per-list branching anywhere between
+> `CLASSES="${ONLY:-$SUITE_SET}"` and the invocation — so a `CORE_CLASSES`
+> member reaches it exactly as an `ONLY=` member does. The HotSpot line
+> (`run.sh:392`) takes `$extra` only and never `$cvextra`, so the oracle stays
+> the plain reference run. A red on either vector's first real run means the
+> underlying fix regressed, which is what a gate is for.
+
+The original finding, kept because the shape is the lesson:
 
 `regression-suite/src/RPriorityQueueGc.java` and
 `regression-suite/src/RTreeRangeGc.java` are each described in a FIXED-bug
@@ -236,11 +268,12 @@ non-moving sweep under which a stale reference still resolves).
 
 Two things have since broken, and they compound:
 
-1. **Neither class is in `CORE_CLASSES`** in `regression-suite/run.sh`, so a
+1. ~~**Neither class is in `CORE_CLASSES`** in `regression-suite/run.sh`, so a
    plain `bash regression-suite/run.sh` never runs either one. They are the only
    two vectors in `src/` that are in neither `CORE_CLASSES` nor
    `JDKONLY_CLASSES` other than `RConcurrent`, whose exclusion *is* documented
-   in run.sh.
+   in run.sh.~~ **FIXED 2026-08-11: both are in `CORE_CLASSES`.**
+   `UNREGISTERED_CLASSES` is now `RConcurrent RCanAccessOutsider`.
 2. ~~**The `cv_extra_args` hook they depend on is gone from `run.sh`.**~~
    **UPDATED 2026-08-07: partly fixed, and the residue is worth knowing.**
    `run.sh` now carries `cv_extra_args` / `class_cv_args` (CratonVM-only
@@ -252,9 +285,10 @@ Two things have since broken, and they compound:
    `--Xmx 64m` (deliberately without `--nojit`, so the compiling configuration
    stays under test). `run.sh`'s own comment now carries this section's warning
    verbatim: *"With `--nojit` alone the vector PASSES ON A BROKEN VM."*
-   **Point 1 still stands**, and it is the whole residual: both classes remain
+   ~~**Point 1 still stands**, and it is the whole residual: both classes remain
    in `UNREGISTERED_CLASSES`, so neither runs at all until a lane that can build
-   and run the VM verifies them — which `run.sh` also says in place.
+   and run the VM verifies them — which `run.sh` also says in place.~~
+   **Point 1 was closed 2026-08-11; see the header of this section.**
    Both
    documents and both vectors' own headers say the suite runs them with
    `--nojit --Xmx 64m` and `--Xmx 64m` respectively. `run.sh` today has only
@@ -273,13 +307,13 @@ the vector passes on a broken VM**:
 > passes on a broken VM."
 
 So the verification command both documents give —
-`ONLY=RPriorityQueueGc bash regression-suite/run.sh` — is **itself vacuous
-today**. Re-adding the classes to `CORE_CLASSES` without restoring the hook would
-produce two more green-forever vectors, which is worse than the current state
-because it would look like coverage.
-
-`run.sh` is not this lane's file. Proposed patch, text anchors, in
-[§4](#4-proposed-patch-to-runsh-not-this-lanes-file).
+`ONLY=RPriorityQueueGc bash regression-suite/run.sh` — was **itself vacuous**
+until `class_cv_args` landed. Re-adding the classes to `CORE_CLASSES` without
+restoring the hook would have produced two more green-forever vectors, which is
+worse than not running them because it looks like coverage. That is why the two
+halves landed in the order they did: hook first (2026-08-07), registration
+second (2026-08-11). As of the second, the documents' verification command is
+live and means what it says.
 
 ### 3.2 CONFIRMED, largest by count: `apps/` is gitignored, and ELEVEN more probe fixtures are gone
 
@@ -384,14 +418,60 @@ All 55 `regression-suite/src/*.java` were checked for both shapes:
   this only works because the count is printed — a vector that stopped printing
   it would lose the property silently.
 
+> **ADDED 2026-08-11 — `regression-suite/src/RJdkViews.java` (67 checks),** the
+> permanent gate for the four families in
+> `W7-1-treemap-views-and-iterator-remove-contract.md`, which had been found by
+> a probe and had no vector. It was written against this record's two shapes
+> deliberately, and two of its properties are here because of them:
+>
+> * **Shape B (assert on presence, not behaviour).** Every navigable-view
+>   assertion checks CONTENT and ORDER, never `!= null` or `!= empty` — an empty
+>   view was the actual defect, and it is the failure mode that reads as a pass
+>   wherever a caller only iterates. Each family also carries a **negative
+>   control** in the sense of §1.3: a range view must refuse an out-of-range
+>   `put` *and* accept an in-range one; `StringBuilder.delete` must reject
+>   `(5,6)` on `"ab"` *and* clamp `(1,99)`; `Iterator.remove` must raise
+>   `ConcurrentModificationException` for a foreign mutation *and not* for its
+>   own. Without each second half, a VM that threw from everything would satisfy
+>   the first half.
+> * **The `for (x : list) list.add(x)` hazard.** That loop is terminated by the
+>   exception it asserts; on a non-fail-fast VM it grows the list until the heap
+>   is gone. Both CME loops are capped at 100 iterations. Checked by simulation
+>   rather than by assumption: iterating a deliberately non-fail-fast `List`
+>   subclass under `-Xmx64m` produces the named `AssertionError` at 101
+>   iterations with `rc=1` in milliseconds, not an `OutOfMemoryError` and not
+>   the suite's 120 s timeout (which would be indistinguishable from a VM hang).
+>
+> One check was **written and then deleted** for being unfalsifiable: an
+> `assert rounds <= CME_CAP` after the CME assertion. It can only be reached
+> when the CME check already passed, and the CME check passing implies the cap
+> was never hit — so it could not fail. That is precisely this record's shape B,
+> arriving in new code while the record was open.
+>
+> All 67 checks were measured on the HotSpot 25.0.3 oracle before being
+> asserted, per §1.4. **Never run under CratonVM** — that is still ahead.
+
 ---
 
-## 4. Proposed patch to `run.sh` (not this lane's file)
+## 4. The patch to `run.sh` — LANDED 2026-08-11
 
-**Unverified — I could not run the suite.** Confirm with
-`ONLY="RPriorityQueueGc RTreeRangeGc" bash regression-suite/run.sh` before
-landing; both documents claim PASS on the fixed binary, so red here means the
-underlying fixes regressed, which is the point of a gate.
+> **This section is history.** Both parts are in `run.sh` now: (b)/(c) landed
+> 2026-08-07 as `class_cv_args()` (the name differs from the proposal's
+> `cv_extra_args`; the behaviour is the one specified here), and (a) landed
+> 2026-08-11. The proposal text is kept below because the *reasoning* in it —
+> particularly why `$cvextra` must not reach the oracle — is the part a future
+> merge resolution needs to not discard again, which is exactly how these
+> registrations were lost the first time.
+>
+> **Still unverified against a CratonVM binary.** Confirm with
+> `ONLY="RPriorityQueueGc RTreeRangeGc" bash regression-suite/run.sh`; both
+> internal documents claim PASS on the fixed binary, so red there means the
+> underlying fixes regressed, which is the point of a gate.
+>
+> Two details of what landed differ from the proposal below and are the current
+> truth: the function is `class_cv_args`, and on the invocation line `$cvextra`
+> precedes `$extra` (`run.sh:369`) rather than following it. Neither is
+> load-bearing — both are flag words consumed unquoted.
 
 **(a) schedule the two vectors.** In the `CORE_CLASSES=` assignment, replace
 
