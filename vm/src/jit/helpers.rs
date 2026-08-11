@@ -1728,9 +1728,25 @@ pub(crate) fn cv_trace_enabled() -> bool {
 /// `get(Ljava/lang/Class;)Ljava/lang/Object;` signature the `ClassValue`
 /// native answers? (Class-blind on purpose — the probe wants every route.)
 fn cv_trace_match(info: &JitInvokeInfo) -> bool {
+    // `CRATONVM_DBG_MIC_METHOD=<substring>` retargets this trace at any method.
+    // It was hardcoded to one investigation's `get(Class)Object` site, which
+    // made it useless for the next one; the MIC is the single hardest place in
+    // the VM to observe, so the instrument should not need a rebuild to move.
+    if let Some(want) = mic_trace_method_filter() {
+        return info.method_name.contains(want);
+    }
     info.method_name == "get"
         && info.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
         && cv_trace_enabled()
+}
+
+/// `CRATONVM_DBG_MIC_METHOD` — retarget [`cv_trace_match`] at an arbitrary
+/// method name (substring match).
+fn mic_trace_method_filter() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<String>> = OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MIC_METHOD").ok())
+        .as_deref()
 }
 
 // SAFETY: `vm` must be live for the call, and `receiver` must be a valid
@@ -7107,6 +7123,81 @@ fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> 
 // SAFETY: Caller must ensure vm_ptr (via `vm`) is a valid SharedVm reference and obj_ref is
 // derived from a live heap object. Only short-lived class_manager read/write locks are held;
 // the heap is never reborrowed. The null case must be handled by the caller before entry.
+/// `CRATONVM_DBG=typecheck-filter=<substring>` — name the branch that decided a
+/// compiled `checkcast`/`instanceof` whose TARGET class name contains the
+/// substring.
+///
+/// A compiled type check leaves no other trace. By the time anything observable
+/// happens the answer has already collapsed into a taken/not-taken branch, so a
+/// disagreement with the interpreter surfaces only as a wrong result far
+/// downstream. `CRATONVM_JIT_DENY=<Class>.<method>` says WHICH compiled body is
+/// wrong; this says WHY, by printing the ids actually compared.
+///
+/// Prints the RECEIVER's class id and name beside the target so a two-ids-one-name
+/// split is visible directly, which is the failure this was written to catch.
+/// A compiled type check reached its helper with NO target class name.
+///
+/// `bytecode_walk`'s `0xc0`/`0xc1` emission falls back to
+/// `(pc, ptr::null(), 0)` when the pc is absent from `typecheck_info_idx`, and
+/// both helpers answer that shape defensively — `instanceof` with `0`,
+/// `checkcast` fails closed. Defensible as a guard against a malformed
+/// artifact; catastrophic if it is reachable from a NORMAL compile, because
+/// then a live `instanceof` has been compiled to constant `false` and nothing
+/// downstream can tell. This fires only when `CRATONVM_DBG_TYPECHECK_FILTER`
+/// is set, and its whole purpose is to answer "is this shape actually
+/// reachable?" — which no other instrument can, since the answer never reaches
+/// `jit_typecheck_resolve`.
+fn jit_typecheck_null_name_trace(kind: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TYPECHECK_FILTER").is_some()
+    }) {
+        return;
+    }
+    eprintln!("[DBG_TYPECHECK] NULL-TARGET-NAME: {kind} compiled with no target class -> answering false/closed WITHOUT resolving");
+}
+
+fn jit_typecheck_trace(
+    vm: &SharedVm,
+    obj_class_id: ClassId,
+    class_name: &str,
+    lenient: bool,
+    stage: &str,
+    target: Option<ClassId>,
+) {
+    use std::sync::OnceLock;
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    let filter = FILTER
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_TYPECHECK_FILTER").ok())
+        .as_deref();
+    let Some(filter) = filter else {
+        return;
+    };
+    if !class_name.contains(filter) {
+        return;
+    }
+    let cm = vm.classes.class_manager.read();
+    let obj_name = cm
+        .get_class(obj_class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let target_desc = match target {
+        Some(t) => format!(
+            "{} (id={})",
+            cm.get_class(t)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            t.as_u32()
+        ),
+        None => "<none>".to_string(),
+    };
+    eprintln!(
+        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={}) resolved_target={target_desc}",
+        obj_class_id.as_u32()
+    );
+}
+
 unsafe fn jit_typecheck_resolve(
     vm: &SharedVm,
     obj_class_id: ClassId,
@@ -7209,6 +7300,7 @@ unsafe fn jit_typecheck_resolve(
     // does not has its own carve-outs at the bottom of this function
     // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
     // comparison cannot reproduce.
+    jit_typecheck_trace(vm, obj_class_id, class_name, lenient, "enter", None);
     if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
         .filter(|_| !recv_is_array)
     {
@@ -7218,6 +7310,18 @@ unsafe fn jit_typecheck_resolve(
             cm.get_class(target_class_id)
                 .is_some_and(|c| &*c.name == class_name)
         };
+        jit_typecheck_trace(
+            vm,
+            obj_class_id,
+            class_name,
+            lenient,
+            if names_this_site {
+                "site-recorded"
+            } else {
+                "site-recorded-names-OTHER-class"
+            },
+            Some(target_class_id),
+        );
         if names_this_site {
             if obj_class_id == target_class_id {
                 return true;
@@ -7245,6 +7349,14 @@ unsafe fn jit_typecheck_resolve(
             ) {
                 return true;
             }
+            jit_typecheck_trace(
+                vm,
+                obj_class_id,
+                class_name,
+                lenient,
+                "REFUSED-by-recorded-site",
+                Some(target_class_id),
+            );
             return false;
         }
     }
@@ -7285,6 +7397,14 @@ unsafe fn jit_typecheck_resolve(
         }
         resolved
     };
+    jit_typecheck_trace(
+        vm,
+        obj_class_id,
+        class_name,
+        lenient,
+        "by-name-fallback",
+        target_class_id_opt,
+    );
     if let Some(target_class_id) = target_class_id_opt {
         if obj_class_id == target_class_id {
             return true;
@@ -7663,6 +7783,7 @@ pub unsafe extern "C" fn jit_instanceof(
         return 0;
     }
     if class_name_len <= 0 || class_name_ptr.is_null() {
+        jit_typecheck_null_name_trace("instanceof");
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
@@ -12915,9 +13036,31 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
+        // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+        // When the receiver's class is not the class that name globally
+        // resolves to, that hands back ANOTHER loader's copy of the method, and
+        // the entry is then cached against THIS receiver's class id — so every
+        // monomorphic hit machine-CALLs a body compiled for a different copy.
+        //
+        // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+        // `@CompileWithForkedClassLoader` test defines its own
+        // `DynamicJavaFileManager`, so one run showed that name resolving to
+        // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+        // 17724, 19569, 21414, ...). The copy that got compiled has its
+        // `instanceof DynamicClassFileObject` site interned against ITS OWN
+        // `DynamicClassFileObject` id, so the check correctly answered false for
+        // the receiver's file object, `super.inferBinaryName` ran, and
+        // `JavacFileManager` threw on a file object it did not create.
+        //
+        // `globally_named` already gates `publish_mic_rust_cached_entry` two
+        // arms below for exactly this reason; the by-name compile that feeds the
+        // machine-code MIC/PIC was left ungated. Not globally named -> do not
+        // compile by name, leave the site on the dispatch helper, which resolves
+        // on the actual receiver.
         let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
             || redefine_jit_quiesced
             || !cacheable_receiver
+            || !globally_named
         {
             // Attribute the skip. All three of these land in `pub_probe_none`
             // below without a probe ever running, which is why that counter
@@ -12949,6 +13092,19 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             }
             probed
         };
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-compile] site={}.{}{} recv_cid={} resolved_class={} cacheable={} globally_named={} compiled={}",
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                receiver_cid,
+                class_name,
+                cacheable_receiver,
+                globally_named,
+                compile_res.is_some(),
+            );
+        }
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
         // safely resume while the HTTP request is still active.
@@ -13136,9 +13292,31 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
+    // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+    // When the receiver's class is not the class that name globally
+    // resolves to, that hands back ANOTHER loader's copy of the method, and
+    // the entry is then cached against THIS receiver's class id — so every
+    // monomorphic hit machine-CALLs a body compiled for a different copy.
+    //
+    // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+    // `@CompileWithForkedClassLoader` test defines its own
+    // `DynamicJavaFileManager`, so one run showed that name resolving to
+    // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+    // 17724, 19569, 21414, ...). The copy that got compiled has its
+    // `instanceof DynamicClassFileObject` site interned against ITS OWN
+    // `DynamicClassFileObject` id, so the check correctly answered false for
+    // the receiver's file object, `super.inferBinaryName` ran, and
+    // `JavacFileManager` threw on a file object it did not create.
+    //
+    // `globally_named` already gates `publish_mic_rust_cached_entry` two
+    // arms below for exactly this reason; the by-name compile that feeds the
+    // machine-code MIC/PIC was left ungated. Not globally named -> do not
+    // compile by name, leave the site on the dispatch helper, which resolves
+    // on the actual receiver.
     let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
         || redefine_jit_quiesced
         || !cacheable_receiver
+        || !globally_named
     {
         None
     } else {

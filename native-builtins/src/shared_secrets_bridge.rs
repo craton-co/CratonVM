@@ -1473,6 +1473,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         iface,
+        "currentThread0",
+        "()Ljava/lang/Thread;",
+        jla_current_carrier_thread,
+    );
+    registry.register(
+        iface,
         "blockedOn",
         "(Lsun/nio/ch/Interruptible;)V",
         jla_blocked_on,
@@ -1604,6 +1610,24 @@ fn jlia_make_class_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 
 fn register_java_lang_invoke_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/invoke/MethodHandleImpl$1";
+    registry.register(
+        owner,
+        "findMethodHandleType",
+        "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
+        jlia_find_method_handle_type,
+    );
+    registry.register(
+        owner,
+        "linkMethodHandleConstant",
+        "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
+        jlia_link_method_handle_constant,
+    );
+    registry.register(
+        owner,
+        "makeClassValueMap",
+        "()Ljava/util/Map;",
+        jlia_make_class_value_map,
+    );
 }
 
 // JavaLangRefAccess -----------------------------------------------------------
@@ -1717,6 +1741,18 @@ fn register_java_lang_reflect_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         owner,
+        "newParameter",
+        "(Ljava/lang/reflect/Executable;ILjava/lang/String;I)Ljava/lang/reflect/Parameter;",
+        jlrefa_new_parameter,
+    );
+    registry.register(
+        owner,
+        "newAccessibleObject",
+        "()Ljava/lang/reflect/AccessibleObject;",
+        jlrefa_new_accessible_object,
+    );
+    registry.register(
+        owner,
         "getExecutableTypeAnnotationBytes",
         "(Ljava/lang/reflect/Executable;)[B",
         jlrefa_get_executable_type_annotation_bytes,
@@ -1745,6 +1781,12 @@ fn jioa_charset(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
 fn register_java_io_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/io/Console$1";
     registry.register(owner, "console", "()Ljava/io/Console;", jioa_console);
+    registry.register(
+        owner,
+        "charset",
+        "()Ljava/nio/charset/Charset;",
+        jioa_charset,
+    );
 }
 
 // JavaIORandomAccessFileAccess ------------------------------------------------
@@ -1968,6 +2010,12 @@ fn jniaa_get_original_host_name(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn register_java_net_inet_address_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/net/InetAddress$1";
+    registry.register(
+        owner,
+        "getHostFromNameService",
+        "(Ljava/net/InetAddress;Z)Ljava/lang/String;",
+        jniaa_get_host_from_name_service,
+    );
     registry.register(
         owner,
         "getOriginalHostName",
@@ -2276,6 +2324,12 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // Some real-JDK builds expose the JavaNioAccess anonymous implementation as
     // Buffer$1 rather than Buffer$2; register both owners to avoid linkage drift.
     registry.register(
+        "java/nio/Buffer$1",
+        "scaleShifts",
+        "(Ljava/nio/Buffer;)I",
+        jnio_scale_shifts,
+    );
+    registry.register(
         owner,
         "isThreadConfined",
         "(Ljava/nio/Buffer;)Z",
@@ -2389,6 +2443,18 @@ fn jsec_get_protect_domains(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn register_java_security_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/security/AccessController$1";
+    registry.register(
+        owner,
+        "doIntersectionPrivilege",
+        "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;Ljava/security/AccessControlContext;)Ljava/lang/Object;",
+        jsec_do_intersection_privilege,
+    );
+    registry.register(
+        owner,
+        "getProtectDomains",
+        "(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;",
+        jsec_get_protect_domains,
+    );
 }
 
 // JavaUtilJarAccess -----------------------------------------------------------
@@ -2458,6 +2524,18 @@ fn juzf_get_manifest_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 
 fn register_java_util_zip_file_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/util/zip/ZipFile$1";
+    registry.register(
+        owner,
+        "getEntry",
+        "(Ljava/util/zip/ZipFile;Ljava/lang/String;Ljava/util/function/Function;)Ljava/util/zip/ZipEntry;",
+        juzf_get_entry,
+    );
+    registry.register(
+        owner,
+        "entryLocalNameEncoding",
+        "(Ljava/util/zip/ZipEntry;)Z",
+        juzf_entry_local_name_encoding,
+    );
     registry.register(
         owner,
         "getManifestName",
@@ -2573,6 +2651,26 @@ fn register_java_util_resource_bundle_access(registry: &mut NativeMethodRegistry
 /// every concrete-class interface method.  Called from the
 /// native-builtins initialisation path (both synthetic-jdk and
 /// real-JDK modes).
+///
+/// # Why an image census cannot adjudicate anything in this file
+///
+/// Every owner here is one of the JDK's own anonymous `Java*Access`
+/// implementations — `java/lang/System$1`, `java/net/InetAddress$1`,
+/// `java/lang/invoke/MethodHandleImpl$1` — and their methods are **ordinary
+/// bytecode** on every image, never `ACC_NATIVE`. The registrations here are
+/// CratonVM's stand-ins for that bytecode, so `image_declaring_method` scores
+/// every one of them `method-nowhere`, which is exactly what a dead
+/// registration also looks like.
+///
+/// `dc55e8057` deleted thirteen of them on that evidence and
+/// `representative_method_registered_per_owner` went red — one owner per run,
+/// because it reports the first gap it finds, so the restore took three rounds.
+/// Restored 2026-08-10.
+///
+/// **If a sweep proposes deleting a row in this file, the sweep is wrong.** The
+/// per-owner test below is the statement of intent the census cannot see, and
+/// `scripts/jdk-only-dead-sweep.py --pinned` is how that intent is fed back to
+/// it.
 pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);

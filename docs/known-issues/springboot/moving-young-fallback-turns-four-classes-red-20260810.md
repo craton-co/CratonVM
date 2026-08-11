@@ -1,9 +1,16 @@
 # Four Spring Boot classes are red because of the JIT-triggered `[moving-young]` fallback, not because of the 300s budget
 
-**Status: OPEN — measured 2026-08-10. Supersedes the "margin exhausted",
-"recurring timeout" and "cumulative `ModifiedClassPathExtension` cost" framings
-of the classes below, whose own docs are retired to
-`fixed-suite-bugs/springboot/`.**
+**Status: all four classes are GREEN on the shipped default as of 2026-08-11 —
+see ["Re-measured on current dev under all three
+collectors"](#2026-08-11-re-measured-on-current-dev-under-all-three-collectors),
+which is the only table on this page taken under one protocol on an idle host.
+The mechanism below is confirmed, unfixed, and now GENERATIONAL-ONLY. Everything
+in the body of this page is still accurate about that collector and is kept for
+it; what changed is that the collector stopped being the default on 2026-08-10,
+so `default` in every older table below means `Generational`. Supersedes the
+"margin exhausted", "recurring timeout" and "cumulative
+`ModifiedClassPathExtension` cost" framings of the classes below, whose own docs
+are retired to `fixed-suite-bugs/springboot/`.**
 
 > **The conclusion holds; three of the four rows were re-measured after
 > `67fadfdd8` and their numbers changed.** The `f695ca875` binary the Flyway,
@@ -22,6 +29,77 @@ of the classes below, whose own docs are retired to
 > **#4096** and still never finishes. The escalation outlasts the budget that
 > kills the process, so absence of the warning in a timed-out log is not
 > evidence of absence — re-run with a real budget before ruling a class out.
+
+## 2026-08-11: re-measured on current dev under all three collectors
+
+**The collector this page calls "default" stopped being the default the day
+after these classes were measured.** `GcAlgorithm`'s default is `Zgc` as of
+2026-08-10 (`vm/src/config.rs`, and `zgc` joined the default feature set in
+`gc/Cargo.toml` and `vm/Cargo.toml` so a plain `cargo build` gets it). The
+switch was made partly ON this mechanism: the 651-class Tomcat three-way run
+found 62 of the 63 classes that are non-PASS under Generational while passing
+under both other backends log `[moving-young] fallback`
+(`../tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`). This page's own
+G1 numbers also predate `79c302916`, the fix for G1's unaligned TLAB carves.
+
+Windows, dev `892ab4f40`, one class at a time, `--Xmx 2g`, JIT on unless noted,
+same launch as `run-spring-boot-suite.ps1` (the three load-bearing env vars,
+`--stack-dump-on-timeout 0`, `--add-opens=java.base/java.net`). HotSpot control
+is Temurin 25.0.3 on the same host. `gen` is `-XX:+UseGenerationalGC`, the
+escape hatch this page's body describes; `zgc` is the bare default.
+
+| Class | HotSpot | **ZGC (the default)** | Generational | G1 |
+|---|---:|---|---|---|
+| Flyway | 8.1s ✓73/73 | **294.0s ✓73/73**, 0 fb | 160.1s ✓73/73, peak **#4** | 176.3s ✓73/73, 0 fb |
+| Integration | 9.0s ✓34/34 | **240.4s ✓34/34**, 0 fb | **no completion in 700s**, peak #2048 | 219.6s ✓34/34, 0 fb |
+| Quartz | 8.6s ✓45/45 | **151.6s ✓45/45**, 0 fb | **no completion in 700s**, peak #2048 | 185.8s ✓45/45, 0 fb |
+| Log4J2 | 3.8s ✓61/61 | **76.7s ✓61/61**, 0 fb | **no completion in 700s**, peak #2048 | 90.7s ✓61/61, 0 fb |
+
+- **All four pass under the shipped default, and all four are inside the 300s
+  per-class budget** (294.0 / 240.4 / 151.6 / 76.7). No `slowClasses` entry is
+  needed, which is the same conclusion this page reached by a different route.
+  Flyway at 294.0s has almost no margin and is the one to watch.
+- **G1 passes all four too**, which settles this page's explicit caveat — "before
+  G1 is proposed as the default for these classes, the same comparison should be
+  run on one of them". Run on all four, the synthetic-probe result generalised:
+  zero fallbacks, zero crashes, and on Flyway G1 is 1.7x faster than ZGC.
+- **The mechanism is intact on Generational**, and worse than the body records:
+  three of the four now reach peak **#2048** and do not finish in 700s. The
+  count remains the triage signal, and Flyway remains the harmless-end
+  calibration point at #4.
+- **The JIT is a net loss on these classes even under ZGC**, so the collector
+  switch masks the cost rather than removing it: Integration is 240.4s with the
+  JIT and **110.0s** under `--nojit` (2.2x), Quartz 151.6s vs 146.0s. That is
+  the `--nojit` A/B under ZGC this page lists as unestablished; it no longer
+  decides pass-vs-fail, only speed.
+- **Log4J2's 14 failures are gone.** The body records "61, 14 fail" as
+  pre-existing and environmental, identical on HotSpot and CratonVM `--nojit`.
+  On this host and this fixture the HotSpot control is 61/61 and so is every
+  CratonVM arm. Whatever caused them was fixed or was environmental to the
+  earlier host; the row should not be cited as a known-failing class.
+- **Five fallback reasons appear, not four.** Quartz's Generational run alone
+  logs `xt-helper-window-conservative-scan` (9), `innermost-rbp-belongs-to-
+  unguarded-callee` (4), `unregistered-jit-frame-on-stack` (2) and
+  `compiled-frame-oop-not-published` (1) — the last is not in the body's list.
+  Integration and Log4J2 are ~94% and 100% `innermost-rbp`. This strengthens
+  rather than weakens the body's argument that no per-reason repair reaches it.
+
+**What this does not say.** The mechanism is not fixed — it is no longer on the
+default path. Anyone running `-XX:+UseGenerationalGC` still gets all of the
+below, and the structural options at the end of this page are still the only
+things that would repair it. ZGC's own cost is documented in `docs/gc-tuning.md`
+(no compaction, ~1.5x heap on buffer-churning workloads).
+
+**Harness note, because it invalidated two earlier attempts at this table.**
+`$proc.Kill($true)` is a no-op on Windows PowerShell 5.1: a timed-out VM
+survives, and a Generational arm in a fallback spiral will happily burn a core
+for another half hour beside the next arm. `taskkill /T /F` by exact PID is the
+one that reaps it, and even that needs verifying — three of the four `gen` arms
+above had to be reaped by the driver after `taskkill` returned SUCCESS. The
+table above was taken by a single driver that refuses to start an arm while any
+`cratonvm` is alive. Both failure modes produced *plausible* numbers rather than
+obvious breakage (a HotSpot arm read 17.6s contaminated, 11.4s partly
+contaminated, 9.0s clean), so an idle-host assertion is not optional here.
 
 ## The measurement
 
@@ -129,6 +207,14 @@ wrong on both counts:
   about these classes is intrinsically too slow for the budget.
 
 No `slowClasses` entries were added.
+
+**Still the right call as of 2026-08-11, now for a second reason.** Under the
+shipped default all four finish inside the existing 300s budget with the JIT on
+(294.0 / 240.4 / 151.6 / 76.7s), so there is nothing for a raised budget to buy.
+The first bullet's reasoning was specific to Generational and is worth keeping
+straight: it is true there — those three fail rather than run long — and it
+would NOT have been true had the default merely been slow. Flyway's 294.0s is
+close enough to 300s to be worth a note if it ever flips to HANG.
 
 ## Mechanism, and why it is already known
 
@@ -295,16 +381,21 @@ rewrite a register-resident one"* (`gen_heap.rs`). Adding pinning there is not a
 hook; it is replacing the algorithm with a region- or block-based one, at which
 point it is G1.
 
-**So the route to un-redding these four classes is G1 maturity, not new pinning
-code.** That is a different and much better-scoped problem, and it is already
-owned elsewhere — G1 has its own open regressions (see the 3-way collector
-comparison recording G1 SIGSEGVs, and `fix/g1-fullsuite-regression-20260809`).
-This page's contribution is the measurement that says the collector question is
-the whole question.
+**So the route to un-redding these four classes is a collector that compacts
+around conservative roots, not new pinning code.** That is a different and much
+better-scoped problem, and it is already owned elsewhere — G1 has its own open
+regressions (see the 3-way collector comparison recording G1 SIGSEGVs, and
+`fix/g1-fullsuite-regression-20260809`). This page's contribution is the
+measurement that says the collector question is the whole question.
 
-Caveat: the table above is a synthetic probe with four peers parked under a
-depth-12 recursion. Before G1 is proposed as the default for these classes, the
-same comparison should be run on one of them.
+**Resolved 2026-08-11, and by the default rather than by G1.** The caveat this
+section closed on — "the table above is a synthetic probe with four peers parked
+under a depth-12 recursion; before G1 is proposed as the default for these
+classes, the same comparison should be run on one of them" — has been paid. Run
+on all four real classes, G1 passes every one with zero fallbacks, so the probe
+generalised. But the shipped default moved to ZGC on 2026-08-10 and it passes
+them too, so the route taken was the collector switch, not G1 maturity. See the
+2026-08-11 section at the top.
 
 ### Priced: pinning is CHEAP — ~50 conservative roots per parked peer, linear
 
@@ -472,12 +563,14 @@ discover. Validated against all five logs from this session.
   run weakens that: with the fabricated-connector defect gone, Quartz's failure
   is a plain `OutOfMemoryError` at fallback peak #16384, which the fallback
   alone explains. Not excluded, but no longer needed to explain any observed row.
-- **Whether Flyway ever belonged on this page.** Post-fix it is faster with the
-  JIT on than off and peaks at #4. It is kept here as the harmless-end
-  calibration point for the count, not as an affected class.
-- **Whether the `Log4J2` row moves too.** It was measured on `6365de194`, which
-  already carries `67fadfdd8`, so it is not confounded — but it was not re-run
-  with the rest of the post-fix table above.
+- **Whether Flyway ever belonged on this page.** ANSWERED 2026-08-11: no. It
+  passes 73/73 under all three collectors and peaks at #4 under Generational. It
+  is kept here as the harmless-end calibration point for the count, not as an
+  affected class.
+- ~~**Whether the `Log4J2` row moves too.**~~ ANSWERED 2026-08-11: it moves, and
+  further than expected. 61/61 with **zero** failures on the HotSpot control and
+  on every CratonVM arm, so the "14 fail" in the table above is stale as well as
+  the timing.
 - **Whether `--nojit` is a fix.** It is a diagnostic lever, not a remedy — it
   removes the trigger by removing the JIT.
 - **Host load.** Four unrelated CratonVM processes from other sessions were

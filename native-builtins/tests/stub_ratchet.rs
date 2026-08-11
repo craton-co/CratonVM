@@ -292,7 +292,41 @@ use cratonvm_types::compat::CompatibilityMode;
 ///    the same day. The corpus found two of the five; the other three were
 ///    latent and came from a class-origin census, because no vector builds an
 ///    atomic field updater.
-const BASELINE_SYNTHETIC_STUBS: usize = 923;
+/// # 923 -> 939, 2026-08-11 (putting back what a census could not adjudicate)
+///
+/// Sixteen, and this one moves the ratchet in the direction it exists to
+/// question, so the reasoning matters more than usual: **these sixteen are
+/// registrations that already existed and were deleted three weeks' worth of
+/// commits ago by mistake.** `dc55e8057` removed 179 rows its dead-sweep scored
+/// `method-nowhere` — the class is on the image, the method is not — and 24
+/// tests across two crates went red naming the triples they pin.
+///
+/// The sixteen that land here are the subset whose receiver class is on no
+/// supported image at all (`java/lang/Compiler`, `java/rmi/activation/*`,
+/// `sun/reflect/Reflection`, `java/net/InetAddressImplFactory`,
+/// `java/security/AccessController$1`), so `no_image_receiver` tags them
+/// `SyntheticStub` on the way back in. The other 49 restored rows are `Bridge`
+/// and show up on L6's ratchet instead.
+///
+/// What the census could not see, in three shapes:
+///
+///  * **A stand-in for a bytecode method is `method-nowhere` by construction.**
+///    Every `SharedSecrets` owner in `shared_secrets_bridge.rs` is one of the
+///    JDK's own anonymous `Java*Access` classes whose methods are ordinary
+///    bytecode; CratonVM registers stand-ins. Thirteen were deleted.
+///  * **A `<clinit>` no-op shim can never be declared native.**
+///    `Provider$ServiceKey.<clinit>` scores `method-nowhere` on every image
+///    there will ever be.
+///  * **A deliberate convenience overload is invisible.**
+///    `Preconditions.checkIndex(II)I` exists so `String.charAt` does not pay a
+///    Java frame per character; the JDK only declares the
+///    `BiFunction`-taking form. Its own test says so in a comment.
+///
+/// Measured: `native-builtins --lib` 3,380/22 -> **3,402/0** and `native-io
+/// --lib` 436/2 -> **438/0**; the `--jdk-only` corpus goes 52 passed to **53**
+/// and compatible 35 to **36**, with the same six pre-existing failures. So the
+/// rise buys back two crates of unit tests and two corpus vectors.
+const BASELINE_SYNTHETIC_STUBS: usize = 939;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
