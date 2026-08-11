@@ -4992,10 +4992,20 @@ fn j25_sts_fork_common(
     descriptor: &str,
 ) -> MethodCallResult {
     let subtask_cls = "java/util/concurrent/StructuredTaskScope$Subtask";
+    // The scope AND the task are pinned across the subtask allocation. Both are
+    // read after it — the scope for its state and counters, the task as the
+    // receiver of the invoke — and an allocation is a collection point. This is
+    // the failure that leaves a counter incremented on the object that used to be
+    // at that address.
+    let this_pin = ctx.pin_native_root(this);
+    let task_pin = task.map(|t| (ctx.pin_native_root(t), t));
     // 3 slots: state, result, exception. `class_manager.rs` fabricates Subtask
     // at `instance_fields(5)`; `try_alloc_concurrent_synthetic` clamps up to the
     // declared width, so asking for 3 is safe and asking for more is not.
     let subtask = try_alloc_concurrent_synthetic(ctx, subtask_cls, 3)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let task = task_pin.map(|(h, t)| ctx.read_native_pin(h, t));
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_UNAVAILABLE));
     ctx.set_field(subtask, 1, Value::Object(None));
     if ctx.object_num_fields(subtask) > 2 {
@@ -5160,8 +5170,14 @@ fn j25_sts_open_with_config(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(f))) => Some(*f),
         _ => None,
     };
+    // Read the joiner's kind BEFORE anything allocates — it is an Int, so once
+    // it is out of the object no collection can invalidate it, and that removes
+    // the joiner from everything below.
     let kind = j25_scope_kind_for_joiner(ctx, joiner);
 
+    // The Function is pinned across the Configuration allocation: it is the
+    // receiver of the invoke below, and the allocation is a collection point.
+    let fn_pin = config_fn.map(|f| (ctx.pin_native_root(f), f));
     // Build the default Configuration first, so the Function receives the same
     // shape the JDK hands it.
     let config = try_alloc_concurrent_synthetic(
@@ -5169,6 +5185,10 @@ fn j25_sts_open_with_config(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         "java/util/concurrent/StructuredTaskScope$Configuration",
         J25_CONFIG_NUM_FIELDS,
     )?;
+    let config_fn = fn_pin.map(|(h, f)| ctx.read_native_pin(h, f));
+    if let Some((h, _)) = fn_pin {
+        ctx.unpin_native_roots(h);
+    }
     ctx.set_field(config, J25_CONFIG_NAME, Value::Object(None));
     ctx.set_field(config, J25_CONFIG_THREAD_FACTORY, Value::Object(None));
     // `Object(None)`, NOT `Long(0)`: this slot holds a `java.time.Duration`
@@ -5202,11 +5222,20 @@ fn j25_sts_open_with_config(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         };
     }
 
+    // The name is a String REFERENCE and the scope allocation below can collect,
+    // so it is pinned across it and re-read from the pin. Reading it first and
+    // storing it afterwards without the pin is the native stale-local family:
+    // the write lands, silently, pointing at where the String used to be.
     let name = ctx.get_field(effective, J25_CONFIG_NAME);
+    let name_pin = pinned_object_value(ctx, name);
     let scope = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/StructuredTaskScope", 8)?;
+    let name = read_pinned_object_value(ctx, name_pin, name);
     j25_sts_init_fields(ctx, scope, kind);
     if ctx.object_num_fields(scope) > J25_STS_NAME {
         ctx.set_field(scope, J25_STS_NAME, name);
+    }
+    if let Some((h, _)) = name_pin {
+        ctx.unpin_native_roots(h);
     }
     Ok(Some(Value::Object(Some(scope))))
 }
@@ -5266,11 +5295,20 @@ fn j25_config_copy_with(
     slot: usize,
     value: Value,
 ) -> MethodCallResult {
+    // BOTH the receiver and the incoming value are pinned across the allocation.
+    // The receiver is read from AFTER the allocation and the value is written
+    // after it, so an unpinned copy of either is the native stale-local family —
+    // and the failure is silent both ways: a stale receiver copies whatever now
+    // occupies its old address, a stale value writes a pointer to nothing.
+    let this_pin = ctx.pin_native_root(this);
+    let value_pin = pinned_object_value(ctx, value);
     let copy = try_alloc_concurrent_synthetic(
         ctx,
         "java/util/concurrent/StructuredTaskScope$Configuration",
         J25_CONFIG_NUM_FIELDS,
     )?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let value = read_pinned_object_value(ctx, value_pin, value);
     for s in [J25_CONFIG_NAME, J25_CONFIG_THREAD_FACTORY, J25_CONFIG_TIMEOUT] {
         let v = if ctx.object_num_fields(this) > s {
             ctx.get_field(this, s)
@@ -5280,6 +5318,10 @@ fn j25_config_copy_with(
         ctx.set_field(copy, s, v);
     }
     ctx.set_field(copy, slot, value);
+    // `unpin_native_roots` releases from its handle ONWARD, so the earlier of the
+    // two handles frees both — pinning the receiver first is what makes one call
+    // sufficient.
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(copy))))
 }
 
