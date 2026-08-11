@@ -193,6 +193,41 @@ proxy: a higher threshold compiles fewer methods, and compiled methods were what
 was leaking monitors. Re-measure it before treating it as evidence about
 admission.
 
+## The second workload, re-measured — and it was never this page's defect
+
+The page gained a section on 2026-08-10 (`ee4ec2c1f`) reporting the same arm
+ordering on `org.h2.test.db.TestTransaction.testMergeUsing` — default-threshold
+JIT worst at 108 ms, `--nojit` 92 ms, near-nothing-compiled best at 87 ms
+against HotSpot's 22 — and the correctness consequence that at H2's own
+`TestAll.lockTimeout = 50` ms the losing connection's whole MERGE batch dies and
+the test asserts `Expected: 100 actual: 50`.
+
+Re-measured on the fixed binary with
+`apps/h2database-suite-runner/probes/MergeLockBudgetProbe contend 50 4`, three
+reps, losing-thread batch ms:
+
+| arm | batch ms | verdict |
+|---|---|---|
+| HotSpot 25 | 4–27 | **4/4 OK** |
+| CratonVM before, JIT | 141–282 | FAIL |
+| CratonVM after, JIT | 111–280 | FAIL |
+| CratonVM after, `--nojit` | 107–242 | FAIL |
+
+**The fix does not move this workload, and it was not supposed to.** The
+JIT-vs-`--nojit` gap here is ~10–15%, not the 52–83% this page was about, and it
+is the same before and after — because the leak's cost is quadratic in *distinct
+objects locked from compiled code*, and this probe runs for about a second over
+a handful of monitors. Nothing accumulates.
+
+What remains is a plain throughput gap of ~5–10x HotSpot, and it already has an
+owner that characterises it correctly and independently:
+`docs/known-issues/h2/h2-update-path-throughput-20260802.md`, which states in as
+many words that **`testMergeUsing`'s 50 merges never warm up at all, which is why
+its failure is identical with and without the JIT**. That sentence and this
+measurement agree, and both say the class is not evidence about tier-up
+admission. The second-workload section is therefore recorded here as re-measured
+and reattributed, not carried forward as an open residual of this page.
+
 ## Gates
 
 `regression-suite/bridge-ratchet.sh` on the fixed binary: **BRIDGE-RATCHET PASS**
