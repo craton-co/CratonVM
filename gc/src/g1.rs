@@ -269,6 +269,32 @@ pub fn kept_seeds_rejected() -> usize {
     KEPT_SEED_REJECTED.load(Ordering::Relaxed)
 }
 
+/// How many CSet-resident ROOTS the evacuator was handed that are not the start
+/// of a live object.
+///
+/// The root array is deliberately over-approximate: `collect_roots`' operand-
+/// stack filter is `is_heap_addr` (a RANGE check), widened from the strict
+/// `is_object_address` on 2026-08-04 because the strict probe dropped genuine
+/// young / mid-initialisation roots. A `long` on the operand stack, or a
+/// computed interior address, whose bits land in the heap range is therefore a
+/// root. That is safe for a non-moving sweep, where a false positive only
+/// over-retains — the moving collectors have to screen it themselves.
+pub static NON_OBJECT_ROOT_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// How many of [`NON_OBJECT_ROOT_SEEN`] were nevertheless COPIED to a new
+/// address by `evacuate_object` — i.e. how many times the evacuator computed a
+/// size from garbage, memcpy'd that many bytes, installed a forwarding entry
+/// for the address, and rewrote the root to point at the copy.
+pub static NON_OBJECT_ROOT_COPIED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`NON_OBJECT_ROOT_SEEN`] and [`NON_OBJECT_ROOT_COPIED`].
+pub fn non_object_root_counts() -> (usize, usize) {
+    (
+        NON_OBJECT_ROOT_SEEN.load(Ordering::Relaxed),
+        NON_OBJECT_ROOT_COPIED.load(Ordering::Relaxed),
+    )
+}
+
 /// Which step of [`G1Collector::classify_candidate_header`] decided an address
 /// is not the start of a live object.
 ///
@@ -2736,6 +2762,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -2749,6 +2776,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, young): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -3210,6 +3248,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -3223,6 +3262,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, mixed): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -4590,6 +4640,25 @@ impl G1Collector {
             }
             None => format!("verdict={verdict:?} region=none"),
         }
+    }
+
+    /// Count (and, for the first few, describe) a CSet-resident root that is not
+    /// the start of a live object. Returns whether it IS one, so the caller can
+    /// report what the evacuator then did with it.
+    ///
+    /// Measurement only — the caller's behaviour is unchanged.
+    fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
+        if self.candidate_header_is_plausible(regions, addr) {
+            return true;
+        }
+        let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] CSet ROOT is not an object (#{n}): addr=0x{addr:x} {}",
+                self.describe_rejected_address(regions, addr),
+            );
+        }
+        false
     }
 
     /// Where `addr` falls in its region's OWN object grid, walked linearly from
