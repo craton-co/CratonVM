@@ -153,6 +153,11 @@ pub(crate) mod rootprof {
                 JITPROBE_CALLS.load(Relaxed),
                 JITPROBE_WORDS.load(Relaxed),
             );
+            let c = scan_caller_counts();
+            eprintln!(
+                "[rootprof] scan_active_jit_frames by caller: gc-roots={} safepoint={} blocked-deposit={}",
+                c[0], c[1], c[2],
+            );
         }
     }
 
@@ -163,6 +168,33 @@ pub(crate) mod rootprof {
         }
         JITPROBE_WORDS.fetch_add(words, Relaxed);
         JITPROBE_CALLS.fetch_add(1, Relaxed);
+    }
+
+    /// Per-CALLER tally for `conservative_roots::scan_active_jit_frames`.
+    ///
+    /// Three call sites drive it and they run at rates three orders of
+    /// magnitude apart — `collect_roots` once per collection, the safepoint
+    /// `update_root_snapshot`, and `deposit_root_snapshot_inner` on every
+    /// blocked-region entry. Sampling cannot separate them here (no frame
+    /// pointers, dwarf unwinding fails on this VM's stack depths) and reading
+    /// the call sites did not either. Index: 0 = gc-roots, 1 = safepoint,
+    /// 2 = blocked-deposit.
+    pub static SCAN_BY_CALLER: [AtomicU64; 3] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+    pub fn note_scan_caller(which: usize) {
+        if on() {
+            SCAN_BY_CALLER[which].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `[gc-roots, safepoint, blocked-deposit]` call counts.
+    pub fn scan_caller_counts() -> [u64; 3] {
+        [
+            SCAN_BY_CALLER[0].load(Relaxed),
+            SCAN_BY_CALLER[1].load(Relaxed),
+            SCAN_BY_CALLER[2].load(Relaxed),
+        ]
     }
 }
 

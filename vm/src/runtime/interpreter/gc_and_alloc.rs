@@ -4130,6 +4130,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // snapshot paths, both of which already invalidate before publishing.
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let jit_scan_start = snapshot.len();
+        crate::memory::native_roots::rootprof::note_scan_caller(1); // safepoint
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut snapshot);
         // G1 pin-in-place, cross-thread half: the snapshot keeps these
         // conservatively-discovered objects ALIVE, but under G1 (a moving

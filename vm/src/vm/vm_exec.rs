@@ -5267,6 +5267,7 @@ impl<'a> NativeContextImpl<'a> {
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
             let jit_scan_start = snapshot.len();
+            crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.mem.heap,
                 &mut snapshot,
