@@ -333,6 +333,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dispatch-tally", on_key: Some("CRATONVM_DBG_DISPATCH_TALLY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dopriv", on_key: Some("CRATONVM_DBG_DOPRIV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dropped-stubs", on_key: Some("CRATONVM_DBG_DROPPED_STUBS"), off_key: None, off_word: None },
+    // Names every "already defined" defineClass backend error and the verdict
+    // `classify_duplicate_define` gave it. Declared rather than left to a live
+    // getenv so `CRATONVM_DBG=dupdef` reaches it and a test can arrange it:
+    // both arms print, which is how a probe proves it exercised the one it claims.
+    E { group: Group::DBG, token: "dupdef", on_key: Some("CRATONVM_DBG_DUPDEF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dump-jit", on_key: Some("CRATONVM_DBG_DUMP_JIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupcall-filter", on_key: Some("CRATONVM_DBG_DUPCALL_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass", on_key: Some("CRATONVM_DBG_DUPCLASS"), off_key: None, off_word: None },

@@ -4202,10 +4202,20 @@ fn classify_duplicate_define(
     if internal_name.is_empty() || !msg.contains("already defined") {
         return DuplicateDefine::NotDuplicate;
     }
+    // `CRATONVM_DBG_DUPDEF=1` -- name every "already defined" backend error and
+    // the verdict it got. This exists because the two verdicts are otherwise
+    // indistinguishable from outside: a workload that never reaches
+    // `ServeExisting` proves nothing about the tolerance still working, and one
+    // that never reaches `SameLoaderObject` proves nothing about the refusal.
+    // Both arms print, so a probe can assert it exercised the arm it claims to.
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPDEF").is_some();
     // THE one question that may raise: did this exact object define it?
     if crate::classloader::class_defined_by_this_loader_object(ctx, loader_obj, internal_name)
         .is_some()
     {
+        if dbg {
+            eprintln!("[DUPDEF] SameLoaderObject {internal_name} loader_id={loader_id}");
+        }
         return DuplicateDefine::SameLoaderObject;
     }
     // A namespace hit whose recorded defining loader IS this object is the same
@@ -4216,9 +4226,19 @@ fn classify_duplicate_define(
             let same = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
                 .is_some_and(|def| def.as_ptr() == loader_obj.as_ptr());
             if same {
+                if dbg {
+                    eprintln!(
+                        "[DUPDEF] SameLoaderObject(via namespace) {internal_name} loader_id={loader_id}"
+                    );
+                }
                 return DuplicateDefine::SameLoaderObject;
             }
             // A namespace hit this loader did not define: the collision shape.
+            if dbg {
+                eprintln!(
+                    "[DUPDEF] ServeExisting(namespace collision) {internal_name} loader_id={loader_id}"
+                );
+            }
             crate::classloader::register_defining_loader(
                 ctx.vm_identity(),
                 class_id.as_u32(),
@@ -4228,8 +4248,18 @@ fn classify_duplicate_define(
         }
     }
     match crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name) {
-        Some(mirror) => DuplicateDefine::ServeExisting(mirror),
-        None => DuplicateDefine::NotDuplicate,
+        Some(mirror) => {
+            if dbg {
+                eprintln!("[DUPDEF] ServeExisting(visible) {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::ServeExisting(mirror)
+        }
+        None => {
+            if dbg {
+                eprintln!("[DUPDEF] NotDuplicate {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::NotDuplicate
+        }
     }
 }
 
