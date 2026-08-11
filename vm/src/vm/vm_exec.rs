@@ -16225,8 +16225,23 @@ pub fn invoke_or_native(
             args.len()
         );
     }
-    // Skip expensive class loading for obviously invalid class names (e.g. "<unknown class 0>").
-    if class_name.contains('<') || class_name.contains(' ') {
+    // Skip expensive class loading for the VM's own placeholder names. Every
+    // one of them is built here and every one starts with '<' — "<unknown
+    // class {id}>", "<unknown class_id={id}>" — so '<' alone catches the set.
+    //
+    // A SPACE used to be part of this test and it is not a marker of anything:
+    // JVMS 4.2.1 forbids only '.', ';', '[' and '/' in a binary name, and
+    // Kotlin mints classes with spaces routinely — every anonymous object
+    // inside a backtick-quoted test method lands in a class named after that
+    // method. Refusing them here made a compiled virtual call on such a
+    // receiver raise NoSuchMethodError instead of dispatching, which
+    // `ParameterizedTypeReference.equals` then reported as "not equal":
+    // RestOperationsExtensionsTests, one test, JIT-only (--nojit passes, and
+    // so does CRATONVM_JIT_DENY=kotlin/jvm/internal/Intrinsics.areEqual).
+    // Two instances of the SAME class, same class bytes, differing only in a
+    // space in the binary name, compare equal 200000/200000 with the plain
+    // name and 1000/200000 with the spaced one.
+    if class_name.contains('<') {
         // Optional operator diagnostic: surface exactly which call had no
         // implementation. Gated on CRATONVM_TRACE_UNIMPLEMENTED so it never
         // spams normal runs. Uses var_os directly (no new env_cache accessor).
@@ -27413,12 +27428,30 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A space in a binary name is LEGAL (JVMS 4.2.1 forbids only `.`, `;`,
+    /// `[` and `/`), so this must not short-circuit on the name. It still
+    /// errors — there is no such class to load — but for that reason and not
+    /// because the name looked odd. The distinction is the whole bug: Kotlin
+    /// names every anonymous object inside a backtick-quoted test method after
+    /// that method, spaces included, and short-circuiting turned a compiled
+    /// virtual call on one into `NoSuchMethodError`.
     #[test]
-    fn invoke_or_native_class_with_space() {
+    fn invoke_or_native_class_with_space_is_a_normal_lookup() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let result = invoke_or_native(&shared, &mut thread, "invalid class", "method", "()V", &[]);
+        let result = invoke_or_native(&shared, &mut thread, "a class", "method", "()V", &[]);
+        // Absent class -> still an error, but reached through the loader.
         assert!(result.is_err());
+        // The placeholder form keeps its short-circuit.
+        let placeholder = invoke_or_native(
+            &shared,
+            &mut thread,
+            "<unknown class 7>",
+            "method",
+            "()V",
+            &[],
+        );
+        assert!(placeholder.is_err());
     }
 
     // =====================================================================
