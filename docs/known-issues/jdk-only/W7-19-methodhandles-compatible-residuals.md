@@ -439,6 +439,14 @@ Rebuild, then run in this order. The first two are the claims; the third and
 fourth are the guards.
 
 ```sh
+# 0. RECOMPILE FIRST. `regression-suite/build` is a gitignored artifact
+#    directory that survives a branch switch, so a direct `-cp
+#    regression-suite/build` run will otherwise execute the PREVIOUS
+#    RJdkHandles.class and report the old vector's one-bit result as if it
+#    were this one's. (run.sh does its own `rm -rf $BUILD`; a hand-run does
+#    not.)
+javac -d regression-suite/build regression-suite/src/RJdkHandles.java
+
 # 1. Compatible. Was: 13 of 37 steps failed, named in the AssertionError.
 cratonvm --real-jdk --java-home "<jdk-25-home>" -cp regression-suite/build RJdkHandles
 #    Expect: PASS RJdkHandles (316 checks, 37 steps).

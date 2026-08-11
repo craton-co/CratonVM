@@ -10277,7 +10277,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                             .first()
                             .is_some_and(|p| p.starts_with('L') || p.starts_with('['));
                         if !leading_is_reference {
-                            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                            return Err(RuntimeError::IllegalArgumentException {
                                 message: "no leading reference parameter".to_string(),
                             }
                             .into());
