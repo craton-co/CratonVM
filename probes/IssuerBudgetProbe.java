@@ -12,7 +12,7 @@ import org.springframework.security.oauth2.jwt.JwtDecoders;
  * What read-timeout budget does Spring Security's issuer-location discovery
  * actually apply, and is it the same on HotSpot and CratonVM?
  *
- * <p>{@code oauth2-issuer-uri-mock-server-read-timeout-flake-20260803.md} measured
+ * <p>{@code fixed-suite-bugs/springboot/oauth2-issuer-uri-mock-server-read-timeout-flake-FIXED-20260811.md} measured
  * `configured=500ms` from inside CratonVM's `http_url_connection.rs` and could not
  * identify which client set it -- the VM-generated Java stack blamed
  * `SimpleClientHttpRequestFactory.prepareConnection`, which is never called. The
