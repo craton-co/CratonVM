@@ -6971,7 +6971,12 @@ fn jit_typecheck_trace(
     stage: &str,
     target: Option<ClassId>,
 ) {
-    let Some(filter) = cratonvm_types::flags::loader_flags().dbg_typecheck_filter.as_deref() else {
+    use std::sync::OnceLock;
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    let filter = FILTER
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_TYPECHECK_FILTER").ok())
+        .as_deref();
+    let Some(filter) = filter else {
         return;
     };
     if !class_name.contains(filter) {
