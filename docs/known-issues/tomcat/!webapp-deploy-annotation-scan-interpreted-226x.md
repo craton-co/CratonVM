@@ -8,6 +8,111 @@
 | **CratonVM** | PASS since 2026-08-06 on the two classes this doc named; still slow (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
+> **Update 2026-08-11 — every `--stack-sample-ms` profile on this page has
+> been read wrong, and the correction moves the target. Also: the 08-11
+> `JarFile` fix does NOT move this page, and criterion 2 is re-verified.**
+>
+> ### The reading error: `pc=0 last_pc=0` is the INVOKE, not the callee
+>
+> The sampling hook lives at the top of the interpreter's dispatch loop
+> (`vm/src/runtime/interpreter.rs`, the `stack_dump_pending()` block). An
+> `invokevirtual` resolves, coerces arguments, pushes the callee frame and
+> `continue`s — so the **first loop iteration that can observe a re-armed
+> sample request after an invoke sees the CALLEE, at `pc=0 last_pc=0`, having
+> executed nothing.** The invoke operation's own cost is therefore reported
+> against the callee's *entry*. Aggregating leaf frames by method — which is
+> what this page has done three times — files that cost under the callee's
+> name, where it reads as "this body is slow".
+>
+> Calibrated, not argued. `probes/InvokeAttributionProbe.java` puts a
+> three-bytecode `callee()` behind an `invokevirtual` in a loop, so nearly all
+> of the loop's cost is invoke overhead **by construction**, and prints the
+> per-iteration delta against the same loop with the call written out:
+>
+> | | |
+> |---|---|
+> | `withCall` | 388–512 ns/iteration |
+> | `noCall` (control) | 94–124 ns/iteration |
+> | **invoke delta** | **290–417 ns per interpreted invoke** |
+> | samples at `callee` `pc=0 last_pc=0` | **37 of 69 = 53.6%** |
+> | samples anywhere in `callee`'s body | 1 |
+>
+> A body-weighted profiler would put ~3/14 of that loop in `callee`. The entry
+> bucket alone takes 54%, and it tracks the timed invoke share. Confirmed.
+>
+> ### What this page's profile actually says
+>
+> Re-taken 2026-08-11 on `dev` `08c8e1891`, Windows, `AnnotationScanCostProbe`
+> over all 35 `output/build/lib` jars (38 s, `--stack-sample-ms 100`, 373 leaf
+> samples), split by whether the frame had executed anything:
+>
+> | bucket | samples | share |
+> |---|---:|---:|
+> | **`pc=0 last_pc=0` — the invoke that pushed the frame** | **197** | **52.8%** |
+> |   …of which `ConstantPool.getConstant(I,Class)` | 147 | 39.4% |
+> |   …of which `BufferedInputStream.read` | 34 | 9.1% |
+> | in-body, `BufferedInputStream.read1` | 83 | 22.3% |
+> | in-body, `ConstantPool.getConstant` | 37 | 9.9% |
+> | in-body, `ConstantPool.<init>` | 23 | 6.2% |
+>
+> **Over half of this workload's interpreted time is the invoke operation**,
+> and one call-site family — BCEL's per-constant-pool-access
+> `getConstant(int, Class)` — is 39% of it.
+>
+> That re-reads both profiles this page argued from:
+>
+> * § Handoff 2026-08-07's "**55.21% `ConstantPool.getConstant`**" is not
+>   `getConstant`'s body. It is the cost of *invoking* it, 1.77 M times.
+> * The 2026-08-06 update's "**78.3% of all interpreted time in five
+>   `BufferedInputStream` bodies**" is the same shape, and its conclusion —
+>   "none of them can compile … that is why every tier-up lever moved nothing"
+>   — reached the right verdict for the wrong reason. Compiling those bodies
+>   would not have helped, because the time is not in them.
+>
+> It also explains the negative result this page found most interesting: every
+> lever that compiled or admitted a *callee* moved nothing, because the cost is
+> **reaching** the callee. `CRATONVM_JIT=sync-methods`, `loop-work-tierup` and
+> `special-tierup` were all aimed one frame too deep.
+>
+> What is left is the interpreted invoke path itself, at ~350 ns against
+> HotSpot's interpreter at ~4 ns for the same operation. § The number that
+> actually sizes this reached ~260–490 ns independently, and is the one row on
+> this page that was already measuring the right thing. This is criterion 3's
+> project, now with a profile that points straight at it and an 8-second A/B
+> harness (`InvokeAttributionProbe`) to price candidate changes without paying
+> for a 35-second scan.
+>
+> ### The 2026-08-11 `JarFile`-accessor fix does not move this page
+>
+> Recorded so it is not assumed.
+> `fixed-bugs/jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`
+> removed a `std::fs::metadata` (20–54 us on Windows) from every `JarFile`
+> accessor call — worth 5–18x on a jar walk and −27% on
+> `TomcatServletWebServerFactoryTests`. On this probe it is **inside the
+> noise**. Four interleaved passes, arm order reversed on even passes, HotSpot
+> control every pass, `taglibs-standard-impl`, us/class:
+>
+> | arm | p1 | p2 | p3 | p4 | mean |
+> |---|---:|---:|---:|---:|---:|
+> | before (`dev` `e05bbe374`) | 854.1 | 730.8 | 593.0 | 668.6 | **711.6** |
+> | after (`dev` `08c8e1891`) | 876.3 | 680.0 | 524.6 | 850.8 | **732.9** |
+> | HotSpot 25 | 6.7 | 12.6 | 17.0 | 19.9 | **14.1** |
+>
+> Total overlap in both orders. The reason is structural rather than
+> surprising: the probe reports `parse` as `read+parse` minus `read`, and the
+> per-entry `getInputStream` the fix speeds up is paid in **both** terms, so it
+> cancels out of the headline. A real deploy cancels nothing, which is why the
+> same fix is large there and absent here — one more reason not to use this
+> probe as the profile of record (§ Methodological finding).
+>
+> ### Criterion 2, re-verified
+>
+> 711.6 / 732.9 us/class against the 813.5 us/class band set on 2026-08-06:
+> **within band, no regression.** The cross-VM ratio reads ~50x here against
+> the ~116x recorded on Azure, which is a host difference (this host's HotSpot
+> column is 6.7–19.9 us/class) and not progress. Take the
+> CratonVM-vs-CratonVM column, as § Measuring this at all already says.
+
 > **Update 2026-08-07 — I tried to close this and could not. Here is the
 > measured ceiling, three corrections to what is written below, and a re-scope.**
 >
