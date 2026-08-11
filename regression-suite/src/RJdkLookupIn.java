@@ -59,6 +59,9 @@ public class RJdkLookupIn {
      * answers 31 and 0 to those two; this one answers 31 and 32.
      */
     public static class PublicNested {
+        public static int publicOfPublicNested() {
+            return 5;
+        }
     }
 
     private static int secret() {
@@ -223,16 +226,26 @@ public class RJdkLookupIn {
         Lookup zero = MethodHandles.lookup().dropLookupMode(Lookup.PUBLIC);
         boolean refusedPublic = false;
         try {
-            zero.findStatic(RJdkLookupInMate.class, "publicStatic", i);
+            zero.findStatic(PublicNested.class, "publicOfPublicNested", i);
         } catch (IllegalAccessException e) {
             refusedPublic = true;
         }
         check(refusedPublic, "a 0-mode lookup must be refused even a PUBLIC member");
 
-        // 32 (publicLookup): public only, and only in exported packages.
+        // 32 (publicLookup): public members of PUBLIC classes only. The
+        // package-private cousin is unreachable from it even though the member
+        // is declared public — accessibility is the CLASS's, not the member's.
         check(((int) MethodHandles.publicLookup()
-                .findStatic(RJdkLookupInMate.class, "publicStatic", i).invokeExact()) == 5,
-                "publicLookup reaches a public static");
+                .findStatic(PublicNested.class, "publicOfPublicNested", i).invokeExact()) == 5,
+                "publicLookup reaches a public static of a public class");
+        boolean refusedNonPublicClass = false;
+        try {
+            MethodHandles.publicLookup().findStatic(RJdkLookupInMate.class, "publicStatic", i);
+        } catch (IllegalAccessException e) {
+            refusedNonPublicClass = true;
+        }
+        check(refusedNonPublicClass,
+                "publicLookup must be refused a public member of a package-private class");
         boolean refusedPrivate = false;
         try {
             MethodHandles.publicLookup().findStatic(RJdkLookupIn.class, "secret", i);
