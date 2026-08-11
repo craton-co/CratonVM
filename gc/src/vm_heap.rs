@@ -1534,6 +1534,37 @@ impl VmHeap {
         }
     }
 
+    /// Bytes currently COMMITTED for the Java heap — backing storage the VM
+    /// holds, whether or not anything lives in it. `Runtime.totalMemory()` and
+    /// the JMX heap `MemoryUsage.getCommitted()`; `freeMemory()` is this minus
+    /// [`Self::allocated_bytes`].
+    ///
+    /// **It must not track live bytes.** HotSpot's `totalMemory()` moves only
+    /// when the heap grows or shrinks, and callers rely on that: H2's
+    /// `Utils.collectGarbage()` has historically been written as "gc until
+    /// `totalMemory()` stops changing", so a value that moved on every
+    /// collection would turn one `System.gc()` into a fixed run of full ones.
+    /// Every arm below is therefore a CAPACITY, not an occupancy:
+    ///
+    /// * Generational — both young semi-spaces plus the old generation
+    ///   (`committed_heap_bytes`). This is the one arm that can move at all,
+    ///   and only when an arena actually grows.
+    /// * G1 — the single arena every region is carved from, allocated once and
+    ///   never reallocated.
+    /// * ZGC — the arena envelope captured at construction.
+    ///
+    /// The two fixed arms are not a placeholder: those collectors really do
+    /// commit their whole heap up front, so reporting it is the honest answer
+    /// and matches what `maxMemory()` already reports for them.
+    pub fn committed_bytes(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.committed_heap_bytes(),
+            VmHeap::G1(h) => h.committed_bytes(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.committed_bytes(),
+        }
+    }
+
     /// Return stable generational card-table metadata for JIT inline barriers.
     ///
     /// G1 and ZGC require collector-specific remembered-set/barrier protocols,
@@ -3350,6 +3381,58 @@ mod concurrent_mark_controller_tests {
             0,
             "sub-megabyte headroom must read as zero free MB"
         );
+    }
+
+    /// `committed_bytes` is a CAPACITY, and `Runtime.totalMemory()` rests on
+    /// that: allocating must move `allocated_bytes` and leave `committed_bytes`
+    /// alone. A version that tracked occupancy would report a `totalMemory()`
+    /// that changes on every collection, which callers written as "gc until
+    /// totalMemory settles" read as "the heap is still resizing".
+    #[test]
+    fn committed_bytes_is_capacity_not_occupancy() {
+        for backend in [GcBackend::Generational, GcBackend::G1] {
+            let heap = VmHeap::new(backend, 64 * 1024 * 1024);
+            let committed_before = heap.committed_bytes();
+            let allocated_before = heap.allocated_bytes();
+            assert!(
+                committed_before > 0,
+                "{backend:?}: committed heap must be positive"
+            );
+            for _ in 0..4000 {
+                let _ = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8);
+            }
+            // Non-vacuity: if the allocations did not register, the equality
+            // below would hold for the wrong reason.
+            assert!(
+                heap.allocated_bytes() > allocated_before,
+                "{backend:?}: the fixture must actually allocate"
+            );
+            assert_eq!(
+                heap.committed_bytes(),
+                committed_before,
+                "{backend:?}: committed heap moved while only occupancy changed"
+            );
+            assert!(
+                heap.committed_bytes() >= heap.allocated_bytes(),
+                "{backend:?}: committed heap is below what is allocated in it"
+            );
+        }
+    }
+
+    /// The old `Runtime.totalMemory()` answered a hardcoded 64 MiB regardless
+    /// of `-Xmx`. Two heaps sized an order of magnitude apart must not report
+    /// the same committed bytes.
+    #[test]
+    fn committed_bytes_follows_the_configured_heap_size() {
+        for backend in [GcBackend::Generational, GcBackend::G1] {
+            let small = VmHeap::new(backend, 8 * 1024 * 1024).committed_bytes();
+            let large = VmHeap::new(backend, 128 * 1024 * 1024).committed_bytes();
+            assert!(
+                large > small,
+                "{backend:?}: committed heap did not follow the configured size \
+                 ({small} vs {large})"
+            );
+        }
     }
 
     #[test]
