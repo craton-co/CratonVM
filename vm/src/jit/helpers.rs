@@ -4717,6 +4717,18 @@ fn stash_jit_monitor_error(
 /// JIT monitorexit helper. A successful thin unlock is one release CAS. An
 /// ownership failure becomes the ordinary catchable
 /// `IllegalMonitorStateException` and is reported with the common JIT sentinel.
+///
+/// Releases through [`crate::vm::vm_exec::monitor_exit_and_retract_jmx`], NOT
+/// through a bare `monitors.exit`. `jit_monitor_enter` reaches
+/// `complete_jmx_monitor_enter` by way of `monitor_enter_blocking`, so a
+/// compiled `monitorenter` publishes into the thread's `jmx_locked_monitors`
+/// exactly as the interpreter's does; a bare release here left every one of
+/// those publishes standing. The list is membership-scanned on each
+/// acquisition, so it grew to every distinct object the thread had ever locked
+/// from compiled code and made `monitorenter` quadratic — on `ZipContentTests`,
+/// `complete_jmx_monitor_enter` + `remove_jmx_locked_monitor` were **54% of the
+/// run**, which is the bulk of the JIT's CPU deficit against `--nojit` on
+/// lock-dense code. The entries also pinned their objects as GC roots forever.
 pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 {
@@ -4728,7 +4740,7 @@ pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
         return i64::MIN;
     };
     let obj = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
-    match vm.threads.monitors.exit(obj, thread.thread_id) {
+    match crate::vm::vm_exec::monitor_exit_and_retract_jmx(vm, obj, thread.thread_id) {
         Ok(()) => 1,
         Err(err) => {
             stash_jit_monitor_error(vm, thread, err);
@@ -17072,5 +17084,165 @@ mod jit_native_dispatch_profile {
                 recv,
             );
         });
+    }
+}
+
+/// The JIT's `monitorenter`/`monitorexit` helpers must leave the thread's JMX
+/// owned-monitor set exactly as they found it.
+///
+/// This is a performance test wearing a correctness test's clothes, and the
+/// correctness half is real: `getLockedMonitors()` must not name a monitor the
+/// thread released, and the list is a GC root set, so a stale entry pins its
+/// object for the life of the thread.
+///
+/// The performance half is why it exists. `ThreadRegistry::jmx_locked_monitors`
+/// is **membership-scanned linearly on every acquisition**, so a publish with no
+/// matching retract does not cost one wasted slot — it grows the list to every
+/// distinct object the thread has ever locked and makes `monitorenter` O(that).
+/// `jit_monitor_exit` released the monitor and stopped there, and on
+/// `ZipContentTests` the two scan functions measured **54% of the whole JIT run**
+/// — the bulk of the JIT's CPU deficit against `--nojit` on lock-dense code.
+///
+/// The same defect had already been found and fixed once, at a different exit
+/// site, where it was 14.9% of a Tomcat webapp deploy. Two occurrences of one
+/// shape is what makes this a test rather than a comment.
+#[cfg(test)]
+mod jit_monitor_jmx_pairing {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::{JvmThread, ThreadId};
+    use std::sync::Arc;
+
+    /// Addresses of the monitors the registry currently believes `tid` owns.
+    fn owned(shared: &SharedVm, tid: ThreadId) -> Vec<usize> {
+        shared
+            .threads
+            .thread_registry
+            .jmx_lock_snapshot(tid)
+            .map(|snap| snap.2.iter().map(|o| o.as_ptr() as usize).collect())
+            .unwrap_or_default()
+    }
+
+    /// Boot a VM with one registered thread whose JIT thread-pointer is
+    /// installed, so `jit_monitor_enter`/`jit_monitor_exit` can be called
+    /// exactly as generated code calls them.
+    fn vm_with_jit_thread() -> (Arc<SharedVm>, Box<JvmThread>, ThreadId) {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let tid = ThreadId(1);
+        let thread = Box::new(JvmThread::new(tid, "jit-monitor-probe"));
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "jit-monitor-probe", None);
+        (shared, thread, tid)
+    }
+
+    #[test]
+    fn the_jit_helpers_publish_and_retract_the_same_monitor() {
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: `vm_ptr` names the live `SharedVm` above, `obj` is a live
+        // heap object, and the JIT thread pointer is installed for this OS
+        // thread — the exact contract compiled code satisfies.
+        unsafe {
+            assert_ne!(
+                jit_monitor_enter(vm_ptr, obj.as_ptr() as i64),
+                i64::MIN,
+                "the helper failed to acquire an uncontended monitor"
+            );
+            // Prove the RED first: without a publish here there would be
+            // nothing for the retract to remove, and the assertion after the
+            // exit would pass on a helper that does no bookkeeping at all.
+            assert_eq!(
+                owned(&shared, tid),
+                vec![obj.as_ptr() as usize],
+                "a compiled monitorenter must publish JMX ownership"
+            );
+            assert_ne!(
+                jit_monitor_exit(vm_ptr, obj.as_ptr() as i64),
+                i64::MIN,
+                "the helper failed to release a monitor it holds"
+            );
+        }
+        restore_jit_thread(scope);
+
+        assert!(
+            owned(&shared, tid).is_empty(),
+            "a compiled monitorexit left its JMX ownership publish standing — \
+             the owned-monitor list is scanned on every acquisition, so this is \
+             an unbounded list and a quadratic monitorenter, not one stale slot"
+        );
+    }
+
+    /// The failure mode is about DISTINCT objects, and one balanced pair cannot
+    /// see it: the leak only becomes quadratic once the list has more entries
+    /// than the thread's real lock nesting depth.
+    #[test]
+    fn locking_many_distinct_objects_leaves_no_residue() {
+        const OBJECTS: usize = 64;
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let objs: Vec<_> = (0..OBJECTS)
+            .map(|_| shared.mem.heap.alloc_object(ClassId::new(0), 0))
+            .collect();
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: as above; every ref comes from this heap and is still live.
+        unsafe {
+            for obj in &objs {
+                jit_monitor_enter(vm_ptr, obj.as_ptr() as i64);
+                jit_monitor_exit(vm_ptr, obj.as_ptr() as i64);
+            }
+        }
+        restore_jit_thread(scope);
+
+        assert_eq!(
+            owned(&shared, tid).len(),
+            0,
+            "{OBJECTS} balanced compiled lock/unlock pairs left {} monitors \
+             recorded as owned; each one is a permanent GC root and a permanent \
+             entry in the scan every subsequent monitorenter runs",
+            owned(&shared, tid).len()
+        );
+    }
+
+    /// A re-entrant acquisition is still held after the inner release, and
+    /// retracting there would under-report a monitor the thread really owns.
+    /// The retract is conditional on `holds` precisely for this case.
+    #[test]
+    fn a_reentrant_release_keeps_the_publish_until_the_outermost_exit() {
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as i64;
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: as above.
+        unsafe {
+            jit_monitor_enter(vm_ptr, addr);
+            jit_monitor_enter(vm_ptr, addr);
+            jit_monitor_exit(vm_ptr, addr);
+        }
+        let after_inner = owned(&shared, tid);
+        // SAFETY: as above.
+        unsafe {
+            jit_monitor_exit(vm_ptr, addr);
+        }
+        let after_outer = owned(&shared, tid);
+        restore_jit_thread(scope);
+
+        assert_eq!(
+            after_inner,
+            vec![addr as usize],
+            "the inner release of a re-entrant lock retracted a monitor the \
+             thread still holds"
+        );
+        assert!(
+            after_outer.is_empty(),
+            "the outermost release left the publish standing"
+        );
     }
 }

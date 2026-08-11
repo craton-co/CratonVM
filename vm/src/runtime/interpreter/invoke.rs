@@ -4032,7 +4032,11 @@ pub(super) fn try_stackless_invoke(
     if thread.frames.len() >= shared.config.max_stack_depth {
         dump_stack_on_soe(thread);
         if let Some(obj) = monitor_obj {
-            let _ = shared.threads.monitors.exit(obj, thread.thread_id);
+            // `monitor_enter_synchronized_method` above published JMX
+            // ownership; this bail must retract it or the entry outlives the
+            // acquisition. See `vm_exec::monitor_exit_and_retract_jmx`.
+            let _ =
+                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id);
         }
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,

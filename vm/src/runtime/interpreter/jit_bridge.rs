@@ -6517,15 +6517,13 @@ impl Drop for JitSynchronizedMonitorGuard {
             let Some(monitor) = thread.native_pin_roots.get(self.pin_index).copied() else {
                 return;
             };
-            if let Err(error) = shared.threads.monitors.exit(monitor, thread.thread_id) {
+            if let Err(error) = crate::vm::vm_exec::monitor_exit_and_retract_jmx(
+                shared,
+                monitor,
+                thread.thread_id,
+            ) {
                 tracing::warn!(thread_id = ?thread.thread_id, ?error,
                     "implicit monitorexit after JIT synchronized method failed");
-            }
-            if !shared.threads.monitors.holds(monitor, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, monitor);
             }
             thread.native_pin_roots.truncate(self.pin_index);
         }
