@@ -477,6 +477,55 @@ before being built:
 3. **Keep threads out of JIT frames while blocked** — narrows the window without
    closing it.
 
+### BUILT AND MEASURED 2026-08-11: the indirect-call repair lands, and Log4J2's spiral goes to ZERO
+
+The repair the sections below decline is now implemented: codegen publishes the
+compiled method's IDENTITY into a TLS slot beside the RBP it already stores, in
+the same instruction pair, so `innermost_frame_method` no longer has to decode
+the call that created the frame. A/B on one binary pair,
+`-XX:+UseGenerationalGC`, `--Xmx 2g`, one class at a time:
+
+| Class | base | fix | priced beforehand |
+|---|---|---|---|
+| `Log4J2LoggingSystemTests` | TIMEOUT@700s, 1238 cycles, peak #1024 | **203.1s, 0 cycles, 61/61** | 419/419 attributable |
+| `IntegrationAutoConfigurationTests` | TIMEOUT, 1510 cycles | TIMEOUT, 821 cycles | 0% — A5 in 100% |
+| `QuartzEndpointWebIntegrationTests` | TIMEOUT, 747 cycles | TIMEOUT, 869 cycles | 0% — cross-thread in 100% |
+
+**The two that do not move are the result, not a shortfall.** Both were priced
+at zero from their per-cycle obligation sets BEFORE the code was written, and
+both held — Quartz still carries `cross-thread-jit-peer` in 867 of 869 cycles.
+Three predictions, three hits.
+
+**Integration shows the "the fix might just move the failure" risk directly**,
+which ["The earlier worry"](#the-earlier-worry-resolved) below raises. With the
+frame now resolvable, its dominant set changed from
+`{unregistered-jit-frame-on-stack, compiled-frame-band-unbounded,
+innermost-rbp}` to `{active-safepoint-map-incomplete,
+unregistered-jit-frame-on-stack, compiled-frame-oop-not-published}`.
+`innermost-rbp` is GONE; what replaced it are checks that only become
+*reachable* once the innermost frame resolves. The repair works everywhere and
+converts a cycle only where nothing else was failing too — which is exactly why
+it had to be priced per class rather than on a probe.
+
+Neutral under the shipped default, where these classes already pass: ZGC Log4J2
+261.2s → 231.5s, Quartz 502.6s → 406.7s, 61/61 and 45/45 either way. Unit tests
+cratonvm-jit 1977, cratonvm-gc 1463, cratonvm-vm `jit::` 153, zero failures.
+
+Two implementation notes that cost a verification round each:
+
+* **The identity must be captured WITH the RBP, not read at scan time.** The
+  first version read the mirror inside `innermost_frame_method` and converted
+  NOTHING — 785 of 786 cycles unchanged. `exact_rbp` is a snapshot in
+  `PreciseFrameInfo`; by scan time the owning thread has entered and left other
+  compiled frames, and the scan often runs on the COLLECTOR's thread, whose
+  mirrors describe a different stack. It is now snapshotted into
+  `PreciseFrameInfo::exact_cm_id` beside the RBP it belongs to.
+* **Both halves move together or the pair lies.** `try_call_compiled_entry`
+  brackets a Rust-side compiled call by saving and restoring the RBP mirror.
+  Restoring only that half pairs the caller's rbp with the callee's identity,
+  and nothing downstream can detect it — both halves still read consistently out
+  of the mirrors. A confidently wrong identity is worse than an absent one.
+
 ### CORRECTED 2026-08-11: the indirect-call repair now converts 100% of Log4J2, and the binding obligation is PER CLASS
 
 **Everything in the section below was true when measured and is false now for

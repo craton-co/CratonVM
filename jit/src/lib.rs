@@ -1367,6 +1367,100 @@ fn jit_code_ranges() -> &'static JitCodeRangeRegistry {
     JIT_CODE_RANGES.get_or_init(JitCodeRangeRegistry::new)
 }
 
+// ---------------------------------------------------------------------------
+// Compile-id table — naming the method that owns the innermost RBP
+// ---------------------------------------------------------------------------
+//
+// `conservative_roots::innermost_frame_method` has to answer "which
+// `CompiledMethod` owns the frame standing at `exact_rbp`?". Its only evidence
+// was the saved return address, from which it decoded the five-byte
+// `CALL rel32` that must have created the frame. An **indirect** JIT->JIT call
+// — every inline-cache hit ends in `CALL R11`, plus the megamorphic stub and
+// the trampolines — encodes no rel32, so the decode failed closed and the whole
+// young collection diverted to the non-moving sweep (`FOREIGN_INNERMOST_RBP`,
+// plus the `UNBOUNDED_FRAME_BAND` the same failure co-emits from the band
+// walk). Measured on dev 892ab4f40 that pair is 419 of 419 of
+// `Log4J2LoggingSystemTests`'s fallback cycles under `-XX:+UseGenerationalGC`,
+// with nothing else in the set.
+//
+// The prologue already publishes its RBP into a TLS slot with one
+// segment-relative `mov`. Publishing an IDENTITY beside it removes the decode:
+// both stores are emitted together at every point that touches the mirror, so
+// `(rbp, id)` describe the same frame by construction.
+//
+// Why a dense u32 and not the `CompiledMethod` pointer: `mov dword
+// <seg>:[disp], imm32` needs no scratch register. The post-call republish paths
+// run with the callee's return value live in RAX and document that they must
+// not disturb it; a 64-bit immediate would need a register and put a push/pop
+// back on every JIT->JIT call site.
+//
+// The id is reserved BEFORE codegen (the immediate is encoded while the
+// prologue is emitted) and bound at publication, because the `CompiledMethod`
+// does not exist until the buffer it owns has been filled. An id that is still
+// unbound — reserved but not published, or released on drop — resolves to
+// `None`, which leaves the caller with exactly the decode-and-fail-closed
+// behaviour it had before.
+static COMPILE_IDS: std::sync::OnceLock<std::sync::RwLock<Vec<usize>>> =
+    std::sync::OnceLock::new();
+
+fn compile_ids() -> &'static std::sync::RwLock<Vec<usize>> {
+    // Index 0 is never handed out: an unwritten or stale TLS slot reads as 0
+    // and must not resolve to a real method.
+    COMPILE_IDS.get_or_init(|| std::sync::RwLock::new(vec![0usize]))
+}
+
+/// Reserve an identity for a compilation that has not produced its
+/// `CompiledMethod` yet. `0` means "no identity" — codegen then emits no
+/// publication and the scan keeps its old decode path for that method.
+pub fn reserve_compile_id() -> u32 {
+    let Ok(mut table) = compile_ids().write() else {
+        return 0;
+    };
+    if table.len() >= u32::MAX as usize {
+        return 0;
+    }
+    table.push(0);
+    (table.len() - 1) as u32
+}
+
+/// Bind a reserved id to the published artifact. Called once, at publication.
+pub fn bind_compile_id(id: u32, cm_ptr: usize) {
+    if id == 0 || cm_ptr == 0 {
+        return;
+    }
+    if let Ok(mut table) = compile_ids().write() {
+        if let Some(slot) = table.get_mut(id as usize) {
+            *slot = cm_ptr;
+        }
+    }
+}
+
+/// Clear a binding when its artifact is dropped. No frame of a dropped method
+/// can be live, so a later lookup answering `None` is the correct answer.
+pub fn release_compile_id(id: u32) {
+    if id == 0 {
+        return;
+    }
+    if let Ok(mut table) = compile_ids().write() {
+        if let Some(slot) = table.get_mut(id as usize) {
+            *slot = 0;
+        }
+    }
+}
+
+/// Resolve a published id to its `CompiledMethod` address, or `None` when the
+/// id is 0, out of range, or unbound.
+pub fn lookup_compile_id(id: u32) -> Option<usize> {
+    if id == 0 {
+        return None;
+    }
+    let table = compile_ids().read().ok()?;
+    match table.get(id as usize).copied() {
+        Some(0) | None => None,
+        Some(ptr) => Some(ptr),
+    }
+}
+
 /// PERF (2026-07-15, RequestMappingMessageConversionIntegrationTests bootstrap
 /// slowness, round 2): monotonically-increasing generation counter, bumped
 /// whenever the registered code-range set changes. `native_stack_has_jit_frame`
@@ -2230,6 +2324,13 @@ pub struct CompiledMethod {
     /// lookup was pure overhead — and reading the owner off the live artifact
     /// cannot return a retired entry's stale answer.
     pub owner_class_id: u32,
+    /// This artifact's compile-id — the identity its prologue publishes into
+    /// the TLS mirror beside RBP, so a conservative scan can name the method
+    /// owning the innermost frame instead of decoding the call that created it.
+    /// Reserved before codegen (the immediate is encoded in the prologue),
+    /// bound to this artifact at publication, released on drop. 0 = the mirror
+    /// is unavailable and nothing is published for this method.
+    pub compile_id: u32,
     /// Value of [`jit_install_epoch`] when this artifact's COMPILATION began.
     ///
     /// The install-side half of the redefinition hole. `redefineClass` bumps
@@ -2261,6 +2362,11 @@ impl Drop for CompiledMethod {
             report_stale_ic_holders(entry);
         }
         unregister_jit_code_range(entry);
+        // Withdraw the identity binding alongside the range. No frame of a
+        // dropped method can be live, so a mirror still holding this id
+        // resolves to `None` afterwards — returning the scan to its old decode
+        // path rather than handing it a freed artifact.
+        release_compile_id(self.compile_id);
         // Same withdrawal, same reason, and it must happen here too: the buffer
         // this artifact owns is unmapped as soon as this function returns, and
         // the address is then reusable by the next `alloc_executable`.
@@ -2394,6 +2500,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            compile_id: 0,
             install_epoch: current_compile_install_epoch(),
         }
     }
@@ -2463,6 +2570,7 @@ impl CompiledMethod {
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
             owner_class_id: cratonvm_types::jit_activation::NO_OWNER_CLASS,
+            compile_id: 0,
             install_epoch: current_compile_install_epoch(),
         }
     }
@@ -10700,6 +10808,12 @@ flushed at epoch {barrier}",
         compiled.owner_class_id = declaring_class_id.as_u32();
         compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
+        // Bind the identity the prologue already encoded. Until this runs the
+        // id resolves to `None`, so a frame entered during compilation — there
+        // cannot be one, but the ordering is what makes that safe rather than
+        // lucky — degrades to the old decode instead of naming a half-built
+        // artifact.
+        bind_compile_id(arc.compile_id, Arc::as_ptr(&arc) as usize);
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
         // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
@@ -10791,6 +10905,12 @@ flushed at epoch {barrier}",
         compiled.owner_class_id = declaring_class_id.as_u32();
         compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
+        // Bind the identity the prologue already encoded. Until this runs the
+        // id resolves to `None`, so a frame entered during compilation — there
+        // cannot be one, but the ordering is what makes that safe rather than
+        // lucky — degrades to the old decode instead of naming a half-built
+        // artifact.
+        bind_compile_id(arc.compile_id, Arc::as_ptr(&arc) as usize);
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range_owned(arc.entry_ptr() as usize, arc.code_len(), &arc);
         }

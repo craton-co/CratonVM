@@ -836,6 +836,158 @@ pub fn inline_rbp_tls_mirror_write(value: usize) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The compile-id mirror — the identity half of the innermost-frame record
+// ---------------------------------------------------------------------------
+//
+// A second slot, written by the same instructions that write the RBP mirror, so
+// the GC can name the method owning `exact_rbp` instead of decoding the call
+// that created the frame (see the compile-id table in `lib.rs` for why the
+// decode cannot work for an indirect JIT->JIT call). Everything here mirrors
+// `inline_rbp_tls_disp` deliberately: same probe, same fail-to-zero rule, same
+// segment prefix. A zero displacement means codegen publishes no identity and
+// the scan keeps its old behaviour.
+#[cfg(windows)]
+pub fn inline_cm_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        // Only meaningful alongside the RBP mirror: the pair is what makes
+        // `(rbp, id)` describe one frame.
+        if inline_rbp_tls_disp() == 0 {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        // SAFETY: as `inline_rbp_tls_disp` — the documented Win32 TLS APIs plus
+        // a sentinel round-trip that proves the displacement before it is used.
+        let disp = unsafe {
+            'probe: {
+                let slot = TlsAlloc();
+                if slot == TLS_OUT_OF_INDEXES {
+                    break 'probe 0;
+                }
+                // A different sentinel from the RBP probe's, so a mix-up
+                // between the two slots cannot round-trip successfully.
+                let sentinel: usize = 0x434D_4944_5F50_0000 | (slot as usize & 0xFFFF);
+                if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                    break 'probe 0;
+                }
+                let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+                if read_gs_qword(candidate) == sentinel {
+                    TlsSetValue(slot, core::ptr::null_mut());
+                    break 'probe candidate;
+                }
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        TlsSetValue(slot, core::ptr::null_mut());
+                        break 'probe d;
+                    }
+                    d += 8;
+                }
+                TlsSetValue(slot, core::ptr::null_mut());
+                0
+            }
+        };
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!("[INLINE-FR] compile-id mirror ENABLED at gs:[{disp:#x}]");
+            } else {
+                eprintln!("[INLINE-FR] compile-id mirror probe FAILED — identity not published");
+            }
+        }
+        disp
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    /// Linux counterpart of the Windows compile-id slot. Generated code writes
+    /// the low 32 bits of this cell as `fs:[disp32]`.
+    pub(super) static LINUX_INLINE_CM_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if inline_rbp_tls_disp() == 0 {
+            return 0;
+        }
+        let disp = LINUX_INLINE_CM_MIRROR.with(|cell| {
+            // SAFETY / rationale: identical to `inline_rbp_tls_disp`'s Linux
+            // arm — derive the cell's offset from the FS base and prove it with
+            // a sentinel round-trip before any generated store uses it.
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x434D_4944_5F4C_4E58);
+            // SAFETY: reads back the 8 bytes the line above wrote through the
+            // same live thread-local; the comparison is what decides whether
+            // the derived displacement is trusted at all.
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x434D_4944_5F4C_4E58 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        });
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INLINE_FR").is_some() {
+            if disp != 0 {
+                eprintln!("[INLINE-FR] compile-id mirror ENABLED at fs:[{:#x}]", disp as u32);
+            } else {
+                eprintln!("[INLINE-FR] compile-id mirror probe FAILED — identity not published");
+            }
+        }
+        disp
+    })
+}
+
+/// Unsupported targets publish no identity.
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn inline_cm_tls_disp() -> usize {
+    0
+}
+
+/// VM-side access to the Linux TLS cell used by generated `fs:` identity
+/// stores. `None` means the startup probe did not enable the mirror. The
+/// Windows side reads `gs:[disp]` directly with its own helper, exactly as it
+/// does for the RBP mirror.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_mirror_read() -> Option<u32> {
+    if inline_cm_tls_disp() == 0 {
+        None
+    } else {
+        Some((LINUX_INLINE_CM_MIRROR.with(std::cell::Cell::get) & 0xFFFF_FFFF) as u32)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn inline_cm_tls_mirror_write(value: u32) -> bool {
+    if inline_cm_tls_disp() == 0 {
+        false
+    } else {
+        LINUX_INLINE_CM_MIRROR.with(|cell| cell.set(value as usize));
+        true
+    }
+}
+
 /// Read the 8-byte value at `gs:[disp]` (Windows TEB-relative). Used only by
 /// the [`inline_rbp_tls_disp`] startup probe.
 ///
