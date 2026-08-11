@@ -173,7 +173,8 @@ public class RForeignLayoutJdkInterfaces {
         check(rs.getFloat(1) == F, "ResultSet.getFloat(int)");
         check(rs.getBoolean(1) == B, "ResultSet.getBoolean(int)");
         check(rs.getBytes(1) == null, "ResultSet.getBytes is the handler's null");
-        check(rs.getString(1) == null, "ResultSet.getString(int) is the handler's null");
+        check("SENTINEL-rs-getString".equals(rs.getString(1)),
+                "ResultSet.getString(int) is the handler's sentinel");
         check(rs.getObject(1) == null, "ResultSet.getObject(int)");
         check(rs.getMetaData() == null, "ResultSet.getMetaData");
         rs.close();
@@ -185,9 +186,12 @@ public class RForeignLayoutJdkInterfaces {
         check(md.getColumnType(1) == I, "ResultSetMetaData.getColumnType");
         check(md.getPrecision(1) == I, "ResultSetMetaData.getPrecision");
         check(md.getColumnDisplaySize(1) == I, "ResultSetMetaData.getColumnDisplaySize");
-        check(md.getColumnName(1) == null, "ResultSetMetaData.getColumnName");
-        check(md.getColumnTypeName(1) == null, "ResultSetMetaData.getColumnTypeName");
-        check(md.getColumnClassName(1) == null, "ResultSetMetaData.getColumnClassName");
+        check("SENTINEL-rsmd-getColumnName".equals(md.getColumnName(1)),
+                "ResultSetMetaData.getColumnName");
+        check("SENTINEL-rsmd-getColumnTypeName".equals(md.getColumnTypeName(1)),
+                "ResultSetMetaData.getColumnTypeName");
+        check("SENTINEL-rsmd-getColumnClassName".equals(md.getColumnClassName(1)),
+                "ResultSetMetaData.getColumnClassName");
         check(rm.seen.size() == 7, "ResultSetMetaData: 7 calls, saw " + rm.seen.size());
         System.out.println("CK RForeignLayoutJdkInterfaces rs=" + r.seen.size()
                 + " rsmd=" + rm.seen.size());
@@ -220,8 +224,10 @@ public class RForeignLayoutJdkInterfaces {
 
         Recorder d = new Recorder("dbmd");
         DatabaseMetaData dm = proxy(DatabaseMetaData.class, d);
-        check(dm.getDatabaseProductName() == null, "DatabaseMetaData.getDatabaseProductName");
-        check(dm.getDriverName() == null, "DatabaseMetaData.getDriverName");
+        check("SENTINEL-dbmd-getDatabaseProductName".equals(dm.getDatabaseProductName()),
+                "DatabaseMetaData.getDatabaseProductName");
+        check("SENTINEL-dbmd-getDriverName".equals(dm.getDriverName()),
+                "DatabaseMetaData.getDriverName");
         check(dm.getDatabaseMajorVersion() == I, "DatabaseMetaData.getDatabaseMajorVersion");
         check(dm.supportsTransactions() == B, "DatabaseMetaData.supportsTransactions");
         check(dm.getConnection() == null, "DatabaseMetaData.getConnection");
@@ -292,9 +298,10 @@ public class RForeignLayoutJdkInterfaces {
         check(sess.getLastAccessedTime() == L, "SSLSession.getLastAccessedTime");
         check(sess.getApplicationBufferSize() == I, "SSLSession.getApplicationBufferSize");
         check(sess.getPacketBufferSize() == I, "SSLSession.getPacketBufferSize");
-        check(sess.getCipherSuite() == null, "SSLSession.getCipherSuite");
-        check(sess.getProtocol() == null, "SSLSession.getProtocol");
-        check(sess.getPeerHost() == null, "SSLSession.getPeerHost");
+        check("SENTINEL-sess-getCipherSuite".equals(sess.getCipherSuite()),
+                "SSLSession.getCipherSuite");
+        check("SENTINEL-sess-getProtocol".equals(sess.getProtocol()), "SSLSession.getProtocol");
+        check("SENTINEL-sess-getPeerHost".equals(sess.getPeerHost()), "SSLSession.getPeerHost");
         check(sess.getPeerPort() == I, "SSLSession.getPeerPort");
         check(sess.getLocalCertificates() == null, "SSLSession.getLocalCertificates");
         check(sess.getSessionContext() == null, "SSLSession.getSessionContext");
