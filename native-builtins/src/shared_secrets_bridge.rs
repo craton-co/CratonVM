@@ -769,8 +769,9 @@ fn thread_container_registration_enabled() -> bool {
 /// is `flock.awaitAll()`, so dropping `args[2]` is what makes JEP 505's
 /// `join()` wait for nothing —
 /// docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md measured 15
-/// divergent lines and three CratonVM runs disagreeing with each other on six
-/// of them, all downstream of this one dropped argument. The registry has
+/// divergent lines, and three CratonVM runs re-taken today disagreed with each
+/// other on eight — all downstream of this one dropped argument, because a
+/// `join()` that does not wait turns the whole API into a race. The registry has
 /// several other consumers (`ThreadContainers.root()` enumeration, thread
 /// dumps, JFR), and they are enumerated in
 /// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
