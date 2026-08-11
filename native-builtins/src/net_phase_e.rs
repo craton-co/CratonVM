@@ -16310,6 +16310,50 @@ fn re10_spawn_dispatcher(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let dbg = crate::nbflags().dbg_httpsrv;
     for idx in 0..HS_DISPATCHER_POOL {
+        // W7-24 — `ensure_vm_internal_class`, not the compatibility door.
+        //
+        // `CratonVM$HttpServerLoop` is a shape this VM invents to carry
+        // `server_id` from here to `re10_serve_loop_run` on a real VM thread.
+        // `javap CratonVM.HttpServerLoop` against the JDK 25 image answers
+        // "class not found", the name is in no JDK namespace at all, and no
+        // class file can ever back it — contract §1 item 6's shape, which
+        // `ensure_vm_internal_class` exists to mint in every mode. Through
+        // `try_alloc_concurrent_synthetic` alone it acquired
+        // `ClassOrigin::CompatibilityStub`, which `--jdk-only` correctly
+        // refuses, and the refusal killed the whole server:
+        //
+        //     $ cratonvm --jdk-only … HttpServerWildcardAddressProbe
+        //     NoClassDefFoundError: CratonVM$HttpServerLoop
+        //         at HttpServerWildcardAddressProbe.main(…:49)
+        //
+        // i.e. `com.sun.net.httpserver.HttpServer.start()` could not start
+        // under strict mode. `bind()` and `getAddress()` were already fine —
+        // this is the one call the door took out.
+        //
+        // The natives are the OTHER gate, and here it is already open,
+        // measured rather than assumed: `--dump-native-registry` taken once
+        // per mode reports this class's single `run()V` as `kind":"bridge"` in
+        // Compatible AND under `--jdk-only`. The name is on none of
+        // `no_image_receiver.rs`'s tables — it does not start with `cratonvm/`
+        // so `VM_MINTED_STAND_IN_RECEIVERS` is not consulted, and it is in
+        // neither `NO_IMAGE_JDK_RECEIVERS` nor `VM_SERVICE_RECEIVERS` — so
+        // `receiver_declared_by_no_supported_image` answers false and nothing
+        // re-tags it `SyntheticStub`. That check is per class and is not a
+        // general licence: flipping the door on a receiver whose natives ARE
+        // dropped in strict buys an `UnsatisfiedLinkError` at the first call
+        // instead of a `NoClassDefFoundError` at the mint, which is a moved
+        // symptom rather than a fix (measured on
+        // `cratonvm/internal/LinkedListSnapshotListItr`).
+        //
+        // Pre-mint rather than replace, so the allocation below keeps its
+        // real-vs-requested field-count widening and its GC-safe retry:
+        // `fabricate_class` returns the existing `ClassId` for an
+        // already-loaded name before it reaches `admit_compatibility_class`,
+        // so `Compatible` is byte-for-byte unchanged and only the recorded
+        // ORIGIN moves (`compatibility-stub` → `vm-internal` in
+        // `--dump-class-origins`, and `vm_exec.rs`'s `stub_hint` stops
+        // suggesting a missing jar for a class no jar has).
+        ctx.ensure_vm_internal_class(HS_LOOP_CLASS, 1);
         let runner = try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?;
         ctx.set_field(runner, 0, Value::Int(server_id));
 
