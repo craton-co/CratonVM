@@ -26767,8 +26767,41 @@ mod tests {
             None
         );
 
-        // The neighbour it used to share a range arm with is UNCHANGED:
-        // `checkcast` (0xc0) does throw, and the site must still be named.
+        // The contrast case needs an opcode that genuinely still withholds.
+        //
+        // It used to be `checkcast` (0xc0), which was a valid foil until
+        // 2026-08-11: `checkcast` throws, but its ONE lowering always follows
+        // `helpers.checkcast` with `emit_post_invoke_exception_check`, so it
+        // was publishing all along and is now admitted
+        // (`precise_getstatic_checkcast_enabled`). Using it here would assert
+        // the opposite of what the backend does.
+        //
+        // `arraylength` (0xbe) is the honest replacement: it throws NPE on a
+        // null array through `emit_null_check_arraylength` ->
+        // `emit_null_check_array_load`, which routes to the SHARED
+        // `null_check_store_stubs` stub — `jit_npe_with_action`, the deopt
+        // sentinel, a plain epilogue, and no frame recorded at the bci.
+        let mut with_arraylength = code.clone();
+        with_arraylength.splice(1..1, [0xbe]);
+        let al_table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 14,
+            handler_pc: 14,
+            catch_type: 0,
+        }];
+        assert_eq!(
+            first_unsupported_precise_frame_site(
+                &with_arraylength,
+                with_arraylength.len(),
+                &al_table,
+            ),
+            Some((1, 0xbe)),
+            "arraylength must still withhold coverage, and must name its own pc"
+        );
+
+        // And the opcode that changed sides must now be clear, in the same
+        // shape the old assertion used — so this test fails if the admission
+        // is ever reverted without revisiting the argument for it.
         let mut with_checkcast = code.clone();
         with_checkcast.splice(1..1, [0xc0, 0x00, 0x03]);
         let cc_table = vec![ExceptionTableEntry {
@@ -26783,8 +26816,8 @@ mod tests {
                 with_checkcast.len(),
                 &cc_table,
             ),
-            Some((1, 0xc0)),
-            "checkcast must still withhold coverage, and must name its own pc"
+            None,
+            "checkcast publishes via emit_post_invoke_exception_check and must be admitted"
         );
     }
 
