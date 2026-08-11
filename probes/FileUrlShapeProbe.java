@@ -32,6 +32,17 @@ public class FileUrlShapeProbe {
         // The exact operation Tomcat performs on it.
         System.out.println(label + ".roundtrip.uri=" + url.toURI());
         System.out.println(label + ".roundtrip.file=" + new File(url.toURI()).getPath());
+        // The operation the RETIRED comment on `URL.toURI()` was protecting:
+        // Spring Boot's launcher does `new File(url.toURI().getSchemeSpecificPart())`.
+        // The old code kept a synthetic URI specifically so that would work; the
+        // claim that a real URI breaks it is checkable, so check it.
+        URI round = url.toURI();
+        System.out.println(label + ".roundtrip.ssp=" + round.getSchemeSpecificPart());
+        System.out.println(label + ".roundtrip.ssp.file=" + new File(round.getSchemeSpecificPart()).getPath());
+        System.out.println(label + ".roundtrip.scheme=" + round.getScheme());
+        System.out.println(label + ".roundtrip.uripath=" + round.getPath());
+        System.out.println(label + ".roundtrip.equals=" + round.equals(uri));
+        System.out.println(label + ".roundtrip.hashmatch=" + (round.hashCode() == uri.hashCode()));
     }
 
     public static void main(String[] args) throws Exception {
