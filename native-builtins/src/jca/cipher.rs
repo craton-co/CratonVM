@@ -344,6 +344,22 @@ fn make_bytes_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     arr
 }
 
+/// Read the `byte[]` at instance-field `slot` and return a FRESH copy of it,
+/// or `None` when the field is null.
+///
+/// The accessor idiom for every JCA key/spec class whose real implementation
+/// ends `return this.<field>.clone()` — `SecretKeySpec.getEncoded`,
+/// `IvParameterSpec.getIV`, `GCMParameterSpec.getIV`. The clone is not
+/// defensive politeness in these classes; it is the contract callers build key
+/// hygiene on, and the JDK's own providers scrub the array they get back.
+fn clone_byte_field(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> Option<ObjectRef> {
+    let Value::Object(Some(arr)) = ctx.get_field(this, slot) else {
+        return None;
+    };
+    let bytes = read_bytes(ctx, arr);
+    Some(make_bytes_array(ctx, &bytes))
+}
+
 /// `true` when the transformation names the RSA cipher (`"RSA/ECB/…"`).
 fn is_rsa_transformation(algo: &str) -> bool {
     algo.split('/')
@@ -2819,9 +2835,14 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Object(Some(copy)));
         Ok(None)
     });
+    // `IvParameterSpec.getIV()` is `return this.iv.clone()` in the real class,
+    // and `GCMParameterSpec.getIV()` likewise. Handing back the STORED array
+    // let a caller edit the spec's IV in place — measured: `getIV()`, fill with
+    // 0x77, `getIV()` again returns 0x77s where HotSpot returns the original.
+    // The constructors already copied; only the accessors leaked.
     r.register(ivps, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
 
     let gcmps = "javax/crypto/spec/GCMParameterSpec";
@@ -2842,7 +2863,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     });
     r.register(gcmps, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
     r.register(gcmps, "getTLen", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2851,17 +2872,53 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
 
     let sks = "javax/crypto/spec/SecretKeySpec";
     r.register(sks, "<clinit>", "()V", clinit_noop);
+    // `SecretKeySpec.<init>` is `this.key = key.clone()` in the real class
+    // (`java.base/javax/crypto/spec/SecretKeySpec.java`, JDK 25 `src.zip`), and
+    // the javadoc states why: "The contents of the array are copied to protect
+    // against subsequent modification."
+    //
+    // Storing the caller's array by reference instead was not a shortcut, it
+    // was an ALL-ZERO AES KEY. SunJCE's own key generators scrub their working
+    // buffer the instant the key object exists —
+    // `AESKeyGenerator.engineGenerateKey` is `new SecretKeySpec(keyBytes,
+    // "AES"); Arrays.fill(keyBytes, (byte)0);` and
+    // `KeyGeneratorCore.implGenerateKey` does the same in a `finally` — so the
+    // scrub landed on the key itself. Measured on this tree's release binary,
+    // real-JDK and --jdk-only alike:
+    //
+    //     KeyGenerator.getInstance("AES").generateKey().getEncoded()
+    //       CratonVM -> 0000000000000000000000000000000000000000000000000000000000000000
+    //       HotSpot  -> a55a06fd157aca61fea2322615a02b6c71c01805cbefca7b89ea10b26efc1ace
+    //
+    // and identically for `HmacSHA256`. `DESede` was unaffected only because
+    // `DESedeKeyGenerator` happens not to scrub. Nothing raised anywhere: the
+    // key had the right LENGTH and the right algorithm name, so every caller
+    // downstream encrypted, signed and stored under a key of all zeros.
     r.register(sks, "<init>", "([BLjava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let key_bytes = obj_arg(args, 1)?;
         let algo = obj_arg(args, 2)?;
-        ctx.set_field(this, 0, Value::Object(Some(key_bytes)));
+        let raw = read_bytes(ctx, key_bytes);
+        // `make_bytes_array` allocates, so both refs we still need must survive
+        // a moving collection. Unpinning from the FIRST handle releases both.
+        let this_pin = ctx.pin_native_root(this);
+        let algo_pin = ctx.pin_native_root(algo);
+        let copy = make_bytes_array(ctx, &raw);
+        let this = ctx.read_native_pin(this_pin, this);
+        let algo = ctx.read_native_pin(algo_pin, algo);
+        ctx.unpin_native_roots(this_pin);
+        ctx.set_field(this, 0, Value::Object(Some(copy)));
         ctx.set_field(this, 1, Value::Object(Some(algo)));
         Ok(None)
     });
+    // `return this.key.clone()`, for the same reason and with the same
+    // measurement behind it: handing the stored array back let a caller zero
+    // the key through the accessor. `Cipher.init` reads the key through
+    // `extract_key_bytes`, which takes field 0 directly and is unaffected by
+    // the extra copy.
     r.register(sks, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
     r.register(sks, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
