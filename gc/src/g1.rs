@@ -2330,11 +2330,21 @@ impl G1Collector {
                                 )
                             })
                             .unwrap_or_default();
+                        // Provenance. A seed that is an INTERIOR pointer had to
+                        // enter the pause as one, and there are only two doors:
+                        // the root array the caller handed us, and the
+                        // conservative JIT-root snapshot.
+                        let in_roots = roots.iter().any(|r| r.as_ptr() as usize == seed);
+                        let jit_roots = crate::gc_quiescence::pinned_jit_roots_snapshot();
+                        let in_jit_roots = jit_roots.contains(&seed);
                         tracing::warn!(
                             "[g1] rejected seed 0x{seed:x}: seeds={} map={} inbound_forwards={inbound} \
-                             passes={passes} {bytes}",
+                             passes={passes} in_roots={in_roots} roots={} in_jit_roots={in_jit_roots} \
+                             jit_roots={} {bytes}",
                             seeds.len(),
                             acc.pointer_map.len(),
+                            roots.len(),
+                            jit_roots.len(),
                         );
                     }
                 }
