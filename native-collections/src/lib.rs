@@ -3277,13 +3277,25 @@ fn java_float_to_string(v: f32) -> String {
 /// For objects that are not plain strings or primitives, this calls
 /// `toString()` via virtual dispatch so that overridden implementations
 /// (e.g. ArrayList, HashMap, user classes) produce correct output.
-fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
-    match val {
+///
+/// Fallible for the reason on [`collection_elements_generic`]. The
+/// `ClassName@hash` fallback below is the right answer when there is no
+/// `toString()` to run, and it was the wrong one when there was and it *threw*
+/// or was refused: `[a, cratonvm.internal.Foo@1a2b, c]` is a plausible string
+/// with no exception behind it, so a strict refusal inside an element's own
+/// `toString()` came out of `list.toString()` looking like ordinary output.
+/// HotSpot propagates — `AbstractCollection.toString` is a bare
+/// `sb.append(e)` loop with no catch.
+fn obj_to_display_string(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+) -> Result<String, MethodCallFailed> {
+    Ok(match val {
         Value::Object(None) => "null".to_string(),
         Value::Object(Some(obj)) => {
             // Fast path: if it's a Java String, read it directly
             if let Some(s) = ctx.read_string(*obj) {
-                return s;
+                return Ok(s);
             }
 
             // Fast path for wrapper types: if the object is a `java.lang.*`
@@ -3313,7 +3325,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                 if is_wrapper {
                     match ctx.get_field(*obj, 0) {
                         Value::Int(v) => {
-                            return if name.contains("Boolean") {
+                            return Ok(if name.contains("Boolean") {
                                 if v != 0 { "true" } else { "false" }.to_string()
                             } else if name.contains("Character") {
                                 char::from_u32(v as u32).unwrap_or('?').to_string()
@@ -3323,14 +3335,14 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                                 (v as i16).to_string()
                             } else {
                                 v.to_string()
-                            };
+                            });
                         }
-                        Value::Long(v) => return v.to_string(),
+                        Value::Long(v) => return Ok(v.to_string()),
                         // Fix (item 4): Java shortest-round-trip formatting,
                         // not Rust's default `{}` (which omits the trailing
                         // `.0` and uses `inf`/`NaN` spellings).
-                        Value::Float(v) => return java_float_to_string(v),
-                        Value::Double(v) => return java_double_to_string(v),
+                        Value::Float(v) => return Ok(java_float_to_string(v)),
+                        Value::Double(v) => return Ok(java_double_to_string(v)),
                         _ => {}
                     }
                 }
@@ -3341,6 +3353,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                 Ok(Some(Value::Object(Some(str_ref)))) => ctx
                     .read_string(str_ref)
                     .unwrap_or_else(|| "null".to_string()),
+                Err(e) => return Err(e),
                 _ => {
                     // Final fallback: ClassName@hash. Arrays render the JVMS
                     // array-class name (the header's class_id is the COMPONENT
@@ -3366,7 +3379,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
         Value::Float(v) => java_float_to_string(*v),
         Value::Double(v) => java_double_to_string(*v),
         _ => "?".to_string(),
-    }
+    })
 }
 
 /// JVMS array-class name for a heap array (`[Ljava/lang/Class;`, `[I`,
@@ -5719,8 +5732,11 @@ pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 text.push_str(", ");
             }
             let val = ctx.get_array_element(d, i);
+            // Hoisted out of the `write!` argument so the `?` is an ordinary
+            // statement rather than a return out of a macro expansion.
+            let d = obj_to_display_string(ctx, &val)?;
             // `write!` into a String never fails; ignore the Result.
-            let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
+            let _ = write!(text, "{}", d);
         }
     }
     text.push(']');
@@ -6248,7 +6264,8 @@ fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             text.push_str(", ");
         }
         let val = ctx.get_array_element(buf, i);
-        let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
+        let d = obj_to_display_string(ctx, &val)?;
+        let _ = write!(text, "{}", d);
     }
     text.push(']');
     let s = ctx.create_string(&text);
@@ -10837,8 +10854,8 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = map_collect_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let ks = obj_to_display_string(ctx, key);
-        let vs = obj_to_display_string(ctx, value);
+        let ks = obj_to_display_string(ctx, key)?;
+        let vs = obj_to_display_string(ctx, value)?;
         parts.push(format!("{}={}", ks, vs));
     }
     let text = format!("{{{}}}", parts.join(", "));
@@ -13426,7 +13443,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let keys = collect_view_snapshot_ordered(ctx, backing)?;
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
-        parts.push(obj_to_display_string(ctx, k));
+        parts.push(obj_to_display_string(ctx, k)?);
     }
     let text = format!("[{}]", parts.join(", "));
     let s = ctx.create_string(&text);
@@ -14015,7 +14032,7 @@ fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     for i in 0..len {
         let arr = ctx.read_native_pin(arr_pin, arr);
         let val = ctx.get_array_element(arr, i);
-        parts.push(obj_to_display_string(ctx, &val));
+        parts.push(obj_to_display_string(ctx, &val)?);
     }
     ctx.unpin_native_roots(arr_pin);
     let text = format!("[{}]", parts.join(", "));
@@ -14543,7 +14560,7 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let s = match val {
         _ if opt_value_is_empty(val) => "Optional.empty".to_string(),
         _ => {
-            let display = obj_to_display_string(ctx, &val);
+            let display = obj_to_display_string(ctx, &val)?;
             format!("Optional[{display}]")
         }
     };
@@ -20355,12 +20372,16 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         });
     } else {
         // Fallback: sort by string representation.
+        // `collect::<Result<..>>` rather than a `?` inside the closure: the
+        // closure has to keep returning a `Result` for the sort key, and a
+        // refused element `toString()` must abort the sort instead of ordering
+        // the stream by a fabricated `ClassName@hash`.
         let keys: Vec<String> = (0..elements.len())
             .map(|i| {
                 let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
                 obj_to_display_string(ctx, &e)
             })
-            .collect();
+            .collect::<Result<Vec<String>, MethodCallFailed>>()?;
         idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
     }
     let sorted: Vec<Value> = idx
@@ -22509,7 +22530,7 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let elements = container_values(ctx);
             let mut parts = Vec::with_capacity(elements.len());
             for elem in &elements {
-                parts.push(obj_to_display_string(ctx, elem));
+                parts.push(obj_to_display_string(ctx, elem)?);
             }
             let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
                 (
@@ -23505,7 +23526,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem));
+                    parts.push(obj_to_display_string(ctx, &elem)?);
                 }
                 let joined = parts.join("");
                 let s = ctx.create_string(&joined);
@@ -23531,7 +23552,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem));
+                    parts.push(obj_to_display_string(ctx, &elem)?);
                 }
                 let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
                 let s = ctx.create_string(&joined);
@@ -31786,7 +31807,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     while let Some(cur) = cur_opt {
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        parts.push(obj_to_display_string(ctx, &elem));
+        parts.push(obj_to_display_string(ctx, &elem)?);
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
             Value::Object(Some(r)) => Some(r),
             _ => None,
@@ -33424,8 +33445,8 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let ks = obj_to_display_string(ctx, &key);
-        let vs = obj_to_display_string(ctx, &val);
+        let ks = obj_to_display_string(ctx, &key)?;
+        let vs = obj_to_display_string(ctx, &val)?;
         parts.push(format!("{ks}={vs}"));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
@@ -34443,7 +34464,7 @@ fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let parts: Vec<String> = elems
         .iter()
         .map(|e| obj_to_display_string(ctx, e))
-        .collect();
+        .collect::<Result<Vec<String>, MethodCallFailed>>()?;
     let s = format!("[{}]", parts.join(", "));
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
@@ -34984,7 +35005,7 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
-            parts.push(obj_to_display_string(ctx, &elem));
+            parts.push(obj_to_display_string(ctx, &elem)?);
         }
     }
     let s = format!("[{}]", parts.join(", "));
@@ -40963,10 +40984,10 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             buf.push_str(", ");
         }
         let (k, _) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &k));
+        buf.push_str(&obj_to_display_string(ctx, &k)?);
         buf.push('=');
         let (_, v) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &v));
+        buf.push_str(&obj_to_display_string(ctx, &v)?);
     }
     ctx.unpin_native_roots(pinned_pairs.base());
     buf.push('}');
@@ -42006,7 +42027,7 @@ fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 buf.push_str(", ");
             }
             let v = ctx.get_array_element(data, i);
-            buf.push_str(&obj_to_display_string(ctx, &v));
+            buf.push_str(&obj_to_display_string(ctx, &v)?);
         }
     }
     buf.push(']');
@@ -45424,8 +45445,8 @@ fn native_chm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = chm_collect_all_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let k = crate::obj_to_display_string(ctx, key);
-        let v = crate::obj_to_display_string(ctx, value);
+        let k = crate::obj_to_display_string(ctx, key)?;
+        let v = crate::obj_to_display_string(ctx, value)?;
         parts.push(format!("{}={}", k, v));
     }
     let s = format!("{{{}}}", parts.join(", "));
@@ -46327,7 +46348,7 @@ fn native_ksv_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut parts = Vec::with_capacity(elems.len());
     for i in 0..elems.len() {
         let e = read_pinned_elem(ctx, handles[i], elems[i]);
-        parts.push(obj_to_display_string(ctx, &e));
+        parts.push(obj_to_display_string(ctx, &e)?);
     }
     if elems_pin != usize::MAX {
         ctx.unpin_native_roots(elems_pin);
