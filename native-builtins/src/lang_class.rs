@@ -14531,6 +14531,17 @@ pub(crate) fn annotation_element_to_java_typed(
                     container_class_id
                         .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
                 })
+                // Same step the scalar `Class` arm takes: `class_id_by_name_near`
+                // only sees names the container's loader has ALREADY resolved,
+                // so drive that loader before conceding to the loader-blind
+                // lookup below — otherwise a component this container has never
+                // touched is answered by whichever single loader happens to
+                // have it.
+                .or_else(|| {
+                    container_class_id.and_then(|holder| {
+                        ctx.class_id_by_name_via_referencing_class(holder, &comp_name_owned).ok()
+                    })
+                })
                 .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
                     let _ = ctx.load_class(&comp_name_owned);
