@@ -377,14 +377,47 @@ throughout. The 1 is `Map.entry(...).setValue`, which is open item 3.
 
 ## What is still open
 
-1. **Delete the 791.** The list is measured and committed; removing the
-   registrations is a stub-removal change with its own subsystem-per-PR
-   discipline, and it should re-run the sweep afterwards rather than trusting
-   this file. Two cautions the list itself cannot carry: its `registered_by`
-   line numbers are **already stale** against `dev`, so rows must be re-located
-   by content; and the largest cluster (`lang_string.rs`, 119) is a covariant
-   fan-out that registers each `append` under three return descriptors, of
-   which only some (class, descriptor) pairs exist in any JDK — those are
+> **CORRECTED 2026-08-10 — item 1 asked for a deletion, and two thirds of its
+> list must not be deleted.** The reasoning is this record's own, applied one
+> step further than it was: it wrote *"a synthetic stub is never a deletion
+> candidate — gate it, never delete it"* and then gated only the rows already
+> carrying the tag that a reclassification wave is *deciding*. The image-side
+> fact the rule actually rests on — no supported image declares the class —
+> holds for the whole `class-absent` bucket.
+>
+> Three measurements, none of which needed a census of what the VM mints:
+>
+> * `probes/DeadSweepReachProbe.java`, written against this list instead of
+>   against JDK surface, **dispatches 30 of the 791**. Eight classes were split
+>   down the middle by nothing but which methods a probe happened to call:
+>   `AtomicIntegerFieldUpdater$RustJvmImpl` had 4 of its 12 registrations
+>   dispatched and the other 8 on the list.
+> * The sweep had **no macOS arm**, and `sun/nio/ch/KQueuePort` (4 rows) and
+>   `sun/nio/fs/PollingWatchService` (9) are on both macOS images.
+>   `jdk-only-dead-sweep.py` now refuses an image set that does not name all
+>   three platforms.
+> * All fourteen remaining legacy names — `java/lang/Compiler`,
+>   `java/lang/UNIXProcess`, `sun/misc/Cleaner`, `sun/reflect/Reflection`,
+>   `java/net/PlainSocketImpl` and the rest — **load under `--synthetic-jdk`**,
+>   with `--dump-class-origins` reporting `compatibility-stub` for every one.
+>   That is *the fifth image* below, and it turns out to answer this bucket
+>   rather than merely being un-askable about it.
+>
+> **The list is 549 rows now, all `method-nowhere`**, and that case is genuinely
+> different: the class *is* a real JDK class on some image, so the receiver's
+> existence is not in question, only the method's. The `class-absent` rows moved
+> to `scripts/baselines/jdk-only-gated-never-delete.tsv` (208 rows, each with why
+> it is gated), and 246 of them are `SyntheticStub` now rather than `Bridge` —
+> `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
+
+1. **Delete the 549** (was 791; see the banner above). The list is measured and
+   committed; removing the registrations is a stub-removal change with its own
+   subsystem-per-PR discipline, and it should re-run the sweep afterwards rather
+   than trusting this file. Two cautions the list itself cannot carry: its
+   `registered_by` line numbers go stale against `dev` within days, so rows must
+   be re-located by content; and the largest cluster (`lang_string.rs`, 119) is a
+   covariant fan-out that registers each `append` under three return descriptors,
+   of which only some (class, descriptor) pairs exist in any JDK — those are
    mechanical, but they are not representative of the rest.
 2. **Restore what earlier waves deleted instead of gating.** `14145d874`
    removed five duplicate registrations that L7 R1's retag had missed;

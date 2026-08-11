@@ -260,7 +260,40 @@ use cratonvm_types::compat::CompatibilityMode;
 /// command — is **byte-identical to HotSpot 25**. Compatible `--real-jdk` mode
 /// is byte-identical to the build before the change; it keeps every one of
 /// these registrations and still answers with the VM's own process object.
-const BASELINE_SYNTHETIC_STUBS: usize = 689;
+///
+/// # 689 -> 943, 2026-08-10 (the receivers no supported image declares)
+///
+/// Two hundred and fifty-four, and for the fourth time in this history **no new
+/// fake was added.** This is the 2026-08-06 `cratonvm/synthetic/Process*` retag
+/// above applied to the rest of its own family instead of to one cluster: a
+/// registration whose receiver class is declared by **no** supported JDK image
+/// cannot bind to an `ACC_NATIVE` method, so §1.5 does not admit it as a
+/// `Bridge` under any reading. `native-api/src/no_image_receiver.rs` carries the
+/// table, the six images (21 and 25 × linux, windows, macos) it was measured
+/// against, and the two exclusions.
+///
+/// The count differs from the 246 a real-JDK boot census reports, and the
+/// difference is this file's registry rather than the change: the ratchet runs
+/// the default registration passes with no image, so it registers some triples a
+/// real boot does not and misses others. Both numbers cover the same 50 receiver
+/// classes.
+///
+/// Measured, in both directions:
+///
+///  * `--jdk-only` regression corpus **52 passed / 5 failed, unchanged** against
+///    the same tree without the change. Getting there took the two exclusions,
+///    and they are the interesting part — see `STRICT_STILL_FABRICATES` in that
+///    module. Strict mode still *creates* four of these classes
+///    (`ensure_synthetic_class` records the §5 violation and fabricates anyway),
+///    so dropping their natives replaced a silent violation with
+///    `UnsatisfiedLinkError`. The corpus caught two of the five; the other three
+///    were found by a class-origin census, because no vector builds an atomic
+///    field updater.
+///  * Compatible mode **34 passed / 0 failed, unchanged**, and the
+///    `CRATONVM_NO_STUBS` drop list grows by exactly the 246 retagged rows with
+///    **nothing else moving in either direction** — the check the 2026-07-14
+///    `java.util.Properties` regression would have failed.
+const BASELINE_SYNTHETIC_STUBS: usize = 943;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.

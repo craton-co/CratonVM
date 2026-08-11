@@ -66,7 +66,11 @@ misspelled. `arg1` is a single **environment block** `String` (NUL-separated
 
 `destroyProcess0(JZ)Z` is **also** registered and is **not** on the image —
 superseded by `destroy0(JJZ)Z` since JDK 9. Left alone; it is inert, and it is
-already recorded in `l5-native-io-bridge-residuals.md`.
+already recorded in the retired L5 `native-io` bridge-residuals write-up
+(`retired/l5-native-io-bridge-residuals-RETIRED-20260810.md`, internal tree).
+Its class *is* on the image, so it is a `method-nowhere` row and stays on the
+deletion-candidate list; only the `class-absent` bucket was re-tagged on
+2026-08-10.
 
 ### `java.lang.ProcessHandleImpl$Info` — 2 natives, both already registered
 

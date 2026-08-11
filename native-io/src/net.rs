@@ -3869,10 +3869,17 @@ fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
 // `SocketDispatcher.close0(I)V`/`close`/`invalidateAndClose`, and the four
 // `SocketChannelImpl`/`ServerSocketChannelImpl` `read0`/`write0` aliases) name
 // a method the class does not declare; 1 (`NativeDispatcher.preClose`) shadows
-// concrete bytecode. Note `SocketDispatcher.close` is DISPATCHED (3 invocations in the
-// census run) while resolving to no declared method — that pair is the one
-// worth a second look. Per-row table:
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// concrete bytecode.
+//
+// ANSWERED 2026-08-05: `SocketDispatcher.close` was flagged here as "DISPATCHED
+// while resolving to no declared method — the pair worth a second look". It
+// resolves to concrete bytecode on `sun.nio.ch.UnixDispatcher`, two frames up,
+// and receiver-driven dispatch finds the registration first. An ordinary §1.4
+// shadow of inherited bytecode, not a dispatch mystery — the census asks one
+// class and stops, which is what made it look like one.
+//
+// Per-row table:
+// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
 /// Register the `sun/nio/ch/Net` TCP-native surface. Safe to call more than
 /// once — later registrations override earlier ones at the same signature.
 pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {

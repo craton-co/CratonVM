@@ -4195,7 +4195,7 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // for the per-row `javap` census.
 //
 // Details and the per-row table:
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
 /// Register every WP1.12-owned subprocess native.  Called from
 /// `register_io_natives` at VM boot.
 pub fn register_process_natives(registry: &mut NativeMethodRegistry) {

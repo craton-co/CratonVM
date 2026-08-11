@@ -1,7 +1,55 @@
 # The `native-io` `Bridge` registrations the image does not back — L5's residual
 
-**Status:** OPEN — reclassification questions, filed 2026-08-05 by the L5
-`register_with_kind` migration. Nothing here is a crash; every row named below
+**Status:** RETIRED 2026-08-10. All five items under *What would close this* are
+closed. Nothing here was ever a crash.
+
+> ## Retirement note, 2026-08-10 — item 1 was the last one, and it was general
+>
+> The banners below took items 2–5 down between 2026-08-05 and 08-06 and left
+> item 1 with "a verdict and an ordered plan rather than a question". The plan
+> said, in terms, to adjudicate `Bridge` registrations on VM-minted receivers
+> **as a class of defect, in both places it is now known to occur** — and the
+> 2026-08-06 change did one cluster, the 29 `cratonvm/synthetic/Process*` rows.
+>
+> There were **fifty** such classes. 246 registrations across them are
+> `SyntheticStub` now, by measurement against six images (Temurin 21.0.12+8 and
+> 25.0.4+7 × linux, windows, macos), applied centrally in
+> `native-api/src/no_image_receiver.rs`. `--jdk-only` corpus 52 passed / 5 failed
+> unchanged, compatible 34/0 unchanged, and the `CRATONVM_NO_STUBS` drop list
+> grows by exactly 246 with nothing else moving in either direction.
+>
+> This record's own framing of item 1 turned out to be right in a way its author
+> could not check at the time: *"Neither half can be fixed alone."* Four of the
+> fifty had to be excluded because strict mode still fabricates the class, so
+> dropping the natives replaces a silent §5 violation with an
+> `UnsatisfiedLinkError`. They are named in the source and blocked on wave-2
+> item 4.
+>
+> **What the handoff would have cost if taken at face value.** The successor item
+> was a 791-row deletion list. **30 of its rows are dispatched by one probe**, 13
+> are on a macOS image nobody had swept, and all 14 remaining legacy names
+> resolve under `--synthetic-jdk`. The list is now 549 rows and a different
+> question. Full record:
+> `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
+>
+> **Re-homed rather than dropped:** the 9,296 `Bridge` rows the image does not
+> back — the question this record's sibling used to own — are now
+> `docs/known-issues/jdk-only/bridge-reclassification-wave.md`, with the per-file
+> breakdown and the measured blocker.
+>
+> **One claim in the 08-06 banner below does not survive re-measurement.** "L5's
+> own criterion … now selects **zero** rows tree-wide" selects 87 on a 2026-08-10
+> Linux census: 59 are `ACC_NATIVE` on another of the six images and 4 inherit an
+> `ACC_NATIVE` supertype — both correctly stated — but **24 registrations are
+> concrete bytecode on every one of the six**, all `ForkJoinTask`-family rows in
+> `native-builtins/src/phases_late/concurrent.rs`. Recorded with the
+> reclassification wave; `jdk-only-adjudicate.py` §3b now prints the check on
+> every run, which no gate was doing.
+
+---
+
+**Original status (2026-08-05):** OPEN — reclassification questions, filed by the
+L5 `register_with_kind` migration. Nothing here is a crash; every row named below
 behaves today exactly as it did before L5. What is open is that each one is
 tagged `Bridge` while the JDK 25 image says its target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits it on a claim nobody has checked.

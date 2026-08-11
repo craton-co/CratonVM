@@ -538,7 +538,7 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // for it. (The earlier "8 of the 11" and the names `readBytes`, `length`,
 // `setLength` in this marker came from a static read of pre-JDK-19 spellings;
 // the census names the descriptors this crate actually registers.) Residuals:
-// docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
+// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
     use cratonvm_native_api::NativeKind;
     let __prev_cat = registry.current_category();

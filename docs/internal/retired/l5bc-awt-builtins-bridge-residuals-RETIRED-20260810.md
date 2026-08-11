@@ -1,7 +1,72 @@
 # `native-awt` and `native-builtins` after L5b/L5c — what still inherits, and why
 
-**Status:** OPEN — reclassification questions left by the L5b/L5c
-`register_with_kind` migration, filed 2026-08-05. Nothing here is a crash.
+**Status:** RETIRED 2026-08-10. Its own file ownership was already clear; the two
+things it handed off are now done or owned elsewhere. Nothing here was ever a
+crash.
+
+> ## Retirement note, 2026-08-10 — both handoffs, followed up
+>
+> This record closed with *"Still open from this file: nothing in its own file
+> ownership … what is left is reclassification, which is contract §8's wave, plus
+> the 796-row deletion list."* Both of those were followed, and one of them was
+> wrong.
+>
+> **The deletion list was not a deletion list.** Three measurements say so, and
+> the record's own sibling had already written the rule that decides it (*"a
+> synthetic stub is never a deletion candidate — gate it, never delete it"*)
+> while applying it only to rows that already carried the tag being decided:
+>
+> * `probes/DeadSweepReachProbe.java`, written against the list rather than
+>   against JDK surface, **dispatches 30 of its 791 rows**. Eight classes were
+>   split down the middle by nothing but which methods a probe happened to call —
+>   `AtomicIntegerFieldUpdater$RustJvmImpl` had 4 of 12 registrations dispatched
+>   and the other 8 on the list.
+> * The sweep had **no macOS arm**: `sun/nio/ch/KQueuePort` and
+>   `sun/nio/fs/PollingWatchService` are on both macOS images, 13 rows.
+> * All 14 remaining legacy names — `java/lang/Compiler`, `java/lang/UNIXProcess`,
+>   `sun/misc/Cleaner`, `sun/reflect/Reflection` and the rest — **load under
+>   `--synthetic-jdk`**, where the VM mints a `compatibility-stub` on demand and
+>   these registrations are its only implementation.
+>
+> The disposition is a kind, not a deletion: **246 registrations across 50
+> receiver classes are `SyntheticStub`**, applied centrally in
+> `native-api/src/no_image_receiver.rs` from a six-image measurement. The list is
+> 549 rows now, all of them the genuinely different `method-nowhere` case.
+> `--jdk-only` corpus 52/5 unchanged, compatible 34/0 unchanged, drop list +246
+> and nothing else. Record:
+> `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
+>
+> **The reclassification wave is re-homed, not dropped.** This record said "This
+> record now owns the reclassification question", and retiring it silently would
+> have orphaned a measured population. It is
+> `docs/known-issues/jdk-only/bridge-reclassification-wave.md` — 9,296 rows
+> (8,319 owning a slot), broken down per registering file, with the blocker
+> stated as the measurement that established it rather than as a worry:
+> `CRATONVM_ENFORCE_NATIVE_SHADOW=1` takes the strict corpus from 32/17 to 3/46,
+> so the class's state has to become real before its shadow can be retired.
+>
+> Two of this record's numbers moved and are corrected there: `bridge` is 10,076
+> (not 10,434) and the unadjudicated population 9,296 (not 9,656), both after the
+> 246 re-tags.
+>
+> **One of its claims does not survive re-measurement.** Both records say L5's
+> criterion — a row may state `Bridge` exactly when the image declares that
+> triple `ACC_NATIVE` — "selects zero rows tree-wide". On 2026-08-10 it selects
+> **87**: 59 are `ACC_NATIVE` on another of the six images and 4 inherit an
+> `ACC_NATIVE` supertype, both correctly stated and invisible to a one-image
+> census — but **24 registrations, 12 triples, are concrete bytecode on all six**.
+> All twelve are `ForkJoinTask`/`RecursiveTask`/`RecursiveAction` in
+> `native-builtins/src/phases_late/concurrent.rs`, which L5c's own tally lists
+> among the rows it stated. They are deliberate load-bearing shadows, so the
+> wrong part is the statement and not the registration, and they belong with the
+> 4,579-row shadow population. Nothing was watching for this: L6's ratchet
+> refuses a *rise* and the kind map refuses a *change*, and neither asks whether
+> a `kind_stated` claim is true. `jdk-only-adjudicate.py` §3b prints it now.
+
+---
+
+**Original status (2026-08-05):** OPEN — reclassification questions left by the
+L5b/L5c `register_with_kind` migration. Nothing here is a crash.
 What is open is that 7,748 registrations across the two crates are tagged
 `Bridge` while the JDK 25 image says their target is not an `ACC_NATIVE`
 method, so `--jdk-only` admits every one of them on a claim nobody has checked.
