@@ -1445,60 +1445,226 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
-    registry.register(
-        "java/lang/Runtime",
-        "loadLibrary0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            // Map bare library name to platform-specific filename.
-            // resolve_library_path() in NativeContextImpl will search java.library.path.
-            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
-        },
-    );
-    registry.register(
-        "java/lang/Runtime",
-        "load0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |ctx, args| {
-            let path_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let path = ctx.read_string(path_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
-        },
-    );
+    //
+    // JDK-ONLY-WAVE2 (loader-scoped `loadedLibraryNames`): these four triples
+    // are registered TWICE over, once per compatibility mode, and each triple
+    // exactly once per registry — not re-registered on top of itself, which
+    // would leave a self-shadow row in the duplicate-registration census for a
+    // change that shadows nothing.
+    //
+    // The mode is readable here because `vm_init.rs` calls
+    // `set_compatibility_mode` BEFORE the `register_*` population pass, and
+    // says so structurally (the call sits above the `#[cfg(feature =
+    // "synthetic-jdk")]` fork so there is no reachable point between `new()`
+    // and the first `register_*` where the mode is unset). Registration is also
+    // where this campaign's own precedent puts a mode decision — §1.4's lever
+    // is registration, not dispatch. A native BODY cannot ask: `NativeCallback`
+    // is a bare `fn` pointer, so it captures nothing, and `NativeContext`
+    // exposes no policy accessor (deliberately — `CompatibilityMode` is a
+    // per-registry FIELD, not a process global).
+    //
+    // The `else` arm is today's four bodies with nothing removed and nothing
+    // decided differently — `LoaderScoping::Off` makes every success arm of
+    // `load_library_or_throw` return the `Ok(None)` it returns today, and the
+    // `args.get(1)` reads on the two `Runtime` sites are kept EXACTLY as they
+    // are even though the strict arm corrects them. See `runtime_load_args` for
+    // why that read is wrong and why correcting it here too would be a
+    // `Compatible` behaviour change this lane is not licensed to make.
+    if registry.compatibility_mode().is_jdk_only() {
+        registry.register(
+            "java/lang/Runtime",
+            "loadLibrary0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let (from_class, name) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                // Map bare library name to platform-specific filename.
+                // resolve_library_path() in NativeContextImpl will search java.library.path.
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    from_class,
+                    LoaderScoping::On,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/Runtime",
+            "load0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let (from_class, path) = runtime_load_args(&*ctx, args);
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    from_class,
+                    LoaderScoping::On,
+                )
+            },
+        );
+        // System.loadLibrary / System.load вЂ” delegate to the same machinery.
+        // Both are STATIC and `@CallerSensitive`: the real bytecode would pass
+        // `Reflection.getCallerClass()` down to `Runtime.load*0`, but the
+        // interception is above that, so there is no `fromClass` argument here
+        // and the caller is recovered from the frame stack instead.
+        registry.register(
+            "java/lang/System",
+            "loadLibrary",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let name_obj = obj_arg(args, 0)?;
+                let name = ctx.read_string(name_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                load_library_or_throw(ctx, &name, LibrarySpelling::BareName, None, LoaderScoping::On)
+            },
+        );
+        registry.register(
+            "java/lang/System",
+            "load",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let path_obj = obj_arg(args, 0)?;
+                let path = ctx.read_string(path_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::On,
+                )
+            },
+        );
+    } else {
+        registry.register(
+            "java/lang/Runtime",
+            "loadLibrary0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let name_obj = match args.get(1) {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(None),
+                };
+                let name = ctx.read_string(name_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                // Map bare library name to platform-specific filename.
+                // resolve_library_path() in NativeContextImpl will search java.library.path.
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/Runtime",
+            "load0",
+            "(Ljava/lang/Class;Ljava/lang/String;)V",
+            |ctx, args| {
+                let path_obj = match args.get(1) {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(None),
+                };
+                let path = ctx.read_string(path_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
 
-    // System.loadLibrary / System.load вЂ” delegate to the same machinery
-    registry.register(
-        "java/lang/System",
-        "loadLibrary",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let name_obj = obj_arg(args, 0)?;
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
-        },
-    );
-    registry.register(
-        "java/lang/System",
-        "load",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let path_obj = obj_arg(args, 0)?;
-            let path = ctx.read_string(path_obj).unwrap_or_default();
-            crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
-        },
-    );
+        // System.loadLibrary / System.load вЂ” delegate to the same machinery
+        registry.register(
+            "java/lang/System",
+            "loadLibrary",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let name_obj = obj_arg(args, 0)?;
+                let name = ctx.read_string(name_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
+                load_library_or_throw(
+                    ctx,
+                    &name,
+                    LibrarySpelling::BareName,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+        registry.register(
+            "java/lang/System",
+            "load",
+            "(Ljava/lang/String;)V",
+            |ctx, args| {
+                let path_obj = obj_arg(args, 0)?;
+                let path = ctx.read_string(path_obj).unwrap_or_default();
+                crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
+                load_library_or_throw(
+                    ctx,
+                    &path,
+                    LibrarySpelling::AbsolutePath,
+                    None,
+                    LoaderScoping::Off,
+                )
+            },
+        );
+    }
+}
+
+/// Decode `Runtime.load0(Class,String)` / `Runtime.loadLibrary0(Class,String)`
+/// into the JDK's own `(fromClass, name)` pair.
+///
+/// **Both are INSTANCE methods.** `javap -p java.lang.Runtime` on JDK 25.0.3:
+///
+/// ```text
+///   public void load(java.lang.String);
+///   void load0(java.lang.Class<?>, java.lang.String);
+///   public void loadLibrary(java.lang.String);
+///   void loadLibrary0(java.lang.Class<?>, java.lang.String);
+/// ```
+///
+/// so a native body sees `args[0]` = the `Runtime` receiver, `args[1]` = the
+/// `fromClass` mirror `Runtime.loadLibrary(String)` resolved with
+/// `Reflection.getCallerClass()`, and `args[2]` = the library name. That
+/// convention is stated all over this crate for the same registry — the
+/// `Runtime.addShutdownHook` registration forty lines above says "args[0] = the
+/// `Runtime` receiver, args[1] = the hook `Thread`", and `vm_exec.rs`'s native
+/// argument marshalling describes its inline buffer as "receiver plus a couple
+/// of operands".
+///
+/// The pre-existing bodies read `args.get(1)` as the NAME. That is the
+/// `fromClass` mirror, and `read_string` of a non-`String` object is `None`
+/// (`vm_object.rs::read_string_non_string_object`), so the name arrives empty
+/// and `Runtime.getRuntime().loadLibrary(x)` fails for every `x` with
+/// `no  in java.library.path` — a wrong answer with a right *shape*, which is
+/// why no vector caught it: the regression suite reaches library loading only
+/// through `System.load`/`System.loadLibrary`
+/// (`RJdkJni.java:189-217`, `RJdkFailure.java:257`), never through `Runtime`.
+///
+/// Corrected on the strict arm only. It is mode-independent — nothing about it
+/// is a `Compatible`-layer substitution — so repairing it under `Compatible`
+/// is a behaviour change owned by whoever owns `Compatible`, not by this lane;
+/// the patch is one line per site and is written down in
+/// W5-1-loadlibrary-allowlist-too-wide.md.
+fn runtime_load_args(ctx: &dyn NativeContext, args: &[Value]) -> (Option<ObjectRef>, String) {
+    let from_class = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = match args.get(2) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    (from_class, name)
 }
 
 /// Which of the two JDK spellings the caller used. `System.loadLibrary("zip")`
@@ -1510,6 +1676,211 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
 enum LibrarySpelling {
     BareName,
     AbsolutePath,
+}
+
+// ---------------------------------------------------------------------------
+// Per-class-loader `loadedLibraryNames`.
+//
+// THE JDK RULE, from `jdk.internal.loader.NativeLibraries` in JDK 25.0.3's
+// `lib/src.zip` (Eclipse Adoptium build; the same file `javap -p
+// jdk.internal.loader.NativeLibraries` describes structurally). The class doc
+// on `newInstance(ClassLoader)` states it as a numbered restriction:
+//
+//     3. Restriction on a native library that can only be loaded by one class
+//        loader. Each class loader manages its own set of native libraries.
+//        The same JNI native library cannot be loaded into more than one class
+//        loader.
+//
+// and `loadLibrary(Class,String,boolean)` enforces it in two steps, in this
+// order, under `acquireNativeLibraryLock(name)`:
+//
+//     NativeLibrary cached = libraries.get(name);       // THIS loader's map
+//     if (cached != null) return cached;                //  -> silent success
+//     if (loadedLibraryNames.contains(name)) {          // ANY loader's names
+//         throw new UnsatisfiedLinkError("Native Library " + name +
+//                 " already loaded in another classloader");
+//     }
+//
+// The two structures are not the same shape: `libraries` is an INSTANCE field
+// of a `NativeLibraries` that `ClassLoader` holds one of per loader
+// (`private final NativeLibraries libraries = NativeLibraries.newInstance(this)`,
+// reached by `ClassLoader.nativeLibrariesFor(loader)`, with
+// `BootLoader.getNativeLibraries()` standing in for the null loader), while
+// `loadedLibraryNames` is a static `Set<String>`. A same-loader repeat is a
+// success that returns the SAME library; a cross-loader repeat is an error.
+// One process-wide set of names cannot tell those apart, because it answers
+// with a string key and no loader identity — which is precisely the
+// bind-by-NAME species this repository has now paid for five separate times
+// (the `docs/known-issues/jdk-only/README.md` loader-identity cluster).
+//
+// WHY THIS HAS TO LIVE HERE AT ALL. On HotSpot the rule is enforced by
+// `ClassLoader.loadLibrary` bytecode, which is where W6-6 correctly says the
+// `NativeLibraries.load` native must NOT duplicate it. But CratonVM intercepts
+// the whole road above that: `System.load`, `System.loadLibrary`,
+// `Runtime.load0` and `Runtime.loadLibrary0` are all registered natives, so
+// `ClassLoader.loadLibrary` -> `NativeLibraries.loadLibrary` never runs for
+// them and the JDK's own bookkeeping is never consulted OR populated. A VM that
+// replaces the bytecode that enforced a rule inherits the rule.
+//
+// SHAPE. One `VmScoped` table, `loader id -> keys`, and both JDK queries are
+// answered from it: "does THIS loader hold it" is a row lookup, "does ANY
+// loader hold it" is the union over rows. Not two structures, and not a process
+// global — jdk-only-mode.md §2 forbids process globals for this feature's
+// state, and this repo has already shipped the failure that protects against
+// (native caches leaking across two `SharedVm`s in one test process; see
+// `cratonvm_native_api::vm_scoped`). Keyed by `vm_identity` and torn down from
+// `forget_vm_system_singletons`, like `SYSTEM_ENV`/`SYSTEM_PROPS` below.
+//
+// No `ObjectRef` is stored — a loader id is an `i32` and a key is a `String` —
+// so unlike those two this table needs no GC root scan and no post-collection
+// remap. Storing the loader MIRROR would have needed both, and would have
+// keyed loader identity on an object whose address moves.
+// ---------------------------------------------------------------------------
+
+/// Whether the per-loader rule above is in force at this registration.
+///
+/// `Off` on every `Compatible` registration: contract §5/§10 requires
+/// `Compatible` to stay byte-for-byte, and this rule can only ever turn a
+/// success into an `UnsatisfiedLinkError`, which is a behaviour change for
+/// every caller written around a `catch (UnsatisfiedLinkError)` fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoaderScoping {
+    Off,
+    On,
+}
+
+/// `loader id -> the library keys that loader has been told it holds`, one row
+/// per VM. `BTreeMap`/`BTreeSet` rather than hash maps because the rows are
+/// tiny (a JVM loads a handful of JNI libraries) and a deterministic iteration
+/// order makes the "which loader owns it" answer reproducible when a key has
+/// somehow been recorded twice.
+static LOADED_LIBRARIES: VmScoped<
+    std::collections::BTreeMap<i32, std::collections::BTreeSet<String>>,
+> = VmScoped::new();
+
+/// Claim `key` for `loader`, or report the loader that already holds it.
+///
+/// ONE table acquisition, deliberately: `contains` followed by a separate
+/// `insert` lets two threads loading the same library concurrently both see
+/// "unclaimed" and both claim it, and HotSpot closes exactly that window by
+/// running its `libraries.get` / `loadedLibraryNames.contains` / put sequence
+/// inside `acquireNativeLibraryLock(name)`.
+///
+/// `Some(owner)` means the key was already held — by `loader` itself (a
+/// same-loader repeat, which the JDK answers with the cached library) or by
+/// another loader (the `UnsatisfiedLinkError`). `None` means it is now
+/// `loader`'s.
+///
+/// The closure touches only this map: no allocation, no Java dispatch, no
+/// second `VmScoped` lock, per the lock discipline in
+/// `cratonvm_native_api::vm_scoped`.
+fn claim_library(vm_identity: usize, loader: i32, key: &str) -> Option<i32> {
+    LOADED_LIBRARIES.with(vm_identity, |rows| {
+        if let Some((owner, _)) = rows.iter().find(|(_, keys)| keys.contains(key)) {
+            return Some(*owner);
+        }
+        rows.entry(loader).or_default().insert(key.to_string());
+        None
+    })
+}
+
+/// Which class loader is asking for this library, as a loader IDENTITY —
+/// `NativeContext::loader_id_of_class`'s `0` bootstrap / `1` platform /
+/// `2` application / `3+` user-defined — never a loader name. Two loaders can
+/// share a name; that is the whole species this record belongs to.
+///
+/// Two sources, in the JDK's own order of authority:
+///
+/// 1. `from_class`, when the entry point had one. `Runtime.load0` and
+///    `Runtime.loadLibrary0` are handed the caller by `Reflection
+///    .getCallerClass()` in real `Runtime` bytecode, and `ClassLoader
+///    .loadLibrary(Class,String)` derives the loader from exactly that:
+///    `ClassLoader loader = (fromClass == null) ? null : fromClass.getClassLoader()`.
+///    Taking the argument means agreeing with the JDK by construction.
+///
+/// 2. Otherwise the frame stack. `System.load`/`System.loadLibrary` are static
+///    and `@CallerSensitive`, and the interception sits above the point where
+///    the JDK would have resolved the caller, so the caller has to be recovered
+///    the same way `latest_user_defined_loader_class` and
+///    `class_for_name_one_arg_caller_loader` do: `frame_class_ids()`, which
+///    hands back each live frame's already-resolved `ClassId` innermost first.
+///    NOT a name re-resolution of a captured stack trace — that collapses two
+///    same-named classes from different loaders onto whichever the global class
+///    table saw first, which would answer this exact question with the wrong
+///    loader.
+///
+///    The `java/lang/System` and `java/lang/Runtime` frames skipped here are
+///    the intercepted native's own frame and the `Runtime.loadLibrary` ->
+///    `loadLibrary0` hop; they are the frames `Reflection.getCallerClass()`
+///    skips for the same reason, both methods being `@CallerSensitive`.
+///
+/// `None` is the honest answer when neither source names a class — a library
+/// load with no Java frame under it (an embedder or a JNI `JNI_OnLoad`
+/// re-entry). See `loaded_by` for what is done with it, which is deliberately
+/// nothing.
+fn requesting_loader_id(ctx: &mut dyn NativeContext, from_class: Option<ObjectRef>) -> Option<i32> {
+    if let Some(mirror) = from_class {
+        if let Some(class_id) = ctx.class_id_from_mirror(mirror) {
+            return Some(ctx.loader_id_of_class(class_id));
+        }
+    }
+    for class_id in ctx.frame_class_ids() {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
+            Some("java/lang/System") | Some("java/lang/Runtime") => continue,
+            Some(_) => return Some(ctx.loader_id_of_class(class_id)),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The success return of `load_library_or_throw`, after the per-loader rule
+/// has had its say.
+///
+/// `key` is the library identity. HotSpot's is `file.getCanonicalPath()` for
+/// anything not statically linked into libjvm (`NativeLibraries.loadLibrary
+/// (Class,File)` sets `name = file.getCanonicalPath()` before handing it to the
+/// checks above), so on HotSpot `System.loadLibrary("zip")` and
+/// `System.load("<java.home>/bin/zip.dll")` collide. Here the key is the string
+/// the caller spelled. That is narrower, and NOT rounded up to a fabricated
+/// path: `NativeContext::load_native_library` returns a library-table INDEX,
+/// not the path it resolved, so a bare name that was found somewhere on
+/// `java.library.path` cannot be canonicalised back to a file without redoing
+/// the search — and a key invented by redoing it would not be the file that was
+/// actually opened. Named residual in
+/// W5-1-loadlibrary-allowlist-too-wide.md; two spellings of one file are
+/// two keys here.
+fn loaded_by(
+    ctx: &mut dyn NativeContext,
+    key: &str,
+    from_class: Option<ObjectRef>,
+    scoping: LoaderScoping,
+) -> MethodCallResult {
+    if scoping == LoaderScoping::Off {
+        return Ok(None);
+    }
+    // No caller, no claim. Recording this under a stand-in loader id would make
+    // the NEXT load — the one from the real owner — throw, manufacturing the
+    // very error this models; throwing here would manufacture it immediately.
+    // Both are fabrications, and a missed error is the one that leaves a
+    // caller's own `catch (UnsatisfiedLinkError)` fallback reachable.
+    let Some(loader) = requesting_loader_id(ctx, from_class) else {
+        return Ok(None);
+    };
+    match claim_library(ctx.vm_identity(), loader, key) {
+        // Freshly claimed, or a same-loader repeat: the JDK returns the cached
+        // `NativeLibrary` for the repeat, which is a plain success here since
+        // nothing above consumes the handle on this road.
+        None => Ok(None),
+        Some(owner) if owner == loader => Ok(None),
+        // Message reproduced verbatim from `NativeLibraries.loadLibrary`;
+        // applications match on it (the JDK's own text is the only contract a
+        // caller can key off, the exception carrying no other detail).
+        Some(_) => Err(RuntimeError::UnsatisfiedLinkError {
+            message: format!("Native Library {key} already loaded in another classloader"),
+        }
+        .into()),
+    }
 }
 
 /// The bare library names whose ENTIRE native surface this VM supplies from
@@ -1565,12 +1936,17 @@ enum LibrarySpelling {
 /// `net` probe (`RJdkJni.java:189-202`). This is a test-produced state, not a
 /// file-layout fact, so it holds identically on Linux.
 ///
-/// KNOWN RESIDUAL: the same dynamic rule applies to `net`/`nio`/`prefs`, and
-/// this list cannot model it — there is no class-loader-scoped
-/// `loadedLibraryNames` bookkeeping anywhere in this VM. A program that uses
-/// `java.net` and then calls `System.loadLibrary("net")` gets a silent success
-/// here where HotSpot throws. `net` stays on the list because the measured
-/// oracle needs it: `RJdkJni` never touches `java.net` before line 195.
+/// THE DYNAMIC RULE IS NO LONGER UNMODELLED, but this list is still not what
+/// models it. Under `LoaderScoping::On` (strict mode) [`loaded_by`] keeps the
+/// per-class-loader record HotSpot keeps, so a second load of the same library
+/// from a DIFFERENT loader now throws. What that record cannot see is a library
+/// the BOOT loader holds, because `jdk/internal/loader/BootLoader.loadLibrary`
+/// is registered as a no-op in `native-builtins/src/lib.rs` — the one event
+/// that would tell us `java.base` had taken `net`/`nio`/`prefs` for itself
+/// never reaches any bookkeeping. See [`record_boot_loader_library`], which is
+/// written and deliberately unarmed. `net` therefore stays on this list, and
+/// the measured oracle still needs it there: `RJdkJni` never touches
+/// `java.net` before line 195.
 pub(crate) fn is_vm_provided_jdk_library(name: &str) -> bool {
     // Ships as a real, separately-present shared object in the JDK 25 image on
     // every platform, and cold-loads on HotSpot.
@@ -1676,24 +2052,35 @@ fn jdk_image_ships_library(ctx: &dyn NativeContext, name: &str) -> bool {
 /// The load is still attempted first, so a library that really is on
 /// `java.library.path` still loads and `JNI_OnLoad` still runs. Only the failure
 /// path changed, and only for names outside [`is_vm_provided_jdk_library`].
+///
+/// `scoping` selects whether the per-class-loader rule above [`LoaderScoping`]
+/// applies. All three SUCCESS arms below route through [`loaded_by`], not
+/// through a bare `Ok(None)`: on HotSpot the "already loaded in another
+/// classloader" check sits above the load attempt, so it governs a JDK-image
+/// library reported loaded from the allowlist exactly as it governs a
+/// third-party `.so` this VM really opened. Two web applications with their own
+/// loaders probing one `tcnative` is the shape that reaches this first, and it
+/// needs no boot-loader bookkeeping to fire.
 fn load_library_or_throw(
     ctx: &mut dyn NativeContext,
     requested: &str,
     spelling: LibrarySpelling,
+    from_class: Option<ObjectRef>,
+    scoping: LoaderScoping,
 ) -> MethodCallResult {
     let target = match spelling {
         LibrarySpelling::BareName => platform_lib_name(requested),
         LibrarySpelling::AbsolutePath => requested.to_string(),
     };
     if ctx.load_native_library(&target).is_ok() {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // A JDK-image library whose natives this VM already provides is not a
     // failure — see `is_vm_provided_jdk_library`. Only a bare name can name
     // one; `System.load("/some/path/libzip.so")` names a FILE, and a file that
     // is not there is an error however it is spelled.
     if spelling == LibrarySpelling::BareName && is_vm_provided_jdk_library(requested) {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // Same reasoning, decided by measurement instead of by list: a library that
     // SHIPS IN THE JDK IMAGE is one HotSpot loads, so refusing it here would be
@@ -1701,7 +2088,7 @@ fn load_library_or_throw(
     // to fix. Restricted to the image directory on purpose -- a library the
     // user put on `java.library.path` that we failed to open is a real failure.
     if spelling == LibrarySpelling::BareName && jdk_image_ships_library(&*ctx, requested) {
-        return Ok(None);
+        return loaded_by(ctx, requested, from_class, scoping);
     }
     // NOT memoised as a failure: the JDK re-attempts the lookup on every call
     // (`RJdkFailure.java:269` asserts the second attempt throws too), and a
@@ -2749,6 +3136,59 @@ pub fn gc_update_system_singleton_refs(
 pub fn forget_vm_system_singletons(vm_identity: usize) {
     SYSTEM_ENV.forget(vm_identity);
     SYSTEM_PROPS.forget(vm_identity);
+    // Same reason, different table: a `vm_identity` is reused, and a second VM
+    // inheriting the first's loaded-library rows would refuse a load the first
+    // VM made — an `UnsatisfiedLinkError` naming a loader that no longer
+    // exists. See `LOADED_LIBRARIES`.
+    LOADED_LIBRARIES.forget(vm_identity);
+}
+
+/// Record that the BOOT loader holds `name`, so a later app-loader
+/// `System.loadLibrary(name)` gets the JDK's "already loaded in another
+/// classloader" error instead of a success.
+///
+/// **THIS HAS NO CALLER IN THE TREE. It is a written-down hand-off, not a live
+/// path — do not read its presence as the feature being on.** The one call site
+/// it is for is the `jdk/internal/loader/BootLoader.loadLibrary` registration in
+/// `native-builtins/src/lib.rs`, which is a deliberate `|_ctx, _args| Ok(None)`
+/// no-op (that short-circuit is what stops real `NativeLibraries` bytecode from
+/// blocking on the JDK's native-library lock during Linux boot-class `<clinit>`,
+/// so it must stay a no-op *for the load*; only the bookkeeping is missing).
+/// The patch is one line inside that closure — `BootLoader.loadLibrary(String)`
+/// is static, so `args[0]` is the name:
+///
+/// ```ignore
+/// |ctx, args| {
+///     if let Some(Value::Object(Some(o))) = args.first() {
+///         let name = ctx.read_string(*o).unwrap_or_default();
+///         crate::lang_system::record_boot_loader_library(ctx, &name);
+///     }
+///     Ok(None)
+/// }
+/// ```
+///
+/// UNARMED ON PURPOSE, and the reason is measurable rather than cautious:
+/// arming it makes `System.loadLibrary("net")` throw for any program that has
+/// already reached a `java.net` boot class, which is exactly HotSpot's answer
+/// and exactly what `RJdkJni.libraryLoading` depends on NOT happening — its
+/// `zip` probe falls through to a `net` probe that must succeed
+/// (`RJdkJni.java:189-202`), and `run.sh` compares `CK` lines. Whether CratonVM
+/// reaches `BootLoader.loadLibrary("net")` before that line cannot be settled
+/// from source; it is one A/B on a built binary in both modes with the HotSpot
+/// oracle beside it. Nothing here has been built or run.
+///
+/// Recording is inert under `Compatible` regardless: nothing reads
+/// `LOADED_LIBRARIES` unless a `LoaderScoping::On` registration is in force,
+/// and only the strict arm installs one.
+pub fn record_boot_loader_library(ctx: &mut dyn NativeContext, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    // Loader id 0 is the bootstrap loader — `NativeContext::loader_id_of_class`'s
+    // own encoding, and the loader `BootLoader.loadLibrary` loads on behalf of
+    // by definition. Any existing owner is left alone: this native returns void
+    // and reports nothing, so there is no shape in which to raise the conflict.
+    let _existing_owner = claim_library(ctx.vm_identity(), 0, name);
 }
 
 pub(crate) fn native_system_getenv_all(
