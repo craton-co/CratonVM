@@ -2293,7 +2293,6 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ivps = "javax/crypto/spec/IvParameterSpec";
-    r.register(ivps, "<clinit>", "()V", clinit_noop);
     r.register(ivps, "<init>", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let iv_arr = obj_arg(args, 1)?;
@@ -2313,7 +2312,6 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     });
 
     let gcmps = "javax/crypto/spec/GCMParameterSpec";
-    r.register(gcmps, "<clinit>", "()V", clinit_noop);
     r.register(gcmps, "<init>", "(I[B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let t_len = args[1].as_int().unwrap_or(128);

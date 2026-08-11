@@ -887,17 +887,36 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
     );
 }
 
+// The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,
+// step 3, 2026-08-10). Its 1,904 call sites moved to the fallible spelling on
+// 2026-08-07 (attempt 5), leaving one straggler in `lookup_define.rs`; with that
+// migrated it survived only as a way back to `ensure_synthetic_class`, which is
+// the entry point step 3 removes.
+
+/// Allocate a synthetic object through the workspace's busiest fabrication
+/// funnel, with the refusal `--jdk-only` requires.
+///
+/// The deleted infallible twin reached `ensure_synthetic_class`, whose signature
+/// had no error channel, so under `--jdk-only` it recorded a
+/// `CompatibilityClassRequested` violation and fabricated anyway. This one goes
+/// through `try_ensure_synthetic_class`, so the refusal reaches the caller as a
+/// `NoClassDefFoundError` naming the class.
+///
+/// Under the default `Compatible` mode this is byte-for-byte what the twin did.
+///
+/// Every native returning `MethodCallResult` should prefer this spelling;
+/// `ClassIdentityError` converts with `?`.
+///
 /// `#[track_caller]` so the class-origin census's `requested_by` names the
 /// native that wanted the shape, not this one forwarding line — see the
-/// matching note on `NativeContext::ensure_synthetic_class`. This is the
-/// single busiest fabrication funnel in the workspace (~2,000 call sites), so
-/// without it the census cannot name a single one of them.
+/// matching note on `NativeContext::try_ensure_synthetic_class`. This funnel has
+/// ~2,000 call sites, so without it the census cannot name a single one.
 #[track_caller]
-pub(crate) fn alloc_concurrent_synthetic(
+pub(crate) fn try_alloc_concurrent_synthetic(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => {
             let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
@@ -908,94 +927,45 @@ pub(crate) fn alloc_concurrent_synthetic(
                 // ClassId for helper/interface-like synthetic classes. Keep
                 // the requested identity so field writes and native dispatch
                 // use the helper layout instead of Object's zero-slot layout.
-                ctx.class_id_by_name(class_name)
-                    .unwrap_or_else(|| ctx.ensure_synthetic_class(class_name, num_fields))
-            };
-            // In real-JDK mode the loaded class's actual instance-field
-            // count often exceeds the synthetic-mode hard-coded number.
-            // Allocating with too few slots causes out-of-bounds field
-            // access later (KC16 bootstrap tripped this on ClassId
-            // 355/359 with index=4 vs num_slots=3).  Use the larger of
-            // the two so both paths have enough room.  0 means the class
-            // isn't loaded yet — keep the caller's requested size.
-            let real = ctx.class_num_total_fields(cid);
-            if num_fields > 0 && num_fields < real {
-                report_layout_alias(class_name, num_fields, real);
-            }
-            let n = num_fields.max(real);
-            // `try_alloc_object_gc_safe` first (proactively collects, then
-            // walks young -> old gen without aborting): this is the shared
-            // allocator behind `java.net.URI`, `HttpURLConnection`, and many
-            // other synthetic native objects -- a gdb backtrace confirmed
-            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
-            // 1,000,000) hard-aborted the whole process here on young-gen
-            // exhaustion. Falling back to the aborting `alloc_object` only
-            // if the GC-safe path still reports genuine exhaustion (both
-            // generations full even after a fresh collection) preserves
-            // today's behavior for that now much narrower case, with no
-            // signature change for this function's many other callers. See
-            // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
-            ctx.try_alloc_object_gc_safe(cid, n)
-                .unwrap_or_else(|| ctx.alloc_object(cid, n))
-        }
-        Err(_) => {
-            // The real `.class` file could not be loaded. Allocating with
-            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
-            // but a non-zero slot count produces an "undersized object
-            // layout" object — the GC's `get_field` bounds guard rejects
-            // every field access on it (class declares 0 fields, object has
-            // `num_fields` slots). Register a synthetic class declaring
-            // `num_fields` instance fields so the header's `class_id`
-            // matches the allocated slot count.
-            let cid = ctx.ensure_synthetic_class(class_name, num_fields);
-            ctx.alloc_object(cid, num_fields)
-        }
-    }
-}
-
-/// The fallible spelling of [`alloc_concurrent_synthetic`] — same operation,
-/// with the refusal `--jdk-only` requires.
-///
-/// [`alloc_concurrent_synthetic`] reaches `ensure_synthetic_class`, whose
-/// signature has no error channel, so under `--jdk-only` it records a
-/// `CompatibilityClassRequested` violation and fabricates anyway. This one goes
-/// through `try_ensure_synthetic_class`, so the refusal reaches the caller as a
-/// `ClassNotFoundException` naming the class.
-///
-/// Under the default `Compatible` mode the two are byte-for-byte identical.
-///
-/// Every native returning `MethodCallResult` should prefer this spelling;
-/// `ClassIdentityError` converts with `?`.
-#[track_caller]
-pub(crate) fn try_alloc_concurrent_synthetic(
-    ctx: &mut dyn NativeContext,
-    class_name: &str,
-    num_fields: usize,
-) -> Result<ObjectRef, MethodCallFailed> {
-    // Structurally identical to the infallible spelling above; only the two
-    // `ensure_synthetic_class` arms differ, and only in that they ask the
-    // policy rather than override it.
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => {
-            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-            let cid = if resolved_name == class_name || class_name == "java/lang/Object" {
-                class_id
-            } else {
                 match ctx.class_id_by_name(class_name) {
                     Some(id) => id,
                     None => refused_class(ctx, class_name, num_fields)?,
                 }
             };
+            // In real-JDK mode the loaded class's actual instance-field count
+            // often exceeds the synthetic-mode hard-coded number. Allocating
+            // with too few slots causes out-of-bounds field access later (KC16
+            // bootstrap tripped this on ClassId 355/359 with index=4 vs
+            // num_slots=3). Use the larger of the two so both paths have enough
+            // room. 0 means the class isn't loaded yet — keep the caller's
+            // requested size.
             let real = ctx.class_num_total_fields(cid);
             if num_fields > 0 && num_fields < real {
                 report_layout_alias(class_name, num_fields, real);
             }
             let n = num_fields.max(real);
+            // `try_alloc_object_gc_safe` first (proactively collects, then walks
+            // young -> old gen without aborting): this is the shared allocator
+            // behind `java.net.URI`, `HttpURLConnection`, and many other
+            // synthetic native objects — a gdb backtrace confirmed
+            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
+            // 1,000,000) hard-aborted the whole process here on young-gen
+            // exhaustion. Falling back to the aborting `alloc_object` only if
+            // the GC-safe path still reports genuine exhaustion (both
+            // generations full even after a fresh collection) keeps that now
+            // much narrower case behaving as it did.
             Ok(ctx
                 .try_alloc_object_gc_safe(cid, n)
                 .unwrap_or_else(|| ctx.alloc_object(cid, n)))
         }
         Err(_) => {
+            // The real `.class` file could not be loaded. Allocating with
+            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields) but a
+            // non-zero slot count produces an "undersized object layout" object
+            // — the GC's `get_field` bounds guard rejects every field access on
+            // it. Ask the policy for a synthetic class declaring `num_fields`
+            // instance fields, so the header's `class_id` matches the allocated
+            // slot count; under `--jdk-only` that ask is refused instead.
             let cid = refused_class(ctx, class_name, num_fields)?;
             Ok(ctx.alloc_object(cid, num_fields))
         }
@@ -1009,8 +979,15 @@ pub(crate) fn try_alloc_concurrent_synthetic(
 /// exception model defines as uncatchable and fatal — the wrong shape for a
 /// policy refusal. Contract §5 asks for the specification's
 /// `NoClassDefFoundError`, which is what `refusal_to_java_failure` builds.
+///
+/// `pub(crate)` since 2026-08-10 (JDK-only wave 2, step 3): the crate's
+/// remaining direct `ensure_synthetic_class` callers — the enterprise-shim
+/// `alloc_object_for` helpers, `alloc_impl`, the array-element class lookups in
+/// `lang_string`/`keystore`/`regex_matcher` — each needed the same three lines,
+/// and three per-site copies of a conversion is how the two spellings drift
+/// apart. One idiom, one place.
 #[track_caller]
-fn refused_class(
+pub(crate) fn refused_class(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
@@ -6052,6 +6029,14 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)J",
         native_stamped_try_write_lock_timed,
     );
+    // `isLocked()` is a DELIBERATE completion of the synthetic surface: JDK 25's
+    // `StampedLock` declares `isReadLocked`/`isWriteLocked` and no `isLocked`,
+    // so the dead-everywhere sweep scores this row "method nowhere on any
+    // image" and listed it for deletion. It must NOT be deleted —
+    // `native-builtins/tests/registry_contracts.rs` pins it, and under
+    // `--synthetic-jdk` it is the only implementation there is. A row a contract
+    // test pins is gated by that fact alone, which is what the sweep's new
+    // `--pinned` input carries.
     registry.register(sl, "isLocked", "()Z", native_stamped_is_locked);
     registry.register(sl, "isWriteLocked", "()Z", native_stamped_is_write_locked);
     registry.register(sl, "isReadLocked", "()Z", native_stamped_is_read_locked);

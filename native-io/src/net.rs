@@ -3884,7 +3884,6 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // Lifecycle
     r.register_with_kind(net, "socket0", "(ZZZZ)I", net_socket0, NativeKind::Bridge);
     // Some JDK builds drop the fastLoopback parameter.
-    r.register(net, "socket0", "(ZZZ)I", net_socket0);
     r.register_with_kind(
         net,
         "bind0",
@@ -3920,12 +3919,9 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         net_shutdown,
         NativeKind::Bridge,
     );
-    r.register(net, "close", "(Ljava/io/FileDescriptor;)V", net_close);
 
     // I/O delegates (also mirror on ServerSocketChannelImpl / SocketChannelImpl
     // in case JDK dispatch reaches them directly).
-    r.register(net, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
-    r.register(net, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     // DF04: bytes-readable query (ioctl FIONREAD). NioSocketImpl.available()
     // → Socket.getInputStream().available() dispatches here.
     r.register_with_kind(

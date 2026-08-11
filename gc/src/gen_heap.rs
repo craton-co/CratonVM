@@ -9366,6 +9366,34 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = merge_skips(young_from.free_blocks_sorted());
+        // MARKWHY: which SKIP ARM covers the watched address? The walk never
+        // stopped at the evicted JSP loader's base, so its span is inside a
+        // stretch the walk strides over. There are three candidates and they
+        // want three different fixes, so name the one that actually applies
+        // instead of inferring it from the absence of desync markers.
+        //
+        // `existing_free` is already the MERGE of the arena free list and the
+        // JIT TLAB reservations, so the two are tested separately here — a
+        // reserved TLAB tail and a genuine free block are not the same finding.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base && w < from_base + young_from.used() {
+                let off = w - from_base;
+                let in_free = young_from
+                    .free_blocks_sorted()
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                let in_jit = jit_skips
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                eprintln!(
+                    "[MARKWHY] skip-arm probe: watch={w:#x} off={off:#x} used={:#x}                      in_free_block={in_free:?} in_jit_tlab_skip={in_jit:?}",
+                    young_from.used(),
+                );
+            }
+        }
         // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
         // sweep start? `existing_free` is built only from prior sweeps' coalesced
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here
@@ -9421,6 +9449,22 @@ impl GenerationalHeap {
         let mut last_anchor_off: usize = 0;
         let mut objects_since_anchor: usize = 0;
         let mut prev_obj: (usize, usize, u32, u8) = (0, 0, 0, 0);
+        // MARKWHY census: `dead_regions` comes out empty and there are exactly
+        // two ways that happens — the walk classified everything LIVE, or it
+        // collected spans and UNWOUND them. These counters separate the two in
+        // one run instead of another round of inference. Free: five `usize`
+        // increments on a path that already does far more per object.
+        let mut mw_side = 0usize;
+        let mut mw_late = 0usize;
+        let mut mw_fwd = 0usize;
+        let mut mw_hdr_marked = 0usize;
+        let mut mw_dead_pushed = 0usize;
+        let mut mw_unwinds = 0usize;
+        // Per-unwind-site tally: [0]=free-block overshoot, [1]=oversized-object
+        // clamp, [2]=implausible-header resync, [3]=free-list overlap.
+        let mut mw_site = [0usize; 4];
+        let mut mw_unwound_entries = 0usize;
+
         let mut objects_live: usize = 0;
 
         // See `YoungMarkCtx::mark_why`; read once, not per object.
@@ -9585,7 +9629,7 @@ impl GenerationalHeap {
                     // it may cover a live object's interior. Unwind them
                     // (they have not been zeroed or published yet;
                     // over-retention is always safe under this sweep).
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[0] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                 }
                 if resynced {
                     // A free block's end is ground truth — a fresh anchor.
@@ -9688,7 +9732,7 @@ impl GenerationalHeap {
                     // Reclaim decisions taken since the last anchor were taken
                     // on a grid this span calls into question -- drop them. That
                     // half was always right.
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[1] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                     // What was wrong is the RESUME. Re-anchoring at the next
                     // FREE BLOCK abandons everything in between, and when the
                     // free list is empty there is no anchor at all, so the
@@ -9933,7 +9977,7 @@ impl GenerationalHeap {
                 // decisions made since the last anchor — they may cover a
                 // live object's interior. They have not been zeroed or
                 // published yet (deferred to the publication loop).
-                dead_regions.truncate(dead_watermark);
+                { mw_unwinds += 1; mw_site[2] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                 if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                     tracing::warn!(
                         "non-moving sweep: re-anchored at next free block (offset {}); \
@@ -9977,7 +10021,7 @@ impl GenerationalHeap {
                     // decisions since the last anchor are suspect — unwind
                     // them (over-retention safe) before re-anchoring at the
                     // hole, where the skip loop takes over.
-                    dead_regions.truncate(dead_watermark);
+                    { mw_unwinds += 1; mw_site[3] += 1; mw_unwound_entries += dead_regions.len() - dead_watermark; dead_regions.truncate(dead_watermark); }
                     cursor = foff;
                     continue;
                 }
@@ -10159,6 +10203,7 @@ impl GenerationalHeap {
             }
 
             if header.is_forwarded() {
+                mw_fwd += 1;
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
                 // reclaim (and zero) the young slot. (A "don't zero" variant was
@@ -10204,6 +10249,7 @@ impl GenerationalHeap {
                                 ));
                             }
                         } else {
+                            mw_dead_pushed += 1;
                             dead_regions.push((
                                 cursor,
                                 total_size,
@@ -10223,6 +10269,11 @@ impl GenerationalHeap {
                     }
                 }
             } else if side_marked_survivor || late_pinned {
+                if side_marked_survivor {
+                    mw_side += 1;
+                } else {
+                    mw_late += 1;
+                }
                 // Side-marked survivor: pure retention, no header writes.
                 // `late_pinned` joins it here for the same reason — a
                 // conservative root points into this object, and the header
@@ -10252,6 +10303,7 @@ impl GenerationalHeap {
                     evac_map.insert(addr, addr);
                 }
             } else if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                mw_hdr_marked += 1;
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
                 // (selective promotion). Saturating so a long-lived pinned
@@ -10297,6 +10349,7 @@ impl GenerationalHeap {
                             last.1 += total_size;
                             last.4 += 1;
                         } else {
+                            mw_dead_pushed += 1;
                             dead_regions.push((
                                 cursor,
                                 total_size,
@@ -10592,6 +10645,26 @@ impl GenerationalHeap {
                         "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
                     );
                 }
+            }
+        }
+
+        // MARKWHY: where did the walk actually END? If the watched offset is
+        // above this, the walk abandoned before reaching it and the span was
+        // retained by the "skipped stretch retained until a moving cycle
+        // resets from-space" arm rather than by any skip list.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} objects_swept={objects_swept}",
+                    w - from_base,
+                );
+                eprintln!(
+                    "[MARKWHY] disposition census: side_marked={mw_side} late_pinned={mw_late}                      forwarded={mw_fwd} header_marked={mw_hdr_marked} dead_pushed={mw_dead_pushed}                      unwinds={mw_unwinds} sites={mw_site:?} unwound_entries={mw_unwound_entries}                      dead_regions_final={} side_sorted={} late_pins={}",
+                    dead_regions.len(),
+                    side_sorted.len(),
+                    late_pins.len(),
+                );
             }
         }
 

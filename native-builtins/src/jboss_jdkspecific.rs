@@ -695,6 +695,61 @@ pub(crate) fn native_module_layer_find_module(
         return Err(e.into());
     }
 
+    // A layer built by `ModuleLayer.defineModules` is its OWN authority, and
+    // the boot `ModuleRegistry` knows nothing about it.
+    //
+    // `bootLayer.defineModules(cf, ...)` runs real JDK bytecode and populates
+    // the layer's canonical `nameToModule` map. Answering such a receiver from
+    // the boot registry is simply asking the wrong object: the name is absent
+    // there by construction, so `findModule` returned `Optional.empty()` for a
+    // module that the layer itself holds. Measured 2026-08-10 with
+    // `probes/MLProbe.java`, which replicates
+    // `com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl.createModule`
+    // line for line:
+    //
+    //   HotSpot   nameToModule = {cratonvm.dyn.translet=module …}
+    //             findModule(…) = Optional[module cratonvm.dyn.translet]
+    //   CratonVM  nameToModule = {cratonvm.dyn.translet=module …}   <- populated
+    //             findModule(…) = Optional.empty                    <- only this
+    //
+    // `TemplatesImpl.createModule` ends in `layer.findModule(mn).get()`, so the
+    // empty Optional surfaced as `NoSuchElementException: No value present` out
+    // of XSLTC — taking every `javax.xml.transform` consumer with it (8 classes
+    // in the 2026-08-10 Spring sweep: the XMLUnit comparison family plus
+    // `XsltViewTests`).
+    //
+    // `ModuleLayer.modules()` already reads this same map
+    // (`native_module_layer_modules`), which is why `layer.modules()` listed the
+    // module that `layer.findModule` could not find. This makes the two agree.
+    //
+    // Authoritative in BOTH directions: when the receiver carries the map, a
+    // miss is a real absence and must answer empty rather than falling through
+    // to the permissive fabrication below. Our synthetic boot layer has no such
+    // field, so it takes none of this path and keeps its existing behaviour.
+    if let Some(Value::Object(Some(layer))) = args.first() {
+        if let Value::Object(Some(name_to_module)) = ctx.get_field_by_name(*layer, "nameToModule") {
+            let map_pin = ctx.pin_native_root(name_to_module);
+            let name_pin = ctx.pin_native_root(name_obj);
+            let map = ctx.read_native_pin(map_pin, name_to_module);
+            let key = ctx.read_native_pin(name_pin, name_obj);
+            let got = ctx.invoke_virtual(
+                map,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key))],
+            );
+            ctx.unpin_native_roots(map_pin);
+            ctx.unpin_native_roots(name_pin);
+            return match got? {
+                Some(Value::Object(Some(module))) => {
+                    let opt = wrap_optional_present(ctx, module)?;
+                    Ok(Some(Value::Object(Some(opt))))
+                }
+                _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+            };
+        }
+    }
+
     // An ABSENT module must answer `Optional.empty()`.
     //
     // This used to fabricate a Module for any syntactically valid name, so

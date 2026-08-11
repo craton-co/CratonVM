@@ -4827,7 +4827,22 @@ fn build_or_get_factory_bean_interface_proxy(
     ctx.pin_native_root(bean_factory);
     ctx.pin_native_root(exposed_mirror);
 
-    let handler_cid = ctx.ensure_synthetic_class(FB_HANDLER_CLASS, 3);
+    // Fallible since 2026-08-10 (JDK-only wave 2, step 3), and the refusal is
+    // ABSORBED here rather than propagated, deliberately: this function's
+    // failure channel is `None`, which it already answers when
+    // `define_or_get_proxy_class` cannot build a real proxy, and the caller's
+    // response is to leave the factory bean unwrapped. A refused
+    // `FB_HANDLER_CLASS` gets that same answer instead of a fabrication. The
+    // violation is recorded upstream by `admit_compatibility_class` either way,
+    // so strict mode still reports the request; what changes is that it stops
+    // continuing in the state the contract forbids.
+    let handler_cid = match ctx.try_ensure_synthetic_class(FB_HANDLER_CLASS, 3) {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(pin_base);
+            return None;
+        }
+    };
     let handler = ctx.alloc_object(handler_cid, 3);
     let handler_pin = ctx.pin_native_root(handler);
     let raw_factory = ctx.read_native_pin(pin_base, raw_factory);

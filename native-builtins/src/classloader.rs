@@ -9592,12 +9592,6 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // which previously SEGV'd on null/oversized bytecode in the non-JIT
     // path. This shim validates args up-front and routes through the
     // shared `define_class_full` backend.
-    r.register(
-        "sun/misc/Unsafe",
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        unsafe_define_class_defensive,
-    );
     // jdk.internal.misc.Unsafe — JDK 9+ public path that user code can't
     // reach directly but `jdk.internal.misc.Unsafe.getUnsafe()` callers
     // (some bytecode-manipulation libs) hit. Same shim covers both.

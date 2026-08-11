@@ -16,7 +16,7 @@ call it.
 **Conflicts:** L11 also edits `vm_exec.rs`, in the dispatch regions (~14700,
 ~22700). Disjoint — but coordinate, and never `git add -A` blind.
 **Effort:** M
-**Evidence:** [`fabricated-object-layouts-leak-into-native-code.md`](../../known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md)
+**Evidence:** [`jdk-only-fabricated-object-layouts-FIXED-20260810.md`](../../fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md) (RETIRED 2026-08-10)
 
 ## Goal
 
@@ -331,7 +331,8 @@ Stated here rather than left to be discovered:
    it was right.** See "The breadth run" below.
 5. **A `_vmN` slot says a value has no home; it does not fix one.** The five
    `VM` rows are open kind-3 defects, filed in
-   `docs/known-issues/jdk-only/files-newbufferedwriter-parks-an-fd-in-writebuffer.md`.
+   [`jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`](../../fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md)
+   (RETIRED 2026-08-10).
    Each wants a side table keyed by the object, or the index anchored past the
    real field count. Marking them countable is what this lane could do; only one
    of them (`Files.newBufferedWriter`) fires in the default build.

@@ -4305,6 +4305,42 @@ extern "C" fn jni_from_reflected_field(_env: JNIEnv, field: JObject) -> JFieldID
     .unwrap_or(0)
 }
 
+/// Resolve a class a JNI entry point needs to allocate against, refusing rather
+/// than fabricating under `--jdk-only`.
+///
+/// The "refuse diagnosably" shape of `vm_init::ensure_bootstrap_compat_class`,
+/// adapted to a caller with no Java-side error channel: a JNI function cannot
+/// throw from here, and its documented failure value is NULL, so a refusal
+/// returns `None` and the caller returns null after this has warned and named
+/// the class. The real class is preferred first, exactly as before, so on any
+/// complete image nothing about this path changes.
+///
+/// Added 2026-08-10 with JDK-only wave 2 step 3, which deleted the infallible
+/// `ensure_synthetic_class` these three sites used to reach.
+fn jni_class_or_refuse(shared: &SharedVm, name: &str, num_fields: usize) -> Option<ClassId> {
+    if let Ok(id) = shared.load_class_concurrent(name) {
+        return Some(id);
+    }
+    match shared
+        .classes
+        .class_manager
+        .write()
+        .try_ensure_synthetic_class(name, num_fields)
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                class = name,
+                error = %err,
+                "--jdk-only: refusing to fabricate this class for a JNI entry point. The \
+                 call returns NULL, which is JNI's documented failure value, and the \
+                 caller sees it at its own call site."
+            );
+            None
+        }
+    }
+}
+
 // ---- Index 9: ToReflectedMethod ----
 // Convert a JMethodID to a java.lang.reflect.Method object.
 extern "C" fn jni_to_reflected_method(
@@ -4329,15 +4365,10 @@ extern "C" fn jni_to_reflected_method(
         // force the load. Allocating with `ClassId::new(0)` (`java/lang/Object`,
         // zero declared fields) but 4 slots produces an undersized object the
         // GC's `get_field` bounds guard rejects.
-        let method_class_id = shared
-            .load_class_concurrent("java/lang/reflect/Method")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/lang/reflect/Method", 4)
-            });
+        let Some(method_class_id) = jni_class_or_refuse(shared, "java/lang/reflect/Method", 4)
+        else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager
@@ -4380,15 +4411,9 @@ extern "C" fn jni_to_reflected_field(
         // comment in `jni_to_reflected_method`): allocating with
         // `ClassId::new(0)` + 4 slots produces an undersized object the GC's
         // `get_field` bounds guard rejects.
-        let field_class_id = shared
-            .load_class_concurrent("java/lang/reflect/Field")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/lang/reflect/Field", 4)
-            });
+        let Some(field_class_id) = jni_class_or_refuse(shared, "java/lang/reflect/Field", 4) else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager
@@ -5160,8 +5185,8 @@ struct JNINativeMethod {
 /// `fn` address inside the host library, called through `dispatch_jni_native`.
 ///
 /// This was the process global `static JNI_NATIVE_METHODS` here until
-/// 2026-08-06 — `JDK-ONLY-WAVE2` §6 of
-/// `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`.
+/// 2026-08-06 — `JDK-ONLY-WAVE2` §6 (retired record:
+/// feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md).
 /// Contract §2 forbids process globals for this feature's state, and the
 /// concrete hazard was that two VMs in one process saw each other's
 /// `RegisterNatives`: a library loaded by VM A bound its pointers for VM B too.
@@ -5176,12 +5201,15 @@ struct JNINativeMethod {
 /// `vm/src/vm/vm_exec.rs` consult `resolve_dispatch` before falling through to
 /// [`find_jni_native`].
 ///
-/// The census gap the move does NOT close: these invocations are still outside
-/// the §4 per-kind totals, because `record_invocation` keys on a
-/// `NativeMethodId` and only `NativeMethodRegistry` issues one — there is no
-/// honest way to mint one for a `dlsym` result. `synthetic_stub_invocations`
-/// stays exact (a stub can never be here); `bridge_invocations` under-counts
+/// The census gap the move left, CLOSED 2026-08-10 without minting a fake id.
+/// `record_invocation` keys on a `NativeMethodId` and only
+/// `NativeMethodRegistry` issues one, so there is still no honest way to give a
+/// `dlsym` result an id — and none is invented. Instead both dispatch sites in
+/// `vm/src/vm/vm_exec.rs` increment `NativeRealm::jni_bridge_invocations`, and
+/// `--jdk-only-report` adds that to `bridge_invocations`, which is where a real
+/// function in a real library belongs. Until then that key under-counted
 /// genuine JNI bridges by exactly the number of dispatches through this table.
+/// `synthetic_stub_invocations` was and stays exact: a stub can never be here.
 pub type JniNativeMethodTable = parking_lot::RwLock<HashMap<u64, usize>>;
 
 /// Compute a hash key for a (class, method, descriptor) triple.
@@ -7012,15 +7040,9 @@ extern "C" fn jni_new_direct_byte_buffer(
         // with `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
         // yields an undersized object that the GC's `get_field` bounds guard
         // rejects on every access.
-        let dbb_class_id = shared
-            .load_class_concurrent("java/nio/DirectByteBuffer")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/nio/DirectByteBuffer", 2)
-            });
+        let Some(dbb_class_id) = jni_class_or_refuse(shared, "java/nio/DirectByteBuffer", 2) else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager

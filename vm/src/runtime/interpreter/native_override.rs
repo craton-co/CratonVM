@@ -6911,8 +6911,14 @@ mod forced_native_string_tests {
             // absence: a mis-typed `include_str!` path would not compile, but a
             // file that stopped containing the chain at all would make this
             // pass for the wrong reason.
+            //
+            // The anchor was `let check_override = method.is_abstract()` until
+            // 2026-08-10, when the name half was split out as `name_override`
+            // so strict mode could skip it. This assertion firing is exactly
+            // how that was noticed, instead of the scan quietly reading a file
+            // that no longer held the thing it was scanning for.
             assert!(
-                src.contains("let check_override = method.is_abstract()"),
+                src.contains("let name_override = class_name =="),
                 "{what} no longer contains the `check_override` chain, so this scan is \
                  looking at the wrong text and its absence-of-`String` verdict means nothing"
             );

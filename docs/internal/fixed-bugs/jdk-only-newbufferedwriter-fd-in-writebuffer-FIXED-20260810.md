@@ -1,13 +1,71 @@
 # The `java.io` Reader/Writer chain parks VM-internal values on JDK fields
 
-**Status:** the `Files.newBufferedWriter` half is **FIXED 2026-08-05, by
-deletion**. The three synthetic-only siblings remain OPEN — see
-"The other three" below. Found by tracing the one *live* access site
-in the `java/io/BufferedWriter` row of the L4 shadow-layout census
-(`CRATONVM_DBG=overlay,overlay-all,overlay-bt=BufferedWriter`, 402 reads per
-run). **Kind 3** in the taxonomy of
-[fabricated-object-layouts-leak-into-native-code.md](fabricated-object-layouts-leak-into-native-code.md):
-a VM-internal value with no real JDK field to live in.
+**Status: FIXED / RETIRED 2026-08-10.** The `Files.newBufferedWriter` half was
+closed on 2026-08-05 by deletion; the three synthetic-only siblings, and the
+five `_vmN` census rows the family produced, are closed now. **Kind 3** in the
+taxonomy of the parent record
+(`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`): a
+VM-internal value with no real JDK field to live in.
+
+## What closed the other three — and why the plan changed twice
+
+The plan in this page was a side table keyed by the object, plus a name-based
+predicate. Measuring **which build can reach the write** changed the answer, the
+same way measuring the flagged arm changed it for `newBufferedWriter`.
+
+Every writer in the family — `native_isr_init`, `native_br_init`,
+`native_osw_init`, `native_bw_init` — is `#[cfg(feature = "synthetic-jdk")]`.
+That is the build in which `java/io/BufferedReader` and friends are ALWAYS
+fabricated stubs, where slot 0 belongs to nobody else and parking an fd there is
+simply the layout. So in the build that can reach the write there is no overlay,
+and in the build where the class can be real there was no writer.
+
+There was, however, still a **reader**. The `BufferedWriter` write/flush/close
+natives each carried their own `match ctx.get_field(this, 0) { Value::Int(fd) =>
+… }` fd fast path, reached whenever `bw_delegate_out` finds no wrapped `out`,
+and those five reads were NOT gated. In the default build they can only ever
+address `java.io.Writer.writeBuffer` — the `char[]` the JDK lazily allocates for
+`write(String)`. They moved behind `phases_late::bw_synthetic_fd`, which carries
+the same `#[cfg]` gate `bw_delegate_out` already had.
+
+With no writer and no reader left, the model can say what is true. It is split
+by build:
+
+* under `synthetic-jdk` the slots stay `_vmN`, which is what keeps a real
+  overlay **countable** — an anonymous `_fN` reads as an innocuous `pad`, and
+  that is exactly how the `newBufferedWriter` fd hid inside `writeBuffer` for a
+  day;
+* in the default build the models name the real fields
+  (`lock, skipBuffer, sd` / `lock, skipBuffer, in` / `writeBuffer, lock, se` /
+  `writeBuffer, lock, out`), and the census is clean **because nothing is
+  parked there**, not because the model stopped saying so.
+
+`shadow_layout`'s `reader_writer_models_match_the_build` pins both ends, and its
+second half asserts that no `_vmN` appears anywhere in the four default-build
+models — so re-introducing one without moving it off a JDK-owned slot fails a
+test rather than quietly changing a census.
+
+**Measured**, `probes/W2ResidualCensusProbe` and `probes/JdkOnlyCensusLoadProbe`
+under `CRATONVM_DBG=overlay,overlay-all`, `--real-jdk` and `--jdk-only`, Temurin
+25.0.3 on Azure Linux: the five VM rows
+
+    java/io/BufferedReader      slot 0  VM  _vm0 over lock:Ljava/lang/Object;
+    java/io/BufferedWriter      slot 0  VM  _vm0 over writeBuffer:[C
+    java/io/InputStreamReader   slot 0  VM  _vm0 over lock:Ljava/lang/Object;
+    java/io/InputStreamReader   slot 1  VM  _vm1 over skipBuffer:[C
+    java/io/OutputStreamWriter  slot 0  VM  _vm0 over writeBuffer:[C
+
+go **5 → 0**, and both probes stay byte-identical to HotSpot in both modes.
+
+### The lesson, which is not the one the page was written to teach
+
+The page opens by asking where to relocate an fd. The answer twice turned out to
+be *nowhere*: `newBufferedWriter`'s path was deleted because it had no working
+configuration left, and these three needed no storage moved at all because the
+build that writes them owns the slot. **Ask which configuration can reach the
+write before designing where the value should go** — a side table for a path
+nobody can run is polish, and a side table for a slot nobody else owns is cost
+with no benefit.
 
 ## What happens
 
@@ -102,13 +160,17 @@ overlay countable: `SlotVerdict::VmInternal`, tag `VM`, reported whenever a real
 field exists at that index and silent when the slot is anchored past the real
 layout (which is the shape a fix should reach).
 
-## The other three, found the same way
+## The other three, found the same way — FIXED 2026-08-10
 
 Widening the model from "name the field" to "say when there is no field to name"
 brought three more classes of the same family into the census. All of their
 writers are `#[cfg(feature = "synthetic-jdk")]`, so unlike `newBufferedWriter`
-these do not fire in the default build — but the models are shared, and the
-`_vmN` rows are what will say so if a registration is ever ungated.
+these do not fire in the default build — but the models were shared, and the
+`_vmN` rows were what would have said so if a registration were ever ungated.
+
+**The table below is the state before the fix.** It is kept because the
+`Reader.lock` finding under it is the reason this family was worth chasing at
+all.
 
 | class | slot | VM parks | real field there |
 |---|---|---|---|
@@ -135,7 +197,7 @@ a real layout they would be **silent no-ops** — a write that reports success a
 produces no bytes. That is the failure mode to expect first if these
 registrations are ever ungated.
 
-## How to reproduce
+## How to check it stays closed
 
 ```sh
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=BufferedWriter \
@@ -152,9 +214,20 @@ For the whole family at once, the `VM` rows of the shadow-layout census:
 CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME" -cp . JdkOnlyCensusLoadProbe 2>&1 | grep '\[OVERLAY-LAYOUT\].* VM '
 ```
 
+The second command is the standing check: it must print **nothing**. Before
+2026-08-10 it printed five rows, one per slot in the table above.
+
 `probes/ReaderWriterLayoutProbe.java` is the behavioural companion: it prints
 paired properties for all four classes (including the KIND actually found in
 `lock` / `writeBuffer` / `skipBuffer` at each stage) so a transcript can be
-diffed byte-for-byte against HotSpot. It currently agrees with Temurin 25.0.3 on
-every line, which is the point — the overlay is not yet observable from Java,
-and this probe is what will notice when it becomes so.
+diffed byte-for-byte against HotSpot. It agreed with Temurin 25.0.3 on every
+line before the fix and after it, which is worth stating plainly: **it was never
+the instrument that would have caught this**, because the overlay was never
+observable from Java. The census was. A behavioural probe that is green on both
+arms of an A/B is not evidence of a fix — it is evidence that the defect lives
+somewhere the probe cannot see, and the two facts look identical if you only
+run the probe.
+
+`probes/W2ResidualCensusProbe` is the workload that reaches this family
+(`readerWriter()` deliberately calls `bw.write(String)`, the JDK path that
+ALLOCATES `writeBuffer` and so would have collided with an fd sitting there).
