@@ -2590,6 +2590,77 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // doFinal(ByteBuffer,ByteBuffer)I — the partner of the `update` overload
+    // above. Registering only `update` would have been worse than registering
+    // neither: the input would be consumed into the accumulator and the
+    // `doFinal` that must flush it would still hit the real JDK body and throw
+    // `Cipher not initialized`, losing the plaintext silently.
+    r.register(
+        cipher,
+        "doFinal",
+        "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(Value::Object(Some(input))) = args.get(1).cloned() {
+                if let Some(Value::Int(n)) = ctx.invoke_virtual(input, "remaining", "()I", &[])? {
+                    if n > 0 {
+                        let tmp =
+                            ctx.new_array(cratonvm_types::ArrayElementType::Byte, n as usize);
+                        ctx.invoke_virtual(
+                            input,
+                            "get",
+                            "([B)Ljava/nio/ByteBuffer;",
+                            &[Value::Object(Some(tmp))],
+                        )?;
+                        let bytes = read_bytes(ctx, tmp);
+                        let tkey = obj_key(ctx, this);
+                        with_table_write(|t| {
+                            if let Some(s) = t.get_mut(&tkey) {
+                                s.accumulated.extend_from_slice(&bytes);
+                            }
+                        });
+                    }
+                }
+            }
+            let out_bytes = match cipher_do_final_impl(ctx, this)? {
+                Some(Value::Object(Some(a))) => read_bytes(ctx, a),
+                // Same reasoning as `doFinal([BII[B)I`: this impl returns either
+                // `Err` or a real byte[], so any other shape is an unexpected
+                // state, not a legitimately empty ciphertext. Refusing beats
+                // reporting "0 bytes written" as success.
+                other => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "Cipher.doFinal produced no output buffer ({other:?}); \
+                             refusing to report 0 bytes written as success"
+                        ),
+                    }
+                    .into());
+                }
+            };
+            let Some(Value::Object(Some(output))) = args.get(2).cloned() else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("output ByteBuffer is null".to_string()),
+                }
+                .into());
+            };
+            let written = out_bytes.len();
+            if written > 0 {
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, written);
+                ctx.write_byte_array_from(arr, 0, &out_bytes);
+                // Through the buffer's own `put`, so heap and DIRECT buffers take
+                // one path and the position advances as the contract requires.
+                ctx.invoke_virtual(
+                    output,
+                    "put",
+                    "([B)Ljava/nio/ByteBuffer;",
+                    &[Value::Object(Some(arr))],
+                )?;
+            }
+            Ok(Some(Value::Int(written as i32)))
+        },
+    );
+
     // getProvider()Ljava/security/Provider; — the real body opens
     // `synchronized (lock)` on a field this synthetic never wrote, so it threw
     // `NullPointerException: Cannot enter synchronized block because
