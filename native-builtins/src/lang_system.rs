@@ -1463,13 +1463,12 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     // exposes no policy accessor (deliberately — `CompatibilityMode` is a
     // per-registry FIELD, not a process global).
     //
-    // The `else` arm is today's four bodies with nothing removed and nothing
-    // decided differently — `LoaderScoping::Off` makes every success arm of
-    // `load_library_or_throw` return the `Ok(None)` it returns today, and the
-    // `args.get(1)` reads on the two `Runtime` sites are kept EXACTLY as they
-    // are even though the strict arm corrects them. See `runtime_load_args` for
-    // why that read is wrong and why correcting it here too would be a
-    // `Compatible` behaviour change this lane is not licensed to make.
+    // The `else` arm keeps `LoaderScoping::Off`, which makes every success arm
+    // of `load_library_or_throw` return the `Ok(None)` it returns today — the
+    // cross-loader `loadedLibraryNames` rule stays strict-only. What it no
+    // longer keeps is the `args.get(1)` read on the two `Runtime` sites: since
+    // 2026-08-12 both arms decode the argument vector through
+    // `runtime_load_args`. See that function for the measurement.
     if registry.compatibility_mode().is_jdk_only() {
         registry.register(
             "java/lang/Runtime",
@@ -1544,11 +1543,13 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             "loadLibrary0",
             "(Ljava/lang/Class;Ljava/lang/String;)V",
             |ctx, args| {
-                let name_obj = match args.get(1) {
-                    Some(Value::Object(Some(o))) => *o,
-                    _ => return Ok(None),
-                };
-                let name = ctx.read_string(name_obj).unwrap_or_default();
+                // `args[2]`, not `args[1]` — instance method, so `args[0]` is
+                // the `Runtime` receiver and `args[1]` the `fromClass` mirror.
+                // `_from_class` is discarded rather than threaded because
+                // `LoaderScoping::Off` makes `loaded_by` early-return before it
+                // is read; keeping the discard makes the mode difference one
+                // axis wide.
+                let (_from_class, name) = runtime_load_args(&*ctx, args);
                 crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
                 // Map bare library name to platform-specific filename.
                 // resolve_library_path() in NativeContextImpl will search java.library.path.
@@ -1566,11 +1567,8 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             "load0",
             "(Ljava/lang/Class;Ljava/lang/String;)V",
             |ctx, args| {
-                let path_obj = match args.get(1) {
-                    Some(Value::Object(Some(o))) => *o,
-                    _ => return Ok(None),
-                };
-                let path = ctx.read_string(path_obj).unwrap_or_default();
+                // `args[2]` — see the `loadLibrary0` note directly above.
+                let (_from_class, path) = runtime_load_args(&*ctx, args);
                 crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
                 load_library_or_throw(
                     ctx,
@@ -1650,11 +1648,28 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
 /// through `System.load`/`System.loadLibrary`
 /// (`RJdkJni.java:189-217`, `RJdkFailure.java:257`), never through `Runtime`.
 ///
-/// Corrected on the strict arm only. It is mode-independent — nothing about it
-/// is a `Compatible`-layer substitution — so repairing it under `Compatible`
-/// is a behaviour change owned by whoever owns `Compatible`, not by this lane;
-/// the patch is one line per site and is written down in
-/// W5-1-loadlibrary-allowlist-too-wide.md.
+/// **The index was not deduced, it was measured** — 2026-08-12, one binary at
+/// dev `87809196b`, HotSpot 25.0.3 beside it, `Runtime.getRuntime()
+/// .loadLibrary(x)` for a name that cannot exist and for `"net"` which does:
+///
+/// ```text
+/// HotSpot          no cratonvm_probe_zzz in java.library.path: ...   /  net LOADED
+/// --jdk-only       no cratonvm_probe_zzz in java.library.path       /  net LOADED
+/// --real-jdk       no  in java.library.path                         /  net "no  in java.library.path"
+/// ```
+///
+/// The strict arm reads `args[2]` and the name arrives; the `Compatible` arm
+/// read `args[1]` and the name arrived EMPTY, with the double space that is the
+/// signature of the bug, for every argument including one HotSpot loads. That
+/// is the discriminator: a probe asserting only "it threw" passes against
+/// either index, because the wrong index throws too.
+///
+/// Corrected on the strict arm 2026-08-11 and on the `Compatible` arm
+/// 2026-08-12 — a `loadLibrary` that fails for EVERY argument is a
+/// HotSpot-parity bug rather than a compatibility-layer substitution, which is
+/// the one thing the `Compatible` freeze admits. Blast radius and the callers
+/// that could depend on the always-failing behaviour are in
+/// W7-79-loadlibrary-compatible-arm.md.
 fn runtime_load_args(ctx: &dyn NativeContext, args: &[Value]) -> (Option<ObjectRef>, String) {
     let from_class = match args.get(1) {
         Some(Value::Object(Some(o))) => Some(*o),
