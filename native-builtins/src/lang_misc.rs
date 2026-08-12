@@ -466,6 +466,48 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
 }
 
+/// Whether `this` was built with suppression turned off — the JDK encodes that
+/// as `suppressedExceptions == null`, written only by the four-arg protected
+/// `Throwable(String, Throwable, boolean enableSuppression, boolean)`.
+///
+/// Every clause here exists to keep a *null we cannot explain* from being read
+/// as a deliberate "disabled", because that reading makes `addSuppressed` a
+/// silent no-op and try-with-resources loses the `close()` failure with nothing
+/// looking wrong:
+///
+/// 1. The receiver's class must actually declare/inherit the field. A synthetic
+///    stub that has no such field also answers `Object(None)` through
+///    `read_throwable_field`'s slot fallback — that is a missing field, not a
+///    disabled one.
+/// 2. `Throwable.<clinit>` must have populated `SUPPRESSED_SENTINEL`. Before it
+///    has, no throwable in the process can carry the sentinel, so a null field
+///    means "too early to mirror the initialiser" rather than "disabled".
+/// 3. Only `Object(None)` counts. An *unset* reference slot reads back as
+///    `Int(0)` (see `init_suppressed_sentinel`), which is again not a verdict.
+///
+/// Each failing clause fails OPEN — append the suppressed exception — because
+/// an extra entry in `getSuppressed()` is visible and a dropped one is not.
+fn suppression_disabled(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(this);
+    if ctx
+        .resolve_field_index_by_class_id(class_id, "suppressedExceptions")
+        .is_none()
+    {
+        return false;
+    }
+    if !matches!(
+        ctx.get_field_by_name(this, "suppressedExceptions"),
+        Value::Object(None)
+    ) {
+        return false;
+    }
+    let sentinel = ctx.class_id_by_name("java/lang/Throwable").and_then(|cid| {
+        ctx.static_field_index_by_name(cid, "SUPPRESSED_SENTINEL")
+            .map(|idx| ctx.get_static_field(cid, idx))
+    });
+    matches!(sentinel, Some(Value::Object(Some(_))))
+}
+
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
 ///
 /// JDK semantics: `Throwable.cause` is declared `private Throwable cause = this;`
@@ -1032,7 +1074,101 @@ pub(crate) fn native_throwable_get_cause(
     Ok(Some(Value::Object(None)))
 }
 
-/// initCause(Throwable) — set the cause field, return this.
+/// Build the exception a `Throwable` state-machine check refuses with.
+///
+/// The JDK's own refusals carry the receiver as their cause — `throw new
+/// IllegalStateException(msg, this)` / `new IllegalArgumentException(msg,
+/// exception)` — and that cause is observable (`ise.getCause()` measured as
+/// `java.lang.RuntimeException: m` on JDK 25). A bare
+/// `RuntimeError::IllegalStateException` cannot carry one, so construct the
+/// throwable properly and fall back to the message-only variant if that fails;
+/// the *type* is the load-bearing half and must survive either way.
+fn throwable_refusal(
+    ctx: &mut dyn NativeContext,
+    exc_class: &str,
+    message: &str,
+    cause: Option<ObjectRef>,
+) -> cratonvm_types::error::MethodCallFailed {
+    use cratonvm_types::error::{MethodCallFailed, RuntimeError};
+    let message_only = || -> MethodCallFailed {
+        match exc_class {
+            "java/lang/IllegalStateException" => RuntimeError::IllegalStateException {
+                message: message.to_string(),
+            }
+            .into(),
+            "java/lang/NullPointerException" => RuntimeError::NullPointerException {
+                message: Some(message.to_string()),
+            }
+            .into(),
+            _ => RuntimeError::IllegalArgumentException {
+                message: message.to_string(),
+            }
+            .into(),
+        }
+    };
+    let Some(cause) = cause else {
+        return message_only();
+    };
+    // `create_string` and the constructor both allocate, so the receiver we were
+    // handed can move underneath us.
+    let pin = ctx.pin_native_root(cause);
+    let msg_ref = ctx.create_string(message);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg_pin = ctx.pin_native_root(msg_ref);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg_ref = ctx.read_native_pin(msg_pin, msg_ref);
+    let built = ctx.new_object_initialized(
+        exc_class,
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[
+            Value::Object(Some(msg_ref)),
+            Value::Object(Some(cause)),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => message_only(),
+    }
+}
+
+/// `initCause(Throwable)` — the JDK's `Throwable.initCause` **state machine**,
+/// not a bare field write.
+///
+/// This native SHADOWS the real `Throwable.initCause` bytecode for **every**
+/// instance — registering a native on a real JDK class does not add a fallback,
+/// it replaces the method — so the two refusals `initCause` is specified to
+/// raise only exist if they are written here. Until 2026-08-12 neither was, and
+/// `initCause` was an unconditional setter — the
+/// differential probe measured `Throwable.initCauseAfterCtorThrows`,
+/// `Throwable.initCauseTwiceThrows` and `Throwable.selfCauseThrows` all as
+/// `no-throw` where HotSpot raises.
+///
+/// The javadoc, verbatim:
+///
+/// > `@throws IllegalStateException` if this throwable was created with
+/// > `Throwable(Throwable)` or `Throwable(String,Throwable)`, or this method has
+/// > already been called on this throwable.
+///
+/// > `@throws IllegalArgumentException` if `cause` is this throwable. (A
+/// > throwable cannot be its own cause.)
+///
+/// **Order matters and is the JDK's**: the already-set test runs *first*, which
+/// is why `new RuntimeException().initCause(itself)` is an
+/// `IllegalArgumentException` (the sentinel still says "unset") rather than an
+/// `IllegalStateException`. Reversing the two would produce the right kind of
+/// failure with the wrong type, and a mistyped refusal sends a caller down the
+/// wrong `catch` branch just as surely as a missing one.
+///
+/// "Already set" is `this.cause != this`: the JDK declares `private Throwable
+/// cause = this;` as a sentinel for "no cause yet", so a constructor-supplied
+/// cause, a previous `initCause` — *including* `initCause(null)`, which is why a
+/// null check would not do — and a deserialised throwable whose `cause` is
+/// genuinely null all read as set. HotSpot refuses all three. Measured
+/// 2026-08-12 on `--real-jdk`: CratonVM's `cause` field already tracks HotSpot's
+/// exactly (`isSelf` after `new RuntimeException("m")`, not-self after
+/// `(String,Throwable)`, null after `initCause(null)`), so testing the raw field
+/// is testing the same thing HotSpot tests.
 pub(crate) fn native_throwable_init_cause(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1042,6 +1178,78 @@ pub(crate) fn native_throwable_init_cause(
         _ => return Ok(Some(Value::Object(None))),
     };
     let cause_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+
+    // `if (this.cause != this) throw new IllegalStateException(...)`, read raw:
+    // `read_throwable_cause`'s self-reference guard is exactly what must NOT be
+    // applied here, because the sentinel is the whole signal.
+    //
+    // Every arm that is not a verdict fails OPEN (proceed with the write). An
+    // over-throw here would refuse a legitimate first `initCause` — the two
+    // dead sections this same probe turned up on 2026-08-12 were both real JDK
+    // code refusing state *we* had corrupted, so a refusal added on a signal we
+    // cannot read is the specific way this goes wrong.
+    let class_id = ctx.class_id_of_object(this);
+    let declares_cause = ctx
+        .resolve_field_index_by_class_id(class_id, "cause")
+        .is_some();
+    let already_set = match read_throwable_field(ctx, this, "cause") {
+        // A live reference that is not the sentinel: a constructor-supplied
+        // cause, or a previous `initCause`.
+        Value::Object(Some(c)) => c != this,
+        // A genuine null is "set" too — `initCause(null)` is a valid first call
+        // and HotSpot refuses the second (measured). Trust the null only when
+        // the receiver really has the field: `read_throwable_field`'s slot
+        // fallback answers the same `Object(None)` for a class that has none.
+        Value::Object(None) => declares_cause,
+        // An unset reference slot reads back as `Int(0)` — no verdict.
+        _ => false,
+    };
+    if already_set {
+        // `"Can't overwrite cause with " + Objects.toString(cause, "a null")`.
+        // Rendering the argument re-enters Java (`toString()`), so the receiver
+        // has to survive a collection across it.
+        let (this, rendered) = match cause_val {
+            Value::Object(Some(c)) => {
+                let pin = ctx.pin_native_root(this);
+                let cause_pin = ctx.pin_native_root(c);
+                // `Objects.toString` dispatches the argument's OWN `toString()`,
+                // which a Throwable subclass may override; only fall back to
+                // this file's `Throwable.toString()` reconstruction if that
+                // dispatch cannot answer.
+                let text = match ctx.invoke_virtual(c, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                let text = match text {
+                    Some(t) => t,
+                    None => {
+                        let c = ctx.read_native_pin(cause_pin, c);
+                        throwable_to_string_text(ctx, c).1
+                    }
+                };
+                let this = ctx.read_native_pin(pin, this);
+                ctx.unpin_native_roots(pin);
+                (this, text)
+            }
+            _ => (this, "a null".to_string()),
+        };
+        return Err(throwable_refusal(
+            ctx,
+            "java/lang/IllegalStateException",
+            &format!("Can't overwrite cause with {rendered}"),
+            Some(this),
+        ));
+    }
+    if let Value::Object(Some(c)) = cause_val {
+        if c == this {
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Self-causation not permitted",
+                Some(this),
+            ));
+        }
+    }
     write_throwable_cause(ctx, this, cause_val);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -1428,6 +1636,36 @@ fn print_throwable_chain_to_stream_obj(
 /// resolving `suppressedExceptions` **by name** instead of a hardcoded
 /// index, matching the pattern `init_suppressed_sentinel` already used
 /// correctly for the same field.
+///
+/// 2026-08-12 — the three rules the JDK states for this method, none of which
+/// this native implemented (the differential probe measured
+/// `Throwable.addSuppressedSelfThrows` as `no-throw` and
+/// `Throwable.suppressionDisabled` as `1:0` against HotSpot's `0:0`). The
+/// javadoc, verbatim:
+///
+/// > `@throws IllegalArgumentException` if `exception` is this throwable; a
+/// > throwable cannot suppress itself.
+///
+/// > `@throws NullPointerException` if `exception` is `null`.
+///
+/// > If suppression is disabled, this method does nothing other than to
+/// > validate its argument.
+///
+/// "other than to validate its argument" is load-bearing and measured: with
+/// suppression disabled, HotSpot *still* raises `IllegalArgumentException` for
+/// `addSuppressed(this)` and `NullPointerException` for `addSuppressed(null)`.
+/// Both checks therefore run BEFORE the disabled test — silently returning on a
+/// null argument, as this native used to, hides a caller bug in exactly the
+/// place (a failed `close()`) where it is hardest to notice.
+///
+/// Suppression is disabled iff `suppressedExceptions == null` — that is the
+/// JDK's own encoding, written by the four-arg protected constructor. Measured
+/// on `--real-jdk`: CratonVM already reproduces both states exactly
+/// (`Collections$EmptyList` by default, `null` after
+/// `new RuntimeException(m, null, false, false)`), because the real constructor
+/// bytecode runs. VM-*minted* throwables are the case that had to be closed
+/// alongside this, or the new rule would drop suppressions on them — see
+/// `mirror_throwable_field_initialisers` in `vm/src/runtime/exceptions.rs`.
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1437,12 +1675,33 @@ pub(crate) fn native_throwable_add_suppressed(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // `if (exception == this) throw new IllegalArgumentException(
+    //      SELF_SUPPRESSION_MESSAGE, exception);`
+    // then `Objects.requireNonNull(exception, NULL_CAUSE_MESSAGE);` — in that
+    // order, so a self-argument is an IAE even though it is also non-null.
     let suppressed = match args.get(1) {
+        Some(Value::Object(Some(r))) if *r == this => {
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Self-suppression not permitted",
+                Some(this),
+            ));
+        }
         Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(None),
+        _ => {
+            // `Objects.requireNonNull` produces a message-only NPE with no
+            // cause — measured: `npe.getCause()` is null on HotSpot.
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/NullPointerException",
+                "Cannot suppress a null exception.",
+                None,
+            ));
+        }
     };
-    // Don't allow self-suppression
-    if this == suppressed {
+    // `if (suppressedExceptions == null) return;` — suppression disabled.
+    if suppression_disabled(ctx, this) {
         return Ok(None);
     }
     // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
@@ -1484,6 +1743,14 @@ pub(crate) fn native_throwable_add_suppressed(
 /// empty array if none were added. See `native_throwable_add_suppressed`'s
 /// doc comment for why this reads by field NAME rather than a hardcoded
 /// index.
+///
+/// The suppression-disabled case needs nothing extra here: the four-arg
+/// constructor leaves `suppressedExceptions` **null**, which is not an array, so
+/// the empty-array tail below is already the specified answer ("if suppression
+/// was disabled … an empty array will be returned"). It only started reporting
+/// that correctly once `addSuppressed` stopped writing an array into the null
+/// field — the probe's `Throwable.suppressionDisabled` measured `1:0` because of
+/// that write, not because of anything on this path.
 pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
