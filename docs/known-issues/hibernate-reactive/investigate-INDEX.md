@@ -10,7 +10,7 @@ Found during a **partial** 3-GC-variant (default/G1/ZGC) PostgreSQL run on Azure
 
 ## Pages
 
-- [batch 01](investigate-batch-01.md) — 12 classes (org.hibernate.reactive.BatchFetchTest .. org.hibernate.reactive.CascadeTest)
+- [batch 01](investigate-batch-01.md) — **CLOSED 2026-08-12**: 11 of 12 were already green at the dev tip; the twelfth (BatchingConnectionTest) hid a real young-GC livelock under -XX:+UseGenerationalGC, now fixed. Residual: [young-walk-zero-run-sibling-sites.md](young-walk-zero-run-sibling-sites.md).
 - [batch 02](investigate-batch-02.md) — 12 classes (org.hibernate.reactive.CollectionStatelessSessionListenerTest .. org.hibernate.reactive.EagerElementCollectionForBasicTypeSetTest)
 - [batch 03](investigate-batch-03.md) — 12 classes (org.hibernate.reactive.EagerElementCollectionForEmbeddableEntityTypeMapTest .. org.hibernate.reactive.EmbeddedIdWithManyEagerTest)
 - [batch 04](investigate-batch-04.md) — 12 classes (org.hibernate.reactive.EmbeddedIdWithManyTest .. org.hibernate.reactive.GeneratedPropertySingleTableTest)
