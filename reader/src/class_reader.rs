@@ -9,7 +9,7 @@ use crate::attribute::*;
 use crate::buffer::ClassFileBuffer;
 use crate::class_access_flags::*;
 use crate::class_file::ClassFile;
-use crate::class_file_version::ClassFileVersion;
+use crate::class_file_version::{preview_enabled, ClassFileVersion};
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
 use crate::byte_view::SharedBytes;
@@ -110,8 +110,26 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     let minor = buf.read_u16()?;
     let major = buf.read_u16()?;
     let version = ClassFileVersion::new(major, minor);
-    if !version.is_supported() {
-        return Err(ClassReaderError::UnsupportedVersion { major, minor });
+    // Preview gating (JVMS 4.1). The enablement bit is read here rather than
+    // threaded through every entry point because HotSpot treats it the same
+    // way: a whole-process property fixed before the first class is parsed.
+    //
+    // Blast radius, stated because this runs on every class the VM loads: the
+    // *only* byte pattern whose verdict moves is `minor == 0xFFFF` with
+    // `major == 69`, which used to load unconditionally and now needs preview
+    // enabled. Every other pattern keeps its previous answer bit-for-bit —
+    // `is_supported` is now `verify(true)` and that is the same function it was.
+    // The JDK's own class files cannot reach the new arm: they are `69.0`
+    // (measured on Adoptium 25.0.3.9, including `StructuredTaskScope.class`
+    // itself — a preview *API* does not imply a preview class file, the
+    // `@PreviewFeature` annotation is javac's business), and `minor == 0`
+    // returns Ok two lines earlier.
+    if let Err(rejection) = version.verify(preview_enabled()) {
+        return Err(ClassReaderError::UnsupportedVersion {
+            major,
+            minor,
+            rejection,
+        });
     }
     debug!("Class file version: {version}");
 

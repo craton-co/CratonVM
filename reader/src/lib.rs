@@ -54,6 +54,10 @@ pub mod verified_code;
 pub use attribute::{decode_attribute, force_decode_all, LazyAttribute};
 pub use byte_view::{ByteView, SharedBytes};
 pub use class_file::ClassFile;
+// The preview seam. `set_preview_enabled` is the whole of the reader's half of
+// `--enable-preview`: the launcher calls it once with the parsed argument and
+// every `read_class*` entry point picks the bit up from there.
+pub use class_file_version::{preview_enabled, set_preview_enabled, VersionRejection};
 pub use class_reader::{read_class, read_class_arc, read_class_shared};
 pub use class_reader_error::ClassReaderError;
 pub use constant_pool::ConstantPool;
