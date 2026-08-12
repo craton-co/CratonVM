@@ -5,6 +5,10 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+// The heap's own object-kind discriminant. `s2_bb_arr` uses it to refuse a
+// `java.nio.Buffer.segment` that is a `MemorySegment` rather than a backing
+// array — see W7-83-segment-as-backing-array.md.
+use cratonvm_types::ObjectKind;
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::phases_late::{
@@ -3387,8 +3391,31 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     // was:<0.0>" across nearly the entire ES vector-codec test family —
     // every value read through a typed-buffer view came back zero
     // regardless of what was actually written.
+    //
+    // W7-83: and slot 5 is `Buffer.segment` on a REAL loaded `java.nio.Buffer`,
+    // where the value is a `MemorySegment`, not an array. Measured on Eclipse
+    // Adoptium 25.0.3.9: `ByteBuffer.allocate(16)` has `segment == null`,
+    // `ByteBuffer.allocateDirect(16)` has `segment == null`, and
+    // `Arena.ofAuto().allocate(16).asByteBuffer()` has `hb == null` and
+    // `segment == jdk.internal.foreign.NativeMemorySegmentImpl`.
+    //
+    // Without the kind screen this function returned that `MemorySegment` to
+    // `array()`, whose declared return type is `[B`, and made `hasArray()`
+    // answer `true` where HotSpot answers `false`. **This registration wins in
+    // Compatible mode** (W7-76 §2: `set_drop_real_layout_synthetic(true)` runs
+    // before `register_io_natives`, so `register_nio_natives` is skipped and
+    // nothing overwrites s2), and `array`/`hasArray`/`arrayOffset` are all on
+    // `native_override.rs`'s forced-native list for `java/nio/ByteBuffer`, so
+    // the native answers even though the real bytecode is present.
+    //
+    // Rejecting the segment is what makes the receiver fall through to the
+    // callers' direct arms: `array()`'s `None if s2_bb_direct_addr(..)` arm
+    // raises `UnsupportedOperationException` and `hasArray()` answers false —
+    // exactly HotSpot. `s2_bb_direct_addr` keeps its own
+    // `is_plausible_native_addr` screen, which is untouched and is still what
+    // stops a heap buffer's `address = 16` being dereferenced.
     match ctx.get_field(buf, BB_SEGMENT_SLOT) {
-        Value::Object(Some(a)) => Some(a),
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == ObjectKind::Array => Some(a),
         _ => None,
     }
 }

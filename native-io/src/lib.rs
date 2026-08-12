@@ -66,6 +66,10 @@ use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{layout_alias, read_alias, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
+// The heap's own object-kind discriminant. `bb_resolve_heap_array` uses it to
+// refuse a non-array where a backing array is required — see
+// W7-83-segment-as-backing-array.md.
+use cratonvm_types::ObjectKind;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // EINTR-transparent socket I/O — the shared retry primitive the blocking
@@ -7744,8 +7748,12 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
 /// with its real justification: `segment` is the only Object-typed field
 /// `Buffer` declares, so it is where `native-builtins`' typed-buffer views
 /// (`s2_view_buf_fn!`, `BB_SEGMENT_SLOT`) deliberately stash their backing
-/// array. Reading it as "maybe an array" is right for that population and
-/// harmless for a real buffer, where `segment` is null.
+/// array. Reading it as "maybe an array" is right for that population and was
+/// claimed to be "harmless for a real buffer, where `segment` is null" — which
+/// W7-83-segment-as-backing-array.md measured and falsified: `segment` is null
+/// on `allocate` and `allocateDirect` receivers, and is a live
+/// `NativeMemorySegmentImpl` on an `Arena…allocate(n).asByteBuffer()` one. The
+/// arm now screens the value's KIND; see `bb_resolve_heap_array`.
 ///
 /// ## What it is now
 ///
@@ -7808,11 +7816,57 @@ fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<TbView, MethodCa
 /// `native-builtins/src/servlet.rs`'s `BB_SEGMENT_SLOT`, restated here rather
 /// than shared because the two crates do not depend on each other; if one
 /// moves, the census in W7-58-bytebuffer-direct-arm.md names both.
+///
+/// The slot carries TWO populations, which is why every read of it needs a kind
+/// screen: `native-builtins`' views put a real backing array here, and a real
+/// JDK 25 `Buffer` puts a `MemorySegment` here (non-null on every
+/// `MemorySegment.asByteBuffer()` receiver). See
+/// W7-83-segment-as-backing-array.md.
 const BB_SEGMENT_SLOT: usize = 5;
 
 /// `hb`-by-name → `segment` slot → synthetic slot 0. Extracted from the two
 /// independent copies in `bb_state` and `bb_storage_view` so the two cannot
 /// drift; they had already drifted in their error messages.
+///
+/// ## The slot-5 kind screen (W7-83-segment-as-backing-array.md)
+///
+/// The slot-5 arm is reached on any receiver whose `hb` is null, and on JDK 25
+/// slot 5 is `java.nio.Buffer.segment` — a `MemorySegment`, not an array.
+/// Measured on Eclipse Adoptium 25.0.3.9:
+///
+/// | receiver | `hb` | `segment` |
+/// |---|---|---|
+/// | `ByteBuffer.allocate(16)` | the array | `null` |
+/// | `ByteBuffer.allocateDirect(16)` | `null` | `null` |
+/// | `Arena.ofAuto().allocate(16).asByteBuffer()` | `null` | `jdk.internal.foreign.NativeMemorySegmentImpl` |
+///
+/// On that third receiver the arm used to return the `MemorySegment` and hand
+/// it to `heap_element_type_of` / `get_array_element` as a backing array. That
+/// is a wrong-KIND object where an array is required — a species the read-side
+/// slot census has no vocabulary for, because the slot index is right and the
+/// field name is right; only the value's kind is wrong.
+///
+/// Two things the screen must not disturb, both load-bearing:
+///
+/// * **The slot-5 read stays a non-firing census control.**
+///   `read_alias::observe_read` is keyed on what slot 5 MEANS on the loaded
+///   class, and it means `segment` — which is what this site declares. The
+///   screen is applied to the VALUE after the read, so the census row is
+///   unchanged and still expected clean (W7-69 §3).
+/// * **`is_plausible_native_addr` is not touched.** Rejecting the segment lets
+///   control reach `bb_resolve_direct_address`, and on an `Arena` buffer
+///   `address` is a genuine process pointer, so the receiver resolves as
+///   DIRECT — which is what it is. The `>= 0x1_0000` screen is what still stops
+///   a heap buffer's `address = 16` from being dereferenced there
+///   (`addr=0x10`, 51 of the 53 crashes in the 2026-08-10 H2 sweep).
+///
+/// The screen is on slot 5 ALONE, deliberately. `hb`-by-name resolves a field
+/// the class declares as `byte[]`, so the VM's own typing covers it; slot 0 is
+/// `Buffer.mark`, an `int`, already refused by the `Value::Object` match, and
+/// is the backing array on the synthetic layout. Slot 5 is the only index in
+/// this family that is a REFERENCE field of non-array type on a real receiver,
+/// so it is the only one where an in-bounds, correctly-named read can still
+/// yield the wrong kind.
 fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
         return Some(a);
@@ -7832,7 +7886,20 @@ fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Obj
         );
     }
     if let Value::Object(Some(a)) = ctx.get_field(this, BB_SEGMENT_SLOT) {
-        return Some(a);
+        // W7-83. The census row above is about the SLOT; this is about the
+        // VALUE. `native-builtins`' typed buffer views park a real backing
+        // array here (there being no other Object-typed field on `Buffer`),
+        // and a real JDK 25 receiver parks a `MemorySegment` here. Only the
+        // first is a backing array, and only a kind question can tell them
+        // apart — the class name cannot, because a heap reference array
+        // reports its COMPONENT class.
+        //
+        // Falling through rather than returning `None` is deliberate: the
+        // synthetic layout's array lives at slot 0, and a receiver that has
+        // both a segment at 5 and an array at 0 must still resolve.
+        if ctx.heap_kind_of(a) == ObjectKind::Array {
+            return Some(a);
+        }
     }
     // THE CALIBRATION CASE. This is the read W7-58-bytebuffer-direct-arm.md
     // repaired: slot 0 of a real java.nio.DirectByteBuffer is
@@ -23759,6 +23826,139 @@ mod buffer_bounds_tests {
         assert_eq!(ctx.get_array_element(dst, 1), Value::Int(11));
         assert_eq!(ctx.get_array_element(dst, 2), Value::Int(12));
         assert_eq!(ctx.get_field(bb, 1), Value::Int(4));
+    }
+
+    /// W7-83, step 1 of 2: **the mock's own honesty, asserted before anything
+    /// depends on it.**
+    ///
+    /// `MockNativeContext::heap_kind_of` returned `ObjectKind::Object`
+    /// unconditionally, `heap_element_type_of` returned
+    /// `ArrayElementType::Reference` unconditionally, and `object_is_array` was
+    /// left on the trait default `false` — for a mock that allocates arrays as
+    /// their own `HeapEntry::Array` variant and has always known the answer.
+    ///
+    /// Every unit test in this crate runs against this mock, so those three
+    /// constants were not cosmetic: they made an entire species of screen
+    /// untestable here. A native that asks "is this actually an array?" got the
+    /// same answer for a `byte[]` and for an ordinary instance, so a test of
+    /// such a screen passed whether or not the screen was right — the probe
+    /// that cannot fail, one layer down from the code under test.
+    ///
+    /// The assertions are paired (array AND non-array, each element type AND
+    /// its default value) precisely because a single-sided assertion is what a
+    /// constant satisfies.
+    #[test]
+    fn mock_answers_object_kind_from_its_own_heap_discriminant() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 4);
+        let obj = ctx.alloc_object(3);
+
+        assert_eq!(
+            ctx.heap_kind_of(bytes),
+            ObjectKind::Array,
+            "the mock allocated this as HeapEntry::Array and must say so — a \
+             constant `Object` here makes every array/instance fork in this \
+             crate untestable"
+        );
+        assert_eq!(
+            ctx.heap_kind_of(obj),
+            ObjectKind::Object,
+            "and it must still answer Object for an ordinary instance, or the \
+             repair has merely inverted the constant"
+        );
+        assert!(ctx.object_is_array(bytes));
+        assert!(!ctx.object_is_array(obj));
+
+        // The element type is the argument `new_array` used to discard.
+        assert_eq!(ctx.heap_element_type_of(bytes), ArrayElementType::Byte);
+        let longs = ctx.new_array(ArrayElementType::Long, 2);
+        assert_eq!(ctx.heap_element_type_of(longs), ArrayElementType::Long);
+        assert_eq!(
+            ctx.get_array_element(longs, 0),
+            Value::Long(0),
+            "a fresh long[] reads back Long(0), not Int(0) — the mock used to \
+             fill every array with Int(0) whatever it was asked for"
+        );
+        let refs = ctx.new_ref_array(ClassId::new(0), 2);
+        assert_eq!(ctx.heap_element_type_of(refs), ArrayElementType::Reference);
+        assert_eq!(ctx.get_array_element(refs, 0), Value::Object(None));
+        // The trait specifies `Reference` for a NON-array too, so this arm is
+        // the contract rather than a leftover of the old constant.
+        assert_eq!(ctx.heap_element_type_of(obj), ArrayElementType::Reference);
+    }
+
+    /// W7-83, step 2 of 2: **a `MemorySegment` at slot 5 is not a backing
+    /// array**, and the typed-view population that legitimately parks a real
+    /// array there still resolves.
+    ///
+    /// Measured on HotSpot 25.0.3.9 (`probes/DirectByteBufferStateProbe.java`,
+    /// the `seg.*` section): `Arena.ofAuto().allocate(16).asByteBuffer()`
+    /// answers `hasArray() == false` and throws `UnsupportedOperationException`
+    /// from `array()`, and its `hb` is null while `Buffer.segment` holds a live
+    /// `jdk.internal.foreign.NativeMemorySegmentImpl`. `bb_resolve_heap_array`
+    /// used to return that segment and hand it to `heap_element_type_of` /
+    /// `get_array_element` as the backing array.
+    ///
+    /// Both arms are in one test on purpose. The rejecting arm alone would pass
+    /// against a screen that refuses EVERYTHING at slot 5, which would take the
+    /// typed views out with it and turn W7-69's deliberate non-firing control
+    /// into a dead branch.
+    #[test]
+    fn bb_state_refuses_a_memory_segment_at_the_segment_slot() {
+        let mut ctx = MockNativeContext::new();
+
+        // --- the RED: a real-JDK-shaped receiver with a segment and no `hb`.
+        let mut native = vec![31u8, 32, 33, 34];
+        let addr = native.as_mut_ptr() as i64;
+        let segment = ctx.alloc_object_with_class(0, "jdk/internal/foreign/NativeMemorySegmentImpl");
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // Buffer.mark
+        ctx.set_field(bb, 1, Value::Int(0)); // Buffer.position
+        ctx.set_field(bb, 2, Value::Int(4)); // Buffer.limit
+        ctx.set_field(bb, 3, Value::Int(4)); // Buffer.capacity
+        ctx.set_field(bb, 4, Value::Long(addr)); // Buffer.address
+        ctx.set_field(bb, BB_SEGMENT_SLOT, Value::Object(Some(segment)));
+
+        assert!(
+            bb_resolve_heap_array(&ctx, bb).is_none(),
+            "slot 5 is `java.nio.Buffer.segment`; a MemorySegment is not a \
+             byte[] and must not be returned as one"
+        );
+
+        // And the receiver resolves as DIRECT, which is what it is — the
+        // rejection degrades to the right answer rather than to "no storage".
+        // `is_plausible_native_addr` is untouched and still guards this arm.
+        let view = bb_state(&ctx, bb).expect("an Arena-backed buffer is a DIRECT buffer");
+        match view.storage {
+            BbStorage::Direct { addr: got } => assert_eq!(got, addr),
+            BbStorage::Heap { arr, .. } => {
+                panic!("resolved a heap array {arr:?} from a MemorySegment receiver")
+            }
+        }
+        assert_eq!(tb_read_elem(&ctx, view, 0).unwrap(), Value::Int(31));
+
+        // --- the CONTROL, in the same test: `native-builtins`' typed buffer
+        // views park a REAL array at slot 5 because `segment` is the only
+        // Object-typed field `Buffer` declares. That population must still
+        // resolve, and W7-69 §3 relies on this arm staying live.
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+        ctx.set_array_element(arr, 0, Value::Int(77));
+        let view_buf = ctx.alloc_object(8);
+        ctx.set_field(view_buf, 0, Value::Int(-1));
+        ctx.set_field(view_buf, 1, Value::Int(0));
+        ctx.set_field(view_buf, 2, Value::Int(4));
+        ctx.set_field(view_buf, 3, Value::Int(4));
+        ctx.set_field(view_buf, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+
+        assert_eq!(
+            bb_resolve_heap_array(&ctx, view_buf),
+            Some(arr),
+            "the screen must reject a non-array WITHOUT taking the typed-view \
+             population with it"
+        );
+        let vv = bb_state(&ctx, view_buf).expect("a slot-5 array is backing storage");
+        assert!(matches!(vv.storage, BbStorage::Heap { .. }));
+        assert_eq!(tb_read_elem(&ctx, vv, 0).unwrap(), Value::Int(77));
     }
 
     #[test]
