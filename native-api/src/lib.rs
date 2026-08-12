@@ -20,6 +20,15 @@ pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
 pub mod intrinsic;
+/// The layout-alias census — the one detector that sees every native object
+/// allocation, not only the fabrication funnel's.
+///
+/// It lives here, beside the `NativeContext::alloc_object` declaration it
+/// observes, because both of its callers (`vm`'s implementation of that method
+/// and `native-builtins`' fabrication funnel) depend on this crate and neither
+/// depends on the other. See the module header for why that is one detector
+/// with two observation points and not two detectors.
+pub mod layout_alias;
 pub mod native_id;
 pub mod native_ring;
 /// Receiver classes no supported JDK image declares — the measured table that

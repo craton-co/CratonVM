@@ -11940,6 +11940,66 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 resolved.unwrap_or(0)
             }
         };
+        // LAYOUT-ALIAS CENSUS (W7-59, 2026-08-12). This is the terminal every
+        // native object allocation in every native crate reaches — the ~200
+        // production `alloc_object` / `try_alloc_object_gc_safe` sites in
+        // `native-builtins`, `native-io` and `native-collections` that bypass
+        // `try_alloc_concurrent_synthetic`, and the funnel's own allocation too.
+        // Until this line the detector sat on the funnel alone, so
+        // `CRATONVM_DBG_LAYOUT_ALIAS=1` could not name a single direct site —
+        // including `native-io`'s `AsynchronousSocketChannel`, allocated four
+        // slots wide against a class declaring one, which is the widest LIVE
+        // over-allocation W7-49-slot-index-recensus.md found.
+        //
+        // OBSERVATION ONLY. It cannot change what is allocated: `slots` below is
+        // computed exactly as before, from exactly the same two integers, and
+        // this block has no `else`. With the flag off (the default, and every
+        // Compatible-mode run that has not opted in) the cost is one `OnceLock`
+        // load and one predictable branch — no class name is resolved, no frame
+        // is formatted, no lock is taken. The comparison itself is free because
+        // `real_fields` is already in hand for the clamp; nothing is looked up
+        // for the census's sake.
+        //
+        // `#[track_caller]` was considered and rejected here: it would add a
+        // hidden argument to every native allocation plus a reify shim on the
+        // `dyn NativeContext` vtable, paid in every run, to serve a flag that is
+        // off in almost all of them. The Java frames are already a `Vec` on this
+        // thread and are formatted only when a row is about to print — and they
+        // answer the better question, because a Rust source location says a site
+        // EXISTS while a Java frame says the path RAN, which is the
+        // LIVE-versus-dead distinction last-write-wins registration makes
+        // unanswerable from source alone.
+        if cratonvm_native_api::layout_alias::enabled()
+            && cratonvm_native_api::layout_alias::classify(num_fields, real_fields).is_some()
+        {
+            let class_name = self
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            let frames: Vec<String> = self
+                .thread
+                .frames
+                .iter()
+                .rev()
+                .take(4)
+                .map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor()))
+                .collect();
+            let site = if frames.is_empty() {
+                "<no java frame>".to_string()
+            } else {
+                frames.join(" <- ")
+            };
+            let _ = cratonvm_native_api::layout_alias::observe(
+                class_name.as_str(),
+                num_fields,
+                real_fields,
+                cratonvm_native_api::layout_alias::AllocSite::Java(site.as_str()),
+            );
+        }
         let slots = num_fields.max(real_fields);
         if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
             if let Some(obj) = self.thread.native_alloc_pool.pop() {
