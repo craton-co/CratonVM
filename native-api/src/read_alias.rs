@@ -520,11 +520,15 @@ impl SweepReport {
 /// return collapses into the same `0`. [`sweep_declared_slot_maps_at`] is the
 /// wrapper the trigger points use; it prints the summary.
 pub fn verify_declared_slot_maps(ctx: &dyn NativeContext) -> SweepReport {
-    let mut report = SweepReport::default();
     if !layout_alias::enabled() {
-        return report;
+        // `ran: false`, and every other field a structural zero. The caller
+        // must not read that as "seven maps agree with their classes".
+        return SweepReport::default();
     }
-    report.ran = true;
+    let mut report = SweepReport {
+        ran: true,
+        ..SweepReport::default()
+    };
     for map in declared_slot_maps() {
         report.maps += 1;
         // `class_id_by_name` returning `None` is two answers — "no loader has
