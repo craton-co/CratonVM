@@ -5287,6 +5287,38 @@ fn fmt_raise(ctx: &mut dyn NativeContext, fault: &FmtFault) -> MethodCallFailed 
 /// (`%+ d` reports "Flags = '+ '", `%-08d` reports "Flags = '-0'").
 const FMT_FLAG_ORDER: &str = "-#+ 0,(<";
 
+/// Every character `java.util.Formatter`'s package-private `DateTime.isValid`
+/// admits after a `%t`/`%T` prefix, verbatim from its `switch` on JDK 25.
+///
+/// The list is the JDK's, not CratonVM's: this decides whether a field is an
+/// `UnknownFormatConversionException` ("t" + the character), which is a
+/// question about the SPECIFIER and must be answered the same way whether or
+/// not this VM happens to implement the field. `format_temporal_field`
+/// currently implements all 31 of them, so the two sets coincide today —
+/// but they are separate questions and a future gap must not silently become
+/// a mistyped refusal.
+const FMT_DATETIME_FIELDS: &str = "HIklMNLQpsSTzZaAbBCdehjmyYrRcDF";
+
+/// Justify a rendered `%t`/`%T` result inside its field width.
+///
+/// Extracted so the null-argument path ("If the argument arg is null, then
+/// the result is 'null'") is padded by the same rule as a real date rather
+/// than bypassing the width entirely — `String.format("[%10tY]", (Object)
+/// null)` is `[      null]` on HotSpot.
+fn fmt_pad_to_width(out: String, flags: &str, width: Option<usize>) -> String {
+    match width {
+        Some(w) if out.len() < w => {
+            let pad = " ".repeat(w - out.len());
+            if flags.contains('-') {
+                format!("{out}{pad}")
+            } else {
+                format!("{pad}{out}")
+            }
+        }
+        _ => out,
+    }
+}
+
 /// Render a flag set in `Flags.toString`'s canonical order.
 fn fmt_flags_string(flags: &str) -> String {
     FMT_FLAG_ORDER
@@ -5652,17 +5684,32 @@ fn format_impl(
             // emitted literally and consumed no argument — e.g. WildFly's
             // `String.format(Locale.ROOT, "subsystem_%2$d_%3$d.xml", …)` came
             // back unformatted and the test resource URL resolved to null.
+            //
+            // The index is SCANNED here and VALIDATED later, at
+            // `deferred_fault` below. `java.util.Formatter` splits the same two
+            // jobs across `FormatSpecifierParser.parse` (which only measures
+            // the pieces, and returns 0 for a specifier it cannot complete) and
+            // the `FormatSpecifier` constructor (which is the only thing that
+            // throws). So `%0$s` is an illegal INDEX while a bare `%0$` — with
+            // no conversion character to complete it — is an unknown
+            // CONVERSION, and the difference is which phase gets there first.
             let mut explicit_index: Option<usize> = None;
+            let mut deferred_fault: Option<FmtFault> = None;
             {
                 let mut j = i;
                 while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
                     j += 1;
                 }
                 if j > i && chars.get(j) == Some(&'$') {
-                    if let Ok(n) = chars[i..j].iter().collect::<String>().parse::<usize>() {
-                        if n >= 1 {
-                            explicit_index = Some(n - 1);
-                        }
+                    // "If the argument index does not correspond to an
+                    // available argument ... " is a different fault; this is
+                    // `FormatSpecifier.index`, which refuses a non-POSITIVE
+                    // index outright and reports `Integer.MIN_VALUE` for digits
+                    // that overflow an `int` (its `NumberFormatException` arm).
+                    match chars[i..j].iter().collect::<String>().parse::<i32>() {
+                        Ok(n) if n >= 1 => explicit_index = Some(n as usize - 1),
+                        Ok(n) => deferred_fault = Some(FmtFault::ArgumentIndex(n)),
+                        Err(_) => deferred_fault = Some(FmtFault::ArgumentIndex(i32::MIN)),
                     }
                     i = j + 1; // consume the digits and the '$'
                 }
@@ -5679,53 +5726,101 @@ fn format_impl(
             // string must throw, not panic.
             //
             // `Flags.parse` refuses a repeated flag ("If a flag is given more
-            // than once ... a DuplicateFormatFlagsException will be thrown"),
-            // which is checked here at parse time — before any conversion
-            // character is even known — exactly as the JDK does.
+            // than once ... a DuplicateFormatFlagsException will be thrown").
+            // The refusal is DEFERRED for the same reason the index one is:
+            // `%--d` is a duplicate flag, but `%--` is an unknown conversion,
+            // because the JDK's scanner never reaches `Flags.parse` for a
+            // specifier it could not complete.
             let mut flags = String::new();
             while chars.get(i).is_some_and(|c| "-+0 #(,<".contains(*c)) {
-                if flags.contains(chars[i]) {
-                    return Err(fmt_raise(
-                        ctx,
-                        &FmtFault::DuplicateFlags(chars[i].to_string()),
-                    ));
+                let flag = chars[i];
+                if flags.contains(flag) {
+                    if deferred_fault.is_none() {
+                        deferred_fault = Some(FmtFault::DuplicateFlags(flag.to_string()));
+                    }
+                } else {
+                    flags.push(flag);
                 }
-                flags.push(chars[i]);
                 i += 1;
             }
 
-            // Parse optional width
+            // Parse optional width. `FormatSpecifier.width` runs the digits
+            // through `Integer.parseInt` and answers a run that overflows with
+            // `IllegalFormatWidthException(Integer.MIN_VALUE)` — so a width
+            // that does not fit an `int` is a REFUSAL, not a very wide field.
+            // (Parsing it into a `usize` and padding to it is how
+            // `String.format("%2147483648d", 1)` became an allocation of two
+            // billion spaces on a 64-bit host.)
             let mut width: Option<usize> = None;
             let width_start = i;
             while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
                 i += 1;
             }
             if i > width_start {
-                width = chars[width_start..i]
+                match chars[width_start..i]
                     .iter()
                     .collect::<String>()
-                    .parse()
-                    .ok();
+                    .parse::<i32>()
+                {
+                    Ok(w) => width = Some(w as usize),
+                    Err(_) => {
+                        if deferred_fault.is_none() {
+                            deferred_fault = Some(FmtFault::IllegalWidth(i32::MIN));
+                        }
+                    }
+                }
             }
 
-            // Parse optional .precision
+            // Parse optional .precision. A '.' with NO digits after it is not a
+            // zero precision — `FormatSpecifierParser.parsePrecision` returns
+            // -1 for it and `parse()` then returns 0, which the outer loop
+            // reports as `UnknownFormatConversionException` naming the
+            // character after the '%'. `String.format("%.d", 1)` is
+            // "Conversion = '.'" on HotSpot, not a precision of 0.
             let mut precision: Option<usize> = None;
+            let mut malformed_precision = false;
             if chars.get(i) == Some(&'.') {
                 i += 1;
                 let prec_start = i;
                 while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
                     i += 1;
                 }
-                precision = if i > prec_start {
-                    chars[prec_start..i].iter().collect::<String>().parse().ok()
+                if i > prec_start {
+                    match chars[prec_start..i]
+                        .iter()
+                        .collect::<String>()
+                        .parse::<i32>()
+                    {
+                        Ok(p) => precision = Some(p as usize),
+                        Err(_) => {
+                            if deferred_fault.is_none() {
+                                deferred_fault = Some(FmtFault::IllegalPrecision(i32::MIN));
+                            }
+                        }
+                    }
                 } else {
-                    Some(0)
-                };
+                    malformed_precision = true;
+                }
             }
 
             // Parse conversion character
+            if malformed_precision {
+                return Err(fmt_raise(
+                    ctx,
+                    &FmtFault::UnknownConversion(first_after_pct.to_string()),
+                ));
+            }
             if let Some(&spec) = chars.get(i) {
                 i += 1;
+                // `FormatSpecifier`'s constructor validates in source order —
+                // index, flags, width, precision — and every one of those comes
+                // before `conversion()` and `check()`. So a specifier with two
+                // faults reports the LEFTMOST, and this is where the ones the
+                // scan deferred are raised: after the scan proved there IS a
+                // conversion character, before any conversion-specific check.
+                if let Some(fault) = deferred_fault {
+                    return Err(fmt_raise(ctx, &fault));
+                }
                 match spec {
                     's' | 'S' | 'd' | 'f' | 'x' | 'X' | 'c' | 'C' | 'b' | 'B' | 'e' | 'E' | 'g'
                     | 'G' | 'o' | 'h' | 'H' | 'a' | 'A' => {
@@ -5809,41 +5904,122 @@ fn format_impl(
                         // 4-digit year). Real java.util.Formatter upper-cases
                         // the whole result when the prefix itself is 'T'.
                         let uppercase = spec == 'T';
-                        if let Some(&field) = chars.get(i) {
-                            i += 1;
-                            let use_idx = if flags.contains('<') {
-                                last_used_index.unwrap_or(0)
-                            } else if let Some(ei) = explicit_index {
-                                ei
-                            } else {
-                                let cur = arg_idx;
-                                arg_idx += 1;
-                                cur
-                            };
-                            last_used_index = Some(use_idx);
-                            if use_idx < arr_len {
-                                if let Some(a) = arr_ref {
-                                    let elem = ctx.get_array_element(a, use_idx);
-                                    let text =
-                                        format_temporal_field(ctx, &elem, field, &flags, width)?;
-                                    result.push_str(&if uppercase {
-                                        text.to_uppercase()
-                                    } else {
-                                        text
-                                    });
-                                }
+                        // The prefix only IS a prefix when a conversion
+                        // character follows: `FormatSpecifierParser.parse`
+                        // requires `isConversion(c1)` before it consumes two
+                        // characters, and otherwise falls back to reading the
+                        // 't' itself as the conversion — which
+                        // `Conversion.isValid` rejects. So `%t1` reports
+                        // "Conversion = 't'", NOT an unknown date/time field,
+                        // and neither does it consume the '1'.
+                        let field = match chars.get(i) {
+                            Some(&c) if c.is_ascii_alphabetic() || c == '%' => {
+                                i += 1;
+                                c
                             }
-                        } else {
-                            // A 't'/'T' with no field character after it never
-                            // matches the JDK's specifier regex either, so it is
-                            // the same truncated-specifier refusal: HotSpot 25
-                            // answers `UnknownFormatConversionException:
+                            // A 't'/'T' with no usable field character after it
+                            // never matches the JDK's specifier regex either, so
+                            // it is the same truncated-specifier refusal: HotSpot
+                            // 25 answers `UnknownFormatConversionException:
                             // Conversion = 't'` for `String.format("%t")`.
+                            _ => {
+                                return Err(fmt_raise(
+                                    ctx,
+                                    &FmtFault::UnknownConversion(spec.to_string()),
+                                ))
+                            }
+                        };
+                        // `FormatSpecifier.toString` for a date/time specifier
+                        // re-emits the 't'/'T' prefix and upper-cases the field
+                        // when the prefix was 'T' — `%-Ty` reports itself as
+                        // "%-TY". It is what the `MissingFormatWidth` and
+                        // `MissingFormatArgument` messages quote.
+                        let dt_spec_text = || {
+                            let mut s = String::from("%");
+                            s.push_str(&fmt_flags_string(&flags));
+                            if let Some(idx) = explicit_index {
+                                s.push_str(&format!("{}$", idx + 1));
+                            }
+                            if let Some(w) = width {
+                                s.push_str(&w.to_string());
+                            }
+                            if let Some(p) = precision {
+                                s.push('.');
+                                s.push_str(&p.to_string());
+                            }
+                            s.push(if uppercase { 'T' } else { 't' });
+                            s.push(if uppercase {
+                                field.to_ascii_uppercase()
+                            } else {
+                                field
+                            });
+                            s
+                        };
+                        // `checkDateTime`, in the JDK's order. None of it ran
+                        // before: a `%t` specifier skipped every legality check
+                        // the other conversions go through, so `%.2tY` formatted
+                        // instead of refusing and `%,tY` was accepted outright.
+                        if let Some(p) = precision {
+                            return Err(fmt_raise(ctx, &FmtFault::IllegalPrecision(p as i32)));
+                        }
+                        if !FMT_DATETIME_FIELDS.contains(field) {
                             return Err(fmt_raise(
                                 ctx,
-                                &FmtFault::UnknownConversion(spec.to_string()),
+                                &FmtFault::UnknownConversion(format!("t{field}")),
                             ));
                         }
+                        {
+                            // checkBadFlags(ALTERNATE | PLUS | LEADING_SPACE |
+                            // ZERO_PAD | GROUP | PARENTHESES): the message names
+                            // the offending SUBSET and the field character.
+                            let offending: String = fmt_flags_string(&flags)
+                                .chars()
+                                .filter(|c| "#+ 0,(".contains(*c))
+                                .collect();
+                            if !offending.is_empty() {
+                                return Err(fmt_raise(
+                                    ctx,
+                                    &FmtFault::FlagsMismatch(offending, field),
+                                ));
+                            }
+                        }
+                        if width.is_none() && flags.contains('-') {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::MissingWidth(dt_spec_text()),
+                            ));
+                        }
+                        let use_idx = if flags.contains('<') {
+                            last_used_index.unwrap_or(0)
+                        } else if let Some(ei) = explicit_index {
+                            ei
+                        } else {
+                            let cur = arg_idx;
+                            arg_idx += 1;
+                            cur
+                        };
+                        last_used_index = Some(use_idx);
+                        // Same argument-availability rule as the general
+                        // conversions above, which this arm did not have: an
+                        // absent argument APPENDED NOTHING and the format string
+                        // came back silently short, where HotSpot raises
+                        // `MissingFormatArgumentException`.
+                        let elem = match arr_ref {
+                            None => Value::Object(None),
+                            Some(a) if use_idx < arr_len => ctx.get_array_element(a, use_idx),
+                            Some(_) => {
+                                return Err(fmt_raise(
+                                    ctx,
+                                    &FmtFault::MissingArgument(dt_spec_text()),
+                                ))
+                            }
+                        };
+                        let text = format_temporal_field(ctx, &elem, field, &flags, width)?;
+                        result.push_str(&if uppercase {
+                            text.to_uppercase()
+                        } else {
+                            text
+                        });
                     }
                     // The literal-percent conversion, reached only when it
                     // carried flags or a width — a bare `%%` is short-circuited
@@ -6004,9 +6180,15 @@ fn temporal_from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
 /// the same zero-offset breakdown is used here for `Date`/`Long`/`Calendar`
 /// to stay consistent with the rest of the VM (and with how those values
 /// were constructed in the first place, e.g. `Timestamp.valueOf`).
+///
+/// `field` is the `%t` field character, carried only so that an argument this
+/// conversion cannot accept is refused as `IllegalFormatConversionException`
+/// naming it — `Formatter.printDateTime`'s `else` arm is `failConversion(c,
+/// arg)` and `c` for a date/time specifier is the FIELD, not the 't'.
 fn extract_temporal_fields(
     ctx: &mut dyn NativeContext,
     val: &Value,
+    field: char,
 ) -> Result<(i64, i32, i32, i32, i32, i32, i32), MethodCallFailed> {
     fn millis_to_fields(millis: i64) -> (i64, i32, i32, i32, i32, i32, i32) {
         let day_millis = 86_400_000i64;
@@ -6093,17 +6275,18 @@ fn extract_temporal_fields(
                 let nano = invoke_i32(ctx, obj, "getNano");
                 Ok((year, month, day, hour, minute, second, nano))
             } else {
-                Err(
-                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                        message: format!(
-                            "{} cannot be formatted as a date",
-                            ctx.class_name_of_id(cid).unwrap_or_default()
-                        ),
-                    }
-                    .into(),
-                )
+                // `printDateTime`'s `else` arm. HotSpot reports
+                // "Y != java.lang.String" for `String.format("%tY", "x")`, a
+                // typed refusal a caller can catch as
+                // `IllegalFormatConversionException`; the base
+                // `IllegalArgumentException` and its invented
+                // "cannot be formatted as a date" wording were CratonVM's own.
+                Err(fmt_raise(ctx, &FmtFault::WrongType(field, cid)))
             }
         }
+        // A primitive that is not a `long` cannot arrive here at all: the
+        // varargs array boxes everything, and the `Long` case is handled
+        // above. Report it the same way `failConversion` would if it could.
         _ => Err(
             cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: "Illegal date/time conversion argument".to_string(),
@@ -6167,7 +6350,15 @@ fn format_temporal_field(
         "Saturday",
     ];
 
-    let (year, month, day, hour, minute, second, nanos) = extract_temporal_fields(ctx, val)?;
+    // "If the argument arg is null, then the result is 'null'" —
+    // `printDateTime` returns before it ever looks at the field, so a null
+    // date is not a refusal. This used to reach `extract_temporal_fields`'
+    // catch-all and come back as an `IllegalArgumentException`.
+    if matches!(val, Value::Object(None)) {
+        return Ok(fmt_pad_to_width("null".to_string(), flags, width));
+    }
+    let (year, month, day, hour, minute, second, nanos) =
+        extract_temporal_fields(ctx, val, field)?;
     let year32 = year as i32;
     let millis = nanos / 1_000_000;
     let dow = day_of_week_sun0(year32, month, day);
@@ -6234,26 +6425,20 @@ fn format_temporal_field(
             "{} {} {:2} {:02}:{:02}:{:02} UTC {:04}",
             DAYS_ABBR[dow], MONTHS_ABBR[month_idx], day, hour, minute, second, year
         ),
+        // Unreachable today: the caller already screened `field` against
+        // `FMT_DATETIME_FIELDS`, which is `DateTime.isValid`'s own set, and
+        // every one of its 31 characters has an arm above. Kept as the arm a
+        // future divergence between the two sets would land in, raising the
+        // refusal the JDK names rather than the base class.
         _ => {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!("Unknown date/time conversion '%t{}'", field),
-                }
-                .into(),
-            );
+            return Err(fmt_raise(
+                ctx,
+                &FmtFault::UnknownConversion(format!("t{field}")),
+            ));
         }
     };
 
-    if let Some(w) = width {
-        if out.len() < w {
-            let pad = w - out.len();
-            if flags.contains('-') {
-                out = format!("{out}{}", " ".repeat(pad));
-            } else {
-                out = format!("{}{out}", " ".repeat(pad));
-            }
-        }
-    }
+    out = fmt_pad_to_width(out, flags, width);
 
     Ok(out)
 }
@@ -7178,7 +7363,25 @@ pub(crate) fn format_arg(
             'x' => format!("{:x}", *v as u32),
             'X' => format!("{:X}", *v as u32),
             'o' => format!("{:o}", *v as u32),
-            'c' => char::from_u32(*v as u32).unwrap_or('?').to_string(),
+            // `printCharacter` gates every non-`Character` argument on
+            // `Character.isValidCodePoint` and refuses the rest with
+            // `IllegalFormatCodePointException` — `String.format("%c",
+            // 0x110000)` is a THROW, not the '?' this answered. A `Character`
+            // argument is never checked by the JDK and never needs to be: it
+            // unboxes into 0..=0xFFFF, which is always valid.
+            'c' => {
+                if !(0..=0x10FFFF).contains(v) {
+                    return Err(fmt_raise(ctx, &FmtFault::IllegalCodePoint(*v)));
+                }
+                // A lone surrogate (0xD800..=0xDFFF) IS a valid code point by
+                // `Character.isValidCodePoint`, and `Character.toChars` hands
+                // it back as a single unpaired `char`. Rust's `char` cannot
+                // hold one and `create_string` takes a `&str`, so the '?' is
+                // kept for exactly that range — a residual of the UTF-8 string
+                // representation, not of this check. See
+                // W7-41-format-exception-subclasses.md.
+                char::from_u32(*v as u32).unwrap_or('?').to_string()
+            }
             'b' => ((*v) != 0).to_string(),
             'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
                 java_float_conversion(*v as f64, spec, None)
