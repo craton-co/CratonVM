@@ -102,7 +102,7 @@ finishes at all. Do that before assuming.
 ## Not investigated further
 
 Time-boxed: the batch-09 session fixed the zlib preset-dictionary defect
-([record](inflater-preset-dictionary-was-a-no-op-20260812.md)) and left this
+([record](../../internal/fixed-suite-bugs/netty-inflater-preset-dictionary-no-op-FIXED-20260812.md)) and left this
 class characterized rather than fixed. Residual 1 is the recommended entry
 point — smallest repro, clearest signal, and it is a datagram-channel defect
 that almost certainly reaches past netty.

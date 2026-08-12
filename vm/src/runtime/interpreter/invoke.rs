@@ -1287,12 +1287,53 @@ pub(super) fn execute_invoke_kind(
                                     }
                                 }
                             }
+                            // A bare `new Object()` IS all-zero, legitimately.
+                            //
+                            // `ObjectHeader::new` documents the mark word as
+                            // "no identity hash installed", `MARK_NEUTRAL`,
+                            // `ObjectKind::Object` and `ArrayElementType::
+                            // Reference` are all `0`, and a no-field `Object`
+                            // has `class_id = 0` and `shape = 0` — so every one
+                            // of the 16 bytes this detector reads is zero for a
+                            // healthy, freshly allocated `java.lang.Object`.
+                            // The comment on `init_object_header` still claims
+                            // a fix that made this impossible ("identity_hash_
+                            // code is now eagerly assigned at allocation time,
+                            // caller passes next_identity_hash()"), but the
+                            // 2026-08-06/07 header shrink folded the hash into
+                            // the mark word and left `ObjectHeader::new` with no
+                            // hash parameter at all, so the fast path cannot
+                            // assign one and the false positive is back.
+                            //
+                            // It fires on `new Object()` used as a lock or
+                            // sentinel — six lines of Java reproduce it, on all
+                            // four collectors — and the cost is not the log
+                            // line: this warning is the tripwire for the
+                            // reclaimed-live-receiver family (CRATONVM_DBG_BUG03
+                            // / _SWEEP_ZERO / _STALE_RECV all hang off it), and
+                            // a tripwire that fires on healthy code is one
+                            // nobody reads.
+                            //
+                            // Demoted, not deleted, and only when the CP class
+                            // is `java/lang/Object` itself — i.e. an
+                            // `Object`-declared call site (hashCode/equals/
+                            // toString/...), where the fallback the detector
+                            // takes is the CORRECT dispatch for a real bare
+                            // `Object` anyway. The trade is explicit: a
+                            // genuinely stale receiver at an `Object`-declared
+                            // site now logs at debug instead of warn. That is
+                            // worth it against a 100% false-positive rate here,
+                            // and it is exactly the call already made two lines
+                            // below for `java/lang/ClassLoader`.
+                            //
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
                             // receiver lost its header but CP resolution is
                             // already `java/lang/ClassLoader`; the CP fallback
                             // succeeds and a WARN was mostly noise.
-                            if method_class_name.as_ref() == "java/lang/ClassLoader" {
+                            if method_class_name.as_ref() == "java/lang/Object"
+                                || method_class_name.as_ref() == "java/lang/ClassLoader"
+                            {
                                 tracing::debug!(
                                     "Stale pointer detected in invokevirtual receiver \
                                      (ptr={:p}, all-zero header) — falling back to CP class {}",
