@@ -1,8 +1,39 @@
 # The strict baseline is 62/6, not 53/1 — and the six are pre-existing
 
-**Status: MEASURED 2026-08-11.** Not a defect record: a correction to the
-number every other record in this directory is read against, plus the
-identities of six strict-mode failures that had never been attributed.
+**Status: MEASURED 2026-08-11, then CLOSED the same day at 68/0.** Not a defect
+record: a correction to the number every other record in this directory is read
+against, plus the identities of six strict-mode failures that had never been
+attributed.
+
+> ## Closed — the corpus is green in both modes
+>
+> All six were fixed the same day, each by a separate lane, and re-measured on
+> one binary (`dev` after the wave, built 20:54):
+>
+> ```
+> --jdk-only   REGRESSION SUITE: 68 passed, 0 failed
+> --real-jdk   REGRESSION SUITE: 41 passed, 0 failed
+> ```
+>
+> | vector | was | root cause |
+> |---|---|---|
+> | `RChmKeySetView` | `NoClassDefFoundError: java/util/HashMap$KeyItr` | a snapshot iterator fabricating a name no image declares, and propagating the refusal with a bare `?` |
+> | `RJdkJmx` / `RReflect` / `RJdkReflect` | `AnnotationProxy`, and two `AssertionError`s | one refusal wearing two faces — the array path used `?`, the single-annotation paths swallowed it into a `null` return |
+> | `RJdkHandles` | `NoClassDefFoundError: __mh_insert_wrapper__` | ten combinator carriers minted through the compatibility door instead of the VM-internal one |
+> | `RJdkForkJoin` | `…$DefaultCommonPoolForkJoinWorkerThreadFactory` | a JDK-21-era nested class name hard-coded; JDK 25 declares only `$DefaultForkJoinWorkerThreadFactory` |
+>
+> Criterion 6 of the contract — "strict corpus green" — is met. The README's own
+> warning about it stands and is worth keeping: it is *"not a formality to tick
+> after the list is done; it is where the defects are."* Six of them were.
+>
+> **What made this measurable was the control, not the fix.** Two intermediate
+> builds failed at the link step (`failed to remove file … Access denied`,
+> because a probe run held the binary) while the shell reported success, so a
+> full suite run was taken against a four-build-old binary and read as "the
+> fixes did not take". The tell was that the six failures were *byte-identical*
+> to the control. Compare the binary's mtime against the merge commit times
+> before believing any suite result, and check cargo's own exit code rather than
+> a trailing command's.
 
 ## What the directory said
 
