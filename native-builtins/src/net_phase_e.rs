@@ -16179,16 +16179,57 @@ fn re10_dispatch_pending(
                 let ex = ctx.read_native_pin(ex_pin, ex0);
                 let status = ctx.get_field(ex, 5).as_int().unwrap_or(200);
                 let mut body_bytes: Vec<u8> = Vec::new();
+                // W7-24: index of the real-JDK response buffer, if the strict
+                // policy refused the `ResponseBody` stand-in and
+                // `re10_real_jdk_response_body` parked a
+                // `java.io.ByteArrayOutputStream` here instead of chunks.
+                // Draining it means an `invoke_virtual`, which allocates, so it
+                // happens AFTER this walk rather than inside it — the walk's own
+                // invariant is that nothing in it allocates.
+                let mut real_sink: Option<usize> = None;
                 if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
                     // array_length / get_array_element do not allocate, so the
                     // chunk array and each `ba` stay valid through the walk.
                     let n = ctx.array_length(chunks);
                     for i in 0..n {
                         if let Value::Object(Some(ba)) = ctx.get_array_element(chunks, i) {
+                            // `object_is_array` is a heap object-kind check, not
+                            // a class-name test — a reference array reports its
+                            // COMPONENT class, so a name test cannot tell these
+                            // apart. Compatible mode never parks a non-array
+                            // here, so this arm is strict-only and the two can
+                            // never interleave: whether the mint is refused is a
+                            // property of the run, not of the call.
+                            if !ctx.object_is_array(ba) {
+                                real_sink.get_or_insert(i);
+                                continue;
+                            }
                             let ln = ctx.array_length(ba);
                             for j in 0..ln {
                                 if let Value::Int(b) = ctx.get_array_element(ba, j) {
                                     body_bytes.push(b as i8 as u8);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(i) = real_sink {
+                    // Re-read the exchange AND its chunk array from the pin
+                    // rather than reusing the locals above: `toByteArray()` runs
+                    // a method and can move both.
+                    let ex = ctx.read_native_pin(ex_pin, ex0);
+                    if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
+                        if let Value::Object(Some(sink)) = ctx.get_array_element(chunks, i) {
+                            if let Ok(Some(Value::Object(Some(arr)))) =
+                                ctx.invoke_virtual(sink, "toByteArray", "()[B", &[])
+                            {
+                                // `arr` is the invoke's own result, so it is
+                                // current, and nothing below allocates.
+                                let ln = ctx.array_length(arr);
+                                for j in 0..ln {
+                                    if let Value::Int(b) = ctx.get_array_element(arr, j) {
+                                        body_bytes.push(b as i8 as u8);
+                                    }
                                 }
                             }
                         }
@@ -16735,6 +16776,125 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `HttpExchange.getResponseBody()`'s real-JDK stand-in, built **only** when the
+/// policy has already refused the VM-minted `HttpExchange$ResponseBody`.
+///
+/// W7-24. `com/sun/net/httpserver/HttpExchange$ResponseBody` is a *behaviour
+/// carrier* in W7-17's classification, not a door defect, and the distinction
+/// decides the fix. `javap com.sun.net.httpserver.HttpExchange$ResponseBody`
+/// against the JDK 25 image answers "class not found", so it passes the
+/// guardrail — but `--dump-native-registry` taken once per mode reports its five
+/// natives (`write(I)`, `write([B)`, `write([BII)`, `flush`, `close`, all
+/// registered a few lines below) as `synthetic-stub` in Compatible and **absent**
+/// under `--jdk-only`. `CompatibilityStub` is therefore the CORRECT origin: the
+/// class exists only to carry an implementation strict mode is deliberately
+/// retiring, and the class and its natives are refused together on purpose.
+/// Re-minting it through `ensure_vm_internal_class` — the fix
+/// `CratonVM$HttpServerLoop` needed, three functions up — would put back a class
+/// strict mode has no implementation for and buy an `UnsatisfiedLinkError` at
+/// the handler's first `write` instead of the `NoClassDefFoundError` at the
+/// mint. What is missing here is not a door but a **fallback at the refusal**,
+/// which is the shape `craton_alloc_system_logger` already implements for
+/// `cratonvm/internal/SystemLogger`.
+///
+/// **Why `java.io.ByteArrayOutputStream`, and not what HotSpot returns.**
+/// Measured on this host, HotSpot 25's `getResponseBody()` hands back a
+/// `sun.net.httpserver.PlaceholderOutputStream`; that class cannot serve — it is
+/// package-private, its only constructor takes the `OutputStream` it wraps, and
+/// every write goes through a `checkWrap()` that throws until a real
+/// `ExchangeImpl` has called `setWrappedStream`. There is no `ExchangeImpl` on
+/// this path. `java.io.ByteArrayOutputStream` can: it is a real, public
+/// `java.base` class; every method this stream needs is registered `bridge` in
+/// BOTH modes (`native-io/src/lib.rs` — `<init>()V`, the three `write`s,
+/// `flush`, `close`, `toByteArray`), so nothing about it is dropped by the
+/// strict policy; and it has exactly the semantics the carrier had — accumulate
+/// now, hand the bytes to the dispatcher after `handle()` returns. It is not the
+/// name HotSpot reports, and this VM's Compatible answer
+/// (`com.sun.net.httpserver.HttpExchange$ResponseBody`) is not that name either,
+/// so the fallback costs no fidelity that was there to lose and buys a working
+/// response body where strict mode had none.
+///
+/// **Where it is parked.** In the exchange's own chunk array (slot 6), not in a
+/// Rust side table: the array is GC-traced from the exchange for exactly as long
+/// as the exchange lives, and `re10_dispatch_pending`'s drain already looks
+/// there, in order, for the response bytes. A side table keyed on an `ObjectRef`
+/// would need pinning across the whole handler call and would inherit a
+/// recycled address's state.
+fn re10_real_jdk_response_body(
+    ctx: &mut dyn NativeContext,
+    ex_pin: usize,
+    ex0: ObjectRef,
+    refusal: MethodCallFailed,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Keep the refusal itself alive across the allocations below.
+    // `MethodCallFailed::ExceptionThrown` carries a raw `ObjectRef`, and
+    // re-raising one that a young collection moved in the meantime is the same
+    // stale-local family every other site in this function's neighbourhood pins
+    // against. The pin batch belongs to the caller's `this_pin`, so the caller's
+    // single `unpin_native_roots` releases this one too — do not unpin here.
+    let refusal_pin = match &refusal {
+        MethodCallFailed::ExceptionThrown(exc) => Some((ctx.pin_native_root(*exc), *exc)),
+        _ => None,
+    };
+    // Same order as `real_jdk_system_logger`: ask whether the real class is
+    // there BEFORE trying to build it, so a missing image class leaves the
+    // refusal standing rather than turning it into a second, less informative
+    // failure.
+    let have_real = ctx.class_id_by_name("java/io/ByteArrayOutputStream").is_some()
+        || ctx
+            .ensure_class_initialized("java/io/ByteArrayOutputStream")
+            .is_ok();
+    let built = if have_real {
+        ctx.new_object_initialized("java/io/ByteArrayOutputStream", "()V", &[])
+    } else {
+        Ok(None)
+    };
+    let sink = match built {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    // No allocation between the create above and the park below — `get_field`,
+    // `array_length`, `get_array_element` and `set_array_element` do not
+    // allocate — so `sink` needs no pin of its own; the exchange does, because
+    // `new_object_initialized` ran a constructor.
+    let ex = ctx.read_native_pin(ex_pin, ex0);
+    let chunks = match ctx.get_field(ex, 6) {
+        Value::Object(Some(c)) => c,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    let cap = ctx.array_length(chunks);
+    for i in 0..cap {
+        if let Value::Object(None) = ctx.get_array_element(chunks, i) {
+            ctx.set_array_element(chunks, i, Value::Object(Some(sink)));
+            return Ok(sink);
+        }
+    }
+    // Chunk array full. The three `write` natives below silently drop a chunk in
+    // this case; a fallback stream that the drain will never read must NOT be
+    // silent about it — a response body dropped without a word is the
+    // "refusal laundered into a wrong answer" failure W7-17 §8 names as worse
+    // than either gate.
+    Err(ioex(
+        "HttpExchange.getResponseBody: no free response chunk slot for the \
+         real-JDK response body",
+    ))
+}
+
+/// Re-raise a refusal that has been held across allocations, reading it back
+/// from its pin first. Split out because the fallback above has three exits that
+/// must all do it and a copy that forgets the `read_native_pin` is invisible
+/// until a young collection happens to move the exception.
+fn re10_reraise(
+    ctx: &dyn NativeContext,
+    refusal: MethodCallFailed,
+    refusal_pin: Option<(usize, ObjectRef)>,
+) -> MethodCallFailed {
+    match refusal_pin {
+        Some((handle, exc)) => MethodCallFailed::ExceptionThrown(ctx.read_native_pin(handle, exc)),
+        None => refusal,
+    }
+}
+
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
     // The JDK factory contract returns this concrete implementation, not the
@@ -17093,14 +17253,33 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // response body. Pin it across the alloc and read it back forwarded.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let out = try_alloc_concurrent_synthetic(
+            let out = match try_alloc_concurrent_synthetic(
                 ctx,
                 "com/sun/net/httpserver/HttpExchange$ResponseBody",
                 2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ctx.set_field(out, 0, Value::Object(Some(this)));
-            ctx.set_field(out, 1, Value::Int(0));
+            ) {
+                Ok(out) => {
+                    let this = ctx.read_native_pin(this_pin, this0);
+                    ctx.set_field(out, 0, Value::Object(Some(this)));
+                    ctx.set_field(out, 1, Value::Int(0));
+                    out
+                }
+                // W7-24 — the real-JDK fallback, taken ONLY at the refusal.
+                // `Compatible` never refuses this mint (measured: the class is
+                // fabricated once per run in every Compatible HttpServer run,
+                // and the `--jdk-only-report` row for it is the only
+                // `net_phase_e` row on the serve path besides the dispatcher's),
+                // so this arm cannot run there and Compatible is unchanged.
+                Err(refusal) => match re10_real_jdk_response_body(ctx, this_pin, this0, refusal) {
+                    Ok(out) => out,
+                    Err(err) => {
+                        // Unpin before unwinding: an early return past
+                        // `unpin_native_roots` leaks the frame.
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(err);
+                    }
+                },
+            };
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(out))))
         },
