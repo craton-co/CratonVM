@@ -141,6 +141,19 @@ are (*"a source-level upper bound on what the flag would print"*). An
 specific shape that fools a source reader, and there are more of them in the
 `over` column.
 
+This is not an isolated correction. W7-61-sslengine-layout-and-tls-blocking.md,
+landed on dev the same day from the `over` side, reaches the same verdict on the
+row W7-49 §7 called the biggest unrepaired live one: `javax/net/ssl/SSLEngine`
+7 vs 2 is **not live** — on the Compatible path the 7-wide allocation cannot
+happen and the 7-slot map has no receiver. Two lanes, opposite directions of the
+same census, both finding that the LIVE column over-reports. That is the census
+behaving as designed — W7-59 §5.3 chose an over-approximating walk on the
+explicit ground that *"a site called LIVE that is dead costs a follow-up lane a
+look, while a site called dead that is live is the failure this campaign is
+about"* — but a third lane reading these tables as a bug list would be wrong
+three times out of four. The tables are a **work queue**, and liveness is the
+first item of work on each row, not a property already established.
+
 ### 2.1 Reproducing the population
 
 An independent scan — all `alloc_object` / `try_alloc_object_gc_safe` / the
