@@ -944,7 +944,12 @@ pub fn spawn_io_thread_with_ctx(
     // `vertx_eventloop::spawn_vertx_event_loop_inner`; the two sites were
     // copies of each other and are now two calls to one helper.
     if vm_tid != 0 {
-        if let Some(mirror) = crate::alloc_carrier_thread_mirror(ctx, &name, vm_tid, daemon) {
+        // Bound to a `let` rather than written inline as the `if let`
+        // scrutinee: a scrutinee's temporaries (the implicit reborrow of `ctx`
+        // included) live for the whole `if let` under Rust 2021, and the body
+        // needs `ctx` again for `set_native_thread_java_obj`.
+        let mirror = crate::alloc_carrier_thread_mirror(ctx, &name, vm_tid, daemon);
+        if let Some(mirror) = mirror {
             let attached = ctx.set_native_thread_java_obj(vm_tid, mirror);
             if !attached {
                 tracing::warn!(

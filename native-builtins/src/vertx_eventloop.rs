@@ -724,9 +724,12 @@ fn spawn_vertx_event_loop_inner(
             // the correct degradation: `current_thread_object` then builds a
             // full-width real mirror lazily on first use, which is precisely
             // what the short mirror used to pre-empt.
-            if let Some(mirror) =
-                crate::alloc_carrier_thread_mirror(&mut **ctx, &name, vm_tid, daemon)
-            {
+            // Bound to a `let` rather than written inline as the `if let`
+            // scrutinee: a scrutinee's temporaries (this reborrow of `ctx`
+            // included) live for the whole `if let` under Rust 2021, and the
+            // body needs `ctx` again for `set_native_thread_java_obj`.
+            let mirror = crate::alloc_carrier_thread_mirror(&mut **ctx, &name, vm_tid, daemon);
+            if let Some(mirror) = mirror {
                 // Attach to the registry. Failure here is recoverable —
                 // the registration entry from above is still valid; the
                 // mirror just won't be findable by ObjectRef. We log it
