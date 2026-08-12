@@ -482,6 +482,61 @@ pub(crate) fn jul_logger_handlers_set(
     ctx.unpin_native_roots(logger_pin);
 }
 
+/// GC-safe side table for `java.util.logging.Handler`'s `ErrorManager`, keyed
+/// by `identity_hash_code` — same pattern, and for the same reason, as
+/// `jul_logger_handlers_table`.
+///
+/// `java.util.logging.Handler` declares
+/// `private volatile ErrorManager errorManager = new ErrorManager();` and
+/// every `Handler` in the JDK routes its absorbed `Exception` there through
+/// `reportError`. CratonVM's SYNTHETIC `StreamHandler` is a 2-field object
+/// (stream=0, formatter=1) with no slot for it, so keying by identity sidesteps
+/// the layout the way the handler-list table already does — and, unlike a
+/// fixed slot, cannot collide with whatever a real-JDK `Handler` keeps there.
+///
+/// Compatible mode never reaches this: `Handler.reportError`,
+/// `Handler.setErrorManager` and `StreamHandler.flush`/`close` all run real
+/// bytecode there, over the real `errorManager` field.
+/// W7-64-printstream-trouble-and-errormanager.md
+fn jul_handler_error_manager_table(vm: usize) -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static std::sync::Mutex<std::collections::HashMap<i32, usize>>>>> =
+        OnceLock::new();
+    crate::logmanager::per_vm_table(&T, vm)
+}
+
+pub(crate) fn jul_handler_error_manager_get(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+) -> Option<ObjectRef> {
+    let vm = ctx.vm_identity();
+    let key = ctx.identity_hash_code(handler);
+    let handle = *jul_handler_error_manager_table(vm).lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_handler_error_manager_set(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+    manager: ObjectRef,
+) {
+    let vm = ctx.vm_identity();
+    // Adding a global root may grow the root table and collect. The handler is
+    // keyed immediately afterward, so retain it across that allocation. Same
+    // hazard, and same fix, as `jul_logger_handlers_set`.
+    let handler_pin = ctx.pin_native_root(handler);
+    let handle = ctx.add_global_root(manager);
+    let handler = ctx.read_native_pin(handler_pin, handler);
+    let key = ctx.identity_hash_code(handler);
+    if let Some(previous) = jul_handler_error_manager_table(vm)
+        .lock()
+        .unwrap()
+        .insert(key, handle)
+    {
+        ctx.remove_global_root(previous);
+    }
+    ctx.unpin_native_roots(handler_pin);
+}
+
 pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
     let vm = ctx.vm_identity();
     let key = ctx.identity_hash_code(logger);

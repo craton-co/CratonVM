@@ -22652,6 +22652,30 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         native_printwriter_write_int,
     );
 
+    // --- the READ side of `trouble`, for BOTH classes ---
+    //
+    // SYNTHETIC-JDK ONLY, and deliberately so: Compatible mode runs the real
+    // `checkError`/`setError`/`clearError` bytecode over the real `trouble`
+    // field, which is correct once the absorbing sites record — shadowing it
+    // with a native would be a contract-1.4 shadow on working code.
+    //
+    // These are two DISTINCT classes sharing one body, which is exactly the
+    // shape that has been wrong elsewhere in this workspace, so it is stated
+    // rather than assumed: `checkError` differs between them ONLY in the type
+    // its delegation branch tests (`PrintStream` vs `PrintWriter`/`psOut`) and
+    // `printstream_check_error` tests BOTH, in the JDK's order, so one body is
+    // correct for both. `setError`/`clearError` are byte-identical two-line
+    // bodies in both classes. Every other `PrintStream`/`PrintWriter` pair in
+    // this file that looks shared (`native_println_string` and friends) is
+    // shared for the different reason that the text is the same; those go
+    // through `stream_write`, which branches on the receiver.
+    // W7-64-printstream-trouble-and-errormanager.md
+    for print_class in ["java/io/PrintStream", "java/io/PrintWriter"] {
+        registry.register(print_class, "checkError", "()Z", printstream_check_error);
+        registry.register(print_class, "setError", "()V", printstream_set_error);
+        registry.register(print_class, "clearError", "()V", printstream_clear_error);
+    }
+
     // --- java.lang.StringBuilder ---
     register_string_builder_natives(registry, "java/lang/StringBuilder");
     register_string_builder_natives(registry, "java/lang/StringBuffer");
@@ -27317,6 +27341,93 @@ fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if ctx.fd_table().flush(fd).is_err() {
             cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
         }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// The READ side of `trouble` — `checkError` / `setError` / `clearError`
+// ---------------------------------------------------------------------------
+//
+// SYNTHETIC-JDK ONLY. In Compatible mode all three of these run the real
+// `java.io` bytecode over the real `trouble` field, and shadowing correct real
+// bytecode with a native is the thing this workspace calls a contract-1.4
+// shadow. They are registered from `register_synthetic_overrides` alone.
+//
+// The RED they close is not "the flag reads wrong": measured on this branch,
+// synthetic-mode `PrintStream.checkError()` resolves to no native and to no
+// method on the fabricated class, so it raises
+// `NoSuchMethodError: java/io/PrintStream.checkError()Z`. `setError()` and
+// `clearError()` — the JDK's `protected` write side, which a `PrintStream`
+// subclass uses to report a failure of its own — do the same.
+// W7-64-printstream-trouble-and-errormanager.md
+
+/// Is `obj` an instance of `class_name`? The question the `instanceof` opcode
+/// asks — by `ClassId` hierarchy, never by class name comparison.
+fn print_sink_is_a(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
+    ctx.class_id_by_name(class_name)
+        .is_some_and(|root| ctx.is_subclass(ctx.class_id_of_object(obj), root))
+}
+
+/// `checkError()` for both classes.
+///
+/// ```text
+/// PrintStream:  if (out != null) flush();
+///               if (out instanceof PrintStream ps) return ps.checkError();
+///               return trouble;
+/// PrintWriter:  if (out != null) flush();
+///               if (out instanceof PrintWriter pw) return pw.checkError();
+///               else if (psOut != null)            return psOut.checkError();
+///               return trouble;
+/// ```
+///
+/// The flush is NOT incidental and is the half a "just read the flag"
+/// implementation loses: measured on HotSpot 25.0.3.9, a stream that has never
+/// failed but whose sink's `flush()` throws answers `checkError() == true` on
+/// the first call, and the sink records the flush attempt. Both halves are
+/// asserted in `probes/CloseFlushSwallowProbe.java`.
+///
+/// `psOut` has no counterpart in our layout, because our
+/// `PrintWriter(OutputStream)` puts the `OutputStream` straight into `out`
+/// rather than the JDK's `BufferedWriter(OutputStreamWriter(out))` — so the
+/// `out instanceof PrintStream` test below IS the `psOut` branch here.
+fn printstream_check_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let out = match ctx.get_field_by_name(this, "out") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    // `flush()` is virtual in the JDK too, so a subclass override runs. Our
+    // own `flush` natives absorb an `IOException` into `trouble`; an `Error`
+    // out of them is not something any JDK `catch` on this path names, so it
+    // propagates — the same rule the flush site itself follows.
+    ctx.invoke_virtual(this, "flush", "()V", &[])?;
+    if let Some(out) = out {
+        for delegate_to in ["java/io/PrintWriter", "java/io/PrintStream"] {
+            if print_sink_is_a(&*ctx, out, delegate_to) {
+                return ctx.invoke_virtual(out, "checkError", "()Z", &[]);
+            }
+        }
+    }
+    let trouble = cratonvm_native_api::print_error_state::is_trouble(&*ctx, this);
+    Ok(Some(Value::Int(i32::from(trouble))))
+}
+
+/// `protected void setError()` — "subsequent invocations of `checkError()`
+/// return `true` until `clearError()` is invoked".
+fn printstream_set_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+    }
+    Ok(None)
+}
+
+/// `protected void clearError()`.
+fn printstream_clear_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        cratonvm_native_api::print_error_state::clear_trouble(&*ctx, this);
     }
     Ok(None)
 }
