@@ -18709,10 +18709,16 @@ pub(crate) fn no_enum_constant_message_for_mirror(
     enum_mirror: ObjectRef,
     constant: &str,
 ) -> String {
-    let canonical = match native_class_get_canonical_name(ctx, &[Value::Object(Some(enum_mirror))])
-    {
+    // Bound to a `let` before the match on purpose: a `&mut ctx` reborrow left
+    // in a match SCRUTINEE stays alive for the whole match, and the arm below
+    // needs `ctx` again for `read_string`.
+    let resolved = native_class_get_canonical_name(ctx, &[Value::Object(Some(enum_mirror))]);
+    let canonical: String = match resolved {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
-        _ => "null".into(),
+        // `getCanonicalName()` returned Java null (local / anonymous enum), or
+        // the mirror was not a class at all. Either way the JDK's string
+        // concatenation renders it "null".
+        _ => "null".to_string(),
     };
     no_enum_constant_message(&canonical, constant)
 }
