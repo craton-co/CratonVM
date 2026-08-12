@@ -1055,21 +1055,27 @@ pub(crate) fn native_printwriter_printf(
                 // Prefer Writer.write(String) which is the canonical PrintWriter
                 // sink. If that isn't registered we fall through to the
                 // OutputStream byte path so BAOS-backed writers still work.
-                let wrote_string = ctx
-                    .invoke_virtual(
-                        backing,
-                        "write",
-                        "(Ljava/lang/String;)V",
-                        &[Value::Object(Some(s))],
-                    )
-                    .is_ok();
+                // RECORDED since W7-64. `PrintWriter.format` is
+                // `try { ensureOpen(); …formatter.format(…); }
+                //  catch (InterruptedIOException x) { …interrupt(); }
+                //  catch (IOException x) { trouble = true; }` — the same two
+                // clauses as `write`, so the same recording policy.
+                // W7-64-printstream-trouble-and-errormanager.md
+                let wrote = ctx.invoke_virtual(
+                    backing,
+                    "write",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(s))],
+                );
+                let wrote_string =
+                    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, wrote);
                 if !wrote_string && !backing_is_writer {
                     let bytes = text.as_bytes();
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
                     }
-                    let _ = ctx.invoke_virtual(
+                    let wrote_bytes = ctx.invoke_virtual(
                         backing,
                         "write",
                         "([BII)V",
@@ -1078,6 +1084,11 @@ pub(crate) fn native_printwriter_printf(
                             Value::Int(0),
                             Value::Int(bytes.len() as i32),
                         ],
+                    );
+                    cratonvm_native_api::print_error_state::record_write_failure(
+                        ctx,
+                        this,
+                        wrote_bytes,
                     );
                 }
             }

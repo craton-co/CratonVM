@@ -3039,11 +3039,52 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 String::new()
             };
 
-            // Format and write to stream
+            // Format and write to stream.
+            //
+            // REPORTED since W7-64. `StreamHandler.publish` wraps its whole
+            // write region in `catch (Exception ex) { reportError(null, ex,
+            // ErrorManager.WRITE_FAILURE); }` — a handler whose sink refuses
+            // the record says so through the `ErrorManager`, it does not throw
+            // and it does not go quiet. One report for the whole record, as in
+            // HotSpot, so the loop stops at the first failure rather than
+            // reporting once per byte.
+            // W7-64-printstream-trouble-and-errormanager.md
             let formatted = format!("[{}] {}\n", level_str, message);
+            let mut write_failure = None;
             for &b in formatted.as_bytes() {
                 let stream = ctx.read_native_pin(stream_pin, stream);
-                let _ = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
+                let wrote = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
+                match cratonvm_native_api::print_error_state::take_absorbed(
+                    &*ctx,
+                    wrote,
+                    "java/lang/Exception",
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(ex)) => {
+                        write_failure = Some(ex);
+                        break;
+                    }
+                    // An `Error` is not what `catch (Exception ex)` names, so
+                    // it leaves `publish` the way it leaves HotSpot's — but
+                    // the pin has to come off first.
+                    Err(e) => {
+                        ctx.unpin_native_roots(stream_pin);
+                        return Err(e);
+                    }
+                }
+            }
+            // Reported while the pin is still held: `reportError` runs
+            // arbitrary Java (an application `ErrorManager`) and can move
+            // anything unpinned, and the loop's `stream` local is dead by
+            // here, so only `ex` is live across it — and it is passed straight
+            // in as an argument, which the invoke pins itself.
+            if let Some(ex) = write_failure {
+                cratonvm_native_api::print_error_state::report_handler_error(
+                    ctx,
+                    this,
+                    ex,
+                    cratonvm_native_api::print_error_state::ERROR_MANAGER_WRITE_FAILURE,
+                );
             }
             ctx.unpin_native_roots(stream_pin);
             Ok(None)
