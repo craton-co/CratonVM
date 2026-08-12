@@ -13212,6 +13212,23 @@ fn wrap_annotation_in_real_proxy(
 // AnnotationProxy, boxed wrappers, arrays, enum-like objects). Keep in sync
 // with the vm_exec.rs originals if annotation `Object`-method semantics
 // change.
+//
+// "Keep in sync" was not enough, and this is what it cost: on 2026-08-12 the
+// `toString` pair had drifted three ways at once (member ordering, binary vs
+// canonical type name, `value=` elision), so ONE CratonVM run printed TWO
+// different strings for the SAME annotation — `@AnnTwin$Single("v")` from the
+// vm_exec copy and `@AnnTwin$Single(value="v")` from this one, neither being
+// HotSpot's `@AnnTwin.Single("v")`. Which copy answers is not something a
+// caller controls: measured, the first `toString()` on a fresh proxy can take
+// the vm_exec hook and every later one this route, and it is not a JIT
+// question — `-Xint` still shows both.
+//
+// The pure, VM-context-free half of `toString` therefore no longer lives in
+// two places: `render_annotation_to_string` (below, `pub`) does the assembly
+// and vm_exec.rs calls it. `vm` depends on `native-builtins`, never the
+// reverse, so that is the only direction available; the extraction and
+// value-rendering halves genuinely cannot be shared, because the two callers
+// hold different VM handles from different crates.
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ctx_class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
@@ -13519,6 +13536,24 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
                 }
             }
             if cname == "java/lang/Class" {
+                // HotSpot's `AnnotationInvocationHandler.memberValueToString`
+                // renders a `Class`-valued member as `getCanonicalName() +
+                // ".class"`, so a member type prints `Outer.Inner.class` — not
+                // the binary `Outer$Inner.class` a blind `$` rewrite yields, and
+                // not `Dollar$Ann.class` turned into `Dollar.Ann.class`. Same
+                // reasoning, same helper, and the same fallbacks as
+                // `ctx_annotation_type_canonical_name` above; see its doc.
+                if let Some(class_id) = ctx.class_id_from_mirror(obj) {
+                    if let Some(slashed) = ctx.class_name_of_id(class_id) {
+                        let canonical = canonical_class_name(ctx, class_id, &slashed);
+                        if !canonical.is_empty() {
+                            return Ok(format!("{}.class", &*canonical));
+                        }
+                        return Ok(format!("{}.class", slashed.replace('/', ".")));
+                    }
+                }
+                // No class id behind the mirror (primitive and synthetic
+                // mirrors among others): fall back to the mirror's name field.
                 if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 1) {
                     if let Some(cls_name) = ctx.read_string(name_ref) {
                         return Ok(format!("{}.class", cls_name.replace('/', ".")));
@@ -13564,7 +13599,118 @@ fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> R
     Ok(s)
 }
 
-/// Mirrors `annotation_proxy_to_string` in vm_exec.rs.
+/// Assemble an `Annotation.toString()` from an ALREADY-canonicalised annotation
+/// type name and its members with their values ALREADY rendered, in class-file
+/// `element_value_pairs` order.
+///
+/// **This is the shared half of a rule that is implemented twice.** The other
+/// implementation is `annotation_proxy_to_string` in `vm/src/vm/vm_exec.rs`
+/// (the interpreter's primary `AnnotationProxy` dispatch hook); this file's
+/// [`ctx_annotation_proxy_to_string`] is the `NativeContext` re-implementation
+/// reached from `native_proxy_dispatch_invoke`. On 2026-08-12 the two disagreed
+/// in a single run — the same annotation rendered `@AnnTwin$Single("v")` from
+/// one and `@AnnTwin$Single(value="v")` from the other — so the assembly step,
+/// which is pure and needs no VM context at all, now lives here and both sides
+/// call it. `vm` depends on `native-builtins` (never the reverse), so this
+/// direction is the only one available.
+///
+/// What is NOT shared, and why: extracting the members, canonicalising the type
+/// name, and rendering each value all need a VM handle, and the two callers hold
+/// different ones (`&SharedVm` vs `&mut dyn NativeContext`) from different
+/// crates. Those steps are still duplicated; keep them in sync deliberately.
+///
+/// Two rules are baked in here:
+///
+/// * **Order is the caller's, and is NOT sorted.** HotSpot's
+///   `AnnotationInvocationHandler` iterates the `LinkedHashMap` that
+///   `AnnotationParser.parseAnnotation2` fills in class-file order, so the
+///   class file's `element_value_pairs` order is what prints.
+/// * **`value=` is elided for a single-member annotation whose sole member is
+///   named `value`** — `@Qualifier("alpha")`, not `@Qualifier(value="alpha")`.
+///   Any multi-member annotation keeps every name, `value` included.
+pub fn render_annotation_to_string(
+    canonical_type_name: &str,
+    members: &[(String, String)],
+) -> String {
+    let mut s = String::with_capacity(32 + canonical_type_name.len());
+    s.push('@');
+    s.push_str(canonical_type_name);
+    s.push('(');
+    let omit_single_value_name = members.len() == 1 && members[0].0 == "value";
+    for (i, (name, rendered)) in members.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        if !omit_single_value_name {
+            s.push_str(name);
+            s.push('=');
+        }
+        s.push_str(rendered);
+    }
+    s.push(')');
+    s
+}
+
+/// The annotation type's CANONICAL name (JLS 6.7) — what HotSpot's
+/// `AnnotationInvocationHandler.toString()` prints. It formats
+/// `annotationType().getCanonicalName()`, not `getName()`, so a member
+/// annotation type renders with `.` where the binary name has `$`. Measured on
+/// Microsoft OpenJDK 25.0.3.9: `@AnnA40.Multi(...)` for the type whose binary
+/// name is `AnnA40$Multi`, and `@AnnA40.Nest.Deep(...)` two levels down.
+///
+/// Resolved through [`canonical_class_name`] — i.e. the annotation type's own
+/// `InnerClasses` attribute (JVMS §4.7.6) — and **not** by rewriting every `$`
+/// in the binary name: `$` is a legal Java identifier character, so a top-level
+/// `@interface Dollar$Ann` has canonical name `Dollar$Ann` and a member type may
+/// legally be named `Inner$Class`. That is the distinction
+/// `native_class_get_canonical_name` / `own_inner_class_entry` already draw, and
+/// which `class_get_canonical_name_preserves_literal_dollar_in_member_name`
+/// pins; going through the same helper also shares its per-`ClassId` cache.
+///
+/// [`canonical_class_name`]'s empty-string sentinel means "no canonical name"
+/// (local/anonymous, JLS 6.7). JLS 9.6 admits only top-level and member
+/// annotation types, so that branch is unreachable for a real annotation type;
+/// it is still handled, falling back to the dotted binary name rather than
+/// rendering a `null` this caller has no form for. Every other miss (no mirror,
+/// no class id) takes the same fallback, which is exactly the string this
+/// function's caller used to produce unconditionally.
+fn ctx_annotation_type_canonical_name(
+    ctx: &mut dyn NativeContext,
+    proxy: ObjectRef,
+    internal: &str,
+) -> String {
+    let dotted_binary = internal.replace('/', ".");
+    // Slot 1 is `ANN_PROXY_TYPE_MIRROR`; `create_annotation_proxy_with_type`
+    // falls back to the admitted `ClassId` precisely so callers may dereference
+    // it without a null check, so a miss means a proxy minted by some other
+    // route and the binary name is the honest answer for it.
+    let mirror = match ctx.get_field(proxy, ANN_PROXY_TYPE_MIRROR) {
+        Value::Object(Some(m)) => m,
+        _ => return dotted_binary,
+    };
+    let class_id = match ctx.class_id_from_mirror(mirror) {
+        Some(id) => id,
+        None => return dotted_binary,
+    };
+    // Pass the class's OWN name, not the descriptor-derived one: the canonical
+    // cache is keyed by `ClassId` and this argument only feeds a cache MISS, so
+    // handing it a name that disagreed with the class would poison the entry
+    // `Class.getCanonicalName()` reads.
+    let slashed = match ctx.class_name_of_id(class_id) {
+        Some(n) => n,
+        None => return dotted_binary,
+    };
+    let canonical = canonical_class_name(ctx, class_id, &slashed);
+    if canonical.is_empty() {
+        dotted_binary
+    } else {
+        (*canonical).to_string()
+    }
+}
+
+/// Mirrors `annotation_proxy_to_string` in `vm/src/vm/vm_exec.rs`. The two must
+/// render identically — see [`render_annotation_to_string`], which is the part
+/// of the rule they share, for why there are two of these at all.
 pub(crate) fn ctx_annotation_proxy_to_string(
     ctx: &mut dyn NativeContext,
     proxy: ObjectRef,
@@ -13581,25 +13727,16 @@ pub(crate) fn ctx_annotation_proxy_to_string(
         } else {
             desc.clone()
         };
-    let dotted = class_name.replace('/', ".");
-    let mut elems = ctx_annotation_proxy_elements(ctx, proxy)?;
-    elems.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut s = String::with_capacity(64);
-    s.push('@');
-    s.push_str(&dotted);
-    s.push('(');
-    let mut first = true;
+    let dotted = ctx_annotation_type_canonical_name(ctx, proxy, &class_name);
+    // NOT sorted: `ctx_annotation_proxy_elements` hands these back in class-file
+    // `element_value_pairs` order, which is the order HotSpot prints.
+    let elems = ctx_annotation_proxy_elements(ctx, proxy)?;
+    let mut members = Vec::with_capacity(elems.len());
     for (name, val) in elems {
-        if !first {
-            s.push_str(", ");
-        }
-        first = false;
-        s.push_str(&name);
-        s.push('=');
-        s.push_str(&ctx_format_annotation_value(ctx, val)?);
+        let rendered = ctx_format_annotation_value(ctx, val)?;
+        members.push((name, rendered));
     }
-    s.push(')');
-    Ok(s)
+    Ok(render_annotation_to_string(&dotted, &members))
 }
 
 /// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a

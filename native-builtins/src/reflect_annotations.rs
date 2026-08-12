@@ -3560,6 +3560,15 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 let flag = Value::Int(if eq { 1 } else { 0 });
                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
             }
+            // `Annotation.toString()` is rendered TWICE in this repository:
+            // here, via `ctx_annotation_proxy_to_string`, and in the
+            // interpreter's primary dispatch hook,
+            // `vm/src/vm/vm_exec.rs::annotation_proxy_to_string`. Which one
+            // answers a given call is not under the caller's control — the
+            // first `toString()` on a fresh proxy can take the vm_exec hook and
+            // every later one this route — so any divergence between them shows
+            // up as ONE run printing TWO different strings for ONE annotation
+            // (measured 2026-08-12). Change neither alone.
             "toString" => {
                 let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler)?;
                 let result = ctx.create_string(&s);
