@@ -22,9 +22,39 @@
 //!
 //! These are text scans, like every gate in `read_alias_coverage.rs`, for the
 //! same reason: the alternative is booting a VM per assertion.
+//!
+//! **A fifth row joined on 2026-08-12** — `SSC_P58_SLOT_MAP`, from
+//! W7-88-net-channels-dead-registration.md. It is a different species from the
+//! four above and the difference is worth stating: the other four are guarded
+//! at RUNTIME by a class-side witness, so their gate is "the witness is still
+//! consulted". This one has no witness and needs none, because the bodies
+//! holding the belief are never dispatched to at all — every triple in
+//! `register_p58_nio_channels` is re-registered later by `native-io`, and the
+//! registrar itself sits behind `#[cfg(feature = "synthetic-jdk")]`. Its gate is
+//! therefore "that is still true", which is the only thing keeping the map from
+//! becoming live code.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Every `.rs` file under `dir`, recursively. Copied from
+/// `read_alias_coverage.rs`, which is the file this one already borrows its
+/// text-scan approach from.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_sources(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -385,14 +415,14 @@ fn the_thread_virtual_slot_read_keeps_its_eetop_witness() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. All four maps reach the sweep
+// 5. All the maps reach the sweep
 // ---------------------------------------------------------------------------
 
-/// Each of the four rows publishes a `SlotMap`, and each publication is wired.
+/// Each of the rows publishes a `SlotMap`, and each publication is wired.
 ///
 /// **Fails** when a map is declared and never handed to `declare_slot_map`,
 /// which would make `verify_declared_slot_maps` sweep nothing and report clean
-/// — `read_alias_coverage.rs`'s gate 6 in miniature, for these four.
+/// — `read_alias_coverage.rs`'s gate 6 in miniature, for these rows.
 #[test]
 fn every_guarded_row_publishes_its_slot_map() {
     let rows = [
@@ -415,6 +445,11 @@ fn every_guarded_row_publishes_its_slot_map() {
             "SYNTHETIC_THREAD_SLOT_MAP",
             "native-builtins/src/jdk25_concurrency.rs",
             "native-builtins/src/jdk25_concurrency.rs",
+        ),
+        (
+            "SSC_P58_SLOT_MAP",
+            "native-builtins/src/phases_late/net_channels.rs",
+            "native-builtins/src/phases_late/net_channels.rs",
         ),
     ];
     for (name, declared_in, wired_in) in rows {
@@ -462,5 +497,113 @@ fn the_published_maps_state_the_belief_not_the_truth() {
         m.contains("(METHOD_LEGACY_SLOT_CLAZZ, \"clazz\")"),
         "METHOD_LEGACY_SLOT_MAP must keep naming slot 0 `clazz`; slot 0 is \
          `override` on a real Method and the disagreement is the finding"
+    );
+
+    let nc = read("native-builtins/src/phases_late/net_channels.rs");
+    assert!(
+        nc.contains("(1, \"bound\")") && nc.contains("(2, \"fd\")"),
+        "SSC_P58_SLOT_MAP must keep naming slot 1 `bound` and slot 2 `fd` — that \
+         IS the belief. On the real `java.nio.channels.ServerSocketChannel` slot 1 \
+         is `closed` (the flag `AbstractInterruptibleChannel.isOpen()` reads) and \
+         slot 2 is `interruptor` (a `sun.nio.ch.Interruptible`, not an int fd). \
+         Editing the map to agree with javap silences the row without changing a \
+         line of the code that holds the belief. \
+         See W7-88-net-channels-dead-registration.md."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. `SSC_P58_SLOT_MAP` — the row with no runtime witness, and why it needs none
+// ---------------------------------------------------------------------------
+
+/// The dead `ServerSocketChannel.socket()` stays deleted, its winner stays
+/// registered, and its registrar stays behind the `synthetic-jdk` gate.
+///
+/// This is the whole guard for row 5. W7-88 deleted a body that wrote seven real
+/// JDK fields — five on a `java.net.ServerSocket` (`impl`, `created`, `bound`,
+/// `closed`, `socketLock`) and one into
+/// `AbstractInterruptibleChannel.interruptedTarget` on the channel — on the
+/// measured ground that nothing could reach it. Three independent facts made
+/// that true, and each is asserted here, because losing any one of them turns
+/// `SSC_P58_SLOT_MAP` from a census row into live heap corruption.
+///
+/// **Fails** when the registration comes back, when `native-io` stops
+/// registering the winner, or when a second caller appears for either link of
+/// the chain that keeps the registrar synthetic-only.
+///
+/// Not a behavioural probe, deliberately: there is no behaviour to assert. The
+/// registrar contributes nothing to `--dump-native-registry` in any runnable
+/// configuration, so a Java-level probe over `socket()` passes identically
+/// before and after the deletion and would be measuring `native-io`.
+#[test]
+fn ssc_p58_socket_stays_deleted_and_the_registrar_stays_gated() {
+    // (a) The deletion holds. Matched on the descriptor AS A RUST STRING
+    //     LITERAL, quotes included: the first spelling of this gate looked for
+    //     the bare descriptor and went red on an unmutated tree, because the
+    //     comment left in place of the deleted body names the triple it
+    //     replaced. A gate that fires on the tree it ships with gets deleted
+    //     rather than investigated, which is `read_alias_coverage.rs`'s own
+    //     recorded near-miss. The descriptor is unique to this triple inside the
+    //     registrar — the DatagramChannel `socket()` next door returns a
+    //     `java.net.DatagramSocket` — so the quoted form has exactly one
+    //     meaning here: a registration.
+    let nc = read("native-builtins/src/phases_late/net_channels.rs");
+    let p58 = fn_body(&nc, "register_p58_nio_channels");
+    assert!(
+        !p58.contains("\"()Ljava/net/ServerSocket;\""),
+        "`register_p58_nio_channels` registers `ServerSocketChannel.socket()` \
+         again. W7-88 deleted it because it wrote `java.net.ServerSocket.closed \
+         := -1` and put the socket in the channel's `interruptedTarget`, which \
+         `AbstractInterruptibleChannel.end(boolean)` reads on every \
+         interruptible operation. If this triple is genuinely needed here, the \
+         map has to be re-derived against `javap -p` first, not restored."
+    );
+
+    // (b) The winner is still there. Deleting the loser is only a no-op while
+    //     something else serves the triple.
+    let sc = read("native-io/src/socket_channel.rs");
+    let real = fn_body(&sc, "register_socket_channel_real");
+    assert!(
+        real.contains(r#"r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);"#),
+        "`native-io`'s `register_socket_channel_real` no longer registers \
+         `ServerSocketChannel.socket()`. That registration is what made W7-88's \
+         deletion a no-op; without it the triple has no owner at all."
+    );
+
+    // (c) The registrar stays reachable from exactly one place, and that place
+    //     stays inside `#[cfg(feature = "synthetic-jdk")] register_synthetic_overrides`.
+    //     Both symbols are `pub(crate)`, so `native-builtins/src` is the whole
+    //     search space. Two occurrences each: the `fn` and the single call.
+    let mut sources = String::new();
+    for file in rust_sources(&workspace_root().join("native-builtins").join("src")) {
+        sources.push_str(&fs::read_to_string(&file).unwrap_or_default());
+    }
+    for symbol in ["register_p58_nio_channels(", "register_phase58_natives("] {
+        let n = sources.matches(symbol).count();
+        assert_eq!(
+            n, 2,
+            "`{symbol}` occurs {n} times in native-builtins/src; expected exactly \
+             2 (its `fn` and its one call site). A second caller is the escape \
+             that makes SSC_P58_SLOT_MAP's beliefs live — re-derive the whole \
+             chain before changing this number. A prose mention spelled with a \
+             trailing `(` also trips this; reword the comment rather than \
+             loosening the gate."
+        );
+    }
+
+    let lib = read("native-builtins/src/lib.rs");
+    assert!(
+        lib.contains(
+            "#[cfg(feature = \"synthetic-jdk\")]\npub fn register_synthetic_overrides("
+        ),
+        "`register_synthetic_overrides` is no longer immediately preceded by \
+         `#[cfg(feature = \"synthetic-jdk\")]`. That attribute is why phase 58 is \
+         absent from every default-build census."
+    );
+    assert!(
+        fn_body(&lib, "register_synthetic_overrides").contains("register_phase58_natives(registry);"),
+        "phase 58 is no longer called from `register_synthetic_overrides`. It may \
+         have moved somewhere the real-JDK boot path reaches, which is exactly \
+         the escape this gate exists for."
     );
 }
