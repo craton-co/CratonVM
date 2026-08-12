@@ -19258,11 +19258,27 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
     // `AsynchronousFileChannel.truncate(long)` carries the same clause as its
     // synchronous twin: "@throws IllegalArgumentException If the new size is
-    // negative". Note where this check has to sit — AFTER the closed and
-    // not-writable refusals above, because the JDK checks those first and a
-    // caller distinguishing the three by type would otherwise see the wrong
-    // one. `(*v).max(0)` truncated the file to EMPTY for a negative size and
-    // returned the channel as though that had been the request.
+    // negative". `(*v).max(0)` truncated the file to EMPTY for a negative size
+    // and returned the channel as though that had been the request.
+    //
+    // ORDER, corrected 2026-08-12 against the JDK source rather than a guess.
+    // The comment here used to claim the JDK checks closed and not-writable
+    // FIRST. It does not: `SimpleAsynchronousFileChannelImpl.truncate` is
+    //
+    //     if (size < 0L) throw new IllegalArgumentException("Negative size");
+    //     if (!writing)  throw new NonWritableChannelException();
+    //     ... begin();   // -> ClosedChannelException
+    //
+    // i.e. negative, then not-writable, then closed — the exact reverse of the
+    // order below. This is left as it stands rather than reordered, and the
+    // reason is a real limitation, not taste: `writing` is a static property of
+    // the open options on the JDK side, whereas `afc_file_writable` here reads
+    // the live handle, which `native_afc_close` has already removed from
+    // `afc_files()`. Reordering would therefore answer
+    // NonWritableChannelException for a CLOSED read-write channel, which is
+    // worse than the one case the current order gets wrong (a negative size on
+    // an already-closed channel: ClosedChannelException here, IAE on HotSpot).
+    // Making both right needs the open options carried on the channel.
     let new_len = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,

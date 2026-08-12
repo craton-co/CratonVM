@@ -1533,10 +1533,20 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             Value::Int(v) if v > 0 => v as u32,
             _ => return Ok(None),
         };
-        cratonvm_native_io::afc_sync_at(handle_id, metadata).map_err(|e| {
-            RuntimeError::IOException {
-                message: format!("AsynchronousFileChannel.force: {e}"),
-            }
+        // STW-TAKEOVER guard, same as the `afc_truncate_at` call site in
+        // `native_afc_truncate`: `afc_sync_at` parks on a real `Mutex::lock()`
+        // and then issues `fsync`/`FlushFileBuffers`, which on a dirty file is
+        // genuinely unbounded disk I/O. Without the bracket a concurrent STW
+        // pause counts this thread as an ordinary cooperating mutator and waits
+        // for a safepoint it cannot reach while parked -- the hang shape H2's
+        // `TestFileSystem.testConcurrent` on the `async:` filesystem already
+        // produced once for the read path. `this` is not touched after the
+        // call, so the ref-resyncing form is not needed.
+        ctx.begin_blocking_region();
+        let sync_result = cratonvm_native_io::afc_sync_at(handle_id, metadata);
+        ctx.end_blocking_region();
+        sync_result.map_err(|e| RuntimeError::IOException {
+            message: format!("AsynchronousFileChannel.force: {e}"),
         })?;
         Ok(None)
     });

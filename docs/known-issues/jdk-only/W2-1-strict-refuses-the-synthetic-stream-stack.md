@@ -1,5 +1,111 @@
 # `--jdk-only` refuses `cratonvm/stream/LazyOp`, and the stream stack is SPLIT
 
+> # A34 2026-08-12 — THE WARRANT BELOW IS FALSE AND THE CONCLUSION IT SUPPORTS
+> # IS TRUE. Read this before the paragraph headed "The 13 `cratonvm/internal/*`
+> # boot refusals in every strict run are that mechanism working".
+>
+> That paragraph cites `ensure_bootstrap_compat_class`
+> (`vm/src/vm/vm_init.rs`) as authority and quotes it: *"these stand-ins exist
+> for the synthetic collection shims, which strict mode does not register."*
+> **That sentence was wrong when it was quoted, and quoting it is how this
+> family went unrevisited for weeks.** It was true of twelve of the thirteen
+> and false of `cratonvm/internal/UnmodifiableMap`, which
+> `lang_system::wrap_system_env_map` allocated and which ships in the
+> ESSENTIAL registration set — so it survived strict mode, ran, asked for a
+> fabricated receiver, and killed `System.getenv()` and every Spring
+> `AbstractEnvironment.<init>` through it with
+> `NoClassDefFoundError: cratonvm/internal/UnmodifiableMap`.
+>
+> The record's *conclusion* — that the 13 boot refusals are the mechanism
+> working rather than the failure — survives, because twelve of them were
+> genuinely unreachable and the thirteenth was a caller defect rather than a
+> refusal defect. **The record's warrant does not.** The distinction is the
+> point: a conclusion that happens to be right, resting on a premise that is
+> wrong, reads as verified and is not.
+>
+> The corrected warrant is now IN THE SOURCE and should be cited instead of
+> the old sentence. `ensure_bootstrap_compat_class`'s doc comment carries a
+> section headed *"The premise this doc used to carry, and why it was false"*
+> (`vm/src/vm/vm_init.rs`, anchor on that heading, not a line number) which
+> states the counter-example in place and ends with the rule worth taking
+> away: **before adding a name to that block, find who allocates it and what
+> `NativeKind` that allocator's registration carries** — the mode flag is not
+> the answer and the `cratonvm/` prefix is not the answer.
+>
+> ## What changed in the tree, and what a run can and cannot show
+>
+> Two source changes landed together in `67146db71` (*jdk-only: wave 2 — nine
+> blocking families, measured, with fixes*, 2026-08-12 17:49), both verified
+> by reading the current tree:
+>
+> 1. **The boot block no longer asks under strict.**
+>    `ensure_bootstrap_compat_class` now opens with
+>    `if class_manager.compatibility_mode().is_jdk_only() { return None; }`,
+>    before `try_ensure_synthetic_class`. Its own doc records the measurement
+>    that motivated it — **13 of the 19 `compatibility-class-requested` rows in
+>    an entire application census came from that one function** — and argues
+>    the skip is execution-identical to the absorb-and-warn it replaces (same
+>    `None`, same skipped wiring, same absent class), so the census gets 13
+>    rows back and nothing diagnostic is lost.
+>    **The 13 boot rows in this record's tables are therefore historical.**
+> 2. **`wrap_system_env_map` no longer needs the stand-in.**
+>    `native-builtins/src/lang_system.rs` now tries the real
+>    `java.util.Collections.unmodifiableMap(Map)` first — it already holds a
+>    real `java/util/HashMap`, so there is nothing to fabricate — then the
+>    stand-in, then degrades to the raw (mutable, and logged as such) backing
+>    map rather than throwing. Under `--jdk-only` the real `java.base`
+>    bytecode runs and the answer is a genuine
+>    `java.util.Collections$UnmodifiableMap`, which is HotSpot's own.
+>
+> **Neither is observable on any binary available to this lane, and that is a
+> provenance fact rather than a negative result.** Both
+> `scratchpad/bin/cratonvm-merged-dev.exe` (15:27) and
+> `C:/craton/synjdk-target/release/cratonvm.exe` (17:57, a `--features
+> synthetic-jdk` build) predate `67146db71` in content — measured, not assumed:
+> on **both**, a `--jdk-only` run of a do-nothing main class still prints
+> exactly **13** *"refusing to fabricate this bootstrap compatibility class"*
+> WARNs, and on both `System.getenv()` still dies with
+> `NoClassDefFoundError: cratonvm/internal/UnmodifiableMap` while
+> `System.getenv("PATH")` answers fine. Do not read those runs as the fixes
+> failing; read them as the fixes being unbuilt.
+>
+> **The falsifier is already a SCHEDULED vector, which is unusual for this
+> directory and should be used instead of a hand probe.**
+> `regression-suite/src/RJdkEnvMap.java` was written for exactly this — its own
+> header says *"the no-arg `System.getenv()` Map"* — and it is listed in
+> `run.sh`'s `JDKONLY_CLASSES`, so every `SUITE=` value runs it. On the pre-fix
+> merged-dev binary it is **RED under `--jdk-only`**, dying at
+> `theWrapperIsNotAFabricatedClass` (`RJdkEnvMap.java:92`, the
+> `Map<String,String> env = System.getenv();` line) while passing on HotSpot
+> with 34 checks. So the rebuild check is not a hand-written probe at all:
+> **`RJdkEnvMap` must go green under `--jdk-only`, and the 13 boot WARNs must
+> become 0.** If `RJdkEnvMap` goes green while the 13 WARNs remain, only
+> `wrap_system_env_map` was built and the boot-block skip was not; if the WARNs
+> go to 0 while `RJdkEnvMap` stays red, the reverse. The two fixes are
+> separable and the pair of observations tells them apart.
+>
+> ## What a run DID settle, in this record's favour
+>
+> This record's own *"Verification (updated)"* requires that the strict
+> fallbacks keep the gap on the census rather than taking it off — *"the
+> `--jdk-only` runs must still emit `CompatibilityClassRequested` violations
+> naming `java/util/HashMap$KeyItr`, `java/util/LinkedList$Itr` and
+> `java/util/ArrayDeque$Itr`"*. Measured on the merged-dev binary with
+> `--jdk-only --explain-jdk-only --jdk-only-report`: a workload that iterates a
+> `LinkedList` produces a `compatibility-class-requested` row for
+> `java/util/LinkedList$Itr` **while the iteration itself succeeds** and prints
+> HotSpot's content. The fallback and the census row coexist, which is exactly
+> the design this record argued for against the `VmInternal` door.
+>
+> **Residual 1 is CLOSED, measured.** The paragraph below saying
+> `linkedList.listIterator()` *"still refuses under `--jdk-only`, deliberately"*
+> is stale twice over — the status block already corrects it in source, and it
+> is now correct in a run: under `--jdk-only`, `listIterator()` walks `abc`,
+> `subList(0,2)` is `[a, b]`, and `arrayList.equals(linkedList)` answers
+> **`true`** where the laundered `false` used to be. See
+> W7-16-arraydeque-and-linkedlist-residuals.md's A34 banner for the three-arm
+> tables; all three of its defects are now closed by measurement.
+
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
 * **Headline: CLOSED.** The `LazyOp` strict guard landed 2026-08-07 (commit
@@ -74,6 +180,20 @@ The inventory below is the more durable half of this record.
 > WARN's "the natives bound to it are unreachable" as the claim it is — about
 > registration — and it is the intended end state for this family, not a
 > symptom. Nothing downstream of those 13 lines failed in any probe.
+>
+> > **STALE WARRANT — corrected 2026-08-12 (A34), see the banner at the top of
+> > this file.** The conclusion of this paragraph stands; the sentence it
+> > quotes as authority is FALSE, and the quote no longer exists in the source
+> > it cites. It was true of twelve of the thirteen and false of
+> > `cratonvm/internal/UnmodifiableMap`, whose allocator
+> > (`lang_system::wrap_system_env_map`) ships in the ESSENTIAL set and so DID
+> > survive strict mode — killing `System.getenv()` and every Spring
+> > `AbstractEnvironment.<init>` until 2026-08-12. "Nothing downstream of those
+> > 13 lines failed in any probe" was true of the probes that were run and not
+> > of the corpus; the probe set had no `System.getenv()` row. Both halves are
+> > fixed in source (`67146db71`) and neither is built. Cite
+> > `ensure_bootstrap_compat_class`'s section *"The premise this doc used to
+> > carry, and why it was false"*, never the old sentence.
 >
 > **What WAS still costing runs is three iterator entry points**, and they are
 > invisible to a `cratonvm/*` grep because the fabricated names are
