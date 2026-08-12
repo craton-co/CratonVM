@@ -4129,7 +4129,35 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
 ///
 /// Deliberately a pure field read: dispatching `getUseParentHandlers()` would
 /// re-enter real bytecode that dereferences the same unmaterialized `config`.
+///
+/// FIRST CHOICE is `lib.rs`'s `jul_logger_use_parent_handlers_table`, which is
+/// where `Logger.setUseParentHandlers(Z)V` records the flag. That write and
+/// this read used to be in different modules and never met: the setter stored
+/// into the side table, this walked `config.useParentHandlers`, and `config` is
+/// null on every logger this bridge mints — so the `false` was accepted, read
+/// back correctly by `getUseParentHandlers()`, and then ignored by the only
+/// consumer that matters. An accessor agreeing with itself is not evidence the
+/// consumer agrees with it. Measured in `Compatible` before this change:
+/// `setUseParentHandlers(false)` then `info(...)` still reached the parent's
+/// Handler (`[INFO:not-up-to-parent]`), where HotSpot delivers nothing; under
+/// `--jdk-only` no native holds either triple, real bytecode runs, and the walk
+/// already stopped. So this closes a `Compatible`-only divergence and leaves
+/// strict mode byte-identical. See
+/// docs/known-issues/jdk-only/W7-35-jul-supplier-and-payload-residuals.md.
+///
+/// An ABSENT entry is not `false`: it means nothing ever called the setter, so
+/// fall through to the `config` read and its JDK default (`true`) rather than
+/// letting a logger nobody configured silence its ancestors' handlers.
 fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(flag) = crate::jul_logger_use_parent_handlers_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return flag;
+    }
     match ctx.get_field_by_name(logger, "config") {
         Value::Object(Some(config)) => !matches!(
             ctx.get_field_by_name(config, "useParentHandlers"),
@@ -4313,6 +4341,51 @@ fn publish_to_jul_handlers_src(
 /// Returns `true` when at least one handler accepted the record, so callers
 /// can keep the console-sink fallback for loggers that have no handler chain
 /// at all instead of silently dropping the line.
+/// The `(sourceClassName, sourceMethodName)` pair a `LogRecord` published from
+/// this bridge should carry, in DOTTED form, or `None` when the stack offers no
+/// caller (bootstrap, or a log driven entirely from native code).
+///
+/// This is `LogRecord$CallerFinder`'s job, ADAPTED rather than transcribed, and
+/// the difference is the whole reason it works. Real `CallerFinder` starts with
+/// `lookingForLogger = true` and returns nothing until it has SEEN a
+/// `java.util.logging.Logger` frame — correct on HotSpot, where the record is
+/// built by `Logger.doLog` with those frames live on the stack. In `Compatible`
+/// this native IS the `Logger` frame and no Java frame is pushed for it, so a
+/// literal transcription would look for a marker that is never present and
+/// return `None` every time — a helper that cannot fire, which is how this
+/// campaign's vacuous fixes have looked. Measured: the whole `Logger.log`/
+/// `doLog`/`warning` run is absent from a `Compatible` capture taken inside a
+/// Handler (`[RJdkLogging$Cap.publish, RJdkLogging.main]` against HotSpot's
+/// `[…publish, Logger.log, Logger.doLog, Logger.log, Logger.warning, main]`).
+///
+/// So: take the INNERMOST Java frame, skipping any `Logger` frames that do
+/// happen to be present. The skip is not dead code — real `Logger` bytecode can
+/// still be on the stack on the mixed paths (`Logger.log(LogRecord)` reaching a
+/// native handler, a convenience overload that resolved to bytecode), and
+/// without it the record would name `java.util.logging.Logger` as its own
+/// caller. The two class names are exactly the two `isLoggerImplFrame` admits;
+/// deliberately not widened, because a name this predicate wrongly skips
+/// silently attributes the record to its caller's caller.
+///
+/// `StackTraceEntry::class_name` is INTERNAL (slash) form — the same form
+/// `lang_class`'s reflection-frame filter matches on — while
+/// `sourceClassName` is read back by Java as a normal dotted class name, so the
+/// winner is converted on the way out.
+fn infer_jul_caller_source(ctx: &mut dyn NativeContext) -> Option<(String, String)> {
+    // Outermost-first: `frames[0]` is `main`, the last entry is the innermost
+    // Java frame. Documented on `capture_stack_trace` and relied on the same
+    // way by `locale_resources::caller_bundle_class_loader`.
+    let frames = ctx.capture_stack_trace(0);
+    frames
+        .iter()
+        .rev()
+        .find(|f| {
+            &*f.class_name != "java/util/logging/Logger"
+                && !f.class_name.starts_with("sun/util/logging/PlatformLogger")
+        })
+        .map(|f| (f.class_name.replace('/', "."), f.method_name.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_to_jul_handlers_full(
     ctx: &mut dyn NativeContext,
@@ -4421,6 +4494,33 @@ fn publish_to_jul_handlers_full(
             let src = ctx.read_native_pin(pin, obj);
             ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
         }
+        // No caller-supplied pair (only `logp` has one): infer it, the way real
+        // `LogRecord.getSourceClassName()` does on first read. `SimpleFormatter`'s
+        // DEFAULT pattern renders this pair as `%2$s` and falls back to the
+        // logger NAME when it is null, so without this every JUL line CratonVM
+        // formats reads `<logger.name>` where HotSpot reads `Class method` —
+        // measured, `Compatible`: `psrc.y` vs `PSrc main`.
+        //
+        // Only reached once a handler chain exists (see the early return
+        // above), so a handler-less logger on the console-fallback path — the
+        // pre-`readConfiguration` Tomcat/Spring Boot state — still pays no
+        // stack capture at all. That bound matters: HotSpot's cost is deferred
+        // to whoever calls `getSourceClassName()`, and this is the nearest
+        // equivalent placement we can reach from a native.
+        if src_cls_pin.is_none() && src_mth_pin.is_none() {
+            if let Some((cls, mth)) = infer_jul_caller_source(ctx) {
+                let cls_obj = ctx.create_string(&cls);
+                let cls_pin = ctx.pin_native_root(cls_obj);
+                let mth_obj = ctx.create_string(&mth);
+                // Both `create_string`s allocate; re-derive the record and the
+                // first string before either is written.
+                let cls_obj = ctx.read_native_pin(cls_pin, cls_obj);
+                let record = ctx.read_native_pin(record_pin, record);
+                ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
+                ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+            }
+        }
+        let record = ctx.read_native_pin(record_pin, record);
         // `getParameters()` / `getThrown()` are as much a part of the record's
         // public surface as the message is: HotSpot's `log(Level, String,
         // Object)` / `log(Level, String, Object[])` / `log(Level, String,

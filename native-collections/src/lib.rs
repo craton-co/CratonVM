@@ -4817,6 +4817,29 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
+    // not addable. `Map.values`: "The collection supports element removal ... It
+    // does not support the `add` or `addAll` operations"; the JDK's
+    // `HashMap$Values extends AbstractCollection`, whose `add` is a bare
+    // `throw new UnsupportedOperationException()`.
+    //
+    // `values.addUnsupported` measured `m.values().add(99)` returning `true`
+    // here, leaving a value in the snapshot that no key in `m` maps to.
+    //
+    // The marker is the same one `native_al_remove_obj` / `native_al_clear` /
+    // the iterator's `remove()` already consult to write removals through, so
+    // this adds no new notion of "is a view" — it answers the question those
+    // three already ask. A plain `ArrayList` cannot match it: the trailing
+    // capacity slot of a normal list is null, and this test requires both a
+    // non-null trailing slot AND `length > size`.
+    if values_view_source(ctx, this).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     // GC-SAFETY: `al_ensure_capacity` allocates (and can GC) internally on a
@@ -5882,6 +5905,122 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
     ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
     ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    // Explicit, not left to whatever `alloc_object` zero-initialises a slot of
+    // an undeclared shape to: W7-1's `lastRet` was exactly this hazard, an
+    // int-zero read as a meaningful value. `this` is a real `ArrayList` here,
+    // so there is no enclosing view to propagate to.
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// The enclosing view of a nested `subList`, or `None` for a view carved
+/// directly out of an `ArrayList`. Guards on the field count so a view built by
+/// some other path with the older four-field shape simply reports "no enclosing
+/// view" (it degrades to the pre-existing behaviour) rather than reading past
+/// the object.
+fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) <= ASL_FIELD_VIEW_PARENT {
+        return None;
+    }
+    match ctx.get_field(this, ASL_FIELD_VIEW_PARENT) {
+        Value::Object(Some(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// `subList` ON a sublist — a real nested view, not a view of a snapshot.
+///
+/// This was registered as `asl_delegate_snapshot`, which materialised the
+/// slice into a fresh `ArrayList` and returned a view of THAT. Reads were
+/// right; every write went into the throwaway. Measured:
+///
+/// ```text
+/// subList.nestedClearWritesThroughToBase  HotSpot [a, B, e]  CratonVM [a, B, c, d, e]
+/// subList.afterNestedClear                HotSpot [B]        CratonVM [B, c, d]
+/// ```
+///
+/// The composition is on the ROOT: the nested view points at the same backing
+/// `ArrayList` with `offset = enclosing.offset + fromIndex`, so it needs no
+/// interval arithmetic at read time and every existing `asl_*` native works on
+/// it unchanged. The enclosing view is recorded separately, in
+/// [`ASL_FIELD_VIEW_PARENT`], only so a structural mutation can walk back up.
+///
+/// Range check is against the ENCLOSING VIEW's size, not the root's, and uses
+/// `AbstractList.subListRangeCheck`'s wording — the same three arms as
+/// `native_al_sub_list`, and note the `fromIndex > toIndex` case is an
+/// `IllegalArgumentException` rather than a bounds exception at all.
+fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let to_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (parent, _, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    if from_i32 < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("fromIndex = {from_i32}")).into(),
+        );
+    }
+    if to_i32 > size {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("toIndex = {to_i32}")).into(),
+        );
+    }
+    if from_i32 > size || to_i32 < 0 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "fromIndex = {from_i32}, toIndex = {to_i32}"
+        ))
+        .into());
+    }
+    if from_i32 > to_i32 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("fromIndex({from_i32}) > toIndex({to_i32})"),
+            }
+            .into(),
+        );
+    }
+    // GC-SAFETY: the allocation below can move `this` and the root list, and
+    // both are STORED in the new view's fields. Re-read the whole enclosing
+    // state through the pin afterwards rather than reusing the pre-allocation
+    // copies — a from-space `parent` recorded here would be what every later
+    // read of the nested view indexes into.
+    let this_pin = ctx.pin_native_root(this);
+    let view = match try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (parent, offset, _, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(parent)));
+    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
+    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
+    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(expected));
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
 }
 
@@ -5909,7 +6048,23 @@ const ASL_FIELD_PARENT: usize = 0;
 const ASL_FIELD_OFFSET: usize = 1;
 const ASL_FIELD_SIZE: usize = 2;
 const ASL_FIELD_EXPECTED: usize = 3;
-const ASL_NUM_FIELDS: usize = 4;
+/// The view this view was carved out of — `null` when `subList` was called on a
+/// real `ArrayList`, and the enclosing `ArrayListSubList` when it was called on
+/// another view.
+///
+/// [`ASL_FIELD_PARENT`] deliberately stays the ROOT list with an ABSOLUTE
+/// offset, so every existing `asl_*` native keeps working on a nested view
+/// without being edited. This field exists for the one thing that cannot be
+/// derived from the root: a structural mutation through a nested view has to
+/// adjust the ENCLOSING views' `size`/`expected` too, or they immediately read
+/// as comodified. The JDK does the same walk, up its own `SubList.parent`
+/// chain, in `updateSizeAndModCount`.
+///
+/// It is an object field and therefore GC-scanned, unlike a side table — the
+/// same reason `TmViewSpec`'s three references had to be wired into all four
+/// overlay GC hooks and this one does not.
+const ASL_FIELD_VIEW_PARENT: usize = 4;
+const ASL_NUM_FIELDS: usize = 5;
 
 /// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
 fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
@@ -6059,9 +6214,9 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/ListIterator;",
         |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;"),
     );
-    r.register(c, "subList", "(II)Ljava/util/List;", |ctx, args| {
-        asl_delegate_snapshot(ctx, args, "subList", "(II)Ljava/util/List;")
-    });
+    // NOT `asl_delegate_snapshot`: a view of a snapshot reads correctly and
+    // writes nowhere. See `native_asl_sub_list`.
+    r.register(c, "subList", "(II)Ljava/util/List;", native_asl_sub_list);
     r.register(
         c,
         "spliterator",
@@ -6099,6 +6254,17 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
             asl_delegate_mutating(ctx, args, "removeIf", "(Ljava/util/function/Predicate;)Z")
         },
     );
+    // `List.sort` is a MUTATOR of the view's range, and `subList.sortWritesThrough`
+    // measured `base.subList(1,4).sort(naturalOrder())` leaving `base` at
+    // `[9, 5, 1, 7, 3]` where HotSpot has `[9, 1, 5, 7, 3]`. It had no
+    // registration here at all, so the call reached an interface-level native
+    // that read the ASL receiver through the `ArrayList` layout — the sorted
+    // result landed nowhere. `asl_delegate_mutating` is exactly right for it:
+    // the snapshot's real `sort` reorders in place, the element count does not
+    // change, and the slice is written back over `[offset, offset+size)`.
+    r.register(c, "sort", "(Ljava/util/Comparator;)V", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "sort", "(Ljava/util/Comparator;)V")
+    });
     r.set_category(__prev_cat);
 }
 
@@ -6369,6 +6535,31 @@ fn asl_delegate_mutating(
     al_set_size(ctx, parent, w as i32);
     ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
     ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    // Ripple the element-count change up the enclosing views, the way the JDK's
+    // `SubList.updateSizeAndModCount` walks its own `parent` chain. Without
+    // this, `sub.subList(1,3).clear()` leaves `sub` holding the pre-mutation
+    // `expected`, so the very next read of `sub` raises
+    // `ConcurrentModificationException` — where HotSpot answers `[B]`
+    // (`subList.afterNestedClear`). Only ANCESTORS are updated: a SIBLING view
+    // over the same parent is genuinely comodified and must keep failing, which
+    // is what its now-stale `expected` does.
+    //
+    // No allocation in this loop, so the refs stay valid without pinning. The
+    // hop cap is the same defensive bound `implements_comparable` uses: a cycle
+    // is impossible by construction (a view's enclosing view is always older
+    // than it), and a cap costs nothing to be sure.
+    let delta = new_size - size;
+    let mut cursor = asl_view_parent(ctx, this);
+    for _ in 0..64 {
+        let Some(v) = cursor else { break };
+        let vs = match ctx.get_field(v, ASL_FIELD_SIZE) {
+            Value::Int(s) => s,
+            _ => break,
+        };
+        ctx.set_field(v, ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
+        ctx.set_field(v, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+        cursor = asl_view_parent(ctx, v);
+    }
     ctx.unpin_native_roots(pin);
     Ok(ret)
 }
@@ -10852,15 +11043,57 @@ fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // hashCode/equals (arbitrary, GC-capable bytecode), and the DEFAULT value
     // sat raw in `args` across it — the common absent-key branch then
     // returned a pre-move address. Pin the default across the lookup.
+    //
+    // `this` and `key` are pinned for the same reason, added with the
+    // `containsKey` re-ask below: that second lookup needs BOTH of them AFTER
+    // the first one has run arbitrary bytecode, and re-reading them out of
+    // `args` would hand the disambiguating question a pre-move receiver — the
+    // very defect this comment block was written about, one call later.
+    let this0 = args.first().copied().unwrap_or(Value::Object(None));
+    let key0 = args.get(1).copied().unwrap_or(Value::Object(None));
     let default0 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let this_pin = pin_value(ctx, this0);
+    let key_pin = pin_value(ctx, key0);
     let default_pin = pin_value(ctx, default0);
+    let pin_base = [this_pin, key_pin, default_pin]
+        .into_iter()
+        .find(|p| *p != usize::MAX);
     let result = native_map_get(ctx, args);
+    let this_now = read_pinned_elem(ctx, this_pin, this0);
+    let key_now = read_pinned_elem(ctx, key_pin, key0);
     let default_now = read_pinned_elem(ctx, default_pin, default0);
-    if default_pin != usize::MAX {
-        ctx.unpin_native_roots(default_pin);
+    if let Some(base) = pin_base {
+        ctx.unpin_native_roots(base);
     }
     match result? {
-        Some(Value::Object(None)) => Ok(Some(default_now)),
+        // A null answer from `get` is ambiguous in exactly the way
+        // `Map.getOrDefault` is specified to resolve: "the value to which the
+        // specified key is mapped, or `defaultValue` if this map contains **no
+        // mapping** for the key". A key present with a null value has a
+        // mapping, so it answers `null` — not the default.
+        //
+        // `HashMap.getOrDefaultOverNullValue` measured `DEFAULT` here against
+        // HotSpot's `null`, after `nm.put("k", null)`. `HashMap.getOrDefault`
+        // reads the NODE (`(e = getNode(key)) == null ? defaultValue : e.value`)
+        // and so never has to ask twice; this path only has the value, so it
+        // asks the second question the `Map` interface's own default
+        // implementation asks — `(((v = get(key)) != null) || containsKey(key))`.
+        //
+        // The extra `containsKey` costs one more lookup on a MISS, which is the
+        // common case for this method. That is the price of the distinction and
+        // the interface default pays it too; the alternative is answering
+        // "absent" for a mapping that exists, which no caller can detect.
+        Some(Value::Object(None)) => {
+            let present = matches!(
+                native_map_contains_key(ctx, &[this_now, key_now])?,
+                Some(Value::Int(1))
+            );
+            if present {
+                Ok(Some(Value::Object(None)))
+            } else {
+                Ok(Some(default_now))
+            }
+        }
         other => Ok(other),
     }
 }
@@ -12093,6 +12326,27 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
     None
 }
 
+/// Write a removal back to whatever a [`ts_view_source`] marker names.
+///
+/// Two kinds of source reach that marker now. A `TreeMap` keySet view names a
+/// MAP, whose removal is `remove(Object)Object`; a `descendingSet` view names
+/// another `TreeSet`, whose removal is `remove(Object)Z`. Dispatching by
+/// descriptor is not optional — `source_map_remove`'s
+/// `(Ljava/lang/Object;)Ljava/lang/Object;` does not exist on `TreeSet` at all,
+/// so calling it on a set source raises `NoSuchMethodError` rather than
+/// removing anything.
+fn ts_source_remove(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    elem: Value,
+) -> Result<(), MethodCallFailed> {
+    if is_tree_map_receiver(ctx, source) {
+        return source_map_remove(ctx, source, elem);
+    }
+    ctx.invoke_virtual(source, "remove", "(Ljava/lang/Object;)Z", &[elem])?;
+    Ok(())
+}
+
 /// Get the backing HashMap from a HashSet.
 fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
@@ -12856,6 +13110,34 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // A keySet()/entrySet() view is not addable. `Map.keySet`: "The set supports
+    // element removal ... It does not support the `add` or `addAll`
+    // operations"; the JDK's `HashMap$KeySet extends AbstractSet`, and
+    // `AbstractCollection.add` is a bare `throw new
+    // UnsupportedOperationException()`.
+    //
+    // `keySet.addUnsupported` measured `m.keySet().add("nope")` returning
+    // normally here. That is worse than it looks: the key landed in the VIEW's
+    // backing and not in `m`, so the caller was left holding a "view" that
+    // disagrees with the map it is a view of — the same silent-divergence shape
+    // the write-through rows are about, arrived at from the other side.
+    //
+    // The predicate is the view marker itself, not a class-name test: an
+    // ordinary `HashSet`'s backing is a real `java/util/HashMap` with fewer
+    // than `VIEW_BACKING_FIELDS` slots, so `view_backing_source` answers `None`
+    // for it by construction. Construction of the view is unaffected —
+    // `make_view_set_of` populates the backing through `native_map_put` and
+    // never comes through here.
+    if view_backing_source(ctx, backing).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                // HotSpot's is message-less; `thrownDetail` prints a message
+                // when there is one.
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // put(element, PRESENT) — the previous value being null is how this
     // reports "the element was not already in the set". See `present_marker`
     // for why the marker must be a reference.
@@ -15428,6 +15710,36 @@ fn native_collections_unmodifiable_list(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `Collections.unmodifiableList` is idempotent by identity:
+    //
+    // ```java
+    // if (list.getClass() == UnmodifiableList.class ||
+    //     list.getClass() == UnmodifiableRandomAccessList.class)
+    //     return (List<T>) list;
+    // ```
+    //
+    // `unmodifiableList.rewrapIsNewObject` measured
+    // `Collections.unmodifiableList(un) == un` as `false` here against HotSpot's
+    // `true`. A second wrapper is not merely wasteful — it is a different
+    // object, so a caller that re-wraps defensively and then compares by
+    // identity (or uses the result as a map key) sees two distinct lists where
+    // the JDK has one, and every extra layer costs another delegation hop on
+    // every read.
+    //
+    // The test is exact class identity, as the JDK's is, and NOT
+    // [`unmod_is_immutable`]: a `List.of(...)` shares this wrapper class here
+    // but reports `ImmutableCollections$ListN` from `getClass()`, and the JDK
+    // does wrap that one — its two `==` comparands are the `Collections$Unmodifiable*`
+    // classes only. So the immutable marker has to exclude, not include.
+    if ctx.object_num_fields(src) > UNMOD_FIELD_IMMUTABLE
+        && ctx
+            .class_name_of_id(ctx.class_id_of_object(src))
+            .as_deref()
+            == Some(UNMOD_LIST_CLASS)
+        && !matches!(ctx.get_field(src, UNMOD_FIELD_IMMUTABLE), Value::Int(1))
+    {
+        return Ok(Some(Value::Object(Some(src))));
+    }
     let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src)?;
     Ok(Some(Value::Object(Some(w))))
 }
@@ -16621,6 +16933,26 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // `HashMap.merge` opens with
+    // `if (value == null || remappingFunction == null) throw new NullPointerException();`
+    // — `Map.merge`: "@throws NullPointerException if ... the value or
+    // remappingFunction is null". `Map.mergeNullValueThrows` measured
+    // `m.merge("g", null, Integer::sum)` returning normally here.
+    //
+    // The refusal is not decoration. A null value means "remove the mapping" to
+    // the rest of this function (see the `new_val == null` branch below, which
+    // is the correct handling of a null RESULT), so a caller that reached
+    // `merge` with a null argument silently got a delete where it asked for an
+    // insert — and on an absent key, a silent no-op.
+    //
+    // The refusal is on an explicitly-passed null, not on a missing argument:
+    // `args.get(3)` returning `None` is a malformed call, and turning that into
+    // an NPE would report a dispatch defect as a program error.
+    if matches!(value, Value::Object(None))
+        || matches!(args.get(3), Some(Value::Object(None)))
+    {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
     let bi_function = match args.get(3) {
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
@@ -33582,6 +33914,50 @@ const AD_FIELD_SIZE: usize = 3; // Int element count
 /// slot is not an optimisation but the JDK's own emptiness invariant.
 const AD_DEFAULT_CAPACITY: usize = 16;
 
+/// `ArrayDeque.addFirst`/`addLast` open with `if (e == null) throw new
+/// NullPointerException();`, and that refusal is load-bearing rather than
+/// defensive: a null in the ring buffer is how real `ArrayDeque` bytecode
+/// *encodes* "another thread mutated me while I was iterating".
+/// `nonNullElementAt` turns any null it reads into a
+/// `ConcurrentModificationException`, so accepting one here does not just lose
+/// three `no-throw` observables — it arms the JDK's own iterator to kill a
+/// caller that never touched null.
+///
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// `dq.add(null)` returned `true`, `dq.size()` answered 3 where HotSpot said 0,
+/// the deque printed `[a, null, null, null, x, y, x, z]`, and then
+///
+/// ```text
+/// java.util.ConcurrentModificationException
+///     at java.util.ArrayDeque.nonNullElementAt(ArrayDeque.java:268)
+///     at java.util.ArrayDeque$DescendingIterator.next(ArrayDeque.java:746)
+/// ```
+///
+/// took the remaining 12 observables of the `dequeEdges` probe section with it.
+/// The CME was therefore never an over-throw and never had anything to do with
+/// the `modCount` this crate gained this session: real JDK bytecode diagnosed
+/// the state this missing check produced, and diagnosed it correctly. See
+/// W7-33-differential-dead-sections.
+///
+/// The check sits in the two funnels rather than at each registration because
+/// that is where the JDK puts it — `add`, `offer`, `offerFirst`, `offerLast`,
+/// `push` and `addAll` all reach the deque through `addFirst`/`addLast` in
+/// both implementations. The one other caller is the `java/util/Queue`
+/// interface bridge, which points at the `ArrayDeque` implementation by
+/// construction; the null-tolerant `Queue` in the JDK is `LinkedList`, and
+/// `((Queue<String>) new LinkedList<String>()).offer(null)` was measured
+/// storing its null on both CratonVM modes today, so it does not route here.
+///
+/// HotSpot's is message-less. `thrownDetail` prints a message when there is
+/// one, so inventing one would itself be a divergence.
+#[inline]
+fn ad_refuse_null(elem: Value) -> Result<(), MethodCallFailed> {
+    if matches!(elem, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    Ok(())
+}
+
 fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32, i32) {
     let data = match ctx.get_field(this, AD_FIELD_DATA) {
         Value::Object(Some(r)) => Some(r),
@@ -33846,6 +34222,8 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
     // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
     // and refresh both, otherwise the store below writes a pre-GC element
@@ -33875,6 +34253,8 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): same shape as
     // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
     // buffer grow and refresh both before the store.
@@ -34781,6 +35161,19 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `java.util.PriorityQueue`: "This queue does not permit null elements",
+    // and both funnels declare `@throws NullPointerException if the specified
+    // element is null`. `offer` opens with the check and `add` delegates to it,
+    // which is why one check here covers the two registrations above.
+    //
+    // Measured on the binary before this line existed:
+    // `PriorityQueue.nullAdd=no-throw` against HotSpot's
+    // `java.lang.NullPointerException`. The reason the JDK refuses is the same
+    // one `ArrayDeque` has — a null has no place in a comparison heap, and
+    // `siftUp` would dereference it on the very next insert — so `ad_refuse_null`
+    // is reused rather than duplicated (only its name is `ArrayDeque`-specific).
+    // See W7-33-differential-dead-sections R1.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `pq_ensure_capacity`
     // reallocates the heap array on grow (GC-capable) — pin `this`/`elem`
     // across it and refresh both, otherwise the store below writes a pre-GC
@@ -35228,12 +35621,15 @@ fn native_stack_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // `java.util.Stack.pop`: "@throws EmptyStackException if this stack is
+        // empty". That class extends `RuntimeException` DIRECTLY, so the
+        // `NoSuchElementException` this used to raise is not a supertype of it
+        // and a `catch (EmptyStackException)` in application code never fired —
+        // a mistyped refusal sends the caller down the wrong branch, which is
+        // worse than no refusal because it looks handled. Measured:
+        // `Stack.popOnEmpty=java.util.NoSuchElementException` against HotSpot's
+        // `java.util.EmptyStackException`. See W7-33-differential-dead-sections R2.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     native_al_remove_at(ctx, &[Value::Object(Some(this)), Value::Int(size - 1)])
 }
@@ -35245,12 +35641,12 @@ fn native_stack_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // Same contract as `pop` above: `java.util.Stack.peek` declares
+        // `@throws EmptyStackException if this stack is empty`. Not measured by
+        // the probe — it only asks `pop` — but the two are one refusal in the
+        // JDK (`peek` is what `pop` calls first) and leaving one behind is how
+        // the pair drifts apart again.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     let elem = data.map_or(Value::Object(None), |buf| {
         ctx.get_array_element(buf, (size - 1) as usize)
@@ -37670,6 +38066,96 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     )
 }
 
+/// The JDK's `compare(key, key)` — "type (and possibly null) check" in its own
+/// comment — for the sorted containers, hoisted to the natives that can reach an
+/// EMPTY one.
+///
+/// Three measured divergences, one cause:
+///
+/// ```text
+/// TreeMap.nullKeyPut              HotSpot NullPointerException  CratonVM no-throw
+/// TreeMap.nullKeyGet              HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.nullAddNaturalOrdering  HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.incomparableFirstAdd    HotSpot ClassCastException    CratonVM no-throw
+/// ```
+///
+/// None of them is an extra rule. Under natural ordering every insert and every
+/// lookup runs `((Comparable) key).compareTo(other)`, which raises both: the
+/// `checkcast` in front of the call raises `ClassCastException` for a
+/// non-`Comparable` receiver, and the invoke itself raises
+/// `NullPointerException` for a null one. `TreeMap.getEntry` opens with an
+/// explicit `if (key == null) throw new NullPointerException()` for exactly
+/// that reason, and `addEntryToEmptyMap` writes the self-compare out by hand
+/// because on an empty container no comparison would otherwise happen at all.
+///
+/// So the gap here is *two* gaps that look like one. [`compare_via_compare_to`]
+/// already raises the ClassCastException half — but only once there is
+/// something to compare against, which is why only the FIRST add diverged. It
+/// never raises the null half at all, and deliberately: it orders `null` first,
+/// because its other caller is `Arrays.sort(Object[])`, whose contract that is.
+/// A sorted map has the opposite contract, so the check has to live here rather
+/// than be added there.
+///
+/// Scoped to natural ordering — `comparator == null` — because that is where
+/// the JDK scopes it. `TreeMap.put`: "@throws NullPointerException if the
+/// specified key is null and this map uses natural ordering, **or its
+/// comparator does not permit null keys**"; with a comparator supplied the JDK
+/// asks the comparator and nothing else. `new TreeSet<>(Comparator.nullsFirst(..))`
+/// legitimately holds a null, and a comparator over a non-`Comparable` element
+/// type is the ordinary reason to supply one — this file already documents a
+/// `Set<Class<?>>` ordered by a name-comparator above `tree_key_from_value`, and
+/// `compare_via_compare_to` documents Spring catching the CCE from the other
+/// shape. Refusing under a comparator would be the over-throw.
+///
+/// The CCE message is `compare_via_compare_to`'s, verbatim, so the two sites
+/// that model the same `checkcast` cannot drift into two different reports. The
+/// NPE carries no message, like [`ad_refuse_null`]: HotSpot's has none here and
+/// `thrownDetail` prints a message when there is one.
+///
+/// `container_is_empty` gates the `Comparable` half only, and gates it exactly
+/// where the JDK gates it: the self-compare is written out by hand in
+/// `addEntryToEmptyMap` and nowhere else, because a non-empty container reaches
+/// the same `checkcast` through the real comparison a moment later — here, via
+/// `compare_via_compare_to` inside `tm_binary_search`/`ts_binary_search`.
+/// Running the hierarchy walk on every populated `get`/`put`/`add` would buy
+/// nothing and would put a class-hierarchy walk on the fast-mode `TreeMap`
+/// path, which today performs no comparison at all. The null half is
+/// unconditional because it is a `matches!` and because
+/// `compare_via_compare_to` will never supply it.
+fn tree_natural_order_key_check(
+    ctx: &dyn NativeContext,
+    comparator: &Value,
+    key: Value,
+    container_is_empty: bool,
+) -> Result<(), MethodCallFailed> {
+    if !matches!(comparator, Value::Object(None)) {
+        return Ok(());
+    }
+    match key {
+        Value::Object(None) => Err(RuntimeError::NullPointerException { message: None }.into()),
+        Value::Object(Some(k)) if container_is_empty && !implements_comparable(ctx, k) => {
+            let cname = object_class_name(ctx, k).replace('/', ".");
+            Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
+            }
+            .into())
+        }
+        // A primitive `Value` never reaches a `(Ljava/lang/Object;)` key
+        // parameter; treat anything else as already checked rather than
+        // inventing a refusal for a shape the registrations cannot produce.
+        _ => Ok(()),
+    }
+}
+
+/// `true` when a natively-managed TreeMap holds no entries, in either storage
+/// mode — `TM_FIELD_SIZE` is maintained by the fast-mode BTreeMap path as well
+/// as the array path (`native_tm_put`'s own fast-mode eligibility test reads
+/// it). Only ever used to decide whether the JDK's empty-map self-compare
+/// applies, so a wrong answer under-throws rather than over-throws.
+fn tm_is_empty_now(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
+}
+
 /// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
 /// if missing. Caller must ensure they only invoke this when fast mode
 /// is applicable (no comparator, etc.).
@@ -39304,7 +39790,21 @@ fn ts_ensure_capacity(
     data: ObjectRef,
 ) -> ObjectRef {
     let arr_len = ctx.array_length(data);
-    let needed = (size + 1) as usize;
+    // A live-view marker lives in the LAST capacity slot (see `ts_view_source`),
+    // so a view must keep one slot free beyond its logical size or the next
+    // `ts_insert_at` writes over the marker and the view silently stops writing
+    // through — the "silently stale view" failure this file's other view code
+    // is careful about. Reserve the slot, and carry the marker across a grow.
+    //
+    // Detected exactly as `ts_view_source` detects it, so the two cannot
+    // disagree: `length > size` AND a non-null trailing slot. A plain TreeSet's
+    // spare capacity is all null, so this is `false` for every non-view.
+    let has_marker = (arr_len as i32) > size
+        && matches!(
+            ctx.get_array_element(data, arr_len - 1),
+            Value::Object(Some(_))
+        );
+    let needed = (size + 1) as usize + usize::from(has_marker);
     if needed <= arr_len {
         return data;
     }
@@ -39325,6 +39825,13 @@ fn ts_ensure_capacity(
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
+    }
+    if has_marker {
+        // Read the marker through the pinned `data` rather than carrying it in a
+        // Rust local across `alloc_ref_array` above: a source recorded here as a
+        // from-space address is a use-after-free on the first write-through.
+        let marker = ctx.get_array_element(data, arr_len - 1);
+        ctx.set_array_element(new_arr, new_cap - 1, marker);
     }
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
     let new_arr = ctx.read_native_pin(new_pin, new_arr);
@@ -39395,6 +39902,21 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    // Before the view branch, not after: a DESCENDING view carries a
+    // `Collections.reverseOrder` comparator, so this is a no-op on it and the
+    // redirect below lets the backing map raise the refusal itself. An
+    // ASCENDING range view carries the source's own (null) comparator, and the
+    // JDK refuses there too — `NavigableSubMap.put` calls `inRange(key)` first,
+    // which is a `compare(key, bound)` and raises the NPE before the
+    // `IllegalArgumentException` this function raises for a real out-of-range
+    // key can be reached.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
 
     // W7-1 family 1: a write through a navigable view is a write to the BACKING
     // MAP. Redirect it, and refuse an out-of-range key the way
@@ -39560,6 +40082,16 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `TreeMap.getEntry` refuses a null key on a natural-ordering map BEFORE it
+    // looks at `root`, so an EMPTY map throws too — which is the shape the probe
+    // measures (`new TreeMap<>().get(null)`). The fast-mode branch below would
+    // otherwise answer `null` for it, i.e. "absent", the quiet wrong answer.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let v = tm_fast_with(ctx, this, |bt| {
@@ -40064,16 +40596,39 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 }
 
+/// Build the `Map.Entry` that `TreeMap`'s *relative-navigation* accessors hand
+/// back — `firstEntry`, `lastEntry`, `pollFirstEntry`, `pollLastEntry`,
+/// `floorEntry`, `ceilingEntry`, `higherEntry`, `lowerEntry`, and nothing else.
+///
+/// Every one of those is `exportEntry(e)` in the JDK, which is
+/// `new AbstractMap.SimpleImmutableEntry<>(e)` — a SNAPSHOT, whose `setValue`
+/// throws. `TreeMap.firstEntryIsImmutable` measured
+/// `tm.firstEntry().setValue(99)` returning normally here against HotSpot's
+/// `java.lang.UnsupportedOperationException`, because this allocated the
+/// MUTABLE twin. `AbstractMap.SimpleImmutableEntry.setValue`: "@throws
+/// UnsupportedOperationException always".
+///
+/// The two classes have the same two instance fields in the same order (`key`,
+/// `value`; `javap -p` on both), so nothing about the direct field stores below
+/// changes — only which `setValue` the receiver resolves to.
+///
+/// This is deliberately NOT the entry-set path. `TreeMap.entrySet()`'s iterator
+/// yields the LIVE `TreeMap.Entry`, whose `setValue` writes through, and
+/// `TreeMap.entrySetEntryIsLive` already matches HotSpot; that path allocates
+/// its own `AbstractMap$SimpleEntry` through `alloc_live_entry` and is
+/// untouched. Getting these two backwards in either direction is a divergence,
+/// which is why the split is stated here rather than left to the call sites.
 fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Result<ObjectRef, MethodCallFailed> {
-    // AbstractMap$SimpleEntry is a real Map.Entry implementation, so reflection
-    // (Class.getMethods) and reflective property access see getKey/getValue.
-    // The old fabricated "HashMap$Entry" does not implement Map.Entry — see
-    // native_tm_entry_set for the SpEL EL1008E that motivated this.
+    // Both `Simple*Entry` classes are real `Map.Entry` implementations, so
+    // reflection (Class.getMethods) and reflective property access see
+    // getKey/getValue. The old fabricated "HashMap$Entry" does not implement
+    // Map.Entry — see native_tm_entry_set for the SpEL EL1008E that motivated
+    // that change.
     // GC-safety: same hazard as `native_map_entry` — pin `key`/`value` across
     // the allocation so the entry is populated with post-move addresses.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2)?;
+    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2)?;
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -41019,6 +41574,62 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 // subMap: entries with keys >= fromKey and < toKey
+/// `NavigableSubMap`'s constructor, first three lines:
+///
+/// ```text
+/// if (!fromStart && !toEnd) {
+///     if (m.compare(lo, hi) > 0)
+///         throw new IllegalArgumentException("fromKey > toKey");
+/// }
+/// ```
+///
+/// `TreeMap.subMapReversedBounds` measured `tm.subMap("d", "a")` returning an
+/// empty view here against HotSpot's `IllegalArgumentException`. An empty view
+/// is the failure mode that reads as a pass everywhere a caller only iterates —
+/// W7-1-treemap-views-and-iterator-remove-contract is a whole record about that
+/// shape — and a caller that transposed two bounds gets no signal at all.
+///
+/// Only the two-bound entry points reach this. `headMap`/`tailMap` take the
+/// `else` arm of that `if`, which is a type check on the single bound and not
+/// an ordering check, so they are deliberately not routed here.
+///
+/// The ordering asked is the RECEIVER's, not the source map's: for
+/// `descendingMap().subMap(a, b)` the receiver is the descending view, whose
+/// comparator slot holds the `Collections.reverseOrder` wrapper, and the JDK's
+/// `m.compare` on a `DescendingSubMap` is that same reversed ordering. Reading
+/// the slot rather than the backing map's is what makes composition agree.
+///
+/// GC-SAFETY: `tree_compare` dispatches a user `Comparator` (or a
+/// `Comparable.compareTo` override), a full interpreted call that can move
+/// `this` and both bound keys — all three are used afterwards, and the two keys
+/// end up STORED in the view's side-table entry, where a from-space address
+/// would outlive the collection that produced it. Pin, compare, re-read.
+fn tm_refuse_reversed_bounds(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    from_key: Value,
+    to_key: Value,
+) -> Result<(ObjectRef, Value, Value), MethodCallFailed> {
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let this_pin = ctx.pin_native_root(this);
+    let from_pin = pin_value(ctx, from_key);
+    let to_pin = pin_value(ctx, to_key);
+    let verdict = tree_compare(ctx, &comparator, from_key, to_key);
+    let this = ctx.read_native_pin(this_pin, this);
+    let from_key = read_pinned_elem(ctx, from_pin, from_key);
+    let to_key = read_pinned_elem(ctx, to_pin, to_key);
+    ctx.unpin_native_roots(this_pin);
+    if verdict? > 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "fromKey > toKey".to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok((this, from_key, to_key))
+}
+
 fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -41026,6 +41637,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -41075,6 +41687,10 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_key = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
+    // The JDK's check is on the bounds alone and ignores the inclusive flags —
+    // `subMap(k, false, k, false)` is a legal empty range, `subMap(hi, .., lo, ..)`
+    // is not. See `tm_refuse_reversed_bounds`.
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -41354,6 +41970,12 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // Before the search, because on an EMPTY set the search performs no
+    // comparison and so raises nothing — the `TreeSet.incomparableFirstAdd`
+    // half. On a non-empty set this fires first and `compare_via_compare_to`
+    // (which would raise the same CCE) is never reached, so the two agree by
+    // construction rather than by coincidence.
+    tree_natural_order_key_check(ctx, &comparator, elem, size == 0)?;
     let data = match data_opt {
         Some(d) => d,
         None => {
@@ -41373,12 +41995,35 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     match search {
         Ok(_) => Ok(Some(Value::Int(0))), // already present
         Err(pos) => {
+            // `this` is pinned as well as `elem` now: `ts_ensure_capacity`
+            // allocates, and both are used after it — `this` by the size store
+            // and, below, by the write-through.
+            let this_pin = ctx.pin_native_root(this);
             let elem_pin = pin_value(ctx, elem);
             let data = ts_ensure_capacity(ctx, this, size, data);
+            let this = ctx.read_native_pin(this_pin, this);
             let elem = read_pinned_elem(ctx, elem_pin, elem);
-            ctx.unpin_native_roots(elem_pin);
             ts_insert_at(ctx, data, size, pos, elem);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size + 1));
+            // Live `descendingSet()` view: an add through the view is an add to
+            // the backing set. `TreeSet.descendingWriteThrough` measured
+            // `ts.descendingSet().add(9)` leaving `ts` at `[1, 2, 3]` where
+            // HotSpot has `[1, 2, 9]` — the view's own contents were already
+            // right, so this is the one direction that was missing.
+            //
+            // A MAP source is a `TreeMap.keySet()` view, and `keySet().add` is
+            // `UnsupportedOperationException` in the JDK, not a write-through.
+            // That refusal is a separate, unmeasured row and is deliberately not
+            // added here; what matters for this one is that a map source must
+            // NOT be handed an add, which is what the predicate says.
+            let propagated = match ts_view_source(ctx, this) {
+                Some(source) if !is_tree_map_receiver(ctx, source) => ctx
+                    .invoke_virtual(source, "add", "(Ljava/lang/Object;)Z", &[elem])
+                    .map(|_| ()),
+                _ => Ok(()),
+            };
+            ctx.unpin_native_roots(this_pin);
+            propagated?;
             Ok(Some(Value::Int(1)))
         }
     }
@@ -41404,8 +42049,10 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
             // Live TreeMap keySet view: delete the key from the source TreeMap.
+            // Live view: propagate the removal to whatever the marker names —
+            // a `TreeMap` for a keySet view, a `TreeSet` for a descendingSet.
             if let Some(source) = ts_view_source(ctx, this) {
-                source_map_remove(ctx, source, elem)?;
+                ts_source_remove(ctx, source, elem)?;
             }
             Ok(Some(Value::Int(1)))
         }
@@ -41933,7 +42580,7 @@ fn ts_remove_element(
     // Live TreeMap keySet view: the element is a key, so delete it from the
     // source TreeMap as well.
     if let Some(source) = ts_view_source(ctx, owner) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(None)
 }
@@ -42463,50 +43110,111 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// TreeSet holding the same elements ordered by the reversed comparator
 /// (`Collections.reverseOrder`), so `iterator`/`first`/`last`/`contains` on the
 /// result are all consistent with descending order.
+///
+/// It is also a WRITE-THROUGH view. `TreeSet.descendingWriteThrough` measured
+///
+/// ```text
+/// HotSpot   3:[9, 2, 1]:[1, 2, 9]
+/// CratonVM  3:[9, 2, 1]:[1, 2, 3]
+/// ```
+///
+/// — `ds.pollFirst()` and `ds.add(9)` both answered correctly *on the view* and
+/// left the backing set untouched. The mechanism is the source marker in the
+/// trailing capacity slot that `ts_view_source` already defines for `TreeMap`
+/// keySet views: `pollFirst`, `pollLast`, `remove`, `clear` and the iterator's
+/// `remove` all consult it, so installing it here is most of the fix; only the
+/// add direction and the map-vs-set removal descriptor
+/// ([`ts_source_remove`]) had to be added.
+///
+/// The marker goes on AFTER the population loop, deliberately: installed first,
+/// every `native_ts_add` below would write each element straight back into the
+/// set it was copied from.
+///
+/// **This makes the view live in one direction only.** A write through `ds`
+/// reaches `ts`; a later write to `ts` is NOT visible in `ds`, which remains
+/// the snapshot it always was. The JDK's is live both ways. Closing the other
+/// direction needs a rebuild-before-read funnel like `tm_sync_native_state`,
+/// and `TreeSet` has no such funnel — every one of its ~40 natives reads
+/// `ts_state` directly. Recorded in W7-36-differential-view-families rather
+/// than half-built here.
 fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let rev = match comparator {
-        Value::Object(Some(c)) => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "(Ljava/util/Comparator;)Ljava/util/Comparator;",
-            &[Value::Object(Some(c))],
-        )?,
-        _ => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "()Ljava/util/Comparator;",
-            &[],
-        )?,
-    }
-    .unwrap_or(Value::Object(None));
-    let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
-        // (it grows the destination array and can dispatch a Comparator), so
-        // both the source array and the result move under this loop.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut result = result;
-        for i in 0..(size as usize) {
-            let e = ctx.get_array_element(data, i);
-            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
+    // GC-SAFETY: `this` is now needed at the very END of this function (it is
+    // the source stored in the view marker), across a `Collections.reverseOrder`
+    // dispatch, two allocations and a whole population loop. It was previously
+    // dead after the first read and so was never pinned.
+    let this_pin = ctx.pin_native_root(this);
+    // Single-exit through a closure so no `?` can unwind past the pin above and
+    // strand it (and everything pinned on top of it) — the shape
+    // `native_map_put_if_absent` uses for the same reason.
+    let outcome = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let (data_opt, size, comparator) = ts_state(ctx, this);
+        let rev = match comparator {
+            Value::Object(Some(c)) => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+                &[Value::Object(Some(c))],
+            )?,
+            _ => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "()Ljava/util/Comparator;",
+                &[],
+            )?,
         }
-        ctx.unpin_native_roots(data_pin);
-        return Ok(Some(Value::Object(Some(result))));
-    }
-    Ok(Some(Value::Object(Some(result))))
+        .unwrap_or(Value::Object(None));
+        // `rev` is a freshly allocated comparator held in a bare Rust local
+        // across the two allocations below and then STORED — the same
+        // stale-at-store shape the Family-1 notes throughout this file describe.
+        let rev_pin = pin_value(ctx, rev);
+        let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+        let result_pin = ctx.pin_native_root(result);
+        // One slot beyond the elements, for the source marker installed after
+        // the population loop. Sized so `ts_ensure_capacity` never has to grow
+        // during that loop — when the marker is not there yet to be carried.
+        let cap = std::cmp::max(size as usize, TS_DEFAULT_CAPACITY) + 1;
+        let buf = alloc_ref_array(ctx, cap);
+        let mut result = ctx.read_native_pin(result_pin, result);
+        let rev = read_pinned_elem(ctx, rev_pin, rev);
+        ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+        ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+        ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
+        if let Some(data) = data_opt {
+            // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
+            // (it grows the destination array and can dispatch a Comparator), so
+            // both the source array and the result move under this loop.
+            let data_pin = ctx.pin_native_root(data);
+            let mut data = data;
+            for i in 0..(size as usize) {
+                let e = ctx.get_array_element(data, i);
+                native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+            }
+            // Left pinned: the caller's `unpin_native_roots(this_pin)` releases
+            // this frame's whole pin range, and unpinning `data_pin` here would
+            // drop `result_pin` with it (it sits above).
+        }
+        // Install the live-view marker last. Nothing allocates from here to the
+        // return, so both refs read through their pins stay valid.
+        let this = ctx.read_native_pin(this_pin, this);
+        let result = ctx.read_native_pin(result_pin, result);
+        let (rdata, rsize, _) = ts_state(ctx, result);
+        if let Some(rd) = rdata {
+            let dlen = ctx.array_length(rd);
+            if (dlen as i32) > rsize {
+                ctx.set_array_element(rd, dlen - 1, Value::Object(Some(this)));
+            }
+        }
+        Ok(Some(Value::Object(Some(result))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    outcome
 }
 
 /// `TreeSet.pollFirst()` — remove and return the lowest element (null if empty).
@@ -42526,7 +43234,7 @@ fn native_ts_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     // Live TreeMap keySet view: delete the key from the source TreeMap too.
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, first)?;
+        ts_source_remove(ctx, source, first)?;
     }
     Ok(Some(first))
 }
@@ -42548,7 +43256,7 @@ fn native_ts_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ts_remove_at(ctx, data, size, idx);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(Some(last))
 }
@@ -43800,6 +44508,25 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
         "forEach",
         "(JLjava/util/function/BiConsumer;)V",
         native_chm_for_each_parallel,
+    );
+    // The two bulk operations the round-2 differential measured. Every method
+    // in this family walks `table` through a `Traverser`, and a natively-backed
+    // CHM keeps its entries in a SEGMENTED layout that never populates `table`
+    // — so unregistered, they run real bytecode over an empty tree and answer
+    // `null`. See `native_chm_reduce_values` for why that answer is the worst
+    // possible one. The rest of the family is still unregistered; the list is in
+    // W7-36-differential-view-families.
+    r.register(
+        c,
+        "reduceValues",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_reduce_values,
+    );
+    r.register(
+        c,
+        "searchKeys",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+        native_chm_search_keys,
     );
     r.register(c, "mappingCount", "()J", native_chm_mapping_count);
     r.register(
@@ -45745,6 +46472,136 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     ctx.unpin_native_roots(action_pin);
     Ok(None)
+}
+
+/// `ConcurrentHashMap.reduceValues(long parallelismThreshold, BiFunction reducer)`
+/// — "the result of accumulating all values using the given reducer to combine
+/// values, or null if none".
+///
+/// Measured `CHM.reduceValues=null` against HotSpot's `6`, on a map whose
+/// ordinary `entrySet` iteration answered correctly in the SAME run
+/// (`CHM.sortedContent={a=6}` matches, and that is `new TreeMap<>(chm)` walking
+/// `entrySet`). The split is the `Traverser`: every method in the bulk-operation
+/// family walks the real `table` field, and a natively-backed CHM keeps its
+/// entries in the segmented side layout that never populates `table` — so the
+/// real bytecode traverses an empty tree and reports "no values".
+///
+/// That is the worst answer available. `null` from `reduceValues` is exactly
+/// what an empty map returns, so a caller cannot tell a lost traversal from a
+/// legitimately empty reduction — the quiet shape the round-2 widening was
+/// written to catch. `forEach(long, BiConsumer)` above was registered for the
+/// same reason.
+///
+/// The fold matches `ReduceValuesTask`: seed with the first value, then
+/// `reducer.apply(acc, next)`. The `parallelismThreshold` argument is read and
+/// ignored, as it may be: it is a *hint*, and a sequential evaluation is a legal
+/// answer for any value of it.
+fn native_chm_reduce_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // `if (reducer == null) throw new NullPointerException();` — the first
+    // statement of the real method.
+    let reducer = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let values = chm_collect_all_values(ctx, this);
+    // GC-SAFETY: `apply` is arbitrary interpreted bytecode. It can move the
+    // reducer, every value still held only in this Rust Vec, and the accumulator
+    // — which is the one that matters most, because it is fed back in as an
+    // argument on the very next iteration.
+    let reducer_pin = ctx.pin_native_root(reducer);
+    let (_, value_pins) = pin_value_slice(ctx, &values);
+    let mut acc: Option<Value> = None;
+    let mut acc_pin = usize::MAX;
+    let mut result: Result<Option<Value>, MethodCallFailed> = Ok(None);
+    for i in 0..values.len() {
+        let next = read_pinned_elem(ctx, value_pins[i], values[i]);
+        let Some(prev) = acc else {
+            acc = Some(next);
+            acc_pin = pin_value(ctx, next);
+            continue;
+        };
+        let reducer = ctx.read_native_pin(reducer_pin, reducer);
+        let prev = read_pinned_elem(ctx, acc_pin, prev);
+        match ctx.invoke_virtual(
+            reducer,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[prev, next],
+        ) {
+            Ok(r) => {
+                let combined = r.unwrap_or(Value::Object(None));
+                acc = Some(combined);
+                acc_pin = pin_value(ctx, combined);
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if let Ok(ref mut out) = result {
+        *out = Some(match acc {
+            Some(v) => read_pinned_elem(ctx, acc_pin, v),
+            None => Value::Object(None),
+        });
+    }
+    ctx.unpin_native_roots(reducer_pin);
+    result
+}
+
+/// `ConcurrentHashMap.searchKeys(long parallelismThreshold, Function searchFunction)`
+/// — "a non-null result from applying the given search function on each key, or
+/// null if none".
+///
+/// Same cause and same silence as [`native_chm_reduce_values`]: measured
+/// `CHM.searchKeys=null` against HotSpot's `found`, where `null` is also the
+/// legitimate "nothing matched" answer. Short-circuits on the first non-null
+/// result, as `SearchKeysTask` does.
+fn native_chm_search_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let search_fn = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = chm_collect_all_keys(ctx, this);
+    let fn_pin = ctx.pin_native_root(search_fn);
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let mut result: MethodCallResult = Ok(Some(Value::Object(None)));
+    for i in 0..keys.len() {
+        let search_fn = ctx.read_native_pin(fn_pin, search_fn);
+        let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        match ctx.invoke_virtual(
+            search_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => {
+                result = Ok(Some(v));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(fn_pin);
+    result
 }
 
 fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -54465,14 +55322,67 @@ fn cowal_read_snapshot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(Obje
     }
 }
 
+/// Bump the receiver's `modCount` — but only when the receiver actually has
+/// one, and only into a slot no other COW native owns.
+///
+/// `resolve_field_index(class, field)` answers for the *named* class's
+/// hierarchy, not the receiver's. Asked for `java/util/AbstractList`'s
+/// `modCount` it returns AbstractList's slot regardless of what `this` is, and
+/// a real `java.util.concurrent.CopyOnWriteArrayList` does not extend
+/// `AbstractList` at all — JDK 25 declares it
+/// `implements List, RandomAccess, Cloneable, Serializable`, with exactly two
+/// instance fields, `lock` then `array`. AbstractList's `modCount` is its own
+/// first instance field, so the index collided with `lock` and every bump
+/// stored an `Int` over the monitor object the class synchronises on.
+///
+/// The corruption is silent until the next piece of *real* COW bytecode runs.
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// a list survived `add`, `set`, `remove`, `add(int,E)` and `clear` (none of
+/// which bump) and died on the two that do —
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot enter synchronized block because "this.lock" is null
+///     at java.util.concurrent.CopyOnWriteArrayList.addAllAbsent(CopyOnWriteArrayList.java:795)
+/// ```
+///
+/// after `addIfAbsent` with an absent element, or after `addAll`. That killed
+/// the whole `concurrentAndAtomic` probe section: 24 ABQ/Atomic/LongAdder
+/// observables after it were absent rather than measured. See
+/// W7-33-differential-dead-sections.
+///
+/// `al_mod_count_slot` documents this exact hazard for the ArrayList natives
+/// and guards against it; this helper, written separately, never did. Ask the
+/// RECEIVER'S class, and refuse the two slots the COW natives own so a
+/// synthetic layout that happens to collide cannot corrupt them either.
+///
+/// On the real JDK layout the answer is `None` and nothing is written, which is
+/// also the right semantics rather than merely the safe one: a real
+/// `CopyOnWriteArrayList` has no `modCount`, its iterator is a snapshot, and it
+/// never raises `ConcurrentModificationException`. The bump only ever meant
+/// anything for the legacy synthetic stub that mirrored `ArrayList` — and that
+/// stub reaches none of the three call sites, all of which sit on the named-
+/// field (`array`) branch.
 fn cowal_bump_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    if let Some(ms) = ctx.resolve_field_index("java/util/AbstractList", "modCount") {
-        let cur = match ctx.get_field(this, ms) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
+    let cid = ctx.class_id_of_object(this);
+    let Some(ms) = ctx.resolve_field_index_by_class_id(cid, "modCount") else {
+        return;
+    };
+    if ms >= ctx.object_num_fields(this) {
+        return;
     }
+    if ctx.resolve_field_index(COWAL_CLASS, "lock") == Some(ms)
+        || ctx.resolve_field_index(COWAL_CLASS, "array") == Some(ms)
+    {
+        return;
+    }
+    let cur = match ctx.get_field(this, ms) {
+        Value::Int(v) => v,
+        // Anything but an `Int` in the slot means it is not the field this
+        // helper thinks it is — the very confusion above. Leave whatever is
+        // there alone instead of overwriting it with a counter.
+        _ => return,
+    };
+    ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
 }
 
 fn cowal_enter_monitor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
