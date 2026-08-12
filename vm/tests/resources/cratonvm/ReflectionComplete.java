@@ -33,19 +33,32 @@ public class ReflectionComplete {
 
     // ---- Test 1: Method.invoke() with access checks and type coercion ----
 
+    // `Method.invoke` checks access against the CALLING class, and the caller
+    // here is ReflectionComplete itself — the very class that declares
+    // `privateStaticMethod`. A class may always reflect on its own private
+    // members, so the first `invoke` SUCCEEDS with no `setAccessible(true)`;
+    // there is no IllegalAccessException to catch.
+    //
+    // This method used to `return -1` on that success path and expect 49. Real
+    // JDK 25 returns -1 (measured: `probes/CorpusOracle`, and a standalone
+    // probe of the same shape on Temurin 25.0.4). The rule, and this exact
+    // correction, are already documented on `testFieldGetPrivate` two methods
+    // below for the field form of the same question — the method form was
+    // simply left behind, and passed only for as long as CratonVM's own
+    // `Method.invoke` denied it too. It stopped passing when dev made that
+    // check caller-sensitive (`caller_may_access_member`).
+    //
+    // Assert what the JDK actually guarantees: own-private invoke works, and
+    // `setAccessible(true)` is a no-op on top of it.
     public static int testMethodInvokePrivateViaReflection() throws Exception {
         Method m = ReflectionComplete.class.getDeclaredMethod("privateStaticMethod", int.class);
-        // Should fail without setAccessible
-        try {
-            m.invoke(null, 5);
-            return -1; // Should not reach
-        } catch (Exception e) {
-            // Expected: IllegalAccessException
-        }
-        // Now set accessible
+        int withoutSetAccessible = (Integer) m.invoke(null, 7);
         m.setAccessible(true);
-        Object result = m.invoke(null, 7);
-        return (Integer) result; // 49
+        int withSetAccessible = (Integer) m.invoke(null, 7);
+        if (withoutSetAccessible != withSetAccessible) {
+            return -1;
+        }
+        return withSetAccessible; // 49
     }
 
     public static int testMethodInvokeInstance() throws Exception {
@@ -92,9 +105,24 @@ public class ReflectionComplete {
     // A declaring class may reflectively read its own private-final field
     // without setAccessible(true). HikariConfig.copyStateTo uses this shape
     // for its private-final AtomicReference credentials field.
-    public int testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible() throws Exception {
+    //
+    // STATIC, and it builds its own receiver, because every corpus fixture is
+    // called as `vm.invoke(class, method, "()I", &[])` — no receiver argument
+    // exists to pass. Declared as an INSTANCE method this ran with `this ==
+    // null`, so `f.get(this)` threw `NullPointerException: Field.get(…): null
+    // receiver for instance field` — which is the correct answer to the
+    // question that shape actually asks, and not the question the fixture
+    // means to ask. `probes/CorpusOracle` hid the mismatch by constructing a
+    // receiver of its own for non-static methods (`Modifier.isStatic` →
+    // `getDeclaredConstructor().newInstance()`), so the oracle exercised the
+    // reflective read while CratonVM was handed a null receiver, and the
+    // difference was filed as a class-library gap. Access is unchanged by the
+    // move: the calling class is still `ReflectionComplete`, which is what
+    // `Field.get`'s access check reads.
+    public static int testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible() throws Exception {
+        ReflectionComplete self = new ReflectionComplete();
         Field f = ReflectionComplete.class.getDeclaredField("privateFinalReference");
-        AtomicReference<?> value = (AtomicReference<?>) f.get(this);
+        AtomicReference<?> value = (AtomicReference<?>) f.get(self);
         return (Integer) value.get();
     }
 

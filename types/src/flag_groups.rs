@@ -858,6 +858,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-isel-emit", on_key: Some("CRATONVM_JIT_IR_ISEL_EMIT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-isel-verify", on_key: Some("CRATONVM_JIT_IR_ISEL_VERIFY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-field-ops", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_FIELD_OPS"), off_word: None },
+    // Declared 2026-08-11 with the pre-push hook that would have caught it.
+    // `jit::precise_getstatic_checkcast_enabled` withdraws the RBC.6 admission
+    // of `getstatic`/`checkcast` so one binary can be A/B'd against its own
+    // pre-change behaviour. Opt-out spelling only, same as its
+    // `precise-field-ops` neighbour, so the token is stated positively and
+    // enabling it means removing the key. The read site already goes through
+    // `runtime_var_os`, which serves a DECLARED name from the latched snapshot
+    // and only falls through to a live `getenv` for an undeclared one — so
+    // this row is the whole fix.
+    E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.

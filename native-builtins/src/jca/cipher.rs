@@ -344,6 +344,22 @@ fn make_bytes_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     arr
 }
 
+/// Read the `byte[]` at instance-field `slot` and return a FRESH copy of it,
+/// or `None` when the field is null.
+///
+/// The accessor idiom for every JCA key/spec class whose real implementation
+/// ends `return this.<field>.clone()` — `SecretKeySpec.getEncoded`,
+/// `IvParameterSpec.getIV`, `GCMParameterSpec.getIV`. The clone is not
+/// defensive politeness in these classes; it is the contract callers build key
+/// hygiene on, and the JDK's own providers scrub the array they get back.
+fn clone_byte_field(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> Option<ObjectRef> {
+    let Value::Object(Some(arr)) = ctx.get_field(this, slot) else {
+        return None;
+    };
+    let bytes = read_bytes(ctx, arr);
+    Some(make_bytes_array(ctx, &bytes))
+}
+
 /// `true` when the transformation names the RSA cipher (`"RSA/ECB/…"`).
 fn is_rsa_transformation(algo: &str) -> bool {
     algo.split('/')
@@ -512,6 +528,21 @@ fn cipher_init_record(
     //
     // Only RSA transformations are affected: for every other transformation
     // the pair is legitimately empty and unused.
+    // The transformation's own key-length constraint, enforced where the JDK
+    // enforces it. `Cipher.init` declares `InvalidKeyException`; `doFinal` does
+    // not, and `Aes::key_expansion`'s failure surfaced there as an UNCHECKED
+    // `IllegalArgumentException` that no `catch (GeneralSecurityException)`
+    // matches — when it surfaced at all. For `AES_128/GCM/NoPadding` with a
+    // 256-bit key it did not surface: the suffix was never read, so the cipher
+    // ran as AES-256 under an AES-128 name.
+    if let Some(reason) = aes_key_length_reason(&algo, key_bytes.len()) {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/InvalidKeyException",
+            &reason,
+        ));
+    }
+
     let (rsa_n, rsa_exp) = if is_rsa_transformation(&algo) {
         match rsa_key_components(ctx, key, mode) {
             Some(pair) if !pair.0.is_empty() && !pair.1.is_empty() => pair,
@@ -653,124 +684,539 @@ fn finish_cipher_bytes(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Allocate a freshly initialised Cipher synthetic and register an
-/// empty `CipherState` keyed on its heap pointer.  The algorithm
-/// string is stashed in the side-table — we do **not** write to any
-/// instance field of the real JDK class, because field-5 is
-/// `initialized:Z` (a primitive boolean) and storing an Object there
-/// breaks the `expected object reference` invariant on read-back.
-/// Reject `Cipher.getInstance` transformations that the requested JDK
-/// provider does not actually supply, so the native shim's "accept
-/// everything" behaviour doesn't mask a real-JDK `NoSuchAlgorithmException`.
+/// The gate in front of `cipher_alloc`: admit the transformation, or raise the
+/// exception the JDK specifies for it.
 ///
-/// Concretely: SunJCE provides AES in ECB/CBC/PCBC/CTR/CTS/CFB/OFB/GCM/KW/KWP
-/// but NOT **CCM** (that AEAD mode ships with BouncyCastle, not the JDK). On
-/// HotSpot `Cipher.getInstance("AES/CCM/…","SunJCE")` throws
-/// `NoSuchAlgorithmException: No such algorithm: AES/CCM/…`. Our native AES
-/// dispatch can't do CCM either, so accepting it (returning a synthetic
-/// Cipher) is strictly wrong — it silently masks the rejection that callers
-/// like Tomcat's `EncryptInterceptor` depend on to refuse the transform
-/// (TestEncryptInterceptorAlgorithms `doTestShouldNotSucceed`). Throw the
-/// catchable checked exception so the real-JDK call site behaves as on HotSpot.
+/// ## What this gate has had to learn, in order
 ///
-/// The CCM check alone was not enough: it looked only at the MODE, so the base
-/// ALGORITHM was never questioned and `Cipher.getInstance("CRATONVM-NO-SUCH-
-/// CIPHER")` returned a fully-formed synthetic `Cipher` — a fabricated success
-/// where the JDK mandates `NoSuchAlgorithmException`, which is what
-/// `regression-suite/src/RJdkFailure.java:309` measures (failing in `--real-jdk`
-/// and `--jdk-only`, passing on HotSpot 25). `MessageDigest.getInstance` and
-/// `KeyFactory.getInstance` in the sibling modules already validate this way;
-/// see `message_digest::algorithm_supported`.
+/// It began as a MODE check for `AES/CCM` alone — SunJCE ships AES in
+/// ECB/CBC/PCBC/CTR/CTS/CFB/OFB/GCM/KW/KWP but not CCM, and Tomcat's
+/// `TestEncryptInterceptorAlgorithms` `doTestShouldNotSucceed` depends on the
+/// refusal. A mode check could not see that the base ALGORITHM was never
+/// questioned, so `Cipher.getInstance("CRATONVM-NO-SUCH-CIPHER")` returned a
+/// fully-formed `Cipher` — the fabricated success
+/// `regression-suite/src/RJdkFailure.java:309` measures. That was fixed by
+/// adding an algorithm allow-list, `cipher_algorithm_known`, which was
+/// deliberately over-inclusive.
+///
+/// Over-inclusive was the third mistake, and the largest: the names it admitted
+/// but could not compute were not refused later, they were served as AES. See
+/// [`classify_transformation`], which replaces it, for the measurements. The
+/// gate is total now — every transformation is admitted as a named family or
+/// refused, with no arm in between.
+///
+/// Returns the admitted [`CipherFamily`] so a caller that needs to know which
+/// engine it just resolved does not have to re-derive it.
 fn check_transformation_supported(
     ctx: &mut dyn NativeContext,
     algo: &str,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let (cipher, mode, _pad) = parse_transformation(algo);
-    if mode == "CCM" || !cipher_algorithm_known(&cipher) {
-        return Err(crate::phases_early::throw_jca_exc(
-            ctx,
-            "java/security/NoSuchAlgorithmException",
-            &format!("No such algorithm: {algo}"),
-        ));
+    form: GetInstanceForm,
+) -> Result<CipherFamily, cratonvm_types::error::MethodCallFailed> {
+    match classify_transformation(algo) {
+        TransformVerdict::Serviceable(family) => Ok(family),
+        // A malformed transformation string is rejected identically by every
+        // overload — `tokenizeTransformation` runs before any provider is
+        // consulted — so the message does not depend on the form.
+        TransformVerdict::InvalidFormat(msg) => Err(
+            crate::jca::provider_chain::throw_no_such_algorithm_public(ctx, &msg),
+        ),
+        TransformVerdict::NoSuchPadding(padding) => match form {
+            // Measured on jdk-25.0.3.9-hotspot: the ANONYMOUS overload never
+            // raises `NoSuchPaddingException` for an unavailable padding. It
+            // walks the provider chain and a service that cannot take the
+            // padding is simply skipped, so the loop falls out the bottom into
+            // `throw new NoSuchAlgorithmException("Cannot find any provider
+            // supporting " + transformation)` (`Cipher.java`). Confirmed:
+            // `Cipher.getInstance("AES/CBC/CRATONVM-NO-SUCH-PADDING")` gives
+            // `NoSuchAlgorithmException: Cannot find any provider supporting
+            // AES/CBC/CRATONVM-NO-SUCH-PADDING`, NOT a padding exception.
+            GetInstanceForm::Anonymous => Err(
+                crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("Cannot find any provider supporting {algo}"),
+                ),
+            ),
+            // Both provider-named overloads DO, because they interrogate one
+            // named provider's single service: measured
+            // `NoSuchPaddingException: Padding not supported:
+            // CRATONVM-NO-SUCH-PADDING` — the PADDING alone, not the whole
+            // transformation.
+            GetInstanceForm::WithProvider => Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/crypto/NoSuchPaddingException",
+                &format!("Padding not supported: {padding}"),
+            )),
+        },
+        TransformVerdict::NoSuchAlgorithm => match form {
+            GetInstanceForm::Anonymous => Err(
+                crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("Cannot find any provider supporting {algo}"),
+                ),
+            ),
+            GetInstanceForm::WithProvider => Err(
+                crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("No such algorithm: {algo}"),
+                ),
+            ),
+        },
     }
-    Ok(())
 }
 
-/// Does `cipher` name a block/stream cipher that ANY provider reachable from
-/// this VM supplies?
+/// `true` when `Cipher.getInstance(transformation)` will hand back a working
+/// cipher rather than refusing.
 ///
-/// Deliberately over-inclusive on the accept side and precise only on the
-/// reject side: this gate exists to stop a *fabricated* name from producing a
-/// working-looking `Cipher`, not to enumerate provider inventories. It spans
-/// SunJCE's whole catalogue plus the BouncyCastle names the corpus reaches
-/// (Keycloak/Elytron/Tomcat), so a legitimate transformation is never refused
-/// on a spelling this list happens not to carry — the failure mode a too-narrow
-/// list would produce is a `NoSuchAlgorithmException` for valid input, which is
-/// strictly worse than the fabrication being fixed.
-///
-/// Names are normalised to alphanumeric-uppercase first, exactly as
-/// `message_digest::algorithm_supported` does, so `AES_128`, `AESWrap_256`,
-/// `ChaCha20-Poly1305` and `DESede` all collapse onto their prefix.
-fn cipher_algorithm_known(cipher: &str) -> bool {
-    let n: String = cipher
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_uppercase();
-    if n.is_empty() {
-        return false;
-    }
-    // Prefix families: AES/AES_128/AESWrap_256, every PBEWith*, DES/DESede/
-    // DESedeWrap, and the RSA transformations (RSA, RSA/ECB/OAEP…).
-    if n.starts_with("AES") || n.starts_with("PBE") || n.starts_with("DES") || n.starts_with("RSA")
-    {
-        return true;
-    }
+/// Exists so `jca::provider_chain` can assert, in a test, that every
+/// transformation it ADVERTISES is one this engine can COMPUTE. The two lists
+/// drifted for three waves in both directions at once — `ChaCha20` advertised
+/// and served as AES, `DESede` served and never advertised — and a census that
+/// is only ever run by hand drifts again. See
+/// `provider_chain::every_advertised_sunjce_cipher_is_serviceable`.
+pub(crate) fn transformation_is_serviceable(transformation: &str) -> bool {
     matches!(
-        n.as_str(),
-        "TRIPLEDES"
-            | "BLOWFISH"
-            | "ARCFOUR"
-            | "RC2"
-            | "RC4"
-            | "RC5"
-            | "RC6"
-            | "CHACHA20"
-            | "CHACHA20POLY1305"
-            | "CHACHA7539"
-            | "SALSA20"
-            | "XSALSA20"
-            | "HC128"
-            | "HC256"
-            | "IDEA"
-            | "IES"
-            | "ECIES"
-            | "ELGAMAL"
-            | "SEED"
-            | "SM2"
-            | "SM4"
-            | "CAMELLIA"
-            | "CAST5"
-            | "CAST6"
-            | "SERPENT"
-            | "TWOFISH"
-            | "NOEKEON"
-            | "SKIPJACK"
-            | "SHACAL2"
-            | "TEA"
-            | "XTEA"
-            | "VMPC"
-            | "GOST28147"
-            | "DSTU7624"
-            | "THREEFISH256"
-            | "THREEFISH512"
-            | "THREEFISH1024"
-            | "GRAINV1"
-            | "GRAIN128"
-            | "NULL"
+        classify_transformation(transformation),
+        TransformVerdict::Serviceable(_)
     )
 }
 
+/// Which `Cipher.getInstance` overload is asking. The two differ in their
+/// REFUSAL wording and in whether an unavailable padding is reportable at all —
+/// both measured, both in `check_transformation_supported`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GetInstanceForm {
+    /// `getInstance(String)` — searches the whole provider chain.
+    Anonymous,
+    /// `getInstance(String, String)` / `getInstance(String, Provider)` — asks
+    /// one named provider.
+    WithProvider,
+}
+
+/// The cipher families this engine can actually COMPUTE — the whole list.
+///
+/// The verdict this enum is half of replaces `cipher_algorithm_known`, whose
+/// doc comment claimed being "deliberately over-inclusive on the accept side"
+/// was safe because "the failure mode a too-narrow list would produce is a
+/// `NoSuchAlgorithmException` for valid input, which is strictly worse than the
+/// fabrication being fixed". Measurement falsified that sentence: an accepted
+/// name this engine cannot compute did not fail, it produced AES. See
+/// [`classify_transformation`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CipherFamily {
+    /// AES with the key length taken from the KEY: `crypto_impl::Aes` /
+    /// `AesGcm` in-crate for ECB and GCM, the real SunJCE
+    /// `AESCipher$General` SPI (via `drive_real_cipher`) for CBC/CFB/OFB.
+    Aes,
+    /// `AES_128` / `AES_192` / `AES_256` — the same code paths as
+    /// [`CipherFamily::Aes`], but the transformation NAME pins the key length
+    /// (carried here in bytes) and `cipher_init_record` enforces it. Without
+    /// that enforcement the name is decorative: measured before this change,
+    /// `AES_128/GCM/NoPadding` initialised happily from a 256-bit key and
+    /// encrypted with AES-256, which is the same silent-substitution defect as
+    /// the ChaCha20 one, one field over.
+    AesFixed(usize),
+    /// RFC 3394 key wrap: `AESWrap`, `AESWrap_128/192/256`, and the canonical
+    /// `AES*/KW/NoPadding` spellings. `wrap`/`unwrap`/`doFinal` only.
+    AesKeyWrap,
+    /// `DES` / `DESede` / `TripleDES` in CBC, through the real SunJCE
+    /// `DESCipher` / `DESedeCipher` SPI.
+    DesFamily,
+    /// RSA through `crypto_impl`'s modexp + RFC 8017 padding.
+    Rsa,
+    /// PKCS#12 PBES2 (`PBEWithHmacSHA{1,224,256}AndAES_{128,256}`).
+    Pbes2,
+}
+
+/// What `Cipher.getInstance` must do with a transformation string.
+enum TransformVerdict {
+    /// This engine computes it, as the named family.
+    Serviceable(CipherFamily),
+    /// `NoSuchAlgorithmException`. Covers an unknown ALGORITHM *and* an
+    /// unavailable MODE — the JDK reports both that way, because a mode lives
+    /// inside the service name (`AES/KW/NoPadding`) or inside the service's
+    /// `SupportedModes` attribute, and either way a miss means no service was
+    /// found. Measured: `AES/CRATONVM-NO-SUCH-MODE/NoPadding` raises
+    /// `NoSuchAlgorithmException`, not `NoSuchPaddingException`.
+    NoSuchAlgorithm,
+    /// `NoSuchPaddingException` — algorithm and mode resolve, the padding
+    /// scheme does not. Carries the PADDING token, which is all HotSpot's
+    /// message names.
+    NoSuchPadding(String),
+    /// The string is not a transformation at all. Carries HotSpot's own
+    /// message; see [`tokenize_transformation`].
+    InvalidFormat(String),
+}
+
+/// `javax.crypto.Cipher.tokenizeTransformation`, restated.
+///
+/// Quoting the specifying javadoc on every `getInstance` overload
+/// (`java.base/javax/crypto/Cipher.java`, JDK 25 `src.zip`):
+///
+/// > `@throws NoSuchAlgorithmException` if `transformation` is `null`, empty,
+/// > in an invalid format, or if no provider supports a `CipherSpi`
+/// > implementation for the specified algorithm
+///
+/// "in an invalid format" is this function, and the four messages below are the
+/// real ones, measured rather than paraphrased. `parse_transformation` — still
+/// used downstream for the mode/padding of an ALREADY-ADMITTED transformation —
+/// cannot do this job: it silently accepts any shape, so `"AES/CBC"` (two
+/// tokens, which the JDK rejects outright) became mode `CBC` with padding
+/// defaulted on, and `"AES/CBC/"` became a padded CBC cipher.
+///
+/// The `SHA512/2` scan is the JDK's own guard, not an embellishment: it stops
+/// `PBEWithHmacSHA512/224AndAES_128` — an algorithm with a `/` inside its own
+/// NAME — being split at that slash. `to_ascii_uppercase` rather than a
+/// Unicode uppercase deliberately: the search index is used to slice the
+/// ORIGINAL string, and only an ASCII fold is guaranteed to preserve byte
+/// offsets.
+///
+/// Returns `(algorithm, mode, padding)`; mode and padding are `None` for the
+/// algorithm-only form, and are never `Some("")` — the JDK rejects an empty
+/// token rather than defaulting it.
+fn tokenize_transformation(
+    transformation: &str,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    const SHA512_TRUNCATED: &str = "SHA512/2";
+    let start_idx = match transformation.to_ascii_uppercase().find(SHA512_TRUNCATED) {
+        Some(i) => i + SHA512_TRUNCATED.len(),
+        None => 0,
+    };
+    let first_slash = transformation
+        .get(start_idx..)
+        .and_then(|tail| tail.find('/'))
+        .map(|i| i + start_idx);
+    let Some(first_slash) = first_slash else {
+        // Algorithm-only form.
+        let algo = transformation.trim();
+        if algo.is_empty() {
+            return Err(format!(
+                "Invalid transformation: algorithm not specified-{transformation}"
+            ));
+        }
+        return Ok((algo.to_string(), None, None));
+    };
+    let algo = transformation[..first_slash].trim();
+    if algo.is_empty() {
+        return Err(format!(
+            "Invalid transformation: algorithm not specified-{transformation}"
+        ));
+    }
+    let rest = first_slash + 1;
+    let Some(second_slash) = transformation
+        .get(rest..)
+        .and_then(|tail| tail.find('/'))
+        .map(|i| i + rest)
+    else {
+        return Err(format!("Invalid transformation format:{transformation}"));
+    };
+    let mode = transformation[rest..second_slash].trim();
+    let padding = transformation[second_slash + 1..].trim();
+    if mode.is_empty() || padding.is_empty() {
+        return Err(format!(
+            "Invalid transformation: missing mode and/or padding-{transformation}"
+        ));
+    }
+    Ok((
+        algo.to_string(),
+        Some(mode.to_string()),
+        Some(padding.to_string()),
+    ))
+}
+
+/// Map a transformation's ALGORITHM token onto a family this engine computes.
+/// `None` means "no family" — which is a refusal, not a default.
+///
+/// Case-insensitive because JCA lookup is (`aes/gcm/nopadding` resolves on
+/// HotSpot; measured). Deliberately NOT prefix-matched: the retired
+/// `cipher_algorithm_known` accepted anything starting `AES`, which is how
+/// `AES_128` reached a code path with no key-length check at all.
+fn cipher_family(algo: &str) -> Option<CipherFamily> {
+    // PBES2 names carry no mode/padding and are matched case-sensitively by
+    // `pbes2_aes_params` (they are the exact SunJCE spellings), so try that
+    // table first and fall back to the case-folded match below.
+    if pbes2_aes_params(algo).is_some() {
+        return Some(CipherFamily::Pbes2);
+    }
+    match algo.to_ascii_uppercase().as_str() {
+        "AES" => Some(CipherFamily::Aes),
+        "AES_128" => Some(CipherFamily::AesFixed(16)),
+        "AES_192" => Some(CipherFamily::AesFixed(24)),
+        "AES_256" => Some(CipherFamily::AesFixed(32)),
+        // `AESWrap` is SunJCE's own alias for `AES/KW/NoPadding`; the
+        // size-suffixed spellings are what Keycloak/Elytron ask for.
+        "AESWRAP" | "AESWRAP_128" | "AESWRAP_192" | "AESWRAP_256" => Some(CipherFamily::AesKeyWrap),
+        // `TripleDES` is `Alg.Alias.Cipher.TripleDES = DESede` on SunJCE.
+        "DES" | "DESEDE" | "TRIPLEDES" => Some(CipherFamily::DesFamily),
+        "RSA" => Some(CipherFamily::Rsa),
+        _ => None,
+    }
+}
+
+/// The whole admission decision for `Cipher.getInstance`, and the reason this
+/// lane exists.
+///
+/// ## What it replaces
+///
+/// The retired gate asked two questions — "is the mode CCM?" and "does the
+/// algorithm name start with something plausible?" — and then threw the
+/// algorithm name away. `cipher_do_final_impl` dispatched on the MODE alone,
+/// and `parse_transformation` defaults an absent mode to `ECB`. Three
+/// independent failures composed into one:
+///
+///   1. the requested algorithm was never dispatched on;
+///   2. an absent mode became ECB, the one mode a caller almost never wants;
+///   3. an AEAD transformation was served by a non-authenticating cipher.
+///
+/// Measured on this tree's own release binary against HotSpot 25, same fixed
+/// 32-byte key, same 32-byte plaintext:
+///
+/// ```text
+/// CratonVM  ChaCha20            ct = c27bed76770d7897735157e3d11726f5…
+/// CratonVM  ChaCha20-Poly1305   ct = c27bed76770d7897735157e3d11726f5…
+/// CratonVM  AES/ECB/PKCS5Padding ct= c27bed76770d7897735157e3d11726f5…
+/// HotSpot   AES/ECB/PKCS5Padding ct= c27bed76770d7897735157e3d11726f5…
+/// HotSpot   ChaCha20            ct = ed7e0180b33c00ac3e8f765cb17e83b2…
+/// ```
+///
+/// Byte-identical: both ChaCha20 names were AES-256-ECB. A 32-byte ChaCha20 key
+/// is a valid AES-256 key, so `Aes::key_expansion` succeeded rather than
+/// erroring; the 12-byte nonce was discarded, output was deterministic per
+/// (key, block), and `ChaCha20-Poly1305` produced no tag — decrypting a
+/// ciphertext with one bit flipped returned 32 bytes of "plaintext" with no
+/// authentication failure anywhere on the path. HotSpot raises
+/// `AEADBadTagException: Tag mismatch` on that same input.
+///
+/// And it was never only ChaCha20. `Blowfish` and `RC4` — both real SunJCE
+/// algorithms — produced the SAME ciphertext as each other from the same
+/// 16-byte key, because both were AES-128-ECB. `AES/CBC/PKCS7Padding`, which
+/// HotSpot refuses outright, was served as PKCS5. `AES/CBC/ISO10126Padding`,
+/// whose padding bytes HotSpot fills at random, was served as PKCS5. Every one
+/// of those is the same shape: a name accepted, then discarded.
+///
+/// ## The rule this function enforces
+///
+/// One table, matching what `provider_chain` advertises, `Option`-returning,
+/// **no `_ =>` arm on the algorithm dispatch**. An algorithm this engine cannot
+/// compute is refused with the exception the JDK specifies — never approximated.
+/// This is the same shape `phases_late::ssl_security`'s `Mac` lane landed for
+/// `mac_algorithm_supported` / `mac_compute_hmac`, and for the same reason: a
+/// wrong cipher is worse than a missing one, because a caller cannot catch it.
+///
+/// Under-serving is the deliberate half of that trade. HotSpot's SunJCE answers
+/// 60 `Cipher` names; this engine answers the families above. Refusing the rest
+/// is truthful precisely because `getInstance` now refuses them — an
+/// application that asks for Blowfish gets a catchable
+/// `NoSuchAlgorithmException` at the call site that names the algorithm,
+/// instead of AES ciphertext it will never be able to decrypt anywhere else.
+fn classify_transformation(transformation: &str) -> TransformVerdict {
+    // `Cipher.getInstance`'s own first line, ahead of tokenizing:
+    // `if ((transformation == null) || transformation.isEmpty()) throw new
+    // NoSuchAlgorithmException("Null or empty transformation")`. A null
+    // argument arrives here as an empty string (`read_string` on a null ref),
+    // and the JDK gives both the same message, so one arm covers both.
+    if transformation.is_empty() {
+        return TransformVerdict::InvalidFormat("Null or empty transformation".to_string());
+    }
+    let (algo, mode, padding) = match tokenize_transformation(transformation) {
+        Ok(parts) => parts,
+        Err(msg) => return TransformVerdict::InvalidFormat(msg),
+    };
+    let Some(family) = cipher_family(&algo) else {
+        return TransformVerdict::NoSuchAlgorithm;
+    };
+    let mode_u = mode.as_deref().map(str::to_ascii_uppercase);
+    let pad_u = padding.as_deref().map(str::to_ascii_uppercase);
+    let named_padding = padding.clone().unwrap_or_default();
+
+    match family {
+        // A default mode is a per-ALGORITHM property, never a global one. SunJCE
+        // really does default a bare `AES` to `AES/ECB/PKCS5Padding` (measured:
+        // HotSpot's ciphertext for `"AES"` is byte-identical to its
+        // `"AES/ECB/PKCS5Padding"` ciphertext), so keeping that default here is
+        // fidelity, not laxity. The defect was applying it to algorithms that
+        // have no ECB mode at all.
+        CipherFamily::Aes => {
+            let m = mode_u.as_deref().unwrap_or("ECB");
+            let p = pad_u.as_deref().unwrap_or("PKCS5PADDING");
+            match m {
+                // AEAD and key wrap: `NoPadding` is the only padding either
+                // takes, on this engine and on SunJCE alike.
+                "GCM" => aes_padding_verdict(p, &named_padding, &["NOPADDING"], family),
+                "KW" => aes_padding_verdict(
+                    p,
+                    &named_padding,
+                    &["NOPADDING"],
+                    CipherFamily::AesKeyWrap,
+                ),
+                // ECB is in-crate; CBC/CFB/OFB drive the real SunJCE SPI. Both
+                // paths implement exactly PKCS#7 (spelled PKCS5Padding by JCA)
+                // and no padding — nothing else, which is why `PKCS7Padding`
+                // and `ISO10126Padding` are refused rather than aliased onto
+                // PKCS5.
+                "ECB" | "CBC" | "CFB" | "OFB" => {
+                    aes_padding_verdict(p, &named_padding, &["NOPADDING", "PKCS5PADDING"], family)
+                }
+                // Everything else is a mode this engine does not compute:
+                // CTR, CTS, PCBC, KWP, the numbered CFB8/OFB8 variants, and
+                // CCM (which SunJCE does not ship either). Each of these used
+                // to reach `cipher_do_final_impl` and die there on an
+                // UNCHECKED `IllegalStateException` naming "WP6.3 dispatch",
+                // which no `catch (GeneralSecurityException)` matches.
+                _ => TransformVerdict::NoSuchAlgorithm,
+            }
+        }
+        // `AES_128` and friends are whole SERVICE names on SunJCE, not an
+        // algorithm plus a default: measured, `Cipher.getInstance("AES_128")`
+        // raises while `AES_128/CBC/NoPadding` resolves, and the advertised set
+        // is exactly {CBC, CFB, ECB, GCM, KW, KWP} x NoPadding (+ KW/PKCS5Padding).
+        // So the triple must be spelled in full and the padding must be
+        // `NoPadding`; anything else is a missing service, not a missing
+        // padding, and HotSpot answers `NoSuchAlgorithmException` accordingly.
+        CipherFamily::AesFixed(_) => {
+            let (Some(m), Some(p)) = (mode_u.as_deref(), pad_u.as_deref()) else {
+                return TransformVerdict::NoSuchAlgorithm;
+            };
+            if p != "NOPADDING" {
+                return TransformVerdict::NoSuchAlgorithm;
+            }
+            match m {
+                "KW" => TransformVerdict::Serviceable(CipherFamily::AesKeyWrap),
+                "ECB" | "CBC" | "CFB" | "OFB" | "GCM" => TransformVerdict::Serviceable(family),
+                _ => TransformVerdict::NoSuchAlgorithm,
+            }
+        }
+        // `AESWrap*` is an algorithm-only name. A mode/padding on it is not a
+        // transformation SunJCE registers, so it is refused rather than
+        // silently ignored.
+        CipherFamily::AesKeyWrap => match (mode_u.as_deref(), pad_u.as_deref()) {
+            (None, None) => TransformVerdict::Serviceable(family),
+            _ => TransformVerdict::NoSuchAlgorithm,
+        },
+        // CBC only, and the mode must be SPELLED. `cipher_do_final_impl`'s
+        // route table hardcodes `"CBC"` for this family whatever the caller
+        // wrote, so admitting `DESede/ECB/PKCS5Padding` would serve CBC under
+        // an ECB name — the mode-substitution twin of the algorithm
+        // substitution this lane is fixing. The bare `DESede` form defaults to
+        // ECB on SunJCE and is refused here for exactly that reason.
+        CipherFamily::DesFamily => {
+            let (Some(m), Some(p)) = (mode_u.as_deref(), pad_u.as_deref()) else {
+                return TransformVerdict::NoSuchAlgorithm;
+            };
+            if m != "CBC" {
+                return TransformVerdict::NoSuchAlgorithm;
+            }
+            if p == "NOPADDING" || p == "PKCS5PADDING" {
+                TransformVerdict::Serviceable(family)
+            } else {
+                TransformVerdict::NoSuchPadding(named_padding)
+            }
+        }
+        // `RSACipher.engineSetMode` (JDK 25 source) is
+        // `if (!mode.equalsIgnoreCase("ECB")) throw new NoSuchAlgorithmException`,
+        // so ECB — or the algorithm-only form, which defaults to it — is the
+        // whole mode set. The padding set is whatever
+        // `RsaCipherPadding::from_transformation` really implements, asked
+        // directly so the gate and the computation cannot drift; `NoPadding`
+        // is NOT in it, which is why `RSA/ECB/NoPadding` (serviceable on
+        // HotSpot) is refused here instead of raising an unchecked
+        // `IllegalStateException` at `doFinal`.
+        CipherFamily::Rsa => {
+            if let Some(m) = mode_u.as_deref() {
+                if m != "ECB" {
+                    return TransformVerdict::NoSuchAlgorithm;
+                }
+            }
+            let padding_name = padding.as_deref().unwrap_or("PKCS1Padding");
+            if crate::crypto_impl::RsaCipherPadding::from_transformation(padding_name).is_some() {
+                TransformVerdict::Serviceable(family)
+            } else {
+                TransformVerdict::NoSuchPadding(named_padding)
+            }
+        }
+        // The PBES2 names carry no mode or padding — the cipher and padding are
+        // fixed by the PKCS#12 scheme itself (AES-CBC + PKCS#5), not chosen by
+        // the caller.
+        CipherFamily::Pbes2 => match (mode_u.as_deref(), pad_u.as_deref()) {
+            (None, None) => TransformVerdict::Serviceable(family),
+            _ => TransformVerdict::NoSuchAlgorithm,
+        },
+    }
+}
+
+/// Admit `padding_upper` if it is one of `allowed`, else report the padding —
+/// spelled as the caller wrote it — as unavailable. Split out so the AES arms
+/// cannot disagree about which exception an unavailable padding produces.
+fn aes_padding_verdict(
+    padding_upper: &str,
+    padding_as_written: &str,
+    allowed: &[&str],
+    family: CipherFamily,
+) -> TransformVerdict {
+    if allowed.contains(&padding_upper) {
+        TransformVerdict::Serviceable(family)
+    } else {
+        TransformVerdict::NoSuchPadding(padding_as_written.to_string())
+    }
+}
+
+/// The key length a transformation NAME pins, in bytes, or `None` when the
+/// name leaves it to the key.
+///
+/// `AES_128` means "AES with a 128-bit key" — the size is part of the service
+/// name, and SunJCE enforces it at `init` with
+/// `InvalidKeyException("The key must be 16 bytes")` (measured wording). This
+/// engine ignored the suffix entirely, so `AES_128/GCM/NoPadding` initialised
+/// from a 256-bit key and encrypted with AES-256.
+fn transformation_pinned_key_len(algo: &str) -> Option<usize> {
+    match cipher_family(&tokenize_transformation(algo).ok()?.0)? {
+        CipherFamily::AesFixed(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Why `key_len` bytes is not a usable key for `algo`, in HotSpot's own wording,
+/// or `None` if it is fine.
+///
+/// Two rules, both measured on jdk-25.0.3.9-hotspot:
+///
+/// * a size-suffixed name pins the length exactly —
+///   `AES_128/GCM/NoPadding` with a 32-byte key gives
+///   `InvalidKeyException: The key must be 16 bytes`;
+/// * plain AES takes 16, 24 or 32 — a 17-byte key gives
+///   `InvalidKeyException: Invalid AES key length: 17 bytes`.
+///
+/// Families whose key length this engine does not constrain (RSA components,
+/// the PBES2 password, DES/DESede parity keys handed to the real SunJCE SPI,
+/// which does its own checking) return `None` and are left alone.
+///
+/// An EMPTY key is deliberately not reported here. It means `extract_key_bytes`
+/// could not read the key at all, which is a different defect with its own
+/// downstream handling; folding it in would convert that diagnosis into a
+/// length complaint.
+fn aes_key_length_reason(algo: &str, key_len: usize) -> Option<String> {
+    if key_len == 0 {
+        return None;
+    }
+    if let Some(pinned) = transformation_pinned_key_len(algo) {
+        return (key_len != pinned).then(|| format!("The key must be {pinned} bytes"));
+    }
+    let family = cipher_family(&tokenize_transformation(algo).ok()?.0)?;
+    if !matches!(family, CipherFamily::Aes | CipherFamily::AesKeyWrap) {
+        return None;
+    }
+    (!matches!(key_len, 16 | 24 | 32))
+        .then(|| format!("Invalid AES key length: {key_len} bytes"))
+}
+
+/// Allocate a freshly initialised Cipher synthetic and register an empty
+/// `CipherState` for it. The algorithm string is stashed in the side-table — we
+/// do **not** write it to any instance field of the real JDK class, because
+/// field 5 is `initialized:Z`, a primitive boolean, and storing an Object there
+/// breaks the `expected object reference` invariant on read-back.
+///
+/// Call only after [`check_transformation_supported`] has admitted `algo`: this
+/// function allocates unconditionally, so reaching it with an unserviceable
+/// name is how a fabricated `Cipher` gets built.
 fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
     let algo_str = ctx.read_string(algo).unwrap_or_default();
@@ -829,6 +1275,14 @@ fn extract_iv_bytes(ctx: &mut dyn NativeContext, spec: ObjectRef) -> Vec<u8> {
 
 /// Parse a Cipher transformation string (`"AES/GCM/NoPadding"`) into
 /// `(cipherName, mode_uppercase, padding_bool)`.
+///
+/// **Post-admission only.** This is a lenient splitter, not a validator: it
+/// accepts any shape, defaults an absent mode to `ECB` and an absent padding to
+/// "padded". Those defaults are correct for the AES family (SunJCE really does
+/// read a bare `AES` as `AES/ECB/PKCS5Padding`) and wrong for everything else,
+/// which is how a nameless-mode `ChaCha20` became AES-ECB. Call it only on a
+/// transformation [`classify_transformation`] has already admitted;
+/// [`tokenize_transformation`] is the validating one.
 fn parse_transformation(algo: &str) -> (String, String, bool) {
     let parts: Vec<&str> = algo.split('/').collect();
     let cipher_name = parts.first().copied().unwrap_or("AES").to_string();
@@ -844,18 +1298,17 @@ fn parse_transformation(algo: &str) -> (String, String, bool) {
 /// `AESWrap` and the size-specific `AESWrap_128` aliases are used by
 /// Keycloak/Elytron; JDK callers may also use the canonical
 /// `AES/KW/NoPadding` transformation.
+/// Asked of the ONE admission table rather than restated as a second literal
+/// list. The old list carried `"AESWRAP128"` (no underscore) and `"AES/KW"`
+/// (two tokens) — neither of which is a transformation `Cipher.getInstance`
+/// accepts — while omitting `AES_128/KW/NoPadding`, which SunJCE advertises and
+/// this engine can serve. A predicate that disagrees with the gate in front of
+/// it is how `wrap()` and `doFinal()` came to answer differently for the same
+/// cipher.
 fn is_aes_key_wrap_transformation(algo: &str) -> bool {
     matches!(
-        algo.to_ascii_uppercase().as_str(),
-        "AESWRAP"
-            | "AESWRAP_128"
-            | "AESWRAP128"
-            | "AESWRAP_192"
-            | "AESWRAP192"
-            | "AESWRAP_256"
-            | "AESWRAP256"
-            | "AES/KW"
-            | "AES/KW/NOPADDING"
+        classify_transformation(algo),
+        TransformVerdict::Serviceable(CipherFamily::AesKeyWrap)
     )
 }
 
@@ -1087,11 +1540,19 @@ fn cipher_unwrap_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 /// Execute `doFinal` against the configured cipher state.
 ///
-/// Currently dispatches the WP6.3-probe-required `AES/GCM/NoPadding`
-/// path through `crypto_impl::AesGcm::{encrypt, decrypt}`.  Other
-/// modes (ECB / CBC / CTR / ChaCha20-Poly1305) are out of probe scope
-/// and return an `IllegalStateException` describing the requested
-/// transformation rather than silently producing wrong bytes.
+/// Reads the transformation back out of the side-table and routes it by
+/// FAMILY, in this order: RSA → PBES2 → the real SunJCE SPI (AES-CBC/CFB/OFB,
+/// DES, DESede) → the in-crate AES paths (GCM, ECB, RFC 3394 key wrap). Every
+/// arrival here has been admitted by `classify_transformation`, so there is no
+/// arm that guesses.
+///
+/// The retired version of this comment said the non-GCM modes were "out of
+/// probe scope and return an `IllegalStateException` describing the requested
+/// transformation rather than silently producing wrong bytes". Half of that was
+/// never true: `ChaCha20`, `Blowfish`, `RC4` and every other admitted-but-
+/// uncomputable name did not reach the `IllegalStateException` at all — they
+/// landed in the ECB arm and returned AES. A comment outlives its defect, and
+/// this one outlived a defect it also misdescribed.
 fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let key = obj_key(ctx, this);
     let state = with_table_read(|t| t.get(&key).cloned());
@@ -1193,14 +1654,33 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         let route: Option<(&'static str, &'static str, &'static str)> = if is_pbes2_aes {
             Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC"))
         } else {
-            match (cn.to_ascii_uppercase().as_str(), cm.as_str()) {
-                ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC")),
-                ("AES", "CFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CFB")),
-                ("AES", "OFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB")),
-                ("DESEDE", _) | ("TRIPLEDES", _) => {
+            // Match on the FAMILY, not the spelling. `("AES", "CBC")` missed
+            // every `AES_128`/`AES_192`/`AES_256` transformation, which then
+            // fell through to the mode-only dispatch below and died on
+            // `mode 'CBC' not implemented`. The mode is still matched on the
+            // token the caller wrote, because for this family it selects real
+            // behaviour — see the DESede note.
+            match (cipher_family(&cn), cm.as_str()) {
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "CBC") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC"))
+                }
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "CFB") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CFB"))
+                }
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "OFB") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB"))
+                }
+                // These two hardcode `"CBC"` whatever the caller wrote, which
+                // is sound ONLY because `classify_transformation` admits no
+                // other mode for this family. Widening the admission table
+                // without widening this line would serve CBC under another
+                // mode's name — the same substitution, one field over.
+                (Some(CipherFamily::DesFamily), _) if cn.eq_ignore_ascii_case("DES") => {
+                    Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC"))
+                }
+                (Some(CipherFamily::DesFamily), _) => {
                     Some(("com/sun/crypto/provider/DESedeCipher", "DESede", "CBC"))
                 }
-                ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC")),
                 _ => None,
             }
         };
@@ -1234,6 +1714,51 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         }
     }
 
+    // `pad` was `_pad` — parsed, then thrown away. Every consequence of
+    // ignoring it is below; see the ECB arm.
+    //
+    // `_cipher_name` was the OTHER half of the defect this lane fixed: the
+    // algorithm the caller asked for was parsed out here and then discarded,
+    // so the `match mode_str` below decided everything. With a missing mode
+    // defaulting to ECB, `Cipher.getInstance("ChaCha20")` landed in the ECB arm
+    // with a 32-byte key that `Aes::key_expansion` was happy to accept as
+    // AES-256. It is bound and CHECKED now: the mode-only dispatch is valid for
+    // the AES family alone, and every other family has already returned above
+    // (RSA, PBES2 and DES/DESede each route earlier in this function).
+    let (cipher_name, parsed_mode, pad) = parse_transformation(&algo);
+    let encrypt = mode == 1;
+
+    let family = cipher_family(&cipher_name);
+    match family {
+        Some(CipherFamily::Aes | CipherFamily::AesFixed(_) | CipherFamily::AesKeyWrap) => {}
+        // Not reachable through `Cipher.getInstance`, which now refuses every
+        // name outside the table — so reaching it means the admission table and
+        // this dispatch have drifted apart, not that a user asked for something
+        // odd. Say so, rather than computing AES and calling it success.
+        other => {
+            return Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "Cipher dispatch reached the AES path for transformation '{algo}' \
+                     (family {other:?}); `classify_transformation` admitted a name this \
+                     arm cannot compute. Refusing to encrypt with a substitute algorithm."
+                ),
+            }
+            .into())
+        }
+    }
+
+    // `AESWrap`, `AESWrap_128/192/256` carry no mode token, so
+    // `parse_transformation` hands back the ECB default for them — which would
+    // send `Cipher.getInstance("AESWrap").doFinal(..)` into the ECB arm and
+    // return AES-ECB blocks where SunJCE returns an RFC 3394 wrap. The name IS
+    // the mode for that family (`Alg.Alias.Cipher.AESWrap = AES/KW/NoPadding`
+    // on SunJCE), so say so once, here, rather than letting a default decide.
+    let mode_str = if matches!(family, Some(CipherFamily::AesKeyWrap)) {
+        "KW".to_string()
+    } else {
+        parsed_mode
+    };
+
     let aes_key = match Aes::key_expansion(&key_bytes) {
         Ok(k) => k,
         Err(e) => {
@@ -1243,11 +1768,6 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             .into())
         }
     };
-
-    // `pad` was `_pad` — parsed, then thrown away. Every consequence of
-    // ignoring it is below; see the ECB arm.
-    let (_cipher_name, mode_str, pad) = parse_transformation(&algo);
-    let encrypt = mode == 1;
 
     let result_bytes: Result<Vec<u8>, String> = match mode_str.as_str() {
         "GCM" => {
@@ -1383,9 +1903,54 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 }
             }
         }
+        // RFC 3394 key wrap reached through `doFinal` rather than
+        // `wrap`/`unwrap`. SunJCE serves both surfaces from the same
+        // `AESKeyWrap` SPI, and this engine's `aes_key_wrap`/`aes_key_unwrap`
+        // are byte-identical to it — measured on jdk-25.0.3.9-hotspot with a
+        // 256-bit KEK: wrap of a 16-byte key gives
+        // `bc3b4783f41958fdef7f32ef69f09086da1a6666e883f93f` on both. Before
+        // this arm existed, `AES/KW/NoPadding` was advertised by
+        // `provider_chain`, worked through `wrap()`, and raised an UNCHECKED
+        // `IllegalStateException` through `doFinal` — one algorithm with two
+        // answers depending on which method the caller reached for.
+        "KW" => {
+            let wrapped = if encrypt {
+                aes_key_wrap(&key_bytes, &data)
+            } else {
+                aes_key_unwrap(&key_bytes, &data)
+            };
+            match wrapped {
+                Ok(bytes) => Ok(bytes),
+                // SunJCE reports both a bad input length and a failed integrity
+                // check from `doFinal` as `IllegalBlockSizeException` — measured
+                // `javax.crypto.IllegalBlockSizeException: Integrity check
+                // failed` for a wrapped key with one bit flipped. It is a
+                // checked `GeneralSecurityException`, so a caller's
+                // `catch` matches; the `Err(String)` tail below would have made
+                // it an unchecked `IllegalStateException` that sails past.
+                // (The detail text is this module's own, which is more specific
+                // than HotSpot's; the CLASS is what a handler selects on.)
+                Err(message) => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/crypto/IllegalBlockSizeException",
+                        &message,
+                    ))
+                }
+            }
+        }
+        // No default arm. `classify_transformation` admits exactly the modes
+        // above for the AES family, so an unadmitted mode cannot arrive here
+        // through `Cipher.getInstance` — and if one does, the two tables have
+        // drifted and the honest answer is to say which mode, not to fall back
+        // on ECB. The retired arm produced `IllegalStateException("Cipher mode
+        // 'CTR' not implemented in WP6.3 dispatch")`: unchecked, so
+        // uncatchable by `catch (GeneralSecurityException)`, and raised at
+        // `doFinal` rather than at `getInstance` where the spec puts it.
         other => Err(format!(
-            "Cipher mode '{}' not implemented in WP6.3 dispatch (probe scope: AES/GCM/NoPadding)",
-            other
+            "Cipher mode '{other}' is admitted by `classify_transformation` but not \
+             computed by this dispatch — the admission table and the AES dispatch \
+             have drifted. Refusing to substitute another mode."
         )),
     };
 
@@ -1802,7 +2367,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
-            check_transformation_supported(ctx, &algo_str)?;
+            check_transformation_supported(ctx, &algo_str, GetInstanceForm::Anonymous)?;
             let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1831,7 +2396,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
-            check_transformation_supported(ctx, &algo_str)?;
+            check_transformation_supported(ctx, &algo_str, GetInstanceForm::WithProvider)?;
             let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1851,7 +2416,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
-            check_transformation_supported(ctx, &algo_str)?;
+            check_transformation_supported(ctx, &algo_str, GetInstanceForm::WithProvider)?;
             let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2306,9 +2871,14 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Object(Some(copy)));
         Ok(None)
     });
+    // `IvParameterSpec.getIV()` is `return this.iv.clone()` in the real class,
+    // and `GCMParameterSpec.getIV()` likewise. Handing back the STORED array
+    // let a caller edit the spec's IV in place — measured: `getIV()`, fill with
+    // 0x77, `getIV()` again returns 0x77s where HotSpot returns the original.
+    // The constructors already copied; only the accessors leaked.
     r.register(ivps, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
 
     let gcmps = "javax/crypto/spec/GCMParameterSpec";
@@ -2329,7 +2899,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     });
     r.register(gcmps, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
     r.register(gcmps, "getTLen", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2338,17 +2908,53 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
 
     let sks = "javax/crypto/spec/SecretKeySpec";
     r.register(sks, "<clinit>", "()V", clinit_noop);
+    // `SecretKeySpec.<init>` is `this.key = key.clone()` in the real class
+    // (`java.base/javax/crypto/spec/SecretKeySpec.java`, JDK 25 `src.zip`), and
+    // the javadoc states why: "The contents of the array are copied to protect
+    // against subsequent modification."
+    //
+    // Storing the caller's array by reference instead was not a shortcut, it
+    // was an ALL-ZERO AES KEY. SunJCE's own key generators scrub their working
+    // buffer the instant the key object exists —
+    // `AESKeyGenerator.engineGenerateKey` is `new SecretKeySpec(keyBytes,
+    // "AES"); Arrays.fill(keyBytes, (byte)0);` and
+    // `KeyGeneratorCore.implGenerateKey` does the same in a `finally` — so the
+    // scrub landed on the key itself. Measured on this tree's release binary,
+    // real-JDK and --jdk-only alike:
+    //
+    //     KeyGenerator.getInstance("AES").generateKey().getEncoded()
+    //       CratonVM -> 0000000000000000000000000000000000000000000000000000000000000000
+    //       HotSpot  -> a55a06fd157aca61fea2322615a02b6c71c01805cbefca7b89ea10b26efc1ace
+    //
+    // and identically for `HmacSHA256`. `DESede` was unaffected only because
+    // `DESedeKeyGenerator` happens not to scrub. Nothing raised anywhere: the
+    // key had the right LENGTH and the right algorithm name, so every caller
+    // downstream encrypted, signed and stored under a key of all zeros.
     r.register(sks, "<init>", "([BLjava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let key_bytes = obj_arg(args, 1)?;
         let algo = obj_arg(args, 2)?;
-        ctx.set_field(this, 0, Value::Object(Some(key_bytes)));
+        let raw = read_bytes(ctx, key_bytes);
+        // `make_bytes_array` allocates, so both refs we still need must survive
+        // a moving collection. Unpinning from the FIRST handle releases both.
+        let this_pin = ctx.pin_native_root(this);
+        let algo_pin = ctx.pin_native_root(algo);
+        let copy = make_bytes_array(ctx, &raw);
+        let this = ctx.read_native_pin(this_pin, this);
+        let algo = ctx.read_native_pin(algo_pin, algo);
+        ctx.unpin_native_roots(this_pin);
+        ctx.set_field(this, 0, Value::Object(Some(copy)));
         ctx.set_field(this, 1, Value::Object(Some(algo)));
         Ok(None)
     });
+    // `return this.key.clone()`, for the same reason and with the same
+    // measurement behind it: handing the stored array back let a caller zero
+    // the key through the accessor. `Cipher.init` reads the key through
+    // `extract_key_bytes`, which takes field 0 directly and is unaffected by
+    // the extra copy.
     r.register(sks, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_byte_field(ctx, this, 0))))
     });
     r.register(sks, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2555,6 +3161,216 @@ mod tests {
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_128"), Some(16));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_192"), Some(24));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_256"), Some(32));
+    }
+
+    // -----------------------------------------------------------------------
+    // W7-15 — the admission table.
+    //
+    // Every "must raise" below has a measured RED behind it: the transformation
+    // named produced AES ciphertext on this tree's release binary before the
+    // table landed. Every "must still work" is a transformation the same binary
+    // computed correctly and byte-identically to HotSpot 25, so the fix is
+    // pinned on both sides.
+    // -----------------------------------------------------------------------
+
+    fn refuses_algorithm(t: &str) -> bool {
+        matches!(classify_transformation(t), TransformVerdict::NoSuchAlgorithm)
+    }
+
+    fn refuses_padding(t: &str) -> bool {
+        matches!(
+            classify_transformation(t),
+            TransformVerdict::NoSuchPadding(_)
+        )
+    }
+
+    /// MUST RAISE. The headline defect: both ChaCha20 names produced
+    /// AES-256-ECB, byte-identically to `AES/ECB/PKCS5Padding`, with the nonce
+    /// discarded and no AEAD tag.
+    #[test]
+    fn chacha20_is_refused_rather_than_served_as_aes() {
+        assert!(refuses_algorithm("ChaCha20"));
+        assert!(refuses_algorithm("ChaCha20-Poly1305"));
+        assert!(refuses_algorithm("chacha20-poly1305"));
+        assert!(refuses_algorithm("ChaCha20-Poly1305/None/NoPadding"));
+        // An AEAD this engine cannot authenticate must be refused, never
+        // approximated: a cipher that cannot fail on a bad tag is worse than a
+        // missing one, because the caller's integrity guarantee evaporates
+        // silently. The one AEAD that IS implemented stays admitted.
+        assert!(!refuses_algorithm("AES/GCM/NoPadding"));
+    }
+
+    /// MUST RAISE. It was never only ChaCha20 — `cipher_algorithm_known`
+    /// accepted a whole catalogue, and every name in it reached the same ECB
+    /// arm. Measured: `Blowfish` and `RC4` produced the SAME ciphertext as each
+    /// other from a 16-byte key, because both were AES-128-ECB.
+    #[test]
+    fn the_other_names_that_were_silently_aes_are_refused_too() {
+        for t in [
+            "Blowfish", "RC4", "ARCFOUR", "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish",
+            "Serpent", "CAST5", "Salsa20", "Skipjack", "ECIES", "ElGamal", "NULL",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused, not served as AES");
+        }
+        assert!(refuses_algorithm("CRATONVM-NO-SUCH-CIPHER"));
+    }
+
+    /// MUST RAISE. Modes with no implementation here. Each used to be admitted
+    /// by `getInstance` and then die at `doFinal` on an UNCHECKED
+    /// `IllegalStateException` naming "WP6.3 dispatch" — the wrong exception,
+    /// at the wrong call, uncatchable by `catch (GeneralSecurityException)`.
+    #[test]
+    fn unimplemented_modes_are_refused_at_getinstance() {
+        for t in [
+            "AES/CTR/NoPadding",
+            "AES/CTS/NoPadding",
+            "AES/PCBC/PKCS5Padding",
+            "AES/CFB8/NoPadding",
+            "AES/CCM/NoPadding",
+            "AES/KWP/NoPadding",
+            "AES_128/KWP/NoPadding",
+            "DESede/ECB/PKCS5Padding",
+            "DESede",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
+        }
+    }
+
+    /// MUST RAISE, as a PADDING failure specifically — the JDK distinguishes
+    /// the two exceptions and a caller may well catch only one. Measured on
+    /// HotSpot: `AES/CBC/PKCS7Padding` is refused outright, and
+    /// `AES/CBC/ISO10126Padding` is served with RANDOM padding bytes. This
+    /// engine implements PKCS#7-as-PKCS5Padding and nothing else, and served
+    /// BOTH of those as PKCS5.
+    #[test]
+    fn unimplemented_paddings_are_refused_not_aliased_onto_pkcs5() {
+        assert!(refuses_padding("AES/CBC/PKCS7Padding"));
+        assert!(refuses_padding("AES/CBC/ISO10126Padding"));
+        assert!(refuses_padding("AES/ECB/CRATONVM-NO-SUCH-PADDING"));
+        // AEAD and key wrap take NoPadding only.
+        assert!(refuses_padding("AES/GCM/PKCS5Padding"));
+        assert!(refuses_padding("AES/KW/PKCS5Padding"));
+        // RSA admits exactly what `RsaCipherPadding::from_transformation` does.
+        assert!(refuses_padding("RSA/ECB/NoPadding"));
+        assert!(refuses_padding("RSA/ECB/OAEPWithSHA-512AndMGF1Padding"));
+        assert!(refuses_algorithm("RSA/None/PKCS1Padding"));
+    }
+
+    /// MUST STILL WORK — the twin every refusal needs. These are the
+    /// transformations the measured binary computed correctly, several of them
+    /// byte-identically to HotSpot 25; none may become collateral damage.
+    #[test]
+    fn every_transformation_that_worked_before_still_resolves() {
+        for t in [
+            "AES/GCM/NoPadding",
+            "AES",
+            "AES/ECB/PKCS5Padding",
+            "AES/ECB/NoPadding",
+            "AES/CBC/PKCS5Padding",
+            "AES/CBC/NoPadding",
+            "AES/CFB/PKCS5Padding",
+            "AES/OFB/PKCS5Padding",
+            "AES/KW/NoPadding",
+            "AESWrap",
+            "AESWrap_128",
+            "AESWrap_192",
+            "AESWrap_256",
+            "AES_128/GCM/NoPadding",
+            "AES_256/CBC/NoPadding",
+            "DES/CBC/PKCS5Padding",
+            "DESede/CBC/PKCS5Padding",
+            "TripleDES/CBC/PKCS5Padding",
+            "RSA",
+            "RSA/ECB/PKCS1Padding",
+            "RSA/ECB/OAEPWithSHA-256AndMGF1Padding",
+            "RSA/ECB/OAEPPadding",
+            "PBEWithHmacSHA1AndAES_128",
+            "PBEWithHmacSHA256AndAES_256",
+            // JCA lookup is case-insensitive and the JDK trims each token —
+            // measured, `aes / gcm / nopadding` resolves on HotSpot.
+            "aes/gcm/nopadding",
+            "AES / GCM / NoPadding",
+        ] {
+            assert!(
+                transformation_is_serviceable(t),
+                "{t} worked before this lane and must still resolve"
+            );
+        }
+    }
+
+    /// The tokenizer is the JDK's, messages included — these four shapes were
+    /// all accepted before, with `parse_transformation` inventing whatever it
+    /// needed. `"AES/CBC"` became a padded CBC cipher; the JDK calls it invalid.
+    #[test]
+    fn malformed_transformations_carry_the_jdk_messages() {
+        let msg = |t: &str| match classify_transformation(t) {
+            TransformVerdict::InvalidFormat(m) => m,
+            _ => panic!("{t} must be an invalid format"),
+        };
+        assert_eq!(msg("AES/CBC"), "Invalid transformation format:AES/CBC");
+        assert_eq!(
+            msg("AES/CBC/"),
+            "Invalid transformation: missing mode and/or padding-AES/CBC/"
+        );
+        assert_eq!(
+            msg("/CBC/NoPadding"),
+            "Invalid transformation: algorithm not specified-/CBC/NoPadding"
+        );
+        // `getInstance` checks empty BEFORE tokenizing and says so; measured.
+        assert_eq!(msg(""), "Null or empty transformation");
+        // The JDK's own guard for an algorithm with a `/` inside its NAME: the
+        // first slash of `SHA512/224` must not be read as a mode separator.
+        assert_eq!(
+            tokenize_transformation("PBEWithHmacSHA512/224AndAES_128").unwrap(),
+            ("PBEWithHmacSHA512/224AndAES_128".to_string(), None, None)
+        );
+    }
+
+    /// `AES_128` means "AES with a 128-bit key". Before this lane the suffix
+    /// was decorative: measured, `AES_128/GCM/NoPadding` initialised from a
+    /// 256-bit key and encrypted with AES-256.
+    #[test]
+    fn size_pinned_names_pin_the_key_length() {
+        assert_eq!(transformation_pinned_key_len("AES_128/GCM/NoPadding"), Some(16));
+        assert_eq!(transformation_pinned_key_len("AES_192/CBC/NoPadding"), Some(24));
+        assert_eq!(transformation_pinned_key_len("AES_256/ECB/NoPadding"), Some(32));
+        assert_eq!(transformation_pinned_key_len("AES/GCM/NoPadding"), None);
+        // HotSpot's measured wording, both flavours.
+        assert_eq!(
+            aes_key_length_reason("AES_128/GCM/NoPadding", 32).as_deref(),
+            Some("The key must be 16 bytes")
+        );
+        assert_eq!(
+            aes_key_length_reason("AES/GCM/NoPadding", 17).as_deref(),
+            Some("Invalid AES key length: 17 bytes")
+        );
+        // MUST STILL WORK: the legal sizes, and the families this rule does
+        // not govern.
+        assert!(aes_key_length_reason("AES_128/GCM/NoPadding", 16).is_none());
+        for n in [16, 24, 32] {
+            assert!(aes_key_length_reason("AES/CBC/PKCS5Padding", n).is_none());
+        }
+        assert!(aes_key_length_reason("RSA/ECB/PKCS1Padding", 294).is_none());
+        assert!(aes_key_length_reason("PBEWithHmacSHA1AndAES_128", 9).is_none());
+        assert!(aes_key_length_reason("DESede/CBC/PKCS5Padding", 24).is_none());
+        // An unreadable key is a different diagnosis and must not be reported
+        // as a length complaint.
+        assert!(aes_key_length_reason("AES/GCM/NoPadding", 0).is_none());
+    }
+
+    /// A bare `AES` really is `AES/ECB/PKCS5Padding` on SunJCE (measured:
+    /// HotSpot's ciphertext for the two is byte-identical), so that default is
+    /// kept — but it is now a property of the AES arm rather than of every
+    /// algorithm name that reaches `parse_transformation`.
+    #[test]
+    fn the_ecb_default_is_scoped_to_the_family_that_has_one() {
+        assert!(transformation_is_serviceable("AES"));
+        assert!(refuses_algorithm("ChaCha20"));
+        // `AES_128` alone is not a service on SunJCE either — measured,
+        // `Cipher.getInstance("AES_128")` raises while `AES_128/CBC/NoPadding`
+        // resolves — so the default must not manufacture one.
+        assert!(refuses_algorithm("AES_128"));
+        assert!(transformation_is_serviceable("AES_128/CBC/NoPadding"));
     }
 
     #[test]

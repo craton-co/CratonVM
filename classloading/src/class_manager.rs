@@ -9015,6 +9015,15 @@ impl ClassManager {
                 | "java/util/Collections$EmptyEnumeration"
                 | "java/util/ArrayList$Itr"
                 | "java/util/ArrayList$ListItr"
+                // `Arrays.asList(T...)`'s fixed-size view. Concrete, and
+                // instantiated: `native_arrays_as_list` allocates one per call
+                // and the accessors read its `a` slot. Left to the `$`
+                // heuristic it was fabricated as an ABSTRACT INTERFACE, so the
+                // one field it needs could never be stored — every
+                // `Arrays.asList(...)` answered `size() == 0`, which is what
+                // `KNOWN_SYNTHETIC_JDK_GAPS` pinned as a missing
+                // `Arrays.asList`.
+                | "java/util/Arrays$ArrayList"
                 | "java/util/function/Function$Identity"
         );
         // LETSGO_S1: Curated list of well-known JDK interfaces whose names
@@ -10278,6 +10287,19 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/lang/Exception" => "java/lang/Throwable",
         "java/io/IOException" => "java/lang/Exception",
         "java/io/FileNotFoundException" => "java/io/IOException",
+        // Serialization's own IOException subtree. Needed as soon as anything
+        // throws one of these by class rather than as a plain `IOException`
+        // carrying the name in its message: without the chain a fabricated
+        // `NotSerializableException` extends `java.lang.Object`, so
+        // `catch (IOException)` — and even `catch (Exception)` — does not
+        // match it, and the throw escapes the handler that was written for it.
+        "java/io/ObjectStreamException" => "java/io/IOException",
+        "java/io/NotSerializableException"
+        | "java/io/InvalidClassException"
+        | "java/io/InvalidObjectException"
+        | "java/io/StreamCorruptedException"
+        | "java/io/OptionalDataException"
+        | "java/io/WriteAbortedException" => "java/io/ObjectStreamException",
 
         // RuntimeException hierarchy
         "java/lang/RuntimeException" => "java/lang/Exception",
@@ -10793,6 +10815,68 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/lang/Class" => &[
             "java/io/Serializable",
             "java/lang/reflect/GenericDeclaration",
+            "java/lang/reflect/Type",
+            "java/lang/reflect/AnnotatedElement",
+        ],
+        // ---- sun.reflect.generics reified types ----
+        //
+        // `Field.getGenericType()`, `Class.getGenericSuperclass()` and the
+        // rest of the WP2.8 reifier deliberately hand back a REAL
+        // `sun.reflect.generics.reflectiveObjects.*Impl` rather than the bare
+        // interface name, so `getTypeName()`/`toString()` render like HotSpot
+        // (`generics::typesig_to_real_type`, `build_wildcard_type`). In a
+        // synthetic-library build those `*Impl` names have no class file, so
+        // they were fabricated here — and, with no arm in this table, they
+        // were fabricated implementing NOTHING. `getGenericType()` then
+        // returned an object that answered `false` to `instanceof
+        // ParameterizedType`, which is the check every consumer of the API
+        // opens with:
+        //
+        //     Type t = f.getGenericType();
+        //     if (!(t instanceof ParameterizedType)) return 0;   // taken
+        //
+        // So the four `GenericReflectionTest` entries pinned in
+        // `KNOWN_SYNTHETIC_JDK_GAPS` ("`getGenericType` / `getGenericSuper-
+        // class` never surface `ParameterizedType` or `WildcardType`") were
+        // not a missing reifier: the reifier ran, produced the right raw type
+        // and the right actual type arguments, and handed them back on an
+        // object no `instanceof` could recognise. Measured under
+        // `--synthetic-jdk`, the object's `getClass().getName()` was already
+        // `sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl` while
+        // `t instanceof ParameterizedType` was `false`.
+        //
+        // `java/lang/reflect/Type` is listed on each explicitly: these classes
+        // are fabricated with `java/lang/Object` as their superclass, so they
+        // inherit no interface, and code that erases to `Type` (every `Type[]`
+        // element store, `getActualTypeArguments`, `getBounds`) needs the
+        // supertype to be true of them.
+        "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => &[
+            "java/lang/reflect/ParameterizedType",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => &[
+            "java/lang/reflect/WildcardType",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => &[
+            "java/lang/reflect/TypeVariable",
+            "java/lang/reflect/GenericDeclaration",
+            "java/lang/reflect/AnnotatedElement",
+            "java/lang/reflect/Type",
+        ],
+        "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => &[
+            "java/lang/reflect/GenericArrayType",
+            "java/lang/reflect/Type",
+        ],
+        // The bare-interface synthetics the same reifier mints on its
+        // fallback paths (`generics::type_sig_to_java`) are `instanceof`-
+        // correct for their own name for free, but nothing linked them to
+        // `Type` — the erased element type of every array they are stored
+        // into.
+        "java/lang/reflect/ParameterizedType"
+        | "java/lang/reflect/WildcardType"
+        | "java/lang/reflect/GenericArrayType" => &["java/lang/reflect/Type"],
+        "java/lang/reflect/TypeVariable" => &[
             "java/lang/reflect/Type",
             "java/lang/reflect/AnnotatedElement",
         ],
@@ -11539,6 +11623,53 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }],
         "java/util/Collections$EmptyEnumeration" => vec![],
         "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => instance_fields(5),
+        // `Arrays.asList(T...)`'s fixed-size view. The real nested class has
+        // exactly one field, `private final E[] a`, and derives `size()` from
+        // `a.length` — which is what `native_arrays_as_list` and the
+        // `Arrays$ArrayList` accessors in `native-collections` are written
+        // against (`arrays_array_list_backing` looks the slot up BY NAME).
+        // Without this arm the fabricated stub had zero slots, so the array
+        // could not be stored at all: `size()` answered 0 for every list and
+        // `Arrays.asList` was pinned as a synthetic-JDK gap.
+        "java/util/Arrays$ArrayList" => vec![named_field("a", "[Ljava/lang/Object;")],
+        // ---- sun.reflect.generics reified types ----
+        //
+        // The WP2.8 reifier allocates these by name and populates them with
+        // `set_field_by_name`, and every accessor native in
+        // `native-builtins/src/lang_reflect.rs` reads them back BY NAME. With
+        // no arm here the fabricated stubs had zero declared slots, so
+        // `class_num_total_fields` was 0, the `.max(2)`/`.max(3)` floors gave
+        // the objects anonymous `_fN` slots instead, and every
+        // `set_field_by_name` write was silently discarded: `getRawType()`
+        // answered null and `getActualTypeArguments()` answered null on an
+        // object whose raw type and arguments had just been computed
+        // correctly.
+        //
+        // Declaration ORDER matters and is the JDK's own — see the
+        // `pti_real` note in `lang_reflect.rs`, which records the real
+        // `ParameterizedTypeImpl` layout as `actualTypeArguments[0],
+        // rawType[1], ownerType[2]`. The `java/lang/reflect/ParameterizedType`
+        // interface natives registered beside it read slots 0/1/2 POSITIONALLY
+        // for the bare-interface synthetic (rawType at 0, arguments at 1,
+        // owner at 2), which is a different object and a different order; do
+        // not "unify" the two.
+        "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl" => vec![
+            named_field("actualTypeArguments", "[Ljava/lang/reflect/Type;"),
+            named_field("rawType", "Ljava/lang/Class;"),
+            named_field("ownerType", "Ljava/lang/reflect/Type;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => vec![
+            named_field("upperBounds", "[Ljava/lang/reflect/Type;"),
+            named_field("lowerBounds", "[Ljava/lang/reflect/Type;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => vec![
+            named_field("genericDeclaration", "Ljava/lang/reflect/GenericDeclaration;"),
+            named_field("name", "Ljava/lang/String;"),
+            named_field("bounds", "[Ljava/lang/Object;"),
+        ],
+        "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => {
+            vec![named_field("genericComponentType", "Ljava/lang/reflect/Type;")]
+        }
         // Collections: ArrayList/Vector/Stack/CopyOnWriteArrayList = 2 fields (data, size)
         "java/util/ArrayList"
         | "java/util/Vector"

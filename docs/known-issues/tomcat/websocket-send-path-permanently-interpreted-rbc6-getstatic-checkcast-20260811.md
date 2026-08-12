@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — cause named, fix not attempted |
+| **Status** | OPEN — two of the three opcodes admitted 2026-08-11; **the test did not move** |
 | **HotSpot** | `OK (1 test)` |
 | **CratonVM** | `testAsyncTiming` fails on timing only — **0 framing failures** |
 | **Discovered** | 2026-08-11, running the check `29-throughput-wall-recurrence-and-unconfirmed` asked for |
@@ -111,3 +111,79 @@ CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1 <cratonvm> --java-home /data/toolchain/j
 Do not filter stdout to JUnit's own lines — the `SEQ0:`/`SEQ1:`/`SEQ2:`
 diagnostics the test prints are the only thing separating a framing bug from a
 latency one, and `Assert.assertFalse(handler.hasFailed())` reports neither.
+
+
+---
+
+## Update 2026-08-11 — `getstatic` and `checkcast` admitted, and it changed nothing measurable
+
+`precise_frame_publishing_opcode` now admits `0xb2` and `0xc0`
+(`fix/rbc6-getstatic-checkcast-arraylength-20260811`). Neither needed new
+codegen — both were already publishing on every path that can throw, and the
+admission list had simply never been revisited, exactly as
+`rbc6-protected-field-ops-FIXED-20260802` found for `getfield`/`putfield`. The
+per-opcode argument is on `precise_getstatic_checkcast_enabled`.
+
+**What it bought: one method.** `WsRemoteEndpointImplBase.endMessage` (the
+`0xc0` site) now compiles. That is all.
+
+**What it did not buy.** The other two did not become compilable — the bail
+moved to the next unadmitted opcode in the same protected range:
+
+| method | before | after |
+|---|---|---|
+| `WsRemoteEndpointImplBase.startMessage` | `pc=169, op=0xb2` getstatic | `pc=172, op=0x13` **ldc_w** |
+| `NioEndpoint$…$NioOperationState.run` | `pc=23, op=0xb2` getstatic | `pc=44, op=0x12` **ldc** |
+| `IntrospectionUtils.setProperty` | `pc=84, op=0xbe` arraylength | unchanged |
+
+**And the test did not move.** Timing failures before → after: SEQ0 16 → 35,
+SEQ1 16 → 22, SEQ2 362 → 344, against budgets of 1/10/100. Still 0 framing
+failures. The host was loaded for both runs, so read this as "unchanged", not
+as a regression — but it is certainly not an improvement.
+
+### The part worth arguing about before spending more
+
+One of the three hot methods *did* become compilable and the numbers did not
+respond. That is weak evidence that JIT admission is not the binding constraint
+on this test at all. Before doing the `ldc`/`ldc_w` work, someone should
+establish that compiling these methods is worth anything — e.g. by measuring
+the send path with all three compiled (a hand-built binary that admits `ldc`
+unsafely would answer it in one run, without shipping anything), or by
+profiling where the inter-chunk gap actually goes. This family has a long
+history of named-lever-moves-nothing: see the retired WebFlux, AQS and
+native-funnel pages.
+
+### If the `ldc` work does get done
+
+`ldc`/`ldc_w` are genuinely unpublished, and in two different ways:
+
+* the String path calls `helpers.ldc_string` (it allocates) with **no**
+  `emit_post_invoke_exception_check` after it;
+* the Class path resolves through `helpers.ldc_class_cp`, which can run a user
+  `ClassLoader.loadClass` and throw, and whose `0`-return guard branches to the
+  **shared** sentinel stub — no frame at the bci.
+
+So this is not another bookkeeping correction; it is new codegen on two arms,
+and the Class arm's `0`-return convention differs from the `i64::MIN` sentinel
+that `emit_post_invoke_exception_check` tests for.
+
+`arraylength` (`0xbe`) remains unadmitted for the reason given above, and is now
+the foil in `protected_instanceof_is_precise_exception_covered`.
+
+### Verification of the admission itself
+
+* `cratonvm-jit`: 14 suites green, including two new tests —
+  `rbc6_admits_exactly_the_opcodes_whose_lowerings_publish` and
+  `rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength`.
+* Tomcat regression slice on the new binary: `TestTomcat` (26),
+  `TestStandardContext` (27), `TestDirResourceSet` (40), `TestJMXAccessorTask`
+  (1) — 94 tests, all green.
+* `vm --test jit_local_exception_handler_tests` fails 3
+  (`test_jit_exception_in_handler_not_recaught_by_same_handler`,
+  `test_jit_indy_after_side_effect_no_double_execution`,
+  `test_precise_handler_frame_catches_a_throw_at_the_end_of_its_try`).
+  **Pre-existing**, established by re-running the same binary with
+  `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST=1`: identical three failures.
+  The opt-out was itself proved live first — with it set,
+  `rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength` fails on the
+  checkcast assertion — so that A/B is not a vacuous green.
