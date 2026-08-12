@@ -599,7 +599,7 @@ impl ModuleRegistry {
     ///   java.logging.canRead(unnamed)      = true
     /// ```
     ///
-    /// (`regression-suite/src/RJdkModule.java:114`,
+    /// (`regression-suite/src/RJdkModule.java:124`,
     /// `check(!svc.canRead(unnamed), "a named module must NOT implicitly read
     /// the unnamed module")`, failed in BOTH `--real-jdk` and `--jdk-only` on
     /// the symmetric rule.)
@@ -1087,7 +1087,7 @@ impl ModuleRegistry {
     ///
     /// # This function is NOT the reflection gate
     ///
-    /// `RJdkModule.java:172` (a public no-arg constructor on a public class in
+    /// `RJdkModule.java:182` (a public no-arg constructor on a public class in
     /// the one package the module neither exports nor opens must be refused
     /// with `IllegalAccessException`) does **not** route through here.
     /// `Constructor.newInstance` is served by
@@ -1737,7 +1737,7 @@ mod tests {
     /// UNNAMED_MODULE`, making the rule symmetric where JPMS makes it
     /// directional. Measured on HotSpot 25: `unnamed.canRead(java.logging)` is
     /// `true`, `java.logging.canRead(unnamed)` is `false`.
-    /// `regression-suite/src/RJdkModule.java:114` asserts exactly that and
+    /// `regression-suite/src/RJdkModule.java:124` asserts exactly that and
     /// failed in both `--real-jdk` and `--jdk-only`.
     #[test]
     fn named_module_does_not_implicitly_read_the_unnamed_module() {
