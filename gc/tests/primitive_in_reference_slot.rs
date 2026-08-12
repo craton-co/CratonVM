@@ -378,3 +378,106 @@ fn a_boxed_slot_survives_a_collection_on_every_collector() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The ratchet
+// ---------------------------------------------------------------------------
+
+/// Every field-store implementation in this crate goes through
+/// `crate::autobox`, both halves.
+///
+/// The behavioural tests above cover the three arms `VmHeap` can construct.
+/// `gc/src/heap.rs`'s `Heap` is a FOURTH implementation of the same primitive
+/// with the same encoder, and it is not reachable through `VmHeap` at all — so
+/// nothing above would notice it drifting back, and nothing above would notice
+/// a FIFTH heap arriving without the calls. That is exactly how this
+/// disagreement got here: `gen_heap` grew the boxing arm and the others did
+/// not, and no test could see the difference.
+///
+/// A text scan, deliberately. The property is "these four files call this one
+/// module", which is structural, and a structural property closes by becoming a
+/// ratchet rather than by being re-argued.
+#[test]
+fn all_four_field_store_implementations_route_through_the_shared_primitive() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for file in ["gen_heap.rs", "zgc.rs", "g1.rs", "heap.rs"] {
+        let path = src.join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            text.contains("autobox::box_for_reference_slot"),
+            "{file} defines a field store but does not call \
+             `crate::autobox::box_for_reference_slot`. A primitive written into \
+             a declared-reference slot there will be handed to \
+             `write_compact_field`, whose `FieldStorageKind::Reference` arm maps \
+             it to raw 0 — i.e. the write is silently dropped to null while the \
+             other heaps preserve it. That is the W7-84 defect returning.",
+        );
+        assert!(
+            text.contains("autobox::unbox_reference_slot"),
+            "{file} does not call `crate::autobox::unbox_reference_slot`, so a \
+             boxed slot read there hands the caller the wrapper — an object of \
+             the synthetic `AUTOBOX_CLASS_ID` with no class name and no methods \
+             — instead of the value inside it.",
+        );
+    }
+}
+
+/// …and there is no FIFTH one hiding. If a new heap appears, it must be added
+/// to the list above (and to `backends()`) rather than quietly inheriting the
+/// bug the list exists to prevent.
+#[test]
+fn there_are_exactly_four_field_store_implementations() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // RECURSIVE, not `read_dir` on the top level. `gc/src/zgc/` alone holds a
+    // dozen modules; a heap added under any of them would be invisible to a
+    // flat scan, which is the exact blind spot this ratchet exists to close.
+    let mut stack = vec![src];
+    let mut found: Vec<String> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("gc/src is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            // The two spellings the four implementations, the trait declaration
+            // and the dispatcher all share. Validated against ground truth
+            // (`grep -rln` over `gc/src`) before this expectation was written,
+            // rather than after: it returns these six files and no others.
+            if text.contains("fn set_field(&self, obj: ObjectRef, index: usize, value: Value)")
+                || text
+                    .contains("fn set_field(&self, obj_ref: ObjectRef, index: usize, value: Value)")
+            {
+                found.push(
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "collector.rs".to_string(),
+            "g1.rs".to_string(),
+            "gen_heap.rs".to_string(),
+            "heap.rs".to_string(),
+            "vm_heap.rs".to_string(),
+            "zgc.rs".to_string(),
+        ],
+        "the set of files declaring a field store changed. `collector.rs` is \
+         the trait declaration and `vm_heap.rs` is the dispatcher; the other \
+         four are implementations and every one of them must appear in \
+         `all_four_field_store_implementations_route_through_the_shared_primitive`. \
+         A new implementation that is not in that list inherits the W7-84 \
+         disagreement by default.",
+    );
+}
