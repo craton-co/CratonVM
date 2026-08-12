@@ -33585,8 +33585,8 @@ const AD_DEFAULT_CAPACITY: usize = 16;
 /// `ArrayDeque.addFirst`/`addLast` open with `if (e == null) throw new
 /// NullPointerException();`, and that refusal is load-bearing rather than
 /// defensive: a null in the ring buffer is how real `ArrayDeque` bytecode
-/// *encodes* "another thread mutated me while I was iterating". `ArrayDeque
-/// .nonNullElementAt` turns any null it reads into a
+/// *encodes* "another thread mutated me while I was iterating".
+/// `nonNullElementAt` turns any null it reads into a
 /// `ConcurrentModificationException`, so accepting one here does not just lose
 /// three `no-throw` observables — it arms the JDK's own iterator to kill a
 /// caller that never touched null.
