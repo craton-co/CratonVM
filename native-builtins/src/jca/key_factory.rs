@@ -1444,6 +1444,21 @@ fn kf_algo_idx(name: &str) -> i32 {
     }
 }
 
+/// Whether `KeyFactory.getInstance` will hand back a receiver for `name` —
+/// `kf_get_instance` throws `NoSuchAlgorithmException` on a negative index.
+///
+/// Exposed for `provider_chain`'s
+/// `every_advertised_key_factory_name_is_serviceable` ratchet, which owns the
+/// seed lists this has to stay equal to. The `ML-DSA` UMBRELLA name was
+/// advertised by the `SUN` `KeyFactory` seed and refused here for several
+/// waves — while `signature::algo_idx` carried the same umbrella arm, so two
+/// engines disagreed about one name. De-advertising it for `KeyFactory` only,
+/// and pinning the pair with that test, is what closed it.
+/// W7-63-jca-advertise-vs-serve.md.
+pub(crate) fn get_instance_offers(name: &str) -> bool {
+    kf_algo_idx(name) >= 0
+}
+
 fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {

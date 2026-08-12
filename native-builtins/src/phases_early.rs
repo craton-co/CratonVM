@@ -16681,10 +16681,30 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 }
             }
             let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems)?;
+            // HotSpot answers `Collections$UnmodifiableSet` here, and this
+            // registration deliberately SHADOWS the registry-backed twin under
+            // `--synthetic-jdk` — so a wrapper applied only over there would be
+            // a fix that is invisible in the one mode this code path serves.
+            // Two surfaces of one method drifting is the defect this whole
+            // registration exists to prevent, and that applies to the SHAPE of
+            // the answer as much as to its contents.
+            // W7-63-jca-advertise-vs-serve.md.
+            //
+            // Wrap BEFORE unpinning: the Java round trip can move `set`.
+            //
+            // Caveat, recorded rather than fixed here: in `--synthetic-jdk`,
+            // `java/util/Collections.unmodifiableSet` is itself bound to
+            // `native_return_first_arg` — the IDENTITY — by two registrars in
+            // this file, and `register_synthetic_overrides` runs last, so this
+            // wrap is expected to be INERT in exactly the mode this code path
+            // serves. It is added anyway, because on the day that identity
+            // registration is repaired this call site must already be right,
+            // and because the alternative is a third surface to remember.
+            let view = crate::jca::provider_chain::wrap_unmodifiable_public(ctx, set);
             if let Some(base) = pins.first() {
                 ctx.unpin_native_roots(*base);
             }
-            Ok(Some(Value::Object(Some(set))))
+            Ok(Some(Value::Object(Some(view))))
         },
     );
 

@@ -894,6 +894,66 @@ fn drive_real_mldsa(
 // Native methods
 // ---------------------------------------------------------------------------
 
+/// Whether `Signature.getInstance` may hand back a receiver for `name`.
+///
+/// `Signature.getInstance` used to accept **every string**. Measured against a
+/// running binary in both arms (W7-29-jca-advertise-implement-gaps.md
+/// residual 5): `getInstance("ML-KEM")`, `("AES")`, `("HmacSHA256")`,
+/// `("NO-SUCH-SIG")` and `("")` all returned a live object whose
+/// `getAlgorithm()` was the sentinel `"Unknown"`, where HotSpot 25 raises
+/// `NoSuchAlgorithmException: <name> Signature not available` for each.
+///
+/// This is not the `Cipher`/`Mac` species — the engine does not fabricate a
+/// cryptographic result, because `sign_dispatch`/`verify_dispatch` refuse an
+/// unrecognised index and `refuse_unanswerable` converts that into a
+/// `SignatureException` rather than an empty signature or a bare `false`. It
+/// is a **deferred and mistyped refusal**, which is its own harm: a caller
+/// writing the ordinary
+///
+/// ```java
+/// try { s = Signature.getInstance(name); } catch (NoSuchAlgorithmException e) { fallback(); }
+/// ```
+///
+/// takes the wrong branch, concludes the algorithm is available, and meets the
+/// failure much later at a point where its `catch` clauses are written for a
+/// bad signature rather than a missing algorithm. Probing an engine for a name
+/// it may not have is ordinary library behaviour.
+///
+/// **The gate is a DISJUNCTION, and W7-29's prescription — gate on
+/// `find_service_provider("Signature", algo)` alone — would have been a
+/// regression.** The registry is seeded with friendly names only, while
+/// `algo_idx` deliberately also carries the signature-algorithm OIDs
+/// (`1.2.840.113549.1.1.11` and neighbours) because X.509 `cert.verify()`
+/// resolves `Signature.getInstance(signatureAlgorithm.getId())` by OID, not by
+/// friendly name. A registry-only gate refuses every one of those at
+/// `getInstance` and breaks certificate verification outright — the same
+/// shape as this record's other correction, where a record's observation is
+/// right and its prescribed fix has been overtaken.
+///
+/// So: accept a name this engine has a concept of (`idx >= 0`), OR a name some
+/// provider in the live chain advertises. Nothing else. That closes both
+/// directions at once — no unadvertised-and-unimplemented name is served, and
+/// no advertised name is refused, which is what
+/// `every_advertised_signature_name_is_offered_by_get_instance` ratchets.
+///
+/// A name that is advertised but has no `algo_idx` arm (`SHA3-256withRSA` and
+/// eight neighbours on `SunRsaSign`) still gets a receiver and still fails at
+/// `sign()`/`verify()` with the checked `SignatureException`. That is an
+/// ordinary unimplemented-algorithm gap and NOT this record's species — the
+/// name is real, the advertisement is truthful, and the failure is closed and
+/// catchable. Narrowing it belongs to whoever implements those arms.
+/// W7-63-jca-advertise-vs-serve.md.
+fn signature_name_is_offered(idx: i32, name: &str) -> bool {
+    idx >= 0 || crate::jca::provider_chain::find_service_provider("Signature", name).is_some()
+}
+
+/// The same gate, by name only, for the provider-chain ratchet — which owns
+/// the seed lists and the `#[cfg(test)]` lock that serialises the process-wide
+/// service map, so the test has to live over there.
+pub(crate) fn get_instance_offers(name: &str) -> bool {
+    signature_name_is_offered(algo_idx(name), name)
+}
+
 fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Shared by all three `getInstance` overloads — see `check_named_provider_arg`.
     crate::jca::provider_chain::check_named_provider_arg(
@@ -912,6 +972,12 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
     let idx = algo_idx(&alg);
+    if !signature_name_is_offered(idx, &alg) {
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            &format!("{alg} Signature not available"),
+        ));
+    }
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
     // SigProbe fix: side-table is the authoritative store; the base-offset

@@ -1,0 +1,485 @@
+# The JCA provider chain advertises algorithms it will not serve — and serves names it never advertised
+
+**Status: FIXED in source 2026-08-12, NOT yet verified against a binary.** This
+lane could not build or run Rust. Every Rust change below is source work backed
+by in-tree unit tests and by a HotSpot 25 oracle; nothing here has been observed
+on a CratonVM binary. The verification command is in §9.
+
+This record **supersedes and closes the residual halves of two others**:
+
+* `W4-3-security-getalgorithms-short-list.md` — Patches A, B, C, D, F.
+* `W7-29-jca-advertise-implement-gaps.md` — residuals 1 to 5.
+
+`W7-55-record-reconciliation.md` §8 recorded that those "are the same five
+defects seen from two ends. Fix them once." That reading is close and it is not
+a measurement. **The true count is seven.** §1 has the arithmetic.
+
+---
+
+## 1. The population, unified
+
+The reconciliation's claim was five-and-five-are-one-five. Adjudicated
+name by name against the tree on 2026-08-12:
+
+| # | defect | W4-3 calls it | W7-29 calls it | shape |
+|---|---|---|---|---|
+| 1 | `MD2` advertised by `SUN` `MessageDigest`, refused by `getInstance` | Patch B | residual 1 | **advertise-but-refuse** |
+| 2 | `SHAKE128-256` / `SHAKE256-512` neither implemented nor advertised | Patch C | residual 2 | *neither* — see below |
+| 3 | `Security.getAlgorithms` / `Provider.getServices` answer a mutable set | Patch A | residual 3 | *shape of the answer* |
+| 4 | `SUN` `KeyFactory` advertises the `ML-DSA` umbrella, refuses it | Patch F | residual 4 | **advertise-but-refuse** |
+| 5 | `Signature.getInstance` accepts every string | — | residual 5 | **serve-but-never-advertise** |
+| 6 | `compute_digest` / `digest_length_bytes` default to SHA-256 / 32 | Patch D | — | **serve-but-never-advertise, with WRONG BYTES** |
+| 7 | `SunJCE` `KeyFactory` advertises the `ML-KEM` umbrella, refuses it | — | — | **advertise-but-refuse** |
+
+**Four are shared. One is unique to each record. One is in neither.**
+
+* **#6 is in W4-3 only.** W7-29's five residuals do not include it. The reason
+  is instructive: W7-29 ran its probes against a real-JDK-mode binary, where
+  `md_get_instance` gates on `algorithm_supported` first and the fallback arm is
+  unreachable. It is live only in `--synthetic-jdk`, which no lane in this
+  campaign has ever built (`W7-55` §7). A defect scoped to a configuration
+  nobody runs does not show up in a run.
+* **#5 is in W7-29 only.** W4-3's census filed `Signature` / SUN as *"7
+  advertised, 7 implemented, none"*. It was read from source and it was looking
+  the wrong way down the asymmetry — see §2.
+* **#7 is in neither.** The census probe found it: `SunJCE` advertises
+  `KeyFactory.ML-KEM` and `key_factory::algo_idx` has arms for
+  `ML-KEM-512/768/1024` only. Structurally identical to #4, eleven lines away in
+  the same seed function, and invisible to both source reads.
+
+The instrument is what found #7, which is the argument for building it. §7.
+
+## 2. Why a census keeps missing half of this
+
+`Security.getAlgorithms(type)` is enumerable. **The set of names an engine will
+ACCEPT is not.** Only the first is a list, so a census that compares two lists
+can only ever see defects in one direction.
+
+W7-29 stated this precisely for `CertificateFactory` and it generalises to the
+whole family: the advertised set was `[X.509]` on both VMs, had agreed the whole
+time, and `getInstance("PKCS7")` still returned a working X.509 parser. No
+comparison of the two lists could have found it.
+
+So the family splits four ways, not three, and the fourth is the one that gets
+mistaken for the others:
+
+* **advertise-but-refuse** (#1, #4, #7). Loud. `getInstance` throws where the
+  advertised set said yes. Harmful because callers enumerate the provider to
+  decide what is available, so this makes the enumeration a lie — but it fails
+  closed, and the caller finds out.
+* **advertise-but-mis-serve** (#6 in synthetic mode; historically the ChaCha20
+  and `Mac` defects). Silent, and the worst. `getInstance` succeeds and the
+  bytes are wrong. **Only a known-answer vector can see this**, which is why §7
+  is built the way it is.
+* **serve-but-never-advertise** (#5, and #6 read structurally). The advertised
+  list never moves, so no census sees it. Ranges from harmless to catastrophic
+  depending on what the default arm does.
+* **implement-but-don't-advertise.** The least harmful and the easiest to
+  mistake for the others: the code is right, the list is short, and nothing
+  breaks except that nobody asks for a name nobody publishes. **This is what #2
+  was misfiled as, in both records, and it is not what #2 was.** SHAKE was
+  neither implemented nor advertised — internally consistent, a plain
+  HotSpot-parity gap, not a member of this species at all. W4-3's residual pass
+  got this right in prose (*"the audit's residual, taken literally, asks for the
+  wrong change"*) and then the summary lines went on calling it "unadvertised".
+  It is fixed here because the task asked for it and because `sha3` was already
+  a dependency, not because it was the same defect.
+
+#3 is a fifth thing again: not about which names are in the set but about the
+**shape of the set itself**. Kept in the population because it is the same
+sentence — "this is a view of platform state" — being not-said.
+
+## 3. Disposition, per defect
+
+### #1 `MD2` — IMPLEMENTED (not de-advertised)
+
+RFC 1319 is short and fully specified, HotSpot 25 carries it, and implementing
+closes **three** advertisements rather than one: `SunRsaSign` and `SunMSCAPI`
+both advertise `MD2withRSA`, which resolves `MessageDigest.getInstance("MD2")`
+internally.
+
+`native-builtins/src/lib.rs`, `real_md2` + the `"MD2"` arm of `compute_digest`.
+
+**This lane could not build, so the transcription was adjudicated before it was
+written.** The identical algorithm was expressed in Java and run against
+HotSpot's own `MessageDigest.getInstance("MD2")` on ten messages — all matched,
+including the three padding boundaries (15 bytes, exactly 16, 17). MD2 pads with
+between 1 and 16 bytes and **never zero**, so an exact multiple of 16 takes a
+full extra block of `0x10`; that is the case a naive implementation gets wrong
+and it is why those three rows exist. The ten vectors are now
+`real_md2_matches_hotspot_vectors`, which also drives them through
+`compute_digest` — a correct `real_md2` wired to the wrong arm name passes the
+direct call and fails the dispatched one.
+
+MD2 is cryptographically broken and is present for parity, not for use. Nothing
+in the corpus asks for it. It reaches no TLS or signing path added here.
+
+### #2 SHAKE — IMPLEMENTED, then advertised, in that order
+
+`compute_digest` gains `"SHAKE128256"` / `"SHAKE256512"` (the `-`/`/`-stripping
+normalisation collapses the JDK spellings), pinned against the HotSpot and NIST
+vectors by `shake_matches_hotspot_vectors`. Only then do the two `put_service`
+rows land.
+
+**`SHAKE128` and `SHAKE256` are ALIASES, not services.** HotSpot carries
+`Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`; measured, `getInstance`
+resolves both bare spellings and returns bytes identical to the hyphenated
+primaries, while `Security.getAlgorithms("MessageDigest")` lists only the two
+primaries. Registering them as services would make the advertised count 17 where
+HotSpot answers 15. `every_advertised_sun_message_digest_is_serviceable` asserts
+both halves — resolvable through the alias map, absent from the advertised list.
+
+The two normalisations that had to agree for one pair of arm spellings to work
+in two files now have their own test
+(`shake_normalisations_agree_across_the_two_filters`). W7-29 asked for exactly
+that, on the grounds that the agreement is a coincidence of these names and not
+a property of the functions. It is.
+
+### #3 the mutable set — WRAPPED
+
+`wrap_unmodifiable` in `provider_chain.rs`, applied at the tail of both
+`security_get_algorithms` and `provider_get_services_native`, while the set is
+still pinned (the Java round trip can move it), on every path including the
+empty ones, per call and never cached.
+
+HotSpot's `Collections$EmptySet` vs `Collections$UnmodifiableSet` split for
+`""` / `"Foo."` / unknown-engine-type is **not** reproduced: both are immutable
+and both are size 0, which is the entire observable contract.
+
+### #4 `ML-DSA` `KeyFactory` — DE-ADVERTISED
+
+**This is a stop-advertising fix and it changes what
+`Security.getAlgorithms("KeyFactory")` returns.** `SUN` no longer lists
+`ML-DSA`. The three parameter-set names stay.
+
+Adding the umbrella arm was declined rather than deferred. W7-29 **ran** the
+three parameter-set names that already resolve and found the objects broken one
+accessor in: `KeyFactory.getInstance("ML-DSA-44").getProvider()` raises
+`NullPointerException: Cannot enter synchronized block because "this.lock" is
+null`, where HotSpot answers `SUN version 25`. Widening a surface that is
+already broken is not a fix.
+
+`Signature` **keeps** advertising `ML-DSA`, because `signature::algo_idx`
+genuinely carries `SIG_MLDSA`. The two engines disagreed about one name; the fix
+makes each engine truthful about **itself**, which is the invariant, rather than
+making the two agree with each other, which is not.
+
+### #5 `Signature.getInstance` accepts everything — GATED
+
+`signature::signature_name_is_offered`, checked before a receiver is allocated,
+refusing with `throw_no_such_algorithm_public` in HotSpot's measured wording
+(`<name> Signature not available`).
+
+**W7-29's prescription — gate on `find_service_provider("Signature", algo)` —
+would have been a regression, and this is the record's second instance of the
+`W7-55` §6 shape.** The service registry is seeded with friendly names only,
+while `signature::algo_idx` deliberately also carries the signature-algorithm
+OIDs (`1.2.840.113549.1.1.11` and neighbours) because X.509 `cert.verify()`
+resolves `Signature.getInstance(signatureAlgorithm.getId())` **by OID**. A
+registry-only gate refuses every one of those at `getInstance` and breaks
+certificate verification outright — the same failure `algo_idx`'s OID arms were
+added to fix, reintroduced one layer up.
+
+So the gate is a **disjunction**: a name this engine has an index for, OR a name
+some provider in the live chain advertises. That closes both directions at once
+and can only fail in one, which is what the ratchet asserts.
+
+W7-29 also asked for the `getAlgorithm()` sentinel `"Unknown"` to be deleted as
+unreachable. **It is still reachable and was left in place.** Nine `SunRsaSign`
+names (`MD2withRSA`, `SHA3-*withRSA`, `SHA512/224withRSA` and friends) are
+advertised, have no `algo_idx` arm, and are therefore admitted by the second
+disjunct with `idx == -1`. Deleting the sentinel on the strength of the
+prescription would have been a bug.
+
+Those nine still fail at `sign()`/`verify()` with the checked
+`SignatureException`. **That is not this record's species and is deliberately
+not closed here:** the name is real, the advertisement is truthful, and the
+failure is closed and catchable. It is an ordinary unimplemented-algorithm gap.
+`every_advertised_signature_name_is_offered_by_get_instance` is written to
+assert only the direction this record owns, and says so in its doc comment, so
+it does not go red for a gap this lane did not open.
+
+The 42-versus-64 advertised gap must **not** be closed by widening the seed
+list. After the gate, 22 of HotSpot's names would each become a
+`NoSuchAlgorithmException`, which is the truthful answer.
+
+### #6 the wrong-digest defaults — FAIL CLOSED
+
+`compute_digest`'s `_ => Ok(real_sha256(data))` becomes an `Err`, and
+`digest_length_bytes`'s `_ => 32` becomes `Option::None`.
+
+The pairing is the point. A caller asking for an unimplemented digest got 32
+bytes of SHA-256 **and** a `getDigestLength()` of 32 corroborating it. Two
+independent-looking observations agreeing because they shared one wrong default
+is what makes this species so hard to see from inside — it is the same
+self-corroboration that let the `Mac` engine report `getMacLength() == 32` for
+`HmacSHA224`.
+
+The synthetic-mode door is shut too. `native_md_get_instance` carried an `if`
+with an **empty body** and a comment asserting the JDK surfaces the failure
+lazily. It does not: HotSpot throws at `getInstance`, measured. Worse, the
+literal list that empty `if` tested had drifted — no SHA-224, no SHA-512/224, no
+SHA-512/256, no SHA3-224, all of which `compute_digest` implements — so the
+check it was not performing would have been wrong in the other direction as
+well. It now calls `message_digest::algorithm_supported_public`, the same
+predicate the real-JDK path uses. One predicate, two doors.
+
+**There was a THIRD digest-length table, and adding MD2 and SHAKE would have
+made it worse rather than better.** `native_md_get_digest_length` in
+`lib.rs` — the synthetic-mode `getDigestLength()` — carried its own `match`
+ending `_ => 32`, with no arms for MD2, SHA-224, SHA-512/224, SHA-512/256 or
+SHA3-224, and a `-`-only normalisation that let `SHA-512/256` reach the default
+and report 32 **by accident rather than by arm**. Since `getInstance` now
+*admits* MD2 and the SHAKEs, that table would have reported 16-byte MD2 as 32
+and 64-byte SHAKE256-512 as 32 — a newly implemented digest contradicting its
+own length, which is precisely the defect being closed. It now calls
+`digest_length_bytes_public`. One table, every door, and
+`every_supported_algorithm_computes_and_has_a_length` now covers this surface
+transitively because there is nothing else left for it to disagree with.
+
+Same reasoning applied to §3 #3's surface: the `--synthetic-jdk`
+`Security.getAlgorithms` override in `phases_early` deliberately shadows the
+registry-backed registration in that mode, so it now wraps through
+`wrap_unmodifiable_public` too. Applying the wrapper only to the shadowed twin
+would have been a fix invisible in the one mode that code path serves.
+
+### #7 `ML-KEM` `KeyFactory` — DE-ADVERTISED
+
+Same disposition and same reasoning as #4. `SunJCE` no longer lists `ML-KEM`;
+`ML-KEM-512/768/1024` stay.
+
+Worth one line on its own: that service row carries a **real JDK class name**
+(`com.sun.crypto.provider.ML_KEM_Impls$KF`). That is not evidence the row is
+serviceable. `kf_get_instance` intercepts natively and never reaches
+`build_jca_impl`, so the class name is documentation. W4-3's census used "carries
+a real JDK class name" as its filter for *"serviceable by construction; they are
+not the risk"* — that filter is unsound for any engine whose `getInstance` is
+natively intercepted, which is most of them.
+
+## 4. What stopped being advertised, explicitly
+
+**Exactly two names.** Both are knowing divergences from HotSpot in the
+under-advertising direction, and **something may enumerate them**, so they are
+listed here rather than left to the diff:
+
+| type | provider | name | HotSpot 25 | CratonVM before | CratonVM after |
+|---|---|---|---|---|---|
+| `KeyFactory` | `SUN` | `ML-DSA` | advertised, served | advertised, **refused** | not advertised, refused |
+| `KeyFactory` | `SunJCE` | `ML-KEM` | advertised, served | advertised, **refused** | not advertised, refused |
+
+Note the *before* column: `getInstance` already refused both. Nothing that
+worked stops working — what changes is only that
+`Security.getAlgorithms("KeyFactory")` stops naming two algorithms this VM will
+not hand over. In both cases the alternative was to keep advertising a name
+`getInstance` refuses. **A missing algorithm is far better than a wrong one, and
+better than a lie about a missing one.**
+
+Neither name is asked for by anything in the tree, checked before removal: no
+Java source under `regression-suite/`, `vm/tests/resources/` or `probes/`
+mentions either, `find_service_provider("Signature", ..)` has no callers at
+all, and these `KeyFactory` rows are reached only through `kf_get_instance`.
+
+`Signature`'s 42-versus-64 under-advertisement is pre-existing and untouched;
+no `Signature` name was removed.
+
+Two names started being advertised: `SHAKE128-256`, `SHAKE256-512`, both now
+implemented. `MessageDigest` goes 13 → 15, matching HotSpot exactly.
+
+## 5. Compatible-mode exceptions taken
+
+Compatible mode (`--real-jdk`) is contractually frozen except for genuine
+HotSpot-parity bug fixes. Three deliberate exceptions were already taken in this
+area earlier in the campaign (`Mac` now raises `NoSuchAlgorithmException`;
+`Cipher` refuses unimplemented transformations; `CertificateFactory.getInstance`
+validates its type). This branch takes **three more**, each stated:
+
+1. **`Signature.getInstance` refuses unknown names.** From "returns an object
+   that fails much later with the wrong exception type" to HotSpot's own
+   `NoSuchAlgorithmException` at HotSpot's own point. Every in-tree Java caller
+   asks for a real algorithm and is unaffected. This is the same shape as the
+   `Mac` and `CertificateFactory` exceptions and is justified the same way.
+2. **`Security.getAlgorithms` / `Provider.getServices` return an unmodifiable
+   set.** A caller that mutates the result now sees exactly what it would see on
+   HotSpot. Smallest of the three.
+3. **`KeyFactory.getInstance("ML-DSA")` / `("ML-KEM")` were already refused; what
+   changes in Compatible mode is that they are no longer *advertised*.** This is
+   a divergence from HotSpot rather than a convergence, and it is the one
+   exception here that does not reduce to parity. It is taken because the
+   alternative is a lie, and it is reversible the moment someone implements the
+   umbrella arms.
+
+`compute_digest`'s fail-closed default is structurally all-modes but reachable
+only in `--synthetic-jdk`, since both real-JDK `getInstance` paths gate first.
+
+## 6. The ratchet at `provider_chain.rs:4043`
+
+`every_advertised_sunjce_cipher_is_serviceable` is **untouched and unweakened**.
+Nothing in this branch changes the `SunJCE` `Cipher` seed list, and W4-3's Patch
+E — which would have deleted four names from it — remains **DEAD**, marked in
+place, and was not applied.
+
+Three ratchets are added beside it, in its shape:
+
+* `every_advertised_sun_message_digest_is_serviceable` — both directions, plus
+  the alias half.
+* `every_advertised_signature_name_is_offered_by_get_instance` — one direction,
+  for the reason in §3 #5, plus an anti-vacuity block proving the gate can say
+  no.
+* `every_advertised_key_factory_name_is_serviceable` — both directions, plus
+  both umbrellas pinned absent-here-present-there.
+
+Each iterates **every provider** in the service map rather than a hardcoded
+list. The first draft of the `KeyFactory` one checked `SUN`, `SunRsaSign` and
+`SunEC`; it would have missed `SunJCE`'s `ML-KEM` entirely, which is the defect
+in this record that neither prior record found. A ratchet over a subset of the
+population has a hole in exactly the place nobody is looking.
+
+Each also asserts a minimum row count **before** looping, because the seed map
+is process-global and a `reset_service_state_for_tests` race would otherwise
+leave the loop iterating nothing and passing. W6-5-vacuous-tests.md is the
+campaign's catalogue of that failure mode.
+
+## 7. The instrument
+
+`probes/JcaAdvertisedVsServedProbe.java`, oracle transcript in
+`probes/JcaAdvertisedVsServedProbe.expected.txt` (HotSpot 25, Windows,
+2026-08-12, 415 lines).
+
+For **every** algorithm the provider chain advertises across sixteen engine
+types, it requests the algorithm for real and prints what came back — bytes
+where the engine can be driven deterministically without key material, the
+exception verbatim otherwise. Four sections, because §2's four shapes need
+four different questions asked:
+
+* **A** walks the advertised set. Catches advertise-but-refuse. Cannot catch
+  mis-serve — a mis-serving engine prints a healthy `OK`.
+* **B** probes 22 names no provider carries. Catches serve-but-never-advertise,
+  the direction a list-versus-list census structurally cannot see.
+* **C** is known-answer vectors. The only section that can catch a wrong
+  algorithm.
+* **D** prints the shape of the answer itself.
+
+Two traps designed around, both already paid for in this campaign:
+
+* **A round trip cannot catch a wrong algorithm.** Encrypt-then-decrypt, or
+  hash-then-compare-to-itself, through the same wrong primitive succeeds. §C
+  therefore prints raw hex against published vectors and round-trips nothing.
+* **Comparing two refusals reports `true`.** A probe asking "do X and Y agree"
+  that gets `NoSuchAlgorithmException` from both compares one exception name
+  with itself and answers `true` — which reads exactly like the defect it is
+  hunting. `sameBytes` answers `n/a` unless both sides produced real bytes,
+  following `sameCipher` in `probes/CryptoTrioProbe.java`.
+
+The anti-vacuity row is `C.md.fallbackEqualsSha256`, and on the oracle it reads
+`n/a`. HotSpot refuses `NO-SUCH-DIGEST`, so nothing is produced, so the
+comparison against real SHA-256 must decline to answer. If it ever reads `true`,
+the digest engine discarded the name and served SHA-256 under it — defect #6,
+observed. If it reads `false` with two real hex strings, something served
+`NO-SUCH-DIGEST` with bytes of its own, which is worse. `n/a` is the only
+correct answer for a VM that refuses the name, and `C.mac.224equals256 = false`
+is the same guard on the `Mac` engine reading `false` rather than `n/a`
+*because* both sides produced bytes — which is what makes `false` meaningful
+there and would make it meaningless on the digest row.
+
+**The oracle has advertise-but-refuse rows of its own**, and this must be known
+before any CratonVM diff is read as a defect: SunJCE advertises 14
+`HMACPBESHA*` / `PBEWITHHMACSHA*` `Mac` names and `Mac.getInstance` answers all
+14 with `java.security.ProviderException: Could not construct MacSpi instance`.
+"Advertised and not serviceable" is therefore not by itself proof of a CratonVM
+bug. It has to be checked per name against the oracle, which is the whole
+reason the transcript is committed rather than the verdicts.
+
+One incidental correction the oracle supplies: `A.KeyGenerator[AES] keylen=32`.
+JDK 25's SunJCE AES default is **256-bit**, not the 128 W4-3's residual pass
+assumed when it noted `KeyGenerator` returns "a hard-coded 128-bit default".
+`keylen` is printed on every `KeyGenerator` row precisely because an engine that
+stores the algorithm string and never reads it again answers every name with one
+size, and the length is the only observation that can see it. That
+`KeyGenerator` gap is real, is out of scope here, and is left recorded.
+
+## 8. What this record does NOT close
+
+* `KeyGenerator` reads its algorithm string once and never again; every name
+  succeeds and yields the same default size. `DESede` gives 16 bytes where
+  SunJCE gives 24. W4-3 recorded it without a patch; still open, and the probe's
+  `keylen` column is now the instrument for it.
+* Nine `SunRsaSign` `Signature` names are advertised, admitted, and fail at
+  `sign()` — §3 #5. Ordinary unimplemented-algorithm gap.
+* `KeyFactory.getInstance("ML-DSA-44").getProvider()` NPEs; `Signature`'s
+  ML-DSA objects return a null provider. W7-29 found both; neither is an
+  advertise-versus-serve gap.
+* `SUN.getServices()` answers 35 rows where HotSpot answers 65. A milder
+  under-advertisement, untouched. Do not read it as evidence the §3 #3 wrapper
+  landed badly.
+* **`Collections.unmodifiableSet` is the IDENTITY function in
+  `--synthetic-jdk`, so §3 #3 is inert there.** Found while wiring
+  `wrap_unmodifiable`. The name has three registrations and registration is
+  last-write-wins:
+  * `native-collections`'s `register_collections_extras_natives` →
+    `native_collections_unmodifiable_set`, a genuine read-only view. Live in
+    real-JDK and `--jdk-only`.
+  * `phases_early::register_collections_extras_natives` **and**
+    `phases_early::register_core_stdlib_extras` → `native_return_first_arg`.
+    Both are reached only from `lib::register_synthetic_overrides`, which runs
+    after the essential registrars, so in `--synthetic-jdk` the identity wins.
+
+  This is the same species as everything else in this record — an API whose
+  entire contract is a refusal, quietly not refusing — and it is broader than
+  the JCA: `unmodifiableList`, `unmodifiableMap` and `unmodifiableCollection`
+  are bound the same way in the same two registrars. Out of scope here, and it
+  needs a `--synthetic-jdk` build, which no lane has made. **It is also a
+  vacuous-green trap:** a probe run under `--synthetic-jdk` reports
+  `D.getAlgorithms[MessageDigest] class=java.util.HashSet add=SUCCEEDED`, which
+  reads exactly like "§3 #3 never landed" and is not that.
+* `--synthetic-jdk` has never been built by any lane, so #6's live half has
+  never been observed — only reasoned about.
+
+## 9. How to verify
+
+Build, then in **both** arms. Note that `--synthetic-jdk` is NOT a valid arm
+for the `D.` rows: `Collections.unmodifiableSet` is the identity function there
+(§8), so those rows will read `HashSet` / `SUCCEEDED` for a reason that has
+nothing to do with this change.
+
+```
+java -cp <out> JcaAdvertisedVsServedProbe > cratonvm-<arm>.txt
+diff probes/JcaAdvertisedVsServedProbe.expected.txt cratonvm-<arm>.txt
+```
+
+The rows that must move from the pre-change binary:
+
+```
+A.MessageDigest.n                     13 -> 15
+A.MessageDigest[MD2]                  THREW NoSuchAlgorithmException -> OK len=16 d("")=8350e5a3...
+A.MessageDigest[SHAKE128-256]         absent -> OK len=32 d("")=7f9c2ba4...
+A.MessageDigest[SHAKE256-512]         absent -> OK len=64 d("")=46b9dd2b...
+A.KeyFactory[ML-DSA]                  present and THREW -> absent from the advertised set
+A.KeyFactory[ML-KEM]                  present and THREW -> absent from the advertised set
+B.Signature[NO-SUCH-SIG]              OK getAlgorithm()=Unknown -> THREW NoSuchAlgorithmException
+B.Signature[ML-KEM] / [AES] / [HmacSHA256] / []   same
+C.md[MD2].abc                         match=n/a -> match=true
+C.md[SHAKE128-256].abc                match=n/a -> match=true
+C.md[SHAKE128].abc                    match=n/a -> match=true    (the ALIAS must resolve)
+C.md.fallbackEqualsSha256             n/a, and must STAY n/a
+D.getAlgorithms[MessageDigest]        class=java.util.HashSet add=SUCCEEDED
+                                        -> class=...Collections$UnmodifiableSet add=UnsupportedOperationException
+D.SUN.getServices.add                 SUCCEEDED -> UnsupportedOperationException
+```
+
+`RJdkSecurity` must still run to `PASS RJdkSecurity (61 checks)` in all three
+arms, and `RCrypto` / `RChaCha20Cipher` must be unchanged.
+
+## 10. The single falsifying observation
+
+If `C.md.fallbackEqualsSha256` reads `true` on a CratonVM arm after this change,
+then some `MessageDigest` path still reaches a SHA-256 default that neither
+`getInstance` gate covers, and §3 #6 shut the wrong two doors. That one row is
+worth more than the rest of section C put together: every other row can be
+satisfied by an engine that computes the right answer for names it knows, and
+only this one asks what it does with a name it does not.
+
+If instead `A.Signature[*]` rows start reading `THREW` for names the oracle
+serves, the `signature_name_is_offered` disjunction has lost its second arm —
+i.e. `find_service_provider` is answering `None` because the provider chain, not
+the service map, is short. The repair in that case is to seed the missing
+service, in one place, where `Security.getAlgorithms` will report it too.

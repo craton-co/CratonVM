@@ -1085,11 +1085,50 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
 /// make the same provider-service decision as the JDK.
 fn seed_direct_native_engine_services() {
     const SUN: &str = "SUN";
-    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512"] {
+    // Every name here must be one `message_digest::algorithm_supported`
+    // accepts. `MD2` sat in this literal and was refused by `getInstance` for
+    // three waves; `SHAKE128-256` / `SHAKE256-512` were the opposite omission,
+    // deliberately withheld while unimplemented. Both were closed on
+    // 2026-08-12 by implementing the digest and then adding the name, in that
+    // order. `every_advertised_sun_message_digest_is_serviceable` is now the
+    // ratchet that keeps this array and that predicate one set.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["MD2", "MD5", "SHA-1", "SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-512/224", "SHA-512/256", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512", "SHAKE128-256", "SHAKE256-512"] {
         put_service(SUN, "MessageDigest", algorithm, "sun.security.provider.Native");
     }
     put_alias(SUN, "MessageDigest", "SHA256", "SHA-256");
-    for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+    // ALIASES, not services. HotSpot's SUN carries
+    // `Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`, so
+    // `MessageDigest.getInstance("SHAKE128")` resolves and returns bytes
+    // identical to the hyphenated primary (measured, §C of
+    // probes/JcaAdvertisedVsServedProbe.expected.txt) while
+    // `Security.getAlgorithms("MessageDigest")` does NOT list it — aliases are
+    // excluded from that walk, see `algorithms_for_service`. Registering these
+    // as services instead would make the advertised set 17 where HotSpot
+    // answers 15.
+    put_alias(SUN, "MessageDigest", "SHAKE128", "SHAKE128-256");
+    put_alias(SUN, "MessageDigest", "SHAKE256", "SHAKE256-512");
+    // `ML-DSA` — the UMBRELLA name — is deliberately absent from this
+    // `KeyFactory` list while the three parameter-set names stay. HotSpot's
+    // SUN does advertise and serve it, so this is a knowing divergence in the
+    // under-advertising direction, and it is the safe one: this VM's
+    // `key_factory::kf_algo_idx` has arms only for `ML-DSA-44/65/87`, falls to
+    // `-1`, and `kf_get_instance` throws. Advertised-and-refused.
+    //
+    // The alternative — add an umbrella arm resolving the parameter set from
+    // the key spec, as `signature::mldsa_spi_class` does from the init key —
+    // was declined rather than deferred, because W7-29 RAN the three names
+    // that already resolve and found the objects partly unusable one accessor
+    // in (`KeyFactory.getInstance("ML-DSA-44").getProvider()` raises
+    // `NullPointerException: Cannot enter synchronized block because
+    // "this.lock" is null`, where HotSpot answers `SUN version 25`). Widening
+    // a surface that is already broken is not a fix. Note that
+    // `signature::algo_idx` DOES carry the umbrella arm, so `Signature`
+    // continues to advertise and serve `ML-DSA` — the two engines disagreed
+    // about the same name, and this makes each engine's advertisement match
+    // its own implementation rather than making them agree with each other.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
         put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
     }
     for algorithm in ["DRBG", "SHA1PRNG"] {
@@ -1223,7 +1262,19 @@ fn seed_direct_native_engine_services() {
             );
         }
     }
-    for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+    // The `ML-KEM` UMBRELLA is absent for the same reason `ML-DSA` is absent
+    // from the `SUN` `KeyFactory` list above, and it was found by the census
+    // rather than by either record: `key_factory::algo_idx` has arms for
+    // `ML-KEM-512/768/1024` only, falls to `-1`, and `kf_get_instance` throws,
+    // so `Security.getAlgorithms("KeyFactory")` named `ML-KEM` while
+    // `KeyFactory.getInstance("ML-KEM")` raised `NoSuchAlgorithmException`.
+    // Advertised-and-refused, a seventh instance of the species in the same
+    // seed function, and note that the SPI class name here is a REAL JDK class
+    // — that does not help, because `kf_get_instance` intercepts natively and
+    // never reaches `build_jca_impl`. A real class name in a service row is
+    // not evidence the row is serviceable.
+    // W7-63-jca-advertise-vs-serve.md.
+    for algorithm in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
         put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
     }
     // SunJCE's own aliases. Aliases are excluded from
@@ -1296,10 +1347,18 @@ fn seed_direct_native_engine_services() {
 ///     succeeds, so seeding a name we do not implement would fabricate a
 ///     working PRNG. The set stays non-empty either way, which is all
 ///     Tomcat's `SessionIdGeneratorBase.<clinit>` needs.
-///   * `MessageDigest` `SHAKE128-256`/`SHAKE256-512` — real on HotSpot, but
-///     `message_digest::algorithm_supported` does not implement them, and
-///     advertising a digest that `getInstance` then refuses is a worse lie
-///     than a 13-name list.
+///
+/// A third exclusion used to stand here: `MessageDigest` `SHAKE128-256` /
+/// `SHAKE256-512`, declined because `message_digest::algorithm_supported` did
+/// not implement them and — in the words of the comment this replaces —
+/// "advertising a digest that `getInstance` then refuses is a worse lie than
+/// a 13-name list". That reasoning is exactly right and is the rule this file
+/// runs on. Its PREMISE expired on 2026-08-12, when both were implemented
+/// against the HotSpot and NIST vectors; they are now seeded in
+/// `seed_direct_native_engine_services` beside the other SUN digests, and
+/// their bare `SHAKE128`/`SHAKE256` spellings are ALIASES there, not
+/// services, so the advertised count lands on HotSpot's 15 rather than 17. A
+/// comment outlives its defect. W7-63-jca-advertise-vs-serve.md.
 fn seed_retired_getalgorithms_literals() {
     const JCE: &str = "SunJCE";
     // Every class name below is MEASURED — `getServices()` enumerated per
@@ -2258,9 +2317,13 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // As in `security_get_algorithms`: wrap while still pinned, then unpin
+    // both. HotSpot answers `Collections$UnmodifiableSet` here too (n=65 for
+    // SUN, measured) and `add(null)` raises `UnsupportedOperationException`.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 fn provider_service_string_field(
@@ -2754,12 +2817,11 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 ///     reproduced rather than "fixed" so the two agree;
 ///   * a null, empty, or `.`-terminated service name yields the EMPTY set.
 ///
-/// Deliberate divergence, recorded: HotSpot wraps the result in
-/// `Collections.unmodifiableSet` (probe: `add` throws
-/// `UnsupportedOperationException`). The caller here gets a plain `HashSet`,
-/// matching what `provider_get_services_native` already returns, because the
-/// wrapper would add a Java round-trip through a synthetic view whose
-/// `contains` this lane could not measure. See the known-issues note.
+/// (A "Deliberate divergence, recorded" paragraph stood here saying the caller
+/// gets a plain `HashSet` where HotSpot returns `Collections.unmodifiableSet`.
+/// That divergence is closed — `security_get_algorithms` and
+/// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
+/// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
@@ -2796,6 +2858,82 @@ pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     out
 }
 
+/// Wrap `set` in `Collections.unmodifiableSet`, which is what HotSpot returns
+/// from BOTH `Security.getAlgorithms` and `Provider.getServices` — measured on
+/// jdk-25.0.3.9-hotspot and recorded in
+/// probes/JcaAdvertisedVsServedProbe.expected.txt §D:
+/// `java.util.Collections$UnmodifiableSet`, with `add`, `remove` and
+/// `iterator().remove()` all raising `UnsupportedOperationException`.
+///
+/// This is not a missing guard, it is a missing STATEMENT.
+/// `Collections.unmodifiableSet` is how the JDK tells a caller "this is a view
+/// of platform state, not yours to edit". A plain `HashSet` is an invitation:
+/// a caller that mutates it and hands it on has manufactured an algorithm list
+/// no provider backs, and nothing downstream can tell it from a real one.
+///
+/// Applied on EVERY path including the empty ones — `getAlgorithms` for an
+/// unknown engine type answers an IMMUTABLE EMPTY set on HotSpot, never a
+/// throw. HotSpot distinguishes `Collections$UnmodifiableSet` (unknown engine
+/// type) from `Collections$EmptySet` (`""`, `"Foo."`, `null`); that split is
+/// not reproduced, because both are immutable and both are size 0, which is
+/// the entire observable contract.
+///
+/// Each HotSpot call returns a DISTINCT object (measured: two calls are not
+/// `==`), so this must be built per call and must not be cached.
+///
+/// GC: `unmodifiableSet` allocates the view, so `set` must be a freshly
+/// re-read reference and only the RETURN value may be used afterwards.
+///
+/// On failure the plain set is returned rather than propagating the error: an
+/// immutability wrapper is not worth converting a correct answer into a thrown
+/// exception. The `Ok(None)` / `Ok(Some(null))` fallback should be unreachable.
+///
+/// **Mode caveat, and it is a vacuous-green trap for whoever verifies this.**
+/// `java.util.Collections.unmodifiableSet` has THREE registrations in this
+/// tree and registration is last-write-wins:
+///
+///   * `native-collections`'s `register_collections_extras_natives` binds it to
+///     `native_collections_unmodifiable_set`, which allocates a genuine
+///     read-only view. Live in real-JDK and `--jdk-only`, where it is what
+///     this call reaches (in real-JDK mode real JDK bytecode is available
+///     too — either way the result is immutable).
+///   * `phases_early::register_collections_extras_natives` AND
+///     `phases_early::register_core_stdlib_extras` both bind it to
+///     `native_return_first_arg` — the IDENTITY function. Both are reached
+///     only from `lib::register_synthetic_overrides`, which runs after the
+///     essential registrars, so **in `--synthetic-jdk` the identity wins and
+///     this wrapper is inert**: the caller gets the same mutable `HashSet`
+///     back and `add` still succeeds.
+///
+/// So a probe run under `--synthetic-jdk` will report
+/// `class=java.util.HashSet add=SUCCEEDED` here and that is NOT evidence this
+/// change failed to land — it is a separate defect one layer down, recorded in
+/// W7-63-jca-advertise-vs-serve.md §8. An "unmodifiable" wrapper that returns
+/// its argument is the same species as everything else in that record: an API
+/// whose whole contract is a refusal, quietly not refusing.
+fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
+    match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(view)))) => view,
+        _ => set,
+    }
+}
+
+/// `wrap_unmodifiable` for the `--synthetic-jdk` `Security.getAlgorithms`
+/// override in `phases_early`, which deliberately shadows the registry-backed
+/// registration in that mode and therefore has to make the same answer in the
+/// same shape.
+pub(crate) fn wrap_unmodifiable_public(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> ObjectRef {
+    wrap_unmodifiable(ctx, set)
+}
+
 fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `Security.getAlgorithms(null)` returns the EMPTY set on HotSpot (the
     // real body's first branch), it does not NPE — measured.
@@ -2828,8 +2966,12 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // Wrap BEFORE unpinning: `wrap_unmodifiable` invokes Java, which can move
+    // `set`, and the pin is what keeps the just-re-read reference valid across
+    // that call. Only the returned view may be used afterwards.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 /// Resolve `name` to the best available `Provider` object: the REAL
@@ -4133,6 +4275,225 @@ mod tests {
             assert!(
                 crate::jca::cipher::transformation_is_serviceable(alias),
                 "{alias} resolves as a service but Cipher.getInstance refuses it"
+            );
+        }
+    }
+
+    /// Collect every algorithm `provider` advertises for `type_str` straight
+    /// out of the seed map.
+    ///
+    /// Deliberately not via `algorithms_for_service`: that walks the live
+    /// PROVIDER CHAIN, and the chain's coverage here is not what the seed
+    /// wrote, so a chain-based read could answer a shorter set and the loops
+    /// below would pass by iterating less than they think. Each caller also
+    /// asserts a minimum row count before looping, because a loop over nothing
+    /// is a probe that cannot fail.
+    fn advertised_for(provider: &str, type_str: &str) -> Vec<String> {
+        services()
+            .lock()
+            .get(provider)
+            .map(|m| {
+                m.values()
+                    .filter(|e| e.type_str == type_str)
+                    .map(|e| e.algorithm.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every `(provider, algorithm)` the seed advertises for `type_str`,
+    /// across EVERY provider in the map.
+    ///
+    /// The hardcoded provider list this replaces would have missed the
+    /// `SunJCE` `KeyFactory` `ML-KEM` umbrella entirely — an
+    /// advertised-and-refused name that neither originating record lists and
+    /// that only the census found. A ratchet that checks a subset of the
+    /// population is a ratchet with a hole in exactly the place nobody is
+    /// looking.
+    fn all_advertised(type_str: &str) -> Vec<(String, String)> {
+        let providers: Vec<String> = services().lock().keys().cloned().collect();
+        let mut out = Vec::new();
+        for provider in providers {
+            for algorithm in advertised_for(&provider, type_str) {
+                out.push((provider.clone(), algorithm));
+            }
+        }
+        out
+    }
+
+    /// W7-63 ratchet: every `MessageDigest` name `SUN` advertises must be one
+    /// `MessageDigest.getInstance` will serve, and every digest this VM
+    /// implements must be advertised.
+    ///
+    /// Both directions, because this pair drifted in both at once and only one
+    /// of them was loud. `MD2` sat in the advertised array for three waves
+    /// while `algorithm_supported` refused it — three lines above a comment
+    /// declining to advertise SHAKE for exactly that reason. `SHAKE128-256`
+    /// and `SHAKE256-512` were the quiet direction: correctly withheld while
+    /// unimplemented, and then still withheld after the dependency to
+    /// implement them was already in the tree. A census run by hand finds one
+    /// of those and drifts again by the next wave; a test finds both and
+    /// cannot.
+    #[test]
+    fn every_advertised_sun_message_digest_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("MessageDigest");
+        assert!(
+            advertised.len() >= 15,
+            "the MessageDigest seed looks empty: {advertised:?}"
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::message_digest::algorithm_supported_public(algorithm),
+                "{provider} advertises MessageDigest.{algorithm}, but \
+                 MessageDigest.getInstance refuses it — advertising a digest the engine \
+                 cannot compute is the defect W7-63 closed"
+            );
+        }
+        // The reverse direction. These are the three names the two records
+        // were actually about; the loop above proves each is serviceable, this
+        // proves the seed did not quietly drop it.
+        for implemented in ["MD2", "SHAKE128-256", "SHAKE256-512"] {
+            assert!(
+                get_service_entry("SUN", "MessageDigest", implemented).is_some(),
+                "{implemented} is implemented but not advertised: the two lists have drifted, \
+                 which is the defect this test exists for"
+            );
+        }
+        // And the ALIAS half, which decides whether the advertised count lands
+        // on HotSpot's 15 or on 17. `SHAKE128` / `SHAKE256` resolve through
+        // `getInstance` (measured on HotSpot 25: byte-identical digests to the
+        // hyphenated primaries) while `Security.getAlgorithms("MessageDigest")`
+        // must NOT list them. An alias registered as a service would pass
+        // every other assertion in this test.
+        for (alias, canonical) in [("SHAKE128", "SHAKE128-256"), ("SHAKE256", "SHAKE256-512")] {
+            assert!(
+                get_service_entry("SUN", "MessageDigest", alias).is_some(),
+                "{alias} must resolve through the alias map to {canonical}"
+            );
+            assert!(
+                !advertised.iter().any(|(_, a)| a.eq_ignore_ascii_case(alias)),
+                "{alias} is an ALIAS and must stay out of Security.getAlgorithms, \
+                 which is where HotSpot keeps it"
+            );
+        }
+    }
+
+    /// W7-63 ratchet: no advertised `Signature` name may be refused at
+    /// `getInstance`.
+    ///
+    /// Only this direction is asserted, and the asymmetry is the point.
+    /// `Signature.getInstance` used to accept EVERY string and defer the
+    /// failure to `sign()`/`verify()` as a `SignatureException`, so a caller
+    /// probing with `catch (NoSuchAlgorithmException)` took the wrong branch.
+    /// The gate that closed it (`signature::signature_name_is_offered`) is a
+    /// disjunction — a name this engine has an index for, OR a name some
+    /// provider advertises — so it can only fail in one direction, and this is
+    /// that direction.
+    ///
+    /// It deliberately does NOT assert that every advertised name can compute.
+    /// Nine `SunRsaSign` names (`MD2withRSA`, `SHA3-*withRSA`,
+    /// `SHA512/224withRSA` and friends) have no `sign_dispatch` arm and fail
+    /// at `sign()` with a checked, catchable `SignatureException`. That is an
+    /// ordinary unimplemented-algorithm gap, not this record's species: the
+    /// name is real, the advertisement is truthful, and the failure is closed.
+    /// Asserting serviceability here would red the test for a gap W7-63 did
+    /// not open and does not close.
+    #[test]
+    fn every_advertised_signature_name_is_offered_by_get_instance() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("Signature");
+        assert!(
+            advertised.len() >= 20,
+            "the Signature seed looks empty ({} rows): a loop over nothing \
+             passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::signature::get_instance_offers(algorithm),
+                "{provider} advertises Signature.{algorithm}, but \
+                 Signature.getInstance refuses it"
+            );
+        }
+        // The anti-vacuity half: prove the gate can say NO. Without this the
+        // loop above is satisfied by a predicate that returns `true`
+        // unconditionally, which is exactly what `sig_get_instance` used to do.
+        for bogus in ["NO-SUCH-SIG", "ML-KEM", "AES", "HmacSHA256", ""] {
+            assert!(
+                !crate::jca::signature::get_instance_offers(bogus),
+                "Signature.getInstance must refuse {bogus:?} — HotSpot 25 raises \
+                 NoSuchAlgorithmException for it, measured"
+            );
+        }
+    }
+
+    /// W7-63 ratchet: every `KeyFactory` name the seed advertises must be one
+    /// `KeyFactory.getInstance` will serve.
+    ///
+    /// The `SUN` seed advertised the `ML-DSA` UMBRELLA name while
+    /// `key_factory::kf_algo_idx` had arms only for `ML-DSA-44/65/87` and
+    /// `kf_get_instance` threw on the negative index — advertised and refused.
+    /// `signature::algo_idx` carries the umbrella arm, so the two engines
+    /// disagreed about one name. The umbrella is now absent from the
+    /// `KeyFactory` seed and still present in the `Signature` seed, which
+    /// makes each engine's advertisement match ITS OWN implementation rather
+    /// than making the two engines agree with each other — that is the
+    /// correct invariant, and it is what this asserts.
+    #[test]
+    fn every_advertised_key_factory_name_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised = all_advertised("KeyFactory");
+        assert!(
+            advertised.len() >= 12,
+            "the KeyFactory seed looks empty ({} rows): a loop over nothing \
+             passes vacuously",
+            advertised.len()
+        );
+        for (provider, algorithm) in &advertised {
+            assert!(
+                crate::jca::key_factory::get_instance_offers(algorithm),
+                "{provider} advertises KeyFactory.{algorithm}, but \
+                 KeyFactory.getInstance refuses it"
+            );
+        }
+        // Both umbrellas are STOP-ADVERTISING fixes, not implementations, so
+        // pin both halves of each: absent where the engine refuses them,
+        // present where it does not. Either half alone would let the pair
+        // drift back. `ML-KEM` was found by the census, not by either
+        // originating record — the loop above is what catches the next one.
+        for (provider, umbrella) in [("SUN", "ML-DSA"), ("SunJCE", "ML-KEM")] {
+            assert!(
+                get_service_entry(provider, "KeyFactory", umbrella).is_none(),
+                "{provider} must not advertise the {umbrella} umbrella for KeyFactory \
+                 while kf_algo_idx refuses it — either implement the umbrella arm or \
+                 leave the name out, but never both"
+            );
+        }
+        assert!(
+            get_service_entry("SUN", "Signature", "ML-DSA").is_some(),
+            "Signature DOES implement the ML-DSA umbrella (signature::algo_idx \
+             carries SIG_MLDSA) and must keep advertising it — the two engines are \
+             each truthful about THEMSELVES, which is the invariant, not that they \
+             agree with each other"
+        );
+        for param_set in [
+            "ML-DSA-44",
+            "ML-DSA-65",
+            "ML-DSA-87",
+        ] {
+            assert!(
+                get_service_entry("SUN", "KeyFactory", param_set).is_some(),
+                "{param_set} is serviceable and must stay advertised"
+            );
+        }
+        for param_set in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+            assert!(
+                get_service_entry("SunJCE", "KeyFactory", param_set).is_some(),
+                "{param_set} is serviceable and must stay advertised"
             );
         }
     }

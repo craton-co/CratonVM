@@ -466,7 +466,16 @@ fn md_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let algo = read_algo(ctx, this);
-    Ok(Some(Value::Int(digest_length_bytes(&algo) as i32)))
+    // `digest_length_bytes` returns `Option` and has no default arm, so a
+    // digest object carrying an algorithm this VM cannot compute reports 0
+    // rather than corroborating a fabricated 32-byte answer. This receiver
+    // cannot exist through either `getInstance` — both gate on
+    // `algorithm_supported` — so a `None` here means the algorithm field was
+    // corrupted or overwritten, and 0 is the honest report of that.
+    // W7-63-jca-advertise-vs-serve.md.
+    Ok(Some(Value::Int(
+        digest_length_bytes(&algo).unwrap_or(0) as i32
+    )))
 }
 
 /// `getProvider()` returns a fresh "SUN" Provider synthetic so callers
@@ -492,6 +501,16 @@ fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The set of digests `MessageDigest.getInstance` will serve. This is the
+/// gate the ADVERTISED set is ratcheted against — see
+/// `provider_chain::every_advertised_sun_message_digest_is_serviceable` —
+/// so a name added here without a `compute_digest` arm, or added to the
+/// provider seed without being added here, fails that test rather than
+/// reaching a caller. W7-63-jca-advertise-vs-serve.md.
+///
+/// Kept arm-for-arm in lockstep with `digest_length_bytes` and with
+/// `crate::compute_digest`. All three are pinned together by
+/// `every_supported_algorithm_computes_and_has_a_length`.
 fn algorithm_supported(algo: &str) -> bool {
     let normalised: String = algo
         .chars()
@@ -500,7 +519,11 @@ fn algorithm_supported(algo: &str) -> bool {
         .to_uppercase();
     matches!(
         normalised.as_str(),
-        "MD5"
+        // RFC 1319. HotSpot 25's SUN carries MD2 and this VM advertised it
+        // for three waves while refusing it; `crate::real_md2` implements it
+        // now. Broken as a hash, present for parity.
+        "MD2"
+            | "MD5"
             | "SHA"
             | "SHA1"
             | "SHA224"
@@ -516,24 +539,54 @@ fn algorithm_supported(algo: &str) -> bool {
             | "SHA3256"
             | "SHA3384"
             | "SHA3512"
+            // The two SHAKE XOFs read out to a fixed length. Same two
+            // normalised spellings `compute_digest`'s `-`/`/`-stripping
+            // filter produces — asserted, not assumed, by
+            // `shake_normalisations_agree_across_the_two_filters`.
+            | "SHAKE128256"
+            | "SHAKE256512"
     )
 }
 
-fn digest_length_bytes(algo: &str) -> usize {
+/// The synthetic-mode `crate::native_md_get_instance` needs this same gate —
+/// it used to carry a second, drifted literal list with an empty `if` body.
+/// One predicate, two doors.
+pub(crate) fn algorithm_supported_public(algo: &str) -> bool {
+    algorithm_supported(algo)
+}
+
+/// The synthetic-mode `crate::native_md_get_digest_length` needs this same
+/// table. It used to carry a THIRD hand-maintained copy, drifted furthest of
+/// the three — no MD2, no SHA-224, no truncated SHA-512s, no SHA3-224, and a
+/// `-`-only normalisation that let `SHA-512/256` fall through to the default
+/// and report 32 by accident rather than by arm. One table, every door.
+pub(crate) fn digest_length_bytes_public(algo: &str) -> Option<usize> {
+    digest_length_bytes(algo)
+}
+
+/// `None` for an algorithm this VM does not implement.
+///
+/// This used to end `_ => 32`, so `getDigestLength()` corroborated the
+/// `compute_digest` SHA-256 fallback: a caller that asked for an
+/// unimplemented digest got 32 bytes AND a `getDigestLength()` of 32 telling
+/// it that was right. Two independent-looking observations agreeing because
+/// they shared one wrong default is the shape that makes this species so hard
+/// to see from inside. W7-63-jca-advertise-vs-serve.md.
+fn digest_length_bytes(algo: &str) -> Option<usize> {
     let normalised: String = algo
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
         .to_uppercase();
-    match normalised.as_str() {
-        "MD5" => 16,
+    Some(match normalised.as_str() {
+        "MD2" | "MD5" => 16,
         "SHA" | "SHA1" => 20,
         "SHA224" | "SHA3224" | "SHA512224" => 28,
-        "SHA256" | "SHA3256" | "SHA512256" => 32,
+        "SHA256" | "SHA3256" | "SHA512256" | "SHAKE128256" => 32,
         "SHA384" | "SHA3384" => 48,
-        "SHA512" | "SHA3512" => 64,
-        _ => 32,
-    }
+        "SHA512" | "SHA3512" | "SHAKE256512" => 64,
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +690,11 @@ mod tests {
             "SHA3-256",
             "SHA3-384",
             "SHA3-512",
+            "MD2",
+            "md2",
+            "SHAKE128-256",
+            "shake128-256",
+            "SHAKE256-512",
         ] {
             assert!(algorithm_supported(algo), "{algo} should be supported");
         }
@@ -644,25 +702,157 @@ mod tests {
 
     #[test]
     fn algorithm_supported_rejects_unknown() {
-        for algo in ["BLAKE2", "Whirlpool", "FAKEHASH", ""] {
+        for algo in [
+            "BLAKE2",
+            "Whirlpool",
+            "FAKEHASH",
+            "",
+            // The bare SHAKE spellings are ALIASES on HotSpot
+            // (`Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`), resolved by
+            // the provider chain's alias table before this predicate is
+            // consulted. They must NOT be arms here, or
+            // `Security.getAlgorithms("MessageDigest")` grows to 17 where
+            // HotSpot answers 15.
+            "SHAKE128",
+            "SHAKE256",
+        ] {
             assert!(!algorithm_supported(algo), "{algo} should be rejected");
+        }
+    }
+
+    /// The gate, the length table and `compute_digest` are three separate
+    /// match arms over the same set of names, and this campaign's dominant
+    /// defect is exactly two such lists drifting apart. Assert they agree
+    /// rather than maintaining them by hand.
+    #[test]
+    fn every_supported_algorithm_computes_and_has_a_length() {
+        for algo in [
+            "MD2",
+            "MD5",
+            "SHA-1",
+            "SHA-224",
+            "SHA-256",
+            "SHA-384",
+            "SHA-512",
+            "SHA-512/224",
+            "SHA-512/256",
+            "SHA3-224",
+            "SHA3-256",
+            "SHA3-384",
+            "SHA3-512",
+            "SHAKE128-256",
+            "SHAKE256-512",
+        ] {
+            assert!(algorithm_supported(algo), "{algo} must be supported");
+            let want = digest_length_bytes(algo)
+                .unwrap_or_else(|| panic!("{algo} is supported but has no declared length"));
+            let got = compute_digest(algo, b"advertised must equal served")
+                .unwrap_or_else(|_| panic!("{algo} is supported but compute_digest refuses it"));
+            assert_eq!(
+                got.len(),
+                want,
+                "{algo}: getDigestLength() says {want} but compute_digest produced {}",
+                got.len()
+            );
+        }
+    }
+
+    /// `compute_digest` normalises by stripping `-` and `/`;
+    /// `algorithm_supported` / `digest_length_bytes` normalise by filtering to
+    /// alphanumerics. For the SHAKE names the two happen to agree, which is
+    /// what makes ONE pair of arm spellings valid in both files. That is a
+    /// coincidence of these particular names, not a property of the two
+    /// functions, so it is asserted rather than assumed —
+    /// W7-29-jca-advertise-implement-gaps.md asked for exactly this.
+    #[test]
+    fn shake_normalisations_agree_across_the_two_filters() {
+        for (raw, expected) in [
+            ("SHAKE128-256", "SHAKE128256"),
+            ("SHAKE256-512", "SHAKE256512"),
+            ("SHA-512/256", "SHA512256"),
+        ] {
+            let strip: String = raw.to_uppercase().replace(['-', '/'], "");
+            let alnum: String = raw
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_uppercase();
+            assert_eq!(strip, expected, "strip-filter normalisation of {raw}");
+            assert_eq!(alnum, expected, "alphanumeric normalisation of {raw}");
+        }
+    }
+
+    /// Known-answer vectors, measured on jdk-25.0.3.9-hotspot and recorded in
+    /// probes/JcaAdvertisedVsServedProbe.expected.txt §C. A round trip cannot
+    /// catch a wrong algorithm — encrypt-then-decrypt or hash-then-hash with
+    /// the same wrong function agrees with itself — so the acceptance test for
+    /// a newly implemented digest has to be a published vector.
+    #[test]
+    fn shake_matches_hotspot_vectors() {
+        let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(compute_digest("SHAKE128-256", b"").unwrap()),
+            "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26"
+        );
+        assert_eq!(
+            hex(compute_digest("SHAKE128-256", b"abc").unwrap()),
+            "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8"
+        );
+        assert_eq!(
+            hex(compute_digest("SHAKE256-512", b"").unwrap()),
+            "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f\
+             d75dc4ddd8c0f200cb05019d67b592f6fc821c49479ab48640292eacb3b7c4be"
+        );
+        assert_eq!(
+            hex(compute_digest("SHAKE256-512", b"abc").unwrap()),
+            "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739\
+             d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4"
+        );
+    }
+
+    /// The fallback that made this record necessary. `compute_digest` used to
+    /// end `_ => Ok(real_sha256(data))`, so an unimplemented name was served
+    /// SHA-256's bytes under its own label.
+    ///
+    /// Note the second half. Asserting only "the unknown name errors" would
+    /// pass on a `compute_digest` that errored on EVERYTHING, which is a
+    /// probe that cannot fail in the direction that matters. The control
+    /// establishes that the same call shape succeeds for a real name.
+    #[test]
+    fn an_unimplemented_digest_fails_rather_than_answering_sha256() {
+        assert!(
+            compute_digest("SHA-256", b"abc").is_ok(),
+            "control: a real algorithm must still compute, or this test is vacuous"
+        );
+        for bogus in ["NO-SUCH-DIGEST", "BLAKE2", "Whirlpool", ""] {
+            assert!(
+                compute_digest(bogus, b"abc").is_err(),
+                "{bogus} must be refused, not served SHA-256's bytes"
+            );
+            assert!(
+                digest_length_bytes(bogus).is_none(),
+                "{bogus} must have no declared length, not a defaulted 32"
+            );
         }
     }
 
     #[test]
     fn digest_lengths_match_jdk25() {
-        assert_eq!(digest_length_bytes("MD5"), 16);
-        assert_eq!(digest_length_bytes("SHA-1"), 20);
-        assert_eq!(digest_length_bytes("SHA-224"), 28);
-        assert_eq!(digest_length_bytes("SHA3-224"), 28);
-        assert_eq!(digest_length_bytes("SHA-256"), 32);
-        assert_eq!(digest_length_bytes("SHA-384"), 48);
-        assert_eq!(digest_length_bytes("SHA-512"), 64);
-        assert_eq!(digest_length_bytes("SHA-512/224"), 28);
-        assert_eq!(digest_length_bytes("SHA-512/256"), 32);
-        assert_eq!(digest_length_bytes("SHA3-256"), 32);
-        assert_eq!(digest_length_bytes("SHA3-384"), 48);
-        assert_eq!(digest_length_bytes("SHA3-512"), 64);
+        assert_eq!(digest_length_bytes("MD2"), Some(16));
+        assert_eq!(digest_length_bytes("MD5"), Some(16));
+        assert_eq!(digest_length_bytes("SHA-1"), Some(20));
+        assert_eq!(digest_length_bytes("SHA-224"), Some(28));
+        assert_eq!(digest_length_bytes("SHA3-224"), Some(28));
+        assert_eq!(digest_length_bytes("SHA-256"), Some(32));
+        assert_eq!(digest_length_bytes("SHA-384"), Some(48));
+        assert_eq!(digest_length_bytes("SHA-512"), Some(64));
+        assert_eq!(digest_length_bytes("SHA-512/224"), Some(28));
+        assert_eq!(digest_length_bytes("SHA-512/256"), Some(32));
+        assert_eq!(digest_length_bytes("SHA3-256"), Some(32));
+        assert_eq!(digest_length_bytes("SHA3-384"), Some(48));
+        assert_eq!(digest_length_bytes("SHA3-512"), Some(64));
+        assert_eq!(digest_length_bytes("SHAKE128-256"), Some(32));
+        assert_eq!(digest_length_bytes("SHAKE256-512"), Some(64));
     }
 
     #[test]

@@ -1,5 +1,33 @@
 # The JCA engines that answer names they never advertised
 
+> **SUPERSEDED for its residuals, 2026-08-12 — W7-63-jca-advertise-vs-serve.md.**
+> All five residuals below are **FIXED in source** there, together with W4-3's
+> five live patches. Read W7-63 §3 rather than working from the residual
+> blocks in this file; two of the prescriptions here were not what was done,
+> and one of those would have been a regression:
+>
+> * **Residual 1** (`MD2`) — implemented rather than de-advertised, which is
+>   the alternative this record already named as "strictly better".
+> * **Residual 2** (SHAKE) — implemented, then advertised, in that order, with
+>   the alias/service split and the normalisation-agreement assertion this
+>   record asked for.
+> * **Residual 3** (mutable set) — applied as written.
+> * **Residual 4** (`ML-DSA` `KeyFactory`) — de-advertised, on this record's
+>   own reasoning. The census also found `SunJCE` `KeyFactory` `ML-KEM`, an
+>   identical defect eleven lines away that neither record names.
+> * **Residual 5** (`Signature.getInstance` accepts every name) — gated, but
+>   **NOT on `find_service_provider` alone as prescribed here.** That gate
+>   would refuse every signature-algorithm OID at `getInstance`, because the
+>   registry carries friendly names only while `signature::algo_idx`
+>   deliberately carries the OIDs that X.509 `cert.verify()` resolves by. It
+>   would have broken certificate verification outright. The shipped gate is a
+>   disjunction; W7-63 §3 #5 has the reasoning. This record's follow-on
+>   instruction to delete the `"Unknown"` sentinel as unreachable is likewise
+>   wrong under that gate — nine advertised `SunRsaSign` names still reach it.
+>
+> Everything else here stands, including the warning about Patch E and the
+> headline `CertificateFactory` fix, which is applied.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** The **required
 > companion edit** is **APPLIED**: `vm/src/vm/tests.rs:51208-51213` no longer
 > passes `Value::Object(None)` — it builds `let x509 = create_java_string(&shared,
