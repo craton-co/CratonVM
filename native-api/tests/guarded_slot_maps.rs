@@ -57,7 +57,7 @@ fn fn_body(src: &str, name: &str) -> String {
     let bytes = src.as_bytes();
     let mut depth = 0usize;
     for (i, b) in bytes.iter().enumerate().skip(open) {
-        match b {
+        match *b {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
@@ -362,7 +362,7 @@ fn the_thread_virtual_slot_read_keeps_its_eetop_witness() {
     let mut depth = 0usize;
     let mut end = open;
     for (i, b) in src.as_bytes().iter().enumerate().skip(open) {
-        match b {
+        match *b {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;
