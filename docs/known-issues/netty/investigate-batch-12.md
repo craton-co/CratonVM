@@ -1,7 +1,8 @@
 # netty — investigate batch 12 of 13
 
-**TRIAGED 2026-08-12 — 10 of 15 now pass** (was 4), on branch
-`fix/netty-util-batch1213-20260812`. Three CratonVM defects were root-caused
+**TRIAGED 2026-08-12 — 11 of 15 now pass** (was 4), across branches
+`fix/netty-util-batch1213-20260812`, `fix/jit-ctor-side-effects-20260812` and
+`fix/netty-defaultpromise-20260812`. Three CratonVM defects were root-caused
 and fixed; the rest are characterised below, one filed separately and one an
 accepted divergence. See "Resolution" at the bottom.
 
@@ -53,7 +54,7 @@ HotSpot either, so "green" was never the target for them.
 | `ResourceLeakDetectorTest` | **2 FAIL** | 1 fail | 1 fail | disjoint from HotSpot's — see below |
 | `ThreadDeathWatcherTest` | 3/3 | 3/3 | 3/3 | already fixed on dev |
 | `AutoScalingEventExecutorChooserFactoryTest` | **1 FAIL** | 7/7 | 7/7 | CratonVM better than the oracle |
-| `DefaultPromiseTest` | 20/20 | 18/20 | 18/20 | JIT-only, not root-caused — see below |
+| `DefaultPromiseTest` | 20/20 | 18/20 | **20/20** | tier-dependent SOE depth (**fixed**) |
 | `DefaultThreadFactoryTest` | 3 ok, **2 aborted** | 1 fail | 1 fail | accepted divergence — see below |
 | `FastThreadLocalTest` | 13 ok, 3 skipped | HANG | HANG | JIT ctor-elision **fixed**; throughput wall remains |
 | `NonStickyEventExecutorGroupTest` | 10/10 | 10/10 | 10/10 | flaky under host load only |
@@ -137,33 +138,44 @@ HotSpot either, so "green" was never the target for them.
    Note that fix alone likely will not green this class — the loop is ~2.1
    billion iterations by construction.
 
-### Open, JIT-attributable, not root-caused
+### Fixed after the first pass
 
-9. **`DefaultPromiseTest` fails only with the JIT on.** Six runs of the class
-   alone on the fixed binary:
+9. **`DefaultPromiseTest` — FIXED (`fix/netty-defaultpromise-20260812`).**
+   Root cause was **not** in promises at all: CratonVM answered "how deep can I
+   recurse before StackOverflowError?" 28x differently depending on tier,
+   because the two tiers bound different things. The interpreter counts frames
+   in a heap `Vec` and stops at `JvmConfig::max_stack_depth` (8192); compiled
+   frames live on the native stack and `compute_self_call_stack_floor` put the
+   guard floor at the BOTTOM of the thread stack, so compiled recursion could
+   burn all ~7 MiB of an 8 MiB carrier.
 
-   | mode | run 1 | run 2 | run 3 |
-   |---|---|---|---|
-   | JIT on | 2 failed | 2 failed | 3 failed |
-   | `--nojit` | **0 failed** | **0 failed** | **0 failed** |
+   | tier | depth before `StackOverflowError` |
+   |---|---|
+   | CratonVM interpreter (`--nojit`) | 8 191 |
+   | CratonVM JIT (before) | **232 417** |
+   | CratonVM JIT (after) | **8 298 / 8 276** |
+   | HotSpot JDK 25 (interpreted → C2) | 11 820 → 23 306 |
 
-   So this is a JIT defect, not host-load flakiness — worth stating explicitly
-   because the failing assertion *is* a wall-clock one
-   (`assertTrue(latch.await(2, TimeUnit.SECONDS))` at
-   `DefaultPromiseTest.java:453`, reached from
-   `testNoStackOverflowWithDefaultEventExecutorA/B` and
-   `testStackOverFlowChainedFuturesB`), which on a shared host would normally
-   be the first thing to suspect. Three clean `--nojit` runs rule that out.
+   This test sizes its work from the depth it measures
+   (`stackOverflowTestDepth()` = `stackOverflowDepth << 1`) and then gives that
+   work a fixed 2-second deadline, so at 232k it was building a ~465 000-element
+   promise chain where HotSpot builds ~24 000–47 000.
 
-   **Not** obviously the same defect as the constructor-elision bug filed in
-   [jit-elided-constructor-side-effects-20260812.md](jit-elided-constructor-side-effects-20260812.md):
-   the promises here are built with a **1-arg** constructor
-   (`new DefaultPromise<Void>(executor)`) whose result is stored into an array,
-   so the receiver escapes and the `()V` trivial-init path does not apply.
-   The symptom is that the chained-listener cascade does not drive
-   `latch.countDown()` to zero within 2s. Next step for whoever picks this up:
-   raise the latch deadline to prove it is a *lost* notification rather than a
-   slow one, then bisect with the JIT tier/inlining levers.
+   **The JIT/`--nojit` split was misleading**, which is why the first pass left
+   it "not root-caused": `--nojit` passed only because the interpreter's
+   8192-frame cap happened to hand the test a small workload, not because the
+   JIT was miscompiling anything. A standalone probe of the same chain shape
+   shows CratonVM completes HotSpot's own chain lengths well inside the budget —
+   n=16 382 in 343 ms and n=46 612 in 798 ms against 2 000 ms — so throughput
+   was never the problem either.
+
+   Fixed by bounding compiled self-recursion to `SELF_CALL_STACK_BUDGET`
+   (4 MiB) below the first observed SP, taking the tighter of that and the
+   existing guard-page floor so the guard can only trip earlier, never later.
+   4 MiB was picked by measurement: 1 MiB (HotSpot's default `-Xss`) gave
+   2 434–5 305 frames — *stricter* than the interpreter, re-opening the gap from
+   the other side — because CratonVM's compiled frames are larger than
+   HotSpot's. The 28x gap is now 1.3%.
 
 ### Not CratonVM defects / accepted divergences
 
