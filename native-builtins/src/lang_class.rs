@@ -19447,12 +19447,29 @@ pub(crate) fn native_class_get_constant_pool(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    // Allocate a synthetic ConstantPool object.
-    // Field 0 stores the class_id as Int for later lookups.
-    let cp_obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ConstantPool", 2)?;
-    ctx.set_field(cp_obj, 0, Value::Int(class_id.as_u32() as i32));
-    // Field 1: store the Class mirror reference for getDeclaringClass()
-    ctx.set_field(cp_obj, 1, Value::Object(Some(this)));
+    // Allocate a ConstantPool carrying two PRIVATE slots, appended ABOVE every
+    // field the real class declares.
+    //
+    // W7-49 (2026-08-12): real `jdk.internal.reflect.ConstantPool` (JDK 25.0.3.9,
+    // `javap -p`) declares exactly one instance field — `private final Object
+    // constantPoolOop`. The old two-slot form wrote `Int(class_id)` into it and
+    // put the mirror one slot past the end of the real layout. `constantPoolOop`
+    // is a REFERENCE the collector scans as an oop, and a small `Int` sitting in
+    // it is the `MethodHandles$Lookup`/`allowedModes` shape §5 of
+    // natives-over-real-jdk-classes.md calls heap corruption, not a wrong answer.
+    //
+    // Safe to move: this file holds the ONLY mention of that class name in the
+    // workspace — nothing reads slot 0 or 1 back, and the real JDK's own
+    // `ConstantPool` accessors are `native` with no registration here, so no
+    // reader of either layout exists to break. In synthetic-JDK mode the class is
+    // a fabricated stub, `appended_slot_base_for_class` answers 0, and the
+    // allocation and both writes are byte-identical to what they were.
+    let (cp_obj, base) =
+        try_alloc_with_appended_slots(ctx, "jdk/internal/reflect/ConstantPool", 2)?;
+    // Private slot 0 stores the class_id as Int for later lookups.
+    ctx.set_field(cp_obj, base, Value::Int(class_id.as_u32() as i32));
+    // Private slot 1: the Class mirror reference for getDeclaringClass()
+    ctx.set_field(cp_obj, base + 1, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(cp_obj))))
 }
 
