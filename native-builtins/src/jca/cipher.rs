@@ -707,7 +707,7 @@ fn cipher_init_record_with_counter(
     // matches — when it surfaced at all. For `AES_128/GCM/NoPadding` with a
     // 256-bit key it did not surface: the suffix was never read, so the cipher
     // ran as AES-256 under an AES-128 name.
-    if let Some(reason) = aes_key_length_reason(&algo, key_bytes.len()) {
+    if let Some(reason) = key_length_reason(&algo, key_bytes.len()) {
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "java/security/InvalidKeyException",
@@ -1013,6 +1013,92 @@ enum CipherFamily {
     /// fixed by RFC 8439 (0 for the one-time Poly1305 key, 1 for the
     /// ciphertext) and must not be caller-chosen.
     ChaCha20Poly1305,
+    /// `Blowfish` in ECB, through the real SunJCE `BlowfishCipher` SPI.
+    ///
+    /// No Blowfish core is written here, on purpose. Adding one would mean a
+    /// second implementation of a primitive the image already ships — the
+    /// defect shape this campaign keeps finding — and it would mean restating
+    /// the P-array and four S-boxes, 4168 bytes of constants derived from pi
+    /// that no reviewer can check by reading. `phases_early::drive_real_cipher`
+    /// already routes AES-CBC/CFB/OFB and the whole DES family to the genuine
+    /// SunJCE SPI for exactly this reason; this is the same move, and its
+    /// output is HotSpot's by construction rather than by comparison.
+    Blowfish,
+    /// `ARCFOUR`, and `RC4` which is SunJCE's alias for it, through the real
+    /// SunJCE `ARCFOURCipher` SPI.
+    ///
+    /// RC4 is broken cryptography — RFC 7465 removed it from TLS, and it is
+    /// here for parity, not as a recommendation. That is not a reason to refuse
+    /// it: a workload that reads an RC4-encrypted legacy blob runs on HotSpot
+    /// and failed hard here, and this VM lacking the algorithm stops nobody
+    /// from using RC4 anywhere else. It IS a reason not to hand-roll it: the
+    /// real SPI carries the 40..1024-bit key-length rule and the KSA/PRGA that
+    /// a short reimplementation gets subtly wrong.
+    Arcfour,
+}
+
+/// The two families [`drive_real_ecb_cipher`] serves, and the SunJCE SPI class,
+/// `engineSetPadding` argument and `SecretKeySpec` algorithm each takes.
+///
+/// One table rather than three `match`es, because the three have to agree: a
+/// `BlowfishCipher` driven with `"NoPadding"` and a key labelled `"AES"` is not
+/// a diagnostic, it is different bytes.
+///
+/// The block size in bytes of the cipher `algo` names — 0 for a stream cipher
+/// or an asymmetric transformation, which is what `Cipher.getBlockSize()`
+/// contractually answers for those.
+///
+/// Split out of the `getBlockSize` registration because `getOutputSize` needs
+/// the same number and was hardcoding 16. That silently over-sized every DES,
+/// DESede and (as of W7-39) Blowfish and RC4 answer: a 16-byte Blowfish
+/// plaintext really encrypts to 24 bytes and `getOutputSize` claimed 32.
+/// Over-reporting is safe — the contract is an upper bound and a too-large
+/// buffer never throws — but two functions deriving the same property from two
+/// tables is how they end up disagreeing, and one of them is already the
+/// documented fix for a hardcoded 16.
+fn cipher_block_size(algo: &str) -> usize {
+    if algo.is_empty() {
+        return 0;
+    }
+    let (cipher_name, _mode, _pad) = parse_transformation(algo);
+    match cipher_name.to_ascii_uppercase().as_str() {
+        // 64-bit block ciphers.
+        "DES" | "DESEDE" | "TRIPLEDES" | "BLOWFISH" | "RC2" | "IDEA" => 8,
+        // Stream ciphers and asymmetric transformations have no block.
+        "RC4" | "ARCFOUR" | "CHACHA20" | "CHACHA20-POLY1305" | "RSA" | "ECIES" => 0,
+        // AES and everything else this module can actually service.
+        _ => 16,
+    }
+}
+
+/// `padded` is `parse_transformation`'s third element — true unless the caller
+/// spelled `NoPadding`, which is also how a bare name arrives.
+fn real_spi_ecb_route(
+    family: CipherFamily,
+    padded: bool,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match family {
+        // PKCS5 unless the caller wrote NoPadding — `Blowfish` bare is
+        // `Blowfish/ECB/PKCS5Padding` on SunJCE (measured: the bare name and the
+        // full spelling encrypt to the same 24 bytes, `33b63e40…`, while
+        // `Blowfish/ECB/NoPadding` gives 16).
+        CipherFamily::Blowfish => {
+            let pad = if padded { "PKCS5Padding" } else { "NoPadding" };
+            Some(("com/sun/crypto/provider/BlowfishCipher", pad, "Blowfish"))
+        }
+        // A stream cipher takes no padding at all, and SunJCE refuses to be
+        // asked for one: `Cipher.getInstance("RC4/ECB/PKCS5Padding")` raises
+        // `NoSuchAlgorithmException` (measured), which is why
+        // `classify_transformation` admits `NoPadding` only and this arm can
+        // hardcode it. The key algorithm is `"RC4"` because that is what a
+        // caller writes into `SecretKeySpec`; `ARCFOURCipher` does not read it.
+        CipherFamily::Arcfour => Some((
+            "com/sun/crypto/provider/ARCFOURCipher",
+            "NoPadding",
+            "RC4",
+        )),
+        _ => None,
+    }
 }
 
 /// What `Cipher.getInstance` must do with a transformation string.
@@ -1144,6 +1230,18 @@ fn cipher_family(algo: &str) -> Option<CipherFamily> {
         // dispatch checks the family rather than the mode.
         "CHACHA20" => Some(CipherFamily::ChaCha20),
         "CHACHA20-POLY1305" => Some(CipherFamily::ChaCha20Poly1305),
+        // Implemented 2026-08-12 (W7-39) against the real SunJCE SPI. Same
+        // history as the two ChaCha20 names above: admitted while nothing
+        // computed them, which made both AES-128-ECB and byte-identical to each
+        // other; refused on 08-11 because a wrong cipher is worse than a missing
+        // one; admitted again now that they resolve to their OWN families and
+        // `cipher_do_final_impl` keys the dispatch on the family.
+        //
+        // `RC4` and `ARCFOUR` land on one family deliberately — on SunJCE they
+        // are one service and an alias for it, not two algorithms, and giving
+        // them separate variants is how the two would drift apart.
+        "BLOWFISH" => Some(CipherFamily::Blowfish),
+        "RC4" | "ARCFOUR" => Some(CipherFamily::Arcfour),
         _ => None,
     }
 }
@@ -1364,6 +1462,65 @@ fn classify_transformation(transformation: &str) -> TransformVerdict {
             (None, None) => TransformVerdict::Serviceable(family),
             _ => TransformVerdict::NoSuchAlgorithm,
         },
+        // ECB only, and the padding set is PKCS5/NoPadding — which is a
+        // NARROWER admission than SunJCE's. Measured on HotSpot 25,
+        // `Blowfish/CBC/PKCS5Padding`, `Blowfish/CTR/NoPadding` and
+        // `Blowfish/ECB/ISO10126Padding` all resolve and encrypt; each is
+        // refused here.
+        //
+        // CBC and CTR are refused because `Cipher.init` in ENCRYPT_MODE with no
+        // parameter spec must GENERATE a random IV and expose it through
+        // `getIV()`/`getParameters()` (measured: HotSpot returned
+        // `iv=0417208096327740` for a `Blowfish/CBC/PKCS5Padding` encrypt the
+        // caller gave no IV), and this engine's `init` surface does not do that
+        // for a family it drives per-`doFinal`. Admitting the mode and quietly
+        // encrypting under an all-zero IV would be a fabricated success of the
+        // exact shape W7-38 measured. ISO10126 is refused for the reason the AES
+        // arm refuses it: its padding bytes are RANDOM, and serving PKCS5 in its
+        // place is a substitution, not an approximation.
+        //
+        // `Blowfish/ECB/PKCS7Padding` and `Blowfish/None/NoPadding` are refused
+        // here AND on HotSpot (measured: `NoSuchAlgorithmException: Cannot find
+        // any provider supporting Blowfish/None/NoPadding`), so those two are
+        // parity rather than under-service.
+        CipherFamily::Blowfish => {
+            let m = mode_u.as_deref().unwrap_or("ECB");
+            let p = pad_u.as_deref().unwrap_or("PKCS5PADDING");
+            if m != "ECB" {
+                return TransformVerdict::NoSuchAlgorithm;
+            }
+            aes_padding_verdict(p, &named_padding, &["NOPADDING", "PKCS5PADDING"], family)
+        }
+        // A stream cipher: `ECB` is the only mode SunJCE's `ARCFOURCipher`
+        // accepts and `NoPadding` the only padding, and both of those are
+        // measured refusals rather than inferred ones —
+        // `Cipher.getInstance("RC4/ECB/PKCS5Padding")`,
+        // `RC4/None/NoPadding` and `RC4/CBC/NoPadding` each raise
+        // `NoSuchAlgorithmException: Cannot find any provider supporting …` on
+        // HotSpot 25. So this arm is parity in BOTH directions, not a narrowing.
+        //
+        // `ECB` naming a stream cipher's mode is nonsense on its face, and it is
+        // what the JDK does: `ARCFOURCipher.engineSetMode` accepts "ECB" and
+        // rejects "NONE" (measured: `NoSuchAlgorithmException: Unsupported mode
+        // NONE` straight from the SPI). Matching the platform beats matching the
+        // dictionary.
+        CipherFamily::Arcfour => {
+            let m = mode_u.as_deref().unwrap_or("ECB");
+            let p = pad_u.as_deref().unwrap_or("NOPADDING");
+            if m != "ECB" {
+                return TransformVerdict::NoSuchAlgorithm;
+            }
+            // Deliberately `NoSuchAlgorithm`, not `NoSuchPadding`: HotSpot
+            // answers `NoSuchAlgorithmException` for `RC4/ECB/PKCS5Padding`
+            // because SunJCE's service carries no `SupportedPaddings` beyond
+            // NoPadding, so the lookup finds no service at all. The two
+            // exceptions are separately catchable and the JDK's choice is the
+            // one to copy.
+            if p != "NOPADDING" {
+                return TransformVerdict::NoSuchAlgorithm;
+            }
+            TransformVerdict::Serviceable(family)
+        }
     }
 }
 
@@ -1401,13 +1558,25 @@ fn transformation_pinned_key_len(algo: &str) -> Option<usize> {
 /// Why `key_len` bytes is not a usable key for `algo`, in HotSpot's own wording,
 /// or `None` if it is fine.
 ///
-/// Two rules, both measured on jdk-25.0.3.9-hotspot:
+/// Four rules, every one measured on jdk-25.0.3.9-hotspot:
 ///
 /// * a size-suffixed name pins the length exactly —
 ///   `AES_128/GCM/NoPadding` with a 32-byte key gives
 ///   `InvalidKeyException: The key must be 16 bytes`;
 /// * plain AES takes 16, 24 or 32 — a 17-byte key gives
-///   `InvalidKeyException: Invalid AES key length: 17 bytes`.
+///   `InvalidKeyException: Invalid AES key length: 17 bytes`;
+/// * Blowfish takes up to 56 — a 57-byte key gives
+///   `InvalidKeyException: Key too long (> 448 bits)`, and 3 and 4 bytes are
+///   both ACCEPTED, which is why there is no lower bound here;
+/// * RC4/ARCFOUR takes 5..=128 — 4 and 129 both give
+///   `InvalidKeyException: Key length must be between 40 and 1024 bit`.
+///
+/// The last two are checked here even though the real SunJCE SPI checks them
+/// again inside `engineInit`, and the duplication is the point: this engine
+/// drives that SPI from `doFinal`, so without a check at `init` the exception
+/// arrives from `Cipher.doFinal`, which does not declare `InvalidKeyException`
+/// at all. `Cipher.init` declares it precisely so a key the provider cannot use
+/// is rejected there — the same reasoning the RSA arm above records.
 ///
 /// Families whose key length this engine does not constrain (RSA components,
 /// the PBES2 password, DES/DESede parity keys handed to the real SunJCE SPI,
@@ -1417,19 +1586,23 @@ fn transformation_pinned_key_len(algo: &str) -> Option<usize> {
 /// could not read the key at all, which is a different defect with its own
 /// downstream handling; folding it in would convert that diagnosis into a
 /// length complaint.
-fn aes_key_length_reason(algo: &str, key_len: usize) -> Option<String> {
+fn key_length_reason(algo: &str, key_len: usize) -> Option<String> {
     if key_len == 0 {
         return None;
     }
     if let Some(pinned) = transformation_pinned_key_len(algo) {
         return (key_len != pinned).then(|| format!("The key must be {pinned} bytes"));
     }
-    let family = cipher_family(&tokenize_transformation(algo).ok()?.0)?;
-    if !matches!(family, CipherFamily::Aes | CipherFamily::AesKeyWrap) {
-        return None;
+    match cipher_family(&tokenize_transformation(algo).ok()?.0)? {
+        CipherFamily::Aes | CipherFamily::AesKeyWrap => (!matches!(key_len, 16 | 24 | 32))
+            .then(|| format!("Invalid AES key length: {key_len} bytes")),
+        CipherFamily::Blowfish => {
+            (key_len > 56).then(|| "Key too long (> 448 bits)".to_string())
+        }
+        CipherFamily::Arcfour => (!(5..=128).contains(&key_len))
+            .then(|| "Key length must be between 40 and 1024 bit".to_string()),
+        _ => None,
     }
-    (!matches!(key_len, 16 | 24 | 32))
-        .then(|| format!("Invalid AES key length: {key_len} bytes"))
 }
 
 /// Allocate a freshly initialised Cipher synthetic and register an empty
@@ -2147,6 +2320,149 @@ fn chacha20_do_final(
     finish_cipher_bytes(ctx, table_key, &out)
 }
 
+/// Drive a real SunJCE `CipherSpi` that takes **no `AlgorithmParameterSpec` at
+/// all** — `BlowfishCipher` in ECB, and `ARCFOURCipher`, which is a stream
+/// cipher and has no parameters in any mode.
+///
+/// ## Why this is not `phases_early::drive_real_cipher`
+///
+/// That function is the same idiom and it is the one to use when there IS an
+/// IV; it builds an `IvParameterSpec` unconditionally and passes the four-arg
+/// `engineInit(int, Key, AlgorithmParameterSpec, SecureRandom)`. Neither of
+/// these two families tolerates that. Measured on jdk-25.0.3.9-hotspot, driving
+/// the real SPI by reflection exactly as `drive_real_cipher` does:
+///
+/// ```text
+/// BlowfishCipher ECB/PKCS5Padding  params=null       -> 33b63e40d662746425f71a69f8cffcdadadae7ffa8950336
+/// BlowfishCipher ECB/PKCS5Padding  params=IV[0]      -> InvalidAlgorithmParameterException: Wrong IV length: must be 8 bytes long
+/// BlowfishCipher ECB/PKCS5Padding  params=IV[8]      -> InvalidAlgorithmParameterException: ECB mode cannot use IV
+/// ARCFOURCipher  ECB/NoPadding     params=null       -> 27ca482b161e3ab93f812659b904df95
+/// ARCFOURCipher  ECB/NoPadding     params=IV[0]      -> InvalidAlgorithmParameterException: Parameters not supported
+/// ```
+///
+/// So the choice is between a zero-length IV (a different exception), an
+/// eight-byte one (a wrong-mode exception), and no parameters. This calls the
+/// THREE-arg `engineInit(int, Key, SecureRandom)` overload rather than passing a
+/// null `AlgorithmParameterSpec` to the four-arg one, because a null there is
+/// ambiguous between the two four-arg overloads (`AlgorithmParameterSpec` and
+/// `AlgorithmParameters`) and because the three-arg form is the one
+/// `Cipher.init(int, Key)` itself calls. Both spellings were measured to produce
+/// the bytes above; this one says what it means.
+///
+/// The right end state is one driver taking `Option<&[u8]>` for the IV.
+/// `drive_real_cipher` lives in `phases_early.rs`, which the W7-39 lane does not
+/// own; merging them is a follow-up, and until then this doc comment and that
+/// one point at each other so neither is edited alone.
+///
+/// ## What is deliberately NOT reimplemented
+///
+/// Everything. No Blowfish key schedule, no RC4 KSA/PRGA, no PKCS#5 padding —
+/// the SPI does all of it, including the key-length refusals
+/// (`key_length_reason` duplicates only the two that must surface at `init`
+/// rather than `doFinal`). A second implementation of a primitive the image
+/// already ships is the defect shape this campaign has found repeatedly; the
+/// point of routing here is that the output is HotSpot's by construction.
+fn drive_real_ecb_cipher(
+    ctx: &mut dyn NativeContext,
+    spi_class: &'static str,
+    pad_str: &str,
+    key_algo: &str,
+    opmode: i32,
+    key_bytes: &[u8],
+    data: &[u8],
+) -> MethodCallResult {
+    let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: spi_class.into(),
+            }
+            .into())
+        }
+    };
+    // Pin the SPI across every allocation below (create_string, byte arrays,
+    // SecretKeySpec): a moving GC between the constructor and `engineDoFinal`
+    // would otherwise leave `spi` pointing at an abandoned from-space copy, and
+    // the symptom would be a cipher that "worked" against uninitialised state.
+    let pin = ctx.pin_native_root(spi);
+    let result = (|| -> MethodCallResult {
+        let mode_s = ctx.create_string("ECB");
+        let spi_r = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineSetMode",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(mode_s))],
+        )?;
+        let pad_s = ctx.create_string(pad_str);
+        let spi_r = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineSetPadding",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(pad_s))],
+        )?;
+
+        // `SecretKeySpec(key, algorithm)`. The array is built fresh from
+        // `key_bytes` and handed straight to the constructor, which COPIES it
+        // (`jca::secret_key_spec`, fixed 2026-08-11) — the side-table's own copy
+        // is never aliased into Java, and nothing here scrubs a buffer the key
+        // still points at. That direction is the one that produced the all-zero
+        // AES key W7-38 measured.
+        let key_arr = crate::phases_early::make_byte_array(ctx, key_bytes);
+        let kpin = ctx.pin_native_root(key_arr);
+        let algo_s = ctx.create_string(key_algo);
+        let key_arr_r = ctx.read_native_pin(kpin, key_arr);
+        let secret_key = match ctx.new_object_initialized(
+            "javax/crypto/spec/SecretKeySpec",
+            "([BLjava/lang/String;)V",
+            &[Value::Object(Some(key_arr_r)), Value::Object(Some(algo_s))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "SecretKeySpec construction failed".into(),
+                }
+                .into())
+            }
+        };
+        let skpin = ctx.pin_native_root(secret_key);
+
+        // `engineInit(opmode, key, null)` — the no-parameters overload. See the
+        // measured table above for what each parameter-bearing spelling does.
+        let spi_r = ctx.read_native_pin(pin, spi);
+        let sk_r = ctx.read_native_pin(skpin, secret_key);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineInit",
+            "(ILjava/security/Key;Ljava/security/SecureRandom;)V",
+            &[
+                Value::Int(opmode),
+                Value::Object(Some(sk_r)),
+                Value::Object(None),
+            ],
+        )?;
+
+        let data_arr = crate::phases_early::make_byte_array(ctx, data);
+        let dlen = data.len() as i32;
+        let dpin = ctx.pin_native_root(data_arr);
+        let spi_r = ctx.read_native_pin(pin, spi);
+        let data_arr_r = ctx.read_native_pin(dpin, data_arr);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineDoFinal",
+            "([BII)[B",
+            &[
+                Value::Object(Some(data_arr_r)),
+                Value::Int(0),
+                Value::Int(dlen),
+            ],
+        )
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
 /// Reads the transformation back out of the side-table and routes it by
 /// FAMILY, in this order: RSA → PBES2 → the real SunJCE SPI (AES-CBC/CFB/OFB,
 /// DES, DESede) → the in-crate AES paths (GCM, ECB, RFC 3394 key wrap). Every
@@ -2310,6 +2626,34 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             )?;
             // Reset accumulators for reuse — but FIRST capture the result so a
             // moving GC during the reset alloc can't relocate it.
+            if let Some(Value::Object(Some(_))) = out {
+                with_table_write(|t| {
+                    if let Some(s) = t.get_mut(&key) {
+                        s.accumulated.clear();
+                        s.aad.clear();
+                    }
+                });
+            }
+            return Ok(out);
+        }
+    }
+
+    // Blowfish and RC4/ARCFOUR — also BEFORE `Aes::key_expansion`, and for the
+    // same reason the ChaCha20 route below gives. A 16-byte Blowfish or RC4 key
+    // is a valid AES-128 key, so the expansion succeeded rather than erroring
+    // and the mode-only dispatch ran AES-128-ECB: measured, both names produced
+    // `178c380cadc0514ffe26d8b26351c673` — the same bytes as each other AND as
+    // `AES/ECB/NoPadding` on the same key. Keying on the FAMILY is what makes
+    // admitting these names safe again; see `real_spi_ecb_route`.
+    let (spi_name, _spi_mode, spi_padded) = parse_transformation(&algo);
+    if let Some(family) = cipher_family(&spi_name) {
+        if let Some((spi_class, pad_str, key_algo)) = real_spi_ecb_route(family, spi_padded) {
+            let out = drive_real_ecb_cipher(
+                ctx, spi_class, pad_str, key_algo, mode, &key_bytes, &data,
+            )?;
+            // Capture the result BEFORE the reset, exactly as the route above
+            // does: the reset allocates, and a moving GC between the two would
+            // relocate the ciphertext array out from under `out`.
             if let Some(Value::Object(Some(_))) = out {
                 with_table_write(|t| {
                     if let Some(s) = t.get_mut(&key) {
@@ -3311,8 +3655,24 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 total.saturating_sub(16)
             }
         } else if encrypt {
-            // Block cipher with PKCS padding: round up to the next 16-byte block.
-            (total / 16 + 1) * 16
+            // Block cipher with PKCS padding: round up to the next whole block,
+            // and PKCS#7 always adds one — an exact multiple gains a full block
+            // of padding, which is why this is `total / b + 1` and not a ceiling.
+            // The block size is the CIPHER's, taken from `cipher_block_size`;
+            // this line read `(total / 16 + 1) * 16` until 2026-08-12, which
+            // over-reported every 8-byte-block transformation and rounded a
+            // stream cipher up to a block boundary it does not have.
+            //
+            // `_pad` is deliberately still ignored: `getOutputSize` is an UPPER
+            // bound, and rounding a `NoPadding` cipher up costs a caller a few
+            // spare bytes while getting it wrong the other way costs them a
+            // `ShortBufferException`. RFC 3394 key wrap is the case that pins
+            // this — `AES/KW/NoPadding` outputs input+8, so an exact-length
+            // answer would be short.
+            match cipher_block_size(&algo) {
+                0 => total,
+                b => (total / b + 1) * b,
+            }
         } else {
             total
         };
@@ -3380,17 +3740,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 .map(|s| s.algorithm.clone())
                 .unwrap_or_default()
         });
-        let (cipher_name, _mode, _pad) = parse_transformation(&algo);
-        let block = match cipher_name.to_ascii_uppercase().as_str() {
-            // 64-bit block ciphers.
-            "DES" | "DESEDE" | "TRIPLEDES" | "BLOWFISH" | "RC2" | "IDEA" => 8,
-            // Stream ciphers and asymmetric transformations have no block.
-            "RC4" | "ARCFOUR" | "CHACHA20" | "CHACHA20-POLY1305" | "RSA" | "ECIES" => 0,
-            // AES and everything else this module can actually service.
-            _ if algo.is_empty() => 0,
-            _ => 16,
-        };
-        Ok(Some(Value::Int(block)))
+        Ok(Some(Value::Int(cipher_block_size(&algo) as i32)))
     });
 
     // STUB-REMOVAL (wave 2), competing registration: `getOutputSize(I)I` was
@@ -3986,15 +4336,204 @@ mod tests {
     /// accepted a whole catalogue, and every name in it reached the same ECB
     /// arm. Measured: `Blowfish` and `RC4` produced the SAME ciphertext as each
     /// other from a 16-byte key, because both were AES-128-ECB.
+    ///
+    /// `Blowfish`, `RC4` and `ARCFOUR` left this list on 2026-08-12 (W7-39) —
+    /// they are computed now, by the real SunJCE SPI, and
+    /// `blowfish_and_rc4_are_their_own_ciphers_and_not_aes` is where they went.
+    /// The rest stay, and the list keeps its name: what it pins is that an
+    /// algorithm nothing computes is REFUSED, not that these particular thirteen
+    /// names are forever unimplementable.
     #[test]
     fn the_other_names_that_were_silently_aes_are_refused_too() {
         for t in [
-            "Blowfish", "RC4", "ARCFOUR", "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish",
+            "RC2", "IDEA", "SEED", "SM4", "Camellia", "Twofish",
             "Serpent", "CAST5", "Salsa20", "Skipjack", "ECIES", "ElGamal", "NULL",
         ] {
             assert!(refuses_algorithm(t), "{t} must be refused, not served as AES");
         }
         assert!(refuses_algorithm("CRATONVM-NO-SUCH-CIPHER"));
+    }
+
+    /// The twin of the test above, for the two names that moved off it. This is
+    /// the assertion that would have caught the ORIGINAL defect: both were
+    /// admitted then, so "does `getInstance` accept it" proves nothing on its
+    /// own — what matters is that each resolves to its OWN family, so
+    /// `cipher_do_final_impl`'s family-keyed dispatch reaches
+    /// `BlowfishCipher`/`ARCFOURCipher` and never `Aes::key_expansion`.
+    ///
+    /// Measured on jdk-25.0.3.9-hotspot with a 16-byte key `30..3f` over the
+    /// 16-byte plaintext `"sixteen byte msg"`, which is the same input
+    /// `probes/CryptoTrioProbe.java` uses:
+    ///
+    /// ```text
+    /// AES/ECB/NoPadding  178c380cadc0514ffe26d8b26351c673
+    /// Blowfish           33b63e40d662746425f71a69f8cffcdadadae7ffa8950336   (24B, PKCS5)
+    /// RC4                27ca482b161e3ab93f812659b904df95                   (16B, stream)
+    /// ```
+    ///
+    /// Three different algorithms, three different answers. Before this lane all
+    /// three of those lines read `178c380c…`.
+    #[test]
+    fn blowfish_and_rc4_are_their_own_ciphers_and_not_aes() {
+        for t in ["Blowfish", "BLOWFISH", "Blowfish/ECB/PKCS5Padding", "Blowfish/ECB/NoPadding"] {
+            assert!(transformation_is_serviceable(t), "{t} must resolve");
+            let (name, _, _) = parse_transformation(t);
+            assert!(
+                matches!(cipher_family(&name), Some(CipherFamily::Blowfish)),
+                "{t} must resolve to the Blowfish family, not to AES"
+            );
+        }
+        for t in ["RC4", "ARCFOUR", "rc4", "RC4/ECB/NoPadding", "ARCFOUR/ECB/NoPadding"] {
+            assert!(transformation_is_serviceable(t), "{t} must resolve");
+            let (name, _, _) = parse_transformation(t);
+            assert!(
+                matches!(cipher_family(&name), Some(CipherFamily::Arcfour)),
+                "{t} must resolve to the ARCFOUR family, not to AES"
+            );
+        }
+        // The SPI route each family takes, asserted rather than assumed: a
+        // Blowfish transformation driven by `ARCFOURCipher` (or either driven
+        // with the other's padding) is a substitution, and the only place that
+        // pairing is written down is `real_spi_ecb_route`.
+        assert_eq!(
+            real_spi_ecb_route(CipherFamily::Blowfish, true),
+            Some(("com/sun/crypto/provider/BlowfishCipher", "PKCS5Padding", "Blowfish"))
+        );
+        assert_eq!(
+            real_spi_ecb_route(CipherFamily::Blowfish, false),
+            Some(("com/sun/crypto/provider/BlowfishCipher", "NoPadding", "Blowfish"))
+        );
+        // A stream cipher's padding does not depend on the transformation,
+        // because `classify_transformation` admits only `NoPadding` for it.
+        for padded in [true, false] {
+            assert_eq!(
+                real_spi_ecb_route(CipherFamily::Arcfour, padded),
+                Some(("com/sun/crypto/provider/ARCFOURCipher", "NoPadding", "RC4"))
+            );
+        }
+        // No other family may reach this driver: every one of them either has
+        // its own in-crate path or routes through `drive_real_cipher` with an
+        // IV, and both of those SPIs refuse the no-parameters `engineInit` this
+        // one calls.
+        for f in [
+            CipherFamily::Aes,
+            CipherFamily::AesFixed(16),
+            CipherFamily::AesKeyWrap,
+            CipherFamily::DesFamily,
+            CipherFamily::Rsa,
+            CipherFamily::Pbes2,
+            CipherFamily::ChaCha20,
+            CipherFamily::ChaCha20Poly1305,
+        ] {
+            assert!(
+                real_spi_ecb_route(f, true).is_none(),
+                "{f:?} must not route to the no-parameters SPI driver"
+            );
+        }
+    }
+
+    /// MUST RAISE. The modes and paddings HotSpot serves for these two families
+    /// and this engine does not — under-service, refused honestly.
+    ///
+    /// `Blowfish/CBC/PKCS5Padding` and `Blowfish/CTR/NoPadding` both resolve and
+    /// encrypt on HotSpot 25 (measured, including the RANDOM IV HotSpot
+    /// generates and reports through `getIV()`: `0417208096327740` on one run).
+    /// Admitting them here without implementing the generate-and-report-an-IV
+    /// contract would encrypt under an all-zero IV and call it success — which
+    /// is the fabricated-success shape W7-38 measured, not a smaller version of
+    /// it. `Blowfish/ECB/ISO10126Padding` resolves on HotSpot too and its
+    /// padding bytes are RANDOM; serving PKCS5 in its place is a substitution.
+    #[test]
+    fn blowfish_and_rc4_modes_this_engine_does_not_compute_are_refused() {
+        for t in [
+            "Blowfish/CBC/PKCS5Padding",
+            "Blowfish/CBC/NoPadding",
+            "Blowfish/CTR/NoPadding",
+            "Blowfish/CFB/NoPadding",
+            "Blowfish/OFB/NoPadding",
+            "Blowfish/PCBC/PKCS5Padding",
+            "RC4/CBC/NoPadding",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
+        }
+        assert!(refuses_padding("Blowfish/ECB/ISO10126Padding"));
+        // …and the shapes HotSpot ALSO refuses, so these rows are parity rather
+        // than under-service. Measured: `NoSuchAlgorithmException: Cannot find
+        // any provider supporting <name>` for each.
+        for t in [
+            "Blowfish/None/NoPadding",
+            "RC4/None/NoPadding",
+            "RC4/NONE/NoPadding",
+            // A padding on a stream cipher is a missing SERVICE on SunJCE, not a
+            // missing padding — the service carries no `SupportedPaddings`
+            // beyond NoPadding, so the lookup finds nothing at all and the
+            // exception is `NoSuchAlgorithmException`. The two are separately
+            // catchable, so which one is thrown is part of the parity.
+            "RC4/ECB/PKCS5Padding",
+            "ARCFOUR/ECB/PKCS5Padding",
+        ] {
+            assert!(refuses_algorithm(t), "{t} must be refused, as HotSpot refuses it");
+        }
+        // `Blowfish/ECB/PKCS7Padding` is refused by HotSpot as well, and as a
+        // PADDING failure here — the algorithm and mode do resolve.
+        assert!(refuses_padding("Blowfish/ECB/PKCS7Padding"));
+    }
+
+    /// The key lengths each family accepts, in HotSpot's own wording, checked at
+    /// `init` where `Cipher.init` declares `InvalidKeyException` — not at
+    /// `doFinal`, which does not declare it. Every bound measured on
+    /// jdk-25.0.3.9-hotspot by calling `Cipher.init` with that many bytes.
+    ///
+    /// The asymmetry is real and is why this is a table and not a rule: a
+    /// 3-byte Blowfish key is ACCEPTED (SunJCE has no lower bound on it) while
+    /// a 4-byte RC4 key is refused.
+    #[test]
+    fn blowfish_and_rc4_key_lengths_match_hotspot() {
+        for n in [3usize, 4, 8, 16, 32, 56] {
+            assert!(
+                key_length_reason("Blowfish", n).is_none(),
+                "HotSpot accepts a {n}-byte Blowfish key"
+            );
+        }
+        assert_eq!(
+            key_length_reason("Blowfish", 57).as_deref(),
+            Some("Key too long (> 448 bits)")
+        );
+        for n in [5usize, 16, 128] {
+            assert!(
+                key_length_reason("RC4", n).is_none(),
+                "HotSpot accepts a {n}-byte RC4 key"
+            );
+        }
+        for n in [4usize, 129] {
+            assert_eq!(
+                key_length_reason("ARCFOUR", n).as_deref(),
+                Some("Key length must be between 40 and 1024 bit"),
+                "HotSpot refuses a {n}-byte RC4 key at init"
+            );
+        }
+    }
+
+    /// `getBlockSize()` and `getOutputSize()` must derive the block from the
+    /// SAME place, which is what `cipher_block_size` is for. They did not:
+    /// `getOutputSize` hardcoded 16 while `getBlockSize` carried the real table,
+    /// so the two disagreed for every 64-bit-block cipher and for every stream
+    /// cipher. Measured on HotSpot: `Blowfish` reports `getBlockSize()=8` and
+    /// `RC4` reports 0.
+    #[test]
+    fn block_size_is_the_ciphers_own_and_stream_ciphers_have_none() {
+        assert_eq!(cipher_block_size("Blowfish"), 8);
+        assert_eq!(cipher_block_size("Blowfish/ECB/PKCS5Padding"), 8);
+        assert_eq!(cipher_block_size("DESede/CBC/PKCS5Padding"), 8);
+        assert_eq!(cipher_block_size("RC4"), 0);
+        assert_eq!(cipher_block_size("ARCFOUR/ECB/NoPadding"), 0);
+        assert_eq!(cipher_block_size("ChaCha20"), 0);
+        assert_eq!(cipher_block_size("RSA/ECB/PKCS1Padding"), 0);
+        assert_eq!(cipher_block_size("AES/GCM/NoPadding"), 16);
+        // An un-inited Cipher has no transformation at all; 0 rather than a
+        // default 16, so a caller cannot align on a block this cipher may not
+        // have.
+        assert_eq!(cipher_block_size(""), 0);
     }
 
     /// MUST RAISE. Modes with no implementation here. Each used to be admitted
@@ -4132,25 +4671,25 @@ mod tests {
         assert_eq!(transformation_pinned_key_len("AES/GCM/NoPadding"), None);
         // HotSpot's measured wording, both flavours.
         assert_eq!(
-            aes_key_length_reason("AES_128/GCM/NoPadding", 32).as_deref(),
+            key_length_reason("AES_128/GCM/NoPadding", 32).as_deref(),
             Some("The key must be 16 bytes")
         );
         assert_eq!(
-            aes_key_length_reason("AES/GCM/NoPadding", 17).as_deref(),
+            key_length_reason("AES/GCM/NoPadding", 17).as_deref(),
             Some("Invalid AES key length: 17 bytes")
         );
         // MUST STILL WORK: the legal sizes, and the families this rule does
         // not govern.
-        assert!(aes_key_length_reason("AES_128/GCM/NoPadding", 16).is_none());
+        assert!(key_length_reason("AES_128/GCM/NoPadding", 16).is_none());
         for n in [16, 24, 32] {
-            assert!(aes_key_length_reason("AES/CBC/PKCS5Padding", n).is_none());
+            assert!(key_length_reason("AES/CBC/PKCS5Padding", n).is_none());
         }
-        assert!(aes_key_length_reason("RSA/ECB/PKCS1Padding", 294).is_none());
-        assert!(aes_key_length_reason("PBEWithHmacSHA1AndAES_128", 9).is_none());
-        assert!(aes_key_length_reason("DESede/CBC/PKCS5Padding", 24).is_none());
+        assert!(key_length_reason("RSA/ECB/PKCS1Padding", 294).is_none());
+        assert!(key_length_reason("PBEWithHmacSHA1AndAES_128", 9).is_none());
+        assert!(key_length_reason("DESede/CBC/PKCS5Padding", 24).is_none());
         // An unreadable key is a different diagnosis and must not be reported
         // as a length complaint.
-        assert!(aes_key_length_reason("AES/GCM/NoPadding", 0).is_none());
+        assert!(key_length_reason("AES/GCM/NoPadding", 0).is_none());
     }
 
     /// A bare `AES` really is `AES/ECB/PKCS5Padding` on SunJCE (measured:
