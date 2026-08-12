@@ -1,3 +1,14 @@
+> **RETIRED 2026-08-12 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> A pure measurement record: the round-2 differential at **96 divergences**, with two dead sections. Its only prescriptive row — *"fix the two throws first, then re-take the diff; the real per-family numbers are not knowable until those sections run to the end"* — is discharged. `SECTION-DIED.dequeEdges` and `SECTION-DIED.concurrentAndAtomic` were closed by `W7-33-differential-dead-sections.md` (landed `aab87e003`), and the diff was re-taken with **0 sections died**.
+>
+> Every one of its 96 rows is owned elsewhere: W7-33 (dead sections), W7-36 (view/collection families), W7-37 (Throwable and VM-minted messages), W7-34 (formatter), W7-44 (NumberFormat / enum / Gaussian), W7-41 (format exception subclasses), W7-65 (stream reuse). Nothing unique remains.
+>
+> **Do not cite W7-40 as the successor.** `W7-40-differential-at-14.md` is itself banner-marked superseded — five of its fourteen were the *instrument* (two sides compiled from different class files; `[SUREFIRE-NPE]` was an `eprintln!` merged into stdout). The live successor is `W7-42-differential-instrument-holes.md`, at **9**, one compile, streams kept apart, `PROBE-LEDGER=missing:0,undeclared:0,duplicate:0,multiline:0,unrenderable:0`.
+>
+> Previous location: `docs/known-issues/jdk-only/W7-32-round-2-differential-run.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # W7-32 — the round-2 differential, run: 96 divergent observables
 
 **Status: MEASURED 2026-08-12.** First execution of `probes/ShadowDifferentialProbe.java` after its

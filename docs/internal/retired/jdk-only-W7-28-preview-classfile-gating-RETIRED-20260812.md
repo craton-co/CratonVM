@@ -1,3 +1,19 @@
+> **RETIRED 2026-08-12 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> **Its status line — *"the switch that turns it off is NOT WIRED"* — was the single most misleading status in this directory.** All four handback parts are in the tree, verified independently of the reconciliation that first flagged it:
+>
+> * **A** — `--enable-preview` declared at `vm-cli/src/main.rs:443-444`, applied at `:2940`, with tests `enable_preview_is_a_bare_flag_and_does_not_consume_main_class` (`:7188`) and `enable_preview_defaults_off_like_hotspot` (`:7208`). Commit `de9bedeef`.
+> * **B** — `PreviewFeatures.isPreviewEnabled` reads the same bit (`native-builtins/src/lib.rs:14953-14958`, re-export `:4304-4306`); the stale *"We don't parse --enable-preview yet"* comment is gone. Commit `de9bedeef`.
+> * **C** — `UnsupportedClassVersionError` with HotSpot's wording: `types/src/error.rs:843`, `vm/src/runtime/exceptions.rs:2362-2363`, `classloading/src/class_manager.rs:5280`. Commit `6ce65f98a`. **C3's open caveat — *"do not invent the placeholder, measure it first"* — was honoured:** the Adoptium 25.0.3.9 measurement is written out at `class_manager.rs:5260-5278` and `<Unknown>` is what it produced.
+> * **D** — the two benchmark scripts. This record left D open with a specific command, `od -An -tx1 -N8 <class>`. **It was run on 2026-08-12 against the checked-in artefacts:** `bench-tornado/PolyEvalTornado.class` and `VectorAddTornado.class` both answer `ca fe ba be 00 00 00 45` — minor 0, major 69, **neither preview-stamped**, so neither can reach the new arm. Independently, neither is ever run by CratonVM: `bench-tornado/run.sh:44` execs `tornado`, and the CratonVM arms of `scripts/internal/bench-poly-4way.sh` (`:52`, `:62`, `:72`) run `CpuPolyBench`/`GpuPolyBench`, which nothing compiles with `--enable-preview`.
+>
+> The reader gate itself is complete and ordered (`reader/src/class_file_version.rs:56`, `:58`, `:62`, order pinned `:319-326`, `rejection_messages_are_hotspots` `:456`), and §3.4's inverted test now asserts the refusal (`reader/tests/vulnerability_fixes.rs:349`). §3.5's refusal to add a `CRATONVM_*` twin is an argued refusal and is held.
+>
+> **One confirming run is still un-taken** — this record's own Falsifier, which is a confirmation of landed source rather than unfinished work. It is carried forward in `docs/known-issues/jdk-only/README.md` §2.6 with its exact commands.
+>
+> Previous location: `docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # CratonVM ran a preview class file HotSpot refuses, and the rule is not "minor == 65535"
 
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "NOT WIRED" IS

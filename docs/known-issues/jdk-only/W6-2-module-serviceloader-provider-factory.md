@@ -25,6 +25,44 @@
   `SyntheticStub` rows at registration and runs the real
   `java.util.ServiceLoader` bytecode all the way to 44/44.
 
+**AMENDED 2026-08-12 (RETIREMENT-20260812.md §3) — this record was nominated for
+retirement and is NOT retired. It carries two live rows.**
+
+* **STILL OPEN, and it is not one of the two scope decisions above: the
+  factory-return-type subtype check is applied on ONE of the two provider
+  paths.** `service_accepts_type` (`native-builtins/src/service_loader.rs:1677`)
+  has exactly one caller, at `:1897`, inside the **iterator** path
+  (`native_sl_iterator`). The **stream** path (`native_sl_stream`, factory block
+  at `:2401-2420`) calls `factory_return_type` and uses the result only to build
+  the wrapper — it never asks `service_accepts_type` and never raises. So a
+  module-declared provider whose `provider()` return type is **not** a subtype
+  of the service raises `ServiceConfigurationError` from `iterator()`, as the
+  JDK requires, and is **quietly handed out** by `stream()`.
+
+  **Why 44/44 does not see it, and why nothing else would have:** the fixture's
+  `FactoryGreeter.provider()` returns `Greeter` — a *correct* subtype. The
+  vector exercises only the positive case, so a check that is present on the
+  path the test walks and absent on the path it does not cannot go red. Do not
+  read the green as covering this.
+
+  Not fixed in the lane that found it: the `:1881-1910` block it has to mirror
+  re-reads `sl` and the return-type mirror through `read_native_pin` **after**
+  the allocating `factory_return_type` call, in the order the comment at
+  `:1886-1889` spells out, and that lane could not compile. It is also a
+  `Compatible`-mode change — permitted, because raising
+  `ServiceConfigurationError` there is genuine HotSpot parity, but only behind a
+  measurement. The negative fixture and the exact command are in
+  RETIREMENT-20260812.md §3.
+
+* **STILL OPEN, downgraded from "argued refusal" to "deferred for want of a
+  measurement":** the constructor-form subtype check under *Deliberately NOT
+  done* below. Confirmed absent — there is no `service_accepts_type` call on
+  either constructor path (`:2038`, `:2465` grant the reflective override and go
+  straight to `newInstance`). Its own stated reason is *"this lane cannot
+  measure that"*, which is a deferral, not a decision. The measurement that
+  settles it is a census of `isAssignableFrom` over the boot modules' `provides`
+  clauses; nobody has taken it.
+
 ## The failure
 
 `RJdkModule.moduleServices()` (`:213`-`:243`). HotSpot 25 prints

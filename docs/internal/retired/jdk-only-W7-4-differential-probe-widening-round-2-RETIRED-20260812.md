@@ -1,3 +1,14 @@
+> **RETIRED 2026-08-12 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> An instrument record whose entire deliverable was *"someone run the CratonVM side of the widened probe"*. That was discharged, and then acted on four times over. The widening itself is fully in the tree: all fifteen sections and 540 observables are in `probes/ShadowDifferentialProbe.java` (`dequeEdges` `:1674`, `concurrentAndAtomic` `:1854`, `bigNumbers` `:1983`, `seededRandom` `:2434`, `throwableSurface` `:2503`, dispatched `:272-281`), as are both hazard fixes it asked for (`drainBounded` `:2878`; the unbounded-iterator and unbounded-enumeration caps `:2845-2870`) and its `thrownDetail` discipline (`:2812`). Its seven "families considered and rejected" are argued refusals, each carrying its reason in place.
+>
+> **Its 540-line HotSpot oracle (lines 319-858) is now STALE and must not be diffed against.** The probe has since gained a declare/manifest ledger (`probes/ShadowDifferentialProbe.java:425`, `declare(...)` `:623-767`); the current transcript is 864 lines with `PROBE-MANIFEST-DIGEST=22732607802c59c2`. Diffing the old transcript manufactures divergence. That is a reason to retire this record, not to keep it.
+>
+> Successors: W7-32 ran it (96 divergences), then W7-33 / W7-36 / W7-37 / W7-40, and the live figure is in `W7-42-differential-instrument-holes.md` (9).
+>
+> Previous location: `docs/known-issues/jdk-only/W7-4-differential-probe-widening-round-2.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # Widening the shadow differential again: fifteen more families, 540 more observables, and the HotSpot oracle to diff them against
 
 **Status: PROBE WIDENED, NOT YET RUN AGAINST CRATONVM.** Written 2026-08-11.
