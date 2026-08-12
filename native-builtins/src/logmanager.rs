@@ -386,136 +386,94 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 /// field layout — the difference is purely the `getClass()` mirror the
 /// bytecode observes.
 ///
-/// # The state that blocked `java/util/logging`'s retirement
+/// # This is the state that blocks `java/util/logging`'s retirement
 ///
-/// Until 2026-08-11 the singleton was ALLOCATED here and never CONSTRUCTED:
-/// `<init>` did not run, and only four of its fourteen slots were written.
-/// Measured against HotSpot 25.0.3 on 2026-08-11 (`--add-opens
+/// The singleton is ALLOCATED here and never CONSTRUCTED: `<init>` does not
+/// run, and only four of its fourteen slots are written. Measured against
+/// HotSpot 25.0.3 on 2026-08-11 (`--add-opens
 /// java.logging/java.util.logging=ALL-UNNAMED`, reflecting the object
-/// `LogManager.getLogManager()` returns), eight reference fields were null
-/// here and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
+/// `LogManager.getLogManager()` returns), eight reference fields are null here
+/// and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
 /// `configurationLock`, `closeOnResetLoggers`, `listeners`, `loggerRefQueue`.
 ///
-/// That was survivable for as long as every accessor was a native. It stopped
-/// being survivable when the 2026-08-11 wave retired 84 `java/util/logging/`
-/// shadows: under `--jdk-only` those triples are now refused and the real
-/// bytecode runs, so `Logger.getLogger(name)` reaches
-/// `LogManager.demandSystemLogger`, dereferences the null `systemContext` and
-/// throws — on the FIRST call any JUL user makes. A/B'd across four binaries,
-/// discriminated by each one's own `--dump-native-registry` row for
-/// `Logger.getLogger`: `bridge` scores 16/17 on a 17-assertion probe,
-/// `synthetic-stub` scores 0/17. Compatible mode is unaffected, because a
-/// `SyntheticStub` still dispatches there.
+/// That was survivable for as long as every accessor was a native, and it is
+/// still what this function produces. What it is NOT is the cause of the
+/// strict-mode `Logger.getLogger` regression, and the correction matters
+/// because the obvious repair here — "run `<init>` on the singleton" — is
+/// inert.
 ///
-/// # The fix taken here: run the real `<init>`
+/// # This object is not on the `--jdk-only` path at all
 ///
-/// The campaign's own rule is that a class's state has to become REAL before
-/// its shadow can retire, so the hold-back is the interim and this is the
-/// answer. `javap -p -c --module java.logging java.util.logging.LogManager` on
-/// Temurin 25.0.3 — the ctor is 114 bytes and every one of them is a field
-/// store:
+/// Measured 2026-08-11 against `target/release/cratonvm.exe` with
+/// `--explain-jdk-only --dump-native-registry`, reading the `registered_by` /
+/// `overwrote` chain the schema-4 census exists to expose:
 ///
 /// ```text
-///   props               = new Properties()
-///   systemContext       = new LogManager$SystemLoggerContext(this)
-///   userContext         = new LogManager$LoggerContext(this)
-///   configurationLock   = new ReentrantLock()
-///   closeOnResetLoggers = new CopyOnWriteArrayList()
-///   listeners           = Collections.synchronizedMap(new IdentityHashMap())
-///   initializedCalled = false; initializationDone = false
-///   loggerRefQueue      = new ReferenceQueue()
-///   Runtime.getRuntime().addShutdownHook(new Cleaner(this))  // catches ISE
+/// LogManager.getLogManager()  Compatible          --jdk-only
+///   phases_early.rs:20272     intrinsic           intrinsic   <- SURVIVES, wins
+///   lib.rs:16964              overwrote intrinsic  (refused)
+///   logmanager.rs:5472        overwrote s-stub, WINS  (refused)
 /// ```
 ///
-/// That is SEVEN of the eight null fields, including the `systemContext` whose
-/// dereference is the NPE. It calls nothing that re-enters `getLogManager()`,
-/// so running it from inside the singleton's own construction cannot recurse.
+/// Three registrars hold that one triple. In `Compatible` the last one — this
+/// file's, which caches through `ensure_singleton` — overwrites the other two
+/// and wins. Under `--jdk-only` the retirement refuses this file's and
+/// `lib.rs`'s, because both are `Bridge`s over real bytecode; **a refusal does
+/// not remove the earlier registration it was going to overwrite**, so what is
+/// left holding the triple is `phases_early.rs`'s, which was registered
+/// `Intrinsic` and is therefore exempt from the retirement. Its body is a bare
+/// `try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)`
+/// with no cache, so strict-mode `getLogManager()` mints a FRESH,
+/// unconstructed manager on every call — measured, `identityHashCode` 11, 12,
+/// 13 on three successive calls, versus a stable value in `Compatible` and on
+/// HotSpot.
 ///
-/// **`rootLogger` stays null, and that is not a residual defect — it is what
-/// the JDK does for a manager that is not the static one.** `rootLogger` is
-/// written only by `ensureLogManagerInitialized`, which returns immediately
-/// unless `this == LogManager.manager`, and this singleton is never installed
-/// in that static field. Every consumer on the `getLogger` path is guarded to
-/// match: `LoggerContext.requiresDefaultLoggers()` is `getOwner() ==
-/// LogManager.manager` and so answers `false`, which short-circuits
-/// `ensureInitialized`/`ensureAllDefaultLoggers` before they read it;
-/// `ensureDefaultLogger` branches on `arg == null` to a bare `return` (the
-/// `AssertionError` after it is behind `$assertionsDisabled`); and
-/// `processParentHandlers` only compares against it with `if_acmpeq`. Read off
-/// the bytecode, not inferred. Making it real means making this object BE
-/// `LogManager.manager`, which is a much larger change than the one the
-/// regression needs — see the W7-25 record for why that was not taken.
+/// So `Logger.getLogger` does not NPE because the singleton below is
+/// unconstructed. It NPEs because it never sees the singleton below.
 ///
-/// **Compatible mode is unchanged, and by the mechanism rather than by a mode
-/// test.** `java/util/logging/LogManager.<init>()V` is a retired shadow, and a
-/// retired shadow still DISPATCHES in `Compatible` — to `native_jboss_init`,
-/// which is a bare `Ok(None)`. So the `invoke` below writes nothing there and
-/// runs the real ctor only in `--jdk-only`, where the retirement refuses the
-/// native. Nothing here branches on the mode, which is deliberate: a mode test
-/// would be a second thing to keep in sync with `retired_shadow.rs`.
+/// # And the state the retirement wanted is ALREADY REAL
 ///
-/// **Nothing in this crate reads the slots the ctor now fills.** Checked, not
-/// assumed: `LM_FIELD_PROPERTIES` and `LM_FIELD_ROOT_LOGGER` appear at exactly
-/// two sites each in `native-builtins/`, both of them the writes in this
-/// function. The four slots have always been write-only, which is why handing
-/// them real values cannot change what any native in this file answers — only
-/// what the real bytecode reading the same object sees.
+/// `LogManager.<init>()V` is itself a retired shadow, so under `--jdk-only`
+/// the real ctor runs and the static `LogManager.manager` — the object real
+/// `getLogManager()` bytecode returns — comes out fully built. Measured with
+/// `--add-opens java.logging/java.util.logging=ALL-UNNAMED`, reflecting the
+/// static rather than the value `getLogManager()` handed back:
 ///
-/// A failure is swallowed rather than propagated, so the worst case is
-/// today's behaviour rather than a new one — same disposition, and for the
-/// same reason, as `try_allocate_property_log_manager`'s `<init>` call below.
+/// ```text
+///   props Properties · systemContext SystemLoggerContext · userContext
+///   LoggerContext · configurationLock ReentrantLock · closeOnResetLoggers
+///   CopyOnWriteArrayList · listeners SynchronizedMap · loggerRefQueue
+///   ReferenceQueue · rootLogger null
+/// ```
+///
+/// Seven of the eight, and `rootLogger` is null on purpose: the JDK writes it
+/// only from `ensureLogManagerInitialized`, which no-ops unless the receiver
+/// is the static `manager` — which this one IS, so the null is instead the
+/// `initializationDone` handshake not having run, and every consumer on the
+/// `getLogger` path is guarded for it (`requiresDefaultLoggers`,
+/// `ensureDefaultLogger`, `processParentHandlers`, all read off `javap`).
+///
+/// **Therefore the §1.4-correct fix adds no state-building code at all**: stop
+/// `phases_early.rs`'s `Intrinsic` from shadowing the triple, and strict mode
+/// returns the already-real static. Adding an `<init>` call to this function
+/// was written, measured to be inert in BOTH modes — never reached under
+/// `--jdk-only`, and in `Compatible` the `<init>` triple resolves to
+/// `native_jboss_init`, a bare `Ok(None)` — and reverted rather than landed as
+/// a fix that moves nothing. The patch, and why the interim hold-back is also
+/// out of reach from this file, are in
+/// docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md.
+///
+/// Do not "simplify" the nulls away without reading that: they are what this
+/// file's own `Compatible`-mode natives are written around.
 fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let mut obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
-    // Only the JDK class has a real ctor to run. `org.jboss.logmanager.LogManager`
-    // is a fabricated class with no bytecode at all, and its `<init>` is the
-    // same no-op native by design (see `native_jboss_init`), so asking for it
-    // would be a call that cannot do anything.
-    if class_name == CLS_JUL_LOG_MANAGER {
-        // GC SAFETY: the ctor above allocates eight objects, several of them
-        // (`IdentityHashMap`, `ConcurrentHashMap` inside each `LoggerContext`)
-        // large enough to trigger a moving collection, so the receiver can be
-        // relocated by its own constructor. `ctx.invoke` — unlike
-        // `new_object_initialized` — does not forward it for us, and the caller
-        // caches this address as the process-wide singleton, so a stale one
-        // here would be handed out for the lifetime of the VM.
-        let pin = ctx.pin_native_root(obj);
-        let init = ctx.invoke(
-            CLS_JUL_LOG_MANAGER,
-            "<init>",
-            "()V",
-            &[Value::Object(Some(obj))],
-        );
-        obj = ctx.read_native_pin(pin, obj);
-        ctx.unpin_native_roots(pin);
-        if let Err(e) = init {
-            // A throw can leave the object half-constructed, which is a state
-            // neither this file's natives nor the real bytecode were written
-            // for. Put the two slots this function has always owned back to
-            // the shape the rest of the file assumes and carry on: strict-mode
-            // JUL is then as broken as it was before this change, and no worse.
-            tracing::warn!(
-                error = ?e,
-                "java.util.logging.LogManager.<init> threw; the singleton keeps the \
-                 pre-2026-08-11 null-field shape and strict-mode Logger.getLogger \
-                 will still NPE on the null systemContext"
-            );
-            ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
-            ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
-        }
-    } else {
-        // Leave slot 0 as `null` — a properly-initialized `Properties` would
-        // round-trip through synthetic HashMap natives, but the JBoss-classed
-        // singleton is read through accessors we no-op, so null is safe. That
-        // argument was the whole file's until 2026-08-11 and now holds only
-        // for the class that has no bytecode to run.
-        ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
-        ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
-    }
-    // The two VM-internal slots are written LAST on purpose: they live past
-    // `LM_REAL_FIELDS`, so a real `<init>` cannot reach them, but writing them
-    // before an `invoke` that can move the object would mean writing them
-    // through a reference the ctor then invalidates.
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
+    // Leave slot 0 as `null` — a properly-initialized `Properties` would
+    // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
+    // code reads it via accessors we no-op, so null is safe. TRUE ONLY IN
+    // COMPATIBLE MODE since the shadow retirement; see the doc comment.
+    ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_LOGGER_REGISTRY, Value::Object(None));
+    ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_READY, Value::Int(1));
     Ok(obj)
 }
@@ -4707,6 +4665,18 @@ fn jul_level_tag(ctx: &mut dyn NativeContext, level_obj: Option<ObjectRef>) -> S
 /// JUnit's `ListenerRegistry.notifyEach` logs swallowed listener exceptions
 /// exactly this way, so any such error was invisible. Identify the throwable
 /// by `instanceof Throwable` and render it with a short stack trace.
+///
+/// **The level gate below is the twin of the one in
+/// `native_jul_logger_log_supplier`, and is here for the same measurement.**
+/// On a logger at `INFO`, HotSpot 25.0.3 evaluates neither
+/// `log(Level.FINEST, throwable, supplier)` nor `log(Level.FINEST, supplier)`;
+/// CratonVM `Compatible` evaluated and emitted both (measured 2026-08-11,
+/// counting supplier invocations: HotSpot `0/0`, CratonVM `1/1`). Fixing one
+/// of the pair and leaving the other is the exact "right in the members with
+/// one implementation, wrong in the members with the other" shape this family
+/// keeps producing, so both close together. `(Level, String, Throwable)` rides
+/// the same native and gains the same gate, which is what its `(Level, String)`
+/// sibling has always done.
 pub(crate) fn native_jul_logger_log_throwable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4719,6 +4689,16 @@ pub(crate) fn native_jul_logger_log_throwable(
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // Gate BEFORE the supplier is resolved: not paying for a suppressed
+    // supplier is the whole point of the overload. Shares the sibling
+    // overloads' threshold walk rather than restating it — see the note on
+    // `native_jul_logger_log_supplier`.
+    if matches!(
+        native_jul_logger_is_loggable(ctx, args)?,
+        Some(Value::Int(0))
+    ) {
+        return Ok(None);
+    }
     // `jul_resolve_msg` may invoke Java supplier code and allocate. Keep the
     // receiver/level rooted while identifying the throwable so the later
     // record never receives an old moving-GC address.
@@ -4793,18 +4773,45 @@ pub(crate) fn native_jul_logger_log_throwable(
 /// overload with no throwable. Resolve the supplier and emit (otherwise the
 /// synthetic JUL drops it, since the real LogRecord/handler path isn't wired).
 ///
-/// **Known divergence, measured 2026-08-11, not fixed here.** This is the one
-/// `log` overload that emits to the console sink WITHOUT first fanning the
-/// record out to the logger's installed `Handler`s —
-/// `native_jul_logger_log_record` below does that fan-out and says why. So an
-/// application that installs a `Handler` and calls
-/// `logger.log(Level.INFO, () -> "…")` sees the record nowhere, while the
-/// other seven overloads reach it: right in the members with one
-/// implementation, wrong in the members with the other. HotSpot 25.0.3
-/// delivers it. Pre-dates the shadow retirement — reproduced on a binary
-/// without it — and is live in `Compatible` mode, so closing it is a
-/// Compatible-mode behaviour change and wants its own lane. Recorded in
-/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md §4.1.
+/// **Two defects fixed here, both measured 2026-08-11 against HotSpot 25.0.3
+/// with a `Handler` of the caller's own and a counting supplier.**
+///
+/// 1. *The record reached no handler.* This was the one `log` overload that
+///    wrote the console sink WITHOUT first fanning the record out to the
+///    logger's installed `Handler`s, so an application that installed one saw
+///    seven of the eight `log` overloads — right in the members with one
+///    implementation, wrong in the members with the other:
+///
+///    ```text
+///    HotSpot          [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L, INFO:sup]
+///    CratonVM compat  [INFO:i, WARNING:w, SEVERE:s, FINE:f, INFO:L]
+///    ```
+///
+/// 2. *The level was never consulted, so the supplier ALWAYS ran.* Measured on
+///    a logger at `FINE`, `log(Level.FINEST, supplier)` evaluated the supplier
+///    and emitted a console line; HotSpot does neither. This is the worse half:
+///    not evaluating a filtered-out supplier is the entire reason the overload
+///    exists, and a caller whose supplier has a cost (or a side effect) paid it
+///    on every suppressed call. The `(Level, String)` sibling has always gated
+///    correctly, so this was also an inconsistency inside one family.
+///
+/// Both close by routing through the two pieces that already existed rather
+/// than by growing a second implementation: [`native_jul_logger_is_loggable`]
+/// is the level gate the sibling overloads use, and [`jul_log_parameterized`]
+/// is the publish-then-fall-back-to-console path the other seven use.
+///
+/// **`Compatible`-mode effect, stated per case, because this is a
+/// Compatible-visible behaviour change.** A logger with NO handler is
+/// byte-for-byte unchanged: `jul_log_parameterized`'s console fallback formats
+/// `{tag} [{name}] {text}`, the exact string this function used to build. A
+/// logger WITH a handler now delivers the record and suppresses the duplicate
+/// console line — which is what the other seven overloads already do. A
+/// filtered-out call now emits nothing and evaluates nothing, where it used to
+/// emit a console line; that line was not HotSpot's and not the sibling
+/// overloads'.
+///
+/// Recorded in docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md;
+/// found by W7-22 §4.1, which measured the fan-out half only.
 fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -4814,19 +4821,42 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // GATE BEFORE RESOLVING. `native_jul_logger_is_loggable` reads args[0] and
+    // args[1] and ignores the rest, so it takes this call's own args — and
+    // sharing it rather than restating the threshold walk is deliberate: that
+    // walk is 60 lines of Level-shape fallbacks (real `config.levelObject`,
+    // synthetic slot 1, the ancestor override table) and a second copy would
+    // answer differently the first time one of those shapes changed.
+    if matches!(
+        native_jul_logger_is_loggable(ctx, args)?,
+        Some(Value::Int(0))
+    ) {
+        return Ok(None);
+    }
+    // GC SAFETY: `jul_resolve_msg` INVOKES the supplier — arbitrary Java that
+    // allocates — so the receiver and the level can both move across it. Same
+    // pin/re-derive discipline as `native_jul_logger_log_throwable`, which
+    // resolves a supplier for the throwable-carrying overloads.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
+    let base_pin = this_pin.map(|(p, _)| p).or_else(|| level_pin.map(|(p, _)| p));
     let msg = match args.get(2) {
         Some(Value::Object(Some(o))) => jul_resolve_msg(ctx, *o),
         _ => String::new(),
     };
-    let logger_name = this
-        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let tag = jul_level_tag(ctx, level_obj);
-    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}"));
-    Ok(None)
+    let message_obj = ctx.create_string(&msg);
+    let message_pin = ctx.pin_native_root(message_obj);
+    // `jul_resolve_msg`/`create_string` both allocate: re-derive everything.
+    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let message_obj = ctx.read_native_pin(message_pin, message_obj);
+    let result = jul_log_parameterized(ctx, this, level_obj, Some(message_obj), None, None);
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
+    } else {
+        ctx.unpin_native_roots(message_pin);
+    }
+    result
 }
 
 /// `java/util/logging/Logger.log(LogRecord)` — the overload many wrappers
