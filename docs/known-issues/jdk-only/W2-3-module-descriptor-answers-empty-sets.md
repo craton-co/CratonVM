@@ -1,11 +1,44 @@
 # `ModuleDescriptor` answered empty sets for every module, in every mode
 
-**Status:** the original fix is **IN THE TREE and verified by reading it**
-(see "Record vs tree" below — this record previously said "FIX WRITTEN,
-UNVERIFIED", which was true when written and is now stale). The residual this
-record is kept open for is the *data sources* behind the accessors the fix
-could not answer. Two of those turned out to have a source already and are
-wired as of 2026-08-11. Nothing here has been built or run.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED, and now verified.** The original fix is in the tree — all
+  seven "Record vs tree" rows check out; spot anchors:
+  `build_module_modifier_set` at `native-builtins/src/jboss_jdkspecific.rs:1436`,
+  `build_requires_set` at `:1480`, both consumed by `build_module_descriptor` at
+  `:1641` and `:1670`. The binary verification this record said it lacked was
+  taken 2026-08-12 against the dev binary at `ba65f1a19`: `RJdkModule` runs to
+  `PASS RJdkModule (44 checks)` in **both** `--jdk-only` and `--real-jdk`. That
+  run needs `--module-path regression-suite/build-modules --add-modules
+  cratonvm.jdkonly.svc`, which `run.sh` supplies via `class_args`; without them
+  it fails on a harness error, not a VM defect.
+* **Residual: CLOSED — the two accessors that turned out to have a source.**
+  Commit `4a388071c` *fix(jdk-only): keep the module directive flags
+  parse_module_info was dropping* put the directive flags and the `requires`
+  version on the parse-side entry structs (`classloading/src/module.rs`:
+  `is_synthetic:58`, `is_mandated:69`, `compiled_version:78`, exports `:96`/`:98`,
+  opens `:117`/`:119`, populated at `:1252-1259`, `:1279-1280`, `:1297-1298`).
+  The bridge consumes them: `Requires.modifiers()` reads TRANSITIVE/STATIC from
+  the real enum statics at `jboss_jdkspecific.rs:1513`, and
+  `ModuleDescriptor.modifiers()` gains `OPEN` at `:1436`/`:1641`.
+* **Residual: STILL OPEN — the whole `## Out-of-file patch (not applied)`, all
+  four parts.** Re-grepped 2026-08-12 and every part is genuinely absent:
+  1. `classloading/src/module.rs` has **zero** occurrences of `main_class` or
+     `ModuleMainClass`; the three external literal sites
+     (`classloading/src/access_control.rs`, `vm/src/vm/vm_init.rs`,
+     `vm/tests/new19_module_access.rs`) are unmodified.
+  2. The six new `NativeContext` accessors do not exist — a tree-wide `*.rs`
+     grep for `module_is_automatic|module_version|module_main_class|
+     module_requires_full|module_exports_full|module_opens_full` returns nothing.
+  3. Consequently the `ModuleRegistry`-backed impls in `vm/src/vm/vm_exec.rs` do
+     not exist either.
+  4. And `build_module_descriptor` cannot consume them; `build_requires_set`'s
+     modifier loop still carries only two bits.
+  The visible consequence stands: `isAutomatic()` is a hardcoded `false`, so
+  `RJdkModule:61` passes **vacuously**. A green 44/44 does not close this.
+
+Lane W2-3 of the jdk-wave2 pool; the defect directly behind lane L9's
+`--module-path` resolution fix.
 
 Lane W2-3 of the jdk-wave2 pool; the defect directly behind lane L9's
 `--module-path` resolution fix.

@@ -1,8 +1,45 @@
 # `--jdk-only` refuses `cratonvm/stream/LazyOp`, and the stream stack is SPLIT
 
-Status: fixed 2026-08-07 (wave-2 lane W2-1) in `native-collections/src/lib.rs`.
-Not built or run — this worktree cannot build. The inventory below is the more
-durable half of this record.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED.** The `LazyOp` strict guard landed 2026-08-07 (commit
+  `ba50b498b`): the policy is asked before minting
+  (`native-collections/src/lib.rs:18084`) and the mint is guarded at `:18137`.
+  The three 2026-08-11 iterator fixes are in the tree too —
+  `native_ksv_iterator` (`native-collections/src/lib.rs:47037`, registered
+  `:47560`, routed `:5528`/`:13513`), the `java/util/LinkedList$Itr` fallback
+  (`:32145-32174`), and the `java/util/ArrayDeque$Itr` fallback
+  (`:34718-34754`, `:36896`, `:36911`).
+* **Residual 1: CLOSED — this record's text is stale.** It says
+  `linkedList.listIterator()` is *"still refused under `--jdk-only`,
+  deliberately"*. That was reversed on 2026-08-11 by commit `6ae3ca634`
+  *fix(jdk-only): mint LinkedListSnapshotListItr through the VM-internal door* —
+  both gates moved together: `ensure_vm_internal_class` at
+  `native-collections/src/lib.rs:31049` and `:31076`, and the name moved from
+  `VM_MINTED_STAND_IN_RECEIVERS` to `VM_SERVICE_RECEIVERS` in
+  `native-api/src/no_image_receiver.rs`. Rationale written in place at
+  `lib.rs:30871-30905`; follow-up record
+  W7-16-arraydeque-and-linkedlist-residuals.md.
+* **Residual 2: CLOSED, and this record's DIAGNOSIS was wrong.**
+  `ArrayDeque.stream().count()` answering `0` in both modes is fixed in source by
+  commit `fddf67650` *fix(collections): give ArrayDeque back the JDK's spare
+  ring-buffer slot* (`ad_ensure_capacity`, `native-collections/src/lib.rs:34020`,
+  measurement at `:34004-34005`). This record attributed the defect to *"the
+  unwritten `tail`"*. That is not what it was — it was the missing spare slot in
+  the ring buffer, which HotSpot keeps and we did not. W7-16 carries the
+  correction. Do not chase `tail`.
+* **Residual 3: STILL OPEN.** Seven names on `NO_IMAGE_JDK_RECEIVERS` are minted
+  outside `native-collections` and were never probed: `HashMap$Entry`,
+  `IteratorEnumeration`, `ServiceLoader$Itr`, `CompletedFuture`, and three
+  `Atomic*FieldUpdater$RustJvmImpl`. All still listed at
+  `native-api/src/no_image_receiver.rs:147-157`, unchanged. Re-grepped
+  2026-08-12.
+* **Residual 4: STILL OPEN, cosmetic.** `cratonvm/internal/StreamChainCollector`
+  (`native-collections/src/lib.rs:18840`) is still an unguarded
+  `try_alloc_synthetic(..)?` — unreachable under strict, so it cannot bite
+  today, but it is the last instance of the shape this record was opened for.
+
+The inventory below is the more durable half of this record.
 
 > ## UPDATED 2026-08-11 — the stream half is green; the split that was still
 > ## costing runs is the ITERATOR family, and it wears `java/util/*` names
