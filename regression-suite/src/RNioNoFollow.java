@@ -319,5 +319,62 @@ public class RNioNoFollow {
             sepBytes.append(String.format("%02x", b));
         }
         System.out.println("CK RNioNoFollow lineSep=" + sepBytes);
+
+        // The separator must be a TERMINATOR, not part of the content: reading
+        // the same file back as lines has to give the two elements exactly. A
+        // VM that appended the separator to the last element's TEXT rather than
+        // after it passes the byte comparison above and fails here.
+        check(Files.readAllLines(lines).equals(java.util.List.of("alpha", "beta")),
+                "the separator terminates lines rather than joining them: "
+                        + Files.readAllLines(lines));
+
+        // THE OTHER HALF OF THE SAME MISTAKE, and the reason it is asserted
+        // rather than assumed. `Files.write(Path, Iterable)` appends a separator
+        // after every element; `Files.writeString` and `Files.write(Path,
+        // byte[])` append NOTHING. A repair that reaches for "line-oriented
+        // output" as one category adds a separator where the JDK adds none, and
+        // every assertion above still passes. These two are the guard against
+        // fixing it backwards.
+        Path exact = dir.resolve("exact");
+        Files.writeString(exact, "no trailing separator");
+        check(content(exact).equals("no trailing separator"),
+                "Files.writeString must append nothing: "
+                        + content(exact).replace("\r", "\\r").replace("\n", "\\n"));
+        Path exactBytes = dir.resolve("exactBytes");
+        Files.write(exactBytes, "raw".getBytes(StandardCharsets.UTF_8));
+        check(Files.size(exactBytes) == 3,
+                "Files.write(byte[]) must append nothing, size=" + Files.size(exactBytes));
+
+        // `BufferedWriter.newLine()` is what the JDK's own Iterable overload
+        // calls, so it is the same contract one layer down — and it carries
+        // more than one registration in this VM, of which only the last one
+        // wins. A losing copy that answers '\n' is invisible until a
+        // registration-order change promotes it.
+        Path bw = dir.resolve("bufferedNewLine");
+        try (java.io.BufferedWriter w = Files.newBufferedWriter(bw)) {
+            w.write("x");
+            w.newLine();
+            w.write("y");
+            w.newLine();
+        }
+        check(content(bw).equals("x" + sep + "y" + sep),
+                "BufferedWriter.newLine emits the platform separator: "
+                        + content(bw).replace("\r", "\\r").replace("\n", "\\n"));
+
+        // `%n` and `println` are SPECIFIED to use the platform separator too,
+        // so if they are wrong they are the same defect with a far wider blast
+        // radius. Asserted against System.lineSeparator() rather than against a
+        // literal, so this file states one rule and checks it four ways.
+        check(String.format("a%nb").equals("a" + sep + "b"),
+                "Formatter %n is the platform separator: "
+                        + String.format("a%nb").replace("\r", "\\r").replace("\n", "\\n"));
+        java.io.ByteArrayOutputStream captured = new java.io.ByteArrayOutputStream();
+        try (java.io.PrintStream ps = new java.io.PrintStream(captured, true, "UTF-8")) {
+            ps.println("p");
+        }
+        String printed = captured.toString("UTF-8");
+        check(printed.equals("p" + sep),
+                "PrintStream.println ends with the platform separator: "
+                        + printed.replace("\r", "\\r").replace("\n", "\\n"));
     }
 }

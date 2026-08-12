@@ -3444,10 +3444,13 @@ fn build_store_text(
     // `System.lineSeparator()`. Match it so callers that re-split the output on
     // the platform separator (e.g. Spring's `SortedProperties.store`, which does
     // `contents.split(System.lineSeparator())`) see the right line boundaries.
+    // The fallback is the platform default, not LF: an unseeded property here
+    // used to make `store` write LF-terminated lines that
+    // `split(System.lineSeparator())` then failed to split on Windows.
     let eol = ctx
         .get_system_property("line.separator")
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "\n".to_string());
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     // Pin `this` across the Date allocation so the entry walk below sees the
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);

@@ -6404,9 +6404,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "newLine", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sep = ctx
-            .get_system_property("line.separator")
-            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
+        let sep = p57_line_separator(ctx);
         if let Some(out) = bw_delegate_out(ctx, this) {
             let s = ctx.create_string(&sep);
             ctx.invoke_virtual(
@@ -7424,6 +7422,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
         };
         let it_pin = ctx.pin_native_root(it);
+        // `Files.write(Path, Iterable<? extends CharSequence>, …)` terminates
+        // EVERY element with `System.lineSeparator()` — the JDK's own
+        // implementation is `for (CharSequence line : lines) { writer.append(line);
+        // writer.newLine(); }`, and `BufferedWriter.newLine()` is the platform
+        // separator. This used to push a bare `'\n'`, so on Windows CratonVM
+        // wrote `alpha\nbeta\n` where HotSpot writes `alpha\r\nbeta\r\n`.
+        //
+        // The sibling `Files.writeString`/`Files.write(byte[])` deliberately
+        // append NOTHING, and that asymmetry is the whole reason this is easy to
+        // get backwards: only the Iterable overload has lines to terminate.
+        //
+        // Read once, before the loop: the iteration below re-enters Java, and a
+        // property lookup per element would be both slower and — if some
+        // element's `toString` changed the property — inconsistent within a
+        // single file.
+        let sep = p57_line_separator(ctx);
         let mut out = String::new();
         loop {
             let it = ctx.read_native_pin(it_pin, it);
@@ -7453,7 +7467,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 }
             });
             out.push_str(&s);
-            out.push('\n');
+            out.push_str(&sep);
         }
         // The iteration above re-entered Java (`hasNext`/`next`/`toString`), so
         // the pinned `Path` is the only reference still safe to return.
@@ -7485,6 +7499,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     ()
+}
+
+/// The platform line separator, as `System.lineSeparator()` reports it.
+///
+/// One function rather than the open-coded copies this module and its
+/// neighbours grew: `Files.write(Path, Iterable)`, `BufferedWriter.newLine()`
+/// and `Properties.store` must all terminate a line the same way, and the way
+/// they came to disagree is that each read the property — or failed to — on its
+/// own. The `line.separator` property is the authority, because a
+/// `-Dline.separator=` override has to be honoured and a bare `cfg!(windows)`
+/// cannot see one; the compile-time platform default is the fallback for a VM
+/// so early in bootstrap that no property map exists yet, and it must be
+/// `"\r\n"` on Windows rather than the `"\n"` three of these fallbacks carried.
+pub(crate) fn p57_line_separator(ctx: &dyn NativeContext) -> String {
+    ctx.get_system_property("line.separator")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
 }
 
 pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
