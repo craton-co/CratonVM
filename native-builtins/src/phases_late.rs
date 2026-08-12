@@ -3066,13 +3066,33 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
     // so a `NoSuchMethodError` out of our own dispatch now comes out.
     // W7-57-close-flush-swallow-sweep.md
     //
-    // Residual: HotSpot routes the absorbed exception to the handler's
-    // `ErrorManager`; we drop it, so it is unobservable rather than unthrown.
+    // REPORTED since W7-64. That `catch` body is not empty: it is
+    // `reportError(null, ex, ErrorManager.<CODE>)`, and the `ErrorManager` is
+    // where a `Handler` failure is *supposed* to end up — the whole reason
+    // `Handler` absorbs instead of throwing. Dropping it is not the same as
+    // the JDK dropping it. Measured on HotSpot 25.0.3.9: a `StreamHandler`
+    // over a sink whose `flush()` raises an `IOException` calls its
+    // `ErrorManager` with `code=2` (`FLUSH_FAILURE`) and that exact
+    // `IOException`; the `close()` path reports `code=3` (`CLOSE_FAILURE`).
+    // An `Error` reaches the `ErrorManager` in NEITHER case — it propagates,
+    // because `catch (Exception)` does not name it.
+    // W7-64-printstream-trouble-and-errormanager.md
     r.register(sh, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, flushed)?;
+            if let Some(ex) = cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                flushed,
+                "java/lang/Exception",
+            )? {
+                cratonvm_native_api::print_error_state::report_handler_error(
+                    ctx,
+                    this,
+                    ex,
+                    cratonvm_native_api::print_error_state::ERROR_MANAGER_FLUSH_FAILURE,
+                );
+            }
         }
         Ok(None)
     });
@@ -3080,19 +3100,57 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
             // `flushAndClose` runs both inside ONE `try`, so in HotSpot a
-            // failing flush skips the close. `absorb_exception` answers
-            // `Ok(None)` for a clean void return and for an absorbed
-            // exception alike, so that branch is not reconstructible here; the
-            // close is attempted either way, which for a logging sink is the
-            // safer of the two. Recorded in
-            // W7-57-close-flush-swallow-sweep.md.
+            // failing flush skips the close — and reports ONE `CLOSE_FAILURE`
+            // for whichever of the two failed first. The close is attempted
+            // either way here, which for a logging sink is the safer of the
+            // two; the report is still the first failure only, which is the
+            // part a caller's `ErrorManager` observes.
+            // W7-57-close-flush-swallow-sweep.md
+            //
+            // GC SAFETY: the flush failure is reported BEFORE the close is
+            // attempted rather than held in a local across it. An absorbed
+            // throwable is a bare `ObjectRef`, and `close()` is arbitrary Java
+            // bytecode that can move it (the native stale-local family). This
+            // ordering also gives the JDK's answer for free: exactly one
+            // report, naming whichever failure came first.
+            let close_failure =
+                cratonvm_native_api::print_error_state::ERROR_MANAGER_CLOSE_FAILURE;
             let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, flushed)?;
+            let flush_failed = match cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                flushed,
+                "java/lang/Exception",
+            )? {
+                Some(ex) => {
+                    cratonvm_native_api::print_error_state::report_handler_error(
+                        ctx,
+                        this,
+                        ex,
+                        close_failure,
+                    );
+                    true
+                }
+                None => false,
+            };
             let closed = ctx.invoke_virtual(stream, "close", "()V", &[]);
-            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, closed)?;
+            if let Some(ex) = cratonvm_native_api::print_error_state::take_absorbed(
+                &*ctx,
+                closed,
+                "java/lang/Exception",
+            )? {
+                if !flush_failed {
+                    cratonvm_native_api::print_error_state::report_handler_error(
+                        ctx,
+                        this,
+                        ex,
+                        close_failure,
+                    );
+                }
+            }
         }
         Ok(None)
     });
+    register_p61_handler_error_manager(r);
 
     // --- FileHandler: see `register_p61_file_handler` below, also called
     // directly from real-JDK mode's init path (vm_init.rs) since this
@@ -3151,6 +3209,160 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+
+/// `java.util.logging.Handler`'s `ErrorManager` surface, and the default
+/// `ErrorManager` itself.
+///
+/// SYNTHETIC-JDK ONLY — reached only through `register_p61_logging` ->
+/// `register_phase61_natives` -> `register_synthetic_overrides`. Compatible
+/// mode runs the real `java.logging` bytecode for all five of these, over the
+/// real `Handler.errorManager` field, and shadowing it would be a
+/// contract-1.4 shadow on working code.
+///
+/// Why it exists at all: `Handler`'s whole absorb contract is
+/// `catch (Exception ex) { reportError(null, ex, ErrorManager.<CODE>); }` —
+/// the error is not discarded, it is *delivered somewhere*. Without a
+/// `reportError` to dispatch to, the synthetic `StreamHandler.flush`/`close`
+/// natives above would take the absorbed exception and have nowhere to put
+/// it, which is the exact defect this lane is chartered on one level down.
+/// W7-64-printstream-trouble-and-errormanager.md
+///
+/// State lives in `logging_shims`' identity-hash side table, not a field slot:
+/// the synthetic `StreamHandler` is a 2-field object (stream=0, formatter=1)
+/// with no room for it, and a raw slot 2 on a real-JDK `Handler` would land on
+/// `formatter`/`logLevel` — the same trap `register_p61_file_handler`'s doc
+/// comment records for `FileHandler`.
+fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let h = "java/util/logging/Handler";
+    let em = "java/util/logging/ErrorManager";
+
+    // `public synchronized void setErrorManager(ErrorManager em)` — the JDK
+    // throws NPE on null before storing.
+    r.register(h, "setErrorManager", "(Ljava/util/logging/ErrorManager;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // `Handler.setErrorManager` is `if (em == null) throw new
+        // NullPointerException();` before the store — the same idiom this file
+        // already uses for a null argument a JDK method refuses.
+        let Some(Value::Object(Some(manager))) = args.get(1).copied() else {
+            return Err(RuntimeError::NullPointerException { message: None }.into());
+        };
+        crate::jul_handler_error_manager_set(ctx, this, manager);
+        Ok(None)
+    });
+
+    // `public ErrorManager getErrorManager()`. The JDK's field initializer is
+    // `= new ErrorManager()`, i.e. every Handler has one from construction and
+    // this never returns null. Minting on first read is observably the same:
+    // the identity is stable once minted, and nothing can observe the object
+    // before something asks for it.
+    r.register(h, "getErrorManager", "()Ljava/util/logging/ErrorManager;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(existing) = crate::jul_handler_error_manager_get(ctx, this) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        let minted = try_alloc_concurrent_synthetic(ctx, "java/util/logging/ErrorManager", 1)?;
+        // Slot 0 is `reported` — see the `error` body below.
+        ctx.set_field(minted, 0, Value::Int(0));
+        crate::jul_handler_error_manager_set(ctx, this, minted);
+        Ok(Some(Value::Object(Some(minted))))
+    });
+
+    // `protected void reportError(String msg, Exception ex, int code)`:
+    //     try { errorManager.error(msg, ex, code); }
+    //     catch (Exception ex2) { System.err.println("Handler.reportError caught:");
+    //                             ex2.printStackTrace(); }
+    // The inner call is VIRTUAL, so an application's own ErrorManager subclass
+    // is what runs — which is the whole point of the surface.
+    r.register(h, "reportError", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        let ex = args.get(2).copied().unwrap_or(Value::Object(None));
+        let code = match args.get(3) {
+            Some(Value::Int(c)) => *c,
+            _ => 0,
+        };
+        let Ok(Some(Value::Object(Some(manager)))) = ctx.invoke_virtual(
+            this,
+            "getErrorManager",
+            "()Ljava/util/logging/ErrorManager;",
+            &[],
+        ) else {
+            return Ok(None);
+        };
+        // The JDK's own `catch (Exception ex2)` around this call: reporting a
+        // failure must not become a second, different failure on the caller.
+        let reported = ctx.invoke_virtual(
+            manager,
+            "error",
+            "(Ljava/lang/String;Ljava/lang/Exception;I)V",
+            &[msg, ex, Value::Int(code)],
+        );
+        cratonvm_native_api::delegated_close::absorb_exception(&*ctx, reported)?;
+        Ok(None)
+    });
+
+    // `java.util.logging.ErrorManager` itself = 1 field (`reported`).
+    r.register(em, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(0));
+        Ok(None)
+    });
+
+    // The default `ErrorManager.error`:
+    //     synchronized (this) { if (reported) return; reported = true; }
+    //     String text = "java.util.logging.ErrorManager: " + code;
+    //     if (msg != null) text = text + ": " + msg;
+    //     System.err.println(text);
+    //     if (ex != null) ex.printStackTrace();
+    // The first-call-only latch is not decoration — it is what keeps a broken
+    // sink from filling the console, and a version without it would be a
+    // visibly different VM under any handler that fails repeatedly.
+    r.register(em, "error", "(Ljava/lang/String;Ljava/lang/Exception;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if matches!(ctx.get_field(this, 0), Value::Int(v) if v != 0) {
+            return Ok(None);
+        }
+        ctx.set_field(this, 0, Value::Int(1));
+        let code = match args.get(3) {
+            Some(Value::Int(c)) => *c,
+            _ => 0,
+        };
+        let mut text = format!("java.util.logging.ErrorManager: {code}");
+        if let Some(Value::Object(Some(msg))) = args.get(1).copied() {
+            if let Some(msg) = ctx.read_string(msg) {
+                text.push_str(": ");
+                text.push_str(&msg);
+            }
+        }
+        // Route through the live Java `System.err` rather than the host's
+        // stderr: a test that redirected `System.err` (Spring Boot's
+        // `OutputCaptureExtension`, Tomcat's log capture) must see this, and
+        // the JDK writes it with `System.err.println`.
+        if let Some(err) = ctx.get_system_stream("err") {
+            let line = ctx.create_string(&text);
+            let _ = ctx.invoke_virtual(
+                err,
+                "println",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(line))],
+            );
+        }
+        if let Some(Value::Object(Some(ex))) = args.get(2).copied() {
+            let _ = ctx.invoke_virtual(ex, "printStackTrace", "()V", &[]);
+        }
+        Ok(None)
+    });
+
+    // NOT done here: `ErrorManager`'s six `public static final int` codes.
+    // A synthetic class has no static field table to put them in, so
+    // `ErrorManager.FLUSH_FAILURE` still does not resolve under
+    // `--synthetic-jdk`. The codes this VM *passes* are correct (2 and 3,
+    // measured), and `probes/CloseFlushSwallowProbe.java` compares against the
+    // literals for exactly that reason. Named, not silently skipped.
+    r.set_category(__prev_cat);
+}
 
 // =============================================================================
 // java.lang.ClassLoader — resource loading, findResource, loadClass
