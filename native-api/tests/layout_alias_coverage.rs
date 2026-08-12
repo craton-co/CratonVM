@@ -779,7 +779,7 @@ fn the_fabrication_funnel_uses_the_shared_classify() {
 /// defect-shaped thing**, so growth is never routine. A native writing
 /// `alloc_object(ClassId::new(0), N)` has resolved a class, failed, and gone
 /// ahead — handing back an object of class `cratonvm/synthetic/AnonymousObject$N`
-/// to a caller that will use it as the class it asked for. 16 of today's 30 ask
+/// to a caller that will use it as the class it asked for. 14 of today's 28 ask
 /// for fewer slots than the class they name really declares (`javap -p`, JDK
 /// 25.0.3.9), so those objects are short.
 ///
@@ -798,7 +798,17 @@ fn the_unresolved_class_fallback_population_only_shrinks() {
     /// is literally `ClassId::new(0)` and whose requested count is not the
     /// literal `0` (a zero-slot request substitutes nothing and asserts no
     /// layout). MAY ONLY GO DOWN.
-    const BOUND: usize = 30;
+    ///
+    /// 30 → **28** on 2026-08-12 by W7-74-short-object-repairs.md: the two
+    /// `java/lang/Thread` carrier mirrors (`vertx_eventloop.rs`,
+    /// `xnio_io_thread.rs`) were the only two members of the population that
+    /// were **not** on an `Err(_)` fallback arm — they allocated a five-slot
+    /// `AnonymousObject$5` unconditionally, on every image, and published it to
+    /// the thread registry as a `java.lang.Thread`. Both now go through
+    /// `try_alloc_concurrent_synthetic`, which resolves the class and widens to
+    /// its declared 19. This is the ratchet doing what its own failure message
+    /// prescribes — *"allocate against a class you actually resolved"*.
+    const BOUND: usize = 28;
 
     let root = workspace_root();
     let mut sites: Vec<String> = Vec::new();
@@ -857,15 +867,17 @@ fn the_unresolved_class_fallback_population_only_shrinks() {
          substitutes `cratonvm/synthetic/AnonymousObject$N` — which declares \
          exactly N, so the slot-count clamp is a no-op and the width census sees \
          agreement — and the object is then handed back as an instance of the class \
-         the caller named. Where that class's real layout is wider (16 of the 30 \
-         sites on 2026-08-12: `ZipEntry` 6 against 14, `Pattern` 2 against 20, \
-         `ServiceLoader` 2 against 10, `java/lang/Thread` 5 against 19), the object \
-         is SHORT and every real-bytecode read past slot N is out of bounds.\n\
+         the caller named. Where that class's real layout is wider (14 of the 28 \
+         sites after 2026-08-12: `ZipEntry` 6 against 14, `Pattern` 2 against 20, \
+         `ServiceLoader` 2 against 10, `Iocp` 1 against 14), the object is SHORT \
+         and every real-bytecode read past slot N is out of bounds.\n\
          The remedies that do not add a row here: propagate the resolution failure \
          to the caller (`MethodCallFailed`), or allocate against a class you \
-         actually resolved. If a new site is genuinely unavoidable, raise BOUND \
-         with the reason in the commit message.\n\
-         See W7-73-short-object-blind-spot.md.",
+         actually resolved — which is what the two `java/lang/Thread` carrier \
+         mirrors did on 2026-08-12 to take the population from 30 to 28.\n\
+         If a new site is genuinely unavoidable, raise BOUND with the reason in \
+         the commit message.\n\
+         See W7-73-short-object-blind-spot.md and W7-74-short-object-repairs.md.",
         sites.len(),
         sites.join("\n  ")
     );

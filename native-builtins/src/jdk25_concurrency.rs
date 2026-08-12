@@ -851,7 +851,12 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // synthetic layout that means leaving the slot-4 virtual flag at 0; for the
     // real-JDK layout it means NOT constructing a BaseVirtualThread subtype.
     let worker_fields = ctx.object_num_fields(worker);
-    let synthetic_thread = worker_fields <= 8;
+    // The shared cutoff, not a fourth copy of it. `<= 8` was open-coded here
+    // because `is_synthetic_thread_layout` was nested inside
+    // `register_essential_natives_with_shims` and unreachable from any other
+    // module; it is at module scope since 2026-08-12
+    // (W7-74-short-object-repairs.md). Same value, one declaration.
+    let synthetic_thread = crate::thread_mirror_is_synthetic_layout(worker_fields);
     if synthetic_thread {
         ctx.set_field(worker, THREAD_FIELD_NAME, Value::Object(Some(name)));
         ctx.set_field(worker, THREAD_FIELD_PRIORITY, Value::Int(5));

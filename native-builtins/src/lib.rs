@@ -6446,6 +6446,21 @@ fn has_real_jdk_thread_layout(ctx: &dyn NativeContext, thread: ObjectRef) -> boo
     matches!(ctx.get_field_by_name(thread, "tid"), Value::Long(_))
 }
 
+// Thread.<init> overrides: synthetic-JDK only. In real-JDK mode the Thread
+// class has many more fields and a FieldHolder layout — writing raw slots 0..3
+// there corrupts the object. We detect by num_fields: synthetic Thread has at
+// most ~8 slots; real-JDK Thread has 20+ (19 declared on JDK 25.0.3.9).
+//
+// Hoisted to module scope on 2026-08-12 (W7-74-short-object-repairs.md). It was
+// nested inside `register_essential_natives_with_shims`, which is the same
+// mistake the block comment above this one records for the other two helpers —
+// and it put the cutoff out of reach of `alloc_carrier_thread_mirror`, which
+// asks exactly this question about exactly this class. `jdk25_concurrency`'s
+// `sts_fork` had already open-coded `worker_fields <= 8` for want of it.
+fn is_synthetic_thread_layout(num_fields: usize) -> bool {
+    num_fields <= 8
+}
+
 // Real-JDK Thread layout: `priority`, `daemon`, `threadStatus`,
 // `stackSize` live inside a nested `java.lang.Thread$FieldHolder`
 // referenced by `Thread.holder`; only `name`/`holder`/`tid`/etc. are
@@ -6655,6 +6670,164 @@ fn populate_real_thread_holder(
         ctx.set_field(this, 3, target);
     }
     ctx.unpin_native_roots(pin_base);
+}
+
+/// The width a *synthetic* `java/lang/Thread` declares:
+/// `name=0, priority=1, tid=2, target=3, virtualFlag=4`
+/// (`classloading::class_manager::synthetic_field_count`).
+///
+/// This is a REQUEST, never a claim about the object that comes back. On a real
+/// image the class declares 19 (`javap -p java.lang.Thread`, JDK 25.0.3.9,
+/// counted transitively with `static` excluded) and the funnel widens to that.
+pub(crate) const SYNTHETIC_THREAD_MIRROR_SLOTS: usize = 5;
+
+/// Does an object this crate JUST ALLOCATED for `java/lang/Thread` carry the
+/// synthetic five-slot layout rather than the real JDK one?
+///
+/// Deliberately the same `<= 8` cutoff as the twelve `Thread.<init>` natives in
+/// [`register_essential_natives_with_shims`] and as
+/// `jdk25_concurrency::sts_fork`'s worker, because it is answering the same
+/// question they are.
+///
+/// **Only sound on a receiver the caller allocated.** For a foreign receiver use
+/// [`has_real_jdk_thread_layout`], which reads a field only the real class
+/// declares — a real mirror can be compact at allocation time, so its slot count
+/// overlaps the synthetic range. A mirror that came out of
+/// `try_alloc_concurrent_synthetic` has no such ambiguity: the funnel widened it
+/// to `class_num_total_fields` itself, so the width IS the class's answer.
+pub(crate) fn thread_mirror_is_synthetic_layout(num_fields: usize) -> bool {
+    is_synthetic_thread_layout(num_fields)
+}
+
+/// Allocate and populate the `java.lang.Thread` mirror for a **Rust-owned
+/// carrier thread** — a Vert.x/Netty event loop or an XNIO I/O thread whose
+/// body is Rust, not a Java `Runnable`.
+///
+/// # The defect this replaces
+///
+/// Both carriers used to write, unconditionally and with no attempt to resolve
+/// the class:
+///
+/// ```ignore
+/// let mirror = ctx.alloc_object(ClassId::new(0), 5);
+/// ```
+///
+/// `alloc_object` substitutes `cratonvm/synthetic/AnonymousObject$5` for the
+/// `ClassId::new(0)` sentinel, so on a real image that produced a **five-slot
+/// object of a class that is not `java.lang.Thread`**, which was then published
+/// to the thread registry through `set_native_thread_java_obj` — i.e. handed
+/// out by `Thread.currentThread()` on those carriers. Two independent failures
+/// in one object:
+///
+/// * **width.** Real `java.lang.Thread` declares 19 instance fields
+///   (`eetop tid name interrupted contextClassLoader holder threadLocals
+///   inheritableThreadLocals scopedValueBindings interruptLock parkBlocker
+///   nioBlocker cont uncaughtExceptionHandler threadLocalRandomSeed
+///   threadLocalRandomProbe threadLocalRandomSecondarySeed container
+///   headStackableScopes`). Every read past slot 4 is out of bounds on the
+///   object, and the synthetic map is wrong even inside it — slot 0 is `eetop`,
+///   not `name`, and slot 2 is `name`, not `tid`.
+/// * **identity.** `AnonymousObject$5` is not assignable to `java/lang/Thread`,
+///   so `getName`/`threadId`/`getThreadGroup`/`getState` — none of which is a
+///   registered native in Compatible mode — cannot even dispatch, and
+///   `read_java_thread_tid` (`vm/src/vm/vm_exec.rs`) resolves `"tid"` by NAME
+///   against the receiver's own class and finds nothing, so the registry's
+///   java-tid index was never populated for these carriers.
+///
+/// See W7-74-short-object-repairs.md and W7-73-short-object-blind-spot.md §3.3.
+///
+/// # The repair, and why it is this shape
+///
+/// The funnel, then the registered constructor — exactly
+/// `net_phase_e::re10_spawn_dispatcher` and `jdk25_concurrency`'s
+/// `StructuredTaskScope` worker, which are the two landed precedents for
+/// building a `java.lang.Thread` from a native:
+///
+/// * [`try_alloc_concurrent_synthetic`](crate::util_concurrent_ext::try_alloc_concurrent_synthetic)
+///   resolves `java/lang/Thread`, reports to the layout-alias census, widens the
+///   request to `class_num_total_fields`, and allocates against the **resolved**
+///   class id. On a real image that is 19 slots of a genuine `java.lang.Thread`.
+/// * `Thread.<init>(ThreadGroup, Runnable, String)` is then driven through
+///   `ctx.invoke`, NOT called as a Rust function. `register()` is
+///   last-write-wins, so invoking by name gets whichever registration actually
+///   won; calling `populate_real_thread_holder` directly would hard-wire the
+///   loser. That native allocates and links `Thread$FieldHolder`, without which
+///   `getPriority`/`isDaemon`/`getThreadGroup`/`getState` all NPE on
+///   `this.holder`.
+///
+/// The synthetic arm is byte-for-byte what both call sites did before: `name`
+/// into slot 0 and the VM `ThreadId` as a `Long` into slot 2, which is the
+/// convention `resolve_thread_id_from_thread_obj`'s legacy fallback reads.
+///
+/// Returns `None` when the class cannot be resolved at all — under `--jdk-only`
+/// the funnel refuses to fabricate. That is a *better* outcome than the old
+/// code's: with no pre-registered mirror, `NativeContextImpl::current_thread_object`
+/// builds a correct full-width one lazily on first use. The short mirror's real
+/// damage was pre-empting exactly that path.
+pub(crate) fn alloc_carrier_thread_mirror(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    vm_tid: u64,
+    daemon: bool,
+) -> Option<ObjectRef> {
+    let mirror =
+        crate::util_concurrent_ext::try_alloc_concurrent_synthetic(
+            ctx,
+            "java/lang/Thread",
+            SYNTHETIC_THREAD_MIRROR_SLOTS,
+        )
+        .ok()?;
+    // GC-safety: `mirror` is a bare Rust local and `create_string` allocates.
+    // `safe_native_call` pins this function's incoming args once at entry and
+    // does not protect an object this callback allocates itself, so a moving
+    // young collection inside `create_string` would relocate the mirror and
+    // leave every write below landing on the dead from-space copy. Same
+    // pin/re-read pattern as `populate_real_thread_holder`.
+    let pin = ctx.pin_native_root(mirror);
+    let name_obj = ctx.create_string(name);
+    let mirror = ctx.read_native_pin(pin, mirror);
+
+    if thread_mirror_is_synthetic_layout(ctx.object_num_fields(mirror)) {
+        // Synthetic image: `name=0, priority=1, tid=2, target=3, virtualFlag=4`.
+        // Unchanged from before the repair, deliberately — the synthetic map is
+        // the synthetic class's real layout, and `MockNativeContext` reports
+        // `class_num_total_fields == 0`, so this is also the arm the T19_K4
+        // tests exercise.
+        ctx.set_field(mirror, 0, Value::Object(Some(name_obj)));
+        ctx.set_field(mirror, 2, Value::Long(vm_tid as i64));
+        ctx.unpin_native_roots(pin);
+        return Some(mirror);
+    }
+
+    // Real image. No `target`: the carrier's body is Rust, and a non-null
+    // Runnable here would make `Thread.run()` execute it on whichever thread
+    // called `start()`.
+    let _ = ctx.invoke(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        &[
+            Value::Object(Some(mirror)),
+            Value::Object(None),
+            Value::Object(None),
+            Value::Object(Some(name_obj)),
+        ],
+    );
+    let mirror = ctx.read_native_pin(pin, mirror);
+    if daemon {
+        // Through the registered native, for the same last-write-wins reason:
+        // `daemon` lives on `holder`, and the winning `setDaemon` is the only
+        // code that knows where the winning `<init>` put it.
+        let _ = ctx.invoke(
+            "java/lang/Thread",
+            "setDaemon",
+            "(Z)V",
+            &[Value::Object(Some(mirror)), Value::Int(1)],
+        );
+    }
+    let mirror = ctx.read_native_pin(pin, mirror);
+    ctx.unpin_native_roots(pin);
+    Some(mirror)
 }
 
 /// Compatibility wrapper for embedders and tests that explicitly request the
@@ -13327,14 +13500,6 @@ pub fn register_essential_natives_with_shims(
         native_thread_current_thread,
         NativeKind::Bridge,
     );
-    // Thread.<init> overrides: synthetic-JDK only. In real-JDK mode the
-    // Thread class has many more fields and a FieldHolder layout — writing
-    // raw slots 0..3 there corrupts the object. We detect by num_fields:
-    // synthetic Thread has at most ~8 slots; real-JDK Thread has 20+.
-    fn is_synthetic_thread_layout(num_fields: usize) -> bool {
-        num_fields <= 8
-    }
-
     registry.register(
         "java/lang/Thread$FieldHolder",
         "<init>",
