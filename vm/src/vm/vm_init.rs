@@ -793,6 +793,33 @@ fn ensure_bootstrap_compat_class(
     // above the first call site, precisely so that no class escapes the policy
     // it was started under. Read from the manager and not from a `cfg!`: a
     // Cargo feature cannot see a runtime mode.
+    // A class that is ALREADY LOADED is answered in every mode. This is not a
+    // fabrication — it is a lookup that happens to share an entry point with
+    // one, and `--jdk-only` has no quarrel with real bytes.
+    //
+    // Measured 2026-08-12: without this, `System.out` in strict mode is a
+    // zero-slot `java/lang/Object`. `getClass()` answers `java.lang.Object`,
+    // `instanceof PrintStream` is false, and `getSuperclass()` is null. The
+    // caller at the `java/io/PrintStream` site says so in its own comment —
+    // "the load above has already put the real java.io.PrintStream in the
+    // store, so this resolves to it and fabricates nothing" — and its refusal
+    // arm deliberately degrades to `java/lang/Object` because that arm was only
+    // ever meant to be reachable where `java.base` is absent.
+    //
+    // The blanket early return below was added the same day to stop the boot
+    // block REQUESTING the thirteen `cratonvm/internal/Unmodifiable*` stand-ins
+    // under strict mode, which it correctly does. But this function is named
+    // for its majority caller, not its contract, and one caller passes a real
+    // JDK class. That is the SECOND time this exact function's stated scope has
+    // been wrong about a caller — its doc comment previously claimed the
+    // stand-ins "exist for the synthetic collection shims", which was false for
+    // `cratonvm/internal/UnmodifiableMap` and cost `System.getenv()`.
+    //
+    // **A guard scoped by a premise about who calls you is only as good as that
+    // premise.** Ask the store, not the caller list.
+    if let Some(id) = class_manager.get_loaded_class_id(name) {
+        return Some(id);
+    }
     if class_manager.compatibility_mode().is_jdk_only() {
         return None;
     }
