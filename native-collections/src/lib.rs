@@ -44509,6 +44509,25 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(JLjava/util/function/BiConsumer;)V",
         native_chm_for_each_parallel,
     );
+    // The two bulk operations the round-2 differential measured. Every method
+    // in this family walks `table` through a `Traverser`, and a natively-backed
+    // CHM keeps its entries in a SEGMENTED layout that never populates `table`
+    // — so unregistered, they run real bytecode over an empty tree and answer
+    // `null`. See `native_chm_reduce_values` for why that answer is the worst
+    // possible one. The rest of the family is still unregistered; the list is in
+    // W7-36-differential-view-families.
+    r.register(
+        c,
+        "reduceValues",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_reduce_values,
+    );
+    r.register(
+        c,
+        "searchKeys",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+        native_chm_search_keys,
+    );
     r.register(c, "mappingCount", "()J", native_chm_mapping_count);
     r.register(
         c,
@@ -46453,6 +46472,136 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     ctx.unpin_native_roots(action_pin);
     Ok(None)
+}
+
+/// `ConcurrentHashMap.reduceValues(long parallelismThreshold, BiFunction reducer)`
+/// — "the result of accumulating all values using the given reducer to combine
+/// values, or null if none".
+///
+/// Measured `CHM.reduceValues=null` against HotSpot's `6`, on a map whose
+/// ordinary `entrySet` iteration answered correctly in the SAME run
+/// (`CHM.sortedContent={a=6}` matches, and that is `new TreeMap<>(chm)` walking
+/// `entrySet`). The split is the `Traverser`: every method in the bulk-operation
+/// family walks the real `table` field, and a natively-backed CHM keeps its
+/// entries in the segmented side layout that never populates `table` — so the
+/// real bytecode traverses an empty tree and reports "no values".
+///
+/// That is the worst answer available. `null` from `reduceValues` is exactly
+/// what an empty map returns, so a caller cannot tell a lost traversal from a
+/// legitimately empty reduction — the quiet shape the round-2 widening was
+/// written to catch. `forEach(long, BiConsumer)` above was registered for the
+/// same reason.
+///
+/// The fold matches `ReduceValuesTask`: seed with the first value, then
+/// `reducer.apply(acc, next)`. The `parallelismThreshold` argument is read and
+/// ignored, as it may be: it is a *hint*, and a sequential evaluation is a legal
+/// answer for any value of it.
+fn native_chm_reduce_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // `if (reducer == null) throw new NullPointerException();` — the first
+    // statement of the real method.
+    let reducer = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let values = chm_collect_all_values(ctx, this);
+    // GC-SAFETY: `apply` is arbitrary interpreted bytecode. It can move the
+    // reducer, every value still held only in this Rust Vec, and the accumulator
+    // — which is the one that matters most, because it is fed back in as an
+    // argument on the very next iteration.
+    let reducer_pin = ctx.pin_native_root(reducer);
+    let (_, value_pins) = pin_value_slice(ctx, &values);
+    let mut acc: Option<Value> = None;
+    let mut acc_pin = usize::MAX;
+    let mut result: Result<Option<Value>, MethodCallFailed> = Ok(None);
+    for i in 0..values.len() {
+        let next = read_pinned_elem(ctx, value_pins[i], values[i]);
+        let Some(prev) = acc else {
+            acc = Some(next);
+            acc_pin = pin_value(ctx, next);
+            continue;
+        };
+        let reducer = ctx.read_native_pin(reducer_pin, reducer);
+        let prev = read_pinned_elem(ctx, acc_pin, prev);
+        match ctx.invoke_virtual(
+            reducer,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[prev, next],
+        ) {
+            Ok(r) => {
+                let combined = r.unwrap_or(Value::Object(None));
+                acc = Some(combined);
+                acc_pin = pin_value(ctx, combined);
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if let Ok(ref mut out) = result {
+        *out = Some(match acc {
+            Some(v) => read_pinned_elem(ctx, acc_pin, v),
+            None => Value::Object(None),
+        });
+    }
+    ctx.unpin_native_roots(reducer_pin);
+    result
+}
+
+/// `ConcurrentHashMap.searchKeys(long parallelismThreshold, Function searchFunction)`
+/// — "a non-null result from applying the given search function on each key, or
+/// null if none".
+///
+/// Same cause and same silence as [`native_chm_reduce_values`]: measured
+/// `CHM.searchKeys=null` against HotSpot's `found`, where `null` is also the
+/// legitimate "nothing matched" answer. Short-circuits on the first non-null
+/// result, as `SearchKeysTask` does.
+fn native_chm_search_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let search_fn = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = chm_collect_all_keys(ctx, this);
+    let fn_pin = ctx.pin_native_root(search_fn);
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let mut result: MethodCallResult = Ok(Some(Value::Object(None)));
+    for i in 0..keys.len() {
+        let search_fn = ctx.read_native_pin(fn_pin, search_fn);
+        let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        match ctx.invoke_virtual(
+            search_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => {
+                result = Ok(Some(v));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(fn_pin);
+    result
 }
 
 fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
