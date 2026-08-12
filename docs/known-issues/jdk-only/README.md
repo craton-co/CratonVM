@@ -206,7 +206,18 @@ command each one names in its own final section. **Do not re-derive them.**
 `W7-68-live-under-allocations.md` · `W7-69-read-side-alias-instrument.md` ·
 `W7-70-printstream-close-noop.md` ·
 `W7-71-jca-exception-types-and-line-separator.md` ·
-`W7-73-short-object-blind-spot.md` · `W7-74-short-object-repairs.md`
+`W7-73-short-object-blind-spot.md` · `W7-74-short-object-repairs.md` ·
+`W7-72-ssc-socket-and-filechannel.md` (inverts W7-68's registrar reading for
+`FileChannel.isOpen`; the copy that reads a private slot is compiled only into
+the synthetic build and overwritten even there) ·
+`W7-76-bytebuffer-alias-residuals.md` (`HeapByteBuffer`'s `6` is a LAYOUT
+WITNESS, not a width — widening it darkens every indexed fallback in the one
+mode with nothing to fall back to) ·
+`W7-79-loadlibrary-compatible-arm.md` (the name is `args[2]`, measured on a
+running VM, not `args[1]` as recorded) ·
+`W7-81-write-route-three-way.md` (its 23 call sites were a red herring; the
+defect was one helper mapping three inputs onto two outputs differently per
+branch)
 
 Also filed 2026-08-12 and in the same state:
 `W7-41-format-exception-subclasses.md` ·
@@ -225,6 +236,14 @@ or `W7-43`, so no row above speaks for them.
 defect records. They stay because the rest of the directory cites their method.
 `W7-78` is the only one of the four that changed a file the suite runs — the
 four nestmate checks in `RJdkReflect`, listed in §2.6.
+
+`W7-15-cipher-silently-wrong-algorithm.md` was in no index row at all. It is
+the record for the ChaCha20-served-as-AES-256-ECB defect (tampered ciphertext
+decrypted cleanly). Its headline is FIXED and verified at full parity by
+`W7-38-crypto-trio-verified.md`; it is kept for the SHAPE — a dispatch line
+that validates a `_name` and then keys on something else — which
+`W7-63-jca-advertise-vs-serve.md` and
+`W7-71-jca-exception-types-and-line-separator.md` both cite.
 
 ### 2.4 Prescribed fixes that are WRONG or SUPERSEDED — do not apply
 
