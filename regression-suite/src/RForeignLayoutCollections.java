@@ -80,6 +80,14 @@ import java.util.Set;
  *   cratonvm --real-jdk --java-home $JDK -cp out RForeignLayoutCollections
  */
 public class RForeignLayoutCollections {
+    static int checks;
+
+    static void check(boolean c, String m) {
+        checks++;
+        if (!c) {
+            throw new AssertionError("RForeignLayoutCollections: " + m);
+        }
+    }
 
     /** Elements live in a `String`, not in any array CratonVM models. */
     static final class ForeignCollection extends AbstractCollection<String> {
@@ -143,6 +151,28 @@ public class RForeignLayoutCollections {
         } catch (Throwable t) {
             return "EXC:" + t.getClass().getName();
         }
+    }
+
+    /**
+     * Print one observable on a line run.sh's `^(PASS|CK) ` extractor keeps.
+     * The value is always whatever the call under test produced — including the
+     * `EXC:` token `safe` builds from a thrown Throwable, which used to be
+     * filtered away along with everything else.
+     */
+    private static void ck(String key, String value) {
+        System.out.println("CK RForeignLayoutCollections " + key + "=" + value);
+    }
+
+    /**
+     * Run one observable, print it, and assert it equals `want` — the value
+     * MEASURED on HotSpot 25 (Adoptium 25.0.3.9), never a guess. The print is
+     * for the cross-VM diff; the assertion is what keeps the vector armed on a
+     * host with no HotSpot, where run.sh skips the diff entirely.
+     */
+    private static void ckEq(String key, String want, java.util.function.Supplier<String> f) {
+        String got = safe(f);
+        ck(key, got);
+        check(want.equals(got), key + " = " + got + ", want " + want);
     }
 
     public static void main(String[] args) {

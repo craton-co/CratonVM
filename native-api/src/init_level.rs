@@ -120,9 +120,24 @@ pub fn await_init_level(target: i32) {
 mod tests {
     use super::*;
 
-    // Tests here can run in parallel with other tests that exercise
-    // the init level, but they all target the same global state —
-    // keep them deterministic by only asserting monotonic progression.
+    // The init level is one process-wide, saturating, monotonic global, and
+    // this module is its only user in this test binary. Every test that
+    // asserts an absolute level — or that needs to start from a known floor —
+    // takes `serial()` first, so no test can observe another's transient.
+
+    /// Serialise the tests that read or drive the process-wide level.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Lower the global back to the floor for a test that needs headroom.
+    ///
+    /// `set_init_level` correctly refuses this, so it goes to the atomic
+    /// directly. Only sound while `serial()` is held.
+    fn reset_to_floor() {
+        global().0.store(0, Ordering::Release);
+    }
 
     #[test]
     fn get_does_not_panic_before_init() {
@@ -132,6 +147,7 @@ mod tests {
 
     #[test]
     fn monotonic_advance() {
+        let _serial = serial();
         // Starts at whatever previous test left it at; bump to max
         // and verify we never go backward.
         let before = get_init_level();
@@ -143,6 +159,7 @@ mod tests {
 
     #[test]
     fn await_returns_immediately_when_at_target() {
+        let _serial = serial();
         set_init_level(4);
         // Should not block.
         let start = std::time::Instant::now();
