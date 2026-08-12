@@ -506,9 +506,13 @@ strict mode. **Compatible mode does not.**
 | `StampedLock` read/write torn-pair observations, 20000×3 readers | 0 | **0** | 0 |
 | `ReentrantReadWriteLock` exclusion (control) | 8000 | **8000** | 8000 |
 | `CountDownLatch` rendezvous (before / after / await) | 0 / 4 / true | **0 / 4 / true** | 0 / 4 / true |
-| `CyclicBarrier` 4-party × 50 passes | 200 | **200** | **run dies here** |
+| `CyclicBarrier` 4-party × 50 passes | 200 | **200** | **run stops here, both runs** |
 | `AtomicBoolean` CAS — exactly one winner × 500 rounds | 500 | **500** | not reached |
 | `ConcurrentHashMap.merge` under contention | 8000 | **8000** | not reached |
+
+Compatible-mode figures are from two runs; the two `synchronizedList` values are
+the two runs' results, not a range. Read the provenance note below the bullets
+before quoting the `CyclicBarrier` row.
 
 **This inverts the brief's category-(B) worry for these families.** The concern
 was that refusing a stub might make strict mode *silently worse*. Measured, the
@@ -519,10 +523,22 @@ opposite holds:
   stub, not a fixed off-by-N. Strict mode, running the real JDK's
   `SynchronizedRandomAccessList`, returns 8000 exactly. This is the
   `Collections.synchronized*` identity-stub-is-not-atomic defect, measured.
-* **The compatible run then dies** at the 4-party `CyclicBarrier` with
-  `Thread Thread-5 terminated with error: ExceptionThrown(...)` and a failing
-  `dispatchUncaughtException`; the last three checks never run. Strict mode
-  completes all nine.
+* **The compatible run then stops** at the 4-party `CyclicBarrier`; the last
+  three checks never print. Strict mode completes all nine.
+
+  **Provenance, because this one claim is spliced from two runs and one of them
+  was killed.** Run 1 ended on its own — the shell pipeline closed and returned,
+  so the VM process exited — after exactly six probe lines. Run 2 stopped at the
+  same six lines and its stderr carries one
+  `Thread Thread-5 terminated with error: ExceptionThrown(...)
+  (dispatchUncaughtException also failed: ...)`, but run 2 was **killed by the
+  harness**, so its truncation is not by itself evidence. What is established:
+  **two runs stopped at the same probe**, and a thread died with a
+  double-fault on the uncaught-exception path in the one run whose stderr was
+  captured. What is **not** established: the VM's exit code (the pipeline
+  returned `grep`'s status, not the VM's), and whether the thread death is the
+  cause of the stop or a separate symptom. Re-run with stderr kept and
+  `echo ${PIPESTATUS[0]}` before treating this as a filed defect.
 
 **`StampedLock` is the other important row.** 31 stub slots, refused in strict,
 and the real JDK `StampedLock` bytecode provides correct mutual exclusion *and*
@@ -668,6 +684,10 @@ python scripts/jdk-only-bridge-ratchet.py # bridge.shadows_bytecode must FALL
 * **Whether each of the 3956 shadowing bridges is CORRECT.** The census proves
   they shadow; it does not adjudicate them. That is 3956 differential tests, not
   a census.
+* **Why the compatible `ConcProbe` run stops at the `CyclicBarrier`** (§5.2).
+  Two runs stop at the same probe, but the VM's exit code was never captured and
+  the one thread death observed may be symptom rather than cause. The
+  `synchronizedList` data loss beside it **is** established; this row is not.
 * **Deep-path behaviour** for the families §5 marked green: file-backed
   `FileHandler`, `LogManager.readConfiguration`, real child processes, TLS
   handshakes, async channel close.
