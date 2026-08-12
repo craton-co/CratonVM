@@ -43,32 +43,65 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "min", "(JJ)J", native_math_min_long);
     registry.register(class, "min", "(FF)F", native_math_min_float);
     registry.register(class, "min", "(DD)D", native_math_min_double);
+    // `sqrt` is shared deliberately: IEEE 754 requires it CORRECTLY ROUNDED, so
+    // `FdLibm.Sqrt.compute` and the hardware instruction compute the same
+    // function. This is the one row of the transcendental surface where sharing
+    // one backing between the two classes is a theorem rather than a bug.
     registry.register(class, "sqrt", "(D)D", native_math_sqrt);
-    registry.register(class, "pow", "(DD)D", native_math_pow);
-    registry.register(class, "sin", "(D)D", native_math_sin);
-    registry.register(class, "cos", "(D)D", native_math_cos);
-    registry.register(class, "tan", "(D)D", native_math_tan);
-    registry.register(class, "asin", "(D)D", native_math_asin);
-    registry.register(class, "acos", "(D)D", native_math_acos);
-    registry.register(class, "atan", "(D)D", native_math_atan);
-    registry.register(class, "atan2", "(DD)D", native_math_atan2);
-    // `log` is the one function in this block whose backing differs between
-    // the two classes. `Math.log` is allowed 1 ULP of error, so platform libm
-    // satisfies it; `StrictMath.log` is a bit-for-bit contract naming fdlibm,
-    // and platform libm does NOT satisfy that — measured on Temurin 25.0.3+9,
-    // `Math.log` and `StrictMath.log` return different bit patterns for 7.3%
-    // of uniform draws in (0,1). That gap was reaching users through
+
+    // --- The fdlibm family: the ONLY correct split between Math and StrictMath.
+    //
+    // These two classes are not two names for one thing. `Math.f` promises a
+    // 1-ULP bound and semi-monotonicity, which the host libm meets, and is free
+    // to use a CPU intrinsic. `StrictMath.f` promises the FDLIBM RESULT, bit for
+    // bit, on every platform and every VM — that is the whole reason the class
+    // exists. Registering one backing for both made the strict class no stricter
+    // than the loose one, and it was not a theoretical deviation. Replaying a
+    // HotSpot oracle against the libm we link (MSVC's CRT, Windows x86-64),
+    // every one of these functions disagreed with fdlibm:
+    //
+    //   cbrt 30.98%  cosh 28.55%  sinh 28.08%  pow 9.73%  exp 9.62%
+    //   log1p 7.58%  log(0,1) 7.37%  expm1 7.12%  tan 3.95%  asin 2.55%
+    //   cos 2.43%  sin 2.37%  tanh 2.32%  acos 0.89%  atan2 0.36%
+    //   hypot 0.32%  log10 0.26%  atan 0.01%
+    //
+    // `log` was found first only because it reached users through
     // `java.util.Random.nextGaussian()`, whose multiplier is
     // `StrictMath.sqrt(-2 * StrictMath.log(s) / s)`: every seeded gaussian
-    // stream came out one ULP off HotSpot's. See
-    // W7-44-numberformat-enum-and-double-tostring.md.
-    if class == "java/lang/StrictMath" {
+    // stream came out one ULP off HotSpot's. It was not special — see
+    // W7-44-numberformat-enum-and-double-tostring.md for that finding and
+    // W7-54-strictmath-fdlibm-family.md for the rest.
+    //
+    // `Math` keeps libm on purpose. Do NOT "simplify" this by pointing both
+    // classes at the fdlibm bodies: that would be slower for the overwhelmingly
+    // more common caller and would not fix anything, since libm already
+    // satisfies `Math`'s contract.
+    let strict = class == "java/lang/StrictMath";
+    if strict {
+        registry.register(class, "pow", "(DD)D", native_strict_math_pow);
+        registry.register(class, "sin", "(D)D", native_strict_math_sin);
+        registry.register(class, "cos", "(D)D", native_strict_math_cos);
+        registry.register(class, "tan", "(D)D", native_strict_math_tan);
+        registry.register(class, "asin", "(D)D", native_strict_math_asin);
+        registry.register(class, "acos", "(D)D", native_strict_math_acos);
+        registry.register(class, "atan", "(D)D", native_strict_math_atan);
+        registry.register(class, "atan2", "(DD)D", native_strict_math_atan2);
         registry.register(class, "log", "(D)D", native_strict_math_log);
+        registry.register(class, "log10", "(D)D", native_strict_math_log10);
+        registry.register(class, "exp", "(D)D", native_strict_math_exp);
     } else {
+        registry.register(class, "pow", "(DD)D", native_math_pow);
+        registry.register(class, "sin", "(D)D", native_math_sin);
+        registry.register(class, "cos", "(D)D", native_math_cos);
+        registry.register(class, "tan", "(D)D", native_math_tan);
+        registry.register(class, "asin", "(D)D", native_math_asin);
+        registry.register(class, "acos", "(D)D", native_math_acos);
+        registry.register(class, "atan", "(D)D", native_math_atan);
+        registry.register(class, "atan2", "(DD)D", native_math_atan2);
         registry.register(class, "log", "(D)D", native_math_log);
+        registry.register(class, "log10", "(D)D", native_math_log10);
+        registry.register(class, "exp", "(D)D", native_math_exp);
     }
-    registry.register(class, "log10", "(D)D", native_math_log10);
-    registry.register(class, "exp", "(D)D", native_math_exp);
     registry.register(class, "floor", "(D)D", native_math_floor);
     registry.register(class, "ceil", "(D)D", native_math_ceil);
     registry.register(class, "rint", "(D)D", native_math_rint);
@@ -79,7 +112,21 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "random", "()D", native_math_random);
     registry.register(class, "signum", "(D)D", native_math_signum_double);
     registry.register(class, "signum", "(F)F", native_math_signum_float);
-    registry.register(class, "cbrt", "(D)D", native_math_cbrt);
+    if strict {
+        registry.register(class, "cbrt", "(D)D", native_strict_math_cbrt);
+    } else {
+        registry.register(class, "cbrt", "(D)D", native_math_cbrt);
+    }
+    // `IEEEremainder` is shared, and unlike `sqrt` that is not because the old
+    // body was already right — it is because there is no latitude here for
+    // EITHER class. Both specs say "as prescribed by the IEEE 754 standard",
+    // which fixes the result exactly, so `Math.IEEEremainder` is as wrong as
+    // `StrictMath.IEEEremainder` when it deviates. The previous body computed
+    // `a - (a/b).round() * b`, which is wrong two ways: `round` is ties-AWAY
+    // where IEEE 754 requires ties-to-EVEN, and `a/b` overflows to infinity for
+    // operands whose remainder is perfectly ordinary. 49.83% of sampled pairs
+    // disagreed with fdlibm, with UNBOUNDED error — the worst row in the census
+    // by a wide margin, and the only one that was not a last-ULP story.
     registry.register(class, "IEEEremainder", "(DD)D", native_math_ieee_remainder);
     // End of the leaf block. The `*Exact` family below raises
     // `ArithmeticException` on overflow, which is a `MethodCallFailed` return
@@ -156,12 +203,26 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     );
 
     // --- Advanced functions (Phase 13 Step 3) ---
-    registry.register(class, "hypot", "(DD)D", native_math_hypot);
-    registry.register(class, "log1p", "(D)D", native_math_log1p);
-    registry.register(class, "expm1", "(D)D", native_math_expm1);
-    registry.register(class, "sinh", "(D)D", native_math_sinh);
-    registry.register(class, "cosh", "(D)D", native_math_cosh);
-    registry.register(class, "tanh", "(D)D", native_math_tanh);
+    // Same Math/StrictMath split as the block above, and for the same reason:
+    // `sinh` and `cosh` are the second- and third-worst rows in the census
+    // (28.08% and 28.55% of sampled inputs disagreed with fdlibm on the libm we
+    // link), because both are defined in terms of `expm1`/`exp` and inherit
+    // those functions' deviation on top of their own.
+    if strict {
+        registry.register(class, "hypot", "(DD)D", native_strict_math_hypot);
+        registry.register(class, "log1p", "(D)D", native_strict_math_log1p);
+        registry.register(class, "expm1", "(D)D", native_strict_math_expm1);
+        registry.register(class, "sinh", "(D)D", native_strict_math_sinh);
+        registry.register(class, "cosh", "(D)D", native_strict_math_cosh);
+        registry.register(class, "tanh", "(D)D", native_strict_math_tanh);
+    } else {
+        registry.register(class, "hypot", "(DD)D", native_math_hypot);
+        registry.register(class, "log1p", "(D)D", native_math_log1p);
+        registry.register(class, "expm1", "(D)D", native_math_expm1);
+        registry.register(class, "sinh", "(D)D", native_math_sinh);
+        registry.register(class, "cosh", "(D)D", native_math_cosh);
+        registry.register(class, "tanh", "(D)D", native_math_tanh);
+    }
     registry.register(class, "copySign", "(DD)D", native_math_copy_sign_double);
     registry.register(class, "copySign", "(FF)F", native_math_copy_sign_float);
     registry.register(class, "nextUp", "(D)D", native_math_next_up_double);
@@ -1420,6 +1481,105 @@ pub(crate) fn native_math_min_double(
     Ok(Some(Value::Double(a.min(b))))
 }
 
+// ---------------------------------------------------------------------------
+// The `StrictMath` bodies: fdlibm, not platform libm.
+//
+// Generated from one macro rather than written out eighteen times. That is not
+// only brevity — eighteen hand-copied bodies differing by a single identifier
+// is exactly the shape that produces a native bound to the wrong function, and
+// a `StrictMath.cos` quietly answering `sin` would pass every accuracy test
+// ever written. With the macro, the method name, the JVM signature and the
+// fdlibm routine appear together on one line at each registration site above,
+// and the argument marshalling has a single implementation.
+//
+// Every one is pure arithmetic on the argument `Value`s and never touches
+// `ctx`, so none can allocate, safepoint, collect, or raise a JNI-pending
+// exception — the same leaf property their `Math` counterparts have. Each is
+// registered from exactly the block its `Math` twin is registered from, so the
+// `set_leaf` state it inherits is unchanged by this split.
+// ---------------------------------------------------------------------------
+
+macro_rules! strict_math_unary {
+    ($($rust_name:ident => $fdlibm_fn:ident),* $(,)?) => {
+        $(
+            #[doc = concat!(
+                "`StrictMath.", stringify!($fdlibm_fn), "(double)` — fdlibm, not platform libm. ",
+                "Separate from the `Math` body on purpose: `Math`'s contract is an accuracy ",
+                "bound (1 ULP, semi-monotonic) that libm meets, while `StrictMath`'s is \"the ",
+                "fdlibm result, on every platform and every VM\". Sharing one body made the ",
+                "strict class no stricter than the loose one."
+            )]
+            #[inline]
+            pub(crate) fn $rust_name(
+                _ctx: &mut dyn NativeContext,
+                args: &[Value],
+            ) -> MethodCallResult {
+                let v = match args.first() {
+                    Some(Value::Double(v)) => *v,
+                    _ => 0.0,
+                };
+                Ok(Some(Value::Double(cratonvm_types::fdlibm::$fdlibm_fn(v))))
+            }
+        )*
+    };
+}
+
+macro_rules! strict_math_binary {
+    ($($rust_name:ident => $fdlibm_fn:ident),* $(,)?) => {
+        $(
+            #[doc = concat!(
+                "`StrictMath.", stringify!($fdlibm_fn), "(double, double)` — fdlibm, not ",
+                "platform libm. See the note on the unary family."
+            )]
+            #[inline]
+            pub(crate) fn $rust_name(
+                _ctx: &mut dyn NativeContext,
+                args: &[Value],
+            ) -> MethodCallResult {
+                let a = match args.first() {
+                    Some(Value::Double(v)) => *v,
+                    _ => 0.0,
+                };
+                let b = match args.get(1) {
+                    Some(Value::Double(v)) => *v,
+                    _ => 0.0,
+                };
+                Ok(Some(Value::Double(cratonvm_types::fdlibm::$fdlibm_fn(a, b))))
+            }
+        )*
+    };
+}
+
+strict_math_unary! {
+    native_strict_math_sin => sin,
+    native_strict_math_cos => cos,
+    native_strict_math_tan => tan,
+    native_strict_math_asin => asin,
+    native_strict_math_acos => acos,
+    native_strict_math_atan => atan,
+    native_strict_math_exp => exp,
+    native_strict_math_log => log,
+    native_strict_math_log10 => log10,
+    native_strict_math_cbrt => cbrt,
+    native_strict_math_log1p => log1p,
+    native_strict_math_expm1 => expm1,
+    native_strict_math_sinh => sinh,
+    native_strict_math_cosh => cosh,
+    native_strict_math_tanh => tanh,
+}
+
+// Argument order here is load-bearing and is NOT the alphabetical one: the JDK
+// declares `atan2(double y, double x)` — ordinate first — and `fdlibm::atan2`
+// takes them in that same order, so `args[0]` is `y`. Transposing them is a
+// defect no accuracy test can see, because `atan2(y, x)` and `atan2(x, y)` are
+// both plausible angles; only the quadrant is wrong. The golden vectors in
+// `types/src/fdlibm.rs` cross the full sign matrix, which is what catches it.
+strict_math_binary! {
+    native_strict_math_atan2 => atan2,
+    native_strict_math_pow => pow,
+    native_strict_math_hypot => hypot,
+}
+
 // --- trig and math functions ---
 #[inline(always)]
 pub(crate) fn native_math_sqrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1531,24 +1691,6 @@ pub(crate) fn native_math_log(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0.0,
     };
     Ok(Some(Value::Double(v.ln())))
-}
-
-/// `StrictMath.log(double)` — fdlibm, not platform libm.
-///
-/// Separate from `native_math_log` on purpose: `Math.log`'s contract is an
-/// accuracy bound (1 ULP, semi-monotonic) that libm meets, while
-/// `StrictMath.log`'s contract is "the fdlibm result, on every platform".
-/// Sharing one body made the strict class no stricter than the loose one.
-#[inline]
-pub(crate) fn native_strict_math_log(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let v = match args.first() {
-        Some(Value::Double(v)) => *v,
-        _ => 0.0,
-    };
-    Ok(Some(Value::Double(cratonvm_types::fdlibm::log(v))))
 }
 
 #[inline]
@@ -1833,15 +1975,31 @@ pub(crate) fn native_math_ieee_remainder(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    // IEEE 754 remainder — same as Rust's f64 rem_euclid? No, it's f64::rem.
-    // Actually Java IEEEremainder = a - (round(a/b) * b)
-    let result = if b == 0.0 || a.is_infinite() || b.is_nan() {
-        f64::NAN
-    } else {
-        let q = (a / b).round();
-        a - q * b
-    };
-    Ok(Some(Value::Double(result)))
+    // fdlibm, for BOTH `Math` and `StrictMath`. Unlike the rest of this file's
+    // transcendentals there is no accuracy latitude to trade away here: both
+    // specs read "as prescribed by the IEEE 754 standard", which fixes the
+    // result exactly, so a deviating `Math.IEEEremainder` is as wrong as a
+    // deviating `StrictMath.IEEEremainder`.
+    //
+    // The previous body was `a - (a/b).round() * b`, guarded on a few specials.
+    // That is wrong two independent ways:
+    //
+    //   1. `f64::round` is ties-AWAY-from-zero. IEEE 754 requires the quotient
+    //      rounded to the NEAREST integer with TIES TO EVEN. Every half-integer
+    //      quotient came out with the wrong remainder — `IEEEremainder(1.5, 1)`
+    //      returned `0.5` where the answer is `-0.5`.
+    //   2. `a / b` overflows to infinity for operands whose remainder is
+    //      perfectly representable (`IEEEremainder(MAX_VALUE, MIN_NORMAL)`),
+    //      and `a - inf*b` is then NaN. fdlibm never forms the quotient at all:
+    //      it reduces by `fmod` against `2p` and finishes with two conditional
+    //      subtractions, so the result is exact by construction.
+    //
+    // Measured: 49.83% of sampled pairs disagreed with HotSpot, with UNBOUNDED
+    // error — by a wide margin the worst row in the census, and the only one
+    // that was not a last-ULP story. W7-54-strictmath-fdlibm-family.md.
+    Ok(Some(Value::Double(cratonvm_types::fdlibm::ieee_remainder(
+        a, b,
+    ))))
 }
 
 // ---------------------------------------------------------------------------
@@ -5327,7 +5485,16 @@ mod tests {
         let r = native_math_to_radians(&mut ctx, &[Value::Double(180.0)]);
         match r.unwrap() {
             Some(Value::Double(v)) => {
-                assert!((v - std::f64::consts::PI).abs() < 1e-10);
+                // Exact, not within 1e-10. JDK 25 computes this as
+                // `angdeg * DEGREES_TO_RADIANS` against a precomputed literal
+                // whose bit pattern (0x3f91df46a2529d39) is identical to Rust's
+                // `PI / 180.0`, so `toRadians(180.0)` is exactly `PI` on both —
+                // there is a single right answer and a tolerance only hides a
+                // future rewiring. (JDK 8 used `angdeg / 180.0 * PI`, a
+                // different expression that rounds differently; if this ever
+                // fails, check which formula the backing uses before widening
+                // anything.) W7-54-strictmath-fdlibm-family.md.
+                assert_eq!(v.to_bits(), std::f64::consts::PI.to_bits());
             }
             other => panic!("expected Double, got {other:?}"),
         }
@@ -5339,7 +5506,10 @@ mod tests {
         let r = native_math_to_degrees(&mut ctx, &[Value::Double(std::f64::consts::PI)]);
         match r.unwrap() {
             Some(Value::Double(v)) => {
-                assert!((v - 180.0).abs() < 1e-10);
+                // Exact — see `math_to_radians_180`. JDK 25's
+                // `RADIANS_TO_DEGREES` literal is bit-identical to Rust's
+                // `180.0 / PI`, and `toDegrees(PI)` is exactly 180.0.
+                assert_eq!(v.to_bits(), 180.0f64.to_bits());
             }
             other => panic!("expected Double, got {other:?}"),
         }

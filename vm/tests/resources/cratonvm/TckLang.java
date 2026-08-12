@@ -379,10 +379,17 @@ public class TckLang {
         return (Math.max(10, 20) == 20 && Math.min(10, 20) == 10) ? 1 : 0;
     }
 
-    /** Math.sqrt(). */
+    /**
+     * Math.sqrt().
+     *
+     * Exact, not a +-0.01 band: IEEE 754 requires sqrt to be CORRECTLY ROUNDED,
+     * and 144.0 is a perfect square, so the only conforming answer is 12.0. The
+     * old band would have accepted an implementation that was not computing a
+     * square root at all. W7-54-strictmath-fdlibm-family.md.
+     */
     public static int math_sqrt() {
         double s = Math.sqrt(144.0);
-        return (s > 11.99 && s < 12.01) ? 1 : 0;
+        return (s == 12.0) ? 1 : 0;
     }
 
     /** Math.pow(). */
@@ -407,11 +414,23 @@ public class TckLang {
                 Math.E > 2.71 && Math.E < 2.72) ? 1 : 0;
     }
 
-    /** Math.sin() / cos(). */
+    /**
+     * Math.sin() / cos().
+     *
+     * sin(0.0) is asserted EXACTLY, and with its sign: the javadoc special case
+     * is "if the argument is zero, then the result is a zero with the same sign
+     * as the argument", which is a fixed answer, not a 1-ULP one. The old
+     * `Math.abs(s) < 0.001` also passed for -0.0 and for 1e-300.
+     *
+     * cos(0.0) is likewise exactly 1.0 by its own special case. Neither of these
+     * relies on the 1-ULP latitude Math.sin/cos have away from zero, so nothing
+     * here needs a tolerance. W7-54-strictmath-fdlibm-family.md.
+     */
     public static int math_sinCos() {
         double s = Math.sin(0.0);
         double c = Math.cos(0.0);
-        return (Math.abs(s) < 0.001 && Math.abs(c - 1.0) < 0.001) ? 1 : 0;
+        boolean sinExact = (s == 0.0) && (Double.doubleToRawLongBits(s) == 0L);
+        return (sinExact && c == 1.0) ? 1 : 0;
     }
 
     /** Math.log() / exp(). */

@@ -14329,34 +14329,35 @@ pub fn register_essential_natives_with_shims(
 
     // --- java.lang.Math / StrictMath (native transcendental functions) ---
     //
-    // VULN / LIMITATION (StrictMath bit-reproducibility): `java.lang.StrictMath`
-    // is contractually required to produce bit-for-bit identical results across
-    // every platform and VM — its spec mandates the fdlibm algorithms (the same
-    // code the reference JDK ships) for sin/cos/tan/asin/acos/atan/atan2/exp/
-    // log/log10/sqrt/cbrt/pow/sinh/cosh/tanh/hypot/expm1/log1p. CratonVM
-    // registers the SAME backing implementation for both `Math` and
-    // `StrictMath` (lang_math::register_math_natives), which delegates the
-    // transcendental functions to the host platform's libm. Platform libm is
-    // NOT guaranteed to be fdlibm-equivalent (last-ULP results vary by OS / libc
-    // / CPU), so StrictMath here can differ from HotSpot in the low bits and
-    // VIOLATES the StrictMath bit-reproducibility contract.
+    // CLOSED 2026-08-12 — W7-54-strictmath-fdlibm-family.md. This site used to
+    // carry a standing VULN/LIMITATION note, and it was accurate:
+    // `java.lang.StrictMath` is contractually required to produce bit-for-bit
+    // identical results on every platform and every VM — its spec names the
+    // fdlibm algorithms, the same code the reference JDK ships — and CratonVM
+    // registered the SAME backing for both `Math` and `StrictMath`, delegating
+    // the whole transcendental surface to the host libm. Platform libm is not
+    // fdlibm-equivalent, so `StrictMath` here violated its own specification.
     //
-    // PARTIALLY CLOSED 2026-08-12: `log` is now the fdlibm algorithm
-    // (`cratonvm_types::fdlibm::log`, a port of JDK 25's `FdLibm.Log.compute`),
-    // registered for `StrictMath` only — `Math.log`'s contract is a 1-ULP bound
-    // that libm meets. This was not a theoretical deviation: `Math.log` and
-    // `StrictMath.log` disagree on 7.3% of uniform draws in (0,1), and
-    // `java.util.Random.nextGaussian()` — whose multiplier is
-    // `StrictMath.sqrt(-2 * StrictMath.log(s) / s)` — was printing
-    // `1.141905315473055` where HotSpot prints `1.1419053154730547`.
-    // W7-44-numberformat-enum-and-double-tostring.md.
+    // `register_math_natives` now splits the two classes for the eighteen
+    // functions where the split is real. This was never theoretical: replaying
+    // a HotSpot oracle against the libm we actually link, every one of them
+    // disagreed with fdlibm — cbrt 30.98%, cosh 28.55%, sinh 28.08%, pow 9.73%,
+    // exp 9.62%, down to atan 0.01% — and the `log` gap was already reaching
+    // users through `Random.nextGaussian()`, which returned a different double
+    // from HotSpot for every seed
+    // (W7-44-numberformat-enum-and-double-tostring.md).
     //
-    // Every OTHER function in that list is still libm and still violates the
-    // contract. It does not affect memory safety and is acceptable for the
-    // app-gauntlet workloads (which do not rely on golden last-ULP StrictMath
-    // vectors), but the same treatment is owed to them before any
-    // StrictMath-bit-exact workload is supported. Tracked against the
-    // 2026-06-20 review finding `nb-lang / StrictMath delegates to platform libm`.
+    // Two functions remain shared between the classes, for opposite reasons.
+    // `sqrt`, because IEEE 754 requires it correctly rounded, so the hardware
+    // instruction IS the fdlibm result — a theorem, not an accident, and the
+    // reason its census row is a structural zero. `IEEEremainder`, because its
+    // spec fixes the result exactly for BOTH classes ("as prescribed by the
+    // IEEE 754 standard"), so both now get the fdlibm body; the old one was
+    // wrong for `Math` too, on 49.83% of pairs and by an unbounded amount.
+    //
+    // `Math` keeps libm everywhere else deliberately. libm satisfies `Math`'s
+    // 1-ULP bound, so pointing both classes at the fdlibm bodies would fix
+    // nothing and would only make the overwhelmingly more common caller slower.
     lang_math::register_math_natives(registry, "java/lang/Math");
     lang_math::register_math_natives(registry, "java/lang/StrictMath");
     // Test fixtures and real-JDK bytecode in default mode still emit standard
@@ -23025,14 +23026,14 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Math natives (Step 5) ---
     //
-    // VULN / LIMITATION (StrictMath bit-reproducibility): StrictMath shares the
-    // SAME backing transcendental implementation as Math here, which delegates
-    // to the host platform libm. Platform libm is not guaranteed fdlibm-exact,
-    // so StrictMath results may differ from HotSpot in the low bits, violating
-    // the StrictMath bit-for-bit reproducibility contract. Known, documented
-    // deviation (no memory-safety impact); replace with a portable fdlibm impl
-    // in lang_math.rs before supporting StrictMath-bit-exact workloads. See the
-    // matching note at the other Math/StrictMath registration site above.
+    // CLOSED 2026-08-12 — W7-54-strictmath-fdlibm-family.md. StrictMath used to
+    // share the SAME backing transcendentals as Math here, delegating to the
+    // host libm, which violated StrictMath's bit-for-bit reproducibility
+    // contract. `register_math_natives` now gives StrictMath the fdlibm bodies
+    // in `cratonvm_types::fdlibm` (a port of JDK 25's `java.lang.FdLibm`) and
+    // leaves Math on libm, whose 1-ULP bound libm meets. See the fuller note at
+    // the other Math/StrictMath registration site above for what stays shared
+    // (`sqrt` and `IEEEremainder`) and why.
     register_math_natives(registry, "java/lang/Math");
     register_math_natives(registry, "java/lang/StrictMath");
 
@@ -35541,7 +35542,15 @@ fn native_random_next_gaussian(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let v = (((s2 >> 16) as u32 as f64) / (u32::MAX as f64)) * 2.0 - 1.0;
         let s = u * u + v * v;
         if s > 0.0 && s < 1.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm, matching the other two copies — see the note in
+            // `securerandom::native_random_next_gaussian`. This body is not
+            // currently reachable from the registry (the `securerandom` module
+            // supersedes it, per the comment above `register_random_and_
+            // securerandom_natives` in this file), but it is still compiled and
+            // still exercised by an in-crate test, and a superseded copy left on
+            // `f64::ln` is exactly what a future re-registration would silently
+            // reinstate. W7-54-strictmath-fdlibm-family.md.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return Ok(Some(Value::Double(u * mult)));
         }
     }
