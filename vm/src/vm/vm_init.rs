@@ -284,37 +284,296 @@ fn windows_build_number() -> Option<u32> {
     Some(22000)
 }
 
-/// Derive `user.language` and `user.country` from the host locale.
+/// The four BCP-47 subtags the JDK publishes per locale category.
 ///
-/// Parses `$LC_ALL`/`$LANG` on Unix, which typically look like
-/// `en_US.UTF-8`.  Windows has no direct env equivalent; we default to
-/// `en`/`US` if the env-var approach fails.
-fn derive_locale() -> (String, String) {
-    let raw = cratonvm_types::flags::runtime_var("LC_ALL")
-        .or_else(|_| cratonvm_types::flags::runtime_var("LANG"))
-        .unwrap_or_default();
-    // Strip `.<encoding>` suffix and any `@<variant>`.
-    let base = raw
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("");
-    if let Some((lang, country)) = base.split_once('_') {
-        if !lang.is_empty() && !country.is_empty() {
-            return (lang.to_string(), country.to_string());
-        }
-    }
-    if !base.is_empty() && !base.contains('_') {
-        // Just a language code (e.g. "C" or "en")
-        if base == "C" || base == "POSIX" {
-            return ("en".to_string(), "US".to_string());
-        }
-        return (base.to_string(), String::new());
-    }
-    ("en".to_string(), "US".to_string())
+/// Mirrors the `_display_*_NDX` / `_format_*_NDX` slot groups of
+/// `jdk.internal.util.SystemProps$Raw` — the JDK's platform layer hands
+/// `SystemProps` exactly these four strings twice, once for DISPLAY and once
+/// for FORMAT, and `SystemProps.fillI18nProps` turns them into the `user.*`
+/// property family.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocaleSubtags {
+    pub language: String,
+    pub script: String,
+    pub country: String,
+    pub variant: String,
 }
+
+/// The host's two locales, as the JDK models them.
+///
+/// These are genuinely two different settings on Windows (UI language vs
+/// "Regional format") and two different `LC_*` categories on Unix, which is
+/// why `Locale.Category` exists at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostLocale {
+    /// Seeds `user.language`/`user.script`/`user.country`/`user.variant`.
+    pub display: LocaleSubtags,
+    /// Seeds the `user.*.format` overlay when it differs from `display`.
+    pub format: LocaleSubtags,
+}
+
+/// Split a locale name into BCP-47 subtags.
+///
+/// Accepts both spellings the two host families use:
+///   * BCP-47, as `GetUserDefaultLocaleName` returns it — `ru-RU`,
+///     `zh-Hans-CN`, `sr-Latn-RS`, `ca-ES-valencia`.
+///   * POSIX, as `$LANG` carries it — `ru_RU.UTF-8`, `en_US`, `C`,
+///     `sr_RS@latin`.
+///
+/// Classification follows the BCP-47 grammar the JDK's own
+/// `Locale.forLanguageTag` uses: subtag 1 is the language; a 4-alpha subtag is
+/// a script; a 2-alpha or 3-digit subtag is a region; anything after that is a
+/// variant. Java spells variants uppercase and joins multiples with `_`, which
+/// is what `Locale.getVariant()` returns, so we do the same.
+///
+/// `C` and `POSIX` map to `en`/`US`, exactly as the HotSpot launcher's
+/// `java_props_md.c` does — a real JVM never reports language `"C"`.
+pub(crate) fn parse_locale_name(raw: &str) -> LocaleSubtags {
+    // POSIX carries the charset after `.` and a modifier after `@`; BCP-47 has
+    // neither, so stripping them is a no-op on that spelling.
+    let raw = raw.trim();
+    let (head, modifier) = match raw.split_once('@') {
+        Some((h, m)) => (h, m.trim()),
+        None => (raw, ""),
+    };
+    let head = head.split('.').next().unwrap_or("").trim();
+
+    let mut out = LocaleSubtags::default();
+    let mut parts = head
+        .split(['-', '_'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(first) = parts.next() else {
+        return LocaleSubtags {
+            language: "en".to_string(),
+            country: "US".to_string(),
+            ..LocaleSubtags::default()
+        };
+    };
+    if first.eq_ignore_ascii_case("C") || first.eq_ignore_ascii_case("POSIX") {
+        return LocaleSubtags {
+            language: "en".to_string(),
+            country: "US".to_string(),
+            ..LocaleSubtags::default()
+        };
+    }
+    out.language = first.to_ascii_lowercase();
+
+    let mut variants: Vec<String> = Vec::new();
+    for part in parts {
+        // A one-character subtag is a BCP-47 *singleton* and everything after
+        // it is an extension (`ja-JP-u-ca-japanese`), not a variant. Java keeps
+        // extensions off `Locale.getVariant()`, and we do not model them, so
+        // stop rather than fold `u`/`ca`/`japanese` into the variant string.
+        if part.len() == 1 {
+            break;
+        }
+        let is_alpha = part.chars().all(|c| c.is_ascii_alphabetic());
+        let is_digit = part.chars().all(|c| c.is_ascii_digit());
+        if out.script.is_empty() && out.country.is_empty() && part.len() == 4 && is_alpha {
+            // Script subtags are Titlecase in BCP-47 and in `Locale.getScript()`.
+            let mut s = part.to_ascii_lowercase();
+            s[..1].make_ascii_uppercase();
+            out.script = s;
+        } else if out.country.is_empty()
+            && variants.is_empty()
+            && ((part.len() == 2 && is_alpha) || (part.len() == 3 && is_digit))
+        {
+            out.country = part.to_ascii_uppercase();
+        } else {
+            variants.push(part.to_ascii_uppercase());
+        }
+    }
+
+    // POSIX `@modifier`. The two that name a script rather than a variant are
+    // the Serbian/Azeri script selectors; everything else the JDK carries
+    // through as a variant.
+    match modifier.to_ascii_lowercase().as_str() {
+        "" => {}
+        "latin" | "latn" => out.script = "Latn".to_string(),
+        "cyrillic" | "cyrl" => out.script = "Cyrl".to_string(),
+        other => variants.push(other.to_ascii_uppercase()),
+    }
+    out.variant = variants.join("_");
+
+    // The three ISO-639 codes Java froze at their pre-1989 spellings.
+    // `Locale` applies this internally (`convertOldISOCodes`), so
+    // `Locale.getDefault().getLanguage()` returns the old code no matter what
+    // the property says; applying it here keeps `System.getProperty
+    // ("user.language")` and `Locale.getDefault().getLanguage()` in agreement,
+    // which is the invariant `locale_bootstrap::resolve_default_locale`
+    // depends on.
+    out.language = match out.language.as_str() {
+        "he" => "iw".to_string(),
+        "yi" => "ji".to_string(),
+        "id" => "in".to_string(),
+        _ => out.language,
+    };
+    out
+}
+
+/// Read the two host locales.
+///
+/// **Windows** — the JDK's `java_props_md.c` reads two distinct settings and
+/// this mirrors them: `GetUserDefaultUILanguage()` (Settings ▸ Language, the
+/// UI language) seeds DISPLAY, and `GetUserDefaultLocaleName()` (Settings ▸
+/// Region ▸ "Regional format") seeds FORMAT. They are independent — an English
+/// UI with a Russian regional format is an ordinary configuration — which is
+/// the whole reason `Locale.Category` exists. Before W7-67 this function did
+/// not query Windows at all and every Windows host reported `en_US`.
+///
+/// **Unix** — the JDK calls `setlocale(LC_CTYPE, "")` for FORMAT and
+/// `setlocale(LC_MESSAGES, "")` for DISPLAY, and libc resolves each from
+/// `LC_ALL` ▸ the category's own variable ▸ `LANG`. We read that precedence
+/// directly rather than linking `setlocale`, which is process-global state we
+/// do not otherwise touch. Note `LC_ALL` must beat `LANG`, not the other way
+/// round.
+fn derive_host_locale() -> HostLocale {
+    if let Some(host) = platform_host_locale() {
+        return host;
+    }
+
+    let env = |name: &str| cratonvm_types::flags::runtime_var(name).unwrap_or_default();
+    let lc_all = env("LC_ALL");
+    let lang = env("LANG");
+    let pick = |category: String| {
+        if !lc_all.trim().is_empty() {
+            lc_all.clone()
+        } else if !category.trim().is_empty() {
+            category
+        } else {
+            lang.clone()
+        }
+    };
+    HostLocale {
+        display: parse_locale_name(&pick(env("LC_MESSAGES"))),
+        format: parse_locale_name(&pick(env("LC_CTYPE"))),
+    }
+}
+
+/// The host's locales from a platform API, or `None` where there is no such
+/// API and the environment is the only source.
+///
+/// Unix/macOS deliberately return `None` rather than calling `setlocale`:
+/// `setlocale` mutates process-global state we do not otherwise touch, and the
+/// `LC_ALL` ▸ category ▸ `LANG` precedence it would apply is the one the caller
+/// reads directly.
+#[cfg(target_os = "windows")]
+fn platform_host_locale() -> Option<HostLocale> {
+    windows_host_locale()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_host_locale() -> Option<HostLocale> {
+    None
+}
+
+/// Ask Windows for the UI language and the regional format, as BCP-47 names.
+///
+/// `GetUserDefaultLocaleName` is the modern replacement for the
+/// `GetUserDefaultLCID` + `GetLocaleInfo(LOCALE_SISO639LANGNAME/
+/// LOCALE_SISO3166CTRYNAME)` pair `java_props_md.c` uses: it returns the same
+/// locale, already assembled as a BCP-47 name, so the script subtag survives
+/// (`zh-Hans-CN`) instead of having to be reconstructed from the LCID.
+///
+/// Returns `None` if either call fails, so the caller falls through to the
+/// environment path rather than inventing a locale.
+#[cfg(target_os = "windows")]
+fn windows_host_locale() -> Option<HostLocale> {
+    // LOCALE_NAME_MAX_LENGTH.
+    const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetUserDefaultLocaleName(lp_locale_name: *mut u16, cch_locale_name: i32) -> i32;
+        fn GetUserDefaultUILanguage() -> u16;
+        fn LCIDToLocaleName(
+            locale: u32,
+            lp_name: *mut u16,
+            cch_name: i32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+
+    /// Trim the trailing NUL the Win32 `*LocaleName` calls include in their
+    /// returned length and decode the UTF-16 buffer.
+    fn decode(buf: &[u16], written: i32) -> Option<String> {
+        if written <= 1 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&buf[..(written as usize - 1)]);
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    let mut buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    let written =
+        unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), LOCALE_NAME_MAX_LENGTH as i32) };
+    let format_name = decode(&buf, written)?;
+
+    // The UI language is a LANGID. `MAKELCID(langid, SORT_DEFAULT)` is just
+    // the LANGID zero-extended, since SORT_DEFAULT == 0.
+    let ui_langid = unsafe { GetUserDefaultUILanguage() };
+    let mut ui_buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    let ui_written = unsafe {
+        LCIDToLocaleName(
+            u32::from(ui_langid),
+            ui_buf.as_mut_ptr(),
+            LOCALE_NAME_MAX_LENGTH as i32,
+            0,
+        )
+    };
+    // A UI language Windows cannot name is not a reason to discard the
+    // regional format we did read — fall back to it, which is what a host with
+    // UI == format looks like anyway.
+    let display_name = decode(&ui_buf, ui_written).unwrap_or_else(|| format_name.clone());
+
+    Some(HostLocale {
+        display: parse_locale_name(&display_name),
+        format: parse_locale_name(&format_name),
+    })
+}
+
+/// Publish one `user.<base>` property family, following
+/// `jdk.internal.util.SystemProps.fillI18nProps` exactly.
+///
+/// Three rules, all of them load-bearing and none of them obvious:
+///
+///  1. **A command-line `-Duser.<base>` wins outright and suppresses the
+///     overlay.** The JDK returns from `fillI18nProps` before deriving
+///     anything, so `-Duser.language=fr` on a host whose regional format is
+///     German must NOT leave a `user.language.format=de` behind.
+///  2. **The base property takes the DISPLAY value**, not the format one.
+///  3. **`.display` is never created from platform values** — the JDK only
+///     writes it when it differs from the base, and it has just been *set*
+///     from the base, so the condition is dead. `.format` is written only when
+///     it differs from DISPLAY.
+///
+/// `cmdline` is `config.system_properties`, which the caller re-applies over
+/// `sys_props` afterwards; consulting it here is what implements rule 1.
+fn fill_i18n_props(
+    sys_props: &mut HashMap<String, String>,
+    cmdline: &[(String, String)],
+    base: &str,
+    display: &str,
+    format: &str,
+) {
+    if cmdline.iter().any(|(k, _)| k == base) {
+        return; // Rule 1: do not override, and do not derive the overlay.
+    }
+    // HotSpot publishes all four keys unconditionally, empty string included —
+    // `System.getProperty("user.variant")` is `""` there, never null. We used
+    // to omit `user.script`/`user.variant` entirely.
+    sys_props.insert(base.to_string(), display.to_string());
+    if format != display {
+        sys_props.insert(format!("{base}.format"), format.to_string());
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // SharedVm — thread-safe shared state
@@ -3153,11 +3412,48 @@ impl SharedVm {
             std::env::temp_dir().to_string_lossy().into_owned(),
         );
 
-        // Locale — derive from LANG/LC_ALL on Unix, or fall back to en_US.
-        // Format: <language>_<country>.<encoding>  e.g. "en_US.UTF-8".
-        let (user_language, user_country) = derive_locale();
-        sys_props.insert("user.language".to_string(), user_language);
-        sys_props.insert("user.country".to_string(), user_country);
+        // Locale — W7-67. Read the HOST's two locales (Windows: UI language +
+        // regional format; Unix: LC_MESSAGES + LC_CTYPE, each resolved through
+        // LC_ALL ▸ category ▸ LANG) and publish the `user.*` family the way
+        // `jdk.internal.util.SystemProps.fillI18nProps` does. This used to
+        // parse `$LANG` only, so every Windows host — where `$LANG` is unset —
+        // reported `en_US` regardless of the machine's actual settings.
+        //
+        // `config.system_properties` (the `-D` flags) is passed in so a
+        // command-line `-Duser.language=…` suppresses the derived `.format`
+        // overlay, matching the JDK; it is re-applied over `sys_props` below,
+        // which is what makes the `-D` value itself win.
+        let host_locale = derive_host_locale();
+        for (base, display, format) in [
+            (
+                "user.language",
+                &host_locale.display.language,
+                &host_locale.format.language,
+            ),
+            (
+                "user.script",
+                &host_locale.display.script,
+                &host_locale.format.script,
+            ),
+            (
+                "user.country",
+                &host_locale.display.country,
+                &host_locale.format.country,
+            ),
+            (
+                "user.variant",
+                &host_locale.display.variant,
+                &host_locale.format.variant,
+            ),
+        ] {
+            fill_i18n_props(
+                &mut sys_props,
+                &config.system_properties,
+                base,
+                display,
+                format,
+            );
+        }
         // user.timezone is normally set by the JDK's TimeZone.getDefault()
         // during initPhase1 — pre-populate with TZ env or empty string so
         // the key is at least present.
@@ -9276,6 +9572,149 @@ mod tests {
             Some("CratonVM")
         );
         assert!(props.contains_key("file.encoding"));
+    }
+
+    // -----------------------------------------------------------------
+    // W7-67 — host default locale
+    // -----------------------------------------------------------------
+
+    /// The BCP-47 spelling Windows hands back. These are not "language and
+    /// country" — a script subtag sits between them and must not be mistaken
+    /// for the region, which is what a naive `split_once('_')` did.
+    #[test]
+    fn parse_locale_name_reads_bcp47_subtags() {
+        let ru = parse_locale_name("ru-RU");
+        assert_eq!(ru.language, "ru");
+        assert_eq!(ru.country, "RU");
+        assert_eq!(ru.script, "");
+        assert_eq!(ru.variant, "");
+
+        let zh = parse_locale_name("zh-Hans-CN");
+        assert_eq!(zh.language, "zh");
+        assert_eq!(zh.script, "Hans");
+        assert_eq!(zh.country, "CN");
+
+        // A 3-digit region (UN M.49) is a region, not a variant.
+        let es = parse_locale_name("es-419");
+        assert_eq!(es.language, "es");
+        assert_eq!(es.country, "419");
+
+        // Everything after the region is a variant; Java uppercases them and
+        // joins multiples with `_`.
+        let ca = parse_locale_name("ca-ES-valencia");
+        assert_eq!(ca.country, "ES");
+        assert_eq!(ca.variant, "VALENCIA");
+    }
+
+    /// The POSIX spelling `$LANG` carries, including the suffixes that are not
+    /// part of the locale.
+    #[test]
+    fn parse_locale_name_reads_posix_spelling() {
+        let ru = parse_locale_name("ru_RU.UTF-8");
+        assert_eq!(ru.language, "ru");
+        assert_eq!(ru.country, "RU");
+
+        let bare = parse_locale_name("en");
+        assert_eq!(bare.language, "en");
+        assert_eq!(bare.country, "");
+
+        // `@latin`/`@cyrillic` name a script, not a variant.
+        let sr = parse_locale_name("sr_RS@latin");
+        assert_eq!(sr.language, "sr");
+        assert_eq!(sr.country, "RS");
+        assert_eq!(sr.script, "Latn");
+
+        // Any other modifier is carried as a variant.
+        assert_eq!(parse_locale_name("de_DE@euro").variant, "EURO");
+    }
+
+    /// `java_props_md.c` maps the POSIX locales onto English/US — a real JVM
+    /// never reports language `"C"`. This is the CI default on a bare shell.
+    #[test]
+    fn parse_locale_name_maps_posix_locales_to_english() {
+        for raw in ["C", "POSIX", "C.UTF-8", "", "  "] {
+            let got = parse_locale_name(raw);
+            assert_eq!(got.language, "en", "input {raw:?}");
+            assert_eq!(got.country, "US", "input {raw:?}");
+        }
+    }
+
+    /// The three ISO-639 codes Java froze at their pre-1989 spellings. Applying
+    /// them here is what keeps `System.getProperty("user.language")` equal to
+    /// `Locale.getDefault().getLanguage()`, which `Locale` reaches by its own
+    /// internal `convertOldISOCodes`.
+    #[test]
+    fn parse_locale_name_applies_the_frozen_iso639_codes() {
+        assert_eq!(parse_locale_name("he-IL").language, "iw");
+        assert_eq!(parse_locale_name("yi").language, "ji");
+        assert_eq!(parse_locale_name("id-ID").language, "in");
+    }
+
+    /// `SystemProps.fillI18nProps` rule 2/3: the base property takes the
+    /// DISPLAY value, and `.format` appears ONLY when it differs. A host whose
+    /// UI and regional format agree — the common case — must not grow a
+    /// redundant overlay, because `Locale.getDefault(FORMAT)` reading a
+    /// present-but-equal key is indistinguishable from reading the base.
+    #[test]
+    fn fill_i18n_props_writes_the_format_overlay_only_when_it_differs() {
+        let mut props = HashMap::new();
+        fill_i18n_props(&mut props, &[], "user.language", "ru", "ru");
+        assert_eq!(props.get("user.language").map(String::as_str), Some("ru"));
+        assert!(!props.contains_key("user.language.format"));
+        // `.display` is never derived from platform values — the JDK's
+        // condition for writing it is dead once the base has taken the same
+        // value.
+        assert!(!props.contains_key("user.language.display"));
+
+        let mut split = HashMap::new();
+        fill_i18n_props(&mut split, &[], "user.language", "en", "ru");
+        assert_eq!(split.get("user.language").map(String::as_str), Some("en"));
+        assert_eq!(
+            split.get("user.language.format").map(String::as_str),
+            Some("ru")
+        );
+    }
+
+    /// `SystemProps.fillI18nProps` rule 1, and the one that is easy to get
+    /// wrong: a command-line `-Duser.language` does not merely override the
+    /// base — it suppresses the derived overlay entirely. Without this,
+    /// `-Duser.language=en -Duser.country=US` on this ru_RU host would pin the
+    /// base to en and leave `user.language.format=ru` behind, so
+    /// `NumberFormat.getInstance()` would still format in Russian and a
+    /// "pinned locale" run would not actually be pinned.
+    #[test]
+    fn fill_i18n_props_lets_a_command_line_value_suppress_the_overlay() {
+        let cmdline = vec![("user.language".to_string(), "en".to_string())];
+        let mut props = HashMap::new();
+        fill_i18n_props(&mut props, &cmdline, "user.language", "en", "ru");
+        assert!(
+            props.is_empty(),
+            "a -D base value must suppress both the derived base and the \
+             overlay, got {props:?}"
+        );
+    }
+
+    /// HotSpot publishes all four `user.*` locale keys, empty string included:
+    /// `System.getProperty("user.variant")` is `""` there, never null. We used
+    /// to omit `user.script` and `user.variant` entirely.
+    #[test]
+    fn shared_vm_publishes_the_whole_user_locale_family() {
+        let shared = SharedVm::new(VmConfig::default());
+        let props = shared.system_properties.read();
+        for key in [
+            "user.language",
+            "user.script",
+            "user.country",
+            "user.variant",
+        ] {
+            assert!(props.contains_key(key), "{key} must be published");
+        }
+        // Never the raw POSIX locale names.
+        let lang = props.get("user.language").cloned().unwrap_or_default();
+        assert!(
+            !lang.is_empty() && lang != "C" && lang != "POSIX",
+            "user.language must be a real language code, got {lang:?}"
+        );
     }
 
     #[test]
