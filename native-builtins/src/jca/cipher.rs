@@ -3910,7 +3910,18 @@ mod tests {
         assert!(is_aes_key_wrap_transformation("AESWrap"));
         assert!(is_aes_key_wrap_transformation("AESWrap_128"));
         assert!(is_aes_key_wrap_transformation("AES/KW/NoPadding"));
+        // KWP is NOT RFC 3394 and this predicate is RFC 3394's, so it stays
+        // false — but it is computed now, by `aes_key_wrap_with_padding`
+        // (RFC 5649). `aes_wrap_flavour` is the predicate that spans all three.
         assert!(!is_aes_key_wrap_transformation("AES/KWP/NoPadding"));
+        assert!(matches!(aes_wrap_flavour("AES/KWP/NoPadding"), Some(AesWrapFlavour::Kwp)));
+        assert!(matches!(
+            aes_wrap_flavour("AES/KW/PKCS5Padding"),
+            Some(AesWrapFlavour::KwPkcs5)
+        ));
+        assert!(matches!(aes_wrap_flavour("AES/KW/NoPadding"), Some(AesWrapFlavour::Kw)));
+        assert!(matches!(aes_wrap_flavour("AESWrap"), Some(AesWrapFlavour::Kw)));
+        assert!(aes_wrap_flavour("AES/GCM/NoPadding").is_none());
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_128"), Some(16));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_192"), Some(24));
         assert_eq!(aes_wrap_expected_kek_len("AESWrap_256"), Some(32));
@@ -3996,13 +4007,18 @@ mod tests {
             "AES/PCBC/PKCS5Padding",
             "AES/CFB8/NoPadding",
             "AES/CCM/NoPadding",
-            "AES/KWP/NoPadding",
-            "AES_128/KWP/NoPadding",
             "DESede/ECB/PKCS5Padding",
             "DESede",
         ] {
             assert!(refuses_algorithm(t), "{t} must be refused at getInstance");
         }
+        // `AES/KWP/NoPadding` was on this list until 2026-08-11 and is now
+        // computed (RFC 5649, `aes_key_wrap_with_padding`), so it belongs on
+        // the "must still work" side. Asserted here rather than only there, so
+        // that whoever deletes an arm from `classify_transformation` sees the
+        // move rather than a silently shorter list.
+        assert!(transformation_is_serviceable("AES/KWP/NoPadding"));
+        assert!(transformation_is_serviceable("AES_128/KWP/NoPadding"));
     }
 
     /// MUST RAISE, as a PADDING failure specifically — the JDK distinguishes
@@ -4016,9 +4032,14 @@ mod tests {
         assert!(refuses_padding("AES/CBC/PKCS7Padding"));
         assert!(refuses_padding("AES/CBC/ISO10126Padding"));
         assert!(refuses_padding("AES/ECB/CRATONVM-NO-SUCH-PADDING"));
-        // AEAD and key wrap take NoPadding only.
+        // AEAD takes NoPadding only.
         assert!(refuses_padding("AES/GCM/PKCS5Padding"));
-        assert!(refuses_padding("AES/KW/PKCS5Padding"));
+        // RFC 3394 key wrap takes BOTH, since 2026-08-11: SunJCE's
+        // `AES/KW/PKCS5Padding` pads to a multiple of eight and then wraps
+        // (measured — a 16-byte payload comes back as 32 bytes, not 24).
+        assert!(transformation_is_serviceable("AES/KW/PKCS5Padding"));
+        // …and still refuses a padding neither scheme has.
+        assert!(refuses_padding("AES/KW/ISO10126Padding"));
         // RSA admits exactly what `RsaCipherPadding::from_transformation` does.
         assert!(refuses_padding("RSA/ECB/NoPadding"));
         assert!(refuses_padding("RSA/ECB/OAEPWithSHA-512AndMGF1Padding"));
