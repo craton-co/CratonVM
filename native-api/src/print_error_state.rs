@@ -36,6 +36,25 @@ use cratonvm_types::{ObjectRef, Value};
 /// their `catch (IOException x)` bodies, and that `checkError()` returns.
 pub const TROUBLE_FIELD: &str = "trouble";
 
+/// `java.io.PrintStream`'s own recursion/idempotence latch.
+///
+/// ```java
+/// private boolean closing = false; /* To avoid recursive closing */
+/// public void close() {
+///     synchronized (this) {
+///         if (!closing) {
+///             closing = true;
+///             ...
+/// ```
+///
+/// It is never cleared, so it is also what makes a second `close()` a total
+/// no-op — measured on HotSpot 25.0.3.9: a second `close()` throws nothing,
+/// does not reach the sink a second time, and does not move `trouble`.
+/// `java.io.PrintWriter` declares no such field (it uses `out == null`), so
+/// reading it there answers `false` and changes nothing.
+/// W7-70-printstream-close-noop.md
+pub const CLOSING_FIELD: &str = "closing";
+
 /// `java.util.logging.ErrorManager.WRITE_FAILURE`.
 pub const ERROR_MANAGER_WRITE_FAILURE: i32 = 1;
 /// `java.util.logging.ErrorManager.FLUSH_FAILURE`.
@@ -63,6 +82,28 @@ pub fn is_trouble(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// do.
 pub fn clear_trouble(ctx: &dyn NativeContext, this: ObjectRef) {
     ctx.set_field_by_name(this, TROUBLE_FIELD, Value::Int(0));
+}
+
+/// Has this `PrintStream` already run its `close()` body?
+///
+/// The read half of [`CLOSING_FIELD`]. A receiver whose class declares no
+/// `closing` field reads as `false`, which is what a stream that has never
+/// been closed answers — so this is inert on `PrintWriter` and on any
+/// fabricated shape that has no slot for it, exactly like [`is_trouble`].
+pub fn is_closing(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(this, CLOSING_FIELD), Value::Int(v) if v != 0)
+}
+
+/// Run `closing = true`, HotSpot's first statement inside `close()`.
+///
+/// Set BEFORE the delegation, never after: the field's stated purpose is "to
+/// avoid recursive closing", and in HotSpot the recursion is real —
+/// `charOut = new OutputStreamWriter(this, charset)` means closing the
+/// character layer calls back into `this.close()`. It is also never cleared,
+/// including on the path where the delegated close throws, so a retry after a
+/// propagated `Error` is a no-op there too (measured).
+pub fn latch_closing(ctx: &dyn NativeContext, this: ObjectRef) {
+    ctx.set_field_by_name(this, CLOSING_FIELD, Value::Int(1));
 }
 
 /// Split a delegated call's outcome into "absorbed, and here is the throwable"

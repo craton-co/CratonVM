@@ -27300,6 +27300,19 @@ fn sink_reaches_system_stream(ctx: &dyn NativeContext, start: ObjectRef) -> bool
 ///     redirect a closed writer's output to stdout instead of dropping it.
 ///     Closing the sink is what makes further writes fail, which is the
 ///     observable part.
+///
+/// Since W7-70-printstream-close-noop.md `native_printstream_close` closes too,
+/// so the cross-reference above is no longer to a no-op. The two bodies still
+/// differ in three ways, all deliberate:
+///   * it detects the console as `out == null` (a `PrintStream`'s own
+///     invariant) where this one needs `stream_fd` + `sink_reaches_system_stream`,
+///     because a `PrintWriter`'s synthetic slot-0 sink can BE `System.out`;
+///   * it latches `java.io.PrintStream`'s real `closing` field, which
+///     `java.io.PrintWriter` does not declare, so a second `close()` here still
+///     reaches the sink;
+///   * its flush is HotSpot's (`textOut.close()` bottoms out in
+///     `StreamEncoder.implClose`'s `out.flush()`, measured), where the flush
+///     here is ours.
 fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(None);
@@ -27402,11 +27415,27 @@ fn printstream_check_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
+    // `if (out != null) flush();` — and a CLOSED `PrintStream` has `out ==
+    // null` in HotSpot, so it skips the flush. `native_printstream_close`
+    // cannot null `out` (a null `out` is this VM's "console stream" marker —
+    // see its doc comment, and `native_printwriter_close`'s); it latches
+    // `closing` instead, and this reads that latch as the same fact. Without
+    // the gate, a stream closed CLEANLY over a sink whose `flush()`-after-
+    // `close()` throws would flush, absorb, record and answer `true` where
+    // HotSpot answers `false` — a `checkError()` reporting the close it was
+    // asked about. `java.io.PrintWriter` declares no `closing` field, so
+    // `is_closing` is `false` on that side of this shared body and its
+    // behaviour is unchanged (its own residual is named in
+    // W7-64-printstream-trouble-and-errormanager.md).
+    // W7-70-printstream-close-noop.md
+    let already_closed = cratonvm_native_api::print_error_state::is_closing(&*ctx, this);
     // `flush()` is virtual in the JDK too, so a subclass override runs. Our
     // own `flush` natives absorb an `IOException` into `trouble`; an `Error`
     // out of them is not something any JDK `catch` on this path names, so it
     // propagates — the same rule the flush site itself follows.
-    ctx.invoke_virtual(this, "flush", "()V", &[])?;
+    if !already_closed {
+        ctx.invoke_virtual(this, "flush", "()V", &[])?;
+    }
     if let Some(out) = out {
         for delegate_to in ["java/io/PrintWriter", "java/io/PrintStream"] {
             if print_sink_is_a(&*ctx, out, delegate_to) {

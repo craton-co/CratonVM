@@ -12059,7 +12059,27 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // `native-api`'s `print_error_state`, which resolves it BY NAME —
         // landing on the real slot in Compatible mode and on this one in
         // synthetic mode, with no `#[cfg]` at the call sites.
-        "java/io/PrintStream" | "java/io/PrintWriter" => {
+        //
+        // `closing` is `PrintStream`'s and only `PrintStream`'s: the real
+        // class declares `private boolean closing` ("to avoid recursive
+        // closing") and `java.io.PrintWriter` declares no such field — it uses
+        // `out == null` as its closed marker instead. So the one arm the two
+        // classes used to share is split here rather than growing a field one
+        // of them does not have: `print_error_state::is_closing` would then
+        // answer for a `PrintWriter` too, while `native_printwriter_close`
+        // deliberately latches nothing. `closing` carries the JDK's own name
+        // for the same reason `trouble` does, and is likewise resolved BY NAME
+        // at every reader and writer, so its index here diverging from the
+        // real image's is a true report for `diff_against_model` to make and
+        // harmless in fact.
+        // W7-70-printstream-close-noop.md
+        "java/io/PrintStream" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields.push(named_field("closing", "Z"));
+            fields
+        }
+        "java/io/PrintWriter" => {
             let mut fields = instance_fields(1);
             fields.push(named_field("trouble", "Z"));
             fields

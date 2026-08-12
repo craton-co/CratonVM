@@ -344,9 +344,16 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
     // The real-JDK `PrintStream.flush()`/`close()` bytecode dereferences that
     // null `out` (`out.flush()`) → NPE ("Cannot invoke flush on null") for any
     // program that calls `System.out.flush()`. Route both through the fd-aware
-    // natives instead: flush drains the fd's buffer, close is a no-op (we must
-    // never close the process stdout/stderr). Mirrors the synthetic-mode
-    // PrintStream registration and the long-standing fd-stream flush contract.
+    // natives instead. Mirrors the synthetic-mode PrintStream registration and
+    // the long-standing fd-stream flush contract.
+    //
+    // Both triples are registered UNCONDITIONALLY, so both natives run for
+    // every `PrintStream` in the VM and not only for the console pair this
+    // comment describes. `close` used to be a bare no-op on that reading, which
+    // meant `new PrintStream(fileOutputStream).close()` delivered no bytes and
+    // released no handle; it now performs the receiver test the comment was
+    // asserting — a null `out` IS the console — and closes everything else.
+    // W7-70-printstream-close-noop.md
     registry.register(
         "java/io/PrintStream",
         "flush",
@@ -1144,11 +1151,120 @@ pub(crate) fn native_printstream_flush(
     Ok(None)
 }
 
+/// `java.io.PrintStream.close()` — flush the sink, then close it.
+///
+/// This was a bare `Ok(None)` with the comment "Don't actually close
+/// stdout/stderr". That is a correct reason for a receiver test the body never
+/// performed: the triple is registered unconditionally in BOTH registrars, so
+/// the no-op applied to every `PrintStream` in the VM, and
+/// `new PrintStream(new FileOutputStream(f)).close()` neither delivered the
+/// buffered bytes nor released the file handle. A `try`-with-resources over
+/// one saw a clean exit — lost data reported as success, the same fault shape
+/// W7-57-close-flush-swallow-sweep.md exists for.
+///
+/// **The JDK body**, `lib/src.zip` from JDK 25.0.3.9:
+///
+/// ```java
+/// public void close() {
+///     synchronized (this) {
+///         if (!closing) {
+///             closing = true;
+///             try {
+///                 textOut.close();
+///                 out.close();
+///             }
+///             catch (IOException x) { trouble = true; }
+///             textOut = null; charOut = null; out = null;
+///         }
+///     }
+/// }
+/// ```
+///
+/// **What the SINK sees**, measured on HotSpot 25.0.3.9 rather than inferred
+/// from that source — because `textOut.close()` does not look like a flush and
+/// is one. `charOut` is `new OutputStreamWriter(this, charset)`, so closing the
+/// character layer bottoms out in `StreamEncoder.implClose`, whose `out` is
+/// `this`: it calls `this.flush()` (which is `out.flush()` on the real sink)
+/// and then `this.close()` (a no-op, caught by the `closing` latch). The
+/// observable contract on the sink is therefore exactly:
+///
+/// | case | sink ops | close() throws | `checkError()` |
+/// |---|---|---|---|
+/// | clean | `[flush, close]` | none | `false` |
+/// | sink `flush` throws `IOException` | `[flush, close]` | none | `true` |
+/// | sink `flush` throws `Error` | `[flush]` — **close is skipped** | the `Error` | — |
+/// | sink `close` throws `IOException` | `[flush, close]` | none | `true` |
+/// | sink `close` throws `Error` | `[flush, close]` | the `Error` | `false` |
+/// | second `close()` | nothing more | none | unchanged |
+///
+/// Every row is an assertion in `probes/CloseFlushSwallowProbe.java`.
+/// The flush-first-then-close pair with `?` between them reproduces all six,
+/// including the one that is easy to get wrong: a propagated `Error` out of the
+/// flush must skip the close, which is what the `?` does.
+///
+/// **`textOut`/`charOut` are deliberately not driven.** They are null on every
+/// `PrintStream` this VM constructs (`native_printstream_init_outputstream`
+/// sets only `out`, and `ensure_system_streams` allocates a zeroed object), and
+/// where a real ctor we do not shadow does populate them the character layer is
+/// still empty, because our own `print`/`println`/`write` natives write to
+/// `out` directly and never buffer into `textOut`. Closing it as well would
+/// drive the sink's `flush` twice. If the `native_osw_init`/`native_bw_init`
+/// lane ever makes a real `textOut` load-bearing, this is the site to revisit.
+///
+/// **The console still cannot be closed**, and now for a reason the code
+/// states: `System.out`/`System.err` are fd-backed with a NULL `out`
+/// (`ensure_system_streams` never populates it — that is the same invariant
+/// `route_write_through_out` and `native_printstream_flush` already branch on),
+/// so there is no sink object to close and the fd is flushed instead. A
+/// `PrintStream` that WRAPS `System.out` delegates its close to it and lands on
+/// that same branch; and `FdTable::close` refuses fd < 3 outright. Three
+/// independent guards, none of which is a name test.
+///
+/// KEPT SWALLOW, NARROWED, RECORDED — the same three-part policy as
+/// `native_printstream_flush` above and `native_printwriter_close`. The JDK's
+/// `catch` names `IOException` and `close()` declares no checked exception, so
+/// an `IOException` is absorbed into `trouble`; an `Error` — a
+/// `NoSuchMethodError` out of our own dispatch above all — is not named by that
+/// `catch` and comes out. W7-57-close-flush-swallow-sweep.md,
+/// W7-64-printstream-trouble-and-errormanager.md,
+/// W7-70-printstream-close-noop.md
 pub(crate) fn native_printstream_close(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // Don't actually close stdout/stderr
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    // `if (!closing)`. Never cleared, so this is both the recursion guard the
+    // JDK's comment names and what makes a second close a total no-op.
+    if cratonvm_native_api::print_error_state::is_closing(&*ctx, this) {
+        return Ok(None);
+    }
+    // The sink, by the JDK's own field name. A non-object here — including the
+    // `Value::Int` fd tag `ensure_system_streams` parks in the legacy
+    // synthetic layout's slot 0 — is "no Java sink", i.e. the console.
+    let sink = match ctx.get_field_by_name(this, "out") {
+        Value::Object(Some(out)) => out,
+        _ => {
+            // The process console. HotSpot really would close it; we must not,
+            // so the closest useful behaviour is the flush its close would have
+            // performed. `closing` is deliberately NOT latched: it means "this
+            // stream's sink has been closed", and nothing here closed one — so
+            // a second `System.out.close()` still drains the console rather
+            // than silently skipping it.
+            if let Some(fd) = stream_fd(ctx, args) {
+                if ctx.fd_table().flush(fd).is_err() {
+                    cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+                }
+            }
+            return Ok(None);
+        }
+    };
+    cratonvm_native_api::print_error_state::latch_closing(&*ctx, this);
+    let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+    cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, flushed)?;
+    let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
+    cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, closed)?;
     Ok(None)
 }
 
