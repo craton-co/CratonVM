@@ -12,16 +12,39 @@
 >
 > * **`ArrayDeque`: CLOSED in source.** `ad_ensure_capacity` at
 >   `native-collections/src/lib.rs:34020`, commit `fddf67650`.
-> * **Residual: STILL OPEN, and now WORSE than when recorded.** The third
->   defect — the `jdk_interfaces` arm — was **not** applied:
->   `classloading/src/class_manager.rs:10824` still goes straight from
->   `ArrayListSubList` to `java/util/Dictionary`, with zero
->   `LinkedListSnapshotListItr` hits in that file. So the carrier still
->   implements no interfaces, `listIterator() instanceof ListIterator` is
->   `false`, and an erased `(ListIterator) x` throws `ClassCastException` — and
->   because (a) and (b) landed, that is **now reachable in strict mode too**.
-> * **Also open, and build-blocking:** W7-20's two frozen baselines were never
->   re-taken; see W7-20-refusal-laundered-into-wrong-answer.md.
+> * **Residual: CLOSED IN SOURCE 2026-08-12 (W7-62-ratchets-and-dead-code.md),
+>   NOT REBUILT.** The third defect — the `jdk_interfaces` arm — is applied,
+>   between the `ArrayListSubList` and `java/util/Dictionary` entries this
+>   record's diagnosis named. The mechanism was checked before the edit rather
+>   than assumed: `jdk_interfaces` is read by `fabricate_class`, which is the
+>   shared body of ALL THREE `ensure_*_class` entry points, so it reaches the
+>   `ClassOrigin::VmInternal` door the carrier is minted through since
+>   `6ae3ca634` and not only the compatibility door the record was written
+>   against. `is_synthetic_collection_iterator` does not match this name, so
+>   the table was in fact the carrier's ONLY source of interfaces.
+>
+>   It **closes** the ClassCastException rather than moving it:
+>   `Class::is_assignable_to_name_inner` walks interfaces transitively, the
+>   nine `ListIterator` methods are exactly the nine natives registered on the
+>   carrier, and dispatch probes the registry from the receiver's own class
+>   name first — so `invokeinterface` through the new declaration lands on the
+>   same bodies. What it does NOT close is the thing behind the carrier:
+>   `listIterator().getClass()` still answers
+>   `cratonvm.internal.LinkedListSnapshotListItr` (deliberately — see Part 3 of
+>   W7-20-refusal-laundered-into-wrong-answer.md), and a real `ListItr.remove()`
+>   against a native `LinkedList` still leaves `size` stale. Those are a
+>   collections reclassification, not an interface list.
+>
+>   The instrument is `probes/ListItrInterfaceProbe.java`, with a HotSpot 25
+>   control transcript in `probes/ListItrInterfaceProbe.expected.txt` and the
+>   before/after CratonVM rows stated there. It carries a red calibration (three
+>   rows whose expected answer is the ClassCastException) because every other
+>   row passes when a cast SUCCEEDS.
+> * **Also open, and PARTLY settled:** W7-20's two frozen baselines. The
+>   kind-map one is re-frozen (twelve rows, by hand, disclosed in its header);
+>   the bridge-ratchet JSON needs a census. See
+>   W7-20-refusal-laundered-into-wrong-answer.md and
+>   W7-62-ratchets-and-dead-code.md.
 
 **Status: `ArrayDeque` DIAGNOSED and FIXED IN SOURCE 2026-08-11, NOT REBUILT.
 `LinkedListSnapshotListItr` DIAGNOSED, deliberately NOT changed — the
