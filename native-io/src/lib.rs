@@ -7286,7 +7286,45 @@ const BB_FIELD_CAPACITY: usize = 3; // Int capacity
 const BB_FIELD_MARK: usize = 4; // Int mark (-1 = not set)
 const BB_NUM_FIELDS: usize = 5;
 
-/// FileChannel layout: 2-field synthetic
+// FileChannel layout: 2-field synthetic, on a class that declares FOUR.
+//
+// MEASURED AND DELIBERATELY LEFT — W7-68-live-under-allocations.md. Recorded
+// here rather than only in that record, so the next reader does not redo the
+// analysis and, in particular, does not "fix" it the obvious way and break the
+// live path.
+//
+// `javap -p java.nio.channels.FileChannel` on JDK 25.0.3.9 gives the
+// transitive order
+//
+//     0 closeLock (Object, final)   1 closed (boolean, volatile)
+//     2 interruptor (Interruptible) 3 interruptedTarget (Object, volatile)
+//
+// all four inherited from `java.nio.channels.spi.AbstractInterruptibleChannel`.
+// So the fd is an `Int` in `closeLock` and the file position is a `Long` in
+// `closed`. The object is NOT short — the base allocator clamps
+// `slots = requested.max(declared)` — it is mis-mapped.
+//
+// It is nevertheless not live corruption, and the reason is registration, not
+// luck: every reader of those two fields on this class is a native.
+// `AbstractInterruptibleChannel.isOpen()` — the one that would otherwise read
+// `closed` and report a channel CLOSED as soon as its position moved off zero
+// — is registered TWICE in `native-builtins/src/phases_late/nio_file.rs`, and
+// both copies screen on the exact class name; the surviving one then reads
+// slot 0 as the fd, agreeing with this map. `close()` is registered here
+// (`native_fc_close`, which screens the same way). `begin()`/`end()` are
+// `protected final` and are only called by an implementation subclass, which
+// this object is not. `sun.nio.ch.FileChannelImpl` declares every other
+// registered method itself with `Code`, so a real channel never resolves here.
+//
+// **That agreement is exactly why this is not repaired.** Moving these two onto
+// the appended-slot idiom — the fix `java/nio/MappedByteBuffer` got in the same
+// lane — would silently break `nio_file.rs`'s `isOpen`, which reads
+// `get_field(this, 0)` and answers `fd_id >= 0`: after the move slot 0 is
+// `closeLock`, `as_int()` gives `None`, and `isOpen()` would start answering
+// FALSE for every open channel. Two crates share this map, so it has to move in
+// one step, and which of the three registrations wins is a last-write-wins
+// question that needs a build. This is W7-49 §5's rule in the live direction: a
+// one-sided renumber only moves the disagreement.
 const FC_FIELD_FD: usize = 0; // Int file descriptor id
 const FC_FIELD_POS: usize = 1; // Long position in file
 
@@ -17729,10 +17767,29 @@ const WE_FIELD_KIND: usize = 0;
 const WE_FIELD_CONTEXT: usize = 1;
 const WE_NUM_FIELDS: usize = 2;
 
-/// DatagramChannel layout: 3 fields
-/// [0] = fd (Int) — UDP socket fd in fd_table
-/// [1] = bound_addr (Object — String local address)
-/// [2] = open (Int) — 1=open, 0=closed
+/// DatagramChannel allocation width — and a slot map that no longer exists.
+///
+/// The three-slot comment this replaces described `[0] = fd, [1] = bound_addr,
+/// [2] = open`. **Nothing writes any of them.** Every piece of
+/// `DatagramChannel` state moved into the identity-keyed side tables below
+/// (`dc_fds`, `dc_nonblocking_channels`, `dc_connected`), which is the remedy
+/// W7-49 §8 names as the sound one for state that must not sit in a real
+/// class's declared fields. `native_dc_open` allocates and then calls
+/// `dc_set_blocking` / `set_dc_fd`; neither touches a slot.
+///
+/// So the `3` was a vestigial number, and the layout-alias census
+/// (W7-59 §5.2) read it as a live 3-vs-10 `under` row against
+/// `java.nio.channels.DatagramChannel`, which declares ten fields transitively
+/// (`javap -p`, JDK 25.0.3.9). It is the emptiest kind of finding this census
+/// produces: a narrow request with an empty slot map cannot alias anything, and
+/// the base allocator clamps the object up to the declared width anyway.
+///
+/// Left at 3 rather than raised to 10: `try_alloc_synthetic` needs *some*
+/// count, and in synthetic-JDK mode — the only mode where the number decides
+/// anything — the class is a fabricated stub and 3 IS its declared width.
+/// Raising it would allocate seven dead slots per channel in that mode to
+/// silence one census row in the other, which is paying in the wrong currency.
+/// The row is real; it is just empty.
 const DC_NUM_FIELDS: usize = 3;
 
 /// Key for the `DatagramChannel` side tables below.
