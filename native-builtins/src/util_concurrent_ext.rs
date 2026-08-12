@@ -857,110 +857,38 @@ fn native_lock_support_get_blocker(
 /// where a non-zero request is the intended fabrication and not an alias. Those
 /// sites are therefore UNMEASURED by this census, not cleared by it.
 ///
-/// Deduplicated by (class, requested, caller) so a hot allocation loop reports
-/// once, not once per object.
+/// Deduplicated by (class, requested, declared, site) so a hot allocation loop
+/// reports once, not once per object. The site is IN the key on purpose: two
+/// natives making the same mistake on the same class are two findings.
 ///
 /// `#[track_caller]` so the site reported is the NATIVE that asked for the
 /// shape: `alloc_concurrent_synthetic` is itself `#[track_caller]`, so the
 /// attribute chains through it to the original call site. Without it every
 /// report would name this file.
+///
+/// # This is a forwarder, not an implementation
+///
+/// The counting, the flag, the dedup key and the output channel moved to
+/// `cratonvm_native_api::layout_alias` on 2026-08-12 (W7-59). They had to: this
+/// funnel is busy but it is not the only allocator, and the ~200 production
+/// `alloc_object` call sites in `native-builtins`, `native-io` and
+/// `native-collections` that bypass it were never censused — including the live
+/// owner of the widest over-allocation in the workspace. See
+/// W7-59-layout-detector-coverage.md and W7-49-slot-index-recensus.md.
+///
+/// **Why this call still exists after the base allocator was instrumented.**
+/// The base allocator sees the count this funnel passes it, and that count is
+/// already clamped: `n = num_fields.max(real)`. An UNDER-request therefore
+/// arrives there as `n == real` and is invisible. Reporting here, before the
+/// clamp, is the only place the under direction survives. Dropping this line
+/// would make the detector quieter in the direction it has reported since it
+/// was written.
 #[track_caller]
 fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-
-    // OFF by default, and deliberately so. Measured over a 30-class random
-    // sample of the real Tomcat suite this fires for 49 distinct JDK classes
-    // from 75 call sites, and the SAME runs produced zero out-of-bounds field
-    // reads -- so the shape is pervasive and, on that corpus, harmless: the
-    // clamp keeps every access in bounds, and no second native reads a wider
-    // layout for any of those classes. An always-on warning would be 75 lines
-    // of boot noise for a risk register, not a bug list.
-    //
-    // It becomes a BUG when a class has two layouts and someone reads the
-    // wider one. That is `java.lang.Process`, and the discriminator is cheap:
-    // a class appearing in BOTH this census and the `cratonvm::gc::guard`
-    // out-of-bounds reads has a live defect. Turn this on, run the failing
-    // workload, and intersect the two lists.
-    //
-    // The 49-class / 75-site measurement above was taken while this function
-    // only saw the UNDER direction, so it says nothing about how common the
-    // OVER direction is; that population has never been counted. That is the
-    // whole reason the OVER case reports rather than refuses. Making it fatal
-    // (or even making it default-on) needs the same measurement the UNDER case
-    // already has: run the real suites with this flag on, count distinct
-    // (class, site) pairs in the OVER direction, and intersect them with
-    // `CRATONVM_DBG_VALIDATE_NEW=1`'s `[young-validate] BAD` lines and the
-    // `cratonvm::gc::guard` out-of-bounds reads. A pair in this census with no
-    // guard hit is wide-but-unused and can be narrowed at the call site; a pair
-    // in both is a live defect. Turning it fatal before that count exists would
-    // convert an unknown number of working call sites into `NoClassDefFoundError`
-    // at boot.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
-    }) {
-        return;
-    }
-    // `OrderedPlMutex`, not a raw `parking_lot::Mutex`: `native-builtins` runs
-    // a lock-discipline ratchet over this crate and a raw construction fails
-    // it. `LockLevel::Scratch` (L0, "acquires nothing") is the honest level —
-    // the guard below lives for exactly one `insert` and nothing is taken while
-    // it is held, which is what makes a future violation a checker failure
-    // rather than a hang. This census re-enters the VM through `tracing::warn!`
-    // right after, so that property is worth stating rather than assuming.
-    static SEEN: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<
-            HashSet<(String, usize, &'static str, u32)>,
-        >,
-    > = OnceLock::new();
-    let site = std::panic::Location::caller();
-    let key = (
-        class_name.to_string(),
-        num_fields,
-        site.file(),
-        site.line(),
-    );
-    let seen = SEEN.get_or_init(|| {
-        cratonvm_types::lock_order::OrderedPlMutex::new(
-            HashSet::new(),
-            cratonvm_types::lock_order::LockLevel::Scratch,
-        )
-    });
-    if !seen.lock().insert(key) {
-        return;
-    }
-    // One channel, one flag, one dedup key, two directions. The `direction`
-    // field is what makes the census sortable -- a consumer that only wants the
-    // corruption-shaped half filters on `over`, and the pre-existing `under`
-    // rows keep their meaning unchanged.
-    if num_fields < real {
-        tracing::warn!(
-            class = class_name,
-            requested_fields = num_fields,
-            real_fields = real,
-            direction = "under",
-            site = %site,
-            "native allocated a class under its own SMALLER field layout; the slot \
-             count is clamped up to the real one, so these writes alias the real \
-             class's own fields and any native reading a wider layout for this \
-             class reads past the object"
-        );
-    } else {
-        tracing::warn!(
-            class = class_name,
-            requested_fields = num_fields,
-            real_fields = real,
-            direction = "over",
-            site = %site,
-            "native allocated a class under its own WIDER field layout; the object \
-             carries more slots than its class declares fields, so its header \
-             disagrees with num_total_fields (what CRATONVM_DBG_VALIDATE_NEW calls \
-             BAD), and the caller's slot map has entries the class does not -- \
-             applied to any instance this site did not allocate (real bytecode new, \
-             or the JIT) those indices write past the object"
-        );
-    }
+    // `observe_from_rust` is `#[track_caller]` and so is this function, so the
+    // location that reaches the census is the NATIVE that asked for the shape,
+    // not this forwarding line and not `alloc_concurrent_synthetic` in between.
+    cratonvm_native_api::layout_alias::observe_from_rust(class_name, num_fields, real);
 }
 
 // The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,
