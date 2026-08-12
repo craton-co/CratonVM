@@ -1,7 +1,8 @@
 # A JDK-generated EC server identity was rejected by the TLS stack — every EC handshake hung
 
-**Status:** FIXED (2026-08-12) in `native-builtins/src/t27_tls.rs`. Found while
-working [investigate-batch-08.md](investigate-batch-08.md).
+**Status:** FIXED (2026-08-12) in `native-builtins/src/t27_tls.rs`; one missed
+call site found and closed the same day — see "Residual, found and closed".
+Found while working [investigate-batch-08.md](../../../known-issues/netty/investigate-batch-08.md).
 
 ## Symptom
 
@@ -134,6 +135,40 @@ the module goes red rather than silently passing. The remaining tests pin that
 the repair declines a key that already has a public key, a non-EC key, a
 certificate that cannot lend a matching point, and truncated/garbage DER on
 both inputs without panicking.
+
+## Residual, found and closed 2026-08-12
+
+The repair was applied at seven places where a key meets its chain, all of which
+share one line: they call `parse_private_key_pem`. **One identity path does
+not** — `JavaKeyManagerResolver::resolve_via_java`, the mTLS resolver behind a
+Java `KeyManager`, takes its material as DER from `km_alias_material` and built
+its `CertifiedKey` directly:
+
+```rust
+let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+match CertifiedKey::from_der(cert_chain, key, &self.provider) {
+```
+
+So a JDK-generated EC *client* certificate delivered through a `KeyManager`
+(rather than through a keystore file, which routes via
+`install_identity_from_der` → PEM → a repaired builder) was still rejected —
+and `resolve` has nowhere to put a refusal, so it presents as the client sending
+an **empty Certificate** and the far end answering `CertificateRequired`. That
+names neither the key nor this decision, which is why it did not show up
+alongside the server-side hang.
+
+Closed by routing that call site through
+`certified_key_from_der_repairing_ec(chain, key_der, provider)`. It exists as a
+named function rather than three inlined lines specifically so the test can
+exercise the path the resolver takes:
+`a_key_manager_supplied_jdk_ec_identity_is_repaired_too` asserts both directions
+through it, and deleting the repair from the helper turns it red (verified by
+mutation, not assumed).
+
+Audited for others by grepping the *shape* rather than the fix — every
+`PrivateKeyDer::Pkcs8(...)` construction and every `with_single_cert` /
+`with_client_auth_cert` / `CertifiedKey::from_der` in the tree. The two
+remaining `PrivateKeyDer::Pkcs8` sites are this helper and a test.
 
 ## Repro (Linux host)
 

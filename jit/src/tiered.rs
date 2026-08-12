@@ -1315,6 +1315,18 @@ pub fn dump_method_stats_to_stderr() {
     // precise facts about a specific call; `interface-blind` is the class-blind
     // probe, and its share is the number that says whether making that arm
     // precise is worth anything.
+    // The positive gate memo. `fills` is bounded by the number of distinct
+    // eligible methods; `hits` is how many `execute()` entries no longer re-run
+    // the full gate (including the O(bytecode) native-shadow scan) because of
+    // it. A hits:fills ratio near 1 would mean the memo is not paying.
+    let (gate_hits, gate_fills) = crate::jit_gate_pass_census();
+    if gate_hits > 0 || gate_fills > 0 {
+        eprintln!(
+            "[cratonvm] JIT gate-pass memo: hits={gate_hits} fills={gate_fills} \
+             (gate evaluations avoided: {})",
+            gate_hits,
+        );
+    }
     let shadow_census = crate::jit_native_shadow_cause_census();
     if !shadow_census.is_empty() {
         eprintln!(

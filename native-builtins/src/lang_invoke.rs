@@ -11865,13 +11865,39 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // afterward); pin it and re-read the forwarded reference before use.
     let member_name_pin = ctx.pin_native_root(member_name);
     // Ensure the class is loaded
-    let _ = ctx.ensure_class_initialized(&class_name);
+    let resolved_class_id = ctx.ensure_class_initialized(&class_name).ok();
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
 
     // Mark as resolved with the non-zero vmindex sentinel — on our fabricated
     // layout only. See `mn_set_vmindex`: a real `MemberName` has no vmindex
     // field, and slot 4 there is `method`.
     mn_set_vmindex(ctx, member_name, 1);
+
+    // The `ACC_*` half of `flags`, which resolution is what fills in.
+    //
+    // `MemberName.flags` is `refKind<<24 | IS_METHOD/IS_FIELD/IS_CONSTRUCTOR |
+    // ACC_*`. The Java-side constructors set the kind and the reference kind
+    // and pass `0` for the modifiers, exactly because HotSpot's
+    // `MHN_resolve_Mem` overwrites them with the resolved member's real access
+    // flags. CratonVM's resolve never did, so **every** MemberName resolved
+    // through this native reported `isStatic() == false`:
+    //
+    //     public MethodType getInvocationType() {
+    //         MethodType itype = getMethodOrFieldType();
+    //         ...
+    //         if (!isStatic())  return itype.insertParameterTypes(0, clazz);
+    //
+    // — a phantom receiver parameter prepended to every static method's type.
+    // Nothing read it back with assertions off, which is why it survived; with
+    // `-ea` the very first `NamedFunction` built this way trips
+    // `LambdaForm$Name`'s constructor during `java.lang.invoke` boot:
+    //
+    //     AssertionError: arity mismatch: arguments.length=1 ==
+    //       function.arity()=2 in t851:L=DirectMethodHandle.allocateInstance(a0:L)
+    //
+    // OR-ed in rather than assigned: the kind bit and reference kind already in
+    // `flags` are the caller's request and must survive resolution.
+    let mut resolved_access: Option<u16> = None;
 
     // If this is a method reference (refKind 5-9), verify the method exists
     if ref_kind >= 5 && ref_kind <= 9 {
@@ -11880,7 +11906,7 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
             let desc = descriptor_from_method_type(ctx, mt);
             if !name.is_empty() && !desc.is_empty() {
                 let exists = ctx.method_exists(&class_name, &name, &desc);
-                if !exists && !name.is_empty() {
+                if !exists {
                     // Method not found — for speculative resolve, return null
                     let speculative = matches!(args.get(3), Some(Value::Int(1)));
                     if speculative {
@@ -11888,12 +11914,111 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
                         return Ok(Some(Value::Object(None)));
                     }
                 }
+                // Not gated on `exists`. `method_exists` matches the exact
+                // descriptor, which a signature-polymorphic member never has —
+                // `MethodHandle.linkToSpecial` is declared `(Object...)Object`
+                // and the MemberName carries the call site's `(L,L)V`. Gating
+                // the modifier lookup on `exists` therefore skipped exactly the
+                // members that need the polymorphic fallback inside
+                // `declared_method_access_flags`, and left `linkToSpecial`
+                // without its `ACC_STATIC`.
+                if let Some(cid) = resolved_class_id {
+                    resolved_access = declared_method_access_flags(ctx, cid, &name, &desc);
+                }
             }
+        }
+    } else if (1..=4).contains(&ref_kind) {
+        // Field kinds. A field name is unique within its declaring class, so
+        // no descriptor match is needed — and `type` here is a Class mirror,
+        // not a MethodType, so there is no descriptor to read anyway.
+        if let Some(cid) = resolved_class_id {
+            if !name.is_empty() {
+                resolved_access = declared_field_access_flags(ctx, cid, &name);
+            }
+        }
+    }
+
+    // `declared_methods`/`declared_fields` allocate, so re-read through the pin
+    // before the write.
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    if let Some(access) = resolved_access {
+        let merged = flags | (i32::from(access) & 0xFFFF);
+        if merged != flags {
+            mn_set(ctx, member_name, "flags", MN_FLAGS, Value::Int(merged));
         }
     }
 
     ctx.unpin_native_roots(member_name_pin);
     Ok(Some(Value::Object(Some(member_name))))
+}
+
+/// Declared access flags of `name`+`descriptor`, searched from `class_id` up
+/// the superclass chain.
+///
+/// Superclasses only, no interface step: a `REF_invokeInterface` member names
+/// the interface itself as its declaring class, so the first hop already covers
+/// it, and a default method inherited from an interface is not something this
+/// native is asked to resolve against a class receiver.
+///
+/// Bounded, so a self-referential hierarchy in a fabricated/synthetic class
+/// cannot spin here.
+fn declared_method_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        let by_name: Vec<_> = ctx
+            .declared_methods(cid)
+            .into_iter()
+            .filter(|m| m.name == name)
+            .collect();
+        if let Some(m) = by_name.iter().find(|m| m.descriptor == descriptor) {
+            return Some(m.access_flags);
+        }
+        // Signature-polymorphic methods (`MethodHandle.invoke`, `invokeExact`,
+        // `invokeBasic`, `linkToStatic`, `linkToSpecial`, …) are DECLARED as
+        // `(Object...)Object`, but a `MemberName` for one carries the *call
+        // site's* type — `(L,L)V` and the like. There is no descriptor to match
+        // on, so the exact search above finds nothing, which left `linkToSpecial`
+        // without its `ACC_STATIC` and produced the second `arity mismatch`
+        // assertion after `allocateInstance`.
+        //
+        // A name declared exactly once in the class is unambiguous, so take it.
+        // Guarded on uniqueness deliberately: with real overloads present,
+        // "some overload's flags" would be a guess, and no flags at all is
+        // better than confidently wrong ones.
+        if by_name.len() == 1 {
+            return Some(by_name[0].access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
+}
+
+/// Declared access flags of the field `name`, searched from `class_id` up the
+/// superclass chain. See [`declared_method_access_flags`].
+fn declared_field_access_flags(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<u16> {
+    let mut cur = Some(class_id);
+    for _ in 0..64 {
+        let cid = cur?;
+        if let Some(f) = ctx
+            .declared_fields(cid)
+            .into_iter()
+            .find(|f| f.name == name)
+        {
+            return Some(f.access_flags);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    None
 }
 
 /// `MethodHandleNatives.init(MemberName self, Object ref)`
@@ -12208,19 +12333,78 @@ pub(crate) fn native_mhn_get_member_vm_info(
 ) -> MethodCallResult {
     let member_name = crate::obj_arg(args, 0)?;
     let vmindex = mn_get_vmindex(ctx, member_name);
+
+    // The shape is dictated by the ONE caller in the whole JDK —
+    // `MemberName.vminfoIsConsistent`, which runs only under `assert`:
+    //
+    //     long vmindex = (Long) ((Object[])vminfo)[0];
+    //     Object vmtarget = ((Object[])vminfo)[1];
+    //     if (refKindIsField(refKind)) { assert(vmindex >= 0);
+    //                                    assert(vmtarget instanceof Class); }
+    //     else { assert(refKindDoesDispatch(refKind) ? vmindex >= 0
+    //                                                : vmindex < 0);
+    //            assert(vmtarget instanceof MemberName); }
+    //
+    // Because that is the only reader and it was unreachable while `-ea` was
+    // being discarded by the launcher, this native's answer was never checked
+    // by anything: it boxed an `Integer` where the cast demands a `Long`, and
+    // returned the MemberName as `vmtarget` for field kinds too. Both surfaced
+    // the moment `-ea` started working — a `ClassCastException: java.lang.Integer
+    // cannot be cast to java.lang.Long` out of `MemberName$Factory.resolve`,
+    // which killed the VM during `java.lang.invoke` boot.
+    let flags = match mn_get(ctx, member_name, "flags", MN_FLAGS) {
+        Value::Int(f) => f,
+        _ => 0,
+    };
+    // `MethodHandleNatives.Constants.MN_REFERENCE_KIND_SHIFT` / `_MASK`.
+    let ref_kind = (flags >> 24) & 0x0F;
+    // REF_getField(1) .. REF_putStatic(4) are the field kinds; REF_invokeVirtual(5)
+    // and REF_invokeInterface(9) are the two that dispatch.
+    let is_field = (1..=4).contains(&ref_kind);
+    let does_dispatch = ref_kind == 5 || ref_kind == 9;
+
+    // CratonVM resolves by name+descriptor and keeps no vtable/itable, so it has
+    // no index of HotSpot's kind to report. What it CAN report truthfully is the
+    // sign the encoding gives meaning to: "has a dispatch slot" (non-negative)
+    // versus "resolved to a single target" (negative). Reporting a non-negative
+    // index for an `invokestatic`-kind member would be the actively wrong
+    // answer; -1 is the same "no dispatch slot" HotSpot writes there.
+    let reported_index: i64 = if is_field || does_dispatch {
+        i64::from(vmindex.max(0))
+    } else {
+        -1
+    };
+
+    // For a field the JDK wants the DECLARING CLASS as `vmtarget`, not the
+    // MemberName — `clazz` is exactly that, and it is already a mirror.
+    let field_target = if is_field {
+        match mn_get(ctx, member_name, "clazz", MN_CLAZZ) {
+            Value::Object(Some(c)) => Some(c),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
     // GC-safety: `box_value` below can trigger a collection that relocates
-    // `arr`/`member_name` (both captured/produced above and read again
-    // afterward); pin them and re-read the forwarded references before use.
+    // `arr`/`member_name`/`field_target` (all captured or produced above and
+    // read again afterward); pin them and re-read the forwarded references
+    // before use. `boxed` is the last allocation, so nothing can move it.
     let arr_pin = ctx.pin_native_root(arr);
     let member_name_pin = ctx.pin_native_root(member_name);
-    // Box vmindex as Integer
-    let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
+    let field_target_pin = field_target.map(|t| (ctx.pin_native_root(t), t));
+    let boxed = crate::lang_class::box_value(ctx, Value::Long(reported_index), "J");
     let arr = ctx.read_native_pin(arr_pin, arr);
     let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    let field_target = field_target_pin.map(|(pin, t)| ctx.read_native_pin(pin, t));
     ctx.unpin_native_roots(arr_pin);
     ctx.set_array_element(arr, 0, boxed);
-    ctx.set_array_element(arr, 1, Value::Object(Some(member_name)));
+    ctx.set_array_element(
+        arr,
+        1,
+        Value::Object(Some(field_target.unwrap_or(member_name))),
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 

@@ -167,6 +167,57 @@ that needs better than ±20% must be ABBA-interleaved and repeated; the seal A/B
 above was interleaved for exactly that reason, and its B arm is still not
 trustworthy at 17%.
 
+## 5a. One defect found and FIXED out of this — the gate-pass memo
+
+Following lever 2 with a frame-pointer build (the DWARF profile in §2 resolved
+no callers; `-C force-frame-pointers=yes` does) attributed `slot_for_exact`
+exactly: **4.11% total, 2.15% of it reached through
+`jit_method_calls_native_shadowed`** — the static JIT-eligibility gate in
+`execute()`, not the dispatch path.
+
+That gate is memoized on one side only. `jit_skip_set` records methods that
+**fail** it — a 2026-07-15 fix whose own comment explains that without it "every
+future call to `execute()` for it recomputed all three from scratch (worst case,
+`jit_method_calls_native_shadowed`'s full O(bytecode-size) decode-and-scan)
+forever". The mirror case was left open: a method that **passes** the gate was
+recorded nowhere, so `already_skipped` could never fire for it and the whole
+gate re-ran on every `execute()` entry — and it runs *before* the `JitCache`
+consult below it, so a fully compiled, hot method paid it too.
+
+Measured, and this is the load-independent part:
+
+| class | gate evaluations before | after | ratio |
+| --- | --- | --- | --- |
+| `AdaptiveByteBufAllocatorTest` | 1,432,835 | **1,858** | 771× |
+| `BigEndianHeapByteBufTest` | 264,235 | **2,319** | 114× |
+
+`fills` is bounded by the number of distinct eligible methods, which is what a
+per-method gate should cost. Everything above it was re-computation.
+
+**Fix:** `JitRealm::jit_gate_pass`, the positive half of `jit_skip_set`,
+stamped with `cratonvm_jit::redefine_epoch()`. The stamp is load-bearing in a
+direction the negative set does not need: a stale *seal* only costs throughput
+(the method stays interpreted), but a stale *pass* would let a redefined body —
+whose new bytecode may call a native-shadowed target — reach the compiler, which
+is precisely what the seal exists to prevent. `bump_redefine_epoch()` already
+runs on every `redefineClass`, beside the `clear_all()` that evicts compiled
+artifacts, so an older stamp is simply a miss.
+
+**Worth, in CPU:** 20 ABBA-interleaved runs per arm in one binary
+(`CRATONVM_JIT=-gate-pass-memo` is the off switch), `BigEndianHeapByteBufTest`,
+`perf stat` task-clock because this box's wall clock is useless (§5) and its
+cloud PMU reports `instructions: <not supported>`:
+
+| arm | n | mean CPU | median | min | max |
+| --- | --- | --- | --- | --- | --- |
+| memo ON | 20 | **55.42 s** | 55.28 | 54.05 | 59.65 |
+| memo OFF | 20 | 56.48 s | 56.05 | 54.87 | 62.56 |
+
+**~1.9% less CPU.** Small, and honestly so: 771× fewer gate evaluations buys
+2%, which is itself the §1 result restated — the run is dominated by the
+*number of calls*, and no single per-call site is a large share of it. It is
+recorded here as a fixed defect, not as a fix for this doc's gap.
+
 ## 6. What would actually move it
 
 Not an `AdaptivePoolingAllocator` fix — there is no allocator-specific defect to
@@ -181,7 +232,15 @@ find. Two general levers, in order of measured size:
    It hashes class+method+descriptor byte-at-a-time and then memcmps all three
    to verify. A `ClassId`-keyed "does this class register any native at all"
    test would replace the hash for the overwhelming majority of invokes, which
-   miss; the call sites currently have only `&str`.
+   miss; the call sites currently have only `&str`. **Partly addressed** — the
+   2.15% of it that came from the eligibility gate is gone (§5a); the remaining
+   ~2% is on the genuine dispatch path, where `NativeCallSite` already memoizes
+   the sites that hold one.
+
+A third thing this investigation did NOT find, and which the numbers rule out:
+any single hot site worth more than a few percent. §1's arithmetic is the whole
+answer — 826 M calls at a few hundred ns each. Anyone hoping to close this gap
+should be sizing lever 1, not hunting for another §5a.
 
 Both are VM-wide, not netty-specific, and both have prior optimization passes in
 their comments — treat this doc as evidence for sizing that work, not as a netty
