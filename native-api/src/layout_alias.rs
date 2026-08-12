@@ -307,8 +307,12 @@ mod tests {
     ///
     /// This asserts the *classification*, which is the only half a unit test can
     /// reach. That the site now arrives here at all is what
-    /// `vm/tests/layout_alias_detector_coverage.rs` proves, and the two together
+    /// `native-api/tests/layout_alias_coverage.rs` proves, and the two together
     /// are the claim — this one alone would be a probe that cannot fail.
+    /// (The path was `vm/tests/layout_alias_detector_coverage.rs` here until
+    /// 2026-08-12; no such file was ever committed. A pointer to a gate that
+    /// does not exist reads exactly like a gate that does — corrected while
+    /// reading this module for W7-68-live-under-allocations.md.)
     #[test]
     fn async_socket_channel_shape_classifies_as_over() {
         assert_eq!(classify(4, 1), Some(Direction::Over));
