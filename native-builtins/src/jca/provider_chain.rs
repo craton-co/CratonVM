@@ -2317,9 +2317,13 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // As in `security_get_algorithms`: wrap while still pinned, then unpin
+    // both. HotSpot answers `Collections$UnmodifiableSet` here too (n=65 for
+    // SUN, measured) and `add(null)` raises `UnsupportedOperationException`.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
     ctx.unpin_native_roots(this_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 fn provider_service_string_field(
@@ -2813,12 +2817,11 @@ pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
 ///     reproduced rather than "fixed" so the two agree;
 ///   * a null, empty, or `.`-terminated service name yields the EMPTY set.
 ///
-/// Deliberate divergence, recorded: HotSpot wraps the result in
-/// `Collections.unmodifiableSet` (probe: `add` throws
-/// `UnsupportedOperationException`). The caller here gets a plain `HashSet`,
-/// matching what `provider_get_services_native` already returns, because the
-/// wrapper would add a Java round-trip through a synthetic view whose
-/// `contains` this lane could not measure. See the known-issues note.
+/// (A "Deliberate divergence, recorded" paragraph stood here saying the caller
+/// gets a plain `HashSet` where HotSpot returns `Collections.unmodifiableSet`.
+/// That divergence is closed — `security_get_algorithms` and
+/// `provider_get_services_native` both wrap through `wrap_unmodifiable` now.
+/// A comment outlives its defect. W7-63-jca-advertise-vs-serve.md.)
 pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     if service_name.is_empty() || service_name.ends_with('.') {
         return Vec::new();
@@ -2855,6 +2858,49 @@ pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
     out
 }
 
+/// Wrap `set` in `Collections.unmodifiableSet`, which is what HotSpot returns
+/// from BOTH `Security.getAlgorithms` and `Provider.getServices` — measured on
+/// jdk-25.0.3.9-hotspot and recorded in
+/// probes/JcaAdvertisedVsServedProbe.expected.txt §D:
+/// `java.util.Collections$UnmodifiableSet`, with `add`, `remove` and
+/// `iterator().remove()` all raising `UnsupportedOperationException`.
+///
+/// This is not a missing guard, it is a missing STATEMENT.
+/// `Collections.unmodifiableSet` is how the JDK tells a caller "this is a view
+/// of platform state, not yours to edit". A plain `HashSet` is an invitation:
+/// a caller that mutates it and hands it on has manufactured an algorithm list
+/// no provider backs, and nothing downstream can tell it from a real one.
+///
+/// Applied on EVERY path including the empty ones — `getAlgorithms` for an
+/// unknown engine type answers an IMMUTABLE EMPTY set on HotSpot, never a
+/// throw. HotSpot distinguishes `Collections$UnmodifiableSet` (unknown engine
+/// type) from `Collections$EmptySet` (`""`, `"Foo."`, `null`); that split is
+/// not reproduced, because both are immutable and both are size 0, which is
+/// the entire observable contract.
+///
+/// Each HotSpot call returns a DISTINCT object (measured: two calls are not
+/// `==`), so this must be built per call and must not be cached.
+///
+/// GC: `unmodifiableSet` allocates the view, so `set` must be a freshly
+/// re-read reference and only the RETURN value may be used afterwards.
+///
+/// On failure the plain set is returned rather than propagating the error: an
+/// immutability wrapper is not worth converting a correct answer into a thrown
+/// exception. `java.util.Collections.unmodifiableSet` is real JDK bytecode in
+/// real-JDK mode and a registered native in synthetic mode
+/// (`native-collections/src/lib.rs`), so the fallback should be unreachable.
+fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
+    match ctx.invoke(
+        "java/util/Collections",
+        "unmodifiableSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(view)))) => view,
+        _ => set,
+    }
+}
+
 fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `Security.getAlgorithms(null)` returns the EMPTY set on HotSpot (the
     // real body's first branch), it does not NPE — measured.
@@ -2887,8 +2933,12 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     let set = ctx.read_native_pin(set_pin, set);
+    // Wrap BEFORE unpinning: `wrap_unmodifiable` invokes Java, which can move
+    // `set`, and the pin is what keeps the just-re-read reference valid across
+    // that call. Only the returned view may be used afterwards.
+    let view = wrap_unmodifiable(ctx, set);
     ctx.unpin_native_roots(set_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(view))))
 }
 
 /// Resolve `name` to the best available `Provider` object: the REAL
