@@ -200,7 +200,7 @@ pub trait SlotOracle {
     fn name_of(&self, class_id: ClassId) -> Option<String>;
 }
 
-impl SlotOracle for dyn NativeContext + '_ {
+impl<'ctx> SlotOracle for dyn NativeContext + 'ctx {
     fn declared_at(&self, class_id: ClassId) -> Vec<FieldMetadata> {
         self.declared_fields(class_id)
     }
@@ -224,8 +224,19 @@ impl SlotOracle for dyn NativeContext + '_ {
 /// diagnostic.
 ///
 /// Only ever called with the flag on.
+///
+/// Generic over the oracle rather than taking `&dyn SlotOracle`: `&dyn
+/// NativeContext` does **not** coerce to `&dyn SlotOracle`, because
+/// trait-object-to-trait-object is not an unsizing coercion (`Unsize<dyn Trait>`
+/// needs a `Sized` source). `O: ?Sized` lets `dyn NativeContext` itself be the
+/// type parameter, so the VM passes its context straight through and a test
+/// passes a concrete chain oracle.
 #[must_use]
-pub fn field_name_at(oracle: &dyn SlotOracle, class_id: ClassId, slot: usize) -> SlotAnswer {
+pub fn field_name_at<O: SlotOracle + ?Sized>(
+    oracle: &O,
+    class_id: ClassId,
+    slot: usize,
+) -> SlotAnswer {
     let mut cursor = Some(class_id);
     let mut saw_any_field = false;
     // 256 is far past any real Java hierarchy; the bound is against a broken
@@ -371,11 +382,9 @@ pub fn observe_read_on_class(
     if !layout_alias::enabled() {
         return None;
     }
-    let oracle: &dyn SlotOracle = ctx;
-    let answer = field_name_at(oracle, class_id, slot);
+    let answer = field_name_at(ctx, class_id, slot);
     let finding = classify_read(expected_field, &answer)?;
-    let class = oracle
-        .name_of(class_id)
+    let class = SlotOracle::name_of(ctx, class_id)
         .unwrap_or_else(|| format!("<class#{}>", class_id.as_u32()));
     if already_reported((
         class.clone(),

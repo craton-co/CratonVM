@@ -57,12 +57,12 @@
 //!
 //! # What this gate deliberately does NOT assert
 //!
-//! It does not require every literal-slot read in the workspace to carry an
-//! expected field name. There are ~7,200 of them and most read objects the
-//! native allocated itself, where the slot map is the class's own truth. A gate
-//! that failed on all of them would be muted on the day it landed. The
-//! remainder is **printed** by [`census`] instead, so it is a visible number
-//! rather than a silent one.
+//! It does not require every constant-slot read in the workspace to carry an
+//! expected field name. [`census`] counts 11,948 of them, and most read objects
+//! the native allocated itself, where its slot map is the class's own truth. A
+//! gate that failed on all of them would be muted on the day it landed. The
+//! remainder is **printed** instead, so it is a visible number rather than a
+//! silent one.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -201,9 +201,23 @@ fn match_brace(src: &str, open: usize) -> Option<usize> {
 }
 
 /// The body of the first `fn <name>` in `src`, brace-matched.
+///
+/// Matches `fn <name>` followed by `(` **or** `<`, not just `(`:
+/// `field_name_at` is generic (`fn field_name_at<O: SlotOracle + ?Sized>(`),
+/// and a needle ending in `(` silently finds nothing there — a gate that
+/// cannot locate its subject fails with "the function moved" and gets
+/// re-baselined instead of read.
 fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("fn {name}(");
-    let start = src.find(&needle)?;
+    let needle = format!("fn {name}");
+    let mut from = 0usize;
+    let start = loop {
+        let hit = src[from..].find(&needle)? + from;
+        let next = src[hit + needle.len()..].chars().next();
+        if matches!(next, Some('(') | Some('<')) {
+            break hit;
+        }
+        from = hit + needle.len();
+    };
     let open = src[start..].find('{')? + start;
     let close = match_brace(src, open)?;
     Some(&src[open..=close])
