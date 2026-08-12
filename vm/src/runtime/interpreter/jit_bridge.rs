@@ -2503,6 +2503,22 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // conservatism". On a Spring Boot context startup this whole predicate seals
     // 1,279 methods out of the JIT — more than the 1,155 that reach C2 — and
     // until now nothing said which arm was responsible for them.
+    //
+    // MEASURED 2026-08-12 on netty `AdaptiveByteBufAllocatorTest` (dev
+    // `6d1bfd531`), which is the shape this predicate should hurt most: 826 M
+    // calls, and its hot allocator methods call `ArrayList.add`, `Math.min` and
+    // `AtomicIntegerArray.get`, all shadowed. Arm split
+    // `direct=474 interface-blind=97 inherited=60` — the class-blind arm is 15%
+    // of the population, not the bulk.
+    //
+    // And the seal is NOT a throughput lever here. Interleaved on one box:
+    // default 594 s / 1117 sealed, `-native-shadow-interface-blind` 493 s /
+    // 1056 sealed, `-native-shadow-caller-seal` (the whole seal off) **591 s**
+    // / 675 sealed. Compiling 626 more methods moved the wall clock 0.5%. So
+    // making this arm precise is a correctness/coverage argument, not a
+    // performance one — the cost on call-dense code is the per-entry transfer
+    // machinery, not the population this seals. See
+    // `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
     if direct {
         cratonvm_jit::note_jit_native_shadow_cause("direct");
     } else if inherited {

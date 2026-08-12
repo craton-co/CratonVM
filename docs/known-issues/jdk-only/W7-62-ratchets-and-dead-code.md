@@ -15,7 +15,23 @@
 > to repair `RCrypto`; they sit inside `register_cipher_clinit_shim`'s
 > `SyntheticStub` window and were deliberately left that kind so strict
 > no-stubs mode drops that family together, matching the sibling `isRestricted`.
-> **The remaining +6 has no owner.** Two candidates were checked and REFUTED:
+> **CORRECTION, same day — the +6 IS attributed, and this block was wrong.**
+> `stub_ratchet.rs:466-474` names them: six `java/util/logging` registrations
+> that became `SyntheticStub` by being added to `RETIRED_SHADOW_TRIPLES`
+> (`retired_shadow.rs:239-240`, `:258-261`). That is a RETIREMENT — a Bridge
+> re-tagged so strict mode runs the real bytecode — not a new fake, which is
+> the thing the gate exists to catch. **The test PREDICTS 1259**; the
+> arithmetic closes exactly: 1253 + 6 retirements + 2 Cipher natives = 1261.
+> The error below was measuring the drift from the STALE frozen 1253 instead of
+> from the test's own prediction. Corroborated independently: five JUL triples
+> are the only rows in the registry where a stub owns the slot in Compatible
+> and a surviving intrinsic owns it in strict — the fingerprint of a retirement
+> mid-flight. Note also that this ratchet is a RUNTIME count and cannot be
+> recomputed by scanning source. A re-freeze to 1261 is therefore justified
+> **with that attribution written next to it**, which is what the gate asked
+> for all along.
+>
+> ~~**The remaining +6 has no owner.**~~ Two candidates were checked and REFUTED:
 > `register_datagram_channel` sets `Bridge` (native-io/src/lib.rs), so the ten
 > new `DatagramSocketAdaptor` registrations do not count here; and the new
 > `Selector.provider` / `Stream.forEachOrdered` registrations are ambient

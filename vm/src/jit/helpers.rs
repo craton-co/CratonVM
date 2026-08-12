@@ -16004,6 +16004,55 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
+/// How much stack one thread may burn on COMPILED recursion before the guard
+/// converts it into a catchable `StackOverflowError` — the JIT-side analogue of
+/// `-Xss`, and the compiled counterpart of the interpreter's
+/// `JvmConfig::max_stack_depth` frame cap.
+///
+/// Without this bound the two tiers disagree by more than an order of
+/// magnitude on WHEN a program overflows, because they measure different
+/// things: the interpreter counts frames in a heap `Vec` and stops at
+/// `max_stack_depth` (8192 by default), while compiled frames live on the
+/// native stack and were allowed to consume all of it. Measured on this host
+/// with an 8 MiB carrier stack, one trivially recursive method reached:
+///
+/// | tier | depth before StackOverflowError |
+/// |---|---|
+/// | CratonVM interpreter (`--nojit`) | 8 191 |
+/// | CratonVM JIT (before this bound) | 232 417 |
+/// | HotSpot JDK 25 (interpreted → C2) | 11 820 → 23 306 |
+///
+/// A 28x tier-dependent answer is a fidelity bug on its own — the depth at
+/// which a program overflows should not hinge on whether a method happened to
+/// get compiled — and HotSpot's own two numbers differ by only ~2x because
+/// both of ITS tiers are bounded by the same `-Xss`.
+///
+/// It also breaks real tests. `io.netty.util.concurrent.DefaultPromiseTest`
+/// sizes its work from the depth it measures (`stackOverflowDepth << 1`), then
+/// gives that work a fixed 2-second deadline; at 232k the chain was ~465 000
+/// promises where HotSpot builds ~24 000–47 000, so
+/// `testNoStackOverflowWithDefaultEventExecutorA/B` timed out with the JIT on
+/// and passed with `--nojit`. It was never a promise or notification defect:
+/// CratonVM completes HotSpot's own chain lengths in 343 ms / 798 ms against
+/// that 2 s budget.
+///
+/// 4 MiB, set by measurement rather than by analogy. A byte budget does not
+/// translate to a fixed depth — that depends on the compiled frame size, which
+/// is exactly how HotSpot behaves too — so the number is chosen to land the
+/// depth ABOVE the interpreter's own 8192-frame cap and inside HotSpot's range.
+/// On the probe above, 4 MiB gives ~10k-21k frames against HotSpot's
+/// 11.8k-23.3k.
+///
+/// 1 MiB (HotSpot's default `-Xss`) was tried first and is WRONG here: it
+/// produced 2434-5305 frames, i.e. STRICTER than the interpreter, which only
+/// re-opens the tier gap from the other side and could reject recursion that
+/// runs fine under `--nojit`. CratonVM's compiled frames are simply larger than
+/// HotSpot's, so matching HotSpot's byte budget does not match its depth.
+///
+/// 4 MiB is also what the no-OS-bounds fallback below has always assumed, so
+/// the two paths now agree instead of differing by the whole stack size.
+const SELF_CALL_STACK_BUDGET: usize = 4 << 20; // 4 MiB
+
 /// Compute the guard floor for this thread: the lowest stack pointer at which
 /// a compiled self-recursive site may still CALL one level deeper.
 ///
@@ -16013,10 +16062,15 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
 /// interpreter/exception-table routing above. 1 MiB is generous for all of
 /// those; it is clamped to a quarter of the stack (min 64 KiB) so small
 /// carrier stacks keep most of their space usable.
+///
+/// The result is then raised to at most [`SELF_CALL_STACK_BUDGET`] below the
+/// first observed SP — see that constant for why the whole-stack floor is the
+/// wrong bound. Taking the HIGHER (tighter) of the two keeps the guard-page
+/// headroom guarantee intact: this only ever trips EARLIER, never later.
 #[cold]
 fn compute_self_call_stack_floor(sp_now: usize) -> usize {
     const HEADROOM: usize = 1 << 20; // 1 MiB
-    match thread_stack_bounds() {
+    let guard_floor = match thread_stack_bounds() {
         Some((low, high)) => {
             let size = high - low;
             let margin = HEADROOM.min(size / 4).max(64 * 1024);
@@ -16027,7 +16081,8 @@ fn compute_self_call_stack_floor(sp_now: usize) -> usize {
         // converts unbounded recursion into a catchable error well before
         // a typical guard page.
         None => sp_now.saturating_sub(4 << 20),
-    }
+    };
+    guard_floor.max(sp_now.saturating_sub(SELF_CALL_STACK_BUDGET))
 }
 
 /// Leaf floor query for the INLINE self-recursion check: get-or-compute the
