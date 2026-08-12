@@ -12,6 +12,16 @@ so `default` in every older table below means `Generational`. Supersedes the
 `ModifiedClassPathExtension` cost" framings of the classes below, whose own docs
 are retired to `fixed-suite-bugs/springboot/`.**
 
+> **`Integration` is GREEN under Generational too, as of 2026-08-11, and the A5
+> repair this page assigns it is priced against a number that does not hold
+> still.** Four Windows binaries, one host, one protocol — see
+> ["Integration, re-measured"](#2026-08-11-integration-re-measured-under-generational-across-four-commits).
+> The short version: this page's own commit still reproduces its row exactly
+> (TIMEOUT@700s, peak #1024), so the measurement was sound; 36 commits later the
+> class completes, and `unregistered-jit-frame-on-stack` — 100% of cycles at the
+> first commit — is **0%** at the second, with **no change to the collector or
+> to the A5 probe in between**.
+
 > **The conclusion holds; three of the four rows were re-measured after
 > `67fadfdd8` and their numbers changed.** The `f695ca875` binary the Flyway,
 > Integration and Quartz rows were taken on **predates** `67fadfdd8`
@@ -29,6 +39,94 @@ are retired to `fixed-suite-bugs/springboot/`.**
 > **#4096** and still never finishes. The escalation outlasts the budget that
 > kills the process, so absence of the warning in a timed-out log is not
 > evidence of absence — re-run with a real budget before ruling a class out.
+
+## 2026-08-11: `Integration`, re-measured under Generational across four commits
+
+Taken to settle the row this page assigns the A5 frame walk. One Windows host,
+one protocol, one fixture, all four binaries built and run the same afternoon:
+`-XX:+UseGenerationalGC --Xmx 2g --stack-dump-on-timeout 0`, the three
+load-bearing env vars, `CRATONVM_DBG=gc-fallback-reasons`, killed at 700s.
+"cycles" is the number of `[moving-young-reasons]` records, not the rate-limited
+`fallback #N` log lines — those differ by ~8x and only the former is a count.
+
+| commit | result | cycles | peak | obligation set in ~every cycle |
+|---|---|---:|---:|---|
+| `892ab4f40` — **this page's own measurement commit** | **TIMEOUT @700s** | 1912 | #1024 | `unregistered-jit-frame-on-stack` + `band-unbounded` + `innermost-rbp` (99.4%) |
+| `a79c7d03f` (36 commits later) | 34/34, **426s** | 557 | #512 | `band-unbounded` + `innermost-rbp` (99.6%) — **A5 absent** |
+| `eb6e603f7` (the young-pause-goal fix, `a79c7d03f`'s child) | 34/34 | 42 | #32 | mixed; no single set dominates |
+| dev @ `4ec8d51e7` | 34/34, **269s** and **215s** | 75 | #64 / #16 | `cross-thread-jit-peer` + `xt-helper-window` (51%) |
+
+Linux (Azure, idle) for the same class, same collector: **34/34 in 121s**, 3
+cycles, peak #3 on dev; **34/34 in 98s**, 46 cycles, peak #32 on `2ad5dd0d2`.
+Its siblings there are green too — `Log4J2LoggingSystemTests` 63/63 in 57s (10
+cycles, peak #32), `FlywayAutoConfigurationTests` 73/73 in 97s (9 cycles, peak
+#16). `QuartzEndpointWebIntegrationTests` discovers **0 tests** on the Azure
+fixture and was not measured; that is a fixture gap, not a result.
+
+Three things follow, and the third is the one that matters.
+
+**1. This page's row was real.** Rebuilt at its own commit it reproduces
+exactly — TIMEOUT at 700s, peak #1024, A5 in 99.4% of cycles, against this
+page's "931/931". The methodology holds up; nothing here is a re-reading of a
+contaminated run.
+
+**2. `Integration` is green now, on both platforms, and the largest single step
+is the young-pause-goal fix.** `eb6e603f7` cuts cycles 557 → 42 and peak
+#512 → #32. That is the fix whose own commit message says
+`adapt_young_trigger_to_pause`'s feedback loop "was inert" on the non-moving
+branch — and a workload in this page's spiral takes the non-moving branch at
+essentially every allocation, so it was inert for precisely these classes. The
+young generation was collecting far more often than the goal asked, and each
+collection re-ran the whole fallback path.
+
+**3. A5's share is not a property of anything this page can point at.** It is
+100% of cycles at `892ab4f40` and **0%** at `a79c7d03f`, and
+`git diff 892ab4f40 a79c7d03f -- gc/src vm/src/jit/conservative_roots.rs` is
+**empty**. The collector did not change. The probe did not change. What changed
+in that range is `vm/src/jit/helpers.rs` (+476 lines), `jit/src/tiered.rs` and
+`jit/src/x64/licm.rs` — code that alters how deep the VM's own native frames go
+and what they leave behind in them.
+
+That is exactly what the A5 probe reads. It is a raw word scan over the stack
+band above the registered JIT entry chain, and a stale return address left in
+the uninitialised middle of a live VM frame is indistinguishable to it from a
+live compiled frame. So its rate is a function of VM stack residue, and any
+change to call depth moves it — between 100% and 0% of cycles, in this case.
+
+### The A5 false-positive rate, measured: 87%
+
+`CRATONVM_DBG=a5-census` (added with this measurement) reports, for every A5
+firing, how many band words look like JIT return addresses and how many of those
+sit at a slot with real frame shape — a saved caller RBP one slot below,
+8-aligned, at a HIGHER address, itself the base of a frame whose return-address
+slot holds a plausible PC. Both x64 backends open every compiled body with
+`push rbp; mov rbp, rsp`, so that shape is available for every genuine JIT
+frame; it is the same invariant this file's other RBP-chain walks already rely
+on.
+
+On `Integration`, dev, Windows: **28,483 firings, of which 24,846 (87.2%) had
+`shaped=0`** — not one candidate in the band sat at a slot with frame shape.
+The band itself is small, 70 KB to 325 KB, so this is not a scan-size artefact.
+
+### What this does to the assigned repair
+
+The prescription reads *"Integration → a frame walk. `unregistered-jit-frame-on-stack`
+is in 931/931 cycles; 322 of them carry NOTHING else, so a correct A5 answer
+alone converts 35%."* Re-priced on dev, A5 is in **12 of 75** cycles on Windows
+(all of them sole, so a perfect A5 converts 16%) and in **0 of 3** on Linux.
+The class passes either way.
+
+**The filter is deliberately NOT built here, and the reason is soundness, not
+effort.** Suppressing a hit whose slot has no frame shape is unsound in exactly
+A5's own scenario. A compiled frame entered from VM Rust code stores *that
+caller's* RBP at `slot - 8`; this tree does not build with forced frame
+pointers, so a Rust caller may be using RBP as a general register, and the
+saved word is then not a stack address at all. The filter would reject a real
+unregistered JIT frame — re-arming the corruption the A5 comment describes at
+length, in the one direction where being wrong is fatal. The sound route is the
+other option that comment already names: **register the entry-point transition**,
+so there is nothing for a residue scan to find. The 87% says how much that is
+worth; it does not license the shortcut.
 
 ## 2026-08-11: re-measured on current dev under all three collectors
 

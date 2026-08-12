@@ -11172,6 +11172,62 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
     name == "java/lang/reflect/Proxy$Instance"
 }
 
+/// This VM's own invented carrier for an annotation's captured member values.
+///
+/// `java/lang/annotation/AnnotationProxy` is the 4-slot tuple (type descriptor,
+/// type mirror, element names, element values) that
+/// `native-builtins/src/lang_class.rs::create_annotation_proxy_with_type`
+/// mints as the invocation handler behind every generated annotation
+/// `$ProxyN`. It plays the role HotSpot gives to
+/// `sun.reflect.annotation.AnnotationInvocationHandler`, under a name of this
+/// VM's own choosing: `javap java.lang.annotation.AnnotationProxy` against the
+/// JDK 25 image answers "class not found", so no class file can ever back it
+/// and it is a *generation artefact*, not a stand-in for bytes that should
+/// have been found. Exactly the argument one function up, for exactly the same
+/// species — see `docs/known-issues/jdk-only/W7-12-strict-annotation-proxy.md`
+/// and `W7-17-vm-internal-door-sweep.md`.
+///
+/// # Yes, this binds by NAME. Read this before "fixing" it.
+///
+/// This campaign's most expensive rule is *never bind by name* — an
+/// `invokestatic` owner, a `$ProxyN`'s interface, a reflect stub's rendered
+/// name, a MIC's owner and a shape test on a class name were six separate
+/// defects, all of the same shape: a **same-named class from another loader**
+/// was the correct answer and the string picked the wrong one. That failure
+/// mode is unreachable here, and not by luck:
+///
+/// * **There is no other copy to confuse this with.**
+///   [`ClassManager::fabricated_origin_for_name`] is consulted only from
+///   [`ClassManager::try_ensure_synthetic_class`] →
+///   [`ClassManager::fabricate_class`], which by then has already had
+///   `get_loaded_class_id` answer `None` *and* `find_class_bytes_delegated`
+///   fail. The name resolves to nothing, in any loader, on any classpath
+///   entry. Every one of the six defects was a decision taken while two live
+///   classes existed; this one is taken only when none does.
+/// * **No other party may occupy the name.** `java/lang/annotation/` is a
+///   package no non-bootstrap loader is permitted to define into, and the
+///   bootstrap loader defines only what the image declares — which, per the
+///   `javap` above, is not this. The string is not a guess at an identity, it
+///   is the identity.
+/// * **It classifies, it does not dispatch.** The six defects all *bound* a
+///   call, a cast or a field to a class. This answers "what provenance does a
+///   class the VM is about to invent deserve", the question this function
+///   exists for and whose only input is the invented name.
+///
+/// # What binding by name here does cost, stated plainly
+///
+/// [`ClassManager::fabricate_class`] runs its ambiguity gate
+/// (`classify_loaded_name` → `ambiguous_stand_in_refused`) **only** for
+/// compatibility-stub origins, so a name routed here skips it — deliberately,
+/// per that gate's own comment about `ensure_generated_class` minting under a
+/// name it just constructed. For this name that is inert for the second reason
+/// above: the package cannot hold a second definition. Any future entry added
+/// beside it must be able to make the same statement, or it is trading a
+/// census label for the type confusion the ambiguity gate exists to stop.
+pub(crate) fn is_vm_annotation_carrier_name(name: &str) -> bool {
+    name == "java/lang/annotation/AnnotationProxy"
+}
+
 /// The origin a **fabricated** class deserves on the strength of its name
 /// alone.
 ///
@@ -11189,6 +11245,16 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
 ///   dispatch consequences of the flip are handled by
 ///   [`Class::dispatch_lacks_class_file`](crate::Class::dispatch_lacks_class_file),
 ///   which is what the three read sites that can observe this class now ask.
+/// * `java/lang/annotation/AnnotationProxy` → [`ClassOrigin::VmInternal`], the
+///   same species and the same argument one class later — see
+///   [`is_vm_annotation_carrier_name`], which carries the "yes, this binds by
+///   name" justification for both. `GeneratedProxy` is as wrong for it as for
+///   the supertype above, and for the same reason: it carries an `interfaces`
+///   list a carrier has no value for. The authoritative half of this fix is at
+///   the mint site (`lang_class.rs`, which now pre-mints through
+///   `ensure_vm_internal_class`); this arm exists so a second minting route
+///   cannot silently re-acquire the wrong label, which is precisely the
+///   pairing `Proxy$Instance` already has.
 /// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
 ///   `Generated*Accessor*` is what generated it, exactly as
 ///   [`ClassManager::classify_defined_origin`] already reports for the same
@@ -11206,6 +11272,9 @@ pub(crate) fn is_vm_proxy_supertype_name(name: &str) -> bool {
 /// with its producer named, not a place to invent metadata.
 fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
     if is_vm_proxy_supertype_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_vm_annotation_carrier_name(name) {
         return ClassOrigin::VmInternal;
     }
     if is_generated_lambda_name(name) {
