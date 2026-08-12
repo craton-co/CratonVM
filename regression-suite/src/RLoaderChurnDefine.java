@@ -163,10 +163,104 @@ public class RLoaderChurnDefine {
         System.out.println("CK RLoaderChurnDefine survivor=ok");
     }
 
+    /** Loaded through a bare {@code URLClassLoader} by `repeatLookupIsACacheHit`. */
+    public static final class Echo {
+        public static String tag() {
+            return "echo";
+        }
+    }
+
+    /**
+     * The THIRD half of the same rule, and the one this vector was missing: a
+     * repeated LOOKUP is not a definition. {@code ClassLoader.loadClass} checks
+     * {@code findLoadedClass} first and {@code Class.forName(name, initialize,
+     * loader)} goes through the loader's initiating-classes record, so a second
+     * call is a cache hit — not a second define, and not a {@code LinkageError}.
+     *
+     * Driven through a BARE {@code java.net.URLClassLoader} on purpose. Every
+     * other section here uses a {@code ClassLoader} SUBCLASS, and a subclass took
+     * a different route inside CratonVM: {@code java/net/URLClassLoader} is on
+     * the built-in-loader-class list, so a bare instance was classified as a
+     * built-in LOADER, could not see the class it had itself defined, and every
+     * repeat lookup re-drove the define — which the duplicate rule above then
+     * correctly refused. {@code IncompatibleClassChangeError: class X already
+     * defined by user-defined(N) loader}, surfaced as {@code ClassFormatError}
+     * out of {@code URLClassLoader.findClass}, on the SECOND
+     * {@code Class.forName}.
+     *
+     * ANTI-VACUITY. Asserting that the second call "did not throw" would pass
+     * against a VM that answers with a DIFFERENT {@code Class} object of the
+     * same name, which is its own defect, so identity is asserted with
+     * {@code ==}. The cross-loader half is asserted too: a second, independent
+     * loader must get its OWN class, or "just return the global copy" would pass
+     * everything above.
+     *
+     * The URLs are this run's own {@code java.class.path}, so nothing is written
+     * and the section stays as deterministic as the rest of the vector. A null
+     * parent forces the loader to define its own copy instead of delegating.
+     */
+    static void repeatLookupIsACacheHit() {
+        String cp = System.getProperty("java.class.path");
+        check(cp != null && !cp.isEmpty(),
+                "java.class.path must be set, or this section tests nothing");
+        String[] entries = cp.split(java.io.File.pathSeparator);
+        java.net.URL[] urls = new java.net.URL[entries.length];
+        for (int i = 0; i < entries.length; i++) {
+            try {
+                urls[i] = new java.io.File(entries[i]).toURI().toURL();
+            } catch (java.net.MalformedURLException e) {
+                throw new AssertionError("RLoaderChurnDefine: bad classpath entry " + entries[i]);
+            }
+        }
+        String name = "RLoaderChurnDefine$Echo";
+
+        java.net.URLClassLoader l1 = new java.net.URLClassLoader(urls, null);
+        Class<?> a1;
+        Class<?> a2;
+        Class<?> a3;
+        try {
+            a1 = Class.forName(name, true, l1);
+            a2 = Class.forName(name, true, l1);
+            a3 = l1.loadClass(name);
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: bare URLClassLoader could not load "
+                    + name + " from its own classpath: " + e);
+        }
+        check(a1 == a2, "a repeated Class.forName through one loader is a cache hit, "
+                + "not a second definition");
+        check(a1 == a3, "loadClass must answer with the same class Class.forName did");
+        check(a1.getClassLoader() == l1, "the bare URLClassLoader defined its own copy");
+        check(a1 != Echo.class, "…which is distinct from the application loader's copy");
+
+        java.net.URLClassLoader l2 = new java.net.URLClassLoader(urls, null);
+        Class<?> b1;
+        Class<?> b2;
+        try {
+            b1 = Class.forName(name, true, l2);
+            b2 = Class.forName(name, true, l2);
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: second loader could not load "
+                    + name + ": " + e);
+        }
+        check(b1 == b2, "the second loader's repeat is a cache hit too");
+        check(b1 != a1, "two loaders over one URL yield two classes");
+        check(b1.getClassLoader() == l2, "…each owned by its own loader");
+
+        // Both copies must actually work, so "isolated" cannot mean "broken".
+        try {
+            check("echo".equals(a1.getMethod("tag").invoke(null)), "loader 1's copy runs");
+            check("echo".equals(b1.getMethod("tag").invoke(null)), "loader 2's copy runs");
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("RLoaderChurnDefine: tag() failed: " + e);
+        }
+        System.out.println("CK RLoaderChurnDefine repeatLookup=ok");
+    }
+
     public static void main(String[] args) {
         manyLoadersOneName();
         churnWithSeveralNames();
         aSurvivorKeepsItsClass();
+        repeatLookupIsACacheHit();
         System.out.println("CK RLoaderChurnDefine checks=" + checks);
         System.out.println("PASS RLoaderChurnDefine (" + checks + " checks)");
     }
