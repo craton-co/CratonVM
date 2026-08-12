@@ -2676,6 +2676,43 @@ fn refused_class(
     }
 }
 
+/// [`try_alloc_synthetic`] at the width the LOADED class declares, with
+/// `synthetic_width` used only when the class cannot be resolved at all.
+///
+/// For the collections in this file whose whole state lives in an
+/// address-keyed side table — `ts_get_slot`/`ts_set_slot` and their TreeMap
+/// twins never touch the object's own fields, and say so — the private slot
+/// count is not a layout. Passing it to the allocator only widens the object
+/// past what the class declares: real `java.util.TreeSet` declares ONE field
+/// (`javap -p` against JDK 25.0.3.9: `private transient NavigableMap m`), so
+/// asking for `TS_NUM_FIELDS` put two slots past the declared width that
+/// nothing in the workspace ever writes or reads. See
+/// W7-66-live-over-allocations.md for the census and
+/// W7-59-layout-detector-coverage.md for the instrument that found it.
+///
+/// In synthetic-JDK mode this is a no-op **by construction**, not by argument:
+/// `class_manager` fabricates `java/util/TreeSet` with three instance fields,
+/// so the declared width already IS the synthetic width, and
+/// `NativeContext::alloc_object` clamps any request UP to the declared count
+/// regardless. The `synthetic_width` fallback covers only the "no class of
+/// this name anywhere" arm that [`try_alloc_synthetic`] itself handles.
+///
+/// This is deliberately NOT `try_alloc_with_appended_slots`' shape: that idiom
+/// is for natives carrying private slots ON the object, which these do not.
+#[track_caller]
+fn try_alloc_declared_width(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    synthetic_width: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let declared = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => ctx.class_num_total_fields(cid),
+        Err(_) => 0,
+    };
+    let width = if declared > 0 { declared } else { synthetic_width };
+    try_alloc_synthetic(ctx, class_name, width)
+}
+
 /// Allocate a *real* JDK object of `class_name` with its natural field count and
 /// no constructor run — the caller sets the fields it needs by name. Used to
 /// produce real instances (e.g. `Collections$SingletonList`) whose methods then
@@ -38497,7 +38534,16 @@ fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
     }
 }
 
-// TreeSet — sorted set backed by sorted array
+// TreeSet — sorted set backed by sorted array.
+//
+// These are NOT object slot indices. `ts_get_slot`/`ts_set_slot` key an
+// address-keyed side table on them and never touch the object's own fields, so
+// nothing here describes a layout and nothing here may be handed to an
+// allocator: real `java.util.TreeSet` declares exactly ONE instance field
+// (`javap -p`, JDK 25.0.3.9: `private transient NavigableMap<E,Object> m`), and
+// every set-view native used to ask for three. Allocate through
+// `try_alloc_declared_width`, which asks for what the loaded class declares.
+// W7-66-live-over-allocations.md.
 const TS_FIELD_DATA: usize = 0; // Object[] sorted elements
 const TS_FIELD_SIZE: usize = 1; // Int: number of elements
 const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
@@ -41215,7 +41261,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // collect, moving both `this` and every key still held only in `pairs`.
     let this_pin = ctx.pin_native_root(this);
     let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let ts = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
@@ -42853,7 +42899,7 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -42902,7 +42948,7 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -42949,7 +42995,7 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -43023,7 +43069,7 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -43071,7 +43117,7 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -43123,7 +43169,7 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let to_elem = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -43347,7 +43393,7 @@ fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // across the two allocations below and then STORED — the same
         // stale-at-store shape the Family-1 notes throughout this file describe.
         let rev_pin = pin_value(ctx, rev);
-        let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+        let result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
         let result_pin = ctx.pin_native_root(result);
         // One slot beyond the elements, for the source marker installed after
         // the population loop. Sized so `ts_ensure_capacity` never has to grow
@@ -54091,7 +54137,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     // Return a TreeSet (ordered by the same comparator) containing all keys.
-    let ts = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
     if let Some(keys) = keys_opt {
         for i in 0..(size as usize) {
@@ -55062,11 +55108,32 @@ fn native_executors_new_scheduled_pool(
 
 // CompletableFuture field layout (shared with native-builtins):
 // field 0 = result value, field 1 = done flag (0=pending, 1=normal, 2=exceptional, 3=cancelled)
-// field 2 = source CF (for deferred stages), field 3 = handler (for deferred stages)
+//
+// Slot 0 aliases the real `volatile Object result` and that aliasing is
+// deliberate and load-bearing — `native_cf_complete` stores the JDK's own
+// `AltResult`/`NIL` encoding there so the un-intercepted `isDone()`/`get()`
+// bytecode agrees with us.
+//
+// Slot 1 aliases the real `volatile Completion stack`, which is a REFERENCE,
+// and the `done` marker written into it is an `Int`. That is the slot-index
+// species of natives-over-real-jdk-classes.md §5, and it is NOT repaired here:
+// the same Int-vs-reference test is this file's discriminator between a
+// synthetic CF and a real one (`cf_is_real_jdk`), it is the only discriminator
+// that stays correct for a real SUBCLASS such as `KafkaCompletableFuture`
+// (whose slot 1 is still `stack`), and moving it needs a build. See
+// W7-66-live-over-allocations.md §"left, with the reason".
+//
+// What IS repaired: the WIDTH. Real `java.util.concurrent.CompletableFuture`
+// declares exactly two instance fields (`javap -p`, JDK 25.0.3.9: `result`,
+// `stack`); the two slots below this comment were allocated on every synthetic
+// CF and then never read or written anywhere in the workspace. They are gone,
+// so the request now equals the declared width.
 const CF_FIELD_RESULT: usize = 0;
 const CF_FIELD_DONE: usize = 1;
-const CF_FIELD_SOURCE: usize = 2;
-const CF_FIELD_HANDLER: usize = 3;
+/// Number of slots a CratonVM *synthetic* `CompletableFuture` carries — the
+/// real declared width, because `CF_FIELD_RESULT`/`CF_FIELD_DONE` are the only
+/// two slots any native in this crate touches.
+const CF_NUM_FIELDS: usize = 2;
 
 fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -56405,22 +56472,20 @@ fn cf_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> CfState {
     }
 }
 
+/// Allocate a CratonVM *synthetic* `CompletableFuture`.
+///
+/// Every live caller passes [`CfState::Pending`]; the completed states go
+/// through [`cf_make_completed`], which builds a genuine JDK object. The width
+/// is [`CF_NUM_FIELDS`] — the real declared width — not the four slots this
+/// used to ask for: `CF_FIELD_SOURCE`/`CF_FIELD_HANDLER` were declared and then
+/// never read or written anywhere in the workspace, so slots 2 and 3 sat past
+/// everything `java.util.concurrent.CompletableFuture` declares with no reader.
+/// W7-66-live-over-allocations.md.
+/// One implementation, not two: this and [`cf_make_completed`]'s last-resort
+/// arm both go through [`cf_make_synthetic_slots`], so the width and the slot
+/// map cannot drift apart between them.
 fn cf_make_synthetic(ctx: &mut dyn NativeContext, state: CfState) -> Result<Value, MethodCallFailed> {
-    let cf = try_alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
-    match state {
-        CfState::Normal(v) => {
-            ctx.set_field(cf, CF_FIELD_RESULT, v);
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-        }
-        CfState::Exceptional(e) => {
-            ctx.set_field(cf, CF_FIELD_RESULT, e);
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
-        }
-        CfState::Pending => {
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
-        }
-    }
-    Ok(Value::Object(Some(cf)))
+    cf_make_synthetic_slots(ctx, state)
 }
 
 fn cf_null_callback(method: &str) -> MethodCallResult {
@@ -56491,24 +56556,58 @@ fn cf_make_completed(ctx: &mut dyn NativeContext, state: CfState) -> Result<Valu
             }
             Ok(Value::Object(Some(cf)))
         }
-        _ => {
-            let cf = try_alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
-            match state {
-                CfState::Normal(v) => {
-                    ctx.set_field(cf, CF_FIELD_RESULT, v);
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-                }
-                CfState::Exceptional(e) => {
-                    ctx.set_field(cf, CF_FIELD_RESULT, e);
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
-                }
-                CfState::Pending => {
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
+        // The real object could not be constructed. Try the JDK's own static
+        // factory before falling back to a slot-written stand-in — this is the
+        // remedy W7-49 §6.2 landed as `aio_completed_future` in
+        // `native-builtins::http_client`, and it is a different door from
+        // `new_object_initialized` above (a static method, no `<init>`
+        // interception), so it can succeed where that failed. It writes no
+        // index at all: the layout is whatever the loaded class actually is.
+        _ => match state {
+            CfState::Normal(v) => {
+                match ctx.invoke(
+                    "java/util/concurrent/CompletableFuture",
+                    "completedFuture",
+                    "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                    &[v],
+                ) {
+                    Ok(Some(real @ Value::Object(Some(_)))) => Ok(real),
+                    // The factory is unavailable too (synthetic-JDK mode has no
+                    // such method), or answered null. Re-use the same value in
+                    // the stand-in rather than losing it.
+                    _ => cf_make_synthetic_slots(ctx, CfState::Normal(v)),
                 }
             }
-            Ok(Value::Object(Some(cf)))
+            other => cf_make_synthetic_slots(ctx, other),
+        },
+    }
+}
+
+/// The slot-written `CompletableFuture` stand-in, at the real declared width.
+/// Last resort only — both [`cf_make_completed`] doors are tried first.
+fn cf_make_synthetic_slots(
+    ctx: &mut dyn NativeContext,
+    state: CfState,
+) -> Result<Value, MethodCallFailed> {
+    let cf = try_alloc_synthetic(
+        ctx,
+        "java/util/concurrent/CompletableFuture",
+        CF_NUM_FIELDS,
+    )?;
+    match state {
+        CfState::Normal(v) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, v);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+        }
+        CfState::Exceptional(e) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, e);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
+        }
+        CfState::Pending => {
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
         }
     }
+    Ok(Value::Object(Some(cf)))
 }
 
 fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -56542,6 +56641,12 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // always carries an Int `done` flag there, whereas the real `stack` field is
     // always a reference. This is the same Int-vs-reference test the already-done
     // check above (`synth_done`) relies on.
+    //
+    // The COUNT is still not a discriminator, and the reason changed: a
+    // synthetic CF is now allocated at the real declared width (two slots), so
+    // it is exactly as wide as a real one. A real SUBCLASS is wider than both.
+    // Int-vs-reference at slot 1 is the only test that stays correct across all
+    // three. W7-66-live-over-allocations.md.
     let synthetic = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_));
     ctx.set_field(this, CF_FIELD_RESULT, stored);
     if synthetic {
@@ -57900,6 +58005,19 @@ mod tests {
         assert_eq!(CF_FIELD_DONE, 1);
         assert_eq!(TP_FIELD_SIZE, 0);
         assert_eq!(TP_FIELD_SHUTDOWN, 1);
+        // Tightened (W7-66): the request must not exceed what the real class
+        // declares. `javap -p java.util.concurrent.CompletableFuture` on JDK
+        // 25.0.3.9 lists exactly two instance fields — `volatile Object result`
+        // and `volatile CompletableFuture$Completion stack` — and its
+        // superclass is `java.lang.Object`. The old value was 4, so every
+        // synthetic CF carried two slots past the declared width that no site
+        // in the workspace read or wrote. Raising this again is an
+        // over-allocation and `CRATONVM_DBG_LAYOUT_ALIAS=1` will say so.
+        assert_eq!(
+            CF_NUM_FIELDS, 2,
+            "synthetic CompletableFuture must not be allocated wider than the \
+             two fields java.util.concurrent.CompletableFuture declares"
+        );
     }
 
     // -----------------------------------------------------------------------

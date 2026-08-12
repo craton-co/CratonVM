@@ -771,6 +771,25 @@ const F_OUTPUT_SHUTDOWN: usize = 10;
 const F_REUSEADDR: usize = 11;
 const N_FIELDS: usize = 12;
 
+/// How many slots a channel **object** actually needs, which is not `N_FIELDS`.
+///
+/// `F_OPEN`..`F_REUSEADDR` are indices into the identity-keyed `chan_fields`
+/// side table, not into the object — `cf_set`'s doc says so and `cf_get`
+/// enforces it. The only slot on the object itself that any native in this file
+/// reads or writes is [`SSC_SOCKET_CACHE`]. Handing `N_FIELDS` to the allocator
+/// therefore asked for twelve slots on classes that declare ten: real
+/// `java.nio.channels.SocketChannel` and `ServerSocketChannel` are each ten
+/// fields transitively (`javap -p`, JDK 25.0.3.9 — nothing of their own, four
+/// from `AbstractInterruptibleChannel`, six from `AbstractSelectableChannel`),
+/// so slots 10 and 11 sat past the declared width with no reader at all.
+///
+/// `alloc_obj` still clamps UP, so this is a floor and not a width: in
+/// real-JDK mode the ten declared fields win, and in synthetic-JDK mode
+/// (`class_manager` fabricates both channels with five) this keeps
+/// `SSC_SOCKET_CACHE` in range, which a bare five would not.
+/// W7-66-live-over-allocations.md.
+const SC_OBJECT_SLOTS: usize = SSC_SOCKET_CACHE + 1;
+
 /// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
 const FAMILY_UNIX: i32 = 1;
 
@@ -1295,7 +1314,7 @@ fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 
 /// Shared body of `SocketChannel.open()` / `open(ProtocolFamily)`.
 fn sc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
-    let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
     let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
@@ -3890,7 +3909,7 @@ fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 
 /// Shared body of `ServerSocketChannel.open()` / `open(ProtocolFamily)`.
 fn ssc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
-    let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
+    let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", SC_OBJECT_SLOTS);
     let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
@@ -4322,7 +4341,7 @@ fn ssc_accept_impl(
     let new_id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
     tcp_blocking_state().write().insert(new_id, blocking);
 
-    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
     let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
@@ -4461,7 +4480,7 @@ fn ssc_accept_unix(
     // `getLocalAddress()`/`getRemoteAddress()` on an accepted UDS channel.
     let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
 
-    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", SC_OBJECT_SLOTS);
     let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
@@ -4973,7 +4992,41 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // update_after_gc`). Mirrors `SEED_TABLE` in
 // `native-builtins/src/securerandom.rs` and the C21 collection-overlay
 // fix in `native-collections/src/lib.rs`.
-const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
+/// Slot on the `ServerSocketChannel` OBJECT holding the cached
+/// `java.net.ServerSocket` adaptor.
+///
+/// **This is not an unused slot, and the comment that used to say so
+/// ("unused F_REMOTE slot") is how the mistake was made: it read the
+/// `chan_fields` side-table index map as if it were the object layout.**
+/// `F_REMOTE` is a key into that side table. Slot 5 of the OBJECT, on the real
+/// JDK 25.0.3.9 layout, is `AbstractSelectableChannel.keys` — the
+/// `private SelectionKey[] keys` array.
+///
+/// Derivation, so the next reader does not have to redo it. CratonVM gives a
+/// superclass's instance fields slots `0..parent_total` and the class's own
+/// fields the slots after them (`class_manager::compute_field_layout`). For
+/// `java.nio.channels.ServerSocketChannel` (`javap -p`, statics excluded):
+/// `AbstractInterruptibleChannel` contributes `closeLock`(0) `closed`(1)
+/// `interruptor`(2) `interruptedTarget`(3); `SelectableChannel` contributes
+/// none; `AbstractSelectableChannel` contributes `provider`(4) `keys`(5)
+/// `keyCount`(6) `keyLock`(7) `regLock`(8) `nonBlocking`(9); the class itself
+/// declares none. Ten total, and slot 5 is `keys`.
+///
+/// So `ssc_socket` stores a `ServerSocket` where real bytecode
+/// (`AbstractSelectableChannel.register` / `isRegistered` / `keyFor` /
+/// `removeKey` / `implCloseChannel`) expects a `SelectionKey[]`. It is an
+/// IN-BOUNDS write of the wrong field, which is why neither an
+/// allocation-width instrument nor the `cratonvm::gc::guard` out-of-bounds
+/// reads can see it — W7-59-layout-detector-coverage.md §6 names this species
+/// exactly and says a second instrument is needed for it.
+///
+/// NOT repaired here. The sound remedy is the identity-keyed side table this
+/// file already runs in the other direction (`SsBackRef`, with
+/// `gc_scan_ss_back_ref_roots` and `ss_back_ref_update_after_gc`), so it means
+/// a new GC-rooted table plus its remap hook — a different species from this
+/// lane's allocation widths, on a Tomcat-critical path, and it needs a build.
+/// W7-66-live-over-allocations.md records it as the headline follow-up.
+const SSC_SOCKET_CACHE: usize = 5;
 
 /// One row per live ServerSocket wrapper. The hash only chooses a bucket:
 /// Java identity hashes are not unique, so every lookup also matches the

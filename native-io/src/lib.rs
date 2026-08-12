@@ -15877,7 +15877,34 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // FileLock, MappedByteBuffer, FileChannel additions, Files.walk/list
 // ===========================================================================
 
-// --- FileLock layout: 6-field synthetic ---
+// --- FileLock layout: 4 real fields + 2 appended private slots ---
+//
+// MEASURED, so the next census does not re-derive it and does not read the
+// 6-vs-4 `direction=over` row `CRATONVM_DBG_LAYOUT_ALIAS` prints here as a
+// defect. `javap -p java.nio.channels.FileLock` on JDK 25.0.3.9 declares
+// exactly four instance fields, in this order, on a class whose superclass is
+// `java.lang.Object`:
+//
+//     private final java.nio.channels.Channel channel;   // 0
+//     private final long position;                       // 1
+//     private final long size;                           // 2
+//     private final boolean shared;                      // 3
+//
+// Slots 0..3 below therefore ALIAS the real fields exactly, by index and by
+// type, which is what makes the real `final` accessors `channel()`,
+// `position()`, `size()` and `isShared()` return our values when they run.
+// `FL_FIELD_VALID` and `FL_FIELD_TOKEN` are CratonVM's own state and start at
+// 4, above everything the class declares — i.e. this is already the
+// appended-slot idiom W7-49 §8 named (`try_alloc_with_appended_slots`),
+// written out by hand. The over-allocation is deliberate and safe, and it is
+// the reason the `over` direction is not on its own a defect predicate: the
+// landed remedy for an over-allocation IS an over-allocation.
+//
+// Left as literal indices rather than a computed base on purpose: these
+// natives also run on receivers they did not allocate (in real-JDK mode
+// `<init>` lands on a real `sun.nio.ch.FileLockImpl`, five fields wide), and
+// W7-49 §8 records why a per-receiver base cannot be recovered from a foreign
+// object's width. W7-66-live-over-allocations.md.
 const FL_FIELD_CHANNEL: usize = 0; // Object: owning FileChannel
 const FL_FIELD_POSITION: usize = 1; // Long: lock start position
 const FL_FIELD_SIZE: usize = 2; // Long: lock region size
@@ -17810,25 +17837,11 @@ fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
     dc_fds().lock().remove(&dc_key(ctx, channel))
 }
 
-/// Selector layout: 3 fields
-/// [0] = registrations (Object — array of SelectionKey objects)
-/// [1] = count (Int)
-/// [2] = open (Int)
-const SEL_FIELD_REGS: usize = 0;
-const SEL_FIELD_COUNT: usize = 1;
-const SEL_FIELD_OPEN: usize = 2;
-const SEL_NUM_FIELDS: usize = 3;
+// The legacy `Selector` / `SelectionKey` slot maps (`SEL_FIELD_*`, `SK_FIELD_*`)
+// were deleted with `register_selector` below; `nio_selector.rs` owns both
+// classes. The `OP_*` bits stay because they are NIO-spec constants, not a
+// layout. W7-66-live-over-allocations.md.
 
-/// SelectionKey layout: 4 fields
-/// [0] = channel (Object)
-/// [1] = interest_ops (Int)
-/// [2] = ready_ops (Int)
-/// [3] = valid (Int)
-const SK_FIELD_CHANNEL: usize = 0;
-const SK_FIELD_INTEREST: usize = 1;
-const SK_FIELD_READY: usize = 2;
-const SK_FIELD_VALID: usize = 3;
-const SK_NUM_FIELDS: usize = 4;
 
 /// SelectionKey operation bits
 const OP_READ: i32 = 1;
@@ -20201,7 +20214,17 @@ fn dc_inet_socket_address(
     ctx.set_field_by_name(inet_holder, "family", Value::Int(1));
     ctx.set_field_by_name(inet, "holder", Value::Object(Some(inet_holder)));
 
-    let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 2)?;
+    // Width 1, not 2: every field below is written BY NAME, so the request only
+    // ever needed to cover what the class declares, and real
+    // `java.net.InetSocketAddress` declares exactly one instance field
+    // (`javap -p`, JDK 25.0.3.9: `private final transient
+    // InetSocketAddress$InetSocketAddressHolder holder`; its superclass
+    // `java.net.SocketAddress` declares only a static `serialVersionUID`).
+    // The second slot sat past the declared width with no writer and no reader.
+    // No-op in synthetic-JDK mode, where `class_manager` fabricates this class
+    // with three fields and `alloc_object` clamps any request up to them.
+    // W7-66-live-over-allocations.md.
+    let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 1)?;
     let socket_holder =
         try_alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
     let socket_host = ctx.create_string(host);
@@ -20358,367 +20381,30 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 // ---------------------------------------------------------------------------
-// 92.4: Real Selector (platform-native I/O multiplexing)
+// 92.4: Real Selector — DELETED (W7-66, 2026-08-12)
 // ---------------------------------------------------------------------------
 //
-// On Windows we use non-blocking poll (WouldBlock checks).
-// On Linux/macOS a real implementation would use epoll/kqueue.
-// This implementation uses Rust's platform-agnostic poll approach via
-// fd_table.poll_ready() which works everywhere.
+// `register_selector` and the ten natives only it installed
+// (`native_sel_open`, `native_channel_register`, `do_select`,
+// `native_sel_select{,_timeout,_now}`, `native_sel_selected_keys`,
+// `native_sel_keys`, `native_sel_wakeup`, `native_sel_close`,
+// `native_sel_is_open`) are gone. The registrar lost its only caller in
+// Wave 3 / Task C — see the note in `register_nio_channel_extras` — and
+// `nio_selector.rs::register_nio_selector`, called from `register_io_natives`,
+// has been the source of truth for `java/nio/channels/Selector` and
+// `SelectionKey` since. Deadness confirmed by grep before deletion: the
+// registrar's only reference in the workspace was its own definition, and
+// every native it installed had exactly one other reference, its own `fn`.
+//
+// Five of W7-59's twenty-eight `over` census rows lived here — `SelectionKey`
+// 4-vs-1 and `HashSet` 2-vs-1 — and were noise in every future run of
+// `CRATONVM_DBG_LAYOUT_ALIAS`. They are the "5 dead" column, now zero.
+//
+// The `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/`OP_ACCEPT` accessors
+// this registrar carried under a "KEEP" comment went with it, and nothing
+// changes: an unreachable registrar never installed them. `nio_selector.rs`
+// declares the same four constants (`pub const OP_READ: i32 = 1`, ...).
 
-fn register_selector(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let sel = "java/nio/channels/Selector";
-
-    // Selector.open() → Selector
-    r.register(
-        sel,
-        "open",
-        "()Ljava/nio/channels/Selector;",
-        native_sel_open,
-    );
-
-    // select() → int (number of ready channels)
-    r.register(sel, "select", "()I", native_sel_select);
-
-    // select(long timeout) → int
-    r.register(sel, "select", "(J)I", native_sel_select_timeout);
-
-    // selectNow() → int (non-blocking)
-    r.register(sel, "selectNow", "()I", native_sel_select_now);
-
-    // selectedKeys() → Set<SelectionKey>
-    r.register(
-        sel,
-        "selectedKeys",
-        "()Ljava/util/Set;",
-        native_sel_selected_keys,
-    );
-
-    // keys() → Set<SelectionKey>
-    r.register(sel, "keys", "()Ljava/util/Set;", native_sel_keys);
-
-    // wakeup() → Selector
-    r.register(
-        sel,
-        "wakeup",
-        "()Ljava/nio/channels/Selector;",
-        native_sel_wakeup,
-    );
-
-    // close() → void
-    r.register(sel, "close", "()V", native_sel_close);
-
-    // isOpen() → boolean
-    r.register(sel, "isOpen", "()Z", native_sel_is_open);
-
-    // SelectableChannel.register(Selector, int ops) → SelectionKey
-    r.register(
-        "java/nio/channels/SelectableChannel",
-        "register",
-        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-        native_channel_register,
-    );
-
-    // SelectionKey methods
-    let sk = "java/nio/channels/SelectionKey";
-    r.register(sk, "interestOps", "()I", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(ctx.get_field(this, SK_FIELD_INTEREST)))
-    });
-    r.register(sk, "readyOps", "()I", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(ctx.get_field(this, SK_FIELD_READY)))
-    });
-    r.register(sk, "isReadable", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let ready = match ctx.get_field(this, SK_FIELD_READY) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if ready & OP_READ != 0 { 1 } else { 0 })))
-    });
-    r.register(sk, "isWritable", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let ready = match ctx.get_field(this, SK_FIELD_READY) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if ready & OP_WRITE != 0 { 1 } else { 0 })))
-    });
-    r.register(
-        sk,
-        "channel",
-        "()Ljava/nio/channels/SelectableChannel;",
-        |ctx, args| {
-            let this = obj_arg92(args, 0)?;
-            Ok(Some(ctx.get_field(this, SK_FIELD_CHANNEL)))
-        },
-    );
-    r.register(sk, "cancel", "()V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        ctx.set_field(this, SK_FIELD_VALID, Value::Int(0));
-        Ok(None)
-    });
-    r.register(sk, "isValid", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let valid = matches!(ctx.get_field(this, SK_FIELD_VALID), Value::Int(1));
-        Ok(Some(Value::Int(if valid { 1 } else { 0 })))
-    });
-
-    // OP constants — KEEP: `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/
-    // `OP_ACCEPT` are `static final int` values fixed by the NIO spec
-    // (1/4/8/16). Returning them is the correct implementation, not a stub.
-    r.register(sk, "OP_READ", "()I", |_, _| Ok(Some(Value::Int(OP_READ))));
-    r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
-    r.register(sk, "OP_CONNECT", "()I", |_, _| {
-        Ok(Some(Value::Int(OP_CONNECT)))
-    });
-    r.register(sk, "OP_ACCEPT", "()I", |_, _| {
-        Ok(Some(Value::Int(OP_ACCEPT)))
-    });
-    r.set_category(__prev_cat);
-}
-
-fn native_sel_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let sel = try_alloc_synthetic(ctx, "java/nio/channels/Selector", SEL_NUM_FIELDS)?;
-    let regs = ctx.new_array(ArrayElementType::Reference, 128);
-    ctx.set_field(sel, SEL_FIELD_REGS, Value::Object(Some(regs)));
-    ctx.set_field(sel, SEL_FIELD_COUNT, Value::Int(0));
-    ctx.set_field(sel, SEL_FIELD_OPEN, Value::Int(1));
-    Ok(Some(Value::Object(Some(sel))))
-}
-
-fn native_channel_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let channel = obj_arg92(args, 0)?;
-    let selector = obj_arg92(args, 1)?;
-    let ops = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => OP_READ,
-    };
-
-    let sk = try_alloc_synthetic(ctx, "java/nio/channels/SelectionKey", SK_NUM_FIELDS)?;
-    ctx.set_field(sk, SK_FIELD_CHANNEL, Value::Object(Some(channel)));
-    ctx.set_field(sk, SK_FIELD_INTEREST, Value::Int(ops));
-    ctx.set_field(sk, SK_FIELD_READY, Value::Int(0));
-    ctx.set_field(sk, SK_FIELD_VALID, Value::Int(1));
-
-    // Add to selector's registration array
-    let count = match ctx.get_field(selector, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    if let Value::Object(Some(regs)) = ctx.get_field(selector, SEL_FIELD_REGS) {
-        ctx.set_array_element(regs, count, Value::Object(Some(sk)));
-        ctx.set_field(selector, SEL_FIELD_COUNT, Value::Int((count + 1) as i32));
-    }
-
-    Ok(Some(Value::Object(Some(sk))))
-}
-
-/// Core select logic: poll all registered channels and update ready ops.
-fn do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> i32 {
-    let count = match ctx.get_field(selector, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(selector, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => return 0,
-    };
-
-    let mut ready_count = 0i32;
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if !matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                continue;
-            }
-            let interest = match ctx.get_field(sk, SK_FIELD_INTEREST) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
-
-            // Get the channel's fd to poll
-            let channel = match ctx.get_field(sk, SK_FIELD_CHANNEL) {
-                Value::Object(Some(c)) => c,
-                _ => continue,
-            };
-
-            // Try to get fd from field 0 (DatagramChannel, FileChannel, etc.)
-            let fd_id = match ctx.get_field(channel, 0) {
-                Value::Int(v) => v as u32,
-                _ => continue,
-            };
-
-            let (readable, writable) = ctx.fd_table().poll_ready(fd_id);
-            let mut ready = 0;
-            if readable && interest & OP_READ != 0 {
-                ready |= OP_READ;
-            }
-            if writable && interest & OP_WRITE != 0 {
-                ready |= OP_WRITE;
-            }
-
-            if ready != 0 {
-                ctx.set_field(sk, SK_FIELD_READY, Value::Int(ready));
-                ready_count += 1;
-            } else {
-                ctx.set_field(sk, SK_FIELD_READY, Value::Int(0));
-            }
-        }
-    }
-    ready_count
-}
-
-fn native_sel_select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_select_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let _timeout = match args.get(1) {
-        Some(Value::Long(n)) => *n,
-        _ => 0,
-    };
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    // Simplified: do a single poll (real impl would sleep for timeout)
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_select_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => {
-            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-            let arr = ctx.new_array(ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            return Ok(Some(Value::Object(Some(set))));
-        }
-    };
-
-    // Collect keys with non-zero ready ops
-    let mut selected = Vec::new();
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                if let Value::Int(ready) = ctx.get_field(sk, SK_FIELD_READY) {
-                    if ready != 0 {
-                        selected.push(sk);
-                    }
-                }
-            }
-        }
-    }
-
-    // Build a Set (synthetic HashSet: [0]=backing array, [1]=size)
-    let set_arr = ctx.new_array(ArrayElementType::Reference, selected.len());
-    for (i, sk) in selected.iter().enumerate() {
-        ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
-    }
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-    ctx.set_field(set, 0, Value::Object(Some(set_arr)));
-    ctx.set_field(set, 1, Value::Int(selected.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
-}
-
-fn native_sel_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => {
-            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-            let arr = ctx.new_array(ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            return Ok(Some(Value::Object(Some(set))));
-        }
-    };
-
-    let mut valid = Vec::new();
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                valid.push(sk);
-            }
-        }
-    }
-
-    let set_arr = ctx.new_array(ArrayElementType::Reference, valid.len());
-    for (i, sk) in valid.iter().enumerate() {
-        ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
-    }
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-    ctx.set_field(set, 0, Value::Object(Some(set_arr)));
-    ctx.set_field(set, 1, Value::Int(valid.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
-}
-
-fn native_sel_wakeup(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    // No-op in simplified model (select doesn't block)
-    Ok(Some(Value::Object(Some(this))))
-}
-
-fn native_sel_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    ctx.set_field(this, SEL_FIELD_OPEN, Value::Int(0));
-    // Invalidate all registered keys
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    if let Value::Object(Some(regs)) = ctx.get_field(this, SEL_FIELD_REGS) {
-        for i in 0..count {
-            if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-                ctx.set_field(sk, SK_FIELD_VALID, Value::Int(0));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let open = matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1));
-    Ok(Some(Value::Int(if open { 1 } else { 0 })))
-}
 
 // ===========================================================================
 // Comprehensive I/O tests

@@ -3064,6 +3064,36 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // AsynchronousServerSocketChannel
 // ---------------------------------------------------------------------------
 
+/// LIVE 4-vs-1 over-allocation, MEASURED and deliberately NOT repaired.
+/// W7-66-live-over-allocations.md.
+///
+/// `javap -p java.nio.channels.AsynchronousServerSocketChannel` on JDK
+/// 25.0.3.9 declares exactly one instance field —
+/// `private final AsynchronousChannelProvider provider` — on a class whose
+/// superclass is `java.lang.Object`. So `F_OPEN` writes an `Int` into the slot
+/// the real layout calls `provider` (the §5 shape of
+/// natives-over-real-jdk-classes.md: a native's Int landing in a reference the
+/// class declares), and `F_CONNECTED`/`F_REG_ID`/`F_REMOTE` sit past the end of
+/// everything it declares. `provider()` is a real `final` accessor and would
+/// return that Int.
+///
+/// The repair is the appended-slot idiom, and it cannot be applied to this
+/// class alone. The four constants are module-level and shared with
+/// `AsynchronousSocketChannel`, and three registrations bind the SAME native to
+/// both classes — `isOpen` is `aio_asc_is_open`, which reads `F_OPEN` off
+/// whichever receiver it gets. Renumbering here without renumbering there
+/// breaks `isOpen` on every server channel; renumbering there is out of bounds,
+/// because `AsynchronousSocketChannel` is the two-crates-one-class case W7-49
+/// §5 measured: `native-builtins`' surviving `connect` triple reads slots 0..3
+/// of objects THIS file allocates, under a map whose slots 0 and 1 mean the
+/// opposite. A prior lane converted that side and correctly reverted it — a
+/// repair to dead code that breaks the one live path is worse than none, and
+/// the same holds for a repair here that breaks a shared native.
+///
+/// What this needs, and what this lane could not do: split the two slot maps
+/// (a private one per class), give `aio_asc_is_open` a per-class sibling, and
+/// settle the `native-builtins` survivor in the same step — a build, and one
+/// change spanning both crates.
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
     let ch = alloc_obj(
