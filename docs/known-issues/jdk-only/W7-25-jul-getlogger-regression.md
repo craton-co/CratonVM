@@ -316,7 +316,7 @@ The nine `Compatible` failures, and their disposition:
 | 39 | `useParentHandlers=false` must stop the parent walk | `setUseParentHandlers` records in `jul_logger_use_parent_handlers_table` (`lib.rs`) while the publication walk's `jul_use_parent_handlers` reads `config.useParentHandlers`, which is null on a synthetic logger — a write and a read that never meet | **open**, §7 |
 | 41,42,43 | `log(Level, Supplier)` delivery and gating | §4 | **fixed** |
 | 44 | `info`/`warning`/`fine`/`finest`(Supplier) | `lib.rs` registrations, not owned | **open**, §7 |
-| 54 | `Formatter.formatMessage` must substitute `{0}` | the `formatMessage` intrinsic returns the raw pattern | **open**, §7 |
+| 54 | `Formatter.formatMessage` must substitute `{0}` | the `formatMessage` intrinsic returns the raw pattern | **fixed** 2026-08-12, W7-43-formatmessage-substitution.md |
 | 57,60 | the supplier record must reach the `StreamHandler` | §4 | **fixed** (predicted) |
 | 59 | `SimpleFormatter` must render the inferred source class/method | records carry no `sourceClassName`/`sourceMethodName` | **open**, §7 |
 
@@ -431,7 +431,7 @@ see the RED note at the end of §5.
 | `getLogManager()` mints a fresh unconstructed manager per call | `--jdk-only` | `phases_early.rs` | §1; fix is §6.1 |
 | `setUseParentHandlers(false)` does not stop the publication walk | `Compatible` | the write is `lib.rs`'s side table, the read is `logmanager.rs`'s `jul_use_parent_handlers` | the accessor agrees with itself — `getUseParentHandlers()` returns `false` correctly — while the consumer reads `config.useParentHandlers`, null on a synthetic logger. The clean fix is one visibility change on `jul_logger_use_parent_handlers_table` plus a first-choice read in `jul_use_parent_handlers`; the in-file-only workaround (dispatch `getUseParentHandlers()Z`) puts a Java invoke on every publication and NPEs on a null `config` in strict, so it was not taken |
 | `info`/`warning`/`fine`/`severe`/`finest`(Supplier) evaluate a suppressed supplier | `Compatible` | `lib.rs:17076-17106` | same defect as §4, same shape of fix |
-| `Formatter.formatMessage` returns the raw `{0}` pattern | `Compatible` | the `formatMessage` intrinsic | HotSpot `one=A two=B`, CratonVM `one={0} two={1}` |
+| `Formatter.formatMessage` returns the raw `{0}` pattern | `Compatible` | the `formatMessage` intrinsic | HotSpot `one=A two=B`, CratonVM `one={0} two={1}` — **FIXED both modes 2026-08-12**, W7-43-formatmessage-substitution.md |
 | records carry no inferred `sourceClassName`/`sourceMethodName` | `Compatible` | `logmanager.rs` record construction | `SimpleFormatter` renders the logger name where HotSpot renders `Class method` |
 | `LogManager.getLogger` demand-creates for an undemanded name | `Compatible` | `logmanager.rs` `native_get_logger` | HotSpot `null`; the JULI shims depend on the demand-creation, so this is a design change, not a patch |
 | `log(LogRecord)` is not level-gated | both | `logmanager.rs` | not measured, predicted from the same missing gate as §4; HotSpot drops a record below the logger's level |

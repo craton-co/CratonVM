@@ -304,6 +304,17 @@ getfield sourceClassName / areturn`. `formatMessage` is `getMessage`, then
 `getResourceBundle().getString(...)`, then `getParameters()`, then an
 `indexOf`/`charAt` scan for a `{n}` and `MessageFormat.format`.
 
+> **CORRECTION, 2026-08-12 — the diagnosis above was right and this patch was
+> not.** Moving the row into a `with_category(Bridge)` block LANDED, and #54
+> stayed red in both modes. The `java/util/logging/` retirement is not driven
+> by a row's kind: it is the explicit `RETIRED_SHADOW_TRIPLES` table in
+> `native-api/src/retired_shadow.rs` that re-tags a triple to `SyntheticStub`,
+> and `Formatter.formatMessage` was never added to it. `Bridge` makes a row
+> *eligible* to be listed; it does not list it. And listing it would have
+> closed `--jdk-only` only — a `SyntheticStub` still dispatches in
+> `Compatible`, where #54 also fails. #54 is FIXED by giving the row a correct
+> body instead: W7-43-formatmessage-substitution.md.
+
 **The retired `formatMessage` calls back into rows this set leaves alone**, and
 that is checked rather than assumed: it reads `getParameters()` and
 `getResourceBundle()`, both still `phases_early.rs` intrinsics. They answer
