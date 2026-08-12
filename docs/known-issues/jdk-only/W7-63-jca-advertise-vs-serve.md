@@ -384,12 +384,35 @@ size, and the length is the only observation that can see it. That
 * `SUN.getServices()` answers 35 rows where HotSpot answers 65. A milder
   under-advertisement, untouched. Do not read it as evidence the §3 #3 wrapper
   landed badly.
+* **`Collections.unmodifiableSet` is the IDENTITY function in
+  `--synthetic-jdk`, so §3 #3 is inert there.** Found while wiring
+  `wrap_unmodifiable`. The name has three registrations and registration is
+  last-write-wins:
+  * `native-collections`'s `register_collections_extras_natives` →
+    `native_collections_unmodifiable_set`, a genuine read-only view. Live in
+    real-JDK and `--jdk-only`.
+  * `phases_early::register_collections_extras_natives` **and**
+    `phases_early::register_core_stdlib_extras` → `native_return_first_arg`.
+    Both are reached only from `lib::register_synthetic_overrides`, which runs
+    after the essential registrars, so in `--synthetic-jdk` the identity wins.
+
+  This is the same species as everything else in this record — an API whose
+  entire contract is a refusal, quietly not refusing — and it is broader than
+  the JCA: `unmodifiableList`, `unmodifiableMap` and `unmodifiableCollection`
+  are bound the same way in the same two registrars. Out of scope here, and it
+  needs a `--synthetic-jdk` build, which no lane has made. **It is also a
+  vacuous-green trap:** a probe run under `--synthetic-jdk` reports
+  `D.getAlgorithms[MessageDigest] class=java.util.HashSet add=SUCCEEDED`, which
+  reads exactly like "§3 #3 never landed" and is not that.
 * `--synthetic-jdk` has never been built by any lane, so #6's live half has
   never been observed — only reasoned about.
 
 ## 9. How to verify
 
-Build, then in **both** arms:
+Build, then in **both** arms. Note that `--synthetic-jdk` is NOT a valid arm
+for the `D.` rows: `Collections.unmodifiableSet` is the identity function there
+(§8), so those rows will read `HashSet` / `SUCCEEDED` for a reason that has
+nothing to do with this change.
 
 ```
 java -cp <out> JcaAdvertisedVsServedProbe > cratonvm-<arm>.txt

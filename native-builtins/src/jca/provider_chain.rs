@@ -2886,9 +2886,31 @@ pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
 ///
 /// On failure the plain set is returned rather than propagating the error: an
 /// immutability wrapper is not worth converting a correct answer into a thrown
-/// exception. `java.util.Collections.unmodifiableSet` is real JDK bytecode in
-/// real-JDK mode and a registered native in synthetic mode
-/// (`native-collections/src/lib.rs`), so the fallback should be unreachable.
+/// exception. The `Ok(None)` / `Ok(Some(null))` fallback should be unreachable.
+///
+/// **Mode caveat, and it is a vacuous-green trap for whoever verifies this.**
+/// `java.util.Collections.unmodifiableSet` has THREE registrations in this
+/// tree and registration is last-write-wins:
+///
+///   * `native-collections`'s `register_collections_extras_natives` binds it to
+///     `native_collections_unmodifiable_set`, which allocates a genuine
+///     read-only view. Live in real-JDK and `--jdk-only`, where it is what
+///     this call reaches (in real-JDK mode real JDK bytecode is available
+///     too — either way the result is immutable).
+///   * `phases_early::register_collections_extras_natives` AND
+///     `phases_early::register_core_stdlib_extras` both bind it to
+///     `native_return_first_arg` — the IDENTITY function. Both are reached
+///     only from `lib::register_synthetic_overrides`, which runs after the
+///     essential registrars, so **in `--synthetic-jdk` the identity wins and
+///     this wrapper is inert**: the caller gets the same mutable `HashSet`
+///     back and `add` still succeeds.
+///
+/// So a probe run under `--synthetic-jdk` will report
+/// `class=java.util.HashSet add=SUCCEEDED` here and that is NOT evidence this
+/// change failed to land — it is a separate defect one layer down, recorded in
+/// W7-63-jca-advertise-vs-serve.md §8. An "unmodifiable" wrapper that returns
+/// its argument is the same species as everything else in that record: an API
+/// whose whole contract is a refusal, quietly not refusing.
 fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
     match ctx.invoke(
         "java/util/Collections",
