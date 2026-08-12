@@ -746,13 +746,23 @@ const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = false;
 
 /// Read once per process: the constant above, overridable by
 /// `CRATONVM_THREAD_CONTAINERS` (`1` on, `0` off).
+///
+/// Read through `flags::runtime_var`, not `std::env::var`. A raw `getenv` is
+/// served live and is therefore invisible to `flags::with_thread_overrides`,
+/// so a test selecting an arm through the supported hook would silently have
+/// measured the developer's ambient environment instead — which is exactly the
+/// A/B this pair prescribes. The token is declared `THREADS/thread-containers`
+/// in `types/src/flag_groups.rs`; `flag_declaration_guard.rs` fails the build
+/// for any `CRATONVM_*` name that is read but declared nowhere.
 fn thread_container_registration_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("CRATONVM_THREAD_CONTAINERS") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" => false,
-        _ => VM_REMOVES_THREADS_FROM_CONTAINERS,
-    })
+    *ENABLED.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_THREAD_CONTAINERS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => VM_REMOVES_THREADS_FROM_CONTAINERS,
+        },
+    )
 }
 
 /// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
