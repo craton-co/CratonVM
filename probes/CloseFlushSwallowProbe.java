@@ -68,9 +68,21 @@ import java.util.zip.ZipOutputStream;
  * An implementation that only reads the stored flag passes the recording
  * checks and fails {@code checkErrorFlushesBeforeItAnswers}.
  *
+ * <p><b>W7-81 added the WRITE path's routing answer.</b> A delegated write has
+ * three outcomes and not two — delivered, absorbed (the JDK's
+ * {@code catch (IOException x)} ran and the bytes are gone), refused (an
+ * {@code Error} the JDK's {@code catch} does not name) — and the byte sink and
+ * the char sink must give the same answer to each. Those rows assert where the
+ * characters ended up and what the receiver recorded, on both sinks, for all
+ * three; and the {@code Error} row's {@code checkError()} is the guard on the
+ * console fallback that the refusal answer keeps alive. The fallback itself
+ * writes to a raw file descriptor and is therefore invisible from inside the
+ * JVM — see {@link #consoleEchoIsOutOfBand()}, which collects that evidence and
+ * says plainly that it cannot judge it.
+ *
  * <p>Every expected value below was measured on HotSpot 25.0.3.9 (Eclipse
  * Adoptium) before it was written down; it prints {@code RESULT ok} there
- * today — 96 printed lines, 93 of them asserted. (The default
+ * today — 119 printed lines, 112 of them asserted. (The default
  * {@code ErrorManager} writes one report and one stack trace to
  * {@code System.err} during {@code streamHandlerCloseIsNarrow}; that is
  * HotSpot's own output, not a failure.)
@@ -257,6 +269,110 @@ public class CloseFlushSwallowProbe {
             int n = 0;
             for (String o : ops) { if (o.equals(op)) { n++; } }
             return n;
+        }
+    }
+
+    /**
+     * W7-81 — a {@code Writer} that records what reached it and can fail on
+     * {@code write} with a chosen throwable.
+     *
+     * <p>The CHAR twin of {@link TraceOut}. {@link WriteBoomWriter} always
+     * throws and keeps nothing, which cannot express "the sink received
+     * exactly these characters and nothing more" — and "how much reached the
+     * sink" is half of what the three-way routing answer decides.
+     */
+    static final class TraceWriter extends Writer {
+        final StringBuilder received = new StringBuilder();
+        private final Throwable writeBoom;
+
+        TraceWriter() { this(null); }
+
+        TraceWriter(Throwable writeBoom) { this.writeBoom = writeBoom; }
+
+        @Override public void write(char[] cbuf, int off, int len) throws IOException {
+            raise();
+            received.append(cbuf, off, len);
+        }
+
+        @Override public void write(String s, int off, int len) throws IOException {
+            raise();
+            received.append(s, off, off + len);
+        }
+
+        @Override public void flush() { }
+        @Override public void close() { }
+
+        private void raise() throws IOException {
+            if (writeBoom == null) { return; }
+            if (writeBoom instanceof IOException) { throw (IOException) writeBoom; }
+            if (writeBoom instanceof RuntimeException) { throw (RuntimeException) writeBoom; }
+            if (writeBoom instanceof Error) { throw (Error) writeBoom; }
+        }
+    }
+
+    /**
+     * W7-81 — a failing byte sink whose slot 0 is {@code System.out}.
+     *
+     * <p>Exists only to make the console fallback REACHABLE. This VM's
+     * {@code stream_fd} decides "is this a console stream" by walking field 0
+     * up to four hops looking for pointer-identity with {@code System.out} /
+     * {@code System.err}; a sink whose fields lead nowhere makes "not routed"
+     * indistinguishable from "routed", because the fallback then has no fd to
+     * write to and does nothing either way. {@code OutputStream} declares no
+     * instance fields, so {@code chain} is slot 0.
+     *
+     * <p>On HotSpot the class is inert scaffolding: nothing there walks slots.
+     */
+    static final class EchoBoomOut extends OutputStream {
+        final OutputStream chain;
+        private final Throwable writeBoom;
+
+        EchoBoomOut(OutputStream chain, Throwable writeBoom) {
+            this.chain = chain;
+            this.writeBoom = writeBoom;
+        }
+
+        @Override public void write(int b) throws IOException { raise(); }
+
+        @Override public void write(byte[] b, int off, int len) throws IOException { raise(); }
+
+        @Override public void flush() { }
+        @Override public void close() { }
+
+        private void raise() throws IOException {
+            if (writeBoom instanceof IOException) { throw (IOException) writeBoom; }
+            if (writeBoom instanceof RuntimeException) { throw (RuntimeException) writeBoom; }
+            if (writeBoom instanceof Error) { throw (Error) writeBoom; }
+        }
+    }
+
+    /**
+     * W7-81 — the CHAR twin of {@link EchoBoomOut}.
+     *
+     * <p>{@code Writer}'s {@code protected Writer(Object lock)} constructor is
+     * what puts {@code System.out} in slot 0 here; a {@code PrintWriter} over
+     * this writer therefore has {@code System.out} two hops down its slot-0
+     * chain, which is the picocli / JUnit-console shape.
+     */
+    static final class EchoBoomWriter extends Writer {
+        private final Throwable writeBoom;
+
+        EchoBoomWriter(Object chain, Throwable writeBoom) {
+            super(chain);
+            this.writeBoom = writeBoom;
+        }
+
+        @Override public void write(char[] cbuf, int off, int len) throws IOException { raise(); }
+
+        @Override public void write(String s, int off, int len) throws IOException { raise(); }
+
+        @Override public void flush() { }
+        @Override public void close() { }
+
+        private void raise() throws IOException {
+            if (writeBoom instanceof IOException) { throw (IOException) writeBoom; }
+            if (writeBoom instanceof RuntimeException) { throw (RuntimeException) writeBoom; }
+            if (writeBoom instanceof Error) { throw (Error) writeBoom; }
         }
     }
 
@@ -979,6 +1095,164 @@ public class CloseFlushSwallowProbe {
     }
 
     /**
+     * W7-81 — a delegated WRITE has three outcomes, not two, and the byte sink
+     * and the char sink must give the same answer to each.
+     *
+     * <p>The routing helper behind every {@code print}/{@code println} native
+     * used to answer one {@code bool} that meant two different things in its
+     * two branches. Its char branch reported an ABSORBED {@code IOException} as
+     * "the write did not happen", which sent the text to the console fast path
+     * — a second write, to a stream HotSpot never touched, because HotSpot's
+     * {@code catch (IOException x) { trouble = true; }} discards the bytes. Its
+     * byte branch reported EVERY failure as "the write happened", including an
+     * {@code Error}, so a {@code NoSuchMethodError} from our own dispatch made
+     * the text vanish with no fallback at all.
+     *
+     * <p>So the contract each row below asserts is <b>where the characters
+     * ended up and what the receiver recorded</b>, on both sinks, for all three
+     * outcomes:
+     *
+     * <table><tr><th>sink raised</th><th>reached the sink</th>
+     * <th>{@code checkError()}</th><th>thrown at the caller</th></tr>
+     * <tr><td>nothing</td><td>everything</td><td>{@code false}</td><td>none</td></tr>
+     * <tr><td>{@code IOException}</td><td>nothing</td><td>{@code true}</td><td>none</td></tr>
+     * <tr><td>{@code Error}</td><td>nothing</td><td>{@code false}</td><td>the {@code Error}</td></tr>
+     * </table>
+     *
+     * <p><b>The {@code Error} row's {@code checkError()} is the guard that
+     * keeps the console fallback alive.</b> The tempting way to collapse the
+     * three answers back into two is to widen "absorbed" to cover an
+     * {@code Error} as well — which is also exactly how the picocli /
+     * JUnit-console survival path gets deleted, because "absorbed" means
+     * "routed" means "do not fall back". Widening it sets {@code trouble} for a
+     * failure HotSpot's {@code catch} never sees, so this row goes red the
+     * moment the fallback is removed that way. It is the only in-process
+     * observable that moves with it; see {@link #consoleEchoIsOutOfBand()}.
+     */
+    static void writeRoutingIsThreeWay() {
+        // ---- byte sink (PrintStream over an OutputStream) ----
+        TraceOut cleanBytes = new TraceOut();
+        PrintStream psClean = new PrintStream(cleanBytes);
+        check("psRouteCleanWriteThrewNothing", "none", outcome(() -> psClean.print("hello")));
+        check("psRouteCleanWriteReachedSink", "hello", cleanBytes.sink.toString());
+        check("psRouteCleanWriteNoTrouble", false, psClean.checkError());
+
+        BoomOut ioBytes = new BoomOut(BoomOut.Where.WRITE, new IOException("route-ps-io"));
+        PrintStream psIo = new PrintStream(ioBytes);
+        check("psRouteIoWriteThrewNothing", "none", outcome(() -> psIo.print("hello")));
+        // HotSpot's `catch` discards the bytes: they are on no stream anywhere.
+        // A fallback that re-writes them puts them on a console HotSpot left
+        // untouched, which is a DOUBLE write, not a rescue.
+        check("psRouteIoWriteReachedSinkBytes", 0, ioBytes.sink.size());
+        check("psRouteIoWriteRecordedTrouble", true, psIo.checkError());
+
+        BoomOut errBytes = new BoomOut(BoomOut.Where.WRITE, new Error("route-ps-boom"));
+        PrintStream psErr = new PrintStream(errBytes);
+        String psErrOutcome = outcome(() -> psErr.print("hello"));
+        check("psRouteErrorWriteReachedSinkBytes", 0, errBytes.sink.size());
+        // The fallback guard. `catch (IOException x)` does not name an `Error`,
+        // so `trouble` must stay clear — and staying clear is what "refused,
+        // fall back to the console" looks like from inside the JVM.
+        check("psRouteErrorWriteDidNotRecordTrouble", false, psErr.checkError());
+
+        // ---- char sink (PrintWriter over a Writer) ----
+        TraceWriter cleanChars = new TraceWriter();
+        PrintWriter pwClean = new PrintWriter(cleanChars);
+        check("pwRouteCleanWriteThrewNothing", "none", outcome(() -> pwClean.print("hello")));
+        check("pwRouteCleanWriteReachedSink", "hello", cleanChars.received.toString());
+        check("pwRouteCleanWriteNoTrouble", false, pwClean.checkError());
+
+        TraceWriter ioChars = new TraceWriter(new IOException("route-pw-io"));
+        PrintWriter pwIo = new PrintWriter(ioChars);
+        check("pwRouteIoWriteThrewNothing", "none", outcome(() -> pwIo.print("hello")));
+        check("pwRouteIoWriteReachedSinkChars", 0, ioChars.received.length());
+        check("pwRouteIoWriteRecordedTrouble", true, pwIo.checkError());
+
+        TraceWriter errChars = new TraceWriter(new Error("route-pw-boom"));
+        PrintWriter pwErr = new PrintWriter(errChars);
+        String pwErrOutcome = outcome(() -> pwErr.print("hello"));
+        check("pwRouteErrorWriteReachedSinkChars", 0, errChars.received.length());
+        check("pwRouteErrorWriteDidNotRecordTrouble", false, pwErr.checkError());
+
+        // ---- the two branches must give the SAME answer ----
+        // Asserted as an explicit equality rather than left implicit in the
+        // twelve rows above: "one branch was fixed" and "both branches were
+        // fixed" look identical row by row, and the disagreement between them
+        // is the defect this section exists for.
+        check("routeBranchesAgreeOnCleanDelivery",
+                cleanBytes.sink.toString(), cleanChars.received.toString());
+        check("routeBranchesAgreeOnIoException",
+                ioBytes.sink.size() + "/" + psIo.checkError(),
+                ioChars.received.length() + "/" + pwIo.checkError());
+        check("routeBranchesAgreeOnError",
+                errBytes.sink.size() + "/" + psErr.checkError(),
+                errChars.received.length() + "/" + pwErr.checkError());
+
+        // PRINTED, NOT ASSERTED — mode-dependent, and the reason is named.
+        // HotSpot lets an `Error` out of `print`; this VM's write natives return
+        // `void` through helpers that cannot propagate, and W7-70 established
+        // that making them propagate deletes the console fallback on the exact
+        // case (a `NoSuchMethodError` from our own dispatch) it exists for. So
+        // "none" here is a KEPT divergence, not a regression, and asserting the
+        // HotSpot value would demand the change this lane declined to make.
+        // Measured on HotSpot 25.0.3.9: both are the `Error`.
+        // W7-70-printstream-close-noop.md, W7-81-write-route-three-way.md
+        System.out.println("observed.psRouteErrorWriteOutcome=" + psErrOutcome);
+        System.out.println("observed.pwRouteErrorWriteOutcome=" + pwErrOutcome);
+    }
+
+    /**
+     * W7-81 — the console echo itself, which NO check in this file can assert.
+     *
+     * <p>The whole behaviour delta of the three-way routing answer lands on one
+     * thing: whether the caller falls back to the console file descriptor.
+     * That fallback is a raw host write to fd 1 — it does not go through
+     * {@code System.out}, so {@code System.setOut} cannot capture it and no
+     * code running inside the JVM can see it. That is precisely why W7-70 wrote
+     * the design down and did not ship it: it "could not measure".
+     *
+     * <p>This method does not pretend otherwise. It performs the two writes
+     * whose echo the change moves, tagged with tokens, and prints what the
+     * console should and should not contain. Whoever runs the probe reads the
+     * process's stdout; the tokens are the evidence, and they are evidence the
+     * probe collects but cannot judge.
+     *
+     * <table><tr><th>token</th><th>before</th><th>after</th><th>HotSpot</th></tr>
+     * <tr><td>{@code W781-IO-MUST-NOT-ECHO}</td><td>echoed (char branch
+     * reported the absorbed {@code IOException} as "not routed")</td>
+     * <td>absent</td><td>absent</td></tr>
+     * <tr><td>{@code W781-ERR-MUST-ECHO}</td><td>absent (byte branch reported
+     * the {@code Error} as "routed" and the text vanished)</td><td>echoed</td>
+     * <td>absent — HotSpot throws instead, which is the one outcome this VM
+     * cannot offer</td></tr></table>
+     *
+     * <p>The two sinks chain {@code System.out} through slot 0 on purpose: the
+     * fallback picks its fd by walking that chain, so a sink whose fields lead
+     * nowhere makes "not routed" do nothing and hides the very difference being
+     * looked for. That construction depends on this VM's field layout rather
+     * than on any Java contract, which is a second reason nothing here is
+     * asserted.
+     */
+    static void consoleEchoIsOutOfBand() {
+        System.out.println("observed.echoTokenThatMustNotAppear=W781-IO-MUST-NOT-ECHO");
+        System.out.println("observed.echoTokenThatMustAppearOnCratonVM=W781-ERR-MUST-ECHO");
+
+        PrintWriter pwIo =
+                new PrintWriter(new EchoBoomWriter(System.out, new IOException("echo-pw-io")));
+        pwIo.print("W781-IO-MUST-NOT-ECHO");
+        pwIo.flush();
+
+        PrintStream psErr =
+                new PrintStream(new EchoBoomOut(System.out, new Error("echo-ps-boom")));
+        try {
+            psErr.print("W781-ERR-MUST-ECHO");
+        } catch (Error expectedOnHotSpot) {
+            // HotSpot propagates it here and echoes nothing. Swallowed so the
+            // probe still reaches `RESULT ok` on the reference JVM.
+        }
+    }
+
+    /**
      * A close that SUCCEEDS must stay silent — the trivial direction, kept so a
      * fix that turned every delegated close into a throw is caught here rather
      * than in a suite.
@@ -1034,6 +1308,9 @@ public class CloseFlushSwallowProbe {
         printStreamCloseOrdering();
         printStreamDoubleCloseIsHarmless();
         printStreamWriteAfterCloseObservation();
+        // W7-81 — the WRITE path's routing answer, and the two sinks agreeing.
+        writeRoutingIsThreeWay();
+        consoleEchoIsOutOfBand();
 
         if (FAILURES.isEmpty()) {
             System.out.println("RESULT ok");

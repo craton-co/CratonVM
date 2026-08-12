@@ -1074,9 +1074,23 @@ pub(crate) fn native_printwriter_printf(
                     "(Ljava/lang/String;)V",
                     &[Value::Object(Some(s))],
                 );
-                let wrote_string =
-                    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, wrote);
-                if !wrote_string && !backing_is_writer {
+                // ROUTED, not DELIVERED — the same distinction W7-81 drew in
+                // `route_write_through_out`, and the same defect if it is
+                // missed. The retry below exists for the case the comment
+                // above names: `write(String)` "isn't registered", i.e. a
+                // `NoSuchMethodError` — `DelegatedWrite::Refused`. An absorbed
+                // `IOException` is not that. HotSpot's `catch` has run, the
+                // characters are gone, and re-sending them through the byte
+                // overload on the SAME backing is a double write on a sink the
+                // JDK already gave up on. `record_write_failure`'s `bool`
+                // cannot tell those apart, which is exactly why it must not be
+                // the gate on a retry.
+                // W7-81-write-route-three-way.md
+                let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                    ctx, this, wrote,
+                )
+                .routed();
+                if !routed && !backing_is_writer {
                     let bytes = text.as_bytes();
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, b) in bytes.iter().enumerate() {
@@ -1503,8 +1517,24 @@ fn native_printwriter_write_string(
             let written =
                 ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
             // RECORDED since W7-64 — see the sibling range overload below.
-            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
-            return Ok(None);
+            //
+            // ROUTED since W7-81. This native resolves `out` itself and never
+            // reaches `route_write_through_out`, so the three-way answer has to
+            // be made here too or this receiver shape keeps the defect the
+            // routing helper just lost: a `Refused` call — a `NoSuchMethodError`
+            // out of our own dispatch — used to `return Ok(None)` and the text
+            // vanished with no fallback at all. Falling through instead reaches
+            // the shared path, which has the console fallback. An `Absorbed`
+            // `IOException` still returns here, because HotSpot wrote the
+            // characters nowhere and re-sending them would be a double write.
+            // W7-81-write-route-three-way.md
+            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                ctx, this, written,
+            )
+            .routed();
+            if routed {
+                return Ok(None);
+            }
         }
     }
     native_printstream_write_string(ctx, args)
@@ -1534,8 +1564,17 @@ fn native_printwriter_write_string_range(
             // catch (IOException x) { trouble = true; } }` — the absorb was
             // already here, the record was not.
             // W7-64-printstream-trouble-and-errormanager.md
-            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
-            return Ok(None);
+            //
+            // ROUTED since W7-81 — see the sibling `write(String)` overload
+            // above for why this native needs the three-way answer of its own.
+            // W7-81-write-route-three-way.md
+            let routed = cratonvm_native_api::print_error_state::classify_write_failure(
+                ctx, this, written,
+            )
+            .routed();
+            if routed {
+                return Ok(None);
+            }
         }
     }
     native_printstream_write_string_range(ctx, args)
@@ -1555,6 +1594,16 @@ pub(crate) fn native_printwriter_write_int(
             let written = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
             // RECORDED since W7-64 — `PrintWriter.write(int)` ends
             // `catch (IOException x) { trouble = true; }`.
+            //
+            // NOT routed three ways, unlike its two `write(String…)` siblings
+            // above, and the difference is deliberate: they have a fallthrough
+            // to hand a REFUSED call to (`native_printstream_write_string…`,
+            // which owns the console fallback) and this one has none — it is
+            // the end of its own path. Giving it one means inventing a
+            // `stream_write` call for a single char, which is a different
+            // change from the one W7-81 made and needs its own justification.
+            // So a `NoSuchMethodError` from `out.write(int)` still loses the
+            // character silently here. W7-81-write-route-three-way.md
             cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
             return Ok(None);
         }

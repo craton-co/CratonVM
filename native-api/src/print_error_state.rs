@@ -196,41 +196,118 @@ pub fn absorb_write_exception_recording(
     Ok(None)
 }
 
-/// Record a delegated write's failure at a call site that **cannot**
-/// propagate, and report whether the write succeeded.
+/// What a delegated `print`/`println`/`write` actually did — the three
+/// outcomes the `bool` these sites used to return collapsed into two.
 ///
-/// The `print`/`println`/`write` natives funnel through helpers that return
-/// `()` or `bool` across a dozen call sites, so the `Error`-propagating half
-/// of [`absorb_write_exception_recording`] is a signature change rather than a
-/// one-line fix there. What is a one-line fix is the half this lane is
-/// chartered on: the JDK's `catch (IOException x) { trouble = true; }` body
-/// still runs, so a failed write is *observable* through `checkError()` even
-/// where it is still (wrongly) unthrown.
+/// The distinction exists because the write natives cannot propagate. They
+/// stand in for `PrintStream.write(String)` / `PrintStream.write(byte[],int,int)`
+/// and their `PrintWriter` twins, whose bodies are
 ///
-/// Absorbs everything, exactly as the `let _ = …` these sites had did.
-/// Returns `true` when the delegated call returned cleanly.
+/// ```text
+/// try { …; out.write(…); … }
+/// catch (InterruptedIOException x) { Thread.currentThread().interrupt(); }
+/// catch (IOException x)            { trouble = true; }
+/// ```
 ///
-/// **Residual, and deliberate:** an `Error` — a `NoSuchMethodError` from our
-/// own dispatch above all — is absorbed here where HotSpot lets it out, and it
-/// does NOT set `trouble` (HotSpot's `catch` never sees it, so a `trouble`
-/// that HotSpot would not set would be fresh invented state, not parity).
+/// so an `IOException` is a failure HotSpot **handles** — the bytes go
+/// nowhere, `checkError()` starts answering `true`, and `println` returns
+/// normally — while an `Error` is a failure HotSpot lets straight out. Those
+/// are not the same event, and answering "the write did not happen" for both
+/// is what made this VM echo a handled failure to the console (a write HotSpot
+/// performs nowhere) and swallow an unhandled one in silence.
 ///
-/// W7-70 measured why that residual is not a signature problem: the `false`
-/// this returns on a failure is what makes `route_write_through_out` report
-/// "not routed", which is what sends the text to the console fast path — and
-/// that fallback is the picocli / JUnit-console `NoSuchMethodError` survival
-/// path. Propagating the `Error` deletes the fallback on exactly the case it
-/// exists for. The arity is 23 call sites, not the "dozen" this comment used
-/// to say, but the arity was never the blocker.
-/// W7-70-printstream-close-noop.md
-pub fn record_write_failure(
+/// W7-81-write-route-three-way.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedWrite {
+    /// The sink took the bytes.
+    Delivered,
+    /// The sink raised the throwable the JDK's own `catch` names, the JDK's
+    /// `catch` body has been run (`trouble` set, or the interrupt re-asserted),
+    /// and — as in HotSpot — **the bytes were written nowhere else**.
+    Absorbed,
+    /// The sink could not take the call at all: an `Error` (a
+    /// `NoSuchMethodError` from our own dispatch above all), a
+    /// `RuntimeException`, or a `MethodCallFailed::InternalError`, which is not
+    /// a Java throwable and can never be the `IOException` a JDK `catch` names.
+    ///
+    /// HotSpot propagates every one of these out of `println`. This VM's write
+    /// natives cannot, so the caller falls back to the console fd instead —
+    /// louder than HotSpot, but the one thing HotSpot never does here is stay
+    /// silent, and silence is the only other option available.
+    Refused,
+}
+
+impl DelegatedWrite {
+    /// The decision table, as a pure function of what the failure *was*.
+    ///
+    /// Split out from [`classify_write_failure`] so the table can be tested
+    /// without a `NativeContext`: the class-hierarchy half is
+    /// [`take_absorbed`]'s and is tested where it lives, and this half — which
+    /// of the three answers each shape gets — is the part a future edit is
+    /// likely to get wrong.
+    ///
+    /// `io` is "assignable to `java/io/IOException`", which is the whole of
+    /// what both `catch` clauses name — `InterruptedIOException` is a subclass,
+    /// so it lands on the same answer and differs only in which `catch` BODY
+    /// runs, which is [`classify_write_failure`]'s business, not this table's.
+    pub fn classify(internal_error: bool, io: bool) -> DelegatedWrite {
+        // A `MethodCallFailed::InternalError` is not a Java throwable and can
+        // never be the `IOException` a JDK `catch` names, so it is never
+        // absorbed however the second argument reads. Everything else the
+        // `catch` does not name — every `Error`, every `RuntimeException` — is
+        // refused for the same reason: HotSpot lets all of them out.
+        if io && !internal_error {
+            DelegatedWrite::Absorbed
+        } else {
+            DelegatedWrite::Refused
+        }
+    }
+
+    /// Did the delegation reach a conclusion the caller must NOT second-guess?
+    ///
+    /// `true` for [`DelegatedWrite::Delivered`] (the sink has the bytes) and
+    /// for [`DelegatedWrite::Absorbed`] (HotSpot wrote them nowhere, so neither
+    /// may we). `false` only for [`DelegatedWrite::Refused`], which is what
+    /// keeps the console fallback alive on the case it exists for.
+    pub fn routed(self) -> bool {
+        match self {
+            DelegatedWrite::Delivered | DelegatedWrite::Absorbed => true,
+            DelegatedWrite::Refused => false,
+        }
+    }
+
+    /// Did the delegated call return cleanly?
+    ///
+    /// The predicate [`record_write_failure`] answers, kept separate from
+    /// [`DelegatedWrite::routed`] on purpose: they used to be the same `bool`
+    /// and that is precisely the conflation W7-81 unpicked.
+    pub fn delivered(self) -> bool {
+        matches!(self, DelegatedWrite::Delivered)
+    }
+}
+
+/// Run the JDK's `catch` bodies for a delegated write and say which of the
+/// three outcomes happened.
+///
+/// The recording half is unchanged from W7-64 — an `InterruptedIOException`
+/// re-asserts the thread's interrupt and does **not** set `trouble`; any other
+/// `IOException` sets it; nothing else touches it, because HotSpot's `catch`
+/// never sees anything else and a `trouble` HotSpot would not set is fresh
+/// invented state rather than parity.
+///
+/// What is new is that the caller can now tell an absorbed `IOException` from a
+/// refused call. Absorbs everything either way: these sites still cannot
+/// propagate. W7-81-write-route-three-way.md
+pub fn classify_write_failure(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     result: MethodCallResult,
-) -> bool {
+) -> DelegatedWrite {
     let thrown = match result {
-        Ok(_) => return true,
-        Err(MethodCallFailed::InternalError(_)) => return false,
+        Ok(_) => return DelegatedWrite::Delivered,
+        Err(MethodCallFailed::InternalError(_)) => {
+            return DelegatedWrite::classify(true, false);
+        }
         Err(MethodCallFailed::ExceptionThrown(obj)) => obj,
     };
     let thrown_class = ctx.class_id_of_object(thrown);
@@ -238,13 +315,45 @@ pub fn record_write_failure(
         ctx.class_id_by_name(name)
             .is_some_and(|root| ctx.is_subclass(thrown_class, root))
     };
-    if is(&*ctx, "java/io/InterruptedIOException") {
-        let current = ctx.current_thread_object();
-        ctx.thread_interrupt(current);
-    } else if is(&*ctx, "java/io/IOException") {
-        set_trouble(&*ctx, this);
+    let io = is(&*ctx, "java/io/IOException");
+    let outcome = DelegatedWrite::classify(false, io);
+    if outcome == DelegatedWrite::Absorbed {
+        if is(&*ctx, "java/io/InterruptedIOException") {
+            let current = ctx.current_thread_object();
+            ctx.thread_interrupt(current);
+        } else {
+            set_trouble(&*ctx, this);
+        }
     }
-    false
+    outcome
+}
+
+/// Record a delegated write's failure at a call site that **cannot**
+/// propagate, and report whether the write succeeded.
+///
+/// [`classify_write_failure`] with its three-way answer narrowed back to the
+/// one question this predicate has always asked — "did the sink take it?" —
+/// for the call sites that have no console fallback to make the wider answer
+/// mean anything. Absorbs everything, exactly as the `let _ = …` these sites
+/// had did.
+///
+/// **Residual, and deliberate:** an `Error` — a `NoSuchMethodError` from our
+/// own dispatch above all — is absorbed here where HotSpot lets it out, and it
+/// does NOT set `trouble` (HotSpot's `catch` never sees it, so a `trouble`
+/// that HotSpot would not set would be fresh invented state, not parity).
+///
+/// Callers that DO have somewhere else to send the text must use
+/// [`classify_write_failure`] instead: this `bool` cannot distinguish "HotSpot
+/// wrote it nowhere" from "the sink could not take the call", and answering
+/// "not written" for the first is what made `route_write_through_out` echo an
+/// absorbed `IOException` to the console.
+/// W7-70-printstream-close-noop.md, W7-81-write-route-three-way.md
+pub fn record_write_failure(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    result: MethodCallResult,
+) -> bool {
+    classify_write_failure(ctx, this, result).delivered()
 }
 
 /// Same for a raw host-level write/flush failure on the fd a console
@@ -291,4 +400,71 @@ pub fn report_handler_error(ctx: &mut dyn NativeContext, handler: ObjectRef, ex:
         ],
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DelegatedWrite;
+
+    /// The whole reason the answer is three-way rather than two.
+    ///
+    /// This table is not observable from inside a Java program: every one of
+    /// the three answers returns from `println` without throwing, and the only
+    /// thing they change is whether the caller falls back to the raw console
+    /// fd — a write no code in the JVM can see, which is exactly why W7-70
+    /// could not measure this and why `probes/CloseFlushSwallowProbe.java`
+    /// asserts the Java-visible half and prints the rest.
+    /// W7-81-write-route-three-way.md
+    #[test]
+    fn an_absorbed_ioexception_is_routed_so_it_is_not_echoed() {
+        // HotSpot's `catch (IOException x) { trouble = true; }` runs and the
+        // bytes go NOWHERE. A caller that treats this as "not written" writes
+        // them a second time, to a console HotSpot never touched.
+        assert_eq!(
+            DelegatedWrite::classify(false, true),
+            DelegatedWrite::Absorbed
+        );
+        assert!(DelegatedWrite::Absorbed.routed());
+        assert!(!DelegatedWrite::Absorbed.delivered());
+    }
+
+    #[test]
+    fn an_error_is_refused_so_the_console_fallback_survives() {
+        // The picocli / JUnit-console `NoSuchMethodError` shape. HotSpot lets
+        // it out of `println`; this VM cannot, so "not routed" — and the
+        // console fallback it triggers — is what keeps the text from vanishing.
+        assert_eq!(
+            DelegatedWrite::classify(false, false),
+            DelegatedWrite::Refused
+        );
+        assert!(!DelegatedWrite::Refused.routed());
+        assert!(!DelegatedWrite::Refused.delivered());
+    }
+
+    #[test]
+    fn an_internal_error_is_refused_and_never_absorbed() {
+        // `MethodCallFailed::InternalError` is not a Java throwable and can
+        // never be the `IOException` a JDK `catch` names, so absorbing it is
+        // never JDK parity — whatever the second argument says.
+        assert_eq!(
+            DelegatedWrite::classify(true, false),
+            DelegatedWrite::Refused
+        );
+        assert_eq!(
+            DelegatedWrite::classify(true, true),
+            DelegatedWrite::Refused
+        );
+    }
+
+    #[test]
+    fn a_clean_write_is_the_only_delivered_answer() {
+        assert!(DelegatedWrite::Delivered.routed());
+        assert!(DelegatedWrite::Delivered.delivered());
+        // `record_write_failure`'s `bool` is `delivered()`, NOT `routed()`.
+        // Conflating the two is the defect W7-81 unpicked, so pin them apart.
+        assert_ne!(
+            DelegatedWrite::Absorbed.routed(),
+            DelegatedWrite::Absorbed.delivered()
+        );
+    }
 }

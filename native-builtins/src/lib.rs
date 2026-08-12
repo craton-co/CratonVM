@@ -26360,6 +26360,12 @@ fn sink_is_writer(ctx: &mut dyn NativeContext, out: ObjectRef) -> Option<bool> {
 /// `this` is the `PrintStream`/`PrintWriter` whose `trouble` flag records a
 /// failure here — see `route_write_through_out`. It is NOT the write target;
 /// `out` is.
+///
+/// Returns whether the call was ROUTED, in `route_write_through_out`'s sense —
+/// not whether the sink took the bytes. Those two used to be the same `bool`
+/// here, which is what made an absorbed `IOException` fall through to the
+/// console fast path and print text HotSpot writes nowhere.
+/// W7-81-write-route-three-way.md
 fn write_string_to_writer(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -26377,7 +26383,7 @@ fn write_string_to_writer(
     // `PrintStream`'s private `write(String)` both end
     // `catch (IOException x) { trouble = true; }`.
     // W7-64-printstream-trouble-and-errormanager.md
-    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written)
+    cratonvm_native_api::print_error_state::classify_write_failure(ctx, this, written).routed()
 }
 
 /// Write text to real stdout/stderr if this is a system stream (dual-mode).
@@ -26388,9 +26394,14 @@ fn write_string_to_writer(
 /// `out.write([B,0,len)` so the real stream chain (tee → screen + digest →
 /// file) observes the output, exactly as the JDK `PrintStream` bytecode would.
 ///
-/// Returns `true` when it routed through `out`; `false` when `out` is null —
-/// the canonical synthetic `System.out`/`System.err` (fd-backed, no real
-/// underlying stream) — so the caller falls back to the fd fast-path.
+/// Returns `true` when the call was ROUTED — the sink took the bytes, or the
+/// sink raised the `IOException` the JDK's own `catch` names and HotSpot
+/// therefore wrote them nowhere. Returns `false` when there is no Java sink to
+/// route to (`out` is null — the canonical synthetic `System.out`/`System.err`,
+/// fd-backed) **or when the sink refused the call outright** (an `Error`, a
+/// `RuntimeException`, an internal VM failure), so the caller falls back to the
+/// fd fast-path. See the three-way table at the byte write below; both branches
+/// answer from it. W7-81-write-route-three-way.md
 ///
 /// This closes the `System.setOut`/`System.setErr` redirection gap: the
 /// blanket `println`/`print` natives previously resolved every PrintStream to
@@ -26442,35 +26453,38 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
     // `PrintWriter` receivers, and the `trouble` field is on both classes, so
     // the record is by field name on `this`.
     //
-    // Two residuals, both unchanged and both deliberate — and W7-70 measured
-    // that they are ONE mechanism, not two independent ones:
-    //   * an `Error` is still absorbed here where HotSpot lets it out.
-    //   * the `bool` this returns still reports a FAILED write as "not routed",
-    //     which sends the caller to the fd fast path and prints the text to
-    //     the console. HotSpot writes nowhere in that case.
+    // ROUTED, not DELIVERED — the two used to be one `bool` and the branches
+    // disagreed about which one it was. `classify_write_failure` splits the
+    // three outcomes the JDK bodies above actually have:
     //
-    // The second IS the first: `record_write_failure` answering `false` is
-    // exactly what makes the caller fall back, and that fallback is what keeps
-    // output flowing when the sink cannot take the call at all — the picocli /
-    // JUnit-console `NoSuchMethodError` case named above, which arrives as an
-    // `Error`. Propagating the `Error` with `?` therefore does not merely
-    // change signatures; it DELETES that fallback on the one path it exists
-    // for. Any repair has to decide what replaces it first.
+    //   clean                 -> Delivered -> routed. The sink has the bytes.
+    //   IOException           -> Absorbed  -> routed. The JDK's `catch` ran,
+    //                            `trouble` is set, and HotSpot wrote the bytes
+    //                            NOWHERE — so neither may we. Falling back here
+    //                            would print to a console HotSpot never touched.
+    //   Error / RuntimeException / InternalError
+    //                         -> Refused   -> NOT routed. HotSpot propagates
+    //                            these out of `println`; this helper cannot, so
+    //                            the caller's console fast path is what stops
+    //                            the text vanishing. That fallback is the
+    //                            picocli / JUnit-console `NoSuchMethodError`
+    //                            survival path named above, and it is the one
+    //                            thing a `?` here would delete.
     //
-    // The signature cost is also larger than the earlier note said: `stream_write`
-    // has 12 call sites and `stream_writeln` 11 (counted on this branch —
-    // "ten" was a sample, the same way W7-57's 9 and W7-64's 52 were), all 23
-    // in native bodies that already return `MethodCallResult`, plus
-    // `stream_writeln_inner`, `printwriter_autoflush_if_needed` and this
-    // helper's own `bool`.
+    // W7-70 left this undone for a stated reason — the absorption and the
+    // fallback are ONE mechanism — and the split above is how they come apart:
+    // not by changing signatures (nothing's arity moved; the 23 `stream_write`
+    // / `stream_writeln` call sites are untouched) but by deciding what "the
+    // sink refused the call" should do differently from "the sink handled the
+    // failure".
     //
-    // Note also that the two branches of this function do not currently agree:
-    // the `sink_is_writer` branch above returns `false` on a failure (so it
-    // falls back) and the byte branch below returns `true` unconditionally (so
-    // it does not). Whichever way that is reconciled is a behaviour change on
-    // the hottest path in the VM and needs its own measurement.
+    // Which branch became authoritative, per outcome: the BYTE branch on an
+    // absorbed `IOException` (it already declined to echo, and HotSpot writes
+    // nowhere), and the WRITER branch on a refusal (it already fell back, and
+    // silence is the one answer HotSpot never gives). Neither branch was right
+    // on both.
     // W7-64-printstream-trouble-and-errormanager.md,
-    // W7-70-printstream-close-noop.md
+    // W7-70-printstream-close-noop.md, W7-81-write-route-three-way.md
     let written = ctx.invoke_virtual(
         out,
         "write",
@@ -26481,8 +26495,7 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
             Value::Int(bytes.len() as i32),
         ],
     );
-    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
-    true
+    cratonvm_native_api::print_error_state::classify_write_failure(ctx, this, written).routed()
 }
 
 fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
@@ -26564,15 +26577,19 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     // { trouble = true; }`. HotSpot's autoflush therefore cannot raise an
     // `IOException` either; `println` declares nothing and never throws one.
     //
-    // Residual: an `Error` from that dispatch is absorbed here where HotSpot
-    // would let it out. This helper and its caller `stream_writeln` both
-    // return `()`; `stream_writeln` has 11 call sites and its sibling
-    // `stream_write` 12, all 23 in native bodies that already return
-    // `MethodCallResult` — "ten" in the note this replaces was a sample,
-    // counted on W7-70's branch. The reason this is not done is not the arity:
-    // it is that the same absorption is what produces the console fallback,
-    // which is load-bearing. See `route_write_through_out`.
-    // W7-57-close-flush-swallow-sweep.md, W7-70-printstream-close-noop.md
+    // Residual, and NOT the same residual `route_write_through_out` closed: an
+    // `Error` from that dispatch is absorbed here where HotSpot would let it
+    // out. W7-81's three-way answer does not reach this site, because this is
+    // not a write and there is nothing to route — an autoflush has no fallback
+    // destination, so "refused" and "absorbed" have the same consequence here
+    // (nothing) and the only remaining question is propagation. That is a
+    // signature change on `stream_writeln` (11 call sites) and its sibling
+    // `stream_write` (12) — all 23 in native bodies that already return
+    // `MethodCallResult`, "ten" in an earlier note having been a sample — and
+    // it is genuinely just arity here, unlike at the write path, where the
+    // arity was never the blocker. Left for a lane that can measure it.
+    // W7-57-close-flush-swallow-sweep.md, W7-70-printstream-close-noop.md,
+    // W7-81-write-route-three-way.md
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
 }
 
