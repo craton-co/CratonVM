@@ -4618,6 +4618,17 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             eprintln!("Virtual thread {} terminated with error: {:?}", tid, error);
         }
     }
+    // Java-side thread teardown, mirroring the platform-thread death path in
+    // `thread_start` — same helper, same position (after the uncaught-handler
+    // dispatch, before the JFR thread-end event and every teardown step that
+    // follows), and likewise outside the `if let Err(error)` block so it covers
+    // normal and abnormal termination alike. Re-read the `Thread` object from
+    // the registry, which is remapped after every GC; if it has no entry there
+    // is no receiver to clean up and the JFR/monitor sequence below already
+    // handles that case by producing no `term_monitor`.
+    if let Some(exit_thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) {
+        run_thread_exit_shared(&shared, &mut thread, exit_thread_obj);
+    }
     {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4898,6 +4909,140 @@ fn dispatch_uncaught_exception_shared(
     };
     thread.native_pin_roots.truncate(pin_base);
     result
+}
+
+/// Run `java.lang.Thread.exit()` on a thread that is terminating — the Java-side
+/// teardown HotSpot's VM performs and this one never did.
+///
+/// `Thread.exit()`'s javadoc is the contract: *"This method is called by the VM
+/// to give a Thread a chance to clean up before it actually exits."* Nothing in
+/// CratonVM called it, on either death path, in any mode, so its whole body was
+/// dead code here. JDK 25's body (`java.base/java/lang/Thread.java`, read from
+/// `src.zip`) is:
+///
+/// ```text
+/// private void exit() {
+///     try { if (headStackableScopes != null) StackableScope.popAll(); }
+///     finally { ThreadContainer c = threadContainer(); if (c != null) c.remove(this); }
+///     try { if (terminatingThreadLocals() != null) TerminatingThreadLocal.threadTerminated(); }
+///     finally { clearReferences(); }
+/// }
+/// ```
+///
+/// `container.remove(this)` is the load-bearing one and the reason this landed:
+/// it is the ONLY decrement of `ThreadFlock.threadCount`, and that decrement is
+/// what unparks an owner blocked in `awaitAll()`. Measured on the pre-change
+/// binary with a thread started through the JDK's own
+/// `Thread.start(ThreadContainer)`, the count stayed at 1 after the worker died
+/// and a `join()` issued at that point never returned in 3/3 runs, where HotSpot
+/// returned in 0-1 ms — see
+/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md §4. That is
+/// why the registration half in `native-builtins/src/shared_secrets_bridge.rs`
+/// is interlocked off behind `VM_REMOVES_THREADS_FROM_CONTAINERS` until this
+/// exists: adding a thread to a container that is never emptied converts
+/// "`join()` waits for nothing" into "`join()` waits forever".
+///
+/// # Why this is called before any teardown step, not after
+///
+/// `exit()` runs arbitrary Java: it can allocate, it can reach a safepoint, and
+/// `StackableScope.popAll()` is documented "this may block". So it must run
+/// while the caller is still an ordinary live mutator. Every step that follows
+/// on both death paths removes a precondition it needs:
+///
+/// * `tlab.retire()` — fills the TLAB's unused tail with a walkable filler.
+///   Allocating after that is not unsound (`retire()` is idempotent and the
+///   next carve refills), but it is pointless churn on a thread that has been
+///   declared finished.
+/// * `enter_inflated_or_contend(wake_obj)` — from there the caller OWNS the
+///   monitor on its own `Thread` object. Running Java that blocks while holding
+///   it is the three-way deadlock `Monitor::block_enter`'s doc comment warns
+///   about, and `block_enter` never checks safepoints.
+/// * `flush_thread_satb()` — after the drain, any reference this thread
+///   overwrites is logged into a buffer whose only strong `Arc` dies with the
+///   OS thread, so a marker loses gray sources it needed.
+/// * `mark_dead()` — after it the collector no longer scans this thread's
+///   frames or locals. Java run past that point allocates objects nothing roots:
+///   a use-after-free, not a cleanup.
+/// * `release_monitors_held_by_except()` — sweeps every monitor still held.
+///
+/// The one thing that must precede it is the uncaught-exception dispatch, and
+/// not only for tidiness: `clearReferences()` nulls `uncaughtExceptionHandler`,
+/// so running `exit()` first would delete the handler before it was consulted.
+/// HotSpot orders it the same way — `JavaThread::exit` calls `Thread.exit()`
+/// after the handler has run and before it posts JVMTI `ThreadEnd` and before
+/// `ensure_join`'s notify — so the call sites place this between the handler
+/// block and the JFR/JVMTI thread-end events.
+///
+/// # Resolution
+///
+/// `exit` is `private`, so it is resolved on `java/lang/Thread` itself rather
+/// than on the receiver's runtime class: a `Thread` subclass (or
+/// `ThreadBuilders$BoundVirtualThread`, which every "virtual" thread on this VM
+/// really is) does not inherit a private method into its own dispatch surface,
+/// and a same-named method on the subclass must NOT win. `invoke_special_shared_on_class`
+/// is the entry point that says exactly that — invokespecial semantics, walk to
+/// the declaring class, dispatch there and only there, no iface/abstract
+/// retarget — and its pre-resolved form skips the loader-blind by-name lookup
+/// (`java/lang/Thread` is bootstrap and unambiguous, but the ambiguity guard is
+/// not free and not worth touching from a thread-death path).
+///
+/// # Errors are reported, never propagated
+///
+/// A throw out of `exit()` cannot be allowed to escape: everything after this
+/// call on both paths is what marks the thread dead and notifies the monitor
+/// that wakes `Thread.join()`, so an early return would trade one leak for a
+/// guaranteed hang. It is equally not swallowed — a silent `let _ =` here would
+/// hide, for instance, `ThreadFlock.onExit`'s `assert removed` firing under
+/// `-ea`, which is the precise signature of a double-remove. So: log at WARN,
+/// unconditionally, naming the thread and the error, and carry on.
+fn run_thread_exit_shared(shared: &SharedVm, thread: &mut JvmThread, thread_obj: ObjectRef) {
+    // Resolve `java/lang/Thread` without loading it: a thread that is
+    // terminating has already run Java, so the class is loaded. Then check
+    // `exit()V` is actually there before invoking, so a class library whose
+    // `java/lang/Thread` is a stub without it (a `--synthetic-jdk` build; every
+    // mode this binary ships supports has the real one) is a silent no-op
+    // rather than a `NoSuchMethodError` warning on every single thread death.
+    let (thread_cid, has_exit) = {
+        let cm = shared.classes.class_manager.read();
+        match cm.get_loaded_class_id("java/lang/Thread") {
+            Some(cid) => (
+                Some(cid),
+                crate::classloading::find_method_recursive(cid, "exit", "()V", &cm.class_store)
+                    .is_some(),
+            ),
+            None => (None, false),
+        }
+    };
+    let Some(thread_cid) = thread_cid.filter(|_| has_exit) else {
+        return;
+    };
+
+    let result = invoke_special_shared_on_class(
+        shared,
+        thread,
+        thread_cid,
+        "java/lang/Thread",
+        "exit",
+        "()V",
+        &[Value::Object(Some(thread_obj))],
+    );
+    if let Err(e) = result {
+        // Drain the native-return slot for the same reason the uncaught-handler
+        // block a few hundred lines down drains it: a leftover there is read as
+        // a substitute for a thrown exception by the next consumer, and
+        // misattributes it.
+        thread.native_pending_return = None;
+        tracing::warn!(
+            "Thread.exit() failed on terminating thread tid={} name={:?}: {:?} — its \
+             Java-side cleanup (StackableScope.popAll / container.remove / \
+             clearReferences) did not complete, so a ThreadContainer may still hold \
+             this thread. Termination continues regardless, so Thread.join() is \
+             still woken.",
+            thread.thread_id.0,
+            thread.name,
+            e,
+        );
+    }
 }
 
 #[inline]
@@ -13042,6 +13187,29 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     eprintln!("Thread {} terminated with error: {:?}", tid, e);
                 }
             }
+            // Java-side thread teardown — `Thread.exit()`, which HotSpot's VM
+            // calls here and this VM never called at all. See
+            // `run_thread_exit_shared` for the JDK body, the measurement, and
+            // the full argument for why this sits exactly here.
+            //
+            // Deliberately OUTSIDE the `if let Err(e) = result` block above, so
+            // it runs on the normal and the abnormal path alike. The abnormal
+            // one is the one that matters most: a task that ends by throwing is
+            // precisely when a structured-concurrency owner is parked waiting
+            // for the flock count to fall, and a cleanup that only covers the
+            // happy path leaves exactly the leak this fixes.
+            //
+            // Re-read the `Thread` object from the registry rather than reusing
+            // `run_thread_obj` from before the `run()` invoke: the registry copy
+            // is remapped after every GC (`update_thread_objs_after_gc`) and the
+            // captured one is not, and `run()` plus the uncaught dispatch is an
+            // arbitrarily long window for a moving collection — the same stale-ref
+            // UAF the `wake_obj` read further down documents.
+            let exit_thread_obj = shared_arc
+                .threads.thread_registry
+                .java_thread_obj(tid)
+                .unwrap_or(thread_obj_for_spawn);
+            run_thread_exit_shared(&shared_arc, &mut jvm_thread, exit_thread_obj);
             // (No carrier-permit release on exit: unreachable here — see the
             // note at the top of this closure — and the permit pool it
             // targeted owned no carrier.)
