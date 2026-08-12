@@ -6,7 +6,7 @@
 three correctness fixes.
 
 Supersedes the one-sample estimate in
-`jni-native-codec-sigsegv-20260812.md` ("~12x throughput gap"): that figure was
+`../../internal/fixed-bugs/netty-jni-native-codec-sigsegv-FIXED-20260812.md` ("~12x throughput gap"): that figure was
 taken before the `TimeUnit`-ordinal defect was found, so part of what it
 attributed to slowness was actually `await(30, SECONDS)` waiting 30 ms.
 

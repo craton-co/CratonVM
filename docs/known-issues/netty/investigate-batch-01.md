@@ -11,7 +11,10 @@ owns exactly the 15 classes below — do not touch classes listed in other batch
 pages.
 
 Originally found during the full 657-class, 3-GC-variant (default/G1/ZGC) suite
-run on Windows (binary built from an isolated worktree at commit `70c8b8cd6`).
+run on Windows (binary built from an isolated worktree at commit `70c8b8cd6`). The
+other already-confirmed CratonVM bug from that run, the JNI-native-codec
+SIGSEGV, was fixed separately and now lives at
+`docs/internal/fixed-bugs/netty-jni-native-codec-sigsegv-FIXED-20260812.md`.
 "status seen" is what that run recorded; "explained by" is the 2026-08-12
 triage on the Azure Linux host (`20.80.105.49`), binary built from `origin/dev`
 `1c4ce7d3a`.

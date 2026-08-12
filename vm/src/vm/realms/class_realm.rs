@@ -396,7 +396,16 @@ pub struct ClassRealm {
     /// Lambda proxy registry: maps synthetic proxy ClassId → LambdaCallSite metadata.
     /// Used by the interpreter to dispatch method calls on lambda proxy objects.
     /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
+    ///
+    /// Held behind an `Arc` because `try_lambda_dispatch` must take an owned
+    /// copy out from under the `RwLock` before it can run the lambda body (the
+    /// body can itself register proxies, so the read guard cannot be held
+    /// across it). With a bare `LambdaCallSite` that copy was a DEEP CLONE on
+    /// every lambda call — six `Arc<str>` refcount pairs plus a fresh
+    /// `Vec<char>` — and the clone/drop/`mi_free`/`memmove` around it measured
+    /// ~27% of a lambda-only `perf` profile. As an `Arc` the same line is one
+    /// refcount bump.
+    pub lambda_proxies: RwLock<FxHashMap<ClassId, Arc<LambdaCallSite>>>,
 
     /// Cache of the synthesized `java.lang.reflect.Method` (with its
     /// `parameterTypes`/`exceptionTypes` arrays and name/signature strings

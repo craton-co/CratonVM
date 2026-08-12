@@ -1807,6 +1807,32 @@ pub fn compile_with_param_slots(
     // The emit hot path records the overflow instead of panicking — bail to
     // the interpreter here rather than returning a truncated, unsafe method.
     if compiler.buf.overflowed() {
+        // A named codegen invariant break is NOT a sizing problem, and the two
+        // used to be indistinguishable here: every `mark_overflowed` site — a
+        // `rel8` displacement out of range, a frame offset with no ModRM form,
+        // a deopt stub with no register-save area — landed in the branch below
+        // and was reported as "code buffer estimate too small". Two costs, both
+        // paid in production: the printed diagnostic named a cause that was not
+        // the cause (with `wanted` UNDER `capacity`, contradicting itself), and
+        // because the shortfall site is `try_compile`'s one bail-list exemption
+        // the method was re-lowered in full on EVERY warmup-gate re-attempt,
+        // failing identically each time and never becoming compiled.
+        //
+        // A bigger buffer cannot encode a displacement that has no encoding, so
+        // these are permanent: name the reason and fall through to the ordinary
+        // (bail-listed) refusal.
+        if let Some(reason) = compiler.buf.codegen_failure_reason() {
+            tracing::warn!(
+                method = method_key,
+                code_len = code_len,
+                capacity = compiler.buf.capacity(),
+                wanted = compiler.buf.wanted(),
+                reason = reason,
+                "JIT compile bailed: codegen invariant cannot be encoded; method stays interpreted"
+            );
+            crate::note_jit_bail_site(reason);
+            return None;
+        }
         // Name the method and the shortfall. A silent bail here is
         // indistinguishable from "the JIT chose not to compile this", which is
         // how a whole class of invoke-heavy methods came to stop being compiled
@@ -1832,7 +1858,15 @@ pub fn compile_with_param_slots(
         // so the first overflow retired the method for the life of the process
         // — the estimate got exactly one chance and a method that needed more
         // was never compiled again. `try_compile` now exempts this one site.
-        crate::note_code_buffer_shortfall(method_key, compiler.buf.wanted());
+        crate::note_code_buffer_shortfall(
+            method_key,
+            compiler.buf.wanted(),
+            // The capacity that FAILED, so the next hint is strictly larger than
+            // it. Without this the doubled `wanted` could land at or below the
+            // heuristic, `estimated_size.max(hint)` re-allocated the same size,
+            // and the retry was a bit-identical repeat — forever.
+            compiler.buf.capacity(),
+        );
         crate::note_jit_bail_site(crate::CODE_BUFFER_TOO_SMALL_SITE);
         return None;
     }

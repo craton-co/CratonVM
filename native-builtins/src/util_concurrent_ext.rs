@@ -1171,25 +1171,47 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // alongside the lock ones; both are registered together above.
 
     // --- CyclicBarrier ---
-    let cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
-        cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-    );
-    registry.register(cb, "await", "()I", native_cb_await);
-    registry.register(
-        cb,
-        "await",
-        "(JLjava/util/concurrent/TimeUnit;)I",
-        native_cb_await_timeout,
-    );
-    registry.register(cb, "getParties", "()I", native_cb_get_parties);
-    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
-    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
-    registry.register(cb, "reset", "()V", native_cb_reset);
+    //
+    // Synthetic-AQS mode only. The synthetic barrier has NO GENERATION: a trip
+    // resets one shared `count` to 0 and notifies, and every waiter decides it
+    // was released by re-reading `count == 0`. That test is only valid while
+    // nobody re-enters the barrier. Under a tight loop (worker calls `await()`
+    // again immediately) a released waiter can be preempted before it re-reads;
+    // by then a faster party has bumped `count` back to 1.. so the waiter
+    // concludes it was NOT released and waits again — with its wake-up already
+    // spent. The barrier is then permanently one party short and every
+    // subsequent trip deadlocks. Reproduced 100% (10/10 runs, JIT on AND
+    // `--nojit`) by a 4-party/20-round barrier; the same loop over the real JDK
+    // bytecode passes. It is what hangs `io.netty.util.NettyRuntimeTests`
+    // (`testRacingGetAndGet`), `DefaultPromiseTest` and `FastThreadLocalTest`.
+    //
+    // With real AQS (the default) the real JDK `CyclicBarrier` — ReentrantLock
+    // + Condition + an identity-compared `Generation` — is correct and needs no
+    // help, exactly as for ReentrantLock/Lock/Condition and Semaphore above.
+    // The constructors are gated with it, not separately: `native_cb_init`
+    // stores its int[3] holder in the receiver's slot 0, which is the real
+    // layout's `lock` field.
+    if !real_aqs {
+        let cb = "java/util/concurrent/CyclicBarrier";
+        registry.register(cb, "<init>", "(I)V", native_cb_init);
+        registry.register(
+            cb,
+            "<init>",
+            "(ILjava/lang/Runnable;)V",
+            native_cb_init_action,
+        );
+        registry.register(cb, "await", "()I", native_cb_await);
+        registry.register(
+            cb,
+            "await",
+            "(JLjava/util/concurrent/TimeUnit;)I",
+            native_cb_await_timeout,
+        );
+        registry.register(cb, "getParties", "()I", native_cb_get_parties);
+        registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
+        registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
+        registry.register(cb, "reset", "()V", native_cb_reset);
+    }
     registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---

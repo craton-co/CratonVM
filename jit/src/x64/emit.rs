@@ -79,7 +79,8 @@ impl Compiler {
     /// for emitters that cannot return a `Result`.
     pub(super) fn modrm_rbp_disp(&mut self, reg: u8, disp: i32) {
         let Ok(d) = Disp::encode_for_base(-(disp as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(d.modrm(reg, RBP));
@@ -148,7 +149,8 @@ impl Compiler {
     /// truncated instruction behind.
     pub(super) fn emit_movq_mem_rbp_from_xmm(&mut self, offset: i32, xmm: u8) {
         let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(0x66);
@@ -176,7 +178,8 @@ impl Compiler {
         // Round-9 LOW fix: see `emit_movq_mem_rbp_from_xmm` — the hand-written
         // `(-127..=128)` guard is now the shared checked encoder.
         let Ok(d) = Disp::encode_for_base(-(offset as i64), RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("frame-displacement-unencodable");
             return;
         };
         self.buf.emit_byte(0xF3);
@@ -1167,11 +1170,11 @@ impl Compiler {
         // today) — bail rather than emit an instruction addressing via a
         // fabricated SIB.
         if base_requires_sib(base) {
-            self.buf.mark_overflowed();
+            self.buf.mark_codegen_unencodable("mem8-base-requires-sib");
             return;
         }
         let Ok(d) = Disp::encode_for_base(disp as i64, base) else {
-            self.buf.mark_overflowed();
+            self.buf.mark_codegen_unencodable("mem8-displacement-unencodable");
             return;
         };
         // This form has always emitted an explicit displacement byte, including

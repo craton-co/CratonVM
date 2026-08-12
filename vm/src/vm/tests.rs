@@ -2635,7 +2635,7 @@ use std::sync::Arc;
             .classes
             .lambda_proxies
             .write()
-            .insert(proxy_class_id, call_site);
+            .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
         // Allocate proxy with no captures
         let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 0);
@@ -2693,7 +2693,7 @@ use std::sync::Arc;
             .classes
             .lambda_proxies
             .write()
-            .insert(proxy_class_id, call_site);
+            .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
         // Allocate proxy with captured value 100
         let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 1);
@@ -2759,7 +2759,7 @@ use std::sync::Arc;
             .classes
             .lambda_proxies
             .write()
-            .insert(proxy_class_id, call_site);
+            .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
         // Allocate proxy with captured PrintStream
         let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 1);
@@ -2875,7 +2875,7 @@ use std::sync::Arc;
 
         shared.classes.lambda_proxies.write().insert(
             proxy1,
-            LambdaCallSite {
+            std::sync::Arc::new(LambdaCallSite {
                 functional_interface_id: None,
                 functional_interface: "java/lang/Runnable".into(),
                 sam_method_name: "run".into(),
@@ -2890,11 +2890,11 @@ use std::sync::Arc;
                 capture_types: vec![],
                 proxy_class_id: proxy1,
                 serializable_flag: false,
-            },
+            }),
         );
         shared.classes.lambda_proxies.write().insert(
             proxy2,
-            LambdaCallSite {
+            std::sync::Arc::new(LambdaCallSite {
                 functional_interface_id: None,
                 functional_interface: "java/util/function/Supplier".into(),
                 sam_method_name: "get".into(),
@@ -2909,7 +2909,7 @@ use std::sync::Arc;
                 capture_types: vec!['I'],
                 proxy_class_id: proxy2,
                 serializable_flag: false,
-            },
+            }),
         );
 
         // Allocate proxy objects
@@ -7746,7 +7746,7 @@ use std::sync::Arc;
         {
             let mut proxies = shared.classes.lambda_proxies.write();
             if proxies.len() < MAX_LAMBDA_PROXIES {
-                proxies.insert(proxy_class_id, call_site);
+                proxies.insert(proxy_class_id, std::sync::Arc::new(call_site));
             }
         }
         let proxy = shared.mem.heap.alloc_object(proxy_class_id, captures.len());
@@ -68757,7 +68757,7 @@ use std::sync::Arc;
                 let cid = ClassId::new(0x8000_0000 + i as u32);
                 proxies.insert(
                     cid,
-                    crate::classloading::resolution::LambdaCallSite {
+                    std::sync::Arc::new(crate::classloading::resolution::LambdaCallSite {
                         functional_interface_id: None,
                         functional_interface: "test/Func".into(),
                         sam_method_name: "apply".into(),
@@ -68772,7 +68772,7 @@ use std::sync::Arc;
                         capture_types: vec![],
                         proxy_class_id: cid,
                         serializable_flag: false,
-                    },
+                    }),
                 );
             }
             assert_eq!(proxies.len(), MAX_LAMBDA_PROXIES);

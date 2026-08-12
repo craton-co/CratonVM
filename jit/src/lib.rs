@@ -360,6 +360,11 @@ pub struct ExecutableBuffer {
     ptr: *mut u8,
     len: usize,
     capacity: usize,
+    /// Named codegen invariant that discarded this method when the discard was
+    /// NOT a capacity problem — see
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable). `None`
+    /// alongside a set `overflowed` means the buffer really was too small.
+    codegen_failed: Option<&'static str>,
     /// Set when an `emit`/`emit_byte` call could not fit in the buffer.
     /// `estimated_size` in the x64 backend is a heuristic, so a pathological
     /// method can exceed it. Rather than panicking the whole process, the
@@ -413,6 +418,7 @@ impl ExecutableBuffer {
             len: 0,
             capacity,
             overflowed: false,
+            codegen_failed: None,
             wanted: 0,
             published: false,
             tag: "untagged",
@@ -498,15 +504,58 @@ impl ExecutableBuffer {
 
     /// Force the buffer into the [`overflowed`](Self::overflowed) state.
     ///
-    /// Used by codegen sites that detect a hard codegen invariant break
-    /// (e.g. a branch displacement that does not fit its encoding) and
-    /// cannot return `Result` to their caller. Setting this flag causes
-    /// the surrounding compile driver to discard the half-emitted method
-    /// and fall back to the interpreter via the existing
-    /// `if buf.overflowed() { return None; }` check in `compile`.
+    /// Reserved for a genuine CAPACITY problem — a write that did not fit, or a
+    /// patch offset past the emitted length. A codegen site that discards the
+    /// method for any OTHER reason must use
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable) instead:
+    /// see that method for why the distinction is load-bearing.
     #[inline]
     pub fn mark_overflowed(&mut self) {
         self.overflowed = true;
+    }
+
+    /// Discard the method because codegen hit a hard invariant it cannot encode
+    /// — a `rel8`/`rel32` displacement out of range, a frame offset with no
+    /// ModRM form, a deopt stub whose frame reserved no register-save area.
+    ///
+    /// These sites used to call [`mark_overflowed`](Self::mark_overflowed),
+    /// which made the driver report every one of them as
+    /// *"code buffer estimate too small; retrying at the measured size"*. That
+    /// was wrong twice over:
+    ///
+    /// * **It named the wrong defect.** The buffer was not too small; `wanted`
+    ///   on such a bail is typically well UNDER `capacity`, so the printed
+    ///   diagnostic contradicted itself and no reader could tell which of the
+    ///   ten sites had fired.
+    /// * **It retried forever.** The overflow bail is the one bail
+    ///   `try_compile` exempts from the permanent bail list, on the theory that
+    ///   the next attempt allocates from a measurement instead of the
+    ///   heuristic. But the hint is derived from `wanted`, and when `wanted` is
+    ///   below the heuristic the recomputed size is IDENTICAL — so the method
+    ///   was re-lowered in full, and failed in exactly the same place, on every
+    ///   warmup-gate re-attempt for the life of the process, while never
+    ///   becoming compiled.
+    ///
+    /// A bigger buffer cannot fix any of these, so they are permanent: the
+    /// driver reports `reason` by name and lets `try_compile` bail-list the
+    /// method after ONE attempt.
+    ///
+    /// Also sets `overflowed`, so every existing
+    /// `if buf.overflowed() { return None; }` discard keeps working unchanged.
+    #[inline]
+    pub fn mark_codegen_unencodable(&mut self, reason: &'static str) {
+        if self.codegen_failed.is_none() {
+            self.codegen_failed = Some(reason);
+        }
+        self.overflowed = true;
+    }
+
+    /// The named codegen invariant that discarded this method, if the discard
+    /// was NOT a capacity problem. `None` means a genuine buffer overflow (or
+    /// no failure at all — check [`overflowed`](Self::overflowed) first).
+    #[inline]
+    pub fn codegen_failure_reason(&self) -> Option<&'static str> {
+        self.codegen_failed
     }
 
     /// Current write position (offset from start).
@@ -652,7 +701,7 @@ impl ExecutableBuffer {
             Ok(v) => {
                 self.try_patch_byte(patch, v as u8).ok();
             }
-            Err(_) => self.mark_overflowed(),
+            Err(_) => self.mark_codegen_unencodable("rel8-displacement-out-of-range"),
         }
     }
 
@@ -12769,37 +12818,67 @@ pub const CODE_BUFFER_TOO_SMALL_SITE: &str = "code-buffer-estimate-too-small";
 /// receives as `method_key`. Small and write-once-per-overflow: only methods
 /// that actually overflowed ever appear, which on the workloads measured here
 /// is none at all.
+/// `(measured, attempts)` per overflowing method.
+type CodeBufferShortfall = (usize, u32);
+
 static CODE_BUFFER_SHORTFALLS: std::sync::OnceLock<
-    parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>>,
+    parking_lot::RwLock<rustc_hash::FxHashMap<String, CodeBufferShortfall>>,
 > = std::sync::OnceLock::new();
 
-fn code_buffer_shortfalls() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>> {
+fn code_buffer_shortfalls(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<String, CodeBufferShortfall>> {
     CODE_BUFFER_SHORTFALLS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
-/// Record that compiling `method_key` wanted `wanted` bytes of code buffer.
+/// How many times one method may be re-lowered to chase a bigger code buffer
+/// before the refusal becomes permanent.
+///
+/// Each doubling is a full single-pass lowering plus an `mmap`/`munmap` of the
+/// estimate, paid on the calling thread at the warmup gate. Three doublings take
+/// the buffer to 8x the first failing capacity; a method that still does not fit
+/// is not going to, and retrying it forever is the failure mode this cap exists
+/// to bound (see [`ExecutableBuffer::mark_codegen_unencodable`], which removed
+/// the OTHER way this loop used to become infinite).
+pub const MAX_CODE_BUFFER_RETRIES: u32 = 3;
+
+/// Record that compiling `method_key` wanted `wanted` bytes and failed at a
+/// buffer of `failed_capacity` bytes.
 ///
 /// Keeps the LARGEST observation: a later attempt can take a shorter path
 /// through the same method (a callee that has since become inlinable, a guard
 /// that de-speculated), and sizing the next buffer from that smaller number
 /// would overflow again.
-pub fn note_code_buffer_shortfall(method_key: &str, wanted: usize) {
-    if method_key.is_empty() || wanted == 0 {
+///
+/// `failed_capacity` is part of that maximum, and it is what makes the retry
+/// CONVERGE. `wanted` alone does not: an overflow can be recorded with `wanted`
+/// well below the capacity that failed (`try_patch_*` overruns add nothing to
+/// it), and `code_buffer_hint`'s doubling of such a `wanted` produces a size the
+/// heuristic already beat — so `estimated_size.max(hint)` re-allocated exactly
+/// the capacity that had just failed, and the next attempt failed identically.
+/// Taking `failed_capacity` into the maximum guarantees each attempt allocates
+/// strictly more than the last.
+pub fn note_code_buffer_shortfall(method_key: &str, wanted: usize, failed_capacity: usize) {
+    if method_key.is_empty() {
+        return;
+    }
+    let measured = wanted.max(failed_capacity);
+    if measured == 0 {
         return;
     }
     let mut map = code_buffer_shortfalls().write();
-    let slot = map.entry(method_key.to_string()).or_insert(0);
-    *slot = (*slot).max(wanted);
+    let slot = map.entry(method_key.to_string()).or_insert((0, 0));
+    slot.0 = slot.0.max(measured);
+    slot.1 = slot.1.saturating_add(1);
 }
 
 /// The measured buffer size to use for `method_key`, if a previous attempt
 /// overflowed.
 ///
-/// Doubled, because `wanted` UNDER-reports: it accumulates the bytes `emit`
-/// asked for, and an out-of-bounds `try_patch_*` adds nothing to it — so the
-/// true requirement is at least `wanted` and possibly more. Doubling converges
-/// in one step for every shape seen so far instead of burning a second
-/// `tier_fail_count` retry to discover the same thing again.
+/// Doubled, because the recorded measurement UNDER-reports: `wanted` accumulates
+/// the bytes `emit` asked for, and an out-of-bounds `try_patch_*` adds nothing to
+/// it — so the true requirement is at least the measurement and possibly more.
+/// Doubling converges in one step for every shape seen so far instead of burning
+/// a second `tier_fail_count` retry to discover the same thing again.
 pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
     if method_key.is_empty() {
         return None;
@@ -12807,7 +12886,23 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
     code_buffer_shortfalls()
         .read()
         .get(method_key)
-        .map(|w| w.saturating_mul(2))
+        .map(|(measured, _)| measured.saturating_mul(2))
+}
+
+/// Has `method_key` used up its [`MAX_CODE_BUFFER_RETRIES`] re-lowerings?
+///
+/// `try_compile` exempts the code-buffer bail from the permanent bail list so
+/// the next attempt can run at the measured size. That exemption is only sound
+/// while the retries are bounded — otherwise a method that can never fit is
+/// re-lowered on every warmup-gate re-attempt for the life of the process.
+pub fn code_buffer_retries_exhausted(method_key: &str) -> bool {
+    if method_key.is_empty() {
+        return false;
+    }
+    code_buffer_shortfalls()
+        .read()
+        .get(method_key)
+        .is_some_and(|(_, attempts)| *attempts >= MAX_CODE_BUFFER_RETRIES)
 }
 
 /// Render a taken bail site for a diagnostic line.
@@ -13952,7 +14047,18 @@ pub fn try_compile_with_invokespecial_resolver(
     // the two attempts, the retry is exactly the experiment worth running.
     // Every other backend-attempted `None` is a property of the class file and
     // stays permanent.
-    let retryable = matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _)));
+    //
+    // BOUNDED, though. Each retry is a full re-lowering plus an `mmap`/`munmap`
+    // of the estimate, on the calling thread, and the exemption used to have no
+    // stopping condition at all: a method the estimate could never satisfy was
+    // re-lowered on every warmup-gate re-attempt for the whole run and never
+    // became compiled. After `MAX_CODE_BUFFER_RETRIES` doublings (8x the first
+    // failing capacity) the refusal becomes permanent like any other.
+    let retryable = matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _)))
+        && !code_buffer_retries_exhausted(&format!(
+            "{}.{}:{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        ));
     if result.is_none() && backend_attempted && !retryable {
         // The heavy backend path ran and returned None — treat as
         // permanent.  Future try_compile calls for this method
@@ -19308,7 +19414,8 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 #[cfg(test)]
 mod code_buffer_retry_tests {
     use super::{
-        code_buffer_hint, note_code_buffer_shortfall, CODE_BUFFER_TOO_SMALL_SITE,
+        code_buffer_hint, code_buffer_retries_exhausted, note_code_buffer_shortfall,
+        ExecutableBuffer, CODE_BUFFER_TOO_SMALL_SITE, MAX_CODE_BUFFER_RETRIES,
     };
 
     /// A method nobody ever measured has no hint, so the heuristic estimate
@@ -19318,8 +19425,9 @@ mod code_buffer_retry_tests {
         assert_eq!(code_buffer_hint("com/example/Never.touched:()V"), None);
         // An empty key is what the legacy `compile()` test wrapper passes; it
         // must not collide with a real method under the empty string.
-        note_code_buffer_shortfall("", 99_999);
+        note_code_buffer_shortfall("", 99_999, 99_999);
         assert_eq!(code_buffer_hint(""), None);
+        assert!(!code_buffer_retries_exhausted(""));
     }
 
     /// The recorded shortfall comes back doubled — `wanted` under-reports,
@@ -19327,7 +19435,7 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_measured_shortfall_comes_back_doubled() {
         let key = "com/example/Big.method:(I)V";
-        note_code_buffer_shortfall(key, 6238);
+        note_code_buffer_shortfall(key, 6238, 4096);
         assert_eq!(code_buffer_hint(key), Some(12_476));
     }
 
@@ -19339,8 +19447,8 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_smaller_later_measurement_does_not_shrink_the_hint() {
         let key = "com/example/Bimodal.method:()V";
-        note_code_buffer_shortfall(key, 15_519);
-        note_code_buffer_shortfall(key, 4_000);
+        note_code_buffer_shortfall(key, 15_519, 4096);
+        note_code_buffer_shortfall(key, 4_000, 4096);
         assert_eq!(code_buffer_hint(key), Some(31_038));
     }
 
@@ -19350,8 +19458,94 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_zero_measurement_is_not_recorded() {
         let key = "com/example/Zero.method:()V";
-        note_code_buffer_shortfall(key, 0);
+        note_code_buffer_shortfall(key, 0, 0);
         assert_eq!(code_buffer_hint(key), None);
+    }
+
+    /// THE NON-CONVERGENCE THIS FIXED. `wanted` can be recorded well BELOW the
+    /// capacity that failed (`try_patch_*` overruns add nothing to it), and the
+    /// driver sizes the next buffer as `max(heuristic, hint)`. With the hint
+    /// derived from `wanted` alone, a `wanted` under half the failing capacity
+    /// produced a hint the failing capacity already beat — so the "retry"
+    /// allocated the SAME number of bytes and failed in the same place, on every
+    /// warmup-gate re-attempt, forever. Folding the failed capacity into the
+    /// measurement makes each attempt strictly larger than the last.
+    #[test]
+    fn the_hint_always_exceeds_the_capacity_that_failed() {
+        let key = "com/example/UnderReported.method:()V";
+        let failed_capacity = 171_424;
+        note_code_buffer_shortfall(key, 12_000, failed_capacity);
+        let hint = code_buffer_hint(key).expect("a measured method has a hint");
+        assert!(
+            hint > failed_capacity,
+            "hint {hint} must exceed the capacity {failed_capacity} that just failed, \
+             or the retry re-runs the identical compile"
+        );
+    }
+
+    /// The bail-list exemption is bounded. Each retry is a full re-lowering plus
+    /// an mmap/munmap on the calling thread; without a cap a method the estimate
+    /// can never satisfy pays that on every re-attempt for the whole run.
+    #[test]
+    fn the_retry_exemption_runs_out() {
+        let key = "com/example/Hopeless.method:()V";
+        for i in 0..MAX_CODE_BUFFER_RETRIES {
+            assert!(
+                !code_buffer_retries_exhausted(key),
+                "attempt {i} must still be allowed to retry"
+            );
+            note_code_buffer_shortfall(key, 8192, 8192);
+        }
+        assert!(
+            code_buffer_retries_exhausted(key),
+            "after {MAX_CODE_BUFFER_RETRIES} doublings the refusal must become permanent"
+        );
+    }
+
+    /// A codegen invariant that has no encoding is NOT a sizing problem, and it
+    /// must not be reported or retried as one: `mark_codegen_unencodable` still
+    /// discards the method (so every `if buf.overflowed()` bail keeps working)
+    /// but names its own reason, which the driver reports instead of the
+    /// code-buffer message and which `try_compile` bail-lists permanently.
+    #[test]
+    fn an_unencodable_codegen_invariant_is_not_reported_as_a_short_buffer() {
+        let mut buf = ExecutableBuffer::new(4096).expect("allocate");
+        assert!(!buf.overflowed());
+        assert_eq!(buf.codegen_failure_reason(), None);
+        buf.mark_codegen_unencodable("rel8-displacement-out-of-range");
+        assert!(
+            buf.overflowed(),
+            "the existing overflowed() discards must still fire"
+        );
+        assert_eq!(
+            buf.codegen_failure_reason(),
+            Some("rel8-displacement-out-of-range")
+        );
+
+        // A genuine capacity overflow reports NO named reason, so the driver
+        // keeps taking the measure-and-retry path for it.
+        let mut small = ExecutableBuffer::new(4096).expect("allocate");
+        small.emit(&[0u8; 8192]);
+        assert!(small.overflowed());
+        assert_eq!(small.codegen_failure_reason(), None);
+        assert!(
+            small.wanted() > small.capacity(),
+            "a real overflow's `wanted` exceeds its capacity; that is what the retry measures"
+        );
+    }
+
+    /// The FIRST reason wins. A codegen site that bails mid-instruction can
+    /// leave later emitters running against a sticky-overflowed buffer, and
+    /// whichever of them marks next must not overwrite the diagnosis.
+    #[test]
+    fn the_first_named_reason_is_the_one_reported() {
+        let mut buf = ExecutableBuffer::new(4096).expect("allocate");
+        buf.mark_codegen_unencodable("deopt-stub-without-saved-regs");
+        buf.mark_codegen_unencodable("rel8-displacement-out-of-range");
+        assert_eq!(
+            buf.codegen_failure_reason(),
+            Some("deopt-stub-without-saved-regs")
+        );
     }
 
     /// The exemption in `try_compile` matches on this constant, and the
