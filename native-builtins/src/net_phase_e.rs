@@ -4269,6 +4269,92 @@ fn re1_socket_read_stream(
     Ok(Some(Value::Int(n as i32)))
 }
 
+/// Largest payload handed to one `send` while a blocking write is sliced.
+///
+/// A blocking-mode `send` of N bytes does not return until all N are queued, so
+/// an unsliced `write_all` parks inside the syscall for an unbounded time and
+/// observes neither the close nor the poll cadence. 8 KiB matches
+/// `socket_channel::WRITE_SLICE_MAX`, whose doc comment carries the measured
+/// evidence (`SendWake.java`, Windows 11, JDK 25.0.3: a writer parked in a
+/// blocking `send` was still parked 6 s after `shutdown(SHUT_WR)`; only closing
+/// the handle woke it). The common protocol frame is smaller than one slice and
+/// is therefore still issued whole.
+const RE1_WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// A blocking `SocketOutputStream.write` that observes an asynchronous
+/// `Socket.close()` — the write twin of [`re1_read_close_aware`].
+///
+/// The reader on this surface was fixed on 2026-08-11 and the writer beside it
+/// was not, which left the symmetric hole: a thread parked in `write_all`
+/// behind a peer that has stopped reading stays parked through
+/// `Socket.close()`, for exactly the reason the reader did —
+/// [`re1_close_socket`] removes the registry entry and issues `shutdown(Both)`,
+/// but cannot close the OS handle while this writer holds an `Arc` clone of the
+/// `TcpStream`.
+///
+/// # Mechanism, not a second mechanism
+///
+/// Identical loop to [`re1_read_close_aware`]: poll with a bounded slice,
+/// re-ask [`re1_stream_still_registered`] after the poll, return
+/// [`re1_socket_closed_err`] once the slot is gone. Only the direction of the
+/// poll and the slicing differ.
+///
+/// # What a partial transfer answers
+///
+/// A close that lands after some bytes are out returns `Ok(written)`. The
+/// caller's contract here is `write(byte[], int, int)`, which the JDK specifies
+/// as "writes len bytes" — so a short answer is reported to Java as the
+/// `SocketException` the close mandates, not silently swallowed. `written` is
+/// carried in the error path only for the debug line.
+///
+/// # On expiry
+///
+/// The `RE1_READ_CLOSE_POLL_MS` slice expiring is not an outcome — it is the
+/// point at which the registry is re-asked, and the loop continues. There is no
+/// second deadline: `java.net.Socket` has no write timeout, and this surface
+/// records only a `read_timeout_ms`.
+fn re1_write_close_aware(sid: i32, stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written);
+        }
+        let ready = match re1_socket_poll_writable(stream, RE1_READ_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-12 blocking
+            // write, which cannot see the close but at least still transfers.
+            None => {
+                let mut w = stream;
+                w.write_all(&data[written..])?;
+                return Ok(data.len());
+            }
+        };
+        // Asked AFTER the poll for the reason `re1_read_close_aware` sets out
+        // at length: `re1_close_socket` removes the entry BEFORE it issues the
+        // shutdown, so by the time the shutdown's own readiness edge wakes this
+        // poll the entry is already gone.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        let end = (written + RE1_WRITE_SLICE_MAX).min(data.len());
+        let mut w = stream;
+        match w.write(&data[written..end]) {
+            Ok(0) => continue,
+            Ok(n) => written += n,
+            // EINTR has written nothing; retry. Same rationale as
+            // `re1_read_retry_eintr`.
+            Err(e) if is_eintr(&e) => continue,
+            // Writable, then not: a concurrent writer on this socket took the
+            // room. Park again rather than report a short write.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn re1_socket_write_stream(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -4296,13 +4382,28 @@ fn re1_socket_write_stream(
             .clone()
     };
     ctx.begin_blocking_region();
+    // ASYNCHRONOUS CLOSE (2026-08-12): a bare `write_all` here is the write
+    // twin of the read hole fixed on this surface on 2026-08-11 — a thread
+    // parked behind a peer that has stopped reading never noticed
+    // `Socket.close()`. `re1_write_close_aware` polls for writability, re-asks
+    // the registry, and slices; see its doc comment.
     let write_result = (|| -> std::io::Result<()> {
-        (&*stream).write_all(&data)?;
+        re1_write_close_aware(stream_id, &stream, &data)?;
         (&*stream).flush()?;
         Ok(())
     })();
     ctx.end_blocking_region();
     if let Err(e) = write_result {
+        // A close observed by the loop above arrives as `Interrupted`, which no
+        // other step on this path can produce (`re1_write_close_aware` reissues
+        // every real EINTR and the poll reports one as "not ready"). JDK 25's
+        // `Socket.close()` specifies that a thread blocked in an I/O operation
+        // on the socket throws a `SocketException` — "will", not "may" — and
+        // the concrete type is load-bearing because callers catch it above
+        // `catch (IOException)`.
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // Real java.net.Socket write path: a peer-reset/broken-pipe write
         // failure must surface as a real, catchable java.net.SocketException
         // (matching real JDK's SocketOutputStream.socketWrite0) -- callers
@@ -4491,12 +4592,16 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
 /// implementation of one primitive, which is the shape this file is trying not
 /// to grow.
 #[cfg(unix)]
-fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+fn re1_socket_poll(
+    stream: &TcpStream,
+    want_write: bool,
+    timeout_ms: i32,
+) -> Option<std::io::Result<bool>> {
     use std::os::unix::io::AsRawFd;
 
     let mut pfd = libc::pollfd {
         fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
+        events: if want_write { libc::POLLOUT } else { libc::POLLIN },
         revents: 0,
     };
     // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
@@ -4532,7 +4637,11 @@ fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::
 }
 
 #[cfg(windows)]
-fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+fn re1_socket_poll(
+    stream: &TcpStream,
+    want_write: bool,
+    timeout_ms: i32,
+) -> Option<std::io::Result<bool>> {
     use std::os::windows::io::AsRawSocket;
 
     // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
@@ -4547,6 +4656,7 @@ fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::
         revents: i16,
     }
     const WSAPOLLRDNORM: i16 = 0x0100;
+    const WSAPOLLWRNORM: i16 = 0x0010;
 
     #[link(name = "Ws2_32")]
     extern "system" {
@@ -4555,7 +4665,7 @@ fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::
 
     let mut pfd = Wsapollfd {
         fd: stream.as_raw_socket() as usize,
-        events: WSAPOLLRDNORM,
+        events: if want_write { WSAPOLLWRNORM } else { WSAPOLLRDNORM },
         revents: 0,
     };
     // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
@@ -4571,8 +4681,9 @@ fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::
 }
 
 #[cfg(not(any(unix, windows)))]
-fn re1_socket_poll_readable(
+fn re1_socket_poll(
     _stream: &TcpStream,
+    _want_write: bool,
     _timeout_ms: i32,
 ) -> Option<std::io::Result<bool>> {
     // No readiness primitive on this target. `None` (rather than a stubbed
@@ -4580,6 +4691,23 @@ fn re1_socket_poll_readable(
     // back to one plain blocking read instead of spinning a poll loop that
     // could never report readiness.
     None
+}
+
+/// Wait up to `timeout_ms` for `stream` to become **readable**.
+///
+/// The original name and contract; [`re1_socket_poll`] above grew a direction
+/// parameter on 2026-08-12 so the write twin could reuse the one binding of
+/// `poll(2)`/`WSAPoll` this file owns instead of adding another. Converting the
+/// idiom rather than copying the site is deliberate: this crate already carries
+/// more bindings of that one syscall than anyone can keep in agreement.
+fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    re1_socket_poll(stream, false, timeout_ms)
+}
+
+/// Wait up to `timeout_ms` for `stream` to become **writable**. Same
+/// three-state contract as [`re1_socket_poll_readable`].
+fn re1_socket_poll_writable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    re1_socket_poll(stream, true, timeout_ms)
 }
 
 /// Zero-timeout OS readability query for a TCP stream.
