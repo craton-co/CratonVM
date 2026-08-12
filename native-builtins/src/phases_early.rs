@@ -20569,26 +20569,47 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `logmanager.rs` already patches around it for that specific case.
 
     // --- LogManager (singleton) ---
+    //
+    // NOT `Intrinsic`, unlike the rest of this function, and the distinction is
+    // load-bearing rather than cosmetic. These two FABRICATE a manager and a
+    // logger in front of real bytecode — a `Bridge` by definition; an intrinsic
+    // is the kind that cannot give an answer the bytecode would not.
+    //
+    // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
+    // while the function-wide ambient category applied here these rows SURVIVED
+    // `--jdk-only` after the retirement refused every OTHER registrar of the
+    // same triples — and a refusal does not remove the registration it would
+    // have overwritten. What was left holding `getLogManager()` was an uncached
+    // fabricator returning a fresh, unconstructed manager on every call
+    // (identityHashCode 7, 8, 9 on three successive calls), whose null
+    // `systemContext` is the first NPE any JUL user hits.
+    //
+    // The real `LogManager.<init>` is itself retired, so the static
+    // `LogManager.manager` already comes out of the real constructor — this
+    // builds no state, it stops shadowing state that is already there.
+    // W7-25-jul-getlogger-regression.md
     let lm = "java/util/logging/LogManager";
-    r.register(
-        lm,
-        "getLogManager",
-        "()Ljava/util/logging/LogManager;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        lm,
-        "getLogger",
-        "(Ljava/lang/String;)Ljava/util/logging/Logger;",
-        |ctx, _args| {
-            // Return a new Logger stub
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            lm,
+            "getLogManager",
+            "()Ljava/util/logging/LogManager;",
+            |ctx, _args| {
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
+                Ok(Some(Value::Object(Some(obj))))
+            },
+        );
+        r.register(
+            lm,
+            "getLogger",
+            "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+            |ctx, _args| {
+                // Return a new Logger stub
+                let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
+                Ok(Some(Value::Object(Some(logger))))
+            },
+        );
+    });
     r.set_category(__prev_cat);
 }
 
