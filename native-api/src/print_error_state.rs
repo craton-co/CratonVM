@@ -155,6 +155,66 @@ pub fn absorb_write_exception_recording(
     Ok(None)
 }
 
+/// Record a delegated write's failure at a call site that **cannot**
+/// propagate, and report whether the write succeeded.
+///
+/// The `print`/`println`/`write` natives funnel through helpers that return
+/// `()` or `bool` across a dozen call sites, so the `Error`-propagating half
+/// of [`absorb_write_exception_recording`] is a signature change rather than a
+/// one-line fix there. What is a one-line fix is the half this lane is
+/// chartered on: the JDK's `catch (IOException x) { trouble = true; }` body
+/// still runs, so a failed write is *observable* through `checkError()` even
+/// where it is still (wrongly) unthrown.
+///
+/// Absorbs everything, exactly as the `let _ = …` these sites had did.
+/// Returns `true` when the delegated call returned cleanly.
+///
+/// **Residual, and deliberate:** an `Error` — a `NoSuchMethodError` from our
+/// own dispatch above all — is absorbed here where HotSpot lets it out, and it
+/// does NOT set `trouble` (HotSpot's `catch` never sees it, so a `trouble`
+/// that HotSpot would not set would be fresh invented state, not parity).
+pub fn record_write_failure(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    result: MethodCallResult,
+) -> bool {
+    let thrown = match result {
+        Ok(_) => return true,
+        Err(MethodCallFailed::InternalError(_)) => return false,
+        Err(MethodCallFailed::ExceptionThrown(obj)) => obj,
+    };
+    let thrown_class = ctx.class_id_of_object(thrown);
+    let is = |ctx: &dyn NativeContext, name: &str| {
+        ctx.class_id_by_name(name)
+            .is_some_and(|root| ctx.is_subclass(thrown_class, root))
+    };
+    if is(&*ctx, "java/io/InterruptedIOException") {
+        let current = ctx.current_thread_object();
+        ctx.thread_interrupt(current);
+    } else if is(&*ctx, "java/io/IOException") {
+        set_trouble(&*ctx, this);
+    }
+    false
+}
+
+/// Same for a raw host-level write/flush failure on the fd a console
+/// `PrintStream` is backed by.
+///
+/// The fd path is this VM's stand-in for the `out.write(...)` the JDK
+/// delegates to, so a host `io::Error` there is precisely the `IOException`
+/// the JDK's `catch` names.
+pub fn record_host_io_failure<T, E>(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    result: Result<T, E>,
+) -> bool {
+    if result.is_err() {
+        set_trouble(ctx, this);
+        return false;
+    }
+    true
+}
+
 /// Run `java.util.logging.Handler.reportError(null, ex, code)` — the JDK's own
 /// route from an absorbed `Exception` to the handler's `ErrorManager`.
 ///

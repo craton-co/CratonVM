@@ -68,7 +68,7 @@ pub use delegated_close::{
 pub use intrinsic::InterpIntrinsic;
 pub use print_error_state::{
     absorb_io_exception_recording, absorb_write_exception_recording, clear_trouble, is_trouble,
-    report_handler_error, set_trouble, take_absorbed,
+    record_host_io_failure, record_write_failure, report_handler_error, set_trouble, take_absorbed,
 };
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///

@@ -1048,14 +1048,29 @@ pub(crate) fn native_printstream_flush(
     // dispatch above all — now comes out.
     // W7-57-close-flush-swallow-sweep.md
     //
-    // Residual: HotSpot records the absorbed failure in `trouble` for
-    // `checkError()`; we do not.
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if let Value::Object(Some(out)) = ctx.get_field_by_name(*this, "out") {
+    // RECORDED since W7-64. The `catch` body is `trouble = true`, and
+    // `checkError()` is that field's only reader — absorbing without setting
+    // it made the failure *unobservable* rather than merely unthrown, which is
+    // strictly worse than the swallow this narrowing removed. Parity, not a
+    // behaviour change: HotSpot sets `trouble` at exactly this point.
+    // W7-64-printstream-trouble-and-errormanager.md
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") {
             let flushed = ctx.invoke_virtual(out, "flush", "()V", &[]);
-            cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
+            cratonvm_native_api::print_error_state::absorb_io_exception_recording(
+                &*ctx, this, flushed,
+            )?;
             return Ok(None);
         }
+        // The fd path below is `PrintStream.flush()` over the process console.
+        // A failing `write`/`flush` on the fd is exactly the `IOException` the
+        // JDK's `catch` names, so it records too — see `stream_write`.
+        if let Some(fd) = stream_fd(ctx, args) {
+            if ctx.fd_table().flush(fd).is_err() {
+                cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            }
+        }
+        return Ok(None);
     }
     if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().flush(fd);
@@ -1102,9 +1117,11 @@ pub(crate) fn native_printstream_write(
         && !route_write_through_out(ctx, args, &buf)
     {
         if let Some(fd) = stream_fd(ctx, args) {
-            with_stdio_print_lock(|| {
-                let _ = ctx.fd_table().write_bytes(fd, &buf);
-            });
+            let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, &buf));
+            // RECORDED since W7-64 — see `stream_write` in native-builtins/src/lib.rs.
+            if let Some(Value::Object(Some(this))) = args.first().copied() {
+                cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            }
         }
     }
     Ok(None)
@@ -1127,9 +1144,11 @@ pub(crate) fn native_printstream_write_int(
         && !route_write_through_out(ctx, args, &buf)
     {
         if let Some(fd) = stream_fd(ctx, args) {
-            with_stdio_print_lock(|| {
-                let _ = ctx.fd_table().write_bytes(fd, &buf);
-            });
+            let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, &buf));
+            // RECORDED since W7-64 — see `stream_write` in native-builtins/src/lib.rs.
+            if let Some(Value::Object(Some(this))) = args.first().copied() {
+                cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            }
         }
     }
     Ok(None)
@@ -1271,11 +1290,18 @@ fn native_printwriter_write_string(
             if let Some(Value::Object(Some(s))) = args.get(1).copied() {
                 if let Some(text) = ctx.read_string(s) {
                     let len = text.encode_utf16().count() as i32;
-                    let _ = ctx.invoke_virtual(
+                    let written = ctx.invoke_virtual(
                         this,
                         "write",
                         "(Ljava/lang/String;II)V",
                         &[Value::Object(Some(s)), Value::Int(0), Value::Int(len)],
+                    );
+                    // RECORDED since W7-64 — `PrintWriter.write(String,int,int)`
+                    // ends `catch (IOException x) { trouble = true; }`, and
+                    // `checkError()` is that field's only reader.
+                    // W7-64-printstream-trouble-and-errormanager.md
+                    cratonvm_native_api::print_error_state::record_write_failure(
+                        ctx, this, written,
                     );
                     return Ok(None);
                 }
@@ -1291,7 +1317,10 @@ fn native_printwriter_write_string(
             // create_string allocates, potentially triggering a compacting GC that moves
             // `out_obj` before it is passed to invoke_virtual).
             let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            let written =
+                ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            // RECORDED since W7-64 — see the sibling range overload below.
+            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
             return Ok(None);
         }
     }
@@ -1310,12 +1339,19 @@ fn native_printwriter_write_string_range(
             let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
             let off_val = args.get(2).cloned().unwrap_or(Value::Int(0));
             let len_val = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(
+            let written = ctx.invoke_virtual(
                 out_obj,
                 "write",
                 "(Ljava/lang/String;II)V",
                 &[str_val, off_val, len_val],
             );
+            // RECORDED since W7-64. `java.io.PrintWriter.write(String,int,int)`
+            // is `synchronized (lock) { try { ensureOpen(); out.write(s, off,
+            // len); } catch (InterruptedIOException x) { …interrupt(); }
+            // catch (IOException x) { trouble = true; } }` — the absorb was
+            // already here, the record was not.
+            // W7-64-printstream-trouble-and-errormanager.md
+            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
             return Ok(None);
         }
     }
@@ -1333,7 +1369,10 @@ pub(crate) fn native_printwriter_write_int(
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             let ch = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            let written = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            // RECORDED since W7-64 — `PrintWriter.write(int)` ends
+            // `catch (IOException x) { trouble = true; }`.
+            cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
             return Ok(None);
         }
     }

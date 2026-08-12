@@ -26142,15 +26142,27 @@ fn sink_is_writer(ctx: &mut dyn NativeContext, out: ObjectRef) -> Option<bool> {
 /// correctly dispatches to the JDK's own
 /// `BufferedWriter`/`OutputStreamWriter`/`StreamEncoder` bytecode — no
 /// stub is added.  Returns `true` on a successful invoke.
-fn write_string_to_writer(ctx: &mut dyn NativeContext, out: ObjectRef, text: &str) -> bool {
+/// `this` is the `PrintStream`/`PrintWriter` whose `trouble` flag records a
+/// failure here — see `route_write_through_out`. It is NOT the write target;
+/// `out` is.
+fn write_string_to_writer(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out: ObjectRef,
+    text: &str,
+) -> bool {
     let s = ctx.create_string(text);
-    ctx.invoke_virtual(
+    let written = ctx.invoke_virtual(
         out,
         "write",
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(s))],
-    )
-    .is_ok()
+    );
+    // RECORDED since W7-64: `PrintWriter.write(String,int,int)` and
+    // `PrintStream`'s private `write(String)` both end
+    // `catch (IOException x) { trouble = true; }`.
+    // W7-64-printstream-trouble-and-errormanager.md
+    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written)
 }
 
 /// Write text to real stdout/stderr if this is a system stream (dual-mode).
@@ -26204,9 +26216,31 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
         // Reconstruct the text from the UTF-8 bytes the caller built (callers
         // pass UTF-8 of the original String / println buffer).
         let text = String::from_utf8_lossy(bytes);
-        return write_string_to_writer(ctx, out, &text);
+        return write_string_to_writer(ctx, this, out, &text);
     }
-    let _ = ctx.invoke_virtual(
+    // RECORDED since W7-64. `PrintStream.write(byte[],int,int)` is
+    // `try { …; out.write(buf, off, len); … }
+    //  catch (InterruptedIOException x) { Thread.currentThread().interrupt(); }
+    //  catch (IOException x) { trouble = true; }`, and every `print`/`println`
+    // overload funnels through a private `write`/`writeln` with the same two
+    // clauses. This helper is that delegation for both `PrintStream` and
+    // `PrintWriter` receivers, and the `trouble` field is on both classes, so
+    // the record is by field name on `this`.
+    //
+    // Two residuals, both unchanged and both deliberate:
+    //   * an `Error` is still absorbed here where HotSpot lets it out.
+    //     `route_write_through_out` returns `bool` into helpers that return
+    //     `()` across ten call sites; propagating is a signature change, not a
+    //     one-line fix. See `record_write_failure`'s doc comment.
+    //   * the `bool` this returns still reports a FAILED write as "not routed",
+    //     which sends the caller to the fd fast path and prints the text to
+    //     the console. HotSpot writes nowhere in that case. Left as-is: the
+    //     console fallback is what keeps output flowing when `out` is a
+    //     `Writer` shape this helper cannot address (the picocli /
+    //     JUnit-console `NoSuchMethodError` case above), and separating those
+    //     two reasons is a different lane's measurement.
+    // W7-64-printstream-trouble-and-errormanager.md
+    let written = ctx.invoke_virtual(
         out,
         "write",
         "([BII)V",
@@ -26216,6 +26250,7 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
             Value::Int(bytes.len() as i32),
         ],
     );
+    cratonvm_native_api::print_error_state::record_write_failure(ctx, this, written);
     true
 }
 
@@ -26234,9 +26269,15 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
         return;
     }
     if let Some(fd) = stream_fd(ctx, args) {
-        with_stdio_print_lock(|| {
-            let _ = ctx.fd_table().write_string(fd, text);
-        });
+        let ok = with_stdio_print_lock(|| ctx.fd_table().write_string(fd, text));
+        // RECORDED since W7-64. The fd IS this stream's `out` — a console
+        // `PrintStream` has no Java sink object — so a host write failure here
+        // is exactly the `IOException` `PrintStream`'s private `write(String)`
+        // catches with `trouble = true`.
+        // W7-64-printstream-trouble-and-errormanager.md
+        if let Some(Value::Object(Some(this))) = args.first().copied() {
+            cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+        }
     }
 }
 
@@ -26312,10 +26353,15 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
         return;
     }
     if let Some(fd) = stream_fd(ctx, args) {
-        with_stdio_print_lock(|| {
-            let _ = ctx.fd_table().write_string(fd, text);
-            let _ = ctx.fd_table().write_string(fd, &sep);
+        let ok = with_stdio_print_lock(|| {
+            ctx.fd_table()
+                .write_string(fd, text)
+                .and_then(|()| ctx.fd_table().write_string(fd, &sep))
         });
+        // RECORDED since W7-64 — see `stream_write`.
+        if let Some(Value::Object(Some(this))) = args.first().copied() {
+            cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+        }
     }
 }
 
@@ -27160,17 +27206,22 @@ fn native_printwriter_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // into a quietly wrong one. `absorb_io_exception` keeps the JDK's half and
     // gives back the other. W7-57-close-flush-swallow-sweep.md
     //
-    // Residual: HotSpot records the absorbed failure in `trouble`, which
-    // `checkError()` reports. We do not, so an absorbed `IOException` stays
-    // unobservable rather than merely unthrown.
+    // RECORDED since W7-64: the `catch` body is `trouble = true` and
+    // `checkError()` is its only reader, so an absorbed `IOException` that is
+    // not written down is *unobservable* rather than merely unthrown.
+    // W7-64-printstream-trouble-and-errormanager.md
     let sink = printwriter_sink(&*ctx, this);
     let console_fd = stream_fd(ctx, args);
     if let Some(sink) = sink {
         let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
-        cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
+        cratonvm_native_api::print_error_state::absorb_io_exception_recording(
+            &*ctx, this, flushed,
+        )?;
     }
     if let Some(fd) = console_fd {
-        let _ = ctx.fd_table().flush(fd);
+        if ctx.fd_table().flush(fd).is_err() {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        }
     }
     Ok(None)
 }
@@ -27242,16 +27293,30 @@ fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // it is ours, so it takes the same `IOException`-absorbing policy rather
     // than a stricter one — see the `vm_only_best_effort` reasoning in
     // `native-api/src/delegated_close.rs`.
+    //
+    // RECORDED since W7-64. HotSpot's `catch (IOException x)` body is
+    // `trouble = true`, and `checkError()` is its only reader. Measured on
+    // HotSpot 25.0.3.9: a `Writer` whose `close()` raises an `IOException`
+    // leaves `PrintWriter.close()` silent and `checkError()` TRUE; the same
+    // `close()` raising an `Error` propagates and leaves `checkError()` FALSE.
+    // Both halves are asserted in `probes/CloseFlushSwallowProbe.java`.
+    // W7-64-printstream-trouble-and-errormanager.md
     if let Some(sink) = sink {
         let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
-        cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
+        cratonvm_native_api::print_error_state::absorb_io_exception_recording(
+            &*ctx, this, flushed,
+        )?;
         if !is_console {
             let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
-            cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, closed)?;
+            cratonvm_native_api::print_error_state::absorb_io_exception_recording(
+                &*ctx, this, closed,
+            )?;
         }
     }
     if let Some(fd) = console_fd {
-        let _ = ctx.fd_table().flush(fd);
+        if ctx.fd_table().flush(fd).is_err() {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        }
     }
     Ok(None)
 }
