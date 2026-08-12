@@ -634,9 +634,16 @@ mod tests {
 
     /// CratonVM's own `java/nio/ByteBuffer` slot map, from
     /// `native-io/src/lib.rs`'s `BB_FIELD_*` constants, checked slot by slot
-    /// against the real layout. Three of its six used slots name a different
-    /// field. This is the first census row and it is derived, not asserted by
-    /// hand.
+    /// against the real layout. This is the first census row and it is
+    /// derived, not asserted by hand.
+    ///
+    /// The name says three and the assertion says two, and both are right: the
+    /// third disagreeing slot is 6, which `bb_resolve_heap_offset` reads and
+    /// which the PUBLISHED map did not carry at all until W7-76 added it. It
+    /// has its own test immediately below. The six replicated here are the six
+    /// the map held when this was written; the name is left alone because it
+    /// is the trail to W7-76-bytebuffer-alias-residuals.md, where the count is
+    /// reconciled and the published map is made complete.
     #[test]
     fn the_cratonvm_byte_buffer_slot_map_disagrees_at_three_of_six_slots() {
         let (oracle, dbb) = direct_byte_buffer_chain();
