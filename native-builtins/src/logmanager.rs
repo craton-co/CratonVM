@@ -4129,7 +4129,35 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
 ///
 /// Deliberately a pure field read: dispatching `getUseParentHandlers()` would
 /// re-enter real bytecode that dereferences the same unmaterialized `config`.
+///
+/// FIRST CHOICE is `lib.rs`'s `jul_logger_use_parent_handlers_table`, which is
+/// where `Logger.setUseParentHandlers(Z)V` records the flag. That write and
+/// this read used to be in different modules and never met: the setter stored
+/// into the side table, this walked `config.useParentHandlers`, and `config` is
+/// null on every logger this bridge mints — so the `false` was accepted, read
+/// back correctly by `getUseParentHandlers()`, and then ignored by the only
+/// consumer that matters. An accessor agreeing with itself is not evidence the
+/// consumer agrees with it. Measured in `Compatible` before this change:
+/// `setUseParentHandlers(false)` then `info(...)` still reached the parent's
+/// Handler (`[INFO:not-up-to-parent]`), where HotSpot delivers nothing; under
+/// `--jdk-only` no native holds either triple, real bytecode runs, and the walk
+/// already stopped. So this closes a `Compatible`-only divergence and leaves
+/// strict mode byte-identical. See
+/// docs/known-issues/jdk-only/W7-35-jul-supplier-and-payload-residuals.md.
+///
+/// An ABSENT entry is not `false`: it means nothing ever called the setter, so
+/// fall through to the `config` read and its JDK default (`true`) rather than
+/// letting a logger nobody configured silence its ancestors' handlers.
 fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(flag) = crate::jul_logger_use_parent_handlers_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return flag;
+    }
     match ctx.get_field_by_name(logger, "config") {
         Value::Object(Some(config)) => !matches!(
             ctx.get_field_by_name(config, "useParentHandlers"),
