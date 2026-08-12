@@ -377,6 +377,9 @@ of its six was RED on an untouched tree the first time anybody checked.
 4. **The published maps still disagree with the real classes, and that is the
    point.** `verify_declared_slot_maps` will still report seven wrong-field rows
    for these two classes, exactly as it does for `native-io`'s `BB_SLOT_MAP`.
+   Since 2026-08-12 that sweep actually has a caller
+   (W7-90-slot-map-sweep-caller.md); the seven rows are §4.2 and §4.3 of that
+   record, still predicted rather than transcribed.
    Those rows are the fallback's honest description; the reason they no longer
    describe a defect is that no real receiver reaches the fallback. The row that
    leaves the census is not one of these — it is the runtime `observe_read`

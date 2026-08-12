@@ -479,6 +479,13 @@ is swept by a function nothing calls, so the three `wrong-field` rows §5.3
 predicts are a prediction, not a transcript. The sweep needs a debug-only VM
 hook after a workload, and wiring it blind is a call nobody has seen run.
 
+**CLOSED 2026-08-12 by W7-90-slot-map-sweep-caller.md.** The trigger is the
+launcher's post-`main` teardown, with the three self-terminating natives
+(`System.exit`, `Runtime.exit`, `Runtime.halt`) as the second, because nothing
+that exits itself reaches the first. This map's three rows are §4.1 of that
+record. They are still a prediction — the sweep has a caller now, but nobody has
+run it.
+
 ---
 
 ## 9. What this lane could not resolve

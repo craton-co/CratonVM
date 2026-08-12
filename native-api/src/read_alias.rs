@@ -90,7 +90,11 @@
 //!   machine-readable link to a field name"; [`SlotMap`] is that link. The
 //!   sweep is where the registration-time idea survives, moved to a point where
 //!   the classes are actually loaded and with `Unknown` kept distinct from
-//!   clean.
+//!   clean. [`sweep_declared_slot_maps_at`] is the wrapper the trigger points
+//!   call; W7-90-slot-map-sweep-caller.md says where they are and why. Until
+//!   that lane the sweep had **no caller at all**, which is indistinguishable
+//!   from a detector reporting all-clear — this campaign's dominant species,
+//!   sitting inside the instrument built to detect it.
 //!
 //! Both funnel into one classifier and one emitter, for the same reason
 //! [`crate::layout_alias`] has two observation points and one implementation:
@@ -450,6 +454,58 @@ pub fn declared_slot_maps() -> Vec<&'static SlotMap> {
     declarations().lock().clone()
 }
 
+/// What one run of [`verify_declared_slot_maps`] actually looked at.
+///
+/// A bare row count is the shape this campaign keeps buying: `0` reads as
+/// "clean" when it usually means "swept nothing". Every field here exists to
+/// keep one of the three zeroes distinguishable from the others —
+///
+/// * `ran == false` — the flag is off and **the sweep did not happen**;
+/// * `maps == 0` — nothing was ever handed to [`declare_slot_map`], so the
+///   sweep had no population at all (the vacuous green
+///   `read_alias_coverage.rs`'s link 6 exists to catch);
+/// * `unresolved > 0` — a published map names a class no loader has, so those
+///   slots are **unmeasured**, not clean. That is the run-time twin of
+///   [`SlotAnswer::Unknown`], and it is why the summary prints it beside
+///   `rows`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// The sweep actually ran. `false` means the flag was off — every other
+    /// field is then a structural zero and must not be read as a result.
+    pub ran: bool,
+    /// Slot maps published so far, i.e. the population the sweep had.
+    pub maps: usize,
+    /// Of those, the ones whose class the loader could name.
+    pub resolved: usize,
+    /// Of those, the ones whose class no loader has (or several do,
+    /// ambiguously). **Unmeasured, not clean.**
+    pub unresolved: usize,
+    /// Slots actually checked, across the resolved maps.
+    pub slots: usize,
+    /// Census rows emitted. Suppressed duplicates are not counted, so a second
+    /// sweep in the same process reports `0` — see `already_reported`.
+    pub rows: usize,
+}
+
+impl SweepReport {
+    /// One line, for the trigger points to print.
+    ///
+    /// Deliberately carries the denominator. `rows=0 unresolved=7` and
+    /// `rows=0 unresolved=0 slots=29` are opposite findings, and a line that
+    /// printed only the first number would render them identical.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        if !self.ran {
+            return "did not run (the layout-alias debug flag is off)".to_string();
+        }
+        format!(
+            "maps={} resolved={} unresolved={} slots={} rows={} \
+             (unresolved maps name a class no loader has: UNMEASURED, not clean)",
+            self.maps, self.resolved, self.unresolved, self.slots, self.rows
+        )
+    }
+}
+
 /// Sweep every published [`SlotMap`] against the loaded class, and report the
 /// slots that disagree.
 ///
@@ -459,28 +515,66 @@ pub fn declared_slot_maps() -> Vec<&'static SlotMap> {
 /// debug-only VM hook; a class that is still unloaded answers
 /// [`SlotAnswer::Unknown`] and is skipped as **unmeasured**, not counted clean.
 ///
-/// Returns the number of rows emitted, so a caller can tell "clean" from "not
-/// looking". A `0` with the flag off means the sweep did not run.
-pub fn verify_declared_slot_maps(ctx: &dyn NativeContext) -> usize {
+/// Returns a [`SweepReport`] rather than a bare count, so a caller can tell
+/// "clean" from "not looking" from "the flag is off" — three states a `usize`
+/// return collapses into the same `0`. [`sweep_declared_slot_maps_at`] is the
+/// wrapper the trigger points use; it prints the summary.
+pub fn verify_declared_slot_maps(ctx: &dyn NativeContext) -> SweepReport {
     if !layout_alias::enabled() {
-        return 0;
+        // `ran: false`, and every other field a structural zero. The caller
+        // must not read that as "seven maps agree with their classes".
+        return SweepReport::default();
     }
-    let mut rows = 0usize;
+    let mut report = SweepReport {
+        ran: true,
+        ..SweepReport::default()
+    };
     for map in declared_slot_maps() {
+        report.maps += 1;
         // `class_id_by_name` returning `None` is two answers — "no loader has
         // it" and "several do, ambiguously". The sweep gives up on both, which
         // is what that method's own doc says a caller that will not act on a
         // miss should do; a diagnostic must never load or fabricate a class.
         let Some(class_id) = ctx.class_id_by_name(map.class) else {
+            report.unresolved += 1;
             continue;
         };
+        report.resolved += 1;
         for (slot, field) in map.slots {
+            report.slots += 1;
             if observe_read_on_class(ctx, class_id, *slot, field, map.origin).is_some() {
-                rows += 1;
+                report.rows += 1;
             }
         }
     }
-    rows
+    report
+}
+
+/// [`verify_declared_slot_maps`] plus the one-line summary — the entry point
+/// the trigger points call. `trigger` names where the sweep fired, e.g.
+/// `main-returned`.
+///
+/// The summary goes to stderr rather than through `tracing`, and that is not a
+/// style choice: the `System.exit` trigger runs microseconds before
+/// `std::process::exit`, which does not unwind and does not flush a `tracing`
+/// subscriber — `lang_system.rs`'s own `System.exit(N) called` line records the
+/// same reason for the same placement. The per-slot rows still go through the
+/// module's one emitter, so a run that exits hard can print the summary and
+/// lose the rows; that limit is stated in W7-90-slot-map-sweep-caller.md rather
+/// than papered over with a second emitter, because two detectors on one
+/// primitive drift, then disagree, and then the reader has to pick.
+///
+/// **Observation only.** Nothing consumes the return value on any production
+/// path; it exists so a caller and a test can tell "clean" from "not looking".
+pub fn sweep_declared_slot_maps_at(ctx: &dyn NativeContext, trigger: &str) -> SweepReport {
+    let report = verify_declared_slot_maps(ctx);
+    if report.ran {
+        eprintln!(
+            "[read-alias] declared slot-map sweep at {trigger}: {}",
+            report.summary_line()
+        );
+    }
+    report
 }
 
 #[cfg(test)]

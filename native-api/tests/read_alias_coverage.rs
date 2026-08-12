@@ -48,6 +48,25 @@
 //!    `SlotMap` that no registrar hands to `declare_slot_map` is dead data, and
 //!    the sweep over it reports clean because it swept nothing. That is the
 //!    vacuous-green shape this campaign keeps re-buying.
+//! 7. The sweep is **actually invoked**
+//!    ([`the_declared_slot_map_sweep_has_a_caller`]). Link 6 proves a map
+//!    reaches the registry; it says nothing about whether anything ever reads
+//!    the registry. From 2026-08-12 until W7-90-slot-map-sweep-caller.md
+//!    `verify_declared_slot_maps` had **no caller at all** while seven
+//!    `SlotMap`s were published to it, which is indistinguishable from a
+//!    detector reporting all-clear — the dominant species of this campaign,
+//!    found inside the instrument built to detect it.
+//! 8. The launcher's trigger runs **after the workload**
+//!    ([`the_post_main_sweep_runs_after_the_workload`]). Moved above the
+//!    `main(String[])` invoke it becomes the registration-time check W7-69 §2
+//!    rejected: most of the declared classes are not loaded yet, and
+//!    `declared_fields` returning empty is indistinguishable from "this class
+//!    has no fields".
+//! 9. The self-terminating paths sweep too, and observe only
+//!    ([`the_exit_paths_sweep_before_they_terminate`]). `System.exit` /
+//!    `Runtime.exit` / `Runtime.halt` never reach the launcher's post-`main`
+//!    line, and they are how every suite fixture this instrument is aimed at
+//!    ends.
 //!
 //! Plus [`census`], which **prints** the read-side population and asserts only
 //! that it is non-zero. Deliberately not a ratchet, for the same reason
@@ -550,6 +569,201 @@ fn every_declared_slot_map_is_published() {
         !declared.is_empty(),
         "no SlotMap is declared anywhere — the scanner broke, not the tree \
          (native-io's BB_SLOT_MAP should be found)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Link 7 — the sweep is actually invoked
+// ---------------------------------------------------------------------------
+
+/// `verify_declared_slot_maps` has at least one caller outside the module that
+/// defines it.
+///
+/// Link 6 proves a `SlotMap` reaches the registry. It proves nothing about
+/// anything ever *reading* the registry, and for the whole of 2026-08-12
+/// nothing did: three lanes (W7-75, W7-76, W7-77) each published a map and each
+/// closed with the same residual — "the sweep has no caller; choosing its
+/// trigger needs a build". Seven maps and 29 declared slots were pointed at a
+/// function nobody called.
+///
+/// **A detector with no caller is indistinguishable from a detector reporting
+/// all-clear.** That is this campaign's dominant species, and it had taken up
+/// residence inside the instrument built to detect it.
+///
+/// `native-api/src` is excluded from the scan on purpose: `read_alias.rs`
+/// contains the definition, its own doc links and the `sweep_declared_slot_maps_at`
+/// wrapper's internal call, so a predicate that counted this crate would be
+/// green on a tree where nothing outside it calls anything — the exact vacuous
+/// shape. Comments are stripped for the same reason link 6's predicate had to
+/// be tightened: six `///` lines in the native crates name the sweep, and a
+/// gate satisfied by prose is satisfied on a tree with no caller.
+#[test]
+fn the_declared_slot_map_sweep_has_a_caller() {
+    let root = workspace_root();
+    let mut callers: Vec<String> = Vec::new();
+    for crate_dir in ["vm", "vm-cli", "gc", "jit"]
+        .iter()
+        .chain(NATIVE_CRATES.iter())
+    {
+        for file in rust_sources(&root.join(crate_dir).join("src")) {
+            let src = strip_comments(&fs::read_to_string(&file).unwrap_or_default());
+            if !src.contains("sweep_declared_slot_maps_at(")
+                && !src.contains("verify_declared_slot_maps(")
+            {
+                continue;
+            }
+            callers.push(
+                file.strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    // Printed, not asserted on: the SET of triggers is expected to grow (an
+    // embedder teardown, `DestroyJavaVM`) and a gate on the exact list would be
+    // re-baselined on sight. What must never be empty is the list itself.
+    println!("declared-slot-map sweep callers: {callers:?}");
+    assert!(
+        !callers.is_empty(),
+        "nothing outside `native-api/src` calls the declared-slot-map sweep.\n\
+         Every `SlotMap` in the workspace is then published to a function that never \
+         runs, and `verify_declared_slot_maps` reporting zero rows means `it was never \
+         asked`, not `the slot maps agree with the loaded classes`. Those two readings \
+         are opposite and the census cannot tell them apart.\n\
+         Wire a trigger at a point where the classes are LOADED — the launcher's \
+         post-`main` teardown and the `System.exit` natives are the two this tree \
+         uses.\n\
+         See W7-90-slot-map-sweep-caller.md."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Link 8 — the launcher's trigger runs after the workload
+// ---------------------------------------------------------------------------
+
+/// The post-`main` sweep sits **below** the `main(String[])` invoke in
+/// `vm-cli`'s `run()`.
+///
+/// The ordering is the whole justification for the trigger's placement, not a
+/// detail. W7-69 §2 rejected a registration-time check with a reason that is a
+/// property of this tree: at registration most of the declared classes are not
+/// loaded, `declared_fields` comes back empty, and `declared == 0` is the
+/// documented overload for *unmeasured, not cleared* —
+/// `java.nio.DirectByteBuffer` is package-private and is not among the 323
+/// classes `bootstrap_core_classes` names. A sweep lifted above the invoke
+/// silently becomes that rejected check while still printing a census, which is
+/// worse than not running: it reports `unresolved` where the tree has defects.
+#[test]
+fn the_post_main_sweep_runs_after_the_workload() {
+    let src = strip_comments(&read("vm-cli/src/main.rs"));
+    let body = fn_body(&src, "run")
+        .expect("vm-cli/src/main.rs no longer defines `fn run()` — the launcher moved");
+    let sweep = body.find("vm.sweep_declared_slot_maps(").unwrap_or_else(|| {
+        panic!(
+            "`vm-cli`'s `run()` no longer sweeps the declared slot maps after `main` \
+             returns.\n\
+             That call is the read-side census's primary trigger. Without it the seven \
+             published `SlotMap`s are swept only on the `System.exit` paths, and a \
+             workload that returns normally prints no census at all — which reads as \
+             clean.\n\
+             It is observation-only, gated on `layout_alias::enabled()` with no `else`, \
+             and costs one OnceLock load and a branch once per process when the flag is \
+             off. If it is in the way, move it, do not drop it.\n\
+             See W7-90-slot-map-sweep-caller.md."
+        )
+    });
+    let main_invoke = body
+        .rfind("\"main\",")
+        .expect("`run()` no longer invokes a method literally named `main` — re-check this gate");
+    assert!(
+        sweep > main_invoke,
+        "the declared-slot-map sweep in `run()` now runs BEFORE the `main(String[])` \
+         invoke.\n\
+         Above the workload it is the registration-time check W7-69 §2 rejected: the \
+         classes the maps name are mostly not loaded yet, `declared_fields` answers \
+         empty, and `Unknown` (unmeasured) is indistinguishable from clean. It would \
+         still print a census — of nothing.\n\
+         See W7-90-slot-map-sweep-caller.md."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Link 9 — the self-terminating paths sweep too, and observe only
+// ---------------------------------------------------------------------------
+
+/// `System.exit`, `Runtime.exit` and `Runtime.halt` each sweep before they
+/// terminate, and the helper they share is gated with no `else`.
+///
+/// Link 8's trigger is never reached when the application ends itself — and
+/// that is how nearly every fixture this instrument is aimed at ends (SbRunner,
+/// Surefire's `ForkedBooter`, every Spring Boot app). A sweep wired only to the
+/// return path reports nothing on exactly the runs that matter, which is link
+/// 7's failure wearing a different hat.
+///
+/// Each call is matched together with **its own trigger label**, not by the
+/// bare function name. That is link 5's lesson applied: `bb_resolve_heap_array`
+/// held a second `observe_read`, so deleting the calibration one left both
+/// `find` and `rfind` satisfied and the gate stayed green against the exact
+/// mutation it exists for. Three exit natives share one helper here, so a
+/// name-only predicate would let two of the three be deleted.
+#[test]
+fn the_exit_paths_sweep_before_they_terminate() {
+    let src = strip_comments(&read("native-builtins/src/lang_system.rs"));
+
+    for (native, trigger) in [
+        ("native_system_exit", "\"System.exit\""),
+        ("native_runtime_exit", "\"Runtime.exit\""),
+        ("native_shutdown_halt0", "\"Runtime.halt\""),
+    ] {
+        let body = fn_body(&src, native).unwrap_or_else(|| {
+            panic!("native-builtins/src/lang_system.rs no longer defines `fn {native}`")
+        });
+        let sweep = body
+            .match_indices("sweep_declared_slot_maps_before_exit(")
+            .find(|(idx, _)| {
+                let call: String = body[*idx..].chars().take(160).collect();
+                call.contains(trigger)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{native}` no longer sweeps the declared slot maps with the {trigger} \
+                     label before terminating.\n\
+                     The launcher's post-`main` trigger is unreachable on this path, so \
+                     dropping it means a workload that exits itself prints no read-side \
+                     census — and no census reads as clean.\n\
+                     See W7-90-slot-map-sweep-caller.md."
+                )
+            });
+        let terminate = body.rfind("std::process::exit(").unwrap_or_else(|| {
+            panic!("`{native}` no longer calls `std::process::exit` — re-check this gate")
+        });
+        assert!(
+            sweep < terminate,
+            "`{native}` sweeps AFTER `std::process::exit`, which never returns — the \
+             call is dead code that looks like coverage."
+        );
+    }
+
+    // The shared helper is gated, and the block has no `else`. Same rule as
+    // link 4 and for the same reason: a diagnostic that changes behaviour is a
+    // behaviour change in Compatible mode, which is contractually frozen.
+    let helper = fn_body(&src, "sweep_declared_slot_maps_before_exit")
+        .expect("lang_system.rs no longer defines the exit-path sweep helper");
+    let gate = helper
+        .find("layout_alias::enabled() {")
+        .expect("the exit-path sweep helper no longer gates on `layout_alias::enabled()`");
+    let open = helper[gate..].find('{').expect("matched above") + gate;
+    let close = match_brace(helper, open).expect("the helper's gate block never closes");
+    assert!(
+        !helper[close + 1..].trim_start().starts_with("else"),
+        "the exit-path sweep helper's `if layout_alias::enabled()` block has an \
+         `else`.\n\
+         The sweep is observation-only. With an `else` the exit path behaves \
+         differently depending on a debug flag, which is a behaviour change in \
+         Compatible mode — contractually frozen."
     );
 }
 
