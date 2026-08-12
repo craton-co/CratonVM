@@ -92,18 +92,54 @@ public class RNioNoFollow {
     public static void main(String[] args) throws Exception {
         dir = Files.createTempDirectory("rnionofollow");
         // Creating a symbolic link needs a privilege Windows does not grant by
-        // default. Report that as its own deterministic line rather than
-        // pretending the vectors ran: both VMs print it, so the cross-VM diff
-        // still matches, and on Linux (where the bug was found) everything below
-        // genuinely executes.
+        // default.
+        //
+        // WHAT THIS USED TO DO, AND WHY IT WAS WRONG. It printed
+        // `CK RNioNoFollow symlinks=unavailable`, printed PASS, and returned —
+        // skipping ALL 27 checks. Both VMs printed the same bail-out line, so
+        // the cross-VM diff agreed, the exit code was 0 and the gate was green.
+        // run.sh says the suite is usually run from Git Bash on Windows, so on
+        // the PRIMARY platform this vector asserted nothing at all, for the
+        // entire time it was scheduled. The comment that stood here — "both VMs
+        // print it, so the cross-VM diff still matches" — described the defect
+        // as though it were the design.
+        //
+        // The guard was also over-broad twice over. Six of the checks below
+        // need no symlink whatever: NOFOLLOW_LINKS on a REGULAR file (three of
+        // them), APPEND, CREATE_NEW refusal, the shorter-write truncation, the
+        // 4 MiB round trip and Files.write(Iterable). Those travel the same
+        // option scanner the defect lived in, and they were being thrown away
+        // with the rest.
+        //
+        // So the bail-out is now scoped to the arms that genuinely need the
+        // privilege, and the count of assertions that ACTUALLY RAN is published
+        // on the PASS line. That count is the instrument: a VM that bails where
+        // the oracle does not reports a different number and the diff goes red,
+        // which is precisely what could not happen before.
+        boolean symlinks;
         try {
             Files.createSymbolicLink(dir.resolve("probe"), dir.resolve("probe.target"));
+            symlinks = true;
         } catch (Exception unsupported) {
-            System.out.println("CK RNioNoFollow symlinks=unavailable");
-            System.out.println("PASS RNioNoFollow");
-            return;
+            symlinks = false;
         }
+        System.out.println("CK RNioNoFollow symlinks=" + (symlinks ? "available" : "unavailable"));
 
+        String refusals = symlinks ? symlinkArms() : "no-symlink-privilege";
+
+        plainFileArms();
+
+        System.out.println("CK RNioNoFollow refusals=" + refusals);
+        System.out.println("CK RNioNoFollow checks=" + checks);
+        System.out.println("PASS RNioNoFollow (" + checks + " checks)");
+    }
+
+    /**
+     * Every arm whose subject is a symbolic link. Runs only where the platform
+     * lets an unprivileged process create one; the count on the PASS line is
+     * what makes its absence visible rather than silent.
+     */
+    static String symlinkArms() throws Exception {
         // --- the refusals -------------------------------------------------
         String writeString = outcome(() -> Files.writeString(link("a", true), "123",
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE,
@@ -182,22 +218,13 @@ public class RNioNoFollow {
         check(content(target("g")).equals("target"), "newBufferedWriter must not touch the target");
 
         // --- the controls that must still succeed --------------------------
+        // These are symlink controls: without them a blanket "always throw on a
+        // symlink" regression would satisfy every refusal above.
         Path follow = link("h", true);
         Files.writeString(follow, "written", StandardOpenOption.TRUNCATE_EXISTING,
                 StandardOpenOption.CREATE);
         check(content(target("h")).equals("written"), "without NOFOLLOW_LINKS the write follows");
         check(Files.isSymbolicLink(follow), "the link itself must survive the write");
-
-        Path plain = dir.resolve("plain");
-        Files.writeString(plain, "plain-1", StandardOpenOption.CREATE, LinkOption.NOFOLLOW_LINKS);
-        check(content(plain).equals("plain-1"), "NOFOLLOW_LINKS on a regular file must write");
-        try (InputStream in = Files.newInputStream(plain, LinkOption.NOFOLLOW_LINKS)) {
-            check(in.read() == 'p', "NOFOLLOW_LINKS on a regular file must read");
-        }
-        try (FileChannel ch = FileChannel.open(plain, StandardOpenOption.READ,
-                LinkOption.NOFOLLOW_LINKS)) {
-            check(ch.size() == 7, "NOFOLLOW_LINKS on a regular file must open a channel");
-        }
 
         // Only the FINAL component is the option's business: a symlinked
         // directory earlier in the path is followed as normal.
@@ -209,6 +236,30 @@ public class RNioNoFollow {
         check(content(realDir.resolve("inner")).equals("inner"),
                 "NOFOLLOW_LINKS must only inspect the final path component");
 
+        return writeString + "," + dangling + "," + outStream + "," + inStream + ","
+                + byteChannel + "," + fileChannel + "," + bufWriter;
+    }
+
+    /**
+     * Every arm that needs no symbolic link at all. These travel the SAME
+     * option scanner the defect lived in — it read APPEND and CREATE_NEW and
+     * nothing else, which is why NOFOLLOW_LINKS went unseen — so they are the
+     * part of this vector that is still meaningful on a host where an
+     * unprivileged process cannot create a link. They used to be discarded
+     * along with the symlink arms by a single over-broad bail-out.
+     */
+    static void plainFileArms() throws Exception {
+        Path plain = dir.resolve("plain");
+        Files.writeString(plain, "plain-1", StandardOpenOption.CREATE, LinkOption.NOFOLLOW_LINKS);
+        check(content(plain).equals("plain-1"), "NOFOLLOW_LINKS on a regular file must write");
+        try (InputStream in = Files.newInputStream(plain, LinkOption.NOFOLLOW_LINKS)) {
+            check(in.read() == 'p', "NOFOLLOW_LINKS on a regular file must read");
+        }
+        try (FileChannel ch = FileChannel.open(plain, StandardOpenOption.READ,
+                LinkOption.NOFOLLOW_LINKS)) {
+            check(ch.size() == 7, "NOFOLLOW_LINKS on a regular file must open a channel");
+        }
+
         // APPEND and CREATE_NEW travel the same scanner as NOFOLLOW_LINKS, and
         // were the only two options it ever read — assert they still work.
         Path app = dir.resolve("appended");
@@ -219,6 +270,7 @@ public class RNioNoFollow {
                 () -> Files.writeString(app, "clobber", StandardOpenOption.CREATE_NEW));
         check(createNew.equals("io"), "CREATE_NEW on an existing file: " + createNew);
         check(content(app).equals("one-two"), "a refused CREATE_NEW must not have written");
+        System.out.println("CK RNioNoFollow createNew=" + createNew);
 
         // The Files.write* statics now open through the fd table and write via a
         // buffered writer rather than a single std::fs::write. Assert the three
@@ -236,17 +288,36 @@ public class RNioNoFollow {
         check(readBack.length == payload.length,
                 "large write round-trip length: " + readBack.length + " != " + payload.length);
         check(java.util.Arrays.equals(readBack, payload), "large write round-trip content");
+        // The content read back, as a value the diff can see. A VM that
+        // garbled, short-read or zero-filled any part of the 4 MiB round trip
+        // moves this number; the assertion above is the local half and this is
+        // the cross-VM half, and they fail independently.
+        System.out.println("CK RNioNoFollow bigRoundTrip=" + readBack.length + ","
+                + java.util.Arrays.hashCode(readBack));
         Files.write(big, new byte[] { 'a', 'b', 'c' });
         check(Files.size(big) == 3, "a shorter write must truncate, size=" + Files.size(big));
+        System.out.println("CK RNioNoFollow truncatedSize=" + Files.size(big));
 
+        // Files.write(Path, Iterable) terminates each element with
+        // System.lineSeparator(), NOT with '\n'. The assertion here read
+        // `equals("alpha\nbeta\n")`, which is false on Windows — and this line
+        // had never once executed there, because the symlink bail-out above
+        // returned before reaching it. It is the first thing scoping that
+        // bail-out uncovered, and it is a defect in the VECTOR, not in any VM.
+        //
+        // The separator is published as bytes as well as consumed, so the
+        // assertion cannot be satisfied by a VM whose Files.write and whose
+        // System.lineSeparator() are wrong in the same direction: that VM
+        // agrees with itself here but disagrees with the oracle on the CK line.
+        String sep = System.lineSeparator();
         Path lines = dir.resolve("lines");
         Files.write(lines, java.util.List.of("alpha", "beta"));
-        check(content(lines).equals("alpha\nbeta\n"), "Iterable write: " + content(lines));
-
-        System.out.println("CK RNioNoFollow checks=" + checks);
-        System.out.println("CK RNioNoFollow refusals=" + writeString + "," + dangling + ","
-                + outStream + "," + inStream + "," + byteChannel + "," + fileChannel + ","
-                + bufWriter + "," + createNew);
-        System.out.println("PASS RNioNoFollow");
+        check(content(lines).equals("alpha" + sep + "beta" + sep),
+                "Iterable write: " + content(lines).replace("\r", "\\r").replace("\n", "\\n"));
+        StringBuilder sepBytes = new StringBuilder();
+        for (byte b : sep.getBytes(StandardCharsets.UTF_8)) {
+            sepBytes.append(String.format("%02x", b));
+        }
+        System.out.println("CK RNioNoFollow lineSep=" + sepBytes);
     }
 }
