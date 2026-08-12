@@ -1,7 +1,44 @@
 # W7-91 — `%t`/`%T` rendered its NAMES from hard-coded English tables, and the other half of `RJdkLogging`'s four bytes
 
-**Status: SOURCE LANDED for the name tables, NOT BUILT and NOT RE-RUN. The
-second half of the measured red is NOT fixed and is out of this lane's files.**
+> # NOT RETIRED 2026-08-12 (second pass). The headline IS discharged; §5 is not,
+> # and §5 is now the whole of this record.
+>
+> **Discharged, by measurement rather than by a `PASS`.** Re-run on the wave
+> binary with the pristine-dev control beside it and HotSpot as the oracle:
+>
+> ```
+>                      streamBytes  handlerLevelGate  defaultZoneRawOffsetMs
+> HotSpot 25                   177                88               -10800000
+> f8      --jdk-only           177                88               -10800000
+> control --jdk-only           175                87                       0
+> ```
+>
+> The month name is the whole of the `175 → 177` movement, which is this
+> record's defect, closed.
+>
+> **§8's falsifier is SUPERSEDED — do not work from it.** It predicts
+> `175 → 177` against HotSpot's `179`, i.e. still RED by one character per
+> record. Both VMs read **177** in the same session, for two reasons that
+> compound: W7-92 landed the hour half, and at 14:xx local the unpadded 12-hour
+> field is one digit on every VM, so `H=1` for the broken VM and the fixed one
+> alike. The arithmetic in §1 is right; the constants were a function of the
+> clock, exactly as §6 warned. The judge is the live same-session diff.
+>
+> **What holds this record open is §5, "The numeric half, deliberately not
+> moved"** — `String.format("%,.2f", x)` with no `Locale` localizes against ROOT
+> where a real `Formatter` uses `Locale.getDefault(FORMAT)`. This record calls
+> it *"probably wants taking — but it wants its own measurement"*, which is a
+> deferral for want of a measurement, not a refusal on the merits, and
+> RETIREMENT-20260812.md §3 rules that shape a LIVE row. Unlike W7-67's
+> residual it is **not** written at its source site, so retiring the record
+> would lose it. Its natural successor if anyone wants it closed rather than
+> carried is W7-34-formatter-family-residuals.md, which owns the
+> `Formatter`-receiver locale. See RETIREMENT-20260812B.md §3.2.
+
+**Status: HEADLINE FIXED AND MEASURED 2026-08-12; §5's numeric half is the live
+residual. Source landed for the name tables.** The measurement in §1 below was
+taken against a pristine `dev` binary before the fix; the banner above is the
+after.
 The measurement in §1 is a real suite run against a pristine `dev` binary
 (44044c7e2, no lane edits) handed to this lane by the orchestrator; everything
 below it about CratonVM is read from source, and the JDK columns are read from

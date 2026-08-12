@@ -1,5 +1,23 @@
 # W7-59 — the layout-alias detector, moved onto the allocation every native reaches
 
+> # RETIRED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.1. The instrument is one
+> implementation (`native-api/src/layout_alias.rs`) with 13 gates in
+> `native-api/tests/layout_alias_coverage.rs`; every §8 row has a live owner
+> (W7-66, W7-68, W7-61, W7-69, W7-72 §1); and the census flag was **run** on
+> 2026-08-12 and emits — so what is left is a scheduling gap, not a defect.
+> `CRATONVM_DBG_LAYOUT_ALIAS` still appears nowhere under `regression-suite/`
+> or `ci/`, and W7-69-read-side-alias-instrument.md carries that same row for
+> the read side.
+>
+> **Two corrections to the banner below.** *"`register_selector` has zero
+> occurrences anywhere in the workspace"* is true of the FUNCTION and false of
+> the STRING — three tombstone comments survive at `native-io/src/lib.rs:18636`,
+> `:18730`, `:21395`. And the per-flag spelling this record prescribes is now
+> deprecated: the binary answers *"the supported spelling is now:
+> `CRATONVM_DBG=layout-alias`"*.
+
 > **ADJUDICATED 2026-08-12 — RETIRE-RETIRED. There is no defect left in this
 > record; what is left is a RUN.** The nomination was tested against the tree,
 > not against the record's own status line, and it holds on every count:

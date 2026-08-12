@@ -1,5 +1,16 @@
 # W7-40 — SUPERSEDED. The differential is 9, not 14
 
+> # RETIRED-SUPERSEDED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.3. Superseded by
+> W7-42-differential-instrument-holes.md, and — the check a supersession can
+> quietly fail — **no row loses its owner on the way out**:
+> `stream.reuseThrows` is W7-65's (closed there), and `format.*` ×5,
+> `Enum.valueOfBadName`, `NumberFormat.currencyNegativeUS` and
+> `Random.nextGaussian` are all carried by
+> W7-44-numberformat-enum-and-double-tostring.md and by W7-42.
+> Nothing in this file is a current measurement.
+
 > # SUPERSEDED 2026-08-12 by W7-42-differential-instrument-holes.md
 >
 > **DO NOT WORK FROM THE NUMBER 14. IT IS WRONG AND THIS RECORD IS THE REASON
