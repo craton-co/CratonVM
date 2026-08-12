@@ -405,11 +405,474 @@ fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     ctx.unpin_native_roots(map_pin);
 }
 
+// ---------------------------------------------------------------------------
+// W7-80 — the JDK image's own CLDR locale data
+//
+// Every "CratonVM doesn't surface jdk.localedata" comment in this file was
+// STALE. Measured on `--jdk-only` with the 2026-08-12 dev binary, before a
+// line of this was written:
+//
+//   LOAD ok sun.text.resources.cldr.ext.FormatData_ru  super=java.util.ListResourceBundle
+//     NEW ok / CONTENTS rows=415
+//     MonthAbbreviations=[янв., февр., мар., апр., мая, …]
+//
+// The classes load out of the jimage, instantiate through their public no-arg
+// constructor, and `getContents()` evaluates. The only thing that ever failed
+// was `setAccessible` from an unnamed module — a JPMS check on the REFLECTIVE
+// caller, which a Rust native does not go through. So there is no need for a
+// curated table: the data is in the image this VM already boots from, all 1158
+// locales of it, and the job is to read it.
+//
+// The values are decoded into RUST strings and cached, rather than caching Java
+// refs: a cached `ObjectRef` is a stale pointer one moving collection later.
+// ---------------------------------------------------------------------------
+
+/// One value out of a CLDR bundle's `getContents()` row. The generated tables
+/// carry a `String` or a `String[]` for every key `java.text` reads; the
+/// `String[][]` rows (`TimeZoneNames`) are deliberately not modelled — see
+/// `decode_cldr_value`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CldrValue {
+    Str(String),
+    Arr(Vec<String>),
+}
+
+/// A whole bundle family flattened for one locale: the CLDR parent chain
+/// merged least-specific-first, so an inherited key still resolves.
+type CldrTable = std::sync::Arc<std::collections::BTreeMap<String, CldrValue>>;
+
+/// `(simple-name, language, country)` → the merged table, or `None` when not a
+/// single candidate class loaded. The `None` is cached too: a miss costs a
+/// `find_resource` probe per candidate and there is no point repeating it.
+fn cldr_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>> {
+    static INSTANCE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<CldrTable>>>,
+    > = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The two packages that hold a `LocaleData` base name's CLDR classes: the
+/// base one in `java.base` (ROOT + `_en` + `_en_US_POSIX`) and the `ext` one in
+/// `jdk.localedata` (every other locale). Enumerated from the live jimage, not
+/// guessed.
+///
+/// **Any** `sun.text.resources.*` / `sun.util.resources.*` base name maps here,
+/// including the legacy JRE-package ones. That is deliberate: CratonVM's
+/// `LocaleProviderAdapter` selection asks for `sun.text.resources.FormatData`
+/// (the JRE package) where HotSpot's CLDR default asks for
+/// `sun.text.resources.cldr.FormatData` — measured with
+/// `CRATONVM_DBG_CATALINA=1`, six calls, all the JRE name. HotSpot's answer is
+/// the oracle and HotSpot answers from CLDR, so both names resolve to the CLDR
+/// classes rather than to `jdk.localedata`'s older JRE-package copies.
+fn cldr_packages(base_name: &str) -> Option<(&'static str, &'static str)> {
+    if base_name.starts_with("sun.text.resources.") {
+        Some(("sun/text/resources/cldr", "sun/text/resources/cldr/ext"))
+    } else if base_name.starts_with("sun.util.resources.") {
+        Some(("sun/util/resources/cldr", "sun/util/resources/cldr/ext"))
+    } else {
+        None
+    }
+}
+
+/// Class-name suffixes for a locale, LEAST specific first, so a later merge
+/// overrides an earlier one — the JDK parent chain flattened into one map, the
+/// same shape `build_locale_chain` uses for `.properties`.
+///
+/// **Not modelled:** CLDR's non-truncating parent locales (`en_GB` → `en_001` →
+/// `en`, `es_MX` → `es_419` → `es`), which live in
+/// `CLDRBaseLocaleDataMetaInfo`, and the script subtag (`sr_Latn`, `zh_Hans`).
+/// Both degrade to the language bundle, which is the right *language* with the
+/// wrong regional variant — visibly closer than en, and named here so the next
+/// reader does not have to rediscover it.
+fn cldr_suffixes(lang: &str, country: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    if !lang.is_empty() {
+        out.push(format!("_{lang}"));
+        if !country.is_empty() {
+            out.push(format!("_{lang}_{country}"));
+        }
+    }
+    out
+}
+
+/// Decode one `getContents()` value. `None` means "a shape this table does not
+/// model", and the caller then drops the whole row rather than storing a row of
+/// empty strings that would read downstream as real data.
+fn decode_cldr_value(ctx: &mut dyn NativeContext, val: ObjectRef) -> Option<CldrValue> {
+    if ctx.heap_kind_of(val) != cratonvm_types::ObjectKind::Array {
+        return ctx.read_string(val).map(CldrValue::Str);
+    }
+    if ctx.heap_element_type_of(val) != cratonvm_types::ArrayElementType::Reference {
+        return None;
+    }
+    let len = ctx.array_length(val);
+    let mut items = Vec::with_capacity(len);
+    for i in 0..len {
+        match ctx.get_array_element(val, i) {
+            Value::Object(Some(e)) => {
+                // A nested array is `TimeZoneNames`' `String[][]`. Those bundles
+                // take the real-class path (`needs_concrete_bundle_class`), so
+                // flattening them here would be inventing data.
+                if ctx.heap_kind_of(e) == cratonvm_types::ObjectKind::Array {
+                    return None;
+                }
+                items.push(ctx.read_string(e).unwrap_or_default());
+            }
+            // A null slot is a real CLDR value (the unused day-period entries of
+            // `AmPmMarkers`), and the JDK stores it as an empty string.
+            _ => items.push(String::new()),
+        }
+    }
+    Some(CldrValue::Arr(items))
+}
+
+/// Instantiate one CLDR bundle class and merge its rows into `out`.
+/// Returns whether anything was read.
+fn read_cldr_contents(
+    ctx: &mut dyn NativeContext,
+    class_internal_name: &str,
+    out: &mut std::collections::BTreeMap<String, CldrValue>,
+) -> bool {
+    let bundle = match ctx.new_object_initialized(class_internal_name, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        // A candidate whose `.class` resource exists but which will not
+        // instantiate is not fatal: the chain simply keeps whatever the
+        // less-specific candidates already merged.
+        _ => return false,
+    };
+    let contents = match ctx.invoke_virtual(bundle, "getContents", "()[[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return false,
+    };
+    // GC: from here to the end of the loop nothing allocates on the Java heap —
+    // `array_length`, `get_array_element`, `heap_kind_of` and `read_string` are
+    // all reads — so the raw `contents` ref cannot go stale under a moving
+    // collection. The `new_object_initialized` for the NEXT candidate happens
+    // after this function has already copied everything into Rust strings.
+    let rows = ctx.array_length(contents);
+    let mut added = 0usize;
+    for i in 0..rows {
+        let Value::Object(Some(row)) = ctx.get_array_element(contents, i) else {
+            continue;
+        };
+        if ctx.array_length(row) < 2 {
+            continue;
+        }
+        let key = match ctx.get_array_element(row, 0) {
+            Value::Object(Some(k)) => match ctx.read_string(k) {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Value::Object(Some(val)) = ctx.get_array_element(row, 1) else {
+            continue;
+        };
+        if let Some(decoded) = decode_cldr_value(ctx, val) {
+            out.insert(key, decoded);
+            added += 1;
+        }
+    }
+    added > 0
+}
+
+/// The merged CLDR table for `base_name` at `(lang, country)`, or `None` when
+/// the image has no candidate class at all.
+///
+/// A `None` is the ONLY path that silently degrades to the curated en tables,
+/// so it announces itself once per (family, locale) rather than leaving a
+/// reader to infer an en fallback from English output on a Russian host.
+fn load_cldr_table(
+    ctx: &mut dyn NativeContext,
+    base_name: &str,
+    lang: &str,
+    country: &str,
+) -> Option<CldrTable> {
+    let (root_pkg, ext_pkg) = cldr_packages(base_name)?;
+    let simple = base_name.rsplit('.').next().unwrap_or_default();
+    if simple.is_empty() {
+        return None;
+    }
+    let cache_key = format!("{simple}|{lang}|{country}");
+    if let Ok(cache) = cldr_cache().lock() {
+        if let Some(hit) = cache.get(&cache_key) {
+            return hit.clone();
+        }
+    }
+
+    let mut merged: std::collections::BTreeMap<String, CldrValue> =
+        std::collections::BTreeMap::new();
+    let mut loaded_any = false;
+    for suffix in cldr_suffixes(lang, country) {
+        // Exactly one of the two packages holds any given candidate (ROOT/_en
+        // in java.base, everything else in jdk.localedata), so the order of
+        // this inner probe does not matter.
+        let mut found: Option<String> = None;
+        for pkg in [root_pkg, ext_pkg] {
+            let cand = format!("{pkg}/{simple}{suffix}");
+            if ctx.find_resource(&format!("{cand}.class")).is_some() {
+                found = Some(cand);
+                break;
+            }
+        }
+        let Some(cand) = found else { continue };
+        if read_cldr_contents(ctx, &cand, &mut merged) {
+            loaded_any = true;
+        }
+    }
+
+    let table: Option<CldrTable> = if loaded_any {
+        Some(std::sync::Arc::new(merged))
+    } else {
+        // Warn only for the families CLDR is expected to answer. The other
+        // `sun.*.resources.*` base names (`BreakIteratorInfo`, `CollationData`,
+        // …) legitimately have no `cldr` package at all, and a warning on those
+        // would be crying wolf — which is how a real fallback notice gets
+        // filtered out of a log.
+        if matches!(
+            simple,
+            "FormatData" | "CurrencyNames" | "LocaleNames" | "CalendarData"
+        ) {
+            tracing::warn!(
+                family = simple,
+                language = lang,
+                country = country,
+                "W7-80: no CLDR bundle class in the JDK image for this locale family; \
+                 falling back to CratonVM's curated en locale data. Formatting will be \
+                 English regardless of the reported locale."
+            );
+        }
+        None
+    };
+    if let Ok(mut cache) = cldr_cache().lock() {
+        cache.insert(cache_key, table.clone());
+    }
+    table
+}
+
+/// `sun.util.locale.provider.LocaleResources.getNumberStrings`, reproduced:
+/// the number tables are keyed by numbering system, so read
+/// `<DefaultNumberingSystem>.<kind>` first, then `latn.<kind>`, then the bare
+/// `<kind>`. Getting this wrong is silent — every locale would fall through to
+/// the bare key, which CLDR does not define, and the whole number surface would
+/// stay en while looking like it had been made locale-aware.
+fn cldr_number_strings(table: &CldrTable, kind: &str) -> Option<Vec<String>> {
+    if let Some(CldrValue::Str(ns)) = table.get("DefaultNumberingSystem") {
+        if let Some(CldrValue::Arr(v)) = table.get(&format!("{ns}.{kind}")) {
+            return Some(v.clone());
+        }
+    }
+    if let Some(CldrValue::Arr(v)) = table.get(&format!("latn.{kind}")) {
+        return Some(v.clone());
+    }
+    match table.get(kind) {
+        Some(CldrValue::Arr(v)) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// One slot of a CLDR `NumberElements` array, or `None` when the array is
+/// absent or the slot is the empty string CLDR uses for "not set here".
+fn number_element(elems: &Option<Vec<String>>, index: usize) -> Option<&str> {
+    elems
+        .as_ref()
+        .and_then(|v| v.get(index))
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// The same slot as a single `char`, with the caller's fallback. CLDR stores
+/// these as strings because a few are multi-character (`minusSignText`,
+/// `percentText`); `DecimalFormatSymbols`' char-valued setters take the first
+/// character, which is what the JDK's own `findNonFormatChar` reduces to for
+/// every locale in the image.
+fn number_element_char(elems: &Option<Vec<String>>, index: usize, fallback: char) -> char {
+    number_element(elems, index)
+        .and_then(|s| s.chars().next())
+        .unwrap_or(fallback)
+}
+
+/// A `String[]` value straight out of the table.
+fn cldr_arr<'t>(table: &'t CldrTable, key: &str) -> Option<&'t Vec<String>> {
+    match table.get(key) {
+        Some(CldrValue::Arr(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// `(language, country)` of the `locale` field on a receiver that carries one —
+/// `sun.util.locale.provider.LocaleResources` for the `getNumberPatterns` /
+/// `getDecimalFormatSymbolsData` / `getDateTimePattern` overrides. Empty
+/// strings when the field or the accessors yield nothing, which resolves to the
+/// CLDR ROOT bundle.
+fn receiver_locale(ctx: &mut dyn NativeContext, this: Option<&Value>) -> (String, String) {
+    let Some(Value::Object(Some(this))) = this else {
+        return (String::new(), String::new());
+    };
+    let Value::Object(Some(loc)) = ctx.get_field_by_name(*this, "locale") else {
+        return (String::new(), String::new());
+    };
+    let (lang, country, _variant) = decompose_locale(ctx, loc);
+    (lang, country)
+}
+
+/// `(language, country)` of a `Locale` argument.
+fn arg_locale(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> (String, String) {
+    match arg {
+        Some(Value::Object(Some(loc))) => {
+            let (lang, country, _variant) = decompose_locale(ctx, *loc);
+            (lang, country)
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// The FormatData table for a locale. One name for the base string so the six
+/// call sites cannot drift apart on it.
+fn cldr_format_data(
+    ctx: &mut dyn NativeContext,
+    lang: &str,
+    country: &str,
+) -> Option<CldrTable> {
+    load_cldr_table(ctx, "sun.text.resources.cldr.FormatData", lang, country)
+}
+
+/// The display symbol for an ISO 4217 code in a locale.
+///
+/// CLDR keys `CurrencyNames` with the UPPERCASE code for the SYMBOL and the
+/// lowercase code for the display NAME — the opposite of what
+/// `populate_currency_names_en` in this file assumed. Measured against the live
+/// bundles rather than inferred: `CurrencyNames_ru` carries `RUB=₽` and
+/// `rub=российский рубль`, and root `CurrencyNames` carries only `EUR`/`JPY`/
+/// `USD`, so an unlisted code correctly falls through.
+///
+/// Order: real CLDR ▸ this file's curated table ▸ the JDK's documented last
+/// resort (the code itself). The curated middle step is what keeps
+/// `getCurrencyInstance(Locale.US)` rendering `$` on an image that shipped
+/// without `jdk.localedata`.
+pub(crate) fn cldr_currency_symbol(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+    lang: &str,
+    country: &str,
+) -> String {
+    if !code.is_empty() {
+        if let Some(table) =
+            load_cldr_table(ctx, "sun.util.resources.cldr.CurrencyNames", lang, country)
+        {
+            if let Some(CldrValue::Str(sym)) = table.get(code) {
+                if !sym.is_empty() {
+                    return sym.clone();
+                }
+            }
+        }
+    }
+    match code {
+        "USD" => "$".to_string(),
+        "EUR" => "\u{20AC}".to_string(),
+        "GBP" => "\u{00A3}".to_string(),
+        "JPY" => "\u{00A5}".to_string(),
+        "CNY" => "\u{00A5}".to_string(),
+        "CHF" => "CHF".to_string(),
+        "CAD" => "$".to_string(),
+        "AUD" => "$".to_string(),
+        _ => code.to_string(),
+    }
+}
+
+/// `Currency.getSymbol()`'s locale: the real no-arg body is
+/// `getSymbol(Locale.getDefault(Locale.Category.DISPLAY))`, so the symbol a
+/// bare `getSymbol()` returns is a function of the host locale — `RUB` renders
+/// `₽` on a ru host and the bare code `RUB` on an en one.
+pub(crate) fn currency_symbol_for_default_locale(
+    ctx: &mut dyn NativeContext,
+    code: &str,
+) -> String {
+    let display = match ctx.invoke(
+        "java/util/Locale",
+        "getDefault",
+        "()Ljava/util/Locale;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(loc)))) => Some(loc),
+        _ => None,
+    };
+    let (lang, country) = match display {
+        Some(loc) => {
+            let (lang, country, _variant) = decompose_locale(ctx, loc);
+            (lang, country)
+        }
+        None => (String::new(), String::new()),
+    };
+    cldr_currency_symbol(ctx, code, &lang, &country)
+}
+
+/// Overlay the JDK image's own CLDR data for `(lang, country)` onto a synthetic
+/// bundle's backing map, on TOP of whatever curated en baseline was written
+/// first. Overlay rather than replace, so a key CLDR does not carry keeps the
+/// value this file has been serving — this change can add correctness but it
+/// cannot take a key away.
+///
+/// Returns whether any CLDR data was found.
+fn overlay_cldr_bundle(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    base_name: &str,
+    lang: &str,
+    country: &str,
+) -> bool {
+    let Some(table) = load_cldr_table(ctx, base_name, lang, country) else {
+        return false;
+    };
+    let map_pin = ctx.pin_native_root(map);
+    for (key, value) in table.iter() {
+        match value {
+            CldrValue::Str(s) => put_str(ctx, map_pin, map, key, s),
+            CldrValue::Arr(items) => {
+                let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                put_arr(ctx, map_pin, map, key, &refs);
+            }
+        }
+    }
+
+    // The legacy 9-slot `DateTimePatterns` (4 time + 4 date + 1 combiner) is
+    // the shape `populate_format_data_en` writes and the shape this file's
+    // consumers read. CLDR splits it into `TimePatterns` / `DatePatterns` /
+    // a 4-slot `DateTimePatterns` combiner, and the overlay above has just
+    // replaced the 9-slot array with the 4-slot combiner. Rebuild the legacy
+    // shape from the real per-locale patterns so the key keeps its meaning
+    // instead of silently shrinking to four entries.
+    let time = cldr_arr(&table, "TimePatterns").cloned();
+    let date = cldr_arr(&table, "DatePatterns").cloned();
+    if let (Some(time), Some(date)) = (time, date) {
+        if time.len() >= 4 && date.len() >= 4 {
+            let combiner = cldr_arr(&table, "DateTimePatterns")
+                .and_then(|c| c.first().cloned())
+                .unwrap_or_else(|| "{1} {0}".to_string());
+            let nine: Vec<&str> = time[..4]
+                .iter()
+                .chain(date[..4].iter())
+                .map(String::as_str)
+                .chain(std::iter::once(combiner.as_str()))
+                .collect();
+            put_arr(ctx, map_pin, map, "DateTimePatterns", &nine);
+            put_arr(ctx, map_pin, map, "gregorian.DateTimePatterns", &nine);
+        }
+    }
+    ctx.unpin_native_roots(map_pin);
+    true
+}
+
 /// Build a synthetic `ResourceBundle` for `bundle_name`. Always returns
 /// non-null. For user `.properties` resources on the classpath we
 /// populate from the file. For known JDK locale-data base names we
 /// pre-populate English/US defaults. Unknown names get an empty bundle.
-fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn build_bundle(
+    ctx: &mut dyn NativeContext,
+    bundle_name: &str,
+    lang: &str,
+    country: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     // cceres5: pin the bundle + backing map across every allocation below
     // (map init, root-locale alloc, per-property string allocations, the
     // populate tables) and return the pin-refreshed address — the raw `obj`
@@ -518,6 +981,23 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> Result<Object
             let map_now = ctx.read_native_pin(map_pin, map);
             populate_currency_names_en(ctx, map_now);
         }
+
+        // W7-80: overlay the JDK image's own CLDR data for the REQUESTED
+        // locale on top of the curated en baseline just written. This is the
+        // whole of stage 2 for the `DateFormatSymbols` surface —
+        // `DateFormatSymbols.initializeData` reads `MonthNames`,
+        // `MonthAbbreviations`, `AmPmMarkers`, `DayNames`, `DayAbbreviations`,
+        // `Eras` and `DateTimePatternChars` out of exactly this bundle, and
+        // `java.util.Formatter`'s `%tb` (the first conversion in
+        // `SimpleFormatter`'s default pattern) reads `getShortMonths()` from
+        // the result.
+        //
+        // A curated fallback stays underneath rather than being deleted: it
+        // costs one map fill per bundle and it means an image without
+        // `jdk.localedata` (a jlinked runtime that dropped it) degrades to
+        // today's behaviour instead of to an empty bundle.
+        let map_now = ctx.read_native_pin(map_pin, map);
+        overlay_cldr_bundle(ctx, map_now, bundle_name, lang, country);
     }
 
     let obj_now = ctx.read_native_pin(obj_pin, obj);
@@ -879,18 +1359,27 @@ fn find_bundle_resource(
 /// (`Locale.FRENCH`, …) whose codes live in `BaseLocale`, not the synthetic
 /// side table.
 fn decompose_locale(ctx: &mut dyn NativeContext, loc: ObjectRef) -> (String, String, String) {
-    let lang = match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+    // Each accessor allocates its result String, so the raw `loc` could be
+    // stale by the second call. W7-80 made this the hot path for every locale
+    // lookup in the file, so pin it rather than keep relying on the three
+    // calls landing between collections.
+    let loc_pin = ctx.pin_native_root(loc);
+    let loc_now = ctx.read_native_pin(loc_pin, loc);
+    let lang = match ctx.invoke_virtual(loc_now, "getLanguage", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let country = match ctx.invoke_virtual(loc, "getCountry", "()Ljava/lang/String;", &[]) {
+    let loc_now = ctx.read_native_pin(loc_pin, loc);
+    let country = match ctx.invoke_virtual(loc_now, "getCountry", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let variant = match ctx.invoke_virtual(loc, "getVariant", "()Ljava/lang/String;", &[]) {
+    let loc_now = ctx.read_native_pin(loc_pin, loc);
+    let variant = match ctx.invoke_virtual(loc_now, "getVariant", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
+    ctx.unpin_native_roots(loc_pin);
     (lang, country, variant)
 }
 
@@ -1158,7 +1647,11 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Tomcat's StringManager rely on).
     if is_jdk_internal_bundle(&bundle_name) {
         ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
-        let obj = build_bundle(ctx, &bundle_name);
+        // W7-80: the requested locale reaches `build_bundle` now. It used to
+        // be dropped here, which is why every locale got the same en bundle —
+        // the data was never asked for a language, so no table could have been
+        // locale-aware however good it was.
+        let obj = build_bundle(ctx, &bundle_name, &lang, &country);
         return Ok(Some(Value::Object(Some(obj?))));
     }
     ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
@@ -1883,31 +2376,59 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "sun/util/locale/provider/LocaleResources",
         "getDecimalFormatSymbolsData",
         "()[Ljava/lang/Object;",
-        |ctx, _args| {
-            let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
+        |ctx, args| {
             // 13-element layout: indices 0-10 are mandatory (decimal,
             // grouping, pattern sep, percent, zero, digit, minus,
             // exponent, perMille, infinity, NaN), 11=monetary decimal
             // separator, 12=monetary grouping separator (both optional —
             // DFS falls back to the regular separators when those slots
             // are empty / the array is short).
-            let elems = make_string_array(
-                ctx,
-                &[
-                    ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN", ".", ",",
-                ],
-            );
-            ctx.set_array_element(outer, 0, Value::Object(Some(elems)));
+            //
+            // W7-80: answered from the JDK image's own CLDR `NumberElements`
+            // for this `LocaleResources`' locale, which is where the real
+            // `getDecimalFormatSymbolsData` reads it from — via
+            // `getNumberStrings`, so the numbering-system prefix
+            // (`latn.NumberElements`) has to be honoured or every locale falls
+            // through to a key CLDR does not define. The en constants stay as
+            // the fallback for an image with no `jdk.localedata`.
+            let (lang, country) = receiver_locale(ctx, args.first());
+            let cldr = cldr_format_data(ctx, &lang, &country)
+                .and_then(|t| cldr_number_strings(&t, "NumberElements"));
+            let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
+            // Every allocation below this point can move `outer`; the raw ref
+            // was carried across three of them before. Pin it and re-read.
+            let outer_pin = ctx.pin_native_root(outer);
+            let elems = match cldr {
+                // `DecimalFormatSymbols.initialize` indexes 0..=10
+                // unconditionally, so a short array is an AIOOBE with no
+                // message — refuse to hand one over.
+                Some(v) if v.len() >= 11 => {
+                    let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+                    make_string_array(ctx, &refs)
+                }
+                _ => make_string_array(
+                    ctx,
+                    &[
+                        ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN", ".",
+                        ",",
+                    ],
+                ),
+            };
+            let outer_now = ctx.read_native_pin(outer_pin, outer);
+            ctx.set_array_element(outer_now, 0, Value::Object(Some(elems)));
             // Use empty strings rather than null for indices 1 and 2 so a
             // checkcast-then-getfield path can't run into a null-pointer
             // surprise via a downstream method call (DFS treats an empty
             // currency symbol as "unset" and resolves it lazily through
             // initializeCurrency()).
             let empty1 = ctx.create_string("");
+            let outer_now = ctx.read_native_pin(outer_pin, outer);
+            ctx.set_array_element(outer_now, 1, Value::Object(Some(empty1)));
             let empty2 = ctx.create_string("");
-            ctx.set_array_element(outer, 1, Value::Object(Some(empty1)));
-            ctx.set_array_element(outer, 2, Value::Object(Some(empty2)));
-            Ok(Some(Value::Object(Some(outer))))
+            let outer_now = ctx.read_native_pin(outer_pin, outer);
+            ctx.set_array_element(outer_now, 2, Value::Object(Some(empty2)));
+            ctx.unpin_native_roots(outer_pin);
+            Ok(Some(Value::Object(Some(outer_now))))
         },
     );
 
@@ -1930,12 +2451,26 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // `positivePrefix` affix ("USD") never matches the literal "$" prefix in
     // the input text.
     //
-    // Answer directly from a small curated ISO-code → symbol table (same
-    // curation level as the existing `populate_currency_names_en` map and the
-    // `Currency.getSymbol()` no-arg override that already existed for
-    // synthetic-JDK mode). `getSymbol()` (no-arg) delegates to
-    // `getSymbol(Locale.getDefault(...))` in real bytecode, so overriding only
-    // the 1-arg overload fixes both call forms.
+    // W7-80: answered from the JDK image's own CLDR `CurrencyNames` bundle for
+    // the ARGUMENT locale, which is what makes this locale-sensitive at all —
+    // the previous curated table returned "$" for USD on every locale and "€"
+    // for EUR on every locale, so the symbol could not disagree between en and
+    // ja the way HotSpot's does (`JPY` is `¥` for ru/de and the fullwidth `￥`
+    // for ja; `RUB` is `₽` for ru and the bare code `RUB` for en).
+    //
+    // The key convention is the opposite way round from the one this file's own
+    // `populate_currency_names_en` used: in CLDR the UPPERCASE ISO code maps to
+    // the SYMBOL and the lowercase code maps to the display NAME. Verified
+    // against the live bundles — `CurrencyNames_ru` has `RUB=₽` and
+    // `rub=российский рубль`.
+    //
+    // The final fallback is the JDK's own: "use the currency code as symbol of
+    // last resort". The curated table is kept ahead of it so an image without
+    // `jdk.localedata` still renders `$` rather than `USD`, which is the
+    // behaviour `CurrencyStyleFormatterTests` / `NumberFormattingTests` need.
+    // `getSymbol()` (no-arg) delegates to `getSymbol(Locale.getDefault(...))`
+    // in real bytecode, so overriding only the 1-arg overload fixes both call
+    // forms.
     registry.register(
         "java/util/Currency",
         "getSymbol",
@@ -1949,18 +2484,9 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
                 _ => String::new(),
             };
-            let sym = match code.as_str() {
-                "USD" => "$",
-                "EUR" => "\u{20AC}",
-                "GBP" => "\u{00A3}",
-                "JPY" => "\u{00A5}",
-                "CNY" => "\u{00A5}",
-                "CHF" => "CHF",
-                "CAD" => "$",
-                "AUD" => "$",
-                _ => &code,
-            };
-            let s = ctx.create_string(sym);
+            let (lang, country) = arg_locale(ctx, args.get(1));
+            let sym = cldr_currency_symbol(ctx, &code, &lang, &country);
+            let s = ctx.create_string(&sym);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1991,26 +2517,53 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // re-entrant currency initialization (Kafka 4.2.0 boot path).
             ctx.set_field_by_name(this, "locale", locale);
             ctx.set_field_by_name(this, "currencyInitialized", Value::Int(1));
-            // Locale-aware decimal/grouping separators. The JDK's per-locale
-            // CLDR data lives in `jdk.localedata`, which CratonVM doesn't
-            // surface, so derive the two separators that actually vary by
+            // `this` was carried raw across ~15 allocating calls below (a
+            // `create_string` each, plus every `invoke_virtual` into real
+            // bytecode). W7-80 adds CLDR loads — which instantiate bundle
+            // classes and build their whole `Object[][]` — to the same
+            // sequence, so pin it and re-read before each use.
+            let this_pin = ctx.pin_native_root(this);
+            // The `Locale` argument goes the same way: it is read again, far
+            // below, to derive the currency, by which point several bundle
+            // classes have been instantiated. `unpin_native_roots(this_pin)`
+            // releases both (pins release from an index onward).
+            let locale_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            let locale_pin = locale_obj.map(|o| ctx.pin_native_root(o));
+            // W7-80: every symbol below now comes from the JDK image's own CLDR
+            // `NumberElements` for this locale — the same array the real
+            // `DecimalFormatSymbols.initialize` reads, in the same index order
+            // (0 decimal, 1 grouping, 2 pattern separator, 3 percent, 4 zero
+            // digit, 5 digit, 6 minus, 7 exponent separator, 8 per-mille,
+            // 9 infinity, 10 NaN, 11 monetary decimal, 12 monetary grouping).
+            //
+            // What that replaces is the CURATED 12-language separator list
+            // below, which survives only as the fallback. The list was
+            // introduced for a real defect (German `NumberFormat.parse("1,1")`
+            // returned 11.0 — Spring DLBF customEditor/converter) and it is a
+            // strict subset of what CLDR says: ru's grouping separator is
+            // U+00A0 and its NaN is "не число", neither of which a list that
+            // only ever chose between '.', ',' and U+202F could reach.
+            //
+            // Original note kept for the fallback's provenance:
+            // derive the two separators that actually vary by
             // language from the locale's language tag (curated, like the
             // `getDateTimePattern` override). Without this, every locale got the
             // en/US separators and e.g. German `NumberFormat.parse("1,1")`
             // returned 11.0 instead of 1.1 (Spring DLBF customEditor/converter).
-            // All other symbols are locale-invariant across the locales the
-            // suite exercises. (dec, grp): en='.'/',' ; de=','/'.' ;
+            // (dec, grp): en='.'/',' ; de=','/'.' ;
             // fr=','/' ' (narrow no-break space).
-            let lang = match locale {
-                Value::Object(Some(loc)) => {
-                    match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[]) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => String::new(),
-                    }
-                }
-                _ => String::new(),
-            };
-            let (dec_sep, grp_sep): (char, char) = match lang.as_str() {
+            let (lang, country) = arg_locale(ctx, args.get(1));
+            let elems = cldr_format_data(ctx, &lang, &country)
+                .and_then(|t| cldr_number_strings(&t, "NumberElements"))
+                // Short array ⇒ ignore it entirely. Taking the first few slots
+                // from CLDR and the rest from the curated list would build a
+                // symbol set no locale has, which is the exact chimera
+                // W7-44 declined to ship.
+                .filter(|v| v.len() >= 11);
+            let (curated_dec, curated_grp): (char, char) = match lang.as_str() {
                 // Comma-decimal / dot-grouping family (German, Spanish, Italian,
                 // Dutch, Portuguese, Danish, Polish, …). Verified against JDK 25
                 // for de; the others share the CLDR ','/'.' convention.
@@ -2022,57 +2575,103 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 // en and everything else: US/root separators.
                 _ => ('.', ','),
             };
+            // `number_element` / `number_element_char` are the one accessor for
+            // a CLDR slot, so an absent array cannot leave half the symbol set
+            // CLDR and half curated.
+            let dec_sep = number_element_char(&elems, 0, curated_dec);
+            let grp_sep = number_element_char(&elems, 1, curated_grp);
+            // Slots 11/12 are optional in CLDR; the JDK's own rule is "absent
+            // or empty means use the plain separator", reproduced here.
+            let mon_dec_sep = number_element_char(&elems, 11, dec_sep);
+            let mon_grp_sep = number_element_char(&elems, 12, grp_sep);
+            let pattern_sep = number_element_char(&elems, 2, ';');
+            let percent_ch = number_element_char(&elems, 3, '%');
+            let zero_digit = number_element_char(&elems, 4, '0');
+            let digit_ch = number_element_char(&elems, 5, '#');
+            let minus_ch = number_element_char(&elems, 6, '-');
+            let permill_ch = number_element_char(&elems, 8, '\u{2030}');
+            let exponent_text = number_element(&elems, 7).unwrap_or("E").to_string();
+            let infinity_text = number_element(&elems, 9).unwrap_or("\u{221E}").to_string();
+            let nan_text = number_element(&elems, 10).unwrap_or("NaN").to_string();
             // Set every public char/string field via the corresponding
             // setter so we don't depend on instance-field layout.
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setDecimalSeparator",
                 "(C)V",
                 &[Value::Int(dec_sep as i32)],
             );
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setGroupingSeparator",
                 "(C)V",
                 &[Value::Int(grp_sep as i32)],
             );
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setPatternSeparator",
                 "(C)V",
-                &[Value::Int(';' as i32)],
+                &[Value::Int(pattern_sep as i32)],
             );
-            let _ = ctx.invoke_virtual(this, "setPercent", "(C)V", &[Value::Int('%' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setZeroDigit", "(C)V", &[Value::Int('0' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setDigit", "(C)V", &[Value::Int('#' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setMinusSign", "(C)V", &[Value::Int('-' as i32)]);
-            let _ = ctx.invoke_virtual(this, "setPerMill", "(C)V", &[Value::Int(0x2030)]);
-            let exp = ctx.create_string("E");
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ =
+                ctx.invoke_virtual(this_now, "setPercent", "(C)V", &[Value::Int(percent_ch as i32)]);
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
+                "setZeroDigit",
+                "(C)V",
+                &[Value::Int(zero_digit as i32)],
+            );
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ = ctx.invoke_virtual(this_now, "setDigit", "(C)V", &[Value::Int(digit_ch as i32)]);
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ = ctx.invoke_virtual(
+                this_now,
+                "setMinusSign",
+                "(C)V",
+                &[Value::Int(minus_ch as i32)],
+            );
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ = ctx.invoke_virtual(
+                this_now,
+                "setPerMill",
+                "(C)V",
+                &[Value::Int(permill_ch as i32)],
+            );
+            let exp = ctx.create_string(&exponent_text);
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ = ctx.invoke_virtual(
+                this_now,
                 "setExponentSeparator",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(exp))],
             );
-            let inf = ctx.create_string("\u{221E}");
+            let inf = ctx.create_string(&infinity_text);
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setInfinity",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(inf))],
             );
-            let nan = ctx.create_string("NaN");
+            let nan = ctx.create_string(&nan_text);
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setNaN",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(nan))],
             );
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setMonetaryDecimalSeparator",
                 "(C)V",
-                &[Value::Int(dec_sep as i32)],
+                &[Value::Int(mon_dec_sep as i32)],
             );
             // setMonetaryGroupingSeparator — without this, `monetaryGroupingSeparator`
             // keeps its zero-value default. Real `DecimalFormat.subparse` (the
@@ -2083,26 +2682,77 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             // "," as a grouping separator and parsing stopped after the first digit
             // group — surfaced as `NumberFormattingTests.currencyFormatting()`
             // binding "$3,339.12" with a ParseException (getErrorCount()==1).
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setMonetaryGroupingSeparator",
                 "(C)V",
-                &[Value::Int(grp_sep as i32)],
+                &[Value::Int(mon_grp_sep as i32)],
             );
-            let cs = ctx.create_string("$");
+
+            // W7-80: the currency. `$`/`USD` were hardcoded here for every
+            // locale, which is why `NumberFormat.getCurrencyInstance(ru_RU)
+            // .getCurrency().getCurrencyCode()` answered USD where HotSpot
+            // answers RUB.
+            //
+            // The CODE comes from `Currency.getInstance(Locale)` — java.base's
+            // own `currency.data` table, which was ALREADY correct here
+            // (measured RUB / EUR / TRY / JPY before this change; the probe row
+            // is `currency.ofLocale`). Nothing had to be curated for it; the
+            // value was simply never asked for. `getInstance` raises
+            // `IllegalArgumentException` for a locale with no ISO 3166 country
+            // (a bare `new Locale("ru")`), and the `_` arm below absorbs that
+            // `Err` — the established idiom in this file for a call whose
+            // failure is a legitimate outcome.
+            //
+            // The SYMBOL goes through `cldr_currency_symbol`, the same helper
+            // the `Currency.getSymbol(Locale)` override uses.
+            //
+            // ORDER IS LOAD-BEARING and is the reverse of what stood here.
+            // `setInternationalCurrencySymbol`'s real body re-derives
+            // `currencySymbol = currency.getSymbol(locale)`, so whichever of
+            // the two runs LAST wins the symbol. The old code set the symbol
+            // first and the code second, and relied on the `getSymbol`
+            // override to put the symbol back; setting the code first and the
+            // symbol second makes that independent of `getSymbol`'s behaviour.
+            let locale_for_currency = match (locale_obj, locale_pin) {
+                (Some(o), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                _ => Value::Object(None),
+            };
+            let currency = match ctx.invoke(
+                "java/util/Currency",
+                "getInstance",
+                "(Ljava/util/Locale;)Ljava/util/Currency;",
+                &[locale_for_currency],
+            ) {
+                Ok(Some(Value::Object(Some(c)))) => Some(c),
+                _ => None,
+            };
+            let code = currency
+                .and_then(|c| match ctx.get_field_by_name(c, "currencyCode") {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                })
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| "USD".to_string());
+            let symbol = cldr_currency_symbol(ctx, &code, &lang, &country);
+            let ics = ctx.create_string(&code);
+            let this_now = ctx.read_native_pin(this_pin, this);
             let _ = ctx.invoke_virtual(
-                this,
-                "setCurrencySymbol",
-                "(Ljava/lang/String;)V",
-                &[Value::Object(Some(cs))],
-            );
-            let ics = ctx.create_string("USD");
-            let _ = ctx.invoke_virtual(
-                this,
+                this_now,
                 "setInternationalCurrencySymbol",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(ics))],
             );
+            let cs = ctx.create_string(&symbol);
+            let this_now = ctx.read_native_pin(this_pin, this);
+            let _ = ctx.invoke_virtual(
+                this_now,
+                "setCurrencySymbol",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(cs))],
+            );
+            ctx.unpin_native_roots(this_pin);
             // Locale field is not exposed via a public setter; the JDK's
             // own initialize() does putfield directly. Use invoke on a
             // synthetic helper via reflection-free path: call getLocale()
@@ -2159,15 +2809,36 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // misses are the `#,##0 %` no-break-space family — the same en/locale
     // split), and slot 3 is not reachable from outside `java.text`, so it is
     // uncounted. See W7-44-numberformat-enum-and-double-tostring.md.
+    //
+    // W7-80 is that larger change, and it lands the two halves TOGETHER as
+    // W7-44 required: this table and `getDecimalFormatSymbolsData` above now
+    // read the same locale's CLDR bundle, so `#,##0.00 ¤` for de arrives beside
+    // de's `,`/`.` separators and its `€`, never one without the others.
+    //
+    // Slot 3 is the ACCOUNTING pattern, not the scientific one. Read from
+    // `NumberFormatProviderImpl`: `ACCOUNTINGSTYLE = 3`, and slot 3 is consulted
+    // only when the locale carries `-u-cf-account`. The `#E0` that stood there
+    // was mislabelled "scientific"; it was harmless because nothing could reach
+    // it (`NumberFormat.getScientificInstance` is package-private), and CLDR's
+    // real slot 3 is strictly better.
     registry.register(
         "sun/util/locale/provider/LocaleResources",
         "getNumberPatterns",
         "()[Ljava/lang/String;",
-        |ctx, _args| {
-            let arr = make_string_array(
-                ctx,
-                &["#,##0.###", "\u{00A4}#,##0.00", "#,##0%", "#E0"],
-            );
+        |ctx, args| {
+            let (lang, country) = receiver_locale(ctx, args.first());
+            let cldr = cldr_format_data(ctx, &lang, &country)
+                .and_then(|t| cldr_number_strings(&t, "NumberPatterns"));
+            let arr = match cldr {
+                // `NumberFormatProviderImpl.getInstance` indexes 0..2 directly
+                // and tests `length > 3` before touching the accounting slot,
+                // so a 3-slot array is safe but a shorter one is not.
+                Some(v) if v.len() >= 3 => {
+                    let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+                    make_string_array(ctx, &refs)
+                }
+                _ => make_string_array(ctx, &["#,##0.###", "\u{00A4}#,##0.00", "#,##0%", "#E0"]),
+            };
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -2207,23 +2878,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // modelled — and the en/de java.time patterns are identical to the java.text
     // ones for the locales the Spring suite exercises, so one table serves both.
     fn locale_datetime_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-        // Read this LocaleResources' `locale` field → language tag so we
-        // pick the right CLDR pattern family. Falls back to en when the
-        // field/getLanguage path yields nothing.
-        let lang = match args.first() {
-            Some(Value::Object(Some(this))) => match ctx.get_field_by_name(*this, "locale") {
-                Value::Object(Some(loc)) => {
-                    match ctx.invoke_virtual(loc, "getLanguage", "()Ljava/lang/String;", &[]) {
-                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
-                        _ => String::new(),
-                    }
-                }
-                _ => String::new(),
-            },
-            _ => String::new(),
-        };
+        // W7-80: the patterns come from the JDK image's own CLDR `TimePatterns`
+        // / `DatePatterns` / `DateTimePatterns` for this `LocaleResources`'
+        // locale. The curated en/de arrays below survive as the fallback.
+        //
+        // The java.time overload takes the same table on purpose: the real
+        // `getJavaTimeDateTimePattern` looks for a `java.time.`-prefixed key
+        // first and falls back to the unprefixed one, and JDK 25's CLDR
+        // `FormatData` carries `java.time.` variants only for the non-Gregorian
+        // calendars (`java.time.japanese.DatePatterns`, …), never for gregory.
+        let (lang, country) = receiver_locale(ctx, args.first());
+        let table = cldr_format_data(ctx, &lang, &country);
         // (time FULL/LONG/MEDIUM/SHORT, date FULL/LONG/MEDIUM/SHORT)
-        let (time, date): ([&str; 4], [&str; 4]) = if lang == "de" {
+        let (fallback_time, fallback_date): ([&str; 4], [&str; 4]) = if lang == "de" {
             (
                 ["HH:mm:ss zzzz", "HH:mm:ss z", "HH:mm:ss", "HH:mm"],
                 ["EEEE, d. MMMM y", "d. MMMM y", "dd.MM.y", "dd.MM.yy"],
@@ -2239,6 +2906,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 ["EEEE, MMMM d, y", "MMMM d, y", "MMM d, y", "M/d/yy"],
             )
         };
+        let time: Vec<String> = match table.as_ref().and_then(|t| cldr_arr(t, "TimePatterns")) {
+            Some(v) if v.len() >= 4 => v.clone(),
+            _ => fallback_time.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let date: Vec<String> = match table.as_ref().and_then(|t| cldr_arr(t, "DatePatterns")) {
+            Some(v) if v.len() >= 4 => v.clone(),
+            _ => fallback_date.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let combiners: Vec<String> =
+            match table.as_ref().and_then(|t| cldr_arr(t, "DateTimePatterns")) {
+                Some(v) if !v.is_empty() => v.clone(),
+                _ => vec!["{1}, {0}".to_string()],
+            };
         let style = |i: usize| -> i32 {
             match args.get(i) {
                 Some(Value::Int(n)) => *n,
@@ -2247,16 +2927,33 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         };
         let time_style = style(1);
         let date_style = style(2);
-        let pick = |arr: &[&str; 4], s: i32| -> String {
-            // clamp out-of-range styles to MEDIUM rather than panic
-            let idx = if (0..=3).contains(&s) { s as usize } else { 2 };
-            arr[idx].to_string()
+        // clamp out-of-range styles to MEDIUM rather than panic
+        let clamp = |s: i32| -> usize {
+            if (0..=3).contains(&s) {
+                s as usize
+            } else {
+                2
+            }
         };
         let pattern = match (date_style >= 0, time_style >= 0) {
-            // combiner "{1}, {0}" = datePattern + ", " + timePattern
-            (true, true) => format!("{}, {}", pick(&date, date_style), pick(&time, time_style)),
-            (true, false) => pick(&date, date_style),
-            (false, true) => pick(&time, time_style),
+            (true, true) => {
+                // `LocaleResources.getDateTimePattern` picks the combiner at
+                // `max(dateStyle, timeStyle)` and substitutes {1}=date, {0}=time.
+                // A literal replace matches the JDK's `MessageFormat.format` on
+                // every combiner in the image: the JDK doubles the quotes first,
+                // so a quoted literal like `{1} 'at' {0}` round-trips to the same
+                // `'at'` a replace leaves in place.
+                let combiner = combiners
+                    .get(clamp(date_style.max(time_style)))
+                    .or_else(|| combiners.first())
+                    .cloned()
+                    .unwrap_or_else(|| "{1}, {0}".to_string());
+                combiner
+                    .replace("{1}", &date[clamp(date_style)])
+                    .replace("{0}", &time[clamp(time_style)])
+            }
+            (true, false) => date[clamp(date_style)].clone(),
+            (false, true) => time[clamp(time_style)].clone(),
             (false, false) => String::new(),
         };
         Value::Object(Some(ctx.create_string(&pattern)))
