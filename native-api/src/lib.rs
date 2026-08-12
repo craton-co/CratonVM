@@ -34,6 +34,12 @@ pub mod native_ring;
 /// Receiver classes no supported JDK image declares — the measured table that
 /// decides which `Bridge` registrations are `SyntheticStub` by §1.5.
 pub mod no_image_receiver;
+/// Where an absorbed failure is **recorded** — `PrintStream`/`PrintWriter`'s
+/// `trouble` flag (read back by `checkError()`) and a `Handler`'s
+/// `ErrorManager`. Sibling of `delegated_close`: that module decides which
+/// throwables a JDK `catch` swallows, this one runs the BODY of the same
+/// `catch`. Absorbing without recording is not JDK parity — it is silence.
+pub mod print_error_state;
 // Registrations retired as contract-1.4 shadows, one measured subsystem at a
 // time. Sibling of `no_image_receiver`: both are class/triple-scoped kind
 // decisions made centrally because they are MEASUREMENTS against a JDK image
@@ -69,6 +75,10 @@ pub use delegated_close::{
     absorb_exception, absorb_io_exception, absorb_thrown, vm_only_best_effort,
 };
 pub use intrinsic::InterpIntrinsic;
+pub use print_error_state::{
+    absorb_io_exception_recording, absorb_write_exception_recording, clear_trouble, is_trouble,
+    record_host_io_failure, record_write_failure, report_handler_error, set_trouble, take_absorbed,
+};
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///
 /// `NativeMethodRegistry::find` hashes all three of class/method/descriptor on

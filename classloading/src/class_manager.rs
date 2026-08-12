@@ -12034,8 +12034,36 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
-        // PrintStream/PrintWriter = 1 field (fd)
-        "java/io/PrintStream" | "java/io/PrintWriter" => instance_fields(1),
+        // ── PrintStream / PrintWriter ────────────────────────────────────────
+        //
+        // `_f0` is the fd tag (declared slot 0; ABSOLUTE slot 1 for
+        // `PrintStream`, which inherits `FilterOutputStream.out` at absolute
+        // 0 — the print natives read the fd through `out`/raw slot 0, so the
+        // comment this replaces, "= 1 field (fd)", named the wrong slot).
+        //
+        // `trouble` is the JDK's own field, not a VM-internal one, so it is
+        // spelled with its real name rather than `_vmN`: it is what
+        // `checkError()` returns, and `PrintStream`/`PrintWriter`'s
+        // `catch (IOException x) { trouble = true; }` bodies are the only
+        // things that set it. Without a slot for it, a synthetic-mode
+        // `checkError()` has nothing to read and the absorbed failure is
+        // unobservable rather than merely unthrown.
+        // W7-64-printstream-trouble-and-errormanager.md
+        //
+        // Its INDEX is not the real image's — the real `java.io.PrintStream`
+        // declares `trouble` at absolute 4, behind `out`/`closed`/`closeLock`/
+        // `autoFlush`. That divergence is real and `shadow_layout`'s
+        // `diff_against_model` is right to report it under
+        // `CRATONVM_DBG_OVERLAY`; it is harmless because nothing addresses
+        // `trouble` positionally. Every reader and writer goes through
+        // `native-api`'s `print_error_state`, which resolves it BY NAME —
+        // landing on the real slot in Compatible mode and on this one in
+        // synthetic mode, with no `#[cfg]` at the call sites.
+        "java/io/PrintStream" | "java/io/PrintWriter" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields
+        }
         // T1.10 — corrected StringReader/StringWriter shapes to match
         // the real native init code in `native-io/src/lib.rs`:
         //   StringReader = 3 fields (content, pos, length) per
