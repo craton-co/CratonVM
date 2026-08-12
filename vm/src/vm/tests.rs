@@ -51056,13 +51056,21 @@ use std::sync::Arc;
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cf = "java/security/cert/CertificateFactory";
 
+        // The type argument is incidental here -- this is a fixture for the
+        // generateCertificate assertions below -- but it must be a type the
+        // provider actually serves. It used to be `Value::Object(None)`, which
+        // asserted the defect: `getInstance` validated nothing and handed back
+        // an X.509 parser for every name, `null` included, where HotSpot raises
+        // `CertificateException: <type> not found` at getInstance. All three
+        // in-tree Java callers ask for "X.509". W7-29.
+        let x509 = create_java_string(&shared, "X.509");
         let factory = call_native(
             &shared,
             &mut thread,
             cf,
             "getInstance",
             "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-            &[Value::Object(None)],
+            &[x509],
         )
         .unwrap()
         .unwrap();
