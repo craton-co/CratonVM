@@ -61,6 +61,45 @@
 //!   shared one → [`there_is_exactly_one_detector`] fails. Two detectors that
 //!   can disagree is the disease, not the cure.
 //!
+//! # The second argument: routing is not the same as SEEING
+//!
+//! Links 1–5 prove that every layout-asserting allocation reaches the census.
+//! They say nothing about whether the census has anything to say when it gets
+//! there, and W7-73-short-object-blind-spot.md found that for the species it is
+//! named after it did not. `classify` returned `None` for `declared == 0`, which
+//! is the ONE case in which the base allocator's
+//! `slots = num_fields.max(real_fields)` clamp leaves the request alone — hence
+//! the one case in which the allocated object can be narrower than the class it
+//! is handed out as. Every `under` row describes an object the clamp already
+//! widened; the short objects were all in the silent bucket. And the
+//! `ClassId::new(0)` sentinel never even got that far: `alloc_object`
+//! substitutes `cratonvm/synthetic/AnonymousObject$N`, which declares exactly
+//! `N`, so 30 production sites arrived as `classify(n, n)` and printed nothing
+//! in either direction.
+//!
+//! A gate proving routing while the rule at the end of the route is silent is a
+//! vacuous green with extra steps. Links 6–10 gate the RULE:
+//!
+//! * Fold `declared == 0` back into `classify`'s `None` guard, or collapse it
+//!   into `Over` → [`a_class_declaring_nothing_is_a_reported_direction`] fails.
+//!   A live call, not a source scan.
+//! * Drop the `Undeclared` arm from `observe`'s `match` →
+//!   [`the_undeclared_direction_reaches_the_wire`] fails.
+//! * Add a fast path that returns from `alloc_object` above the observation →
+//!   [`no_allocation_door_opens_before_the_census`] fails, quoting the line. The
+//!   `anon_class_cache` early return did exactly this until 2026-08-12.
+//! * Hoist the `ClassId::new(0)` substitution above the sentinel observation →
+//!   [`the_unresolved_class_sentinel_is_observed_before_it_is_substituted`]
+//!   fails. After the substitution the widths agree by construction.
+//! * Re-open-code the classification in the fabrication funnel →
+//!   [`the_fabrication_funnel_uses_the_shared_classify`] fails. Its old inline
+//!   predicate carried the `real > 0` exclusion this lane removed, so the
+//!   funnel had already drifted from the shared rule on the case that matters.
+//! * Add another `alloc_object(ClassId::new(0), N)` site →
+//!   [`the_unresolved_class_fallback_population_only_shrinks`] fails. The one
+//!   ratchet in this file, and see its doc for why this population earns one
+//!   when [`census`] does not.
+//!
 //! # What this gate deliberately does NOT assert
 //!
 //! It does not ratchet the *number* of allocation sites. Sites are added and
@@ -495,6 +534,394 @@ fn there_is_exactly_one_detector() {
          fifth of the population. Forward to \
          `cratonvm_native_api::layout_alias::observe` instead of re-implementing."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Links 6–10 — the SHORT-OBJECT half (W7-73-short-object-blind-spot.md)
+//
+// Links 1–5 prove every layout-asserting allocation REACHES the census. They say
+// nothing about whether the census has anything to say when it gets there, and
+// for the one species it is named after it did not: `classify` returned `None`
+// for `declared == 0`, which is the only case in which
+// `slots = num_fields.max(real_fields)` leaves the request alone — hence the
+// only case in which the object can be narrower than the class it is handed out
+// as. Every `under` row describes an object the clamp already widened.
+//
+// A gate that proves routing while the rule at the end of the route is silent is
+// the shape of a vacuous green, so these five gate the RULE.
+// ---------------------------------------------------------------------------
+
+/// `classify(N, 0)` for `N > 0` must report, not swallow.
+///
+/// A live call into the crate under test, not a source scan: the arm can be
+/// deleted, or `declared == 0` folded back into the `None` guard, without any
+/// text this file greps for changing. It also asserts the direction is its OWN
+/// variant rather than `Over` — collapsing it into `Over` would claim the object
+/// has more slots than its class declares fields, which is a statement about a
+/// known layout, and here there is no known layout.
+///
+/// **How it fails.** Restore the old `if requested == 0 || declared == 0 || ...`
+/// guard in `native-api/src/layout_alias.rs` and this goes red on the first
+/// assertion, naming the widths of the two worst real sites. (Verified red
+/// against a mutated copy that restored that guard: `classify(6, 0)` came back
+/// `None` and the assertion fired.)
+#[test]
+fn a_class_declaring_nothing_is_a_reported_direction() {
+    use cratonvm_native_api::layout_alias::{classify, Direction};
+    assert_eq!(
+        classify(6, 0),
+        Some(Direction::Undeclared),
+        "`classify` went quiet again for declared == 0.\n\
+         That is the ONLY case in which `NativeContextImpl::alloc_object`'s \
+         `slots = num_fields.max(real_fields)` clamp does nothing, so it is the \
+         only case in which the allocated object can be SHORTER than the class it \
+         is handed out as. 6-against-14 is `java/util/zip/ZipEntry`'s \
+         `ClassId::new(0)` fallback arm; 2-against-20 is `java/util/regex/Pattern`; \
+         5-against-19 is the `java/lang/Thread` mirror, on a path that is not even \
+         a fallback.\n\
+         Reporting `None` here is not neutrality — a suppressed row and an absent \
+         defect are the same bytes to every consumer of this census.\n\
+         See W7-73-short-object-blind-spot.md."
+    );
+    assert_ne!(
+        classify(6, 0),
+        Some(Direction::Over),
+        "`Undeclared` was folded into `Over`. An `over` row asserts the object has \
+         more slots than its class has FIELDS — a claim about a known layout. \
+         `declared == 0` means there is no known layout to make a claim about, and \
+         the three shapes behind it (field-less class, unregistered id, fabricated \
+         stub over a wider real class) need different fixes."
+    );
+    // Unchanged, and asserted here so a future widening cannot quietly start
+    // reporting allocations that assert no layout at all.
+    assert_eq!(classify(0, 0), None);
+    assert_eq!(classify(0, 9), None);
+}
+
+/// The detector must still EMIT the third direction, not merely compute it.
+///
+/// [`a_class_declaring_nothing_is_a_reported_direction`] would still pass if
+/// `observe`'s `match` lost its `Undeclared` arm and fell through to `Over`'s
+/// message, or if the arm logged at a level nothing collects. This pins the
+/// wire format the same way [`there_is_exactly_one_detector`] pins the channel.
+#[test]
+fn the_undeclared_direction_reaches_the_wire() {
+    let src = strip_comments(&read("native-api/src/layout_alias.rs"));
+    assert!(
+        src.contains("direction = \"undeclared\""),
+        "`native-api/src/layout_alias.rs` no longer emits `direction = \"undeclared\"`.\n\
+         The classification without the row is a rule nobody can read. The field \
+         names (`class`, `requested_fields`, `real_fields`, `direction`, `site`) and \
+         the channel are deliberately identical to the other two directions so an \
+         existing consumer's filter still works and can opt in.\n\
+         See W7-73-short-object-blind-spot.md."
+    );
+    // The two directions that predate this lane, so widening the census can
+    // never be paid for by narrowing it.
+    for d in ["direction = \"under\"", "direction = \"over\""] {
+        assert!(src.contains(d), "the detector stopped emitting `{d}`");
+    }
+}
+
+/// Nothing may return from `alloc_object` before the census has looked.
+///
+/// This is the link that would silently reopen the blind spot, and it is not
+/// hypothetical: `alloc_object` already grew one early `return` — the lock-free
+/// `anon_class_cache` fast path for `ClassId::new(0)` allocations — which
+/// bypassed the observation entirely for the busiest untyped-allocation path in
+/// the VM. Another hot-path fast path added above the census would do it again,
+/// and the population it hides is exactly the population W7-73 measured: 30
+/// production sites, 16 of them requesting fewer slots than the class they name
+/// really declares.
+///
+/// The census does not have to be at the very top — the sentinel observation
+/// comes first, then the substitution, then the width observation — it has to be
+/// above every exit.
+///
+/// **How it fails.** Add `if some_fast_path { return obj; }` anywhere above the
+/// first `layout_alias::enabled()` in `NativeContextImpl::alloc_object` and this
+/// prints the offending line. (Verified red against a mutated copy carrying
+/// `if num_fields == 0 { return self.heap_alloc_object(class_id, 0); }` as the
+/// method's first statement: the assertion fired and quoted that line.)
+#[test]
+fn no_allocation_door_opens_before_the_census() {
+    let src = read("vm/src/vm/vm_exec.rs");
+    let stripped = strip_comments(&src);
+    let body = fn_body(&stripped, "alloc_object")
+        .expect("vm_exec.rs no longer defines `fn alloc_object` — the base allocator moved");
+    let census_at = body.find("layout_alias::enabled()").expect(
+        "`NativeContextImpl::alloc_object` no longer gates on `layout_alias::enabled()` \
+         — see `the_base_allocator_observes`",
+    );
+    let mut escapes: Vec<String> = Vec::new();
+    for (idx, _) in body[..census_at].match_indices("return") {
+        // Word boundary both sides: `returned`, `_return` and friends are not
+        // control flow, and a gate with false positives gets muted.
+        let before = body[..idx].chars().next_back().unwrap_or(' ');
+        let after = body[idx + 6..].chars().next().unwrap_or(' ');
+        if before.is_alphanumeric() || before == '_' {
+            continue;
+        }
+        if after.is_alphanumeric() || after == '_' {
+            continue;
+        }
+        let line_no = body[..idx].matches('\n').count() + 1;
+        let text: String = body[idx..].chars().take(80).collect();
+        let text = text.replace('\n', " ");
+        escapes.push(format!("  +{line_no} lines into the body: {}", text.trim()));
+    }
+    assert!(
+        escapes.is_empty(),
+        "`NativeContextImpl::alloc_object` can return BEFORE the layout-alias \
+         census observes:\n{}\n\
+         Every allocation taking that exit is invisible to \
+         CRATONVM_DBG_LAYOUT_ALIAS in all three directions, whatever slot map it \
+         imposes on a real JDK class. The `anon_class_cache` fast path did exactly \
+         this until 2026-08-12 and hid the entire short-object population — 30 \
+         production `alloc_object(ClassId::new(0), N)` sites, 16 of them narrower \
+         than the class they name.\n\
+         The observation is one OnceLock load when the flag is off. Move the fast \
+         path BELOW it, or carry an observation into the fast path; do not step \
+         over it.\n\
+         See W7-73-short-object-blind-spot.md.",
+        escapes.join("\n")
+    );
+}
+
+/// The sentinel must be observed while it is still the sentinel.
+///
+/// `alloc_object` substitutes `cratonvm/synthetic/AnonymousObject$N` for
+/// `ClassId::new(0)`, and that stub declares exactly `N`. So after the
+/// substitution every one of these allocations classifies as `classify(n, n)` —
+/// agreement — and prints nothing. The observation is only meaningful strictly
+/// above `ensure_generated_class`.
+///
+/// This is the same ordering argument as [`the_base_allocator_observes`]'s
+/// observe-before-clamp check, one substitution earlier, and it fails the same
+/// way: a well-meaning tidy-up that hoists the class fixup to the top of the
+/// method leaves a census that still compiles, still runs, and reports clean.
+/// (Verified red against a mutated copy with an `ensure_generated_class` call
+/// moved above the observation.)
+#[test]
+fn the_unresolved_class_sentinel_is_observed_before_it_is_substituted() {
+    let src = read("vm/src/vm/vm_exec.rs");
+    let stripped = strip_comments(&src);
+    let body = fn_body(&stripped, "alloc_object")
+        .expect("vm_exec.rs no longer defines `fn alloc_object`");
+    let observe_at = body.find("layout_alias::UNRESOLVED_CLASS").expect(
+        "`NativeContextImpl::alloc_object` no longer observes the `ClassId::new(0)` \
+         sentinel under `layout_alias::UNRESOLVED_CLASS`.\n\
+         Without it the 30 production `alloc_object(ClassId::new(0), N)` sites in the \
+         native crates are invisible in BOTH directions at once: `under` cannot fire \
+         because the clamp runs first, and this path cannot fire because the \
+         AnonymousObject$N substitution makes the two widths agree by construction.\n\
+         See W7-73-short-object-blind-spot.md.",
+    );
+    let substitute_at = body.find("ensure_generated_class(").expect(
+        "the `ClassId::new(0)` substitution changed shape; re-check that the census \
+         still observes the UNRESOLVED class id rather than its stand-in",
+    );
+    assert!(
+        observe_at < substitute_at,
+        "the sentinel observation now runs AFTER `ensure_generated_class` has \
+         substituted `cratonvm/synthetic/AnonymousObject$N` for it.\n\
+         That stub declares exactly the requested count, so the census sees \
+         `classify(n, n)` — agreement — and reports nothing for every one of these \
+         allocations. The caller, meanwhile, tried to resolve a real class, FAILED, \
+         and handed the object out as an instance of it anyway."
+    );
+}
+
+/// The fabrication funnel must use the shared rule, not its own copy.
+///
+/// W7-59-layout-detector-coverage.md moved the counting, the flag, the dedup key
+/// and the channel into one module and asserted *"there is one implementation
+/// here"*. That was true of the reporting MACHINERY and false of the DECISION:
+/// `try_alloc_concurrent_synthetic` kept `num_fields > 0 && real > 0 &&
+/// num_fields != real` inline, which is `classify` open-coded — and its
+/// `real > 0` term is exactly the `declared == 0` exclusion this lane removed.
+/// The two had already drifted before anyone looked.
+///
+/// [`there_is_exactly_one_detector`] cannot catch this: that file does not read
+/// the flag and does not emit a direction, so it is not an owner by that test's
+/// definition. It just decides, in secret, what the owner is allowed to hear.
+#[test]
+fn the_fabrication_funnel_uses_the_shared_classify() {
+    let stripped = strip_comments(&read("native-builtins/src/util_concurrent_ext.rs"));
+    let body = fn_body(&stripped, "try_alloc_concurrent_synthetic")
+        .expect("`try_alloc_concurrent_synthetic` moved — it is the second observation point");
+    assert!(
+        body.contains("layout_alias::classify("),
+        "the fabrication funnel no longer calls `layout_alias::classify` — it is \
+         deciding for itself which allocations the census is allowed to see.\n\
+         That is not a style point. The predicate it used until 2026-08-12 \
+         (`num_fields > 0 && real > 0 && num_fields != real`) excluded `real == 0`, \
+         which is the ONLY case the allocator's `max` clamp leaves alone and \
+         therefore the only case in which the object is genuinely SHORT. One \
+         primitive, one implementation; forward to `classify` and let the shared \
+         rule widen for everyone at once.\n\
+         See W7-73-short-object-blind-spot.md."
+    );
+    assert!(
+        !body.contains("real > 0"),
+        "the fabrication funnel has re-acquired a `real > 0` guard. `real == 0` is \
+         the short-object case, not the uninteresting one — see \
+         W7-73-short-object-blind-spot.md."
+    );
+}
+
+/// A RATCHET, and the only one in this file: the `ClassId::new(0)` fallback
+/// population may shrink and may not grow.
+///
+/// [`census`] deliberately refuses to ratchet its count, on the sound ground
+/// that a population which changes with every native added gets re-baselined on
+/// sight. This population is different in kind: **every member of it is a
+/// defect-shaped thing**, so growth is never routine. A native writing
+/// `alloc_object(ClassId::new(0), N)` has resolved a class, failed, and gone
+/// ahead — handing back an object of class `cratonvm/synthetic/AnonymousObject$N`
+/// to a caller that will use it as the class it asked for. 16 of today's 30 ask
+/// for fewer slots than the class they name really declares (`javap -p`, JDK
+/// 25.0.3.9), so those objects are short.
+///
+/// The number is a source-level count of a shape, not a runtime measurement, and
+/// it does not claim any of these arms is ever taken. That is the point: nothing
+/// can claim that from source, which is why the runtime row exists as well.
+///
+/// **How it fails.** Add one more `alloc_object(ClassId::new(0), 3)` to any
+/// native crate and this goes red with the new total. (Verified red against a
+/// mutated copy with one added site: reported 31 against the bound of 30.)
+/// Lowering the bound after a repair is the intended edit and needs no
+/// discussion; raising it needs a reason in the commit message.
+#[test]
+fn the_unresolved_class_fallback_population_only_shrinks() {
+    /// 2026-08-12, W7-73-short-object-blind-spot.md. Sites whose class argument
+    /// is literally `ClassId::new(0)` and whose requested count is not the
+    /// literal `0` (a zero-slot request substitutes nothing and asserts no
+    /// layout). MAY ONLY GO DOWN.
+    const BOUND: usize = 30;
+
+    let root = workspace_root();
+    let mut sites: Vec<String> = Vec::new();
+    for crate_dir in NATIVE_CRATES {
+        for file in rust_sources(&root.join(crate_dir).join("src")) {
+            let src = strip_comments(&fs::read_to_string(&file).unwrap_or_default());
+            let test_spans = cfg_test_spans(&src);
+            for method in LAYOUT_ASSERTING_METHODS {
+                let needle = format!("{method}(");
+                for (idx, _) in src.match_indices(&needle) {
+                    if src[..idx].trim_end().ends_with("fn") {
+                        continue;
+                    }
+                    let prev = src[..idx].chars().next_back().unwrap_or(' ');
+                    if prev.is_alphanumeric() || prev == '_' {
+                        continue;
+                    }
+                    if test_spans.iter().any(|(a, b)| *a <= idx && idx < *b) {
+                        continue;
+                    }
+                    let open = idx + needle.len() - 1;
+                    let Some(args) = paren_args(&src, open) else {
+                        continue;
+                    };
+                    let parts = split_top_level(args);
+                    if parts.is_empty() || !parts[0].contains("ClassId::new(0)") {
+                        continue;
+                    }
+                    let requested = parts.get(1).map_or("", |s| s.as_str()).trim();
+                    if requested == "0" {
+                        continue;
+                    }
+                    let line = src[..idx].matches('\n').count() + 1;
+                    sites.push(format!(
+                        "{}:{line}  requested={requested}",
+                        file.strip_prefix(&root)
+                            .unwrap_or(&file)
+                            .display()
+                            .to_string()
+                            .replace('\\', "/")
+                    ));
+                }
+            }
+        }
+    }
+    sites.sort();
+    println!("layout-alias blind spot — `alloc_object(ClassId::new(0), N>0)` sites");
+    for s in &sites {
+        println!("  {s}");
+    }
+    println!("  TOTAL {} (bound {BOUND})", sites.len());
+    assert!(
+        sites.len() <= BOUND,
+        "the `ClassId::new(0)` allocation population GREW to {} (bound {BOUND}):\n  {}\n\
+         Each of these resolves a class, fails, and allocates anyway. The VM \
+         substitutes `cratonvm/synthetic/AnonymousObject$N` — which declares \
+         exactly N, so the slot-count clamp is a no-op and the width census sees \
+         agreement — and the object is then handed back as an instance of the class \
+         the caller named. Where that class's real layout is wider (16 of the 30 \
+         sites on 2026-08-12: `ZipEntry` 6 against 14, `Pattern` 2 against 20, \
+         `ServiceLoader` 2 against 10, `java/lang/Thread` 5 against 19), the object \
+         is SHORT and every real-bytecode read past slot N is out of bounds.\n\
+         The remedies that do not add a row here: propagate the resolution failure \
+         to the caller (`MethodCallFailed`), or allocate against a class you \
+         actually resolved. If a new site is genuinely unavoidable, raise BOUND \
+         with the reason in the commit message.\n\
+         See W7-73-short-object-blind-spot.md.",
+        sites.len(),
+        sites.join("\n  ")
+    );
+}
+
+/// The argument list of a call whose opening `(` is at `open`.
+fn paren_args(src: &str, open: usize) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in src[open..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&src[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split an argument list on top-level commas.
+fn split_top_level(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in args.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            out.push(cur.trim().to_string());
+            cur = String::new();
+        } else {
+            cur.push(ch);
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
 }
 
 // ---------------------------------------------------------------------------

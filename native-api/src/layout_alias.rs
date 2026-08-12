@@ -72,16 +72,57 @@
 //! they were. Compatible mode is untouched by construction — this module can
 //! only print.
 //!
-//! # What it still cannot see
+//! # `declared == 0` — the short-object case, reported since 2026-08-12
 //!
-//! `declared == 0` is excluded from both directions and that exclusion is
-//! inherited, not new. Zero is overloaded: it means "class not loaded yet" (the
-//! reason the clamp's `max` exists at all) and it also means "genuinely no
-//! instance fields" — every interface, and `java/lang/Object`. Natives are
-//! routinely asked for interface names, where a non-zero request is the
-//! intended fabrication and not an alias. Those allocations are **unmeasured by
-//! this census, not cleared by it**. Closing that needs a `class_is_loaded`
-//! predicate `NativeContext` does not have.
+//! Until W7-73-short-object-blind-spot.md this module returned `None` for
+//! `declared == 0` and said so in a header paragraph titled *"what it still
+//! cannot see"*. That paragraph was accurate and the behaviour was still wrong,
+//! because a `None` and a clean run are the same absence to every consumer.
+//!
+//! The reasoning that forced the change is structural, not statistical.
+//! `NativeContextImpl::alloc_object` clamps `slots = num_fields.max(real_fields)`
+//! **two lines after** it calls this module. So:
+//!
+//! * whenever `declared > 0`, a [`Direction::Under`] row describes an object
+//!   the clamp has already widened to its full declared width — a *mis-request*,
+//!   never a short object;
+//! * whenever `declared == 0` the clamp is the identity (`n.max(0) == n`), the
+//!   object really is exactly `requested` wide, and the old `None` meant the one
+//!   case that CAN be short was the one case reported as nothing.
+//!
+//! [`Direction::Undeclared`] is that case, and it is deliberately not folded
+//! into `Over`. `declared == 0` is overloaded three ways and the instrument
+//! cannot tell them apart from here:
+//!
+//! 1. **Genuinely field-less** — an interface, `java/lang/Object`, a marker
+//!    class. A non-zero request is intended fabrication and the object is not
+//!    short by any definition. Common and benign.
+//! 2. **Not registered** — `get_class(class_id)` answered `None`. A stale id, or
+//!    a class observed mid-registration (which is exactly why the base
+//!    allocator refuses to cache a zero).
+//! 3. **A fabricated stub, or the `ClassId::new(0)` fallback arm** — the class
+//!    the caller *named* has a real layout wider than the request, and nothing
+//!    clamped. **This object is short.**
+//!
+//! Reporting all three as `undeclared` is the honest answer: the row says "an
+//! allocation this instrument cannot adjudicate happened here", which is what a
+//! reader can act on. Silence said "clean", which is what a reader believed.
+//! A consumer that only wants the pre-2026-08-12 census filters on
+//! `direction in (under, over)`; the field names and channel are unchanged.
+//!
+//! # And the `ClassId::new(0)` sentinel does NOT reach this module
+//!
+//! Worth stating because it is the natural next guess and it is wrong.
+//! `alloc_object` intercepts `class_id == ClassId::new(0) && num_fields > 0`
+//! *before* it resolves any field count and substitutes
+//! `cratonvm/synthetic/AnonymousObject$N`, which declares exactly `N`. So the
+//! sentinel arrives at [`classify`] as `classify(n, n)` — agreement — not as
+//! `declared == 0`. The width species genuinely has nothing to say about it, and
+//! that is why the base allocator observes the sentinel **before** the
+//! substitution, with [`UNRESOLVED_CLASS`] as the class name and `declared = 0`.
+//! Without that the busiest blind-spot population in the workspace — 30
+//! production sites, 16 of them requesting fewer slots than the class they name
+//! really declares — is invisible in both directions at once.
 
 use std::collections::HashSet;
 use std::panic::Location;
@@ -101,7 +142,33 @@ pub enum Direction {
     /// applied to any instance this site did not allocate (real bytecode `new`,
     /// or the JIT) those indices write past the object.
     Over,
+    /// The caller asked for slots against a class that declares **none**, so
+    /// there was nothing to compare and nothing to clamp against.
+    ///
+    /// This is the only direction in which a **short object** can exist, and it
+    /// is reported precisely because it cannot be adjudicated here. See the
+    /// module header: `declared == 0` means "interface / field-less" (benign),
+    /// "not registered" (a stale or mid-registration id), or "a fabricated stub
+    /// standing in for a class with a wider real layout" (short). The row says
+    /// which allocation, not which of the three — that is the reader's next
+    /// step, and before 2026-08-12 there was no row to take it from.
+    ///
+    /// It is deliberately NOT `Over`. An `over` row asserts the object has more
+    /// slots than its class has fields, which is a claim about a known layout;
+    /// here there is no known layout to make a claim about.
+    Undeclared,
 }
+
+/// The class-name placeholder for an allocation whose `ClassId` did not resolve.
+///
+/// `alloc_object` substitutes `cratonvm/synthetic/AnonymousObject$N` for
+/// `ClassId::new(0)` before it looks anything up, so by the time a name is
+/// available it is the *substitute's* name and the row would read as a clean
+/// exact-width allocation of a class nobody asked for. Reporting the sentinel
+/// under this literal keeps the row greppable and keeps it from being mistaken
+/// for a real `java/lang/Object` allocation (which is a legitimate, field-less,
+/// zero-slot thing that happens constantly).
+pub const UNRESOLVED_CLASS: &str = "<unresolved:ClassId(0)>";
 
 /// The classification, with no I/O and no global state.
 ///
@@ -109,13 +176,34 @@ pub enum Direction {
 /// class manager or a `tracing` subscriber, and so the two observation points
 /// provably apply the *same* rule rather than each open-coding `!=`.
 ///
-/// `None` is "nothing to say", and it covers two cases that must not be
-/// conflated with "clean": a request of 0 (the caller is not asserting a
-/// layout), and a declared count of 0 (see the module header — unmeasured).
+/// `None` is "nothing to say", and after 2026-08-12 it means exactly two
+/// things, both of which really are nothing:
+///
+/// * `requested == 0` — the caller is not asserting a layout at all, so there
+///   is no slot map to be wrong about;
+/// * `requested == declared` — agreement.
+///
+/// `declared == 0` used to be a third `None` and is now
+/// [`Direction::Undeclared`]. That is the whole of W7-73-short-object-blind-spot.md:
+/// it is the ONLY case in which the base allocator's
+/// `slots = num_fields.max(real_fields)` clamp does nothing, hence the only case
+/// in which the allocated object can be narrower than the class it is handed out
+/// as. Reporting it as `None` made the instrument silent about the one thing it
+/// was named after.
 #[must_use]
 #[inline]
 pub fn classify(requested: usize, declared: usize) -> Option<Direction> {
-    if requested == 0 || declared == 0 || requested == declared {
+    if requested == 0 {
+        return None;
+    }
+    if declared == 0 {
+        // Deliberately BEFORE the `requested == declared` test, which would
+        // otherwise swallow `classify(0, 0)` — already handled above — and,
+        // more to the point, keeps this arm from ever being reachable-by-
+        // accident-only. It is the reported case, not the leftover one.
+        return Some(Direction::Undeclared);
+    }
+    if requested == declared {
         return None;
     }
     Some(if requested < declared {
@@ -273,6 +361,24 @@ pub fn observe(
              applied to any instance this site did not allocate (real bytecode new, \
              or the JIT) those indices write past the object"
         ),
+        Direction::Undeclared => tracing::warn!(
+            class = class_name,
+            requested_fields = requested,
+            real_fields = declared,
+            direction = "undeclared",
+            site = %site_text,
+            "native allocated slots against a class declaring NONE, so the slot-count \
+             clamp did nothing and this object is exactly requested_fields wide -- \
+             this instrument cannot tell whether that is correct. real_fields=0 means \
+             one of: the class is genuinely field-less (an interface, java/lang/Object \
+             -- benign); its ClassId is not registered (stale, or observed \
+             mid-registration); or it is a fabricated stub / the ClassId::new(0) \
+             fallback arm standing in for a class whose real layout is WIDER, in which \
+             case this object is SHORT and every real-bytecode read of a field past \
+             requested_fields is out of bounds. Compare requested_fields against \
+             `javap -p` for the class this site names. See \
+             W7-73-short-object-blind-spot.md"
+        ),
     }
     Some(direction)
 }
@@ -322,9 +428,40 @@ mod tests {
     fn under_and_exact_and_unmeasured() {
         assert_eq!(classify(1, 3), Some(Direction::Under), "Kafka HashSet shape");
         assert_eq!(classify(3, 3), None, "agreement is not a finding");
-        // Both zero cases are "unmeasured", NOT "clean" — see the module header.
-        assert_eq!(classify(4, 0), None, "class not loaded, or an interface");
         assert_eq!(classify(0, 4), None, "caller asserts no layout");
+    }
+
+    /// The blind spot W7-73-short-object-blind-spot.md closed.
+    ///
+    /// This assertion was `assert_eq!(classify(4, 0), None, "class not loaded,
+    /// or an interface")` until 2026-08-12, with a comment calling it
+    /// "unmeasured, NOT clean". The comment was right and the return value was
+    /// still read as clean by every consumer, because a suppressed row and an
+    /// absent defect are the same bytes on the wire.
+    ///
+    /// `declared == 0` is the ONLY case the base allocator's
+    /// `slots = num_fields.max(real_fields)` clamp leaves alone, so it is the
+    /// only case in which the object can be narrower than the class it is handed
+    /// out as. The three shapes that produce it are in the module header; this
+    /// test asserts the classification, and
+    /// `native-api/tests/layout_alias_coverage.rs` asserts that the sites
+    /// producing it actually reach here.
+    #[test]
+    fn a_class_declaring_nothing_is_reported_not_swallowed() {
+        assert_eq!(
+            classify(6, 0),
+            Some(Direction::Undeclared),
+            "java/util/zip/ZipEntry's ClassId::new(0) fallback arm: 6 slots, no \
+             declared layout to clamp against, real class declares 14"
+        );
+        assert_eq!(
+            classify(5, 0),
+            Some(Direction::Undeclared),
+            "the java/lang/Thread mirror in vertx_eventloop.rs / xnio_io_thread.rs: \
+             5 slots against a class declaring 19, and NOT on a fallback arm"
+        );
+        // Still nothing to say: the caller asserted no layout at all.
+        assert_eq!(classify(0, 0), None, "no request, no claim");
     }
 
     /// The dedup key carries the site, so two natives making the same mistake on

@@ -849,13 +849,23 @@ fn native_lock_support_get_blocker(
 /// names both and the reader subtracts. See the ENABLED note in the body for
 /// what a follow-up must measure before this could be made fatal.
 ///
-/// `real == 0` is excluded from BOTH directions, because 0 is overloaded. It
-/// means "class not loaded yet" (the reason the `max` below exists at all) and
-/// it also means "genuinely no instance fields" -- every interface, and
-/// `java/lang/Object`. This funnel is routinely asked for interface names
-/// (`java/util/concurrent/locks/Condition`, `java/util/concurrent/Flow$Subscription`),
-/// where a non-zero request is the intended fabrication and not an alias. Those
-/// sites are therefore UNMEASURED by this census, not cleared by it.
+/// `real == 0` was excluded from BOTH directions until 2026-08-12, on the
+/// argument that 0 is overloaded: it means "class not loaded yet" (the reason
+/// the `max` below exists at all) and it also means "genuinely no instance
+/// fields" -- every interface, and `java/lang/Object`. This funnel is routinely
+/// asked for interface names (`java/util/concurrent/locks/Condition`,
+/// `java/util/concurrent/Flow$Subscription`), where a non-zero request is the
+/// intended fabrication and not an alias.
+///
+/// **The argument was sound and the exclusion was still wrong**, because 0 is
+/// also the ONLY value of `real` for which the `max` below does nothing -- and
+/// therefore the only case in which the object handed back is genuinely NARROWER
+/// than the class it is handed out as. Every `under` row describes an object the
+/// clamp already widened; the short objects were all in the excluded bucket.
+/// Those sites now report `direction=undeclared`, which says "this instrument
+/// cannot adjudicate this allocation" instead of saying nothing, because saying
+/// nothing is what a consumer reads as clean. See
+/// W7-73-short-object-blind-spot.md.
 ///
 /// Deduplicated by (class, requested, declared, site) so a hot allocation loop
 /// reports once, not once per object. The site is IN the key on purpose: two
@@ -944,12 +954,24 @@ pub(crate) fn try_alloc_concurrent_synthetic(
             // room. 0 means the class isn't loaded yet — keep the caller's
             // requested size.
             let real = ctx.class_num_total_fields(cid);
-            // `!=`, not `<`, since 2026-08-11 (JDK-only lane W4-4). The old test
-            // reported only the direction that cannot corrupt the heap; the
-            // rationale for widening it, and for excluding `real == 0` rather
-            // than treating it as "declares nothing", is on
-            // `report_layout_alias`.
-            if num_fields > 0 && real > 0 && num_fields != real {
+            // `!=`, not `<`, since 2026-08-11 (JDK-only lane W4-4).
+            //
+            // Call the SHARED rule; do not re-derive it. This line read
+            // `if num_fields > 0 && real > 0 && num_fields != real` until
+            // 2026-08-12, which is `layout_alias::classify` open-coded — a second
+            // implementation of the one primitive
+            // W7-59-layout-detector-coverage.md said it had eliminated ("there is
+            // one implementation here"). It had eliminated the second copy of the
+            // reporting MACHINERY and left a second copy of the DECISION, and the
+            // two then drifted on the case that matters: `real > 0` is exactly
+            // the `declared == 0` exclusion W7-73-short-object-blind-spot.md
+            // removed, so this funnel — the busiest allocator in the workspace —
+            // would have stayed blind to the short-object species after
+            // `classify` learned to report it.
+            //
+            // Strictly louder: `classify` returns `Some` for every input this
+            // predicate accepted, plus `Undeclared` for `real == 0`.
+            if cratonvm_native_api::layout_alias::classify(num_fields, real).is_some() {
                 report_layout_alias(class_name, num_fields, real);
             }
             // ALLOCATION IS UNCHANGED by the widening above: still `max`, so an

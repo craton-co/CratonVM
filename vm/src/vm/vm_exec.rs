@@ -11769,6 +11769,61 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // with its slot count. Field-less Object allocations (`new Object()`
         // and array-element class hints) are unaffected.
         let class_id = if class_id == ClassId::new(0) && num_fields > 0 {
+            // LAYOUT-ALIAS CENSUS, THE SHORT-OBJECT HALF (W7-73, 2026-08-12).
+            // This observation must stay ABOVE the substitution below and above
+            // the `anon_class_cache` early `return`, and both halves of that are
+            // load-bearing.
+            //
+            // The substitution replaces `ClassId::new(0)` with
+            // `cratonvm/synthetic/AnonymousObject$N`, which declares exactly
+            // `N`. So every one of these allocations arrives at the census
+            // downstream as `classify(n, n)` — perfect agreement — and prints
+            // nothing in either direction. The caller, meanwhile, resolved a
+            // class and FAILED, then handed the object out as an instance of
+            // the class it named: 30 production sites in the native crates
+            // spell `alloc_object(ClassId::new(0), N)`, and 16 of them name a
+            // class whose real JDK 25 layout is WIDER than `N` — `ZipEntry` 6
+            // against 14, `Pattern` 2 against 20, `ServiceLoader` 2 against 10,
+            // and `java/lang/Thread` 5 against 19 at two sites that are not
+            // even fallback arms. Those are the genuinely short objects, and
+            // both directions of the census were structurally blind to all of
+            // them: `under` cannot fire because the clamp runs first, and this
+            // path cannot fire because the substitution makes the widths agree.
+            //
+            // Reported as `declared = 0` under `layout_alias::UNRESOLVED_CLASS`
+            // rather than as the substitute's name, because the honest statement
+            // is "no declared layout was available here", not "an
+            // AnonymousObject$N was allocated at its exact width".
+            //
+            // OBSERVATION ONLY, and no `else`: the substitution, the cache, the
+            // clamp and the returned object are byte-for-byte what they were.
+            // With the flag off the cost is one `OnceLock` load and one
+            // predictable branch — the same price the base observation below
+            // pays, and paid only by allocations that already took this
+            // untyped-allocation branch.
+            if cratonvm_native_api::layout_alias::enabled() {
+                let frames: Vec<String> = self
+                    .thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .map(|f| {
+                        format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor())
+                    })
+                    .collect();
+                let site = if frames.is_empty() {
+                    "<no java frame>".to_string()
+                } else {
+                    frames.join(" <- ")
+                };
+                let _ = cratonvm_native_api::layout_alias::observe(
+                    cratonvm_native_api::layout_alias::UNRESOLVED_CLASS,
+                    num_fields,
+                    0,
+                    cratonvm_native_api::layout_alias::AllocSite::Java(site.as_str()),
+                );
+            }
             // One synthetic class per distinct field count, shared across
             // all callers — keeps the class store from growing unbounded.
             //
@@ -11972,6 +12027,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         if cratonvm_native_api::layout_alias::enabled()
             && cratonvm_native_api::layout_alias::classify(num_fields, real_fields).is_some()
         {
+            // `get_class` answering `None` is not a missing name — it is the
+            // reason `real_fields` is 0, and it is one of the three shapes
+            // `direction=undeclared` covers (a stale id, or a class observed
+            // mid-registration, which is exactly why the field-count cache above
+            // refuses to memoise a zero). An empty `class` field would have
+            // reported it as a nameless nothing; say which id it was, so the
+            // reader can tell it from an interface allocated at N slots.
             let class_name = self
                 .shared
                 .classes
@@ -11979,7 +12041,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 .read()
                 .get_class(class_id)
                 .map(|c| c.name.to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| format!("<unregistered:ClassId({})>", class_id.as_u32()));
             let frames: Vec<String> = self
                 .thread
                 .frames
