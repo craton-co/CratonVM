@@ -1002,17 +1002,21 @@ pub(crate) fn try_alloc_concurrent_synthetic(
 /// Read W7-49-slot-index-recensus.md for why the alternative — guessing the
 /// layout from the object's own slot count — cannot work for a receiver this
 /// native did not allocate.
+///
+/// **The body moved to `cratonvm_native_api::appended_slots` on 2026-08-12**
+/// and this is now a forwarder, not a second copy. W7-68-live-under-allocations.md
+/// found the `under` direction's live cases in `native-io`
+/// (`java/nio/channels/FileChannel`, `java/nio/MappedByteBuffer`), which cannot
+/// reach a `pub(crate)` helper in this crate; copying it here would have made
+/// it the sixteenth private re-implementation of a primitive
+/// W7-59-layout-detector-coverage.md §2.1 already counted fifteen copies of.
+/// Kept as a name because this crate's call sites read better with it and
+/// because deleting it would churn them for nothing.
 pub(crate) fn appended_slot_base_for_class(
     ctx: &mut dyn NativeContext,
     class_name: &str,
 ) -> usize {
-    if ctx.is_class_synthetic_stub(class_name) {
-        return 0;
-    }
-    match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => ctx.class_num_total_fields(cid),
-        Err(_) => 0,
-    }
+    cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
 }
 
 /// Allocate `class_name` carrying `width` private slots appended above the real
