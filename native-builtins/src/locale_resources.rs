@@ -781,6 +781,13 @@ pub(crate) fn cldr_currency_symbol(
 /// `getSymbol(Locale.getDefault(Locale.Category.DISPLAY))`, so the symbol a
 /// bare `getSymbol()` returns is a function of the host locale — `RUB` renders
 /// `₽` on a ru host and the bare code `RUB` on an en one.
+///
+/// `getDefault()` rather than `getDefault(DISPLAY)` on purpose: W7-67 §2 records
+/// that the base property is seeded FROM the display value and that
+/// `user.language.display` is never created from platform values (the JDK's own
+/// condition for writing it is dead), so the two are the same locale on every
+/// host — and the no-arg form is one call instead of two plus a `Category`
+/// mirror lookup.
 pub(crate) fn currency_symbol_for_default_locale(
     ctx: &mut dyn NativeContext,
     code: &str,
