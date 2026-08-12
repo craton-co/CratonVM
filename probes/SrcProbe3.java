@@ -14,9 +14,16 @@
 //       section C shows no `java.util.logging.Logger` frame.
 //
 // Run all three arms and diff:
-//   java -cp probes SrcProbe3
-//   cratonvm --real-jdk -cp probes SrcProbe3
-//   cratonvm --jdk-only -cp probes SrcProbe3
+//   java     --add-opens java.logging/java.util.logging=ALL-UNNAMED -cp probes SrcProbe3
+//   cratonvm --real-jdk --add-opens=java.logging/java.util.logging=ALL-UNNAMED -cp probes SrcProbe3
+//   cratonvm --jdk-only --add-opens=java.logging/java.util.logging=ALL-UNNAMED -cp probes SrcProbe3
+//
+// USE THE `=` SPELLING ON CRATONVM. The space-separated form HotSpot accepts
+// (`--add-opens M/P=T`) makes CratonVM's launcher swallow the following `-cp`,
+// and the run dies with "Could not find or load main class" -- which reads as
+// a broken probe rather than a mis-parsed flag. Without add-opens, section
+// A2/A3/A4 fails soft with InaccessibleObjectException; A4 is the line that
+// located this defect, so a soft-failed run answers nothing.
 import java.util.List;
 import java.util.logging.Handler;
 import java.util.logging.Level;

@@ -20290,6 +20290,42 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     }
     let lr = "java/util/logging/LogRecord";
+    // NOT `Intrinsic`, for the same reason as the source-pair block below, and
+    // this is the row that actually held W7-56 open. An intrinsic cannot give
+    // an answer the bytecode would not; this constructor gives a DIFFERENT
+    // object. JDK 25's `LogRecord(Level, String)` ends with
+    // `needToInferCaller = true` and assigns `sequenceNumber` from
+    // `globalSequenceNumber.getAndIncrement()`. This one writes neither.
+    //
+    // `needToInferCaller` is the whole defect. Measured under `--jdk-only` with
+    // `--add-opens=java.logging/java.util.logging=ALL-UNNAMED`, on a binary
+    // where the four source accessors were ALREADY retired and the REAL lazy
+    // getter was running:
+    //
+    //   HotSpot     A4 fresh needToInferCaller=true
+    //   CratonVM    A4 fresh needToInferCaller=false
+    //
+    // A real getter reading a false flag never calls `inferCaller()`, so the
+    // source pair stays null no matter how well the walk works. Retiring the
+    // getters alone was necessary and not sufficient.
+    //
+    // `java/util/logging/LogRecord.<init>(Level,String)` has been in
+    // `RETIRED_SHADOW_TRIPLES` since the 2026-08-11 wave, but the retag arm in
+    // `NativeMethodRegistry::register` only fires on an effective category of
+    // `Bridge`, and this function's ambient category is `Intrinsic` — so the
+    // entry has been INERT the whole time. Under `--jdk-only` the OTHER
+    // registration of this triple (native-builtins/src/lib.rs, `Bridge`) is
+    // refused and this one silently owns the slot, which is why retiring that
+    // one measured verdict-neutral: nothing changed because this kept running.
+    // Fourth instance of the ambient-category defect on this file's JUL rows.
+    // W7-56-infercaller-strict.md
+    //
+    // Spelled as an explicit set/restore rather than `with_category`, matching
+    // this file's own idiom at line 101 and elsewhere: a closure would re-indent
+    // ninety lines of body for a one-line category change, and the tree is not
+    // `cargo fmt`-clean, so that diff would bury the change that matters.
+    let __ctor_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         lr,
         "<init>",
@@ -20348,10 +20384,20 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, 5, Value::Long(now_ms));
                 ctx.set_field(this, 10, Value::Int(short_tid));
             }
+            // Mirrors the real ctor's closing `needToInferCaller = true`. This
+            // shadow only runs in `Compatible` now, where nothing reads the
+            // flag (the source-pair getters are natives there), so it is inert
+            // — but a shadow that silently drops a field the real constructor
+            // sets is exactly what cost W7-56 a build, and the next reader of
+            // this block should not have to rediscover that.
+            if real {
+                ctx.set_field_by_name(this, "needToInferCaller", Value::Int(1));
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(None)))
         },
     );
+    r.set_category(__ctor_cat);
     r.register(
         lr,
         "getLevel",
