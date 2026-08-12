@@ -1465,6 +1465,42 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     });
 
     // AsynchronousSocketChannel = 4-field (connected=0, open=1, fd_id=2, remote_addr=3)
+    //
+    // DEAD, EXCEPT ONE TRIPLE, AND THE SURVIVOR DISAGREES WITH ITS OWNER
+    // (measured 2026-08-12, lane W7-49 — W7-49-slot-index-recensus.md).
+    //
+    // `native-io/src/async_socket.rs::register_async_socket_real` registers
+    // `open()` x2, `isOpen`, `close`, `getRemoteAddress`, `read(ByteBuffer)` and
+    // `write(ByteBuffer)` on this same class, and `register_io_natives` runs
+    // AFTER `register_essential_natives_with_shims` (vm_init.rs:1701 then 1898,
+    // and 2208 then 2403). Registration is last-write-wins, so every one of
+    // those registrations below is overwritten and never dispatches.
+    //
+    // The one survivor is `connect(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;`
+    // — native-io registers only the `(SocketAddress, Object, CompletionHandler)V`
+    // form, so this descriptor is not overwritten. It therefore runs against
+    // objects `aio_asc_open` allocated, under a DIFFERENT slot map:
+    //
+    //     here            native-io (the owner, and the allocator)
+    //     0 connected     0 F_OPEN
+    //     1 open          1 F_CONNECTED
+    //     2 fd_id         2 F_REG_ID   (an AIO registry id, NOT an fd_table fd)
+    //     3 remote        3 F_REMOTE
+    //
+    // Slots 0 and 1 have OPPOSITE meanings and slot 2 holds a different KIND of
+    // integer. That is the two-layouts-on-one-class condition — the shape that
+    // made `java.lang.Process` a bug — and it is NOT repaired here: the owner is
+    // also the allocator, so the repair has to move both sides in one step and
+    // belongs to a lane that owns `native-io`. A one-sided renumber only moves
+    // the disagreement.
+    //
+    // Neither map is layout-correct either way: real
+    // `java.nio.channels.AsynchronousSocketChannel` (JDK 25.0.3.9, `javap -p`)
+    // declares exactly ONE instance field, `provider`, a reference the collector
+    // scans as an oop — so slot 0 of both maps writes an `Int` into it and slots
+    // 1-3 sit past the end of the real layout. `alloc_obj(..., N_FIELDS)` on the
+    // native-io side is a DIRECT allocation, so it never reaches
+    // `report_layout_alias` and this pair appears in no run of that census.
     let asc = "java/nio/channels/AsynchronousSocketChannel";
     r.register(
         asc,
