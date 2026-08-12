@@ -147,6 +147,34 @@ public class RJdkProcess {
         }
     }
 
+    /**
+     * Poll {@code p.descendants()} until it reports at least one process,
+     * bounded by {@link #TREE_WAIT_MS}.
+     *
+     * <p>Bounded polling rather than a single sample, for the reason
+     * {@link #awaitInTree} gives: a snapshot is taken at call time and a
+     * just-forked grandchild is not obliged to be in the first one. The bound
+     * sits far below the sleeper's own 30s lifetime, so a timeout means the
+     * query is broken and never that the subtree had already gone.
+     *
+     * <p>The caller must first have established that the subject really does
+     * have a descendant on this host -- otherwise a VM answering an empty
+     * stream for the WRONG process is indistinguishable from a correct one,
+     * which is the whole defect this exists to catch.
+     */
+    static boolean awaitOwnDescendant(Process p) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(TREE_WAIT_MS);
+        for (;;) {
+            if (p.descendants().findAny().isPresent()) {
+                return true;
+            }
+            if (System.nanoTime() - deadline >= 0) {
+                return false;
+            }
+            Thread.sleep(10);
+        }
+    }
+
     static void currentProcess() {
         ProcessHandle self = ProcessHandle.current();
         check(self != null, "ProcessHandle.current()");
@@ -246,29 +274,35 @@ public class RJdkProcess {
                 "the child's parent must be us");
         check(awaitInTree(lh.pid(), false), "the child must appear in our children()");
         check(awaitInTree(lh.pid(), true), "the child must appear in our descendants()");
-        // `Process.descendants()` and `ProcessHandle.descendants()` are the
-        // SAME query -- the JDK's concrete `Process.descendants()` body is
-        // literally `return toHandle().descendants();` -- so they must report
-        // the same pids. Asserted as an identity rather than against a fixed
-        // expectation because the shape of the subtree is a host fact: on
-        // Windows `cmd.exe /c ping ...` forks a real grandchild, while a Unix
-        // `/bin/sh -c "sleep 30"` usually execs and has none.
+        // `Process.descendants()` is a DIFFERENT dispatch from the
+        // `ProcessHandle.descendants()` polled above, and it is the one a VM
+        // can get wrong without anything noticing: the JDK's concrete
+        // `Process.descendants()` body is `return toHandle().descendants();`,
+        // so a native that intercepts it and answers from its own idea of the
+        // receiver's pid produces an empty stream -- which is exactly what a
+        // childless process returns. CratonVM did that under `--jdk-only` until
+        // 2026-08-12: the native registered on `java/lang/Process` read the
+        // VM's own pid slot off a real `java.lang.ProcessImpl` receiver (which
+        // does not override `descendants()`, so dispatch reaches it), got no
+        // pid, and enumerated the descendants of -1.
         //
-        // What it catches is a `descendants()` answered for the WRONG process,
-        // which is what CratonVM did under `--jdk-only` until 2026-08-12: the
-        // native registered on `java/lang/Process` read the VM's own pid slot
-        // off a real `java.lang.ProcessImpl` receiver (which does not override
-        // `descendants()`, so dispatch reaches it), got no pid, and returned an
-        // empty stream -- indistinguishable from a childless process, and on
-        // this host provably wrong. NOTE the asymmetry: an empty answer on both
-        // sides satisfies this check, so on a host whose launcher execs rather
-        // than forks it is satisfied without being exercised. It is live on
-        // Windows, which is where the defect was.
-        List<Long> viaProcess = live.descendants().map(ProcessHandle::pid).sorted().toList();
-        List<Long> viaHandle = lh.descendants().map(ProcessHandle::pid).sorted().toList();
-        check(viaProcess.equals(viaHandle),
-                "Process.descendants() must agree with ProcessHandle.descendants(): "
-                        + viaProcess.size() + " vs " + viaHandle.size());
+        // Asserted by POLLING for a non-empty answer, not by comparing two
+        // snapshots. The obvious form -- assert that `live.descendants()` and
+        // `lh.descendants()` report the same pids -- is WRONG, and real
+        // HotSpot 25 rejected it: they are two separate reads of the live OS
+        // process table taken microseconds apart, and this vector measured them
+        // disagreeing (1 vs 2) on the ORACLE, before any CratonVM arm ran. Same
+        // trap and same fix as `awaitInTree` above.
+        if (windows()) {
+            check(awaitOwnDescendant(live),
+                    "Process.descendants() must see the sleeper's own child");
+        } else {
+            // `/bin/sh -c "sleep 30"` normally execs rather than forking, so
+            // there is no grandchild to see and a non-empty assertion would
+            // fail on HotSpot too. Named rather than silently absent -- that is
+            // what `skipped` is for.
+            skip("Process.descendants(): the Unix sleeper execs, so it has no descendant to see");
+        }
 
         // The whole tree section is only meaningful if the subject never left
         // the table underneath us; prove that rather than assume it.

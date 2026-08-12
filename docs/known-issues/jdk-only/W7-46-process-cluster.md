@@ -59,7 +59,7 @@ diff against the oracle; a check that stopped running at all is a **hard
 failure**. The count that used to be the only evidence is now the assertion.
 
 `EXPECTED_CHECKS` is 55 — the 53 HotSpot ran, plus the two new checks this lane
-added. The `check(exit == null, "unreachable")` inside the `onExit()` try-block
+added. **Measured on the oracle, three times, not counted by hand** (see §3). The `check(exit == null, "unreachable")` inside the `onExit()` try-block
 is deliberately not counted: HotSpot never reaches it. A VM that fails to throw
 runs it, the count becomes 56, and the constant catches that too.
 
@@ -176,30 +176,64 @@ reaches the real `ProcessHandleImpl.descendants()` and therefore
 refuses propagates its `UnsupportedOperationException`, because that is how the
 spec spells the refusal and an empty stream is not.
 
-### The RED, and what it looks like
+### The RED, and the check that had to be thrown away to get it
 
-`regression-suite/src/RJdkProcess.java` now asserts the identity the JDK's body
-states:
+The obvious assertion is the identity the JDK's own body states — that
+`live.descendants()` and `live.toHandle().descendants()` report the same pids —
+and it is **wrong**. It was written, run against real HotSpot 25 on this host,
+and rejected by the oracle before any CratonVM arm existed:
+
+```
+Exception in thread "main" java.lang.AssertionError:
+  Process.descendants() must agree with ProcessHandle.descendants(): 1 vs 2
+```
+
+Two separate reads of the live OS process table, microseconds apart, of a
+`cmd.exe` that is spawning a `ping`. This is the same trap
+`L10-rjdkprocess-vector-overassertion.md` recorded for this very file, and
+`awaitInTree` already carries the fix; the new check simply did not inherit it.
+**Worth stating as its own finding: an assertion derived from the spec can still
+be unsound against the spec's own implementation, and the cheap way to learn
+that is to run it on the oracle first.** Building the VM was never needed for it.
+
+What landed instead polls for a non-empty answer, bounded by `TREE_WAIT_MS`,
+because what the defect produces is *always* empty:
 
 ```java
-List<Long> viaProcess = live.descendants().map(ProcessHandle::pid).sorted().toList();
-List<Long> viaHandle  = lh.descendants().map(ProcessHandle::pid).sorted().toList();
-check(viaProcess.equals(viaHandle), …);
+if (windows()) {
+    check(awaitOwnDescendant(live), "Process.descendants() must see the sleeper's own child");
+} else {
+    skip("Process.descendants(): the Unix sleeper execs, so it has no descendant to see");
+}
 ```
 
 On this host the sleeper is `cmd.exe /c ping -n 30 127.0.0.1`, which forks a
-real `ping` grandchild, so before the fix `viaProcess` is `[]` and `viaHandle` is
-`[pingPid]` and the check fails with
-`Process.descendants() must agree with ProcessHandle.descendants(): 0 vs 1`.
-**Stated, not observed — this lane ran nothing.**
+real `ping` grandchild that outlives the whole 10s window, so the check is
+genuinely exercised here. On Unix `/bin/sh -c "sleep 30"` normally execs and has
+no grandchild to see — a non-empty assertion would fail on HotSpot too — so it
+is a **named** `skip`, not a silent absence. That is the machinery from §1 being
+used for the thing it was built for on the day it was built.
 
-**The honest limit of this check, stated because a probe that cannot fail is
-this campaign's most common wasted effort:** if the host's launcher execs rather
-than forks (a Unix `/bin/sh -c "sleep 30"` usually does), both sides are empty
-and the check is satisfied without being exercised. It is live on Windows, which
-is where the defect is. It is not a substitute for a subtree the vector builds
-itself, and a later lane that wants a platform-independent version has to build
-one.
+Before the fix, `awaitOwnDescendant` returns false after 10s and the vector
+fails with `Process.descendants() must see the sleeper's own child`. **Stated,
+not observed: the CratonVM arms were not run in this lane.**
+
+### The oracle run that WAS done
+
+`javac` + `java` on the fixture against
+`C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot`, three times:
+
+```
+CK RJdkProcess checks=55 skipped=[]
+PASS RJdkProcess (55 checks)
+```
+
+identical on all three. So `EXPECTED_CHECKS = 55` is **measured on the oracle,
+not counted by hand** — which matters, because a ratchet seeded from a
+hand-count is a gate that fails for its own arithmetic on the first run. The
+empty `skipped` list is the second half of it: on HotSpot every guard is true
+and every check is a real assertion, which is the baseline the CratonVM arms are
+diffed against.
 
 ## 4. `ProcessImpl.create` fabricated a handle for a command line it could not parse
 
@@ -328,6 +362,8 @@ CK RJdkProcess checks=55 skipped=[]
 ```
 
 on **all three** arms — HotSpot 25, `--real-jdk`, `--jdk-only`, byte-identical.
+The HotSpot half of that is not a prediction: it was run three times in this
+lane and printed exactly those two lines each time.
 Anything else falsifies something specific, and each failure names itself:
 
 * `checks=` any other number, or an `AssertionError: check count moved` — a
