@@ -15521,7 +15521,10 @@ pub(crate) fn drive_real_cipher(
 // needs this to decrypt PKCS#8 (PBES2) encrypted private keys. We compute
 // PBKDF2 directly with HMAC over the `sha1`/`sha2` crates — a real,
 // RFC-2898-correct derivation, not a synthetic stub (verified byte-identical
-// to HotSpot). Only the 64-byte-block PRFs PEMFile uses are wired.
+// to HotSpot). SHA-1/224/256 (64-byte HMAC block) go through the hand-rolled
+// `hmac_block64`; SHA-384/512 (128-byte HMAC block, needed by pgjdbc's SCRAM
+// client) go through `pbkdf2_derive_wide`, which uses the `hmac` crate so the
+// block size is derived correctly instead of hardcoded.
 // ---------------------------------------------------------------------------
 
 /// HMAC over a 64-byte-block hash (`SHA-1` / `SHA-224` / `SHA-256`).
@@ -15579,15 +15582,61 @@ fn pbkdf2_derive<D: sha2::Digest + Clone>(
 }
 
 /// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
-/// Only 64-byte-block PRFs are supported (the ones PEMFile uses).
 pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     match alg {
         "PBKDF2WithHmacSHA1" => Some(1),
         "PBKDF2WithHmacSHA224" => Some(224),
         "PBKDF2WithHmacSHA256" => Some(256),
+        "PBKDF2WithHmacSHA384" => Some(384),
+        "PBKDF2WithHmacSHA512" => Some(512),
         _ => None,
     }
 }
+
+/// PBKDF2 (PKCS#5 v2.0) over a 128-byte-block PRF (`SHA-384` / `SHA-512`) —
+/// `hmac_block64` above hardcodes a 64-byte HMAC block, which is wrong for
+/// these (RFC 2104 derives the block size from the underlying hash's own
+/// block size, 128 bytes for SHA-384/512), so it would silently derive the
+/// wrong key instead of throwing. Uses the `hmac` crate (already a dependency,
+/// see `t27_tls_cbc.rs`) so the block size is correct by construction rather
+/// than guessed. pgjdbc's SCRAM-SHA-256 client needs `PBKDF2WithHmacSHA384`
+/// wired for `com.ongres.scram.common.ScramMechanism`'s static init to
+/// succeed, even though SHA-384 itself is only used for the (unrelated)
+/// SCRAM-SHA-256-PLUS channel-binding negotiation path.
+macro_rules! pbkdf2_derive_wide_impl {
+    ($name:ident, $digest:ty) => {
+        fn $name(pw: &[u8], salt: &[u8], iters: u32, dklen: usize) -> Vec<u8> {
+            use hmac::Mac;
+            type HmacImpl = hmac::Hmac<$digest>;
+            let mut out: Vec<u8> = Vec::with_capacity(dklen);
+            let mut block_index: u32 = 1;
+            while out.len() < dklen {
+                let mut salt_i = salt.to_vec();
+                salt_i.extend_from_slice(&block_index.to_be_bytes());
+                let mut mac =
+                    HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                mac.update(&salt_i);
+                let mut u = mac.finalize().into_bytes().to_vec();
+                let mut t = u.clone();
+                for _ in 1..iters.max(1) {
+                    let mut mac =
+                        HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                    mac.update(&u);
+                    u = mac.finalize().into_bytes().to_vec();
+                    for (a, b) in t.iter_mut().zip(u.iter()) {
+                        *a ^= *b;
+                    }
+                }
+                out.extend_from_slice(&t);
+                block_index += 1;
+            }
+            out.truncate(dklen);
+            out
+        }
+    };
+}
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha384, sha2::Sha384);
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512, sha2::Sha512);
 
 /// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
 /// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
@@ -15605,8 +15654,8 @@ pub(crate) fn pbkdf2_derive_for(
     match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
-        384 => pbkdf2_derive::<sha2::Sha384>(pw, salt, iters, dklen),
-        512 => pbkdf2_derive::<sha2::Sha512>(pw, salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(pw, salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(pw, salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
@@ -15767,7 +15816,7 @@ fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<usi
 }
 
 /// `SecretKeyFactory.getInstance(algorithm[, provider])` for PBKDF2.
-/// Recognises only `PBKDF2WithHmacSHA1/224/256`; any other algorithm throws
+/// Recognises `PBKDF2WithHmacSHA1/224/256/384/512`; any other algorithm throws
 /// the same `NoSuchAlgorithmException` (mapped to `SecurityException`) the real
 /// JCA path would have thrown.
 pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15876,6 +15925,8 @@ pub(crate) fn pbkdf2_generate_secret(
     let dk = match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(&pw_bytes, &salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(&pw_bytes, &salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
     };
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
