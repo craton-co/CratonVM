@@ -21,6 +21,12 @@ These change how every page on this list should be read, not just batch 01:
   shared box. Re-run the class with `--shards 1` and a large `--timeout`
   before treating it as a deadlock. See
   [adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md).
+* **Collection-heavy classes were paying ~1 µs per `ArrayList` call** until
+  the batch-03 fix (2026-08-12). If a page's classes push a lot of
+  `ArrayList`/`Vector` traffic, re-measure on a build that contains
+  `docs/internal/fixed-suite-bugs/arraylist-slot-layout-rederived-per-call-FIXED-20260812.md`
+  before recording anything. A residual ~12× over plain-Java remains, tracked in
+  [arraylist-native-overhead-and-the-view-carrier-class](arraylist-native-overhead-and-the-view-carrier-class-20260812.md).
 * **Two of the three defects fixed for batch 01 are VM-wide** (timed
   `java.util.concurrent` waits used the wrong `TimeUnit`; zero-length direct
   `ByteBuffer` bulk copies threw). Rebuild from a `dev` that contains
@@ -31,7 +37,7 @@ These change how every page on this list should be read, not just batch 01:
 
 - **[batch 01](investigate-batch-01.md) — 15 classes (io.netty.bootstrap.BootstrapTest .. io.netty.buffer.BigEndianHeapByteBufTest) — ✅ DONE 2026-08-12.** Three CratonVM JDK-contract defects explained every assertion failure; fixed. No test on that page now fails on CratonVM and passes on HotSpot. Read its *Outcome* section before starting another page — two of the three defects (the `TimeUnit`-ordinal family and the zero-length direct-buffer copy) are VM-wide, so other pages' failures may already be gone.
 - **[batch 02](investigate-batch-02.md) — 15 classes (io.netty.buffer.BigEndianUnsafeDirectByteBufTest .. io.netty.buffer.ReadOnlyByteBufferBufTest) — ✅ DONE 2026-08-12.** 14 of 15 match HotSpot with **no new fix needed** — the batch-01 and batch-07 fixes had already cleared every assertion failure on the page, which is the clearest evidence yet for the "rebuild before re-measuring" note above. The 15th, `JfrEventsTest`, is blocked by a JFR feature gap ([RecordingStream delivers no events](jfr-recordingstream-delivers-no-events-20260812.md)). Its three `*Unsafe*`/`*Aligned*` classes need `--sun-misc-unsafe-memory-access=allow` on the HotSpot side or the baseline skips them entirely.
-- [batch 03](investigate-batch-03.md) — 15 classes (io.netty.buffer.ReadOnlyDirectByteBufferBufTest .. io.netty.channel.ManualIoEventLoopTest)
+- **[batch 03](investigate-batch-03.md) — 15 classes (io.netty.buffer.ReadOnlyDirectByteBufferBufTest .. io.netty.channel.ManualIoEventLoopTest) — ✅ DONE 2026-08-12.** 14 of 15 match HotSpot; all five `io.netty.channel` classes are green (one is *better* than HotSpot, whose failure is a netty test-isolation flake). The 15th led to a **VM-wide** find: `java.util.ArrayList` operations cost ~1 µs each — 36× the same method body written in plain Java on the same VM — because the receiver's slot layout was re-derived per call through string-keyed class-manager lookups. Fixed (`size()` 1014→337 ns), which is worth a rebuild before measuring any collection-heavy page. Residual filed: [ArrayList overhead / view carrier class](arraylist-native-overhead-and-the-view-carrier-class-20260812.md).
 - [batch 04](investigate-batch-04.md) — 15 classes (io.netty.channel.NativeImageHandlerMetadataTest .. io.netty.handler.codec.compression.BrotliIntegrationTest)
 - [batch 05](investigate-batch-05.md) — 15 classes (io.netty.handler.codec.compression.Bzip2IntegrationTest .. io.netty.handler.codec.dns.NativeImageHandlerMetadataTest)
 - [batch 06](investigate-batch-06.md) — 15 classes (io.netty.handler.codec.haproxy.NativeImageHandlerMetadataTest .. io.netty.handler.codec.http2.DefaultHttp2FrameReaderTest)

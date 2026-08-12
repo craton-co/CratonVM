@@ -3734,15 +3734,19 @@ const AL_DEFAULT_CAPACITY: usize = 10;
 /// each access rather than caching globally.
 #[inline]
 fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
-    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData");
-    let size = ctx.resolve_field_index("java/util/ArrayList", "size");
-    match (data, size) {
-        (Some(d), Some(s)) => {
-            let n = std::cmp::max(d, s) + 1;
-            (d, s, n)
-        }
-        _ => (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
-    }
+    al_slots_resolved(ctx).unwrap_or((AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS))
+}
+
+/// `al_slots`, but reporting whether the layout was actually RESOLVED rather
+/// than defaulted. `al_slots_for`'s memo caches only `Some`: a
+/// `resolve_field_index` that fails today because the class is not loaded yet
+/// can succeed later, and caching the constant fallback would pin the wrong
+/// layout for the rest of the run. Same argument `class_name_rc` makes for not
+/// caching its `None`.
+fn al_slots_resolved(ctx: &dyn NativeContext) -> Option<(usize, usize, usize)> {
+    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData")?;
+    let size = ctx.resolve_field_index("java/util/ArrayList", "size")?;
+    Some((data, size, std::cmp::max(data, size) + 1))
 }
 
 /// Receiver-aware slot resolution for the shared ArrayList-backed list natives.
@@ -3757,17 +3761,84 @@ fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
 /// file"). Resolve against the receiver's actual class instead.
 fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
     let cid = ctx.class_id_of_object(this);
+    let raw = cid.as_u32();
+    let vm = ctx.vm_identity();
+    let index = facts_slot_index(raw) & (AL_SLOTS_WAYS - 1);
+
+    let hit = AL_SLOTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != Some(vm) {
+            *cache = (Some(vm), [None; AL_SLOTS_WAYS]);
+        }
+        match cache.1[index] {
+            Some((cached_id, slots)) if cached_id == raw => Some(slots),
+            _ => None,
+        }
+    });
+    if let Some(slots) = hit {
+        return slots;
+    }
+
+    // Cold. The borrow above is released first: the resolution below re-enters
+    // the VM, which must never find this `RefCell` already borrowed.
+    let resolved = al_slots_for_uncached(ctx, cid);
+    if let Some(slots) = resolved {
+        AL_SLOTS.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.0 == Some(vm) {
+                cache.1[index] = Some((raw, slots));
+            }
+        });
+        return slots;
+    }
+    (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS)
+}
+
+/// Ways in the direct-mapped receiver-class -> list-slot-layout cache.
+///
+/// `al_slots_for` sits on EVERY `native_al_*` operation and re-derived a
+/// constant each time: a string-keyed `class_id_by_name`, an `is_subclass`
+/// walk, and two string-keyed `resolve_field_index` calls, all behind the
+/// class-manager lock. `native_al_size` reaches it twice per call. Measured
+/// before this memo, on an idle box: `ArrayList.size()` 1014 ns/op against
+/// 28 ns/op for the identical method body written in plain Java on the same VM;
+/// netty's `AhoCorasicSearchProcessorFactory.buildTrie` — 6.05 M ArrayList
+/// native calls — took 217 s where HotSpot takes 0.214 s.
+///
+/// Sound for the same reason as `RECEIVER_FACTS` and `RECEIVER_NAMES`: a
+/// `ClassId` is never reissued, and a class's field layout is immutable after
+/// linking.
+const AL_SLOTS_WAYS: usize = 64;
+
+thread_local! {
+    /// `(vm_identity, [(ClassId, (data, size, n)); WAYS])`.
+    static AL_SLOTS: std::cell::RefCell<(
+        Option<usize>,
+        [Option<(u32, (usize, usize, usize))>; AL_SLOTS_WAYS],
+    )> = const { std::cell::RefCell::new((None, [None; AL_SLOTS_WAYS])) };
+}
+
+/// The uncached body of [`al_slots_for`]. `None` when the layout could not be
+/// resolved, so the caller can apply the constant fallback WITHOUT caching it.
+fn al_slots_for_uncached(
+    ctx: &dyn NativeContext,
+    cid: ClassId,
+) -> Option<(usize, usize, usize)> {
     if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
         if cid == vec_id || ctx.is_subclass(cid, vec_id) {
             if let (Some(d), Some(s)) = (
                 ctx.resolve_field_index("java/util/Vector", "elementData"),
                 ctx.resolve_field_index("java/util/Vector", "elementCount"),
             ) {
-                return (d, s, std::cmp::max(d, s) + 1);
+                return Some((d, s, std::cmp::max(d, s) + 1));
             }
+            // A Vector receiver whose own layout is unresolvable must NOT fall
+            // through to ArrayList's `size` slot — that is the DF08 mixup this
+            // function exists to prevent. Report unresolved instead.
+            return None;
         }
     }
-    al_slots(ctx)
+    al_slots_resolved(ctx)
 }
 
 /// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
@@ -4585,7 +4656,11 @@ fn unmod_list_oob_error(
 }
 
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    // `class_name_rc` is the memoized reader; `class_name_of_id` takes the
+    // class-manager read lock and allocates a fresh `String` on EVERY call.
+    // This runs on the hot path of every `native_al_*` entry point.
+    let cid = ctx.class_id_of_object(this);
+    let name = class_name_rc(&*ctx, cid)?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
         return None;
     }
@@ -4603,8 +4678,8 @@ fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
 /// reporting **0**. The sizes are constants of the wrapper type, so answer them
 /// directly and keep the delegation as the path for everything else.
 fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
-    match name.as_str() {
+    let name = class_name_rc(ctx, ctx.class_id_of_object(this))?;
+    match &*name {
         "java/util/Collections$SingletonList"
         | "java/util/Collections$SingletonSet"
         | "java/util/Collections$SingletonMap" => Some(1),
@@ -58068,6 +58143,7 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
     ts_set_slot(ctx, this, slot, v);
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58106,6 +58182,86 @@ mod tests {
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
+
+    // --- al_slots_for memo -------------------------------------------------
+    //
+    // `al_slots_for` is on the path of EVERY `native_al_*` operation and used
+    // to re-derive a constant each call (a string-keyed `class_id_by_name`, an
+    // `is_subclass` walk, two string-keyed `resolve_field_index` lookups, all
+    // behind the class-manager lock). It is now memoized per receiver ClassId.
+    // A stale or cross-wired entry reads the WRONG field slots on every
+    // collection operation in the VM, so the memo is covered directly.
+
+    fn memo_ctx() -> (lbq_blocking_tests::MockCtx, ClassId, ClassId) {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        let al = ClassId::new(4001);
+        let vec = ClassId::new(4002);
+        ctx.define_class(al, "java/util/ArrayList");
+        ctx.define_class(vec, "java/util/Vector");
+        ctx.define_field(al, "elementData", 4);
+        ctx.define_field(al, "size", 6);
+        ctx.define_field(vec, "elementData", 2);
+        ctx.define_field(vec, "elementCount", 3);
+        (ctx, al, vec)
+    }
+
+    #[test]
+    fn al_slots_memo_matches_the_uncached_path_and_is_stable() {
+        let (ctx, al, _vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+
+        let uncached = super::al_slots_for_uncached(&ctx, al);
+        let first = super::al_slots_for(&ctx, list);
+        assert_eq!(first, super::al_slots_for(&ctx, list), "memo must be stable");
+        assert_eq!(first, super::al_slots_for(&ctx, list));
+        if let Some(u) = uncached {
+            assert_eq!(first, u, "memo must match the uncached resolution");
+        }
+    }
+
+    #[test]
+    fn al_slots_memo_does_not_cross_wire_two_receiver_classes() {
+        let (ctx, al, vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+        let vector = ctx.alloc_object_of(vec, 8);
+
+        let l1 = super::al_slots_for(&ctx, list);
+        let v1 = super::al_slots_for(&ctx, vector);
+        // Re-ask in the opposite order: a cache without a tag comparison would
+        // hand the second class the first one's layout here.
+        assert_eq!(super::al_slots_for(&ctx, vector), v1, "Vector layout moved");
+        assert_eq!(super::al_slots_for(&ctx, list), l1, "ArrayList layout moved");
+        assert_ne!(
+            l1, v1,
+            "ArrayList and Vector declare different slots; the memo must keep them apart"
+        );
+    }
+
+    /// An UNRESOLVABLE layout must not be cached: `resolve_field_index` can
+    /// fail before the class is loaded and succeed afterwards, so pinning the
+    /// constant fallback would freeze the wrong slots for the rest of the run.
+    #[test]
+    fn al_slots_memo_does_not_cache_the_fallback() {
+        let ctx = lbq_blocking_tests::MockCtx::new(2);
+        let foreign = ClassId::new(4003);
+        ctx.define_class(foreign, "java/nio/charset/Charset");
+        let obj = ctx.alloc_object_of(foreign, 3);
+
+        assert!(super::al_slots_for_uncached(&ctx, foreign).is_none());
+        let fallback = (super::AL_FIELD_DATA, super::AL_FIELD_SIZE, super::AL_NUM_FIELDS);
+        assert_eq!(super::al_slots_for(&ctx, obj), fallback);
+
+        // Now the layout becomes resolvable, exactly as a late class load would
+        // make it. A cached fallback would keep answering the old slots.
+        ctx.define_class(foreign, "java/util/ArrayList");
+        ctx.define_field(foreign, "elementData", 4);
+        ctx.define_field(foreign, "size", 6);
+        assert_eq!(
+            super::al_slots_for(&ctx, obj),
+            (4, 6, 7),
+            "the fallback was cached, so a later resolution could not win"
+        );
+    }
 
     /// `java.util.Random.nextGaussian()` must reproduce the JDK's documented
     /// sequence for a given seed. The expected bit patterns are the first six
@@ -60329,8 +60485,16 @@ mod tests {
                 Value::Object(None)
             }
             fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-                None
+            /// Resolve by NAME through the same modelled layout
+            /// `resolve_field_index_by_class_id` uses. This was a `None` stub
+            /// while the by-id form was fully modelled, so a class the test had
+            /// just described with `define_class` + `define_field` still
+            /// answered "no such field" here — which forces
+            /// `al_slots`/`al_slots_for` onto their constant-fallback path and
+            /// makes a layout test unable to exercise the resolved branch.
+            fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+                let class_id = self.class_id_by_name(class_name)?;
+                self.resolve_field_index_by_class_id(class_id, field_name)
             }
             fn create_string(&mut self, _t: &str) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
