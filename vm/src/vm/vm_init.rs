@@ -7494,6 +7494,14 @@ impl SharedVm {
         // synthetic-jdk mode (1-field stub, slot 0 is the primitive fd tag) the
         // store still happens. `class_layout` is only populated when compact is
         // enabled, so this is a no-op (legacy behaviour) when the flag is off.
+        //
+        // 2026-08-12 (W7-84-primitive-in-reference-store.md): this guard was
+        // written against `gen_heap`, the only heap that boxed. `zgc`, `g1` and
+        // `heap` dropped the same write to null, so on those collectors the
+        // hazard above could not occur and this guard was carrying nothing.
+        // All four box now, so the guard is load-bearing on every collector —
+        // which is the honest cost of converging on the value-preserving
+        // answer, and the reason it is stated here rather than left implicit.
         let slot0_is_ref = cratonvm_gc::class_layout(ps_class_id.as_u32())
             .and_then(|l| l.field_is_ref(0))
             .unwrap_or(false);

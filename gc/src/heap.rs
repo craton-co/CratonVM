@@ -660,13 +660,36 @@ impl Heap {
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
-            return unsafe {
+            let v = unsafe {
                 cratonvm_types::read_compact_field(
                     ptr,
                     storage,
                     std::sync::atomic::Ordering::Relaxed,
                 )
             };
+            if !storage.is_reference() {
+                return v;
+            }
+            // Un-box the wrapper `set_field` installs for a non-reference value
+            // stored into a declared-REFERENCE slot — the field half of what
+            // `get_array_element_unboxing` already does for elements. This
+            // accessor used to hand such a value to `write_compact_field`,
+            // whose `FieldStorageKind::Reference` arm maps every non-`Object`
+            // value to raw 0, so the write was silently dropped to null
+            // (W7-84-primitive-in-reference-store.md).
+            return crate::autobox::unbox_reference_slot(
+                v,
+                |r| {
+                    if !self.is_valid_heap_object(r) {
+                        return None;
+                    }
+                    // SAFETY: `is_valid_heap_object` confirmed `r` points to an
+                    // 8-byte-aligned address inside one of this heap's arenas,
+                    // so reading its `ObjectHeader` is valid memory.
+                    Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+                },
+                |r| self.get_field(r, 0),
+            );
         }
         // HIB-DCAST-LATEPHASE.1 (mutator side), the fourth accessor family.
         // `compact_object_field_storage` answers `None` for TWO reasons and
@@ -726,6 +749,23 @@ impl Heap {
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
+            // A non-reference value into a declared-REFERENCE slot: box it,
+            // rather than let `write_compact_field`'s `Reference` arm map it to
+            // raw 0 and drop the write to null. This is the field half of what
+            // `set_array_element` below has always done for elements
+            // (W7-84-primitive-in-reference-store.md).
+            let value = if storage.is_reference() {
+                let class_id = self.get_header(obj_ref).class_id;
+                crate::autobox::box_for_reference_slot(value, class_id, index, |v| {
+                    let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                    self.set_field(wrapper, 0, v);
+                    wrapper
+                })
+            } else {
+                value
+            };
+            // Recomputed AFTER the boxing closure: it may have allocated, and
+            // this is a semi-space copying heap.
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
             unsafe {
                 cratonvm_types::write_compact_field(
@@ -1007,6 +1047,10 @@ impl Heap {
                     _ => {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
+                        // Arm the process-wide wrapper latch — see the matching
+                        // note in `GenerationalHeap::set_array_element` and
+                        // `crate::autobox`.
+                        crate::autobox::note_wrapper_created();
                         write_prim_element(
                             base,
                             index,

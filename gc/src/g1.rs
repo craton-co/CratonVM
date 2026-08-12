@@ -8286,6 +8286,9 @@ impl G1Collector {
         }
         let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
         self.set_field(wrapper, 0, value);
+        // Arm the process-wide wrapper latch — see the matching note in
+        // `GenerationalHeap::set_array_element` and `crate::autobox`.
+        crate::autobox::note_wrapper_created();
         Value::Object(Some(wrapper))
     }
 
@@ -8781,8 +8784,150 @@ impl G1Collector {
 }
 
 // ---------------------------------------------------------------------------
-// GarbageCollector trait implementation
+// Field-read primitive shared by the trait impl and the SATB pre-barrier
 // ---------------------------------------------------------------------------
+
+impl G1Collector {
+    /// `get_field` WITHOUT the auto-box un-wrap — the raw contents of the
+    /// slot, reference word and all.
+    ///
+    /// Two callers, and the split is load-bearing rather than tidy. The trait
+    /// `get_field` un-boxes, because a wrapper must never escape to Java. The
+    /// SATB pre-barrier must NOT un-box: a boxed primitive is a real object
+    /// reachable only from the slot being overwritten, so logging the
+    /// primitive instead of the wrapper drops the edge the barrier exists to
+    /// keep. The reference-ARRAY store in this same file reads `old_raw` for
+    /// exactly that reason (`set_array_element`, G1MAT-3); this is the field
+    /// half of the same rule (W7-84-primitive-in-reference-store.md).
+    pub(crate) fn get_field_raw(&self, obj: ObjectRef, index: usize) -> Value {
+        // C2b (round-12 gc): runtime bounds + suspect-header guard, mirroring
+        // `GenerationalHeap::get_field` (gen_heap.rs). A corrupted/oversized
+        // header or an out-of-layout index must NOT dereference arbitrary
+        // memory — return a benign null read instead, matching gen_heap.
+        let header = self.get_header(obj);
+        let num_slots = header.num_slots() as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: suspect header (returning null)",
+            );
+            return Value::Object(None);
+        }
+        if index >= num_slots {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: out-of-bounds field read dropped (returning null)",
+            );
+            return Value::Object(None);
+        }
+
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // returns `None` for TWO different reasons and the `unwrap_or` below
+        // treats them as one: "this is a legacy object" (correct — the uniform
+        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) whose
+        // `(class_id, num_slots)` no longer resolves to a registered layout"
+        // (its `class_layout_for_fields(..)?` early return — e.g. a class
+        // redefinition racing the layout registry).
+        //
+        // For the second, `alloc_object` above sized this object's body with
+        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
+        // `num_slots()` on a compact object is the FIELD COUNT — so the
+        // `index >= num_slots` screen above does not bound the legacy stride,
+        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
+        // the allocation. That is the read half of the `SIGSEGV` observed
+        // against the real `DefaultCatalogAndSchemaTest` workload.
+        //
+        // `is_compact_object(header)` is the per-object header bit, read
+        // independently of the registry, and is exactly how this collector's
+        // own walkers already separate the two cases — see
+        // `for_each_flat_object_reference` and the concurrent mark's object
+        // arm, both of which then simply skip the object when
+        // `with_class_layout` misses. An accessor cannot skip, so it degrades
+        // as this function's neighbouring guards do: benign null read, loud
+        // `cratonvm::gc::guard` record, no panic. Matches
+        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
+        // rationale and the open `TODO` about the unchecked `layout_domain` on
+        // the read path.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
+        let (payload_off, payload_size) = compact
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
+            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
+        let total_size = object_total_size(header);
+
+        // C2 (round-12 gc): humongous objects are region-fragmented; translate
+        // the flat payload offset to the owning continuation region's buffer so
+        // the read can never escape the object's backing memory.
+        {
+            let regions = self.regions.lock();
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
+                let mut tmp = [0u64; 2];
+                if self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    tmp.as_mut_ptr().cast(),
+                    payload_size,
+                    false,
+                ) {
+                    return if let Some((_, storage)) = compact {
+                        unsafe {
+                            cratonvm_types::read_compact_field(
+                                tmp.as_ptr().cast(),
+                                storage,
+                                Ordering::Relaxed,
+                            )
+                        }
+                    } else {
+                        let bytes =
+                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
+                        value_from_bytes(bytes)
+                    };
+                }
+                return Value::Object(None);
+            }
+        }
+
+        // SAFETY: `index < num_slots` (checked above) so the slot lies within
+        // the object's allocated, single-region backing store.
+        //
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
+        // a non-atomic 16-byte copy that could tear against a concurrent
+        // plain `set_field` from another mutator thread -- see
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
+        // which covered g1::scan_object_refs but not this mutator-side path).
+        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+        if let Some((_, storage)) = compact {
+            unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
+        } else {
+            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
+        }
+    }
+}
 
 impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
@@ -8919,132 +9064,27 @@ impl GarbageCollector for G1Collector {
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        // C2b (round-12 gc): runtime bounds + suspect-header guard, mirroring
-        // `GenerationalHeap::get_field` (gen_heap.rs). A corrupted/oversized
-        // header or an out-of-layout index must NOT dereference arbitrary
-        // memory — return a benign null read instead, matching gen_heap.
-        let header = self.get_header(obj);
-        let num_slots = header.num_slots() as usize;
-        if num_slots > (1 << 24) {
-            tracing::debug!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: suspect header (returning null)",
-            );
-            return Value::Object(None);
-        }
-        if index >= num_slots {
-            tracing::warn!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: out-of-bounds field read dropped (returning null)",
-            );
-            return Value::Object(None);
-        }
-
-        let compact = cratonvm_types::compact_object_field_storage(header, index);
-        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
-        // returns `None` for TWO different reasons and the `unwrap_or` below
-        // treats them as one: "this is a legacy object" (correct — the uniform
-        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
-        // object (`GC_FLAG_COMPACT`, set at allocation) whose
-        // `(class_id, num_slots)` no longer resolves to a registered layout"
-        // (its `class_layout_for_fields(..)?` early return — e.g. a class
-        // redefinition racing the layout registry).
+        // Un-box the wrapper `set_field` installs for a non-reference value
+        // stored into a declared-REFERENCE slot. G1 used to hand such a value
+        // straight to `write_compact_field`, whose `FieldStorageKind::Reference`
+        // arm maps every non-`Object` value to raw 0, so the write was silently
+        // dropped to null while `gen_heap` boxed it and the legacy 16-byte cell
+        // kept it verbatim (W7-84-primitive-in-reference-store.md).
         //
-        // For the second, `alloc_object` above sized this object's body with
-        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
-        // `num_slots()` on a compact object is the FIELD COUNT — so the
-        // `index >= num_slots` screen above does not bound the legacy stride,
-        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
-        // the allocation. That is the read half of the `SIGSEGV` observed
-        // against the real `DefaultCatalogAndSchemaTest` workload.
-        //
-        // `is_compact_object(header)` is the per-object header bit, read
-        // independently of the registry, and is exactly how this collector's
-        // own walkers already separate the two cases — see
-        // `for_each_flat_object_reference` and the concurrent mark's object
-        // arm, both of which then simply skip the object when
-        // `with_class_layout` misses. An accessor cannot skip, so it degrades
-        // as this function's neighbouring guards do: benign null read, loud
-        // `cratonvm::gc::guard` record, no panic. Matches
-        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
-        // rationale and the open `TODO` about the unchecked `layout_domain` on
-        // the read path.
-        if compact.is_none() && cratonvm_types::is_compact_object(header) {
-            tracing::warn!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: compact receiver has no registered layout for \
-                 its (class_id, field_count) — returning null rather than \
-                 striding its packed compact body as legacy 16-byte cells \
-                 (HIB-DCAST-LATEPHASE.1)",
-            );
-            return Value::Object(None);
-        }
-        let (payload_off, payload_size) = compact
-            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
-            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
-        let total_size = object_total_size(header);
-
-        // C2 (round-12 gc): humongous objects are region-fragmented; translate
-        // the flat payload offset to the owning continuation region's buffer so
-        // the read can never escape the object's backing memory.
-        {
-            let regions = self.regions.lock();
-            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
-                let mut tmp = [0u64; 2];
-                if self.humongous_copy(
-                    &regions,
-                    start,
-                    total_payload,
-                    payload_off,
-                    tmp.as_mut_ptr().cast(),
-                    payload_size,
-                    false,
-                ) {
-                    return if let Some((_, storage)) = compact {
-                        unsafe {
-                            cratonvm_types::read_compact_field(
-                                tmp.as_ptr().cast(),
-                                storage,
-                                Ordering::Relaxed,
-                            )
-                        }
-                    } else {
-                        let bytes =
-                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
-                        value_from_bytes(bytes)
-                    };
-                }
-                return Value::Object(None);
-            }
-        }
-
-        // SAFETY: `index < num_slots` (checked above) so the slot lies within
-        // the object's allocated, single-region backing store.
-        //
-        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
-        // a non-atomic 16-byte copy that could tear against a concurrent
-        // plain `set_field` from another mutator thread -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
-        // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
-        // which covered g1::scan_object_refs but not this mutator-side path).
-        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-        if let Some((_, storage)) = compact {
-            unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
-        } else {
-            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
-        }
+        // `autobox_payload` is the same validated read the reference-ARRAY path
+        // here has always used; `crate::autobox` puts it behind the process-wide
+        // latch so a run that never boxes never reaches it.
+        let v = self.get_field_raw(obj, index);
+        crate::autobox::unbox_reference_slot(
+            v,
+            |r| {
+                self.is_object_address(r.as_ptr() as usize)?;
+                // SAFETY: `is_object_address` confirmed `r` points at a valid
+                // object header inside one of this collector's regions.
+                Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+            },
+            |r| self.get_field_raw(r, 0),
+        )
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
@@ -9093,15 +9133,42 @@ impl GarbageCollector for G1Collector {
         // mid-cycle young pause, tainting the bitmap verdicts remark-time
         // reference processing depends on. The TLS read is gated behind the
         // marking-active check, so the non-marking hot path pays nothing.
+        // W7-84: resolve the layout BEFORE the barrier decisions, because a
+        // non-reference value bound for a declared-REFERENCE slot is boxed into
+        // an `AUTOBOX_CLASS_ID` wrapper — and once boxed the store IS a
+        // reference store, so both barriers have to see the boxed value.
+        // Handing it to `write_compact_field` unboxed is what used to drop it
+        // to raw 0, i.e. to null, while `gen_heap` boxed it and the legacy
+        // 16-byte cell kept it verbatim
+        // (W7-84-primitive-in-reference-store.md).
+        //
+        // The allocation happens here, BEFORE the `regions` lock is taken
+        // below — the same ordering constraint `autobox_for_reference_array`
+        // records for the array half.
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        let value = match compact {
+            Some((_, storage)) if storage.is_reference() => {
+                crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
+                    let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                    self.set_field(wrapper, 0, v);
+                    wrapper
+                })
+            }
+            _ => value,
+        };
+
         let is_ref_store = matches!(value, Value::Object(_));
         if is_ref_store && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
-            let old = self.get_field(obj, index);
+            // `get_field_raw`, NOT `get_field`: if the slot currently holds a
+            // wrapper, the wrapper is the object the marker must not lose, and
+            // `get_field` would hand back the primitive inside it. See
+            // `get_field_raw`'s own note.
+            let old = self.get_field_raw(obj, index);
             if let Value::Object(Some(old_ref)) = old {
                 self.satb_pre_barrier(old_ref.as_ptr() as usize);
             }
         }
 
-        let compact = cratonvm_types::compact_object_field_storage(header, index);
         // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
         // on the matching guard in `get_field` above for why this `None` is
         // two different states and why only the legacy one may reach the
@@ -9110,8 +9177,8 @@ impl GarbageCollector for G1Collector {
         // 16-byte `Value` cell over whatever follows the object.
         //
         // The SATB pre-barrier above has already run, and in this state its
-        // `self.get_field(obj, index)` returned `Value::Object(None)` through
-        // that same guard — so no bogus edge was logged, and the second
+        // `self.get_field_raw(obj, index)` returned `Value::Object(None)`
+        // through that same guard — so no bogus edge was logged, and the second
         // `cratonvm::gc::guard` record it emits for this object is expected.
         if compact.is_none() && cratonvm_types::is_compact_object(header) {
             tracing::warn!(
