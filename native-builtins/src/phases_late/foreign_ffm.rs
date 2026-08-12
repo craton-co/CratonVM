@@ -834,8 +834,16 @@ fn p67_segment_check_scope(
         // CratonVM against `GlobalSession$HeapSession` on HotSpot. Returning
         // unconditionally here was a second fail-open: the one shape that
         // resolves a session was the one shape that skipped the check.
-        p67_session_check_valid(ctx, scope)?;
-        return Ok(());
+        if p67_session_modelled(ctx, scope) {
+            p67_session_check_valid(ctx, scope)?;
+            return Ok(());
+        }
+        // Neither — so this is not a scope at all, and accepting it would be a
+        // third fail-open. `get_field_by_name` resolves an index in the LOADED
+        // class's hierarchy, and a synthetic segment is stamped with the
+        // `MemorySegment` INTERFACE, so the name can land on a slot this model
+        // owns rather than on a real `AbstractMemorySegmentImpl.scope`. Fall
+        // through to the arena, which is self-validating.
     }
     // Synthetic segment: slot 2 names the owning arena. Deliberately NOT
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
