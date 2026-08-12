@@ -80,7 +80,7 @@ behind a flag.
 
 | observable | HotSpot | CratonVM | note |
 |---|---|---|---|
-| `stream.reuseThrows` | `IllegalStateException` | `no-throw` | **declined deliberately** — needs a `linkedOrConsumed` flag in a funnel with 99 call sites in one file; a flag set once too often turns a working stream into a throw on the most pervasive path in the SB/Tomcat arms |
+| `stream.reuseThrows` | `IllegalStateException` | `no-throw` | **declined deliberately** — needs a `linkedOrConsumed` flag in a funnel with 99 call sites in one file; a flag set once too often turns a working stream into a throw on the most pervasive path in the SB/Tomcat arms. **CLOSED 2026-08-12 — W7-65-stream-reuse-throws.md.** The 99 were substring matches over three functions that all bottom out in ONE, `stream_elements`, so it took one check-and-set. The risk this row named is real, and is why that record leaves six residuals unset rather than guessing at them. |
 | `format.*` ×5 | `UnknownFormatConversionException`, `MissingFormatArgumentException`, `IllegalFormatConversionException`, `IllegalFormatFlagsException`, `IllegalFormatPrecisionException` | `java.lang.IllegalArgumentException` | the refusals landed; the **subclass** does not. All five extend `IllegalArgumentException`, so we raise the base. A mistyped refusal sends a caller down the wrong `catch` |
 | `Enum.valueOfBadName` | `No enum constant ShadowDifferentialProbe.Color.MAUVE` | `No enum constant MAUVE` | message omits the qualified type |
 | `NumberFormat.currencyNegativeUS` | `-$1,234.50` | `($1,234.50)` | US locale renders negative currency with a minus, not parentheses |
