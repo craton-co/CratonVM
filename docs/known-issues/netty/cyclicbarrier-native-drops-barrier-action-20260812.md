@@ -1,14 +1,25 @@
 # `CyclicBarrier(parties, Runnable)` — the barrier action is silently dropped
 
-**Status:** OPEN (2026-08-12). Found while fixing the timed-wait family for
+**Status:** OPEN, but **narrowed to synthetic-AQS mode** as of `67c5e048c`
+(2026-08-12). Found while fixing the timed-wait family for
 [netty investigate-batch-01](investigate-batch-01.md); not itself a batch-01
 failure, but it lives in the same native.
 
+**Default real-JDK mode is no longer affected.** `67c5e048c` (the batch-12/13
+session) gates the whole synthetic `CyclicBarrier` native surface behind
+synthetic-AQS mode, so the default build runs `CyclicBarrier`'s real bytecode
+and the barrier action works. What remains is the synthetic path:
+
+```
+                                default mode   CRATONVM_SYNTHETIC_AQS=1
+barrierActionRuns (expect 1)         1                  0
+```
+
 ## Symptom
 
-The `Runnable` passed to `new CyclicBarrier(parties, barrierAction)` never
-runs. HotSpot runs it once per trip, on the last arriving thread, before any
-party is released.
+Under `CRATONVM_SYNTHETIC_AQS=1`, the `Runnable` passed to
+`new CyclicBarrier(parties, barrierAction)` never runs. HotSpot runs it once
+per trip, on the last arriving thread, before any party is released.
 
 ```java
 AtomicInteger tripped = new AtomicInteger();
@@ -55,7 +66,12 @@ native's storage model, not a one-line addition.
 
 ## Suggested fix
 
-Prefer **deleting these natives in real-JDK mode** over extending them.
+`67c5e048c` already took the first half of this advice — the natives no longer
+shadow the real bytecode in default mode. The remaining question is whether the
+synthetic-AQS surface needs a barrier action at all, or whether that mode
+should also be retired.
+
+Prefer **deleting these natives** over extending them.
 `java.util.concurrent.CyclicBarrier` is pure Java over `ReentrantLock` +
 `Condition`, `vm/src/vm/vm_init.rs` already asserts it loads as real bytecode,
 and the timed-wait probe run for the batch-01 fix shows CratonVM's
@@ -68,11 +84,12 @@ condition_awaitNanos500ms_noSignal=elapsed=500ms
 parkNanos500ms=elapsed=500ms
 ```
 
-Running the real bytecode would restore the barrier action, the real
+Running the real bytecode restores the barrier action, the real
 `BrokenBarrierException`/`TimeoutException` types, and proper generation
-semantics in one move — but it changes behaviour for every existing
-`CyclicBarrier` user, so it needs a suite-wide check (netty, Keycloak, Tomcat)
-rather than a drive-by edit.
+semantics in one move — which is exactly what `67c5e048c` achieved for the
+default build. Doing the same for synthetic-AQS mode means deciding what that
+mode is still for; it exists for fake-JDK launchers with no real AQS bytecode
+available, where "run the real bytecode" is not an option.
 
 Two related gaps in the same native were fixed in
 `docs/internal/fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`:

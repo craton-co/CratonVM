@@ -176,6 +176,45 @@ Now constructs the real `java.util.concurrent.TimeoutException` /
 `IllegalStateException` only if the class cannot be built (synthetic-JDK mode),
 so no configuration loses the failure entirely.
 
+## 3c. Fixed concurrently, twice, by two different routes — what each one covers
+
+While this branch was in flight the batch-12/13 session landed `67c5e048c`,
+which **gates the entire synthetic `CyclicBarrier` native surface behind
+synthetic-AQS mode** (it found the same natives losing a waiter's release,
+because they have no generation). In default real-JDK mode CratonVM now runs
+`CyclicBarrier`'s real bytecode, which never reaches the ordinal bug at all.
+
+Re-measured on a binary built from the dev tip (`8401d5308`) with **none** of
+this branch applied, so this split is observed rather than argued:
+
+| probe | dev tip alone | this branch |
+| --- | --- | --- |
+| `CyclicBarrier.await(30, SECONDS)`, default mode | ✅ correct (their gating) | ✅ correct |
+| `CyclicBarrier.await(30, SECONDS)`, `CRATONVM_SYNTHETIC_AQS=1` | ❌ `IllegalStateException: TimeoutException: CyclicBarrier await timed out` | ✅ correct |
+| `CyclicBarrier(parties, Runnable)` action, `CRATONVM_SYNTHETIC_AQS=1` | ❌ never runs | ❌ never runs (filed, see below) |
+| `poll`/`Future.get`/`Exchanger.exchange` with `SECONDS`, default mode | ✅ correct — those natives are not reached in real-JDK mode | ✅ correct |
+| `ByteArrayInputStream.read(b, off, 0)` at EOF | ❌ `0` | ✅ `-1` |
+| zero-length direct-buffer bulk copy at the limit | ❌ throws | ✅ no-op |
+
+So, honestly:
+
+* **Defects 1 and 2 (BAIS EOF ordering, zero-length arena copy) are this
+  branch's alone** and are still load-bearing on the dev tip — that is what
+  keeps netty's `testStreamTransfer1` and `writerIndexBoundaryCheck4` green.
+* **Defect 3 (the `TimeUnit` ordinal family) no longer changes default-mode
+  behaviour**, because the natives that read it are all either newly gated
+  (`CyclicBarrier`) or already gated (`ReentrantLock`, `Condition`,
+  `Semaphore`), and the ungated ones (`poll`, `Future.get`,
+  `Exchanger.exchange`) are not reached with a real-JDK receiver. It is kept
+  because it is **the only fix for the synthetic-AQS path**, which the gating
+  leaves broken, and because a wrong ordinal read is a landmine for any future
+  caller that does route there. The batch-01 measurement that attributed 22 of
+  34 failures to it was taken before `67c5e048c` existed and was correct at the
+  time.
+
+The two fixes are complementary, not redundant, and neither had to be
+reverted.
+
 ## Tests
 
 * `native-io`: `bais_read_zero_len_at_eof_is_minus_one`,

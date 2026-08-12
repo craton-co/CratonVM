@@ -22,16 +22,21 @@ triage on the Azure Linux host (`20.80.105.49`), binary built from `origin/dev`
 ## Outcome
 
 Three CratonVM JDK-contract defects accounted for **every** assertion failure
-on this page. They are fixed in
+on this page. Two of them are fixed only here; the third was fixed here and,
+concurrently, by a different route on `dev` (see below). All are recorded in
 `docs/internal/fixed-suite-bugs/netty-batch01-timed-wait-and-bytebuf-contract-FIXED-20260812.md`:
 
 1. **Timed `java.util.concurrent` waits read the `TimeUnit` ordinal from object
    slot 0**, which on the real JDK enum holds the `name` String — so nine
    natives silently fell back to MILLISECONDS and `await(30, SECONDS)` waited
    30 ms. This is the whole `CyclicBarrier await timed out` /
-   `BrokenBarrierException` cluster: 22 of the 34 failing test methods. Reach
-   goes far past netty (`poll`, `tryLock`, `tryAcquire`, `Future.get`,
-   `Exchanger.exchange`).
+   `BrokenBarrierException` cluster: 22 of the 34 failing test methods.
+   **Fixed twice, concurrently**: `67c5e048c` (the batch-12/13 session) reached
+   the same netty symptom from the other side by gating the synthetic
+   `CyclicBarrier` natives out of real-JDK mode, so the default build no longer
+   depends on either fix alone. The ordinal fix remains the only one that
+   covers `CRATONVM_SYNTHETIC_AQS=1`. See the FIXED record's §3c for the
+   measured split.
 2. **`ByteArrayInputStream.read(byte[],int,int)` checked `len == 0` before
    EOF**, answering `0` where the JDK answers `-1` —
    `AbstractByteBufTest.testStreamTransfer1` on all 10 concrete ByteBuf classes.
