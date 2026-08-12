@@ -66,6 +66,60 @@ public class RCrypto {
         }
     }
 
+    /**
+     * The exception a body raised, PREFIXED with whether it was checked.
+     *
+     * THE ASSERTION THIS FILE MOST CONSPICUOUSLY LACKED. `refused()` above
+     * reports the class NAME, and a name comparison cannot see the property
+     * that actually decides whether a caller's handler runs: a
+     * `javax.crypto.BadPaddingException` is CHECKED, and the
+     * `IllegalStateException` CratonVM raised in its place is not — so
+     * `catch (BadPaddingException e)`, the exception `Cipher.doFinal` DECLARES,
+     * did not run and the failure escaped through code that believed it had
+     * handled it.
+     *
+     * `Throwable` and not `Exception`: an `Error` is unchecked too, and a VM
+     * that raises a name which does not resolve produces `NoClassDefFoundError`
+     * — a wrong-exception defect turned into a worse one. Catching only
+     * `Exception` would let that sail past this instrument exactly as it sails
+     * past the caller's.
+     */
+    static String kind(Body body) {
+        try {
+            body.run();
+            return "NONE";
+        } catch (Throwable t) {
+            boolean unchecked = (t instanceof RuntimeException) || (t instanceof Error);
+            return (unchecked ? "UNCHECKED:" : "checked:") + t.getClass().getSimpleName();
+        }
+    }
+
+    /**
+     * The AEAD trap, and the reason it needs its own helper.
+     *
+     * `AEADBadTagException extends BadPaddingException`, so
+     * `catch (BadPaddingException)` catches BOTH and a probe that only checks
+     * the base class cannot tell them apart. Catching the SUBCLASS first is
+     * what makes the distinction observable: a GCM tag failure reported as the
+     * bare base class returns the BASE-ONLY token, which is a real finding —
+     * this campaign already shipped a cipher that served AES-256-ECB for
+     * ChaCha20 with no AEAD tag at all, so tampered ciphertext decrypted
+     * cleanly.
+     */
+    static String aead(Body body) {
+        try {
+            body.run();
+            return "NONE";
+        } catch (AEADBadTagException e) {
+            return "AEADBadTagException";
+        } catch (BadPaddingException e) {
+            return "BadPaddingException-BASE-ONLY";
+        } catch (Throwable t) {
+            boolean unchecked = (t instanceof RuntimeException) || (t instanceof Error);
+            return (unchecked ? "UNCHECKED:" : "checked:") + t.getClass().getSimpleName();
+        }
+    }
+
     /** A copy of $b with one bit flipped at $i — the smallest possible corruption. */
     static byte[] flip(byte[] b, int i) {
         byte[] c = b.clone();
@@ -216,8 +270,16 @@ public class RCrypto {
             c.init(Cipher.DECRYPT_MODE, kp.getPrivate());
             c.doFinal(flip(oaepCt, 200));
         });
-        check(!oaepWrongKey.equals("NONE"), "OAEP under the wrong private key must fail: " + oaepWrongKey);
-        check(!oaepCorrupt.equals("NONE"), "OAEP on a corrupted ciphertext must fail: " + oaepCorrupt);
+        // NOT merely "must fail" — must fail as the CHECKED exception
+        // `Cipher.doFinal` declares. Measured on Temurin 25.0.3+9:
+        // `javax.crypto.BadPaddingException: Padding error in decryption` for
+        // both. CratonVM answered `IllegalStateException` here, which is
+        // unchecked, so a caller who wrote the JDK's own
+        // `catch (BadPaddingException e)` did not catch it.
+        check(oaepWrongKey.equals("BadPaddingException"),
+                "OAEP under the wrong private key must raise BadPaddingException: " + oaepWrongKey);
+        check(oaepCorrupt.equals("BadPaddingException"),
+                "OAEP on a corrupted ciphertext must raise BadPaddingException: " + oaepCorrupt);
         System.out.println("CK RCrypto oaepRefusals=" + oaepWrongKey + "," + oaepCorrupt);
 
         Cipher rPkcsE = Cipher.getInstance("RSA/ECB/PKCS1Padding");
@@ -237,7 +299,8 @@ public class RCrypto {
             c.init(Cipher.DECRYPT_MODE, other.getPrivate());
             c.doFinal(pkcsCt);
         });
-        check(!pkcsWrongKey.equals("NONE"), "PKCS1 under the wrong private key must fail: " + pkcsWrongKey);
+        check(pkcsWrongKey.equals("BadPaddingException"),
+                "PKCS1 under the wrong private key must raise BadPaddingException: " + pkcsWrongKey);
         System.out.println("CK RCrypto pkcs1Refusals=" + pkcsWrongKey);
 
         Signature sig = Signature.getInstance("SHA256withRSA");
@@ -277,6 +340,194 @@ public class RCrypto {
         check(!wrongKey, "a signature must NOT verify against a different public key");
         check(!corrupt.equals("VERIFIED"), "a corrupted signature must NOT verify");
         System.out.println("CK RCrypto verifyNegatives=" + wrongMsg + "," + wrongKey + "," + corrupt);
+
+        // ---- THE EXCEPTION-TYPE CENSUS ----
+        //
+        // Every arm above asked "did it refuse". These ask "with WHICH class,
+        // and was it CHECKED", which is the only property a caller's `catch`
+        // selects on. Each expected value is measured on Temurin 25.0.3+9;
+        // none is guessed. The full census lives in
+        // probes/JcaExceptionTypeProbe.java — what is here is the subset the
+        // scheduled suite can afford to run on every build.
+
+        // The hierarchy itself, asked of the VM rather than assumed. If
+        // GeneralSecurityException were made to extend RuntimeException the
+        // whole family would silently become unchecked and every class-NAME
+        // comparison in this file would still pass.
+        check(!RuntimeException.class.isAssignableFrom(GeneralSecurityException.class),
+                "GeneralSecurityException must be CHECKED");
+        check(BadPaddingException.class.isAssignableFrom(AEADBadTagException.class),
+                "AEADBadTagException must extend BadPaddingException");
+        check(GeneralSecurityException.class.isAssignableFrom(BadPaddingException.class)
+                        && GeneralSecurityException.class.isAssignableFrom(IllegalBlockSizeException.class)
+                        && GeneralSecurityException.class.isAssignableFrom(ShortBufferException.class)
+                        && GeneralSecurityException.class.isAssignableFrom(SignatureException.class),
+                "the JCA refusal family must be GeneralSecurityException");
+
+        // RSA: padding vs LENGTH are different exceptions, and the short/long
+        // asymmetry is HotSpot's own. A ciphertext SHORTER than the modulus is
+        // a smaller integer that decrypts and fails to unpad; only a LONGER one
+        // is a block-size failure. A `ct.length != k` check gets the class
+        // wrong on both sides and the side wrong on one.
+        String rsaChecked = kind(() -> {
+            Cipher c = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+            c.init(Cipher.DECRYPT_MODE, other.getPrivate());
+            c.doFinal(oaepCt);
+        });
+        String rsaShortCt = refused(() -> {
+            Cipher c = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            c.init(Cipher.DECRYPT_MODE, kp.getPrivate());
+            c.doFinal(new byte[200]);
+        });
+        String rsaLongCt = refused(() -> {
+            Cipher c = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            c.init(Cipher.DECRYPT_MODE, kp.getPrivate());
+            c.doFinal(new byte[300]);
+        });
+        String rsaPkcsTooLong = refused(() -> {
+            Cipher c = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            c.init(Cipher.ENCRYPT_MODE, kp.getPublic());
+            c.doFinal(new byte[246]);
+        });
+        String rsaOaepTooLong = refused(() -> {
+            Cipher c = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+            c.init(Cipher.ENCRYPT_MODE, kp.getPublic());
+            c.doFinal(new byte[191]);
+        });
+        check(rsaChecked.equals("checked:BadPaddingException"),
+                "an RSA padding failure must be CHECKED: " + rsaChecked);
+        check(rsaShortCt.equals("BadPaddingException"),
+                "a short RSA ciphertext is a padding failure: " + rsaShortCt);
+        check(rsaLongCt.equals("IllegalBlockSizeException"),
+                "an over-long RSA ciphertext is a block-size failure: " + rsaLongCt);
+        check(rsaPkcsTooLong.equals("IllegalBlockSizeException"),
+                "246 bytes under RSA-2048 PKCS1 is a block-size failure: " + rsaPkcsTooLong);
+        check(rsaOaepTooLong.equals("IllegalBlockSizeException"),
+                "191 bytes under RSA-2048 OAEP-SHA256 is a block-size failure: " + rsaOaepTooLong);
+        System.out.println("CK RCrypto rsaExc=" + rsaChecked + "," + rsaShortCt + ","
+                + rsaLongCt + "," + rsaPkcsTooLong + "," + rsaOaepTooLong);
+
+        // AEAD, asked so the SUBCLASS is what answers. `gcmRefusals` above
+        // compares class names and would read the same whether the throw was
+        // checked or not; these ask the other question, and the BASE-ONLY token
+        // is what a VM reporting the bare BadPaddingException returns.
+        String gcmAead = aead(() -> {
+            Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+            c.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, iv));
+            c.doFinal(flip(ct, 0));
+        });
+        String gcmTruncated = aead(() -> {
+            Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+            c.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, iv));
+            c.doFinal(new byte[8]);
+        });
+        check(gcmAead.equals("AEADBadTagException"),
+                "a GCM tag failure must be AEADBadTagException specifically: " + gcmAead);
+        check(gcmTruncated.equals("AEADBadTagException"),
+                "a ciphertext shorter than the tag must be AEADBadTagException: " + gcmTruncated);
+        System.out.println("CK RCrypto gcmAeadClass=" + gcmAead + "," + gcmTruncated);
+
+        // AES block modes: padding vs block size, again as different classes.
+        Cipher ecbE = Cipher.getInstance("AES/ECB/PKCS5Padding");
+        ecbE.init(Cipher.ENCRYPT_MODE, key);
+        byte[] ecbCt = ecbE.doFinal(pt);
+        String ecbWrongKey = kind(() -> {
+            byte[] otherK = keyBytes.clone();
+            otherK[0] ^= 0x01;
+            Cipher c = Cipher.getInstance("AES/ECB/PKCS5Padding");
+            c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(otherK, "AES"));
+            c.doFinal(ecbCt);
+        });
+        String ecbRagged = kind(() -> {
+            Cipher c = Cipher.getInstance("AES/ECB/NoPadding");
+            c.init(Cipher.ENCRYPT_MODE, key);
+            c.doFinal(new byte[17]);
+        });
+        check(ecbWrongKey.equals("checked:BadPaddingException"),
+                "AES/ECB/PKCS5 under the wrong key must be a CHECKED BadPaddingException: "
+                        + ecbWrongKey);
+        check(ecbRagged.equals("checked:IllegalBlockSizeException"),
+                "a ragged NoPadding input must be a CHECKED IllegalBlockSizeException: "
+                        + ecbRagged);
+        System.out.println("CK RCrypto aesExc=" + ecbWrongKey + "," + ecbRagged);
+
+        // RFC 3394 key wrap. SunJCE answers an integrity failure with
+        // IllegalBlockSizeException("Integrity check failed") — NOT
+        // BadPaddingException, which is the sibling and not the parent, so a
+        // `catch (IllegalBlockSizeException)` written against the JDK would not
+        // have run.
+        Cipher kwE = Cipher.getInstance("AES/KW/NoPadding");
+        kwE.init(Cipher.ENCRYPT_MODE, key);
+        byte[] wrapped = kwE.doFinal(new byte[16]);
+        String kwTampered = kind(() -> {
+            Cipher c = Cipher.getInstance("AES/KW/NoPadding");
+            c.init(Cipher.DECRYPT_MODE, key);
+            c.doFinal(flip(wrapped, 0));
+        });
+        check(kwTampered.equals("checked:IllegalBlockSizeException"),
+                "a tampered AES/KW payload must be a CHECKED IllegalBlockSizeException: "
+                        + kwTampered);
+        System.out.println("CK RCrypto kwExc=" + kwTampered);
+
+        // A too-small output buffer. The census answer for this overload was
+        // "raises NOTHING of its own": the bytes were written past the end of
+        // the caller's array.
+        String shortBuf = kind(() -> {
+            Cipher c = Cipher.getInstance("AES/ECB/PKCS5Padding");
+            c.init(Cipher.ENCRYPT_MODE, key);
+            c.doFinal(pt, 0, pt.length, new byte[1]);
+        });
+        check(shortBuf.equals("checked:ShortBufferException"),
+                "a too-small output buffer must be a CHECKED ShortBufferException: " + shortBuf);
+        System.out.println("CK RCrypto shortBufferExc=" + shortBuf);
+
+        // Signature state. All three of these DECLARE SignatureException, so a
+        // caller's catch is already written; raising the unchecked
+        // IllegalStateException instead is what made it dead. `update` before
+        // init is the one that raised NOTHING and silently accumulated, which
+        // is worse: `sign()` then produced a signature over bytes the caller
+        // never meant to sign.
+        String sigUninitSign = kind(() -> Signature.getInstance("SHA256withRSA").sign());
+        String sigUninitVerify =
+                kind(() -> Signature.getInstance("SHA256withRSA").verify(new byte[3]));
+        String sigUninitUpdate =
+                kind(() -> Signature.getInstance("SHA256withRSA").update(msg));
+        String sigWrongDirection = kind(() -> {
+            Signature s = Signature.getInstance("SHA256withRSA");
+            s.initVerify(kp.getPublic());
+            s.update(msg);
+            s.sign();
+        });
+        String sigPartial = kind(() -> {
+            Signature s = Signature.getInstance("SHA256withRSA");
+            s.initSign(kp.getPrivate());
+            s.update(msg);
+            s.sign(new byte[4], 0, 4);
+        });
+        check(sigUninitSign.equals("checked:SignatureException"),
+                "sign() before init must be a CHECKED SignatureException: " + sigUninitSign);
+        check(sigUninitVerify.equals("checked:SignatureException"),
+                "verify() before init must be a CHECKED SignatureException: " + sigUninitVerify);
+        check(sigUninitUpdate.equals("checked:SignatureException"),
+                "update() before init must be a CHECKED SignatureException: " + sigUninitUpdate);
+        check(sigWrongDirection.equals("checked:SignatureException"),
+                "sign() after initVerify must be a CHECKED SignatureException: "
+                        + sigWrongDirection);
+        check(sigPartial.equals("checked:SignatureException"),
+                "a partial signature must be refused, not truncated and reported: " + sigPartial);
+        System.out.println("CK RCrypto sigExc=" + sigUninitSign + "," + sigUninitVerify + ","
+                + sigUninitUpdate + "," + sigWrongDirection + "," + sigPartial);
+
+        // THE ROW WHERE UNCHECKED IS THE CORRECT ANSWER, and it is asserted for
+        // exactly that reason: without it, a VM that made every JCA refusal
+        // checked would pass every other row in this section. `Mac.doFinal`
+        // DECLARES IllegalStateException and HotSpot raises it. Unchecked is
+        // not wrong by itself — it is wrong when the JDK's own signature says
+        // otherwise.
+        String macUninit = kind(() -> Mac.getInstance("HmacSHA256").doFinal(msg));
+        check(macUninit.equals("UNCHECKED:IllegalStateException"),
+                "Mac before init is HotSpot's own IllegalStateException: " + macUninit);
+        System.out.println("CK RCrypto macExc=" + macUninit);
 
         System.out.println("CK RCrypto checks=" + checks);
         System.out.println("PASS RCrypto (" + checks + " checks)");
