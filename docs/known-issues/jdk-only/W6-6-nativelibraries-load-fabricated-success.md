@@ -24,7 +24,49 @@
   distinction right. See W5-1-loadlibrary-allowlist-too-wide.md.
 * **Residual: STILL OPEN — one, and it is W5-1's to arm.** The boot-loader case
   cannot fire on either road because `BootLoader.loadLibrary` is still a no-op
-  (`native-builtins/src/lib.rs:13813-13818`). Re-grepped 2026-08-12.
+  (`native-builtins/src/lib.rs:14049-14054`; the record's old `:13813` anchor has
+  rotted). Re-verified 2026-08-12: `lang_system::record_boot_loader_library`
+  (`native-builtins/src/lang_system.rs:3183`) has **zero callers** tree-wide, and
+  its own doc comment says so in bold. `LOADED_LIBRARIES` (`lang_system.rs:1757`)
+  is real, is a `VmScoped` rather than a process global, and is torn down from
+  `forget_vm_system_singletons` (`:3143`) — the strict-only half is genuinely
+  landed, it just has no boot-loader event to record.
+
+**AMENDED 2026-08-12 (W7-78-inherited-residual-closeout.md).**
+
+* **A hazard on this record's headline fix that nobody had checked: the
+  `BootLoader.loadLibrary` no-op is a `Bridge`, and it has to be.** Its
+  registration uses the bare `registry.register(...)`, so its `NativeKind` is
+  **ambient**. The enclosing registrar is `register_essential_natives_with_shims`
+  (`native-builtins/src/lib.rs:7084`), which sets `Bridge` at `:7139-7140` and
+  restores it after the one temporary `Intrinsic` window for regex
+  (`:7666-7680`); line 14049 is outside that window, so the ambient kind is
+  `Bridge`. That is the load-bearing fact, because `NativeKind::allowed_in`
+  drops `SyntheticStub` under `JdkOnly`: had this registration drifted into a
+  `SyntheticStub` window, the no-op would be dropped in strict mode, real
+  `NativeLibraries` bytecode would run in its place, and the JDK's
+  native-library lock — the exact thing this short-circuit exists to avoid
+  during Linux boot-class `<clinit>` — would be back. **Anyone moving this
+  registration must re-check the enclosing `set_category`, not just the call.**
+* **Nothing further is fixable here without a run, and this is stated rather
+  than guessed.** Arming `record_boot_loader_library` is one line, but it can
+  only ever turn a success into an `UnsatisfiedLinkError`, and the library it
+  would first claim for the boot loader is `net` — which
+  `is_vm_provided_jdk_library` deliberately still carries *because* the dynamic
+  rule cannot fire (`lang_system.rs:1939-1949`). Arming it without measuring
+  therefore risks flipping `RJdkJni`'s `net` probe from LOADS to THROWS on the
+  strict arm. The run, from the repo root:
+
+  ```
+  cratonvm --java-home "<jdk-25>" --jdk-only  -cp regression-suite/build RJdkJni
+  cratonvm --java-home "<jdk-25>" --real-jdk  -cp regression-suite/build RJdkJni
+  java -cp regression-suite/build RJdkJni          # HotSpot 25 oracle
+  ```
+
+  taken **with and without** the one-line arming, diffing the
+  `CK RJdkJni loadedLibrary=` line. `--java-home` is not optional: a hand-run
+  that omits it measures the host's default JDK and has already inverted a
+  per-mode verdict once in this campaign.
 
 ## The hole, and why it was worth a lane on its own
 
