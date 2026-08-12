@@ -26,6 +26,12 @@ import java.util.List;
  * range (`remaining() >= 0` passes against -1-derived garbage); nothing asserts
  * "did not throw".
  *
+ * W7-76 added three sections after the original two arms — `orderPropagation`,
+ * `arrayWindow` and `freshOrder`, 77 further checks, 233 in total. They are
+ * appended rather than interleaved so every line of the original 156-check
+ * transcript stays byte-identical and the expected file diffs additively. The
+ * heap arm is still the control in all three.
+ *
  * Run: java DirectByteBufferStateProbe
  * Exit 0 = every check matched; exit 1 = at least one FAIL line above.
  */
@@ -37,6 +43,15 @@ public final class DirectByteBufferStateProbe {
     public static void main(String[] args) {
         arm("direct", ByteBuffer.allocateDirect(16), true);
         arm("heap", ByteBuffer.allocate(16), false);
+
+        // W7-76. Appended AFTER the two original arms so every line above is
+        // byte-identical to the 156-check transcript W7-58 measured; the
+        // expected file diffs purely additively.
+        orderPropagation("direct", ByteBuffer.allocateDirect(16), true);
+        orderPropagation("heap", ByteBuffer.allocate(16), false);
+        arrayWindow("direct", ByteBuffer.allocateDirect(16), true);
+        arrayWindow("heap", ByteBuffer.allocate(16), false);
+        freshOrder();
 
         System.out.println("---");
         System.out.println("checks=" + checks + " failures=" + failures.size());
@@ -206,6 +221,155 @@ public final class DirectByteBufferStateProbe {
         b.rewind();
         eq(tag + ".rewind.position", b.position(), 0);
         eq(tag + ".rewind.remaining", b.remaining(), 16);
+    }
+
+    /**
+     * W7-76 — byte order: where it comes from, and what does NOT inherit it.
+     *
+     * `java.nio.ByteBuffer` declares `boolean bigEndian = true` as a FIELD
+     * INITIALISER, so the value is written by every `ByteBuffer` constructor
+     * and by nothing else. A buffer a VM fabricates with a raw object
+     * allocation — no constructor run — leaves it at the Java default `false`,
+     * and real `ByteBuffer.order()` (which is `public final` and reads the
+     * field directly, so it cannot be intercepted per-subclass) then answers
+     * LITTLE_ENDIAN. That is the whole of the defect this section exists for,
+     * and `.fresh` below is its one-line statement.
+     *
+     * The derived-buffer rows are MEASURED and are the opposite of the
+     * intuition the task carried in: `slice()`, `slice(int,int)`,
+     * `duplicate()` and `asReadOnlyBuffer()` preserve CONTENT and do NOT
+     * preserve ORDER. Each of them runs a constructor, so each comes back
+     * BIG_ENDIAN however the source was set. Asserting "preserves order" here
+     * would have pinned a behaviour HotSpot does not have.
+     */
+    private static void orderPropagation(String tag, ByteBuffer b, boolean direct) {
+        String t = tag + ".ord";
+        for (int i = 0; i < 16; i++) {
+            b.put(i, (byte) (i * 7));
+        }
+        // bytes 0..3 are 0,7,14,21 = 0x00070E15.
+        eq(t + ".fresh", b.order().toString(), "BIG_ENDIAN");
+        eq(t + ".isDirect", b.isDirect(), direct);
+        eq(t + ".getIntBE", b.getInt(0), 0x00070E15);
+        b.order(ByteOrder.LITTLE_ENDIAN);
+        eq(t + ".afterSet", b.order().toString(), "LITTLE_ENDIAN");
+        eq(t + ".getIntLE", b.getInt(0), 0x150E0700);
+
+        ByteBuffer s = b.slice();
+        eq(t + ".slice.order", s.order().toString(), "BIG_ENDIAN");
+        eq(t + ".slice.getIntBE", s.getInt(0), 0x00070E15);
+        eq(t + ".slice.get5", s.get(5), (byte) 35);
+
+        ByteBuffer s2 = b.slice(2, 4);
+        eq(t + ".sliceRange.order", s2.order().toString(), "BIG_ENDIAN");
+        eq(t + ".sliceRange.capacity", s2.capacity(), 4);
+        eq(t + ".sliceRange.get0", s2.get(0), (byte) 14);
+
+        ByteBuffer d = b.duplicate();
+        eq(t + ".duplicate.order", d.order().toString(), "BIG_ENDIAN");
+        eq(t + ".duplicate.get5", d.get(5), (byte) 35);
+
+        ByteBuffer r = b.asReadOnlyBuffer();
+        eq(t + ".readOnly.order", r.order().toString(), "BIG_ENDIAN");
+        eq(t + ".readOnly.get5", r.get(5), (byte) 35);
+
+        // A TYPED VIEW is the one thing that DOES carry the order across, and
+        // it is not an exception to the rule above: the JDK compiles one
+        // concrete view class per endianness (`ByteBufferAsIntBufferB` /
+        // `...L`), so the order is frozen into the CLASS at creation from the
+        // source's order at that moment. A VM that decides a view's order from
+        // a field rather than from the class it stamped gets these two rows
+        // the same and both wrong.
+        eq(t + ".asIntBuffer.fromLE", b.asIntBuffer().order().toString(), "LITTLE_ENDIAN");
+        b.order(ByteOrder.BIG_ENDIAN);
+        eq(t + ".asIntBuffer.fromBE", b.asIntBuffer().order().toString(), "BIG_ENDIAN");
+        eq(t + ".asIntBuffer.get0", b.asIntBuffer().get(0), 0x00070E15);
+        eq(t + ".restored", b.order().toString(), "BIG_ENDIAN");
+    }
+
+    /**
+     * W7-76 — `hasArray`/`array`/`arrayOffset` on a WINDOW, which is where a
+     * fabricated answer stops being indistinguishable from the real one.
+     *
+     * On a fresh heap buffer `arrayOffset()` is 0 and `array().length` is the
+     * capacity, so a native that returns a fresh copy of the right size passes
+     * every check the original arm makes. A heap `slice()` separates them: the
+     * array is the PARENT's, still 16 long, and the offset is 4. The identity
+     * row is the one that cannot be faked.
+     */
+    private static void arrayWindow(String tag, ByteBuffer b, boolean direct) {
+        String t = tag + ".win";
+        for (int i = 0; i < 16; i++) {
+            b.put(i, (byte) (i * 7));
+        }
+        b.position(4);
+        ByteBuffer w = b.slice();
+        eq(t + ".capacity", w.capacity(), 12);
+        eq(t + ".position", w.position(), 0);
+        eq(t + ".hasArray", w.hasArray(), !direct);
+        if (direct) {
+            eq(t + ".array.throws", throwName(() -> w.array()),
+                    "java.lang.UnsupportedOperationException");
+            eq(t + ".arrayOffset.throws", throwName(() -> w.arrayOffset()),
+                    "java.lang.UnsupportedOperationException");
+        } else {
+            eq(t + ".array.length", w.array().length, 16);
+            eq(t + ".array.identity", w.array() == b.array(), true);
+            eq(t + ".arrayOffset", w.arrayOffset(), 4);
+            eq(t + ".array.windowByte", w.array()[w.arrayOffset()], (byte) 28);
+        }
+        eq(t + ".get0", w.get(0), (byte) 28);
+        eq(t + ".get11", w.get(11), (byte) 105);
+
+        // `hasArray()` is `hb != null && !isReadOnly`, so BOTH read-only arms
+        // answer false — including the heap one, whose array exists. The two
+        // arms then differ in WHICH exception they raise, and the direct one is
+        // not the read-only exception.
+        ByteBuffer ro = w.asReadOnlyBuffer();
+        eq(t + ".readOnly.hasArray", ro.hasArray(), false);
+        eq(t + ".readOnly.array.throws", throwName(() -> ro.array()),
+                direct ? "java.lang.UnsupportedOperationException"
+                       : "java.nio.ReadOnlyBufferException");
+        eq(t + ".readOnly.arrayOffset.throws", throwName(() -> ro.arrayOffset()),
+                direct ? "java.lang.UnsupportedOperationException"
+                       : "java.nio.ReadOnlyBufferException");
+    }
+
+    /**
+     * W7-76 — the RED, stated as plainly as it can be stated: every factory
+     * that mints a ByteBuffer answers BIG_ENDIAN, at every size, through every
+     * entry point. `allocate(0)` is included because a zero-capacity buffer is
+     * the one case where a VM might skip its allocation path entirely.
+     */
+    private static void freshOrder() {
+        eq("fresh.allocate8.order", ByteBuffer.allocate(8).order().toString(), "BIG_ENDIAN");
+        eq("fresh.allocate0.order", ByteBuffer.allocate(0).order().toString(), "BIG_ENDIAN");
+        eq("fresh.allocateDirect8.order",
+                ByteBuffer.allocateDirect(8).order().toString(), "BIG_ENDIAN");
+
+        byte[] backing = new byte[16];
+        ByteBuffer w = ByteBuffer.wrap(backing);
+        eq("fresh.wrap.order", w.order().toString(), "BIG_ENDIAN");
+        eq("fresh.wrap.arrayIdentity", w.array() == backing, true);
+        eq("fresh.wrap.arrayOffset", w.arrayOffset(), 0);
+        eq("fresh.wrap.capacity", w.capacity(), 16);
+
+        // wrap(array, off, len) sets POSITION and LIMIT, not offset/capacity —
+        // the buffer still spans the whole array and arrayOffset stays 0. Its
+        // slice() is what carries the offset.
+        ByteBuffer wr = ByteBuffer.wrap(backing, 4, 8);
+        eq("fresh.wrapRange.order", wr.order().toString(), "BIG_ENDIAN");
+        eq("fresh.wrapRange.position", wr.position(), 4);
+        eq("fresh.wrapRange.limit", wr.limit(), 12);
+        eq("fresh.wrapRange.capacity", wr.capacity(), 16);
+        eq("fresh.wrapRange.arrayOffset", wr.arrayOffset(), 0);
+        eq("fresh.wrapRange.remaining", wr.remaining(), 8);
+
+        ByteBuffer wrs = wr.slice();
+        eq("fresh.wrapRange.slice.arrayOffset", wrs.arrayOffset(), 4);
+        eq("fresh.wrapRange.slice.capacity", wrs.capacity(), 8);
+        eq("fresh.wrapRange.slice.order", wrs.order().toString(), "BIG_ENDIAN");
+        eq("fresh.wrapRange.slice.arrayIdentity", wrs.array() == backing, true);
     }
 
     // ---- harness ---------------------------------------------------------
