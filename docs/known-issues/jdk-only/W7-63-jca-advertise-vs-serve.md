@@ -239,21 +239,29 @@ natively intercepted, which is most of them.
 
 ## 4. What stopped being advertised, explicitly
 
-Three names, all knowing divergences from HotSpot in the under-advertising
-direction. **Something may enumerate these.**
+**Exactly two names.** Both are knowing divergences from HotSpot in the
+under-advertising direction, and **something may enumerate them**, so they are
+listed here rather than left to the diff:
 
-| type | provider | name | HotSpot 25 |
-|---|---|---|---|
-| `KeyFactory` | `SUN` | `ML-DSA` | advertised and served |
-| `KeyFactory` | `SunJCE` | `ML-KEM` | advertised and served |
+| type | provider | name | HotSpot 25 | CratonVM before | CratonVM after |
+|---|---|---|---|---|---|
+| `KeyFactory` | `SUN` | `ML-DSA` | advertised, served | advertised, **refused** | not advertised, refused |
+| `KeyFactory` | `SunJCE` | `ML-KEM` | advertised, served | advertised, **refused** | not advertised, refused |
 
-(Two, not three — `Signature`'s under-advertisement is pre-existing and
-untouched.) In both cases the alternative was to keep advertising a name
+Note the *before* column: `getInstance` already refused both. Nothing that
+worked stops working — what changes is only that
+`Security.getAlgorithms("KeyFactory")` stops naming two algorithms this VM will
+not hand over. In both cases the alternative was to keep advertising a name
 `getInstance` refuses. **A missing algorithm is far better than a wrong one, and
-better than a lie about a missing one.** Neither name is asked for by anything
-in the tree; `find_service_provider("Signature", ..)` has no callers at all, and
-the `KeyFactory` rows are reached only through `kf_get_instance`, which refused
-both already.
+better than a lie about a missing one.**
+
+Neither name is asked for by anything in the tree, checked before removal: no
+Java source under `regression-suite/`, `vm/tests/resources/` or `probes/`
+mentions either, `find_service_provider("Signature", ..)` has no callers at
+all, and these `KeyFactory` rows are reached only through `kf_get_instance`.
+
+`Signature`'s 42-versus-64 under-advertisement is pre-existing and untouched;
+no `Signature` name was removed.
 
 Two names started being advertised: `SHAKE128-256`, `SHAKE256-512`, both now
 implemented. `MessageDigest` goes 13 → 15, matching HotSpot exactly.
