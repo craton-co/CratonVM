@@ -327,20 +327,64 @@ feature-gated half of the tree.
   runner's convention), so the Ryuk path was never exercised. Still open as an
   untested path, not as a known defect. Whoever picks it up should run one class
   **without** that variable set.
-* **The remaining lambda cost is ~530 ns against ~6 ns for the equivalent
-  interface call.** What is left, from the post-fix profile: the
-  `try_lambda_dispatch` body itself (13.6%), the loader-faithful override
-  lookups `lambda_impl_dispatch_override{,_driven}` + `lambda_global_impl_owner`
-  (~10%), and — the structural one — the `MethodHandleKind::InvokeStatic` arm
-  resolving its implementation through `invoke_shared` **by class name, member
-  name and descriptor on every call**, where the
-  `InvokeVirtual`/`InvokeInterface` arm has had `try_invoke_cached_lambda_impl`
-  for some time. A resolved-impl cache for the static arm is the obvious next
-  fix and is deliberately **not** taken here: this file's bug history is almost
-  entirely loader-faithful-dispatch defects (see
-  `two-lambda-dispatchers-passive-vs-driven-loader-override`), and caching a
-  negative loader answer is precisely what those fixes exist to prevent. It
-  needs its own change with its own invalidation argument.
+* **The remaining lambda cost is ~450 ns against ~10 ns for the equivalent
+  interface call.**
+
+  **CORRECTION (2026-08-12, same day).** This bullet previously claimed the
+  structural residual was that "the `MethodHandleKind::InvokeStatic` arm
+  resolves its implementation through `invoke_shared` by class name, member name
+  and descriptor on every call, where the `InvokeVirtual`/`InvokeInterface` arm
+  has had `try_invoke_cached_lambda_impl`". **That is false.** The static arm has
+  routed through `lambda_global_impl_owner` -> `try_invoke_cached_lambda_impl`
+  since `a938584d9` (2026-08-10), which predates this record's own base commit.
+  The claim came from reading a 50-line window of that arm that ended two lines
+  before the `else if let Some(owner) = lambda_global_impl_owner(...)` branch and
+  reporting the absence as fact — a truncated read taken as an absence proof, on
+  a file this record had already been burned by once.
+
+  **What the residual actually is**, measured rather than read, with the in-tree
+  `CRATONVM_DBG_LAMBDA_PROF=1` instrument (10 runs per arm, A-B-B-A):
+
+  | bucket | what it covers | ns/call |
+  |---|---|---:|
+  | `lookup` | `lambda_proxies` read + the (now `Arc`) call-site clone | 39 |
+  | `prep` | SAM checks, capture prepend, descriptors, `coerce_lambda_args` | 56 |
+  | `target` | the impl invoke, incl. whatever resolution its entry point does | 220 |
+  | `other` | entry guards, `coerce_return`, **and the instrument's own ~36 ns** | 147 |
+
+  The **loader-faithful override lookups were the removable part of `target`**
+  and are now removed: `lambda_impl_dispatch_override` and its `_driven` sibling
+  took a `lambda_proxy_hosts` read lock (twice) plus a `class_manager` read lock
+  per lambda call to re-derive a per-proxy constant that is `None` for every
+  program without a custom classloader. Both now short-circuit on
+  `any_defining_loader_registered()` — a lock-free atomic whose `false`
+  guarantees no `ClassId` anywhere has a `UserDefined` loader id, which is the
+  same invariant `lookup_loader_initiated` (the function
+  `lambda_impl_dispatch_override` delegates to) has relied on for every
+  `new`/`checkcast`/`instanceof` in the VM. Behaviour is therefore unchanged by
+  construction for the passive half, and for the `_driven` half the atomic
+  subsumes its own `UserDefined(_)` test four lines further down.
+
+  Measured: **`target` 249.8 -> 219.8 ns (1.136x), ranges non-overlapping**
+  (base 239-258, fix 210-231), with `lookup`, `prep` and `other` flat to within
+  0.1 ns — the change moves exactly the bucket it should and nothing else.
+  Whole-dispatch **494.0 -> 464.4 ns (1.064x)** under the profiler, **421.5 ->
+  385.0 ns (1.09x)** by wall clock with the four control arms flat.
+
+  Negative control: the three hibernate-reactive `@BytecodeEnhanced`
+  integration classes — the exact workload
+  `lambda_impl_dispatch_override_driven`'s doc cites, a lambda in a
+  bytecode-enhancing loader's copy of a class whose impl owner also exists
+  globally — pass identically before and after (`ReferenceBETest` 7/7,
+  `LazyBasicFieldTest` 4/4, `LazyOneToOneBETest` 3/3).
+
+  **Still open after that**: `target` is 220 ns for a body that adds 1, which is
+  cached-frame build + interpret + teardown (`Frame::new_pooled_cached`,
+  `init_locals_from_parts`, `pop_and_recycle_frame_with_reason` and the two
+  `drop_glue`s were ~16% of a `perf` profile) — shared interpreter cost, not
+  lambda-specific. `other` is ~110 ns net of the instrument and is the entry
+  guards plus `coerce_return`. Neither is a defect; both are the interpreter
+  architecture.
 * **The 71-class investigation index** (`investigate-INDEX.md` and its six
   batch pages) was built from the partial Azure run that the SASL/SCRAM and JNA
   bugs dominated. With both of those fixed and 39/40 of the head of
