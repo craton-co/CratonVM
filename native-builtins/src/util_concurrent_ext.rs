@@ -1104,44 +1104,28 @@ pub(crate) fn try_alloc_with_appended_slots(
 ) -> Result<(ObjectRef, usize), MethodCallFailed> {
     let base = appended_slot_base_for_class(ctx, class_name);
     let obj = try_alloc_concurrent_synthetic(ctx, class_name, base + width)?;
+    let carried = ctx.object_num_fields(obj);
     debug_assert!(
-        ctx.object_num_fields(obj) >= base + width,
-        "appended-slot allocation of {class_name} came back with {} slots, \
-         needed base {base} + width {width}",
-        ctx.object_num_fields(obj)
+        carried >= base + width,
+        "appended-slot allocation of {class_name} came back with {carried} \
+         slots, needed base {base} + width {width}"
     );
     Ok((obj, base))
 }
 
-/// The base for a RECEIVER this native may not have allocated.
-///
-/// `None` means "this object is too narrow to carry the private map" — which is
-/// exactly a real-layout instance that real bytecode (or the JIT) allocated at
-/// the class's declared width. Writing the private map onto it is the
-/// past-the-end write §5 of natives-over-real-jdk-classes.md
-/// calls heap corruption, so the caller must refuse rather than write.
-///
-/// This is the check that FAILS: today those sites write unconditionally and
-/// nothing observes it; with this the narrow receiver takes the refusal arm and
-/// a debug build trips the assertion at the exact native.
-pub(crate) fn appended_slot_base_of(
-    ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
-    class_name: &str,
-    width: usize,
-) -> Option<usize> {
-    let base = appended_slot_base_for_class(ctx, class_name);
-    if ctx.object_num_fields(obj) < base + width {
-        debug_assert!(
-            false,
-            "native applied a {width}-slot private map at base {base} to a \
-             {}-slot {class_name} it did not allocate",
-            ctx.object_num_fields(obj)
-        );
-        return None;
-    }
-    Some(base)
-}
+// NOT PROVIDED, and the omission is deliberate: a `base_for_this_receiver`
+// companion (W7-49, 2026-08-12). It was written, its only caller was reverted,
+// and it is not left here unused — but the reason it cannot exist usefully is
+// worth keeping, because it is the first thing the next reader will reach for.
+//
+// Given an object this native did NOT allocate, "how many private slots does it
+// carry" is not answerable from its width. A real-layout instance of the exact
+// class is narrow and can be refused; a real SUBCLASS instance is wide, for its
+// own reasons, and `width - real` lands squarely inside its own fields. So such
+// a helper can only ever refuse the narrow case, which is the easy half. The
+// sound remedy for foreign receivers is a side table keyed on object identity —
+// `jca/key_factory.rs` already runs one, with the GC-stable key that lane had to
+// invent when the raw `ObjectRef` address aliased across a young collection.
 
 /// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
 /// Java throwable.

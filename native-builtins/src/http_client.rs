@@ -1390,7 +1390,7 @@ fn hci_send_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // essential path already use, in both modes. Semantics are unchanged: the
     // old form always marked the future done, with a null result on failure,
     // which is exactly `completedFuture(null)`.
-    crate::phases_late::aio_completed_future(ctx, resp_val)
+    crate::phases_late::concurrent::aio_completed_future(ctx, resp_val)
 }
 
 fn do_send(

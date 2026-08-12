@@ -364,17 +364,14 @@ which is not a judgement call.
 
 ## 8. The idiom this lane adds
 
-Three functions next to the funnel in `util_concurrent_ext.rs`, because the
+Two functions next to the funnel in `util_concurrent_ext.rs`, because the
 "append your private slots above the real layout" remedy existed only as four
 private copies of `synthetic_base_offset` in `jca/`:
 
 * `appended_slot_base_for_class` — 0 for a fabricated stub, the real transitive
   field count otherwise.
 * `try_alloc_with_appended_slots` — allocate `base + width` and hand back the
-  base.
-* `appended_slot_base_of` — the base for a **receiver** this native may not have
-  allocated; `None`, plus a debug assertion, when the object is too narrow to
-  carry the map, which is exactly a real-layout instance somebody else made.
+  base, with a debug assertion that the object came back at least that wide.
 
 **The stub arm is the part `jca/`'s copies do not have, and it is load-bearing.**
 `synthetic_base_offset` asks `class_num_total_fields` unconditionally. In
@@ -385,12 +382,20 @@ maps in one run, which is the very condition this species is about.
 `is_class_synthetic_stub` is stable under that: a stub stays a stub.
 
 **What the idiom cannot do**, stated so nobody reaches for it there: it cannot
-make a native safe against a receiver it did not allocate. Given a foreign
-object, "how many private slots does it carry" is unanswerable from its width
-alone — a real subclass instance is wide for its own reasons.
-`appended_slot_base_of` can only refuse the too-narrow case. The sound remedy
-for foreign receivers is a side table keyed on object identity, which
-`jca/key_factory.rs` already uses and which is out of scope here.
+make a native safe against a receiver it did not allocate. A third function was
+written for that — the base for a receiver, `None` when the object is too narrow
+to carry the map — and is NOT committed, because its only caller was the
+reverted §5 conversion and a helper with no caller is how a knob outlives its
+reader. The reasoning is kept as a comment where it would have gone, because it
+is the first thing the next reader will reach for and it does not work: given a
+foreign object, "how many private slots does it carry" is unanswerable from its
+width alone. A real-layout instance of the exact class is narrow and can be
+refused; a real SUBCLASS instance is wide for its own reasons, and `width -
+real` lands squarely inside its own fields. Such a helper can only refuse the
+easy half. The sound remedy for foreign receivers is a side table keyed on
+object identity, which `jca/key_factory.rs` already runs — with the GC-stable
+key that lane had to invent when the raw `ObjectRef` address aliased across a
+young collection — and which is out of scope here.
 
 ## 9. What this lane could not resolve
 

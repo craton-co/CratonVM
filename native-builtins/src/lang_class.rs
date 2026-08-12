@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::try_alloc_concurrent_synthetic;
+use crate::try_alloc_with_appended_slots;
 use crate::lang_math::alloc_wrapper;
 use crate::obj_arg;
 
