@@ -321,26 +321,32 @@ fn native_output_stream_writer_close(
     Ok(None)
 }
 
-/// `InputStreamReader.close()` is a bare `sd.close()` under
-/// `throws IOException`, over a `StreamDecoder.implClose()` that is a bare
-/// `in.close()` / `ch.close()`. Nothing on that chain catches, so the
-/// delegated failure PROPAGATES. W7-57-close-flush-swallow-sweep.md
-///
-/// NOTE: no `register` call names this function anywhere in the workspace —
-/// the live `java/io/InputStreamReader` `close` bodies are
-/// `native-io/src/lib.rs::native_isr_close` and the synthetic one in
-/// `servlet.rs`. Repaired for consistency with those two rather than left as
-/// the odd one out; the deadness is recorded, not resolved here.
-fn native_input_stream_reader_close(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if let Value::Object(Some(input)) = ctx.get_field(this, 0) {
-        ctx.invoke_virtual(input, "close", "()V", &[])?;
-    }
-    Ok(None)
-}
+// `java/io/InputStreamReader.close()` has NO body here, deliberately.
+//
+// `native_input_stream_reader_close` lived here from 29539defc until it was
+// deleted, and its `register` call was removed by aaf64a5de -- the commit that
+// tore out the synthetic `<init>`/`read([CII)I`/`close` block because it
+// "unconditionally shadowed that real bytecode for EVERY InputStreamReader"
+// and "broke every multi-byte decode". The function body outlived its
+// registration by an oversight; the deadness was the intent.
+//
+// Do not restore it. Two live bodies already own this triple, and this one
+// agreed with NEITHER:
+//
+//   * `native-io/src/lib.rs::native_isr_close` wins on the real-JDK path. It
+//     reads the wrapped stream from slot 1 with a legacy fd fallback at slot 0,
+//     and drops the reader's pending UTF-8 decode state.
+//   * the synthetic body registered in `servlet.rs` reads slot 0 -- the layout
+//     its own three `<init>`s park the stream in -- and, crucially, NULLS slot 0
+//     afterwards so a subsequent `read()` reports EOF.
+//
+// The deleted function read slot 0 and did not null it, so it matched the
+// SYNTHETIC layout while missing that layout's close semantics: re-registering
+// it would have kept reading from a closed reader. Against the real-JDK layout
+// slot 0 is the fd, not the stream, so it would have closed nothing at all.
+// Registration is last-write-wins, so wiring it up would not have added a
+// fallback -- it would have replaced a correct winner with a wrong one.
+// W7-57-close-flush-swallow-sweep.md row 12.
 
 #[derive(Default)]
 struct BufferedInputStreamMarkState {
