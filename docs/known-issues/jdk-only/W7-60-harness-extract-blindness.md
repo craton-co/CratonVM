@@ -73,9 +73,12 @@ also why the guard below is armed as a hard error rather than a baseline.
 
 ### 1.1 The adjacent population the same census exposed
 
-Ten vectors — `RCollections`, `RStrings`, `RNumbers`, `RSerial`, `RCrypto`,
-`RExceptions`, `RReflect`, `ROptionalClassForName`, `RPrivateLambdaOwner`,
-`RDirectBufferElem` — reduce to a **single line** with no `CK` line at all. They
+In the census as taken, ten vectors — `RCollections`, `RStrings`, `RNumbers`,
+`RSerial`, `RCrypto`, `RExceptions`, `RReflect`, `ROptionalClassForName`,
+`RPrivateLambdaOwner`, `RDirectBufferElem` — reduced to a **single line** with no
+`CK` line at all. (`RCrypto` is one of the ten and is repaired in §4.1, for a
+different reason: its round trips, not its filtering. The other nine are left
+alone, and the paragraph below is why.) They
 look like the defect and are not, and the distinction is worth stating because
 getting it wrong would have produced ten pointless "repairs":
 
