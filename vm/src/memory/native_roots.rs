@@ -167,8 +167,21 @@ fn scan_collection_overlays(shared: &crate::vm::SharedVm, roots: &mut Vec<Object
     // shape) fell through to the unconditional scan, which roots every
     // element of every overlay-backed collection with no reachability gate
     // at all (see gc_and_alloc.rs's `scan_collection_overlay_roots` comment).
-    let conditional = shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
-        && cratonvm_gc::gc_quiescence::young_marker_follows_side_tables();
+    //
+    // ZGC unconditionally defers too (mirroring `mirror_pin_deferrable`'s own
+    // `VmHeap::Zgc(_) => true` arm): its single STW mark-sweep closure is
+    // always the precise, owner-based marker (`zgc.rs`'s `collect_garbage`
+    // mark loop now calls `external_roots_for_owner` from every confirmed-live
+    // object, the same shape as Generational's non-moving young marker and
+    // old-gen BFS), so there is no non-precise ZGC cycle to protect against.
+    let conditional = match shared.config.gc_algorithm {
+        crate::config::GcAlgorithm::Generational => {
+            cratonvm_gc::gc_quiescence::young_marker_follows_side_tables()
+        }
+        #[cfg(feature = "zgc")]
+        crate::config::GcAlgorithm::Zgc => true,
+        crate::config::GcAlgorithm::G1 => false,
+    };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_GATE").is_some() {
         eprintln!(
             "[OVERLAYGATE] conditional={conditional} gc_algo={:?} major_gc_requested={} is_active={} unregistered_jit={}",

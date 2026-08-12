@@ -5510,6 +5510,18 @@ impl GarbageCollector for ZgcRealHeap {
             if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
                 work.extend(metadata);
             }
+            // Same owner-based propagation Generational's non-moving young
+            // marker and old-gen BFS already do (`gen_heap.rs`): a native
+            // side-table entry is only reachable through the Java collection
+            // object that owns it, so it must be traced from a CONFIRMED-live
+            // owner, not rooted unconditionally for every overlay regardless
+            // of reachability. `native_roots.rs`'s `scan_collection_overlays`
+            // relies on this loop running before it defers to us.
+            for overlay_ref in
+                crate::external_roots::external_roots_for_owner(addr, Some(class_id))
+            {
+                work.push(overlay_ref.as_ptr() as usize);
+            }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -5561,6 +5573,14 @@ impl GarbageCollector for ZgcRealHeap {
                         cratonvm_types::metadata_pin::roots_for_loader(a)
                     {
                         work.extend(metadata);
+                    }
+                    // Same owner-based overlay propagation as the main mark
+                    // loop above — a resurrected finalizable object's own
+                    // side-table entries must survive with it.
+                    for overlay_ref in
+                        crate::external_roots::external_roots_for_owner(a, Some(class_id))
+                    {
+                        work.push(overlay_ref.as_ptr() as usize);
                     }
                 }
             }

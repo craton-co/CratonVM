@@ -251,7 +251,11 @@ pub fn unload_dead_class_metadata(
 /// be cleared. Safe to call unconditionally (including with
 /// `CRATONVM_LOADER_UNLOAD=0`): every entry is still rooted in that mode, so
 /// `is_marked` is always true and nothing is pruned.
-pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
+pub fn reconcile_class_mirrors(
+    shared: &crate::vm::SharedVm,
+    is_marked: &dyn Fn(usize) -> bool,
+    cycle_roots: Option<&[ObjectRef]>,
+) {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     let mut mirrors = shared.classes.class_mirrors.write();
     if dbg {
@@ -309,6 +313,23 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                 if !is_marked(addr) {
                     continue;
                 }
+                // `root_held_paths` stops a branch only at a zero-referrer
+                // node — a genuine GC root and a side-table-propagated
+                // object (mirror_pin/loader_pin/metadata_pin/an overlay
+                // owner edge) both have zero heap referrers and land in the
+                // exact same bucket, so a "no heap referrer, root=<not-a-
+                // direct-root>" line can never tell them apart: it is what
+                // BOTH a legitimately-live control loader and a wrongly-
+                // retained one print. `cycle_roots` is this collection's
+                // OWN root vector (the one actually handed to the marker,
+                // threaded down from the `collect_roots` call site that
+                // started this cycle) -- checking membership in it directly
+                // is the one predicate that can actually say which of the
+                // two this is.
+                let real_root_addrs: std::collections::HashSet<usize> = cycle_roots
+                    .map(|roots| roots.iter().map(|r| r.as_ptr() as usize).collect())
+                    .unwrap_or_default();
+                let is_real_root = |a: usize| real_root_addrs.contains(&a);
                 let render = |paths: &Vec<Vec<(usize, u32)>>, tag: &str| {
                     eprintln!("[MIRRORWHY] {name} {tag} root_held_paths={}", paths.len());
                     for path in paths.iter().take(8) {
@@ -327,19 +348,32 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                         // Without it the path says what holds the object and
                         // stops exactly where the answer is: a head with no
                         // parent is a root, and "which root" is the whole
-                        // question. `<not-a-direct-root>` is itself a finding —
-                        // the head is reachable through something the walk
-                        // could not attribute, not handed to the marker.
-                        let src = path
-                            .first()
-                            .and_then(|&(a, _)| {
-                                crate::memory::native_roots::root_source_of(a)
-                            })
-                            .unwrap_or("<not-a-direct-root>");
-                        eprintln!("[MIRRORWHY]   [root={src}] {}", rendered.join(" -> "));
+                        // question. `<not-a-direct-root>` used to be printed
+                        // for BOTH a genuine root this table doesn't name (a
+                        // thread frame, a static field, a class mirror/lock)
+                        // AND a side-table-propagated object with no heap
+                        // referrer at all — `verified_root` below (this
+                        // cycle's actual root vector, not an inference) is
+                        // what tells those apart.
+                        let head_addr = path.first().map(|&(a, _)| a);
+                        let verified_root = head_addr.is_some_and(is_real_root);
+                        let src = head_addr
+                            .and_then(crate::memory::native_roots::root_source_of)
+                            .unwrap_or(if verified_root {
+                                "<root-not-named-by-VM_ROOT_SOURCES>"
+                            } else {
+                                "<NOT-A-ROOT-no-heap-referrer>"
+                            });
+                        eprintln!(
+                            "[MIRRORWHY]   [root={src} verified_root={verified_root}] {}",
+                            rendered.join(" -> ")
+                        );
                     }
                 };
-                render(&shared.mem.heap.root_held_paths(addr, 200_000, 8), &format!("mirror={addr:#x}"));
+                render(
+                    &shared.mem.heap.retention_paths(addr, &is_real_root, 200_000, 8),
+                    &format!("mirror={addr:#x}"),
+                );
                 // The mirror has no heap referrer; it is marked because
                 // `mirror_pin` propagates from its LOADER. So the real
                 // question is what keeps the LOADER alive.
@@ -353,7 +387,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                         is_marked(laddr)
                     );
                     render(
-                        &shared.mem.heap.root_held_paths(laddr, 200_000, 8),
+                        &shared.mem.heap.retention_paths(laddr, &is_real_root, 200_000, 8),
                         &format!("loader={laddr:#x}"),
                     );
                 } else {
@@ -385,13 +419,44 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                     "[MIRRORWHY] {name} live_instances_of_this_loader={}",
                     live_instances.len()
                 );
+                // Zero live instances does not mean "nothing propagates to
+                // it": the owner-based collection-overlay edge (fixed this
+                // session, `external_roots_for_owner`) is invisible to both
+                // `retention_paths`'s heap-field-only reverse walk AND to
+                // the live-instance enumeration above, because it is a
+                // native side-table edge, not a Java object field. Ask
+                // directly whether the mirror/loader address is currently
+                // an ELEMENT of any overlay-backed collection at all — the
+                // unconditional scan sees every element regardless of which
+                // owner (if any) is still alive, so a hit here says "some
+                // overlay holds this," not yet "and that owner is live,"
+                // but it is the one thing neither check above can rule out.
+                let mut all_overlay_elems: Vec<crate::types::ObjectRef> = Vec::new();
+                cratonvm_gc::external_roots::scan_external_roots(&mut all_overlay_elems);
+                let mirror_in_overlay = all_overlay_elems.iter().any(|r| r.as_ptr() as usize == addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror_is_overlay_element={mirror_in_overlay} \
+                     total_overlay_elements={}",
+                    all_overlay_elems.len()
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    let loader_in_overlay =
+                        all_overlay_elems.iter().any(|r| r.as_ptr() as usize == laddr);
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader_is_overlay_element={loader_in_overlay}"
+                    );
+                }
                 for &(iaddr, icid) in live_instances.iter().take(4) {
                     let iname = cm
                         .get_class(cratonvm_types::ClassId::new(icid))
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("cid{icid}"));
                     render(
-                        &shared.mem.heap.root_held_paths(iaddr, 200_000, 4),
+                        &shared.mem.heap.retention_paths(iaddr, &is_real_root, 200_000, 4),
                         &format!("instance {iname}@{iaddr:#x}"),
                     );
                 }

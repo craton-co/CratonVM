@@ -890,7 +890,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     &shared.threads.monitors,
                 )
                 .0;
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
             // relocated survivors — REMAP each watched holder through the
@@ -1115,7 +1115,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         &shared.threads.monitors,
                     )
                     .0;
-                process_references_after_gc(shared, &result.pointer_map);
+                process_references_after_gc(shared, &result.pointer_map, &roots);
 
                 // Update shared VM state (statics, string pool, etc.)
                 update_all_roots(shared, thread, &result.pointer_map);
@@ -1325,7 +1325,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .heap
             .collect_garbage_with_finalizers(&stw, &mut roots, &fin_roots, &shared.threads.monitors)
             .0;
-        process_references_after_gc(shared, &result.pointer_map);
+        process_references_after_gc(shared, &result.pointer_map, &roots);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
@@ -1388,7 +1388,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                     &shared.threads.monitors,
                 )
                 .0;
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
             // multi-threaded forced collection too. The single-threaded GC paths
@@ -1612,7 +1612,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             &fin_addrs,
             &shared.threads.monitors,
         );
-        process_references_after_gc(shared, &result.pointer_map);
+        process_references_after_gc(shared, &result.pointer_map, &roots);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
@@ -1681,7 +1681,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                 &fin_addrs,
                 &shared.threads.monitors,
             );
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
             // across this multi-threaded finalizer collection (single-threaded
@@ -2019,6 +2019,7 @@ pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
 pub(super) fn process_references_after_gc(
     shared: &SharedVm,
     pointer_map: &cratonvm_types::PointerMap,
+    cycle_roots: &[ObjectRef],
 ) {
     // HIB-CV-24 (Manifestation B): reconcile the defining-loader side-table with
     // this collection. A user `ClassLoader` the application no longer references
@@ -2143,7 +2144,7 @@ pub(super) fn process_references_after_gc(
         // "before the no_refproc short-circuit" rationale: the cache must
         // never hold a stale ObjectRef after a collection, independent of
         // that diagnostic switch.
-        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked);
+        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked, Some(cycle_roots));
         // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
         // from the now-pruned class_mirrors + just-remapped defining-loader
         // side-table, so the marker sees current addresses next cycle.
@@ -5162,7 +5163,12 @@ pub(super) fn g1_remark_process_references(
     // Reconcile those weak ownership tables against the completed bitmap before
     // cleanup frees dead regions and before the optional reference-processor
     // short-circuit.
-    crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+    // G1's own mark bitmap has no separate roots Vec by this point (unlike
+    // the Generational path this diagnostic was built for) -- `None` keeps
+    // `CRATONVM_DBG_MIRRORPIN_WHY`'s verified-root check off for G1 rather
+    // than feeding it a stale/empty vector that would misreport every real
+    // root as unverified.
+    crate::memory::gc::reconcile_class_mirrors(shared, is_marked, None);
     let no_moves = cratonvm_types::PointerMap::default();
     let dead_class_hints =
         cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
