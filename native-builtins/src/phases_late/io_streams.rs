@@ -35,10 +35,16 @@ pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
     r.register(pi, "unread", "(I)V", p58_pushback_in_unread);
     r.register(pi, "available", "()I", p58_pushback_in_available);
     r.register(pi, "close", "()V", |ctx, args| {
-        // Close by delegating to the underlying stream (field 0)
+        // Close by delegating to the underlying stream (field 0).
+        //
+        // `PushbackInputStream.close()` is `if (in == null) return; in.close();
+        // in = null; buf = null;` — it declares `throws IOException` and
+        // catches nothing, so the delegated failure PROPAGATES. Dropping it
+        // here reported a failed close as a clean one.
+        // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            ctx.invoke_virtual(underlying, "close", "()V", &[])?;
         }
         Ok(None)
     });
@@ -59,9 +65,13 @@ pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
     r.register(pr, "read", "()I", p58_pushback_reader_read);
     r.register(pr, "unread", "(I)V", p58_pushback_reader_unread);
     r.register(pr, "close", "()V", |ctx, args| {
+        // `PushbackReader.close()` is `synchronized (lock) { super.close();
+        // buf = null; }`, and `FilterReader.close()` is a bare `in.close()`.
+        // Nothing on that chain catches, so the delegated failure PROPAGATES.
+        // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(underlying)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            ctx.invoke_virtual(underlying, "close", "()V", &[])?;
         }
         Ok(None)
     });
@@ -345,9 +355,17 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
     });
     r.register(pr, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Delegate close() to the underlying Reader (field 0) if present, then clear our buffer.
+        // Delegate close() to the underlying Reader (field 0) if present, then
+        // clear our buffer.
+        //
+        // `PushbackReader.close()` = `synchronized (lock) { super.close();
+        // buf = null; }` over `FilterReader.close()`'s bare `in.close()`:
+        // nothing catches, so the delegated failure PROPAGATES — and the
+        // buffer clear sits AFTER it in HotSpot too (no `finally`), so a
+        // failed close leaves the reader unclosed there as well.
+        // W7-57-close-flush-swallow-sweep.md
         if let Value::Object(Some(inner)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+            ctx.invoke_virtual(inner, "close", "()V", &[])?;
         }
         ctx.set_field(this, 0, Value::Object(None));
         ctx.set_field(this, 1, Value::Object(None));
@@ -520,17 +538,26 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(oos, "flush", "()V", |ctx, args| {
+        // `ObjectOutputStream.flush()` is a bare `bout.flush()` under
+        // `throws IOException` — nothing catches, so it PROPAGATES. A dropped
+        // failure here is the worst shape in the set: the caller flushed
+        // precisely to learn whether the bytes landed.
+        // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            ctx.invoke_virtual(stream, "flush", "()V", &[])?;
         }
         Ok(None)
     });
     r.register(oos, "close", "()V", |ctx, args| {
+        // `ObjectOutputStream.close()` is `flush(); clear(); bout.close();` —
+        // both delegations PROPAGATE, and the close is skipped when the flush
+        // throws, exactly as the JDK's straight-line body does.
+        // W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            ctx.invoke_virtual(stream, "flush", "()V", &[])?;
+            ctx.invoke_virtual(stream, "close", "()V", &[])?;
         }
         Ok(None)
     });
@@ -734,9 +761,13 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         }
     });
     r.register(ois, "close", "()V", |ctx, args| {
+        // `ObjectInputStream.close()` ends in a bare `bin.close()` under
+        // `throws IOException`, with a comment in the JDK insisting the close
+        // be propagated to the underlying stream even when already closed.
+        // Nothing catches. W7-57-close-flush-swallow-sweep.md
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            ctx.invoke_virtual(stream, "close", "()V", &[])?;
         }
         Ok(None)
     });
