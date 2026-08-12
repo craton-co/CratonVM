@@ -4492,13 +4492,23 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             // `-1` is the com.sun.net.httpserver convention for "no response
             // body". Errors are swallowed: failing to report the failure must
             // not turn into a second, different failure on the caller.
+            //
+            // KEPT SWALLOW, NARROWED on the `close`. This is a backstop for a
+            // handler that is not there, so `HttpHandler.handle` has no JDK
+            // body to copy a `catch` from — the swallow is a deliberate
+            // decision of ours and stays. What does not belong inside it is an
+            // `Error`: a `NoSuchMethodError` from `HttpExchange.close` means
+            // our own `HttpExchange` natives are broken, which is neither the
+            // original failure nor a second one caused by reporting it.
+            // W7-57-close-flush-swallow-sweep.md
             let _ = ctx.invoke_virtual(
                 exchange,
                 "sendResponseHeaders",
                 "(IJ)V",
                 &[Value::Int(500), Value::Long(-1)],
             );
-            let _ = ctx.invoke_virtual(exchange, "close", "()V", &[]);
+            let closed = ctx.invoke_virtual(exchange, "close", "()V", &[]);
+            cratonvm_native_api::delegated_close::vm_only_best_effort(&*ctx, closed)?;
             Ok(None)
         },
     );
