@@ -5146,10 +5146,23 @@ pub(crate) fn native_perf_create_byte_array(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // createByteArray(String name, int variability, int units, byte[] value, int maxLength)
-    //   -> ByteBuffer
-    // Allocate a direct buffer sized to the requested maxLength (or 0 if missing/negative).
-    let max_length = match args.get(4) {
+    // W7-86. `createByteArray` is `public native ByteBuffer createByteArray(
+    // String, int, int, byte[], int)` — an INSTANCE method (`javap -p --module
+    // java.base jdk.internal.perf.Perf`, Adoptium 25.0.3.9) — so `args[0]` is
+    // the `Perf` receiver and `maxLength`, the fifth PARAMETER, sits at
+    // `args[5]`. The comment this replaces listed the parameters in their
+    // STATIC positions and then indexed by them: `args[4]` is the `byte[]`
+    // value, a `Value::Object`, which missed the `Value::Int` arm and left
+    // `max_length` at its 0 default — so every perf byte-array counter got a
+    // ZERO-length direct buffer instead of the size the caller asked for.
+    //
+    // Not observable from ordinary Java: `jdk.internal.perf.Perf` is exported
+    // to nobody and `Perf.getPerf()` is itself gated, so there is no probe for
+    // this row and none is pretended. What is measured is the registration:
+    // `--dump-native-registry` on a default run shows it owning its slot, and
+    // the real method is `acc_native` with no code, so nothing else answers it.
+    // Compatible mode (`--real-jdk`, default).
+    let max_length = match args.get(5) {
         Some(Value::Int(v)) if *v >= 0 => *v,
         _ => 0,
     };
