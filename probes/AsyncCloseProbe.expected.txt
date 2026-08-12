@@ -1,0 +1,54 @@
+Oracle transcript for probes/AsyncCloseProbe.java.
+
+Host JDK: Eclipse Temurin 25.0.3.9 (Windows x64), 2026-08-12.
+CratonVM: NOT RUN. No binary was built in the session that wrote this probe,
+          so there is no CratonVM arm here and none should be inferred. The
+          HotSpot arm below is the CONTROL — it says the instrument works. A
+          CratonVM row is evidence only once the same row has been seen to
+          pass here on the same host.
+
+What the control establishes, beyond the 13 PASSes:
+
+  * `selfTestNoPark parked=false` — the anti-vacuity guard FIRES. Every other
+    row's verdict rests on `parked=true`, and a `parked` check nobody has seen
+    say `false` is an uncalibrated instrument. This is the row that calibrates
+    it. If it ever reports `parked=true`, no other row in the file means
+    anything however green.
+
+  * The failure path is not hypothetical either. Measured on the same host:
+
+        java -Dprobe.skipClose=socketRead -cp <out> \
+             AsyncCloseProbe selfTestNoPark socketRead channelRead
+
+        PROBE selfTestNoPark parked=false ms=0 outcome=returned:42 want=must-not-park PASS
+        PROBE socketRead     parked=true ms=4000 outcome=TIMEOUT want=SocketException FAIL
+        PROBE channelRead    parked=true ms=1 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+        SUMMARY pass=2 fail=1 inconclusive=0
+
+    Wall clock 5.1 s, exit 1. A missing wakeup REDs after exactly `probe.wakeMs`
+    and the process leaves; it does not hang. That is the property that makes
+    this usable in a suite, and it has been executed rather than asserted.
+
+One `want` was corrected against the measurement rather than the other way
+round: `channelWrite` answers `ClosedChannelException` on HotSpot 25.0.3,
+because the parked write returns its partial count and the NEXT iteration of
+the row's write loop finds the channel already closed. All three of
+AsynchronousCloseException / ClosedChannelException / a partial count are
+wakeups; only TIMEOUT is the defect this family is about.
+
+=== java -cp <out> AsyncCloseProbe ===
+PROBE settleMs=300 wakeMs=4000 os=Windows 11 java=25.0.3 vm=OpenJDK 64-Bit Server VM
+PROBE selfTestNoPark parked=false ms=0 outcome=returned:42 want=must-not-park PASS
+PROBE socketRead parked=true ms=0 outcome=SocketException want=SocketException PASS
+PROBE socketWrite parked=true ms=0 outcome=SocketException want=SocketException PASS
+PROBE serverSocketAccept parked=true ms=0 outcome=SocketException want=SocketException PASS
+PROBE channelRead parked=true ms=1 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+PROBE channelWrite parked=true ms=0 outcome=ClosedChannelException want=AsynchronousCloseException|ClosedChannelException|returned PASS
+PROBE channelAccept parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+PROBE datagramReceive parked=true ms=0 outcome=SocketException want=SocketException PASS
+PROBE datagramChannelReceive parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+PROBE pipeRead parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+PROBE pipeWrite parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException|ClosedChannelException|returned PASS
+PROBE asyncAccept parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+PROBE asyncRead parked=true ms=0 outcome=AsynchronousCloseException want=AsynchronousCloseException PASS
+SUMMARY pass=13 fail=0 inconclusive=0
