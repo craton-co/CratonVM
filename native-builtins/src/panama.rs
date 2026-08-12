@@ -621,11 +621,28 @@ fn pe_arena_allocate_impl(
     size: i64,
     align: i64,
 ) -> MethodCallResult {
-    if matches!(ctx.get_field(arena_obj, 2), Value::Int(1)) {
+    // TWO arena layouts reach this body, and only one of them is the one it was
+    // written for (W7-89). `register_pe_arena`'s own arena is four slots wide --
+    // [0] global flag, [1] alloc-id array, [2] closed flag, [3] count -- and
+    // wins under `--synthetic-jdk`. In Compatible mode the winner of
+    // `Arena.ofConfined()` is `foreign_ffm`'s TWO-slot arena ([0] open,
+    // [1] session), measured on the native census. On that shape slot 2 and
+    // slot 3 are past the end of the object and slot 1 is the SESSION, so the
+    // id-tracking block below was calling `set_array_element` on a non-array.
+    // Both reads are now gated on the width that makes them meaningful.
+    let four_slot_layout = ctx.object_num_fields(arena_obj) > 3;
+    if four_slot_layout && matches!(ctx.get_field(arena_obj, 2), Value::Int(1)) {
         return Err(RuntimeError::IllegalStateException {
             message: "Arena is closed".into(),
         }
         .into());
+    }
+    // The two-slot arena keeps its liveness in the session, and HotSpot raises
+    // `IllegalStateException: Already closed` for `arena.allocate(...)` after
+    // `arena.close()` -- measured, `MemorySessionValidStateProbe` row
+    // `C.closed.allocate`.
+    if let Some(session) = pe_arena_session(ctx, arena_obj) {
+        pe_session_check_open(ctx, session)?;
     }
 
     // Allocate off-heap memory via SharedVm's native_memory table
@@ -636,13 +653,20 @@ fn pe_arena_allocate_impl(
         })?;
 
     // Track alloc_id in arena's ID list
-    if let Value::Object(Some(ids_arr)) = ctx.get_field(arena_obj, 1) {
-        let count = match ctx.get_field(arena_obj, 3) {
-            Value::Int(n) => n as usize,
-            _ => 0,
-        };
-        ctx.set_array_element(ids_arr, count, Value::Long(alloc_id));
-        ctx.set_field(arena_obj, 3, Value::Int((count + 1) as i32));
+    if four_slot_layout {
+        if let Value::Object(Some(ids_arr)) = ctx.get_field(arena_obj, 1) {
+            // Kind screen, W7-83's: the slot is only an id array on the
+            // four-slot layout, and answering "is this actually an array?" is
+            // what stops a session or a backing array being written through.
+            if ctx.object_is_array(ids_arr) {
+                let count = match ctx.get_field(arena_obj, 3) {
+                    Value::Int(n) => n as usize,
+                    _ => 0,
+                };
+                ctx.set_array_element(ids_arr, count, Value::Long(alloc_id));
+                ctx.set_field(arena_obj, 3, Value::Int((count + 1) as i32));
+            }
+        }
     }
 
     // Create MemorySegment: [0]=ptr, [1]=size, [2]=arena, [3]=ro, [4]=alive, [5]=offset
@@ -1603,6 +1627,22 @@ fn pe_segment_check_scope(ctx: &dyn NativeContext, seg: ObjectRef) -> Result<(),
     let Some(session) = pe_segment_session(ctx, seg) else {
         return Ok(());
     };
+    pe_session_check_open(ctx, session)
+}
+
+/// `Err(IllegalStateException)` if this MODELLED session has been closed.
+///
+/// One implementation, called by both the access path and
+/// `pe_arena_allocate_impl`: a second open-coded copy of "state == 0 means
+/// closed" is precisely the drift W7-89 had to unpick between this file and
+/// `foreign_ffm`. The caller is responsible for having resolved `session`
+/// through [`pe_segment_session`] / [`pe_arena_session`], both of which gate on
+/// [`pe_session_modelled`] -- so a session whose encoding we do not own never
+/// reaches here.
+fn pe_session_check_open(
+    ctx: &dyn NativeContext,
+    session: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let slots = crate::phases_late::foreign_ffm::p67_session_slots(ctx, session);
     if matches!(ctx.get_field(session, slots.state), Value::Int(0)) {
         return Err(RuntimeError::IllegalStateException {
