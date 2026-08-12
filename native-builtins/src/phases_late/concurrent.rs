@@ -7045,13 +7045,29 @@ pub(crate) fn cont_slots(ctx: &dyn NativeContext, this: ObjectRef) -> ContSlots 
             real: true,
         };
     }
-    // W7-69, observation only, no `else` — the read below is unchanged whatever
-    // this answers. On a synthetic receiver the census is expected to answer
-    // `Unknown`/clean (its fields are `_f0.._f4`); on a real receiver that
-    // somehow failed the witness above it prints the four wrong-field rows,
-    // which is the loud direction and the one worth having.
+    // W7-69, observation only, no `else` — the fallback below is returned
+    // whatever this answers.
+    //
+    // It is deliberately NOT unconditional, and the reason is W7-69 §5.1's own
+    // lesson in the other direction: an instrument that fires on every read is
+    // a probe that cannot fail. A wholly synthetic receiver's fields are
+    // `_f0.._f4` (`class_manager.rs`'s `instance_fields`), so observing there
+    // would print five `scope → _f0`-shaped rows on every synthetic run — true
+    // statements, and pure noise, because on a fabricated class the native's
+    // slot map IS the class's truth. The interesting state is the one that
+    // cannot happen by construction: a receiver that carries SOME real JDK
+    // field name and still failed the four-name witness above, i.e. a
+    // partially-real layout being read through the synthetic map. `parent` is
+    // the discriminator because it is a real-JDK-only name — no synthetic
+    // Continuation shape in this tree declares it.
     if layout_alias::enabled() {
-        for (slot, expected) in NEW15_CONT_SLOT_MAP.slots {
+        let rows: &[(usize, &str)] =
+            if ctx.resolve_field_index_by_class_id(cid, "parent").is_some() {
+                NEW15_CONT_SLOT_MAP.slots
+            } else {
+                &[]
+            };
+        for (slot, expected) in rows {
             read_alias::observe_read(
                 ctx,
                 this,
@@ -7122,9 +7138,24 @@ pub(crate) fn fjp_slots(ctx: &dyn NativeContext, pool: ObjectRef) -> FjpSlots {
             active: ctx.resolve_field_index_by_class_id(cid, "active"),
         };
     }
-    // W7-69, observation only, no `else`.
+    // W7-69, observation only, no `else`. Same discriminator argument as
+    // `cont_slots`: the synthetic `ForkJoinPool` shape
+    // (`class_manager.rs`: `instance_fields(1)`) names its field `_f0`, and
+    // reporting `parallelism → _f0` on every synthetic run is noise, not a
+    // finding. `termination` is the real-JDK-only name that says this receiver
+    // is real enough to have failed the `parallelism` witness for some other
+    // reason — which cannot happen by construction and is exactly what is worth
+    // printing if it does.
     if layout_alias::enabled() {
-        for (slot, expected) in NEW15_FJP_SLOT_MAP.slots {
+        let rows: &[(usize, &str)] = if ctx
+            .resolve_field_index_by_class_id(cid, "termination")
+            .is_some()
+        {
+            NEW15_FJP_SLOT_MAP.slots
+        } else {
+            &[]
+        };
+        for (slot, expected) in rows {
             read_alias::observe_read(
                 ctx,
                 pool,
@@ -9106,6 +9137,272 @@ pub(crate) mod new15_tests {
         assert_ne!(NEW15_CONT_STATE_NEW, NEW15_CONT_STATE_RUNNING);
         assert_ne!(NEW15_CONT_STATE_RUNNING, NEW15_CONT_STATE_YIELDED);
         assert_ne!(NEW15_CONT_STATE_YIELDED, NEW15_CONT_STATE_DONE);
+    }
+
+    // -----------------------------------------------------------------------
+    // W7-75 — the read-side slot alias, and the guard that could not fire
+    // -----------------------------------------------------------------------
+
+    /// The real JDK 25 `jdk.internal.vm.Continuation` layout, `javap -p`
+    /// against Eclipse Adoptium 25.0.3.9, in declaration order with `static`
+    /// excluded. Superclass is `java.lang.Object`, which declares none, so this
+    /// is the whole transitive chain.
+    const REAL_CONT_FIELDS: &[(&str, &str)] = &[
+        ("target", "Ljava/lang/Runnable;"),
+        ("scope", "Ljdk/internal/vm/ContinuationScope;"),
+        ("parent", "Ljdk/internal/vm/Continuation;"),
+        ("child", "Ljdk/internal/vm/Continuation;"),
+        ("tail", "Ljdk/internal/vm/StackChunk;"),
+        ("done", "Z"),
+        ("mounted", "Z"),
+        ("yieldInfo", "Ljava/lang/Object;"),
+        ("preempted", "Z"),
+        ("scopedValueCache", "[Ljava/lang/Object;"),
+    ];
+
+    /// The real JDK 25 `java.util.concurrent.ForkJoinPool` layout, same oracle.
+    /// Its superclass `AbstractExecutorService` declares NO instance field (its
+    /// only member is the static `$assertionsDisabled`), so ForkJoinPool's own
+    /// sixteen are the whole chain — which is what makes `parallelism` 15 and
+    /// not 15-plus-something.
+    const REAL_FJP_FIELDS: &[(&str, &str)] = &[
+        ("termination", "Ljava/util/concurrent/CountDownLatch;"),
+        ("saturate", "Ljava/util/function/Predicate;"),
+        (
+            "factory",
+            "Ljava/util/concurrent/ForkJoinPool$ForkJoinWorkerThreadFactory;",
+        ),
+        ("ueh", "Ljava/lang/Thread$UncaughtExceptionHandler;"),
+        ("container", "Ljdk/internal/vm/SharedThreadContainer;"),
+        ("workerNamePrefix", "Ljava/lang/String;"),
+        ("poolName", "Ljava/lang/String;"),
+        ("delayScheduler", "Ljava/util/concurrent/DelayScheduler;"),
+        ("queues", "[Ljava/util/concurrent/ForkJoinPool$WorkQueue;"),
+        ("runState", "J"),
+        ("keepAlive", "J"),
+        ("config", "J"),
+        ("stealCount", "J"),
+        ("threadIds", "J"),
+        ("ctl", "J"),
+        ("parallelism", "I"),
+    ];
+
+    /// The synthetic shapes, exactly as `ClassManager::instance_fields(n)`
+    /// fabricates them: anonymous `_f0..`, all `Ljava/lang/Object;`. This is
+    /// what makes the fallback tests real — a fabricated class declares NONE of
+    /// the JDK's names, which is precisely the witness `cont_slots` keys on.
+    const ANON_FIELD_NAMES: &[&str] = &["_f0", "_f1", "_f2", "_f3", "_f4"];
+
+    /// Teach the mock a class with this exact instance-field layout and hand
+    /// back a fresh instance of it. The mock resolves a name only through the
+    /// metadata a test declares (its `mock_field_slot` fallback table names
+    /// none of the fields used here — checked), so the witness is falsifiable.
+    fn instance_of(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        class_name: &str,
+        fields: &[(&str, &str)],
+    ) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized(class_name)
+            .expect("mock always resolves");
+        ctx.set_declared_fields(
+            cid,
+            fields
+                .iter()
+                .enumerate()
+                .map(|(slot_index, (name, descriptor))| {
+                    cratonvm_native_api::FieldMetadata {
+                        name: (*name).to_string(),
+                        descriptor: (*descriptor).to_string(),
+                        access_flags: 0,
+                        slot_index,
+                        declaring_class_id: cid,
+                        is_static: false,
+                    }
+                })
+                .collect(),
+        );
+        ctx.alloc_object(cid, fields.len())
+    }
+
+    fn anon_fields(count: usize) -> Vec<(&'static str, &'static str)> {
+        ANON_FIELD_NAMES[..count]
+            .iter()
+            .map(|name| (*name, "Ljava/lang/Object;"))
+            .collect()
+    }
+
+    /// What W7-69 §6(1) recorded, asserted rather than described: every entry
+    /// of the synthetic map names a different field than the real class has at
+    /// that index, and `scope`/`target` are SWAPPED — the shape where both
+    /// resolve and neither complains.
+    #[test]
+    fn the_synthetic_continuation_map_disagrees_with_the_real_class_in_every_slot() {
+        let at = |i: usize| REAL_CONT_FIELDS[i].0;
+        assert_eq!(at(NEW15_CONT_SCOPE), "target");
+        assert_eq!(at(NEW15_CONT_TARGET), "scope");
+        assert_eq!(at(NEW15_CONT_STATE), "parent");
+        assert_eq!(at(NEW15_CONT_PIN), "child");
+        assert_eq!(at(NEW15_CONT_PREEMPT), "tail");
+        // And the two that are swapped really are the same pair, not two
+        // unrelated wrongs: the map's `scope` is the class's `target` and vice
+        // versa. That is the `AsynchronousSocketChannel` shape W7-49 §5 names.
+        assert_eq!(at(NEW15_CONT_SCOPE), "target");
+        assert_eq!(at(NEW15_CONT_TARGET), "scope");
+        // Real `parallelism` is a genuine `int`; slot 0 and 1 are references.
+        assert_eq!(REAL_FJP_FIELDS[NEW15_FJP_PARALLELISM].0, "termination");
+        assert_eq!(REAL_FJP_FIELDS[NEW15_FJP_ACTIVE].0, "saturate");
+        assert_eq!(REAL_FJP_FIELDS[15], ("parallelism", "I"));
+    }
+
+    #[test]
+    fn cont_slots_resolves_the_real_layout_by_name() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", REAL_CONT_FIELDS);
+        let s = cont_slots(&ctx, this);
+        assert!(s.real, "the four-name witness must hold on the real layout");
+        assert_eq!(s.target, 0);
+        assert_eq!(s.scope, 1);
+        assert_eq!(s.done, 5);
+        assert_eq!(s.preempted, 8);
+        assert_eq!(
+            s.pin, None,
+            "the real class declares no pin counter; writing one would stamp \
+             an Int over `child`, a Continuation reference"
+        );
+        // None of those is the synthetic index it replaced.
+        assert_ne!(s.scope, NEW15_CONT_SCOPE);
+        assert_ne!(s.target, NEW15_CONT_TARGET);
+        assert_ne!(s.done, NEW15_CONT_STATE);
+    }
+
+    #[test]
+    fn cont_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_CONT_FIELDS);
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", &fields);
+        let s = cont_slots(&ctx, this);
+        assert!(!s.real);
+        assert_eq!(s, CONT_SLOTS_SYNTHETIC);
+    }
+
+    /// **The RED.** The completed-continuation guard, on a real receiver,
+    /// against the predicate it used to be.
+    ///
+    /// The old predicate is reproduced here verbatim rather than described,
+    /// because "the guard is fixed" is exactly the claim a test that only
+    /// checks the new path cannot make: both would pass. It reads slot 2 —
+    /// `parent` — and a fresh `Continuation`'s `parent` is null, so the
+    /// `Value::Int` match falls through to `NEW` and DONE is unreachable no
+    /// matter how many times `run()` completed.
+    #[test]
+    fn the_completed_guard_fires_on_the_real_layout_and_the_old_predicate_did_not() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", REAL_CONT_FIELDS);
+        // `parent` as the real class leaves it on a fresh instance.
+        ctx.set_field(this, 2, Value::Object(None));
+        let s = cont_slots(&ctx, this);
+
+        assert!(!cont_is_done(&ctx, this, s), "NEW is not done");
+        cont_set_done(&ctx, this, s, false); // run() marks it running
+        assert!(!cont_is_done(&ctx, this, s), "RUNNING is not done");
+        cont_set_done(&ctx, this, s, true); // run() completes
+
+        assert!(
+            cont_is_done(&ctx, this, s),
+            "the guard must see the completion it just recorded"
+        );
+
+        // The old predicate, verbatim: `match get_field(this, NEW15_CONT_STATE)
+        // { Value::Int(v) => v, _ => NEW } == DONE`.
+        let old_verdict = match ctx.get_field(this, NEW15_CONT_STATE) {
+            Value::Int(v) => v,
+            _ => NEW15_CONT_STATE_NEW,
+        } == NEW15_CONT_STATE_DONE;
+        assert!(
+            !old_verdict,
+            "the old slot-2 predicate must NOT fire here — if it does, this \
+             test is not measuring the defect it is named after"
+        );
+    }
+
+    /// The same guard on a synthetic receiver keeps its old four-value
+    /// encoding, so the fallback is not a behaviour change for the mode that
+    /// was already correct.
+    #[test]
+    fn the_completed_guard_keeps_the_state_int_encoding_on_a_synthetic_receiver() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_CONT_FIELDS);
+        let this = instance_of(&mut ctx, "jdk/internal/vm/Continuation", &fields);
+        let s = cont_slots(&ctx, this);
+        cont_set_done(&ctx, this, s, false);
+        assert_eq!(
+            ctx.get_field(this, NEW15_CONT_STATE),
+            Value::Int(NEW15_CONT_STATE_RUNNING)
+        );
+        assert!(!cont_is_done(&ctx, this, s));
+        cont_set_done(&ctx, this, s, true);
+        assert_eq!(
+            ctx.get_field(this, NEW15_CONT_STATE),
+            Value::Int(NEW15_CONT_STATE_DONE)
+        );
+        assert!(cont_is_done(&ctx, this, s));
+    }
+
+    /// `getParallelism()` on a pool the native did not allocate. HotSpot
+    /// answers the pool's own `parallelism`; the synthetic index answered a
+    /// reference slot and fell back to 1.
+    #[test]
+    fn fjp_parallelism_resolves_to_the_real_int_field_not_termination() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let pool = instance_of(&mut ctx, "java/util/concurrent/ForkJoinPool", REAL_FJP_FIELDS);
+        // What real `ForkJoinPool(4)` bytecode leaves behind: parallelism at
+        // its own index, `termination` a null latch.
+        ctx.set_field(pool, 15, Value::Int(4));
+        ctx.set_field(pool, NEW15_FJP_PARALLELISM, Value::Object(None));
+
+        let s = fjp_slots(&ctx, pool);
+        assert_eq!(s.parallelism, 15);
+        assert_eq!(
+            s.active, None,
+            "the real class has no `active`; slot 1 is `saturate`, a Predicate"
+        );
+        assert_eq!(ctx.get_field(pool, s.parallelism), Value::Int(4));
+
+        // The old read, verbatim, against the same object.
+        let old = match ctx.get_field(pool, NEW15_FJP_PARALLELISM) {
+            Value::Int(i) => i,
+            _ => 1,
+        };
+        assert_eq!(
+            old, 1,
+            "slot 0 is `termination` — the old read could only ever answer its \
+             fallback here, which is the whole finding"
+        );
+    }
+
+    #[test]
+    fn fjp_slots_falls_back_to_the_synthetic_map_on_an_anonymous_class() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fields = anon_fields(NEW15_FJP_FIELDS);
+        let pool = instance_of(&mut ctx, "java/util/concurrent/ForkJoinPool", &fields);
+        let s = fjp_slots(&ctx, pool);
+        assert_eq!(s.parallelism, NEW15_FJP_PARALLELISM);
+        assert_eq!(s.active, Some(NEW15_FJP_ACTIVE));
+    }
+
+    /// Both published maps must name the class they are about, or
+    /// `verify_declared_slot_maps` sweeps them against the wrong one — the
+    /// `PB_FIELD_*` misattribution W7-69 §4.4 had to correct by hand.
+    #[test]
+    fn the_published_slot_maps_name_their_own_classes() {
+        assert_eq!(NEW15_CONT_SLOT_MAP.class, "jdk/internal/vm/Continuation");
+        assert_eq!(NEW15_CONT_SLOT_MAP.slots.len(), NEW15_CONT_FIELDS);
+        assert_eq!(
+            NEW15_FJP_SLOT_MAP.class,
+            "java/util/concurrent/ForkJoinPool"
+        );
+        assert_eq!(NEW15_FJP_SLOT_MAP.slots.len(), NEW15_FJP_FIELDS);
     }
 }
 
