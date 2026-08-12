@@ -1,19 +1,55 @@
 # W6-9 — `ForkJoinTask.complete(v)` erased the abnormal record, and
 # `completeExceptionally` was never registered at all
 
-Status: **fix written (unbuilt, unmeasured)**. Wave 6, lane W6-9. Takes the
-defect W6-7 found and declined ("live long-standing registrations, blast radius
-unmeasured").
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-**2026-08-11 — §7's four divergences are now addressed** (landed in source,
-unbuilt). Three are landed in
-`native-builtins/src/phases_late/concurrent.rs`
-(`register_forkjointask_w6_9_residual_bridge`): `getException()` on a cancelled
-task, `reinitialize()`, and the missing `RecursiveAction.complete(Object)`. The
-fourth — the `setRawResult` half of `complete(v)` on a cancelled task — and the
-three edits the first three imply outside that file are written out verbatim in
-§8, **not applied**. §7 now records the disposition of each rather than
-deferring it.
+> **§8 IS FULLY APPLIED. THE "not applied" IN ITS HEADING IS FALSE AND HAS
+> ALREADY COST TWO SEPARATE AGENT RUNS.** All four §8 patches landed in commit
+> `e643b5893` *fix(jdk-only): apply the four cross-file patches wave-1 lanes
+> could not reach*, **hours after this record was last edited**. Anyone handed
+> §8 as pending work is being handed work that is done. Checked twice
+> independently, 2026-08-12.
+
+* **Headline: CLOSED in source** (commit `b3aca74c8`). §3.1 `fjp_state_set_done`
+  no longer clears `thrown` (`native-builtins/src/phases_early.rs:8226`); §3.2
+  the shared `fjp_complete_body` with a virtual `setRawResult` for own-slot
+  receivers (`:8896`); §3.3 `completeExceptionally` registered on all three
+  classes and both boot paths (`phases_early.rs:9577`, `:9652`, `:9709`,
+  `:9947`) with both allow-list entries (`native-api/src/registry.rs:6071`,
+  `vm/src/runtime/interpreter/native_override.rs:1716`).
+* **Residual: CLOSED — all four of §7.** §7.1 `getException()` on a cancelled
+  task returns a fresh `CancellationException` — `849034341`, `fjt_get_exception`
+  at `native-builtins/src/phases_late/concurrent.rs:7404`, registered `:7478`.
+  §7.2 `reinitialize()` registered — `849034341` at `concurrent.rs:7447`/`:7485`,
+  made live in real-JDK mode by the two allow-list entries `e643b5893` added
+  (`native-api/src/registry.rs:6078`,
+  `vm/src/runtime/interpreter/native_override.rs:1721`). §7.3
+  `RecursiveAction.complete(Object)` registered — `849034341`,
+  `concurrent.rs:7492` inside `register_forkjointask_w6_9_residual_bridge`
+  (`:7458`). **§7.5 — whose heading said "NOT LANDED" — landed** in
+  `e643b5893`: `fjp_state_set_raw_result` at `phases_early.rs:8221`, called from
+  `fjp_complete_body` at `:8905` before `fjp_state_set_done`.
+* **Residual: CLOSED — §8.1 through §8.4, every one.** `fjp_state_set_raw_result`
+  + its call (`phases_early.rs:8221`, `:8905`); the shadowed `getException`
+  deleted from `register_real_jdk_forkjoin_essentials` (`phases_early.rs:9922` —
+  `grep '"getException"'` over that file now returns zero); the
+  `("reinitialize","()V")` allow-list entry (`native-api/src/registry.rs:6078`);
+  and `is_forkjoin_native_override`'s `reinitialize` arm
+  (`vm/src/runtime/interpreter/native_override.rs:1721`).
+* **Cannot adjudicate without a run — two, and one carries an explicit
+  instruction.** (1) §8.2 warned the `duplicate_registration_gate`'s
+  `shadowed <= BASELINE_SHADOWED` assertion would fire until 8.2 landed; 8.2 has
+  landed, but the gate's current numeric state is a build question:
+  `cargo test -p cratonvm-native-builtins --test duplicate_registration_gate`.
+  **This record explicitly says not to compute or re-seed that number without a
+  real run — honour that.** (2) The §6 and §7.4 falsifiers: build, then
+  `cratonvm --jdk-only -cp regression-suite/classes RJdkForkJoin` and
+  `--real-jdk`. Note the §6/§7.4 Java snippets are in **no** vector —
+  `regression-suite/src/RJdkForkJoin.java` mentions neither `reinitialize` nor
+  `CancellationException` — so a green `RJdkForkJoin` does not exercise them.
+
+Wave 6, lane W6-9. Takes the defect W6-7 found and declined ("live long-standing
+registrations, blast radius unmeasured").
 
 Predecessors: `W2-8-forkjointask-invoke-returns-computes-null.md`,
 `W3-4-forkjointask-status-flags-and-the-eager-default.md`,
@@ -394,7 +430,12 @@ second `invoke()` replayed the memoised 7 without running `compute()`; under
 `reinitialize` pair only discriminates once §8.3/§8.4 land — without them it is
 dropped in real-JDK mode, so a green there proves nothing about that mode.
 
-### 7.5 `complete(v)` on a cancelled task is still a full no-op — NOT LANDED
+### 7.5 `complete(v)` on a cancelled task is still a full no-op — ~~NOT LANDED~~ LANDED
+
+> **Reconciled 2026-08-12.** This landed in commit `e643b5893`:
+> `fjp_state_set_raw_result` at `native-builtins/src/phases_early.rs:8221`,
+> called from `fjp_complete_body` at `:8905` before `fjp_state_set_done`. The
+> heading is kept for findability.
 
 Recorded in §8 as an applied-by-someone-else patch, because the write belongs
 inside `fjp_complete_body` (`native-builtins/src/phases_early.rs`), outside this
@@ -426,7 +467,25 @@ slot IS the side table. A receiver with its own slot never had the bug —
 `fjp_complete_body` invokes the virtual `setRawResult` unconditionally, exactly
 like the real `complete`. `RecursiveAction` cannot have it (7.3).
 
-## 8. Out-of-file patch (not applied)
+## 8. Out-of-file patch — ~~(not applied)~~ FULLY APPLIED
+
+> **Reconciled 2026-08-12. Do not hand this section out as pending work.** All
+> four patches below landed in commit `e643b5893` *fix(jdk-only): apply the four
+> cross-file patches wave-1 lanes could not reach*, hours after this record was
+> last edited — and the heading was never updated, so §8 has since been issued
+> twice as work that was already done.
+>
+> | patch | landed | evidence |
+> |---|---|---|
+> | 8.1 `fjp_state_set_raw_result` + call from `fjp_complete_body` | `e643b5893` | `native-builtins/src/phases_early.rs:8221` (fn), `:8905` (call) |
+> | 8.2 delete the shadowed `getException` in `register_real_jdk_forkjoin_essentials` | `e643b5893` | `native-builtins/src/phases_early.rs:9922`; `grep '"getException"'` over that file returns zero |
+> | 8.3 allow-list `("reinitialize","()V")` | `e643b5893` | `native-api/src/registry.rs:6078` |
+> | 8.4 `is_forkjoin_native_override` `reinitialize` arm | `e643b5893` | `vm/src/runtime/interpreter/native_override.rs:1721` |
+>
+> Expected-count checks from the record all hold: `grep -c '"reinitialize"'`
+> gives 1 in `registry.rs`, 1 in `native_override.rs`, 1 in `concurrent.rs`
+> (`:7485`); `grep -c '"completeExceptionally"'` gives 1, 1, and 4
+> (`phases_early.rs:9577`, `:9652`, `:9709`, `:9947`).
 
 Four edits, none inside this lane's files. Ordered by what they unblock.
 

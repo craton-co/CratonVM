@@ -1,8 +1,55 @@
 # `Method.invoke` gave a PUBLIC method no module check at all
 
-**Status:** FIXED (this branch). The exact sibling of the `Constructor.newInstance`
-hole a wave-4 lane closed, which that lane found, named, and left alone because
-it was unmeasured.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED in source.** Commit `b3aca74c8` routed the public arm of
+  `native_method_invoke` through the `exports` gate:
+  `native-builtins/src/lang_class.rs:8590` (fn), with
+  `check_reflection_export_access_with_target_id` on **both** the non-public
+  (`:8810`) and public (`:8823`) arms. The exact sibling of the
+  `Constructor.newInstance` hole W4-2 closed, which that lane found, named, and
+  left alone because it was unmeasured.
+* **Residual: CLOSED — `Field.get` over-denying,** commit `dcfe77cb8`:
+  `enforce_module_check_on_field` (`lang_class.rs:1311`) now calls the export
+  helper on **one** arm (`:1337`). **This record's PRESCRIPTION for that row was
+  wrong even though the observation was right** — it asked for a widening
+  disjunct on the public arm, which would have traded an over-deny for an
+  under-deny (`Unsafe.INVALID_FIELD_OFFSET` must throw with no flags). What
+  landed instead **dissolved** the `is_public` split. The record says so itself
+  further down; it is repeated here because it is the canonical instance of this
+  failure mode in this directory.
+* **Residual: CLOSED — `Lookup.unreflect*`'s missing MODE check.** Commit
+  `3644142d5`, `lk_enforce_unreflect_access` at
+  `native-builtins/src/lang_invoke.rs:4452` plus six call sites, sharing
+  `lk_modes_required_for_member` (`:4337`) with the `find*` gate.
+* **Residual: CLOSED — the contradicted test.** `b3aca74c8` renamed and flipped
+  it: `vm/tests/new19_module_access.rs:345`
+  `new19_java_public_invoke_cross_module_without_exports_is_refused`. It is
+  still `#[ignore]`d, for an unrelated synthetic-JDK `getDeclaredMethods` gap
+  (`:332`).
+* **Residual: STILL OPEN — four, three deliberate and one a missing vector.**
+  1. `unreflectSetter` on a trusted-final field is unchecked. Only a comment
+     exists (`lang_invoke.rs:11189`); there is no `is_trusted_final` predicate
+     anywhere in the crate.
+  2. The **module/`exports`** half for `find*`/`unreflect*` is still absent by
+     design — neither gate calls any `check_reflection_*`.
+  3. `unreflectSpecial`'s `specialCaller != lookupClass()` conjunct is not
+     enforced; the reason is in source at `lang_invoke.rs:4385` and `:4430`.
+  4. **No vector asserts the POSITIVE.** `regression-suite/src/RJdkModule.java`
+     still carries only the `newInstance()` witness at `:172`; the
+     `internal.getMethod("greet").invoke(...)` assertion this record asks for
+     next to `:168` was never added. The headline fix is therefore
+     **unexercised** by the corpus.
+* **RETIREMENT-20260811.md is stale on this record.** Its kept-list reason —
+  *"`Field.get`/`Field.set` ask the `opens` question unconditionally … and the
+  whole `Lookup.unreflect*`/`find*` family has no module check of any kind"* — is
+  wrong in its first half (`dcfe77cb8`) and half-wrong in its second (the mode
+  check landed in `3644142d5`; only the module half remains, deliberately).
+* **Cannot adjudicate without a run:** `cratonvm --jdk-only -cp
+  regression-suite/classes RJdkStrict` (the java.base-exports detector,
+  `RJdkStrict.java:250-256`), with `RJdkJni`, `RJdkReflect`, `RReflect`,
+  `RFieldSiteCache` as unnamed-module controls; plus
+  `cargo test -p cratonvm-vm --test new19_module_access -- --ignored`.
 
 > **2026-08-11 — both surviving OPEN rows are closed. Nothing here is a work item.**
 >

@@ -1,8 +1,56 @@
 # `publicLookup()` reached a private method: `allowedModes` was never written, and never read
 
-**Status:** FIXED in source 2026-08-07 (lane W4-1, JDK-only wave 4). Not
-verified against a binary — see *How to verify*. **No out-of-file patch is
-required**; two optional hardening patches are listed at the end.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED in source** (2026-08-07, commit `256d119b4`). Half 1 —
+  `alloc_lookup_for` writes by name with a class-side witness,
+  `native-builtins/src/lookup_define.rs:268`, witness at `:335`/`:364`. Half 2 —
+  `lk_enforce_find_access` is the first statement of the ten `lookup_find_*`,
+  `native-builtins/src/lang_invoke.rs:4232`; `Lookup.in` mode computation at
+  `:4584`, `lookup_require_field` at `:5228`.
+* **Residual: CLOSED — all four the 2026-08-11 block names, plus the two
+  "optional hardening patches".** `unreflect` is gated —
+  `lk_enforce_unreflect_access` (`lang_invoke.rs:4452`) called first at all six
+  sites (`:11033`, `:11079`, `:11149`, `:11193`, `:11234`, `:11389`), commit
+  `3644142d5`. `UNCONDITIONAL`'s class half — `fd86485c6`,
+  `lang_invoke.rs:4283-4292`. A zero-mode `Lookup` is refused and `Some(0)` is
+  separated from "unreadable" — `6dd552ce2`, `lk_read_allowed_modes_opt` at
+  `lang_invoke.rs:4110`, refusal at `:4258`. `Lookup.in` rejects primitive/array
+  targets — `680699467`. The two hardening patches landed on **2026-08-07** in
+  commit `dcfe77cb8`: `lk_drop_lookup_mode` at
+  `native-builtins/src/classloader.rs:9571` (carrying the exact "See `lk_in_method`
+  for why this must not read `LK_ALLOWED_MODES` raw" comment) and `lk_in_method`
+  at `:9543`.
+  **RETIREMENT-20260811.md is WRONG on this record** — its kept-list reason,
+  *"two optional hardening patches … that are still unapplied"*, was already
+  false four days before that audit ran. This page's own 2026-08-11 block is the
+  correct one.
+* **Residual: STILL OPEN — one, and it is a deletion, not a behaviour change.**
+  The `## Out-of-file patch (not applied)` below is genuinely unapplied. The dead
+  block in `native-builtins/src/classloader.rs` survives: `lk_public_lookup`
+  (`:8436`), `enforce_lookup_access` (`:9151`), `lk_find_virtual` (`:9216`),
+  `lk_find_static` (`:9236`) and siblings — and, worse, **four unit tests still
+  aim at the dead function** (`classloader.rs:13004`, `:13028`
+  `lk_find_virtual_private_method_with_public_lookup_throws`, `:13110`), so they
+  assert nothing about the code that actually runs. Zero behaviour change; a
+  cleanliness item and a trap. Re-grepped 2026-08-12.
+* **Deliberate, not pending** — three refusals with reasons in source:
+  `UNCONDITIONAL`'s "unconditionally exported package" half is one-directional
+  because there is no module graph to ask (`lang_invoke.rs:4277-4281`); and
+  nestmate / `protected`-receiver / module-`exports` checks are outside
+  `lk_enforce_find_access` by design.
+* **Two of this page's own claims are wrong and are struck below — do not
+  "simplify" on them.** The layout-discriminator rationale (that
+  `get_field_by_name` returns `Int(0)` for an absent field) is false for the
+  production path; the code is correct only because of W6-3's class-side witness
+  at `lookup_define.rs:335`. And "`allowedModes == 0` → allow" is superseded by
+  `6dd552ce2`.
+* **Cannot adjudicate without a run:** `CRATONVM_MH_STRICT_INVOKEEXACT=1
+  target/release/cratonvm --java-home "$JDK25" --jdk-only -cp
+  regression-suite/classes RJdkHandles`, and the same with `--real-jdk`;
+  expect `PASS RJdkHandles (51 checks)`. Note
+  W7-11-strict-baseline-remeasured.md reports the strict suite at 68/0, which
+  covers `RJdkHandles`.
 
 > **2026-08-11 — the residuals are closed, and two of this page's claims were
 > wrong.** Nothing below is a work item.

@@ -1,5 +1,37 @@
 # W4-2 — instantiating a class in a non-exported package was not refused
 
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md; this record
+previously had no status line at all):**
+
+* **Headline: CLOSED, and now verified.** The `exports` gate is on the
+  `ctor_is_public` arm of `native_constructor_new_instance` — commit `256d119b4`,
+  `native-builtins/src/lang_class.rs:11184`, helper at `:1154`. Binary
+  verification, taken 2026-08-12 on the dev binary at `ba65f1a19`: `RJdkModule`
+  runs 44 of 44 in **both** `--jdk-only` and `--real-jdk`.
+* **Residual: CLOSED — the `Method.invoke` sibling.** The identical hole this
+  record named is fixed on both arms: commit `b3aca74c8`,
+  `native-builtins/src/lang_class.rs:8810` and `:8823`. Full write-up:
+  W6-8-method-invoke-exports-gate.md.
+* **Residual: CLOSED — `ServiceLoader` + a module-path provider.** Commit
+  `b3aca74c8`, `grant_reflective_override` at
+  `native-builtins/src/service_loader.rs:1564`, applied at `:1923`, `:2038`,
+  `:2409`, `:2465`.
+* **Residual: adjudicated NOT A DEFECT.** `is_package_exported_to` failing closed
+  for an unregistered target module is unreachable; the record's three-writer
+  argument stands, writer 3 confirmed live at
+  `classloading/src/class_manager.rs:9568`. No source change, and none wanted.
+* **Residual: STILL OPEN — one, the "found on the way, NOT fixed" row.** Array
+  classes report the wrong module. `synthesize_array_class_for_loader`
+  (`classloading/src/class_manager.rs:9328`) writes
+  `module_name: Some("java.base".to_string())` unconditionally at `:9568`,
+  regardless of component type, so `MyApp[].class.getModule()` still answers
+  `java.base`. Re-grepped 2026-08-12. **This is the only live item in the
+  record**, and RETIREMENT-20260811.md does not mention it — that audit kept
+  W4-2 for two reasons that are both wrong (the `ServiceLoader` interaction
+  landed in `b3aca74c8`; `is_package_exported_to` is unreachable).
+* The record's own `### Out-of-file patch (not applied)` section reads "None."
+  and is accurate.
+
 `regression-suite/src/RJdkModule.java:172`, failing in **both** `--real-jdk`
 and `--jdk-only` on the wave-3 build; HotSpot 25 passes all 44 checks.
 
