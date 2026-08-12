@@ -232,8 +232,16 @@ calls `ensure_class_initialized` further down, and never pinned `args[0]`).
 
 The rule is **mode bits only**:
 
-* `allowedModes == 0` → allow. A Lookup nobody populated, or one whose modes
-  we cannot read. This is the pre-fix behaviour, kept as the valve.
+* ~~`allowedModes == 0` → allow. A Lookup nobody populated, or one whose modes
+  we cannot read. This is the pre-fix behaviour, kept as the valve.~~
+  **STRUCK — SUPERSEDED, DO NOT RE-IMPLEMENT. Reconciled 2026-08-12.** This is
+  the second of the two claims the status block says are struck below; it was
+  the one that had not actually been struck. A genuine zero-mode `Lookup` is now
+  REFUSED every member, public ones included, since commit `6dd552ce2`:
+  `lk_read_allowed_modes_opt` (`native-builtins/src/lang_invoke.rs:4110`) keeps
+  `Some(0)` apart from "could not read the field", and the refusal is at `:4258`.
+  Only the *unreadable* case still allows. Detail in the *Residual* section
+  below and in W7-55-record-reconciliation.md §2.4.
 * `allowedModes & PRIVATE != 0` → allow, short-circuiting before the
   allocating `declared_methods` walk. Covers `MethodHandles.lookup()` (0x5F),
   `privateLookupIn` (0x1F) and the JDK's `TRUSTED` lookup (-1).

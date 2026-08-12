@@ -227,6 +227,19 @@ all of which ask for `SHA1PRNG`. H2's `TestAll` — the app that motivated the
 
 ## Out of scope (files this lane does not own)
 
+> **SUPERSEDED FRAMING — DO NOT APPLY AS WRITTEN. Reconciled 2026-08-12.** The
+> section below names the discarded constructor seed as the defect. It is not:
+> `new SecureRandom(seed)` selects DRBG on HotSpot, and DRBG's `engineSetSeed`
+> *reseeds* rather than replaces, so the discard **matches** the oracle — the
+> measurement is under *Verdict 2* further down this record. Acting on the
+> paragraph below alone deletes the wrong row and leaves the real defect in
+> place. The live prescription is the *Out-of-file patch* at the foot of this
+> record: delete the two `setSeed` no-ops, whose bodies undo `securerandom.rs`'s
+> SHA1PRNG **reseeding** — the one replay guarantee the JDK gives a
+> `SecureRandom` — together with the constructor row. Index entry:
+> W7-55-record-reconciliation.md §2.4. Kept below unedited because its
+> registration facts are still accurate; only its verdict is not.
+
 `native-builtins/src/crypto_impl.rs:1377` registers `SecureRandom.<init>([B)V`
 to `native_secure_random_init_seed_bytes`, a pure no-op that records neither
 `algorithm` nor `provider`. In synthetic-jdk mode that registration wins over
