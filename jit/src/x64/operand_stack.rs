@@ -539,7 +539,8 @@ impl Compiler {
         // with enough stack-passed args) would have encoded as a NEGATIVE
         // disp8 and read the callee's own frame instead of the caller's.
         let Ok(d) = Disp::encode_for_base(positive_disp as i64, RBP) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("caller-arg-displacement-unencodable");
             return;
         };
         self.rex_w_r(reg);

@@ -9981,7 +9981,7 @@ impl Compiler {
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
                         }
-                        self.buf.mark_overflowed();
+                        self.buf.mark_codegen_unencodable("unresumable-indy-trap");
                     }
 
                     let patch = self.emit_jmp_rel32_patch();
