@@ -309,7 +309,8 @@ population has a hole in exactly the place nobody is looking.
 
 Each also asserts a minimum row count **before** looping, because the seed map
 is process-global and a `reset_service_state_for_tests` race would otherwise
-leave the loop iterating nothing and passing. See `INDEX_vacuous_greens`.
+leave the loop iterating nothing and passing. W6-5-vacuous-tests.md is the
+campaign's catalogue of that failure mode.
 
 ## 7. The instrument
 

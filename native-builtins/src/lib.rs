@@ -35902,12 +35902,15 @@ pub(crate) fn real_md2(data: &[u8]) -> Vec<u8> {
             x[32 + j] = x[16 + j] ^ x[j];
         }
         let mut t: u8 = 0;
-        for j in 0..18u16 {
+        for j in 0..18u8 {
             for k in 0..48 {
                 x[k] ^= MD2_PI[t as usize];
                 t = x[k];
             }
-            t = t.wrapping_add(j as u8);
+            // `t + j` mod 256. `j` never exceeds 17 so this cannot overflow in
+            // practice, but the RFC's arithmetic IS mod 256 and `wrapping_add`
+            // says so rather than relying on that.
+            t = t.wrapping_add(j);
         }
     }
 
