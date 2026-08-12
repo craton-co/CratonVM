@@ -1,10 +1,19 @@
 # The process cluster re-run: two inherited records were discharged, one was live, and the sweep they licensed found three more
 
-**Status:** SOURCE-ONLY, UNBUILT. Lane W7-46, 2026-08-12, worktree
-`CratonVM-procnat-20260812`, branch `fix/processimpl-natives-and-checks-20260812`.
-Nothing below has been compiled or run in this lane. Every claim is either a
-`javap` census against the JDK 25.0.3 Windows image on this host, or provable by
-reading the code; the two that are neither are named as unproven.
+**Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,
+2026-08-12, worktree `CratonVM-procnat-20260812`, branch
+`fix/processimpl-natives-and-checks-20260812`.
+
+Every Rust claim is either a `javap` census against the JDK 25.0.3 Windows image
+on this host, or provable by reading the code; the ones that are neither are
+named as unproven at the point they are made, and no speedup is claimed anywhere.
+
+**One thing WAS executed, and it earned its place:** the modified
+`RJdkProcess.java` was compiled and run against real HotSpot 25 — the oracle,
+which needs no CratonVM build. That is what seeded `EXPECTED_CHECKS` from a
+measurement instead of a hand-count, and it is also what caught this lane's own
+first attempt at the `descendants()` check being unsound (§3). A fixture change
+is testable on the oracle alone; not doing so is a habit worth losing.
 
 **Files changed:** `native-io/src/process.rs`,
 `regression-suite/src/RJdkProcess.java`.
