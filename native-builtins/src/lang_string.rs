@@ -5008,11 +5008,463 @@ pub(crate) fn native_string_transform(
     )
 }
 
+// ---------------------------------------------------------------------------
+// java.util.Formatter's NEGATIVE surface: the refusals, and the flags that
+// change a value rather than decorate it.
+// ---------------------------------------------------------------------------
+//
+// `probes/ShadowDifferentialProbe` measured five refusals against HotSpot 25
+// on 2026-08-12 and CratonVM answered `no-throw` to every one of them
+// (`docs/known-issues/jdk-only/W7-32-round-2-differential-run.md`). A
+// formatter that never refuses is the shape W2-7 named: the negative half of
+// the API answering "here you go".
+//
+// The type matters as much as the throw. `java.util.Formatter` specifies a
+// DISTINCT `IllegalFormatException` subclass per failure, and callers catch
+// the subclass — a mistyped refusal walks past the `catch` that was written
+// for it and lands in one that was not. So each fault below carries the
+// class the javadoc names, and is constructed through that class's REAL
+// constructor rather than by allocating a Throwable and stuffing a message
+// into slot 0: all six override `getMessage()` and never set
+// `Throwable.detailMessage` (the same trap that kept
+// `java/util/regex/PatternSyntaxException` out of the synthetic-exception
+// bridge list in `lib.rs`).
+
+/// A `java.util.Formatter` refusal, as the class the javadoc names for it.
+///
+/// Every variant's payload is exactly its JDK constructor's arguments, so
+/// [`fmt_raise`] is a straight translation with no message reconstruction.
+enum FmtFault {
+    /// `%q` — "Conversion = 'q'". The conversion character is not one the
+    /// javadoc's table defines.
+    UnknownConversion(String),
+    /// `%s %s` with one argument — "Format specifier '%s'". Carries the
+    /// specifier's own text, which is what the JDK's message quotes.
+    MissingArgument(String),
+    /// `%d` of a String — "d != java.lang.String". Carries the conversion
+    /// character and the argument's class.
+    WrongType(char, cratonvm_types::ClassId),
+    /// `%-08d` — "Flags = '-0'". Two flags that contradict each other; the
+    /// message lists the specifier's WHOLE flag set.
+    IllegalFlags(String),
+    /// `%,x` — "Conversion = x, Flags = ,". A flag that is legal in general
+    /// but not for this conversion; the message lists only the OFFENDING
+    /// flags.
+    FlagsMismatch(String, char),
+    /// `%.2d` — "2". A precision on a conversion that has no fractional part.
+    IllegalPrecision(i32),
+    /// `%5n` — "5". A width on a conversion that has no field to justify in.
+    IllegalWidth(i32),
+    /// `%-d` — "%-d". `'-'` and `'0'` are relative to a field width, so they
+    /// are meaningless without one; the message is the specifier's own text.
+    MissingWidth(String),
+    /// `%--8d` — "Flags = '-'". The same flag given twice.
+    DuplicateFlags(String),
+}
+
+impl FmtFault {
+    /// The class the javadoc names, and its constructor.
+    fn class_and_ctor(&self) -> (&'static str, &'static str) {
+        match self {
+            FmtFault::UnknownConversion(_) => (
+                "java/util/UnknownFormatConversionException",
+                "(Ljava/lang/String;)V",
+            ),
+            FmtFault::MissingArgument(_) => (
+                "java/util/MissingFormatArgumentException",
+                "(Ljava/lang/String;)V",
+            ),
+            FmtFault::WrongType(..) => (
+                "java/util/IllegalFormatConversionException",
+                "(CLjava/lang/Class;)V",
+            ),
+            FmtFault::IllegalFlags(_) => (
+                "java/util/IllegalFormatFlagsException",
+                "(Ljava/lang/String;)V",
+            ),
+            FmtFault::FlagsMismatch(..) => (
+                "java/util/FormatFlagsConversionMismatchException",
+                "(Ljava/lang/String;C)V",
+            ),
+            FmtFault::IllegalPrecision(_) => ("java/util/IllegalFormatPrecisionException", "(I)V"),
+            FmtFault::IllegalWidth(_) => ("java/util/IllegalFormatWidthException", "(I)V"),
+            FmtFault::MissingWidth(_) => (
+                "java/util/MissingFormatWidthException",
+                "(Ljava/lang/String;)V",
+            ),
+            FmtFault::DuplicateFlags(_) => (
+                "java/util/DuplicateFormatFlagsException",
+                "(Ljava/lang/String;)V",
+            ),
+        }
+    }
+
+    /// The message the JDK's overridden `getMessage()` would build. Used ONLY
+    /// by the fallback below, where the specified class could not be
+    /// constructed — the real objects build it themselves.
+    fn message(&self, ctx: &dyn NativeContext) -> String {
+        match self {
+            FmtFault::UnknownConversion(s) => format!("Conversion = '{s}'"),
+            FmtFault::MissingArgument(s) => format!("Format specifier '{s}'"),
+            FmtFault::WrongType(c, cid) => format!(
+                "{c} != {}",
+                ctx.class_name_of_id(*cid).unwrap_or_default().replace('/', ".")
+            ),
+            FmtFault::IllegalFlags(f) => format!("Flags = '{f}'"),
+            FmtFault::FlagsMismatch(f, c) => format!("Conversion = {c}, Flags = {f}"),
+            FmtFault::IllegalPrecision(p) | FmtFault::IllegalWidth(p) => p.to_string(),
+            FmtFault::MissingWidth(s) => s.clone(),
+            FmtFault::DuplicateFlags(f) => format!("Flags = '{f}'"),
+        }
+    }
+}
+
+/// Turn a [`FmtFault`] into the thrown Java exception.
+///
+/// Constructed through the class's real `<init>` because all six override
+/// `getMessage()` off their own fields — allocating the class and setting a
+/// `detailMessage` would produce an object whose `getMessage()` is still null.
+///
+/// The fallback is `IllegalArgumentException`, which is the SUPERCLASS of
+/// `IllegalFormatException` and therefore never sends a caller down a `catch`
+/// branch it did not ask for; it is reached only when the specified class is
+/// genuinely absent (a `--synthetic-jdk` build with no `java.util.Formatter`
+/// exception hierarchy), never to make a diff go away.
+fn fmt_raise(ctx: &mut dyn NativeContext, fault: &FmtFault) -> MethodCallFailed {
+    let (class_name, ctor) = fault.class_and_ctor();
+    if ctx.class_id_by_name(class_name).is_some() {
+        let ctor_args: Vec<Value> = match fault {
+            FmtFault::UnknownConversion(s)
+            | FmtFault::MissingArgument(s)
+            | FmtFault::IllegalFlags(s)
+            | FmtFault::MissingWidth(s)
+            | FmtFault::DuplicateFlags(s) => {
+                let obj = ctx.create_string(s);
+                vec![Value::Object(Some(obj))]
+            }
+            FmtFault::WrongType(c, cid) => {
+                let mirror = ctx.get_class_mirror(*cid);
+                vec![Value::Int(*c as i32), Value::Object(Some(mirror))]
+            }
+            FmtFault::FlagsMismatch(f, c) => {
+                let obj = ctx.create_string(f);
+                vec![Value::Object(Some(obj)), Value::Int(*c as i32)]
+            }
+            FmtFault::IllegalPrecision(p) | FmtFault::IllegalWidth(p) => vec![Value::Int(*p)],
+        };
+        match ctx.new_object_initialized(class_name, ctor, &ctor_args) {
+            Ok(Some(Value::Object(Some(exc)))) => return MethodCallFailed::ExceptionThrown(exc),
+            // A failure INSIDE the constructor is already a thrown exception;
+            // propagating it beats masking it with a fabricated one.
+            Err(err) => return err,
+            Ok(_) => {}
+        }
+    }
+    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+        message: fault.message(ctx),
+    }
+    .into()
+}
+
+/// The flag characters `java.util.Formatter` accepts, in `Flags.toString`'s
+/// canonical order — which is the order every flag-bearing message lists them
+/// in, regardless of the order they were written in the format string
+/// (`%+ d` reports "Flags = '+ '", `%-08d` reports "Flags = '-0'").
+const FMT_FLAG_ORDER: &str = "-#+ 0,(<";
+
+/// Render a flag set in `Flags.toString`'s canonical order.
+fn fmt_flags_string(flags: &str) -> String {
+    FMT_FLAG_ORDER
+        .chars()
+        .filter(|f| flags.contains(*f))
+        .collect()
+}
+
+/// Rebuild a specifier's own text, which is what `FormatSpecifier.toString`
+/// produces and what the `MissingFormatArgument` / `MissingFormatWidth`
+/// messages quote.
+fn fmt_spec_text(
+    explicit_index: Option<usize>,
+    flags: &str,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conversion: char,
+) -> String {
+    // `FormatSpecifier.toString` writes the FLAGS before the argument index,
+    // and writes them in `Flags.toString`'s canonical order rather than the
+    // order they were typed — `%#-s` reports itself as `%-#s`. The '<' flag
+    // is one of them, so it survives here as written.
+    let mut s = String::from("%");
+    s.push_str(&fmt_flags_string(flags));
+    if let Some(i) = explicit_index {
+        s.push_str(&format!("{}$", i + 1));
+    }
+    if let Some(w) = width {
+        s.push_str(&w.to_string());
+    }
+    if let Some(p) = precision {
+        s.push('.');
+        s.push_str(&p.to_string());
+    }
+    s.push(conversion);
+    s
+}
+
+/// `java.util.Formatter`'s `checkGeneral`/`checkCharacter`/`checkInteger`/
+/// `checkFloat`/`checkNumeric`, in their JDK order — the order decides WHICH
+/// exception a doubly-illegal specifier gets.
+///
+/// The rules are the javadoc's, quoted where they are not obvious:
+///
+/// * numeric conversions — "If the `'-'` or `'0'` flags are given, then the
+///   width is required" and `'+'` with `' '`, or `'-'` with `'0'`, is
+///   "an illegal combination of flags".
+/// * `'d'` — "If the `'#'` flag is given then a
+///   FormatFlagsConversionMismatchException will be thrown."
+/// * `'o'`/`'x'`/`'X'` — likewise for `','`, and (from `print(long, Locale)`)
+///   for `'('`, `' '` and `'+'`, none of which a two's-complement rendering
+///   has anywhere to put.
+/// * every integral conversion — "If a precision is provided then an
+///   IllegalFormatPrecisionException will be thrown", and the same for
+///   `'c'`/`'C'`.
+/// * `'e'`/`'E'` — grouping is a mismatch; `'a'`/`'A'` — grouping and
+///   parentheses both are; `'g'`/`'G'` — `'#'` is.
+fn fmt_check_spec(
+    explicit_index: Option<usize>,
+    flags: &str,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conversion: char,
+) -> Result<(), FmtFault> {
+    let spec_text = || fmt_spec_text(explicit_index, flags, width, precision, conversion);
+    let mismatch = |bad: &str| {
+        let offending: String = fmt_flags_string(flags)
+            .chars()
+            .filter(|c| bad.contains(*c))
+            .collect();
+        if offending.is_empty() {
+            Ok(())
+        } else {
+            // `failMismatch` reports the LOWER-case conversion, because
+            // `Conversion.isValid` folds `%X`/`%E`/`%S` down to `x`/`e`/`s`
+            // and keeps the upper-casing in a separate internal flag. Only
+            // `UnknownFormatConversionException` sees the character as typed,
+            // since an unknown one is never folded — `%Q` really does say
+            // "Conversion = 'Q'".
+            Err(FmtFault::FlagsMismatch(
+                offending,
+                conversion.to_ascii_lowercase(),
+            ))
+        }
+    };
+    // `IllegalFormatFlagsException` reports `Flags.toString(flags)` over the
+    // WHOLE set, and that set carries the JDK's INTERNAL `UPPERCASE` flag —
+    // added by `Conversion.isValid` for every upper-case conversion and
+    // rendered as `'^'`, between `'-'` and `'#'`. So `%+ X` says
+    // "Flags = '^+ '" where `%+ x` says "Flags = '+ '". `FormatSpecifier`'s
+    // own `toString` explicitly REMOVES it again, which is why `spec_text`
+    // does not carry it.
+    let all_flags = || {
+        let mut s = fmt_flags_string(flags);
+        if conversion.is_ascii_uppercase() {
+            s.insert(usize::from(s.starts_with('-')), '^');
+        }
+        s
+    };
+    // `checkNumeric`, shared by the integral and float families.
+    let check_numeric = || -> Result<(), FmtFault> {
+        if width.is_none() && (flags.contains('-') || flags.contains('0')) {
+            return Err(FmtFault::MissingWidth(spec_text()));
+        }
+        if (flags.contains('+') && flags.contains(' '))
+            || (flags.contains('-') && flags.contains('0'))
+        {
+            return Err(FmtFault::IllegalFlags(all_flags()));
+        }
+        Ok(())
+    };
+
+    match conversion {
+        // General: 'b'/'B' 'h'/'H' 's'/'S'. `'#'` is a mismatch for all of
+        // them here — the JDK admits it only for a `Formattable` argument,
+        // which this native never dispatches to.
+        'b' | 'B' | 'h' | 'H' | 's' | 'S' => {
+            // `checkGeneral` rejects '#' up front for 'b'/'h' only; for
+            // 's' the JDK gets there later, inside `print(Object)`, which is
+            // why `%#-s` reports the MISSING WIDTH and `%#-b` reports the
+            // flag mismatch. Order is the whole of the difference.
+            if matches!(conversion, 'b' | 'B' | 'h' | 'H') {
+                mismatch("#")?;
+            }
+            if width.is_none() && flags.contains('-') {
+                return Err(FmtFault::MissingWidth(spec_text()));
+            }
+            mismatch("+ 0,(")?;
+            mismatch("#")?;
+        }
+        'c' | 'C' => {
+            if let Some(p) = precision {
+                return Err(FmtFault::IllegalPrecision(p as i32));
+            }
+            mismatch("#+ 0,(")?;
+            if width.is_none() && flags.contains('-') {
+                return Err(FmtFault::MissingWidth(spec_text()));
+            }
+        }
+        'd' | 'o' | 'x' | 'X' => {
+            check_numeric()?;
+            if let Some(p) = precision {
+                return Err(FmtFault::IllegalPrecision(p as i32));
+            }
+            if conversion == 'd' {
+                mismatch("#")?;
+            } else {
+                mismatch(",")?;
+                // `print(long, Locale)`'s own check, after `checkInteger`.
+                mismatch("( +")?;
+            }
+        }
+        'e' | 'E' | 'f' | 'g' | 'G' | 'a' | 'A' => {
+            check_numeric()?;
+            match conversion {
+                'a' | 'A' => mismatch("(,")?,
+                'e' | 'E' => mismatch(",")?,
+                'g' | 'G' => mismatch("#")?,
+                _ => {}
+            }
+        }
+        other => return Err(FmtFault::UnknownConversion(other.to_string())),
+    }
+    Ok(())
+}
+
+/// The three `java.text.DecimalFormatSymbols` characters
+/// `java.util.Formatter` localizes a magnitude with.
+///
+/// The JDK's own `getZero`/`getDecimalSeparator`/`getGroupingSeparator`
+/// helpers read exactly these three off
+/// `DecimalFormatSymbols.getInstance(locale)`, and answer `'0'`/`'.'`/`','`
+/// for a null locale.
+#[derive(Clone, Copy)]
+struct FmtSymbols {
+    grouping: char,
+    decimal: char,
+    zero: char,
+}
+
+impl Default for FmtSymbols {
+    fn default() -> Self {
+        FmtSymbols {
+            grouping: ',',
+            decimal: '.',
+            zero: '0',
+        }
+    }
+}
+
+thread_local! {
+    /// Re-entrancy latch for [`fmt_symbols_for`].
+    ///
+    /// Resolving symbols runs real JDK bytecode (resource bundles, locale
+    /// providers) which is free to call `String.format(Locale, …)` itself. It
+    /// would then re-enter this native and ask for symbols again, on a locale
+    /// whose symbols are still mid-construction. While the latch is set the
+    /// inner call takes the root defaults, which is the same answer the JDK's
+    /// own null-locale branch gives and cannot recurse.
+    static FMT_SYMBOLS_RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read a `java.util.Locale`'s formatting symbols, or the root defaults for a
+/// null locale.
+///
+/// Goes through `DecimalFormatSymbols.getInstance(Locale)` rather than a
+/// hard-coded table because that is what `java.util.Formatter` does, and
+/// because the separators are not guessable: France's grouping separator is
+/// U+202F NARROW NO-BREAK SPACE, not U+0020 — measured on HotSpot 25, and
+/// CratonVM's own `DecimalFormatSymbols` was measured to answer the identical
+/// three characters for ROOT/US/GERMANY/FRANCE, so this reads a real value
+/// rather than reproducing one.
+fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: Option<cratonvm_types::ObjectRef>) -> FmtSymbols {
+    let locale = match locale {
+        Some(l) => l,
+        None => return FmtSymbols::default(),
+    };
+    if FMT_SYMBOLS_RESOLVING.with(std::cell::Cell::get) {
+        return FmtSymbols::default();
+    }
+    FMT_SYMBOLS_RESOLVING.with(|f| f.set(true));
+    let resolved = (|| {
+        let dfs = match ctx.invoke(
+            "java/text/DecimalFormatSymbols",
+            "getInstance",
+            "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
+            &[Value::Object(Some(locale))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let read = |ctx: &mut dyn NativeContext, name: &str, fallback: char| -> char {
+            match ctx.invoke_virtual(dfs, name, "()C", &[]) {
+                Ok(Some(Value::Int(c))) => char::from_u32(c as u32).unwrap_or(fallback),
+                _ => fallback,
+            }
+        };
+        Some(FmtSymbols {
+            grouping: read(ctx, "getGroupingSeparator", ','),
+            decimal: read(ctx, "getDecimalSeparator", '.'),
+            zero: read(ctx, "getZeroDigit", '0'),
+        })
+    })();
+    FMT_SYMBOLS_RESOLVING.with(|f| f.set(false));
+    resolved.unwrap_or_default()
+}
+
+/// Rewrite an ASCII numeric body into the locale's digits and separators.
+///
+/// Runs LAST, after grouping, signs and width padding, so everything upstream
+/// keeps working in ASCII where a byte length and a character count agree —
+/// U+202F is three UTF-8 bytes, and a width pad computed over it would be
+/// short by two. The substitution is one character for one, so the padded
+/// character count survives it unchanged.
+///
+/// Applied only to the conversions the JDK localizes (`%d %f %e %g`): `%x`,
+/// `%o` and `%a` are documented as "No localization is applied", and a `%s`
+/// argument's own digits are the caller's text, not a magnitude.
+fn fmt_localize(s: &str, sym: FmtSymbols) -> String {
+    if sym.grouping == ',' && sym.decimal == '.' && sym.zero == '0' {
+        return s.to_string();
+    }
+    let shift = sym.zero as u32 - '0' as u32;
+    s.chars()
+        .map(|c| match c {
+            ',' => sym.grouping,
+            '.' => sym.decimal,
+            '0'..='9' => char::from_u32(c as u32 + shift).unwrap_or(c),
+            other => other,
+        })
+        .collect()
+}
+
 // --- String.format (basic %s/%d/%f support) ---
 
 pub(crate) fn native_string_format(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+) -> MethodCallResult {
+    format_impl(ctx, args, None)
+}
+
+/// The body of every `String.format` / `Formatter.format` overload.
+///
+/// `locale` is the `java.util.Locale` an explicit-locale overload was given,
+/// or `None` for the overloads that have none. It is resolved to
+/// [`FmtSymbols`] LAZILY, at the first conversion that actually localizes, so
+/// the very common `String.format(Locale.ROOT, "%s", x)` pays nothing for a
+/// locale it never consults.
+fn format_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    locale: Option<cratonvm_types::ObjectRef>,
 ) -> MethodCallResult {
     // Static: args[0] = format String, args[1] = Object[] array
     let fmt_obj = match args.first() {
@@ -5033,6 +5485,7 @@ pub(crate) fn native_string_format(
     };
 
     let arr_len = arr_ref.map_or(0, |a| ctx.array_length(a));
+    let mut symbols: Option<FmtSymbols> = None;
 
     // Format string parser supporting flags, width, precision:
     // %[flags][width][.precision]conversion
@@ -5047,18 +5500,18 @@ pub(crate) fn native_string_format(
     while i < chars.len() {
         if chars[i] == '%' {
             // A '%' that is the final character of the format string is a
-            // truncated conversion — real java.util.Formatter throws an
-            // UnknownFormatConversionException (an IllegalFormatException,
-            // which extends IllegalArgumentException).
+            // truncated conversion. The JDK's specifier regex simply fails to
+            // match and it reports the character that FOLLOWS the '%' — or the
+            // '%' itself when there is none, which is why `String.format("abc%")`
+            // says "Conversion = '%'" rather than naming the whole tail.
             if i + 1 >= chars.len() {
-                return Err(
-                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                        message: "Format string ends with a lone '%'".to_string(),
-                    }
-                    .into(),
-                );
+                return Err(fmt_raise(ctx, &FmtFault::UnknownConversion("%".to_string())));
             }
             i += 1;
+            // Held for the truncated-specifier report below, which names this
+            // character however much of the specifier was consumed afterwards
+            // (`%5` reports '5', `%1$` reports '1').
+            let first_after_pct = chars[i];
             // Check for %% and %n first
             if chars[i] == '%' {
                 result.push('%');
@@ -5109,8 +5562,19 @@ pub(crate) fn native_string_format(
             // Every chars[i] read below is guarded by `i < chars.len()` via
             // chars.get(i) — a format specifier that runs off the end of the
             // string must throw, not panic.
+            //
+            // `Flags.parse` refuses a repeated flag ("If a flag is given more
+            // than once ... a DuplicateFormatFlagsException will be thrown"),
+            // which is checked here at parse time — before any conversion
+            // character is even known — exactly as the JDK does.
             let mut flags = String::new();
             while chars.get(i).is_some_and(|c| "-+0 #(,<".contains(*c)) {
+                if flags.contains(chars[i]) {
+                    return Err(fmt_raise(
+                        ctx,
+                        &FmtFault::DuplicateFlags(chars[i].to_string()),
+                    ));
+                }
                 flags.push(chars[i]);
                 i += 1;
             }
@@ -5166,14 +5630,62 @@ pub(crate) fn native_string_format(
                             cur
                         };
                         last_used_index = Some(use_idx);
-                        if use_idx < arr_len {
-                            if let Some(a) = arr_ref {
-                                let elem = ctx.get_array_element(a, use_idx);
-                                let text =
-                                    format_arg_full(ctx, &elem, spec, &flags, width, precision)?;
-                                result.push_str(&text);
-                            }
+                        // Flag/width/precision legality is decided BEFORE the
+                        // argument is fetched, as it is in the JDK — the
+                        // `FormatSpecifier` constructor runs every `check*`
+                        // before `format` ever sees a value. So `%.2d` refuses
+                        // even when no argument was supplied.
+                        if let Err(fault) =
+                            fmt_check_spec(explicit_index, &flags, width, precision, spec)
+                        {
+                            return Err(fmt_raise(ctx, &fault));
                         }
+                        // "If there are fewer arguments than format specifiers,
+                        // the argument index is out of range ... a
+                        // MissingFormatArgumentException is thrown." Answering
+                        // the empty string instead let a caller's own
+                        // arity-guard `catch` never fire, and silently shifted
+                        // every later conversion's argument.
+                        //
+                        // A NULL varargs array is not the same thing: the JDK's
+                        // `format` loop guards the range check with `args !=
+                        // null` and then passes `null` for every conversion, so
+                        // `String.format("%s", (Object[]) null)` is "null" and
+                        // not a refusal.
+                        let arg = match arr_ref {
+                            None => Value::Object(None),
+                            Some(a) if use_idx < arr_len => ctx.get_array_element(a, use_idx),
+                            Some(_) => {
+                                return Err(fmt_raise(
+                                    ctx,
+                                    &FmtFault::MissingArgument(fmt_spec_text(
+                                        explicit_index,
+                                        &flags,
+                                        width,
+                                        precision,
+                                        spec,
+                                    )),
+                                ))
+                            }
+                        };
+                        // Only a conversion that localizes needs the locale, so
+                        // this is where the `DecimalFormatSymbols` lookup is
+                        // paid for — never on a format string of plain `%s`.
+                        let sym = if matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
+                            match symbols {
+                                Some(s) => s,
+                                None => {
+                                    let s = fmt_symbols_for(ctx, locale);
+                                    symbols = Some(s);
+                                    s
+                                }
+                            }
+                        } else {
+                            FmtSymbols::default()
+                        };
+                        let text =
+                            format_arg_full(ctx, &arg, spec, &flags, width, precision, sym)?;
+                        result.push_str(&text);
                     }
                     't' | 'T' => {
                         // Date/time conversion: 't'/'T' is a *prefix*, not a
@@ -5207,38 +5719,88 @@ pub(crate) fn native_string_format(
                                 }
                             }
                         } else {
-                            return Err(
-                                cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                                    message:
-                                        "Format string ends with an incomplete date/time conversion"
-                                            .to_string(),
-                                }
-                                .into(),
-                            );
+                            // A 't'/'T' with no field character after it never
+                            // matches the JDK's specifier regex either, so it is
+                            // the same truncated-specifier refusal: HotSpot 25
+                            // answers `UnknownFormatConversionException:
+                            // Conversion = 't'` for `String.format("%t")`.
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::UnknownConversion(spec.to_string()),
+                            ));
                         }
                     }
-                    _ => {
-                        result.push('%');
-                        result.push_str(&flags);
-                        if let Some(w) = width {
-                            result.push_str(&w.to_string());
-                        }
+                    // The literal-percent conversion, reached only when it
+                    // carried flags or a width — a bare `%%` is short-circuited
+                    // above. `checkText` admits `'-'` and nothing else ("The
+                    // flags ... are the same as for the general conversions,
+                    // except that only the '-' flag is allowed"), and `'-'`
+                    // still needs a width.
+                    '%' => {
                         if let Some(p) = precision {
-                            result.push('.');
-                            result.push_str(&p.to_string());
+                            return Err(fmt_raise(ctx, &FmtFault::IllegalPrecision(p as i32)));
                         }
-                        result.push(spec);
+                        if !flags.is_empty() && flags != "-" {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::IllegalFlags(fmt_flags_string(&flags)),
+                            ));
+                        }
+                        if flags == "-" && width.is_none() {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::MissingWidth(fmt_spec_text(
+                                    explicit_index,
+                                    &flags,
+                                    width,
+                                    precision,
+                                    '%',
+                                )),
+                            ));
+                        }
+                        let pad = width.unwrap_or(1).saturating_sub(1);
+                        if flags == "-" {
+                            result.push('%');
+                            result.push_str(&" ".repeat(pad));
+                        } else {
+                            result.push_str(&" ".repeat(pad));
+                            result.push('%');
+                        }
+                    }
+                    // Likewise `%n`, reached only when decorated. It takes no
+                    // width at all ("If the width is set, an
+                    // IllegalFormatWidthException will be thrown") and no flags.
+                    'n' => {
+                        if let Some(w) = width {
+                            return Err(fmt_raise(ctx, &FmtFault::IllegalWidth(w as i32)));
+                        }
+                        if !flags.is_empty() {
+                            return Err(fmt_raise(
+                                ctx,
+                                &FmtFault::IllegalFlags(fmt_flags_string(&flags)),
+                            ));
+                        }
+                        result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
+                    }
+                    // "If the conversion is not one of the conversions defined
+                    // above, an UnknownFormatConversionException is thrown."
+                    // Echoing the specifier back instead made every typo a
+                    // silent pass-through, and the argument it should have
+                    // consumed stayed queued for the NEXT conversion.
+                    other => {
+                        return Err(fmt_raise(
+                            ctx,
+                            &FmtFault::UnknownConversion(other.to_string()),
+                        ))
                     }
                 }
             } else {
                 // Reached end of string after consuming flags/width/precision
                 // with no conversion character — a truncated specifier.
-                return Err(
-                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                        message: "Format string ends with an incomplete conversion".to_string(),
-                    }
-                    .into(),
-                );
+                return Err(fmt_raise(
+                    ctx,
+                    &FmtFault::UnknownConversion(first_after_pct.to_string()),
+                ));
             }
         } else {
             result.push(chars[i]);
@@ -5607,68 +6169,43 @@ fn format_temporal_field(
 // Rounding is the fourth reason and it is not visible in that one probe line.
 // Rust rounds ties to EVEN; java.util.Formatter specifies HALF_UP for
 // %f/%e/%g, so `%.1f` of 0.25 is Java "0.3" against Rust's "0.2". Rather than
-// correct that per call site, everything below rounds the value's EXACT
-// decimal expansion with its own digit arithmetic (see `fmt_exact_decimal`),
-// where HALF_UP is one comparison. %a is the exception: the JDK rounds it in
-// BINARY, half to even, inside `Formatter.hexDouble`, and `fmt_hex_float`
-// reproduces that rather than the decimal rule.
+// correct that per call site, everything below does its own digit arithmetic
+// (see `fmt_decimal_digits`), where HALF_UP is one comparison. %a is the
+// exception: the JDK rounds it in BINARY, half to even, inside
+// `Formatter.hexDouble`, and `fmt_hex_float` reproduces that rather than the
+// decimal rule.
 //
 // `Double.toString`'s own 10^-3..10^7 scientific threshold (`format_double`,
 // `cratonvm_types::java_double_to_string`) is a DIFFERENT set of rules and is
 // deliberately not shared with any of this: %g at default precision switches
-// to scientific below 10^-4, not below 10^-3.
+// to scientific below 10^-4, not below 10^-3. Only the DIGITS are shared — see
+// `fmt_shortest_decimal` — never the layout.
 // ---------------------------------------------------------------------------
 
-/// The number of digits in the EXACT decimal expansion of a finite `f64`'s
-/// fractional part.
+/// The decimal digits a Java number STRING carries — most significant first,
+/// no leading and no trailing zeros — plus the base-10 exponent of the leading
+/// digit: `value == d0.d1d2… × 10^exp`. A zero of any spelling answers
+/// `([0], 0)`; a leading `-` is ignored, since callers track the sign.
 ///
-/// Every finite double is `m * 2^k` for integers `m`, `k`. Once `m` is odd,
-/// `2^k` with `k < 0` is `5^-k / 10^-k`, so the expansion terminates after
-/// exactly `-k` fractional digits — at most 1074, for the smallest subnormal.
-/// That termination is what lets [`fmt_exact_decimal`] ask Rust for a digit
-/// count it can answer without rounding.
-fn fmt_exact_fraction_digits(v: f64) -> usize {
-    let bits = v.to_bits();
-    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
-    let raw_frac = bits & ((1u64 << 52) - 1);
-    // Subnormals have no implicit leading 1 and a fixed exponent; normals carry
-    // the implicit bit and a significand scaled by 2^-52.
-    let (mut sig, mut e2) = if raw_exp == 0 {
-        (raw_frac, -1074i32)
-    } else {
-        (raw_frac | (1u64 << 52), raw_exp - 1075)
+/// Accepts both spellings the two producers emit: `Double.toString`'s
+/// `1.0E-4` / `123.45`, and `BigDecimal.toPlainString`'s never-scientific
+/// form.
+fn fmt_decimal_digits(s: &str) -> (Vec<u8>, i32) {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (mantissa, exp10) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
     };
-    if sig == 0 {
-        return 0;
-    }
-    while sig & 1 == 0 {
-        sig >>= 1;
-        e2 += 1;
-    }
-    usize::try_from(-e2).unwrap_or(0)
-}
-
-/// A finite, non-negative `f64` as its EXACT decimal digits — most significant
-/// first, no leading and no trailing zeros — plus the base-10 exponent of the
-/// leading digit: `v == d0.d1d2… × 10^exp`. Zero answers `([0], 0)`.
-///
-/// `format!("{:.*}", n, v)` is exact in Rust (flt2dec's exact mode, not a
-/// shortest-representation approximation), so asking it for precisely the
-/// number of fractional digits the value really has rounds nothing at all.
-/// Every rounding decision downstream is then plain digit arithmetic, which is
-/// the only way to get HALF_UP out of a formatter that only offers half-even.
-fn fmt_exact_decimal(v: f64) -> (Vec<u8>, i32) {
-    let nfrac = fmt_exact_fraction_digits(v);
-    let s = format!("{:.*}", nfrac, v);
-    let (int_str, frac_str) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let (int_str, frac_str) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let mut digits: Vec<u8> = int_str
         .bytes()
         .chain(frac_str.bytes())
+        .filter(u8::is_ascii_digit)
         .map(|b| b - b'0')
         .collect();
     // `exp` starts at the exponent of the first INTEGER-part digit and drops by
     // one for every leading zero skipped.
-    let mut exp = int_str.len() as i32 - 1;
+    let mut exp = int_str.len() as i32 - 1 + exp10;
     match digits.iter().position(|&d| d != 0) {
         None => (vec![0], 0),
         Some(lead) => {
@@ -5680,6 +6217,45 @@ fn fmt_exact_decimal(v: f64) -> (Vec<u8>, i32) {
             (digits, exp)
         }
     }
+}
+
+/// A finite, non-negative `f64` as the digits `java.util.Formatter` rounds
+/// from — which are `Double.toString`'s SHORTEST round-trip digits, not the
+/// value's exact decimal expansion.
+///
+/// This is the spec, not an approximation of it. The javadoc for `%f`, `%e`
+/// and `%g` all say the same sentence: "If the precision is less than the
+/// number of digits which would appear after the decimal point in the string
+/// returned by `Double#toString(double)`, then the value will be rounded using
+/// the round half up algorithm. Otherwise, zeros may be appended to reach the
+/// precision."
+///
+/// W7-3 rounded the EXACT expansion instead and recorded the difference as a
+/// residual where "beyond roughly 20 significant digits this implementation is
+/// more exact than HotSpot" — the guess being that `FloatingDecimal`'s
+/// `char[20]` digit buffer was the cap. Measured against HotSpot 25 on
+/// 2026-08-12, the cap is not 20 digits, it is the shortest representation, and
+/// so the divergence starts at the FIRST digit past it rather than in some rare
+/// tail:
+///
+/// | expression | HotSpot 25 | exact-expansion |
+/// |---|---|---|
+/// | `%.1f` of 0.35 | `0.4` | `0.3` (exact is 0.34999999999999997…) |
+/// | `%.2f` of 1.005 | `1.01` | `1.00` (exact is 1.00499999999999989…) |
+/// | `%.17f` of 0.1 | `0.10000000000000000` | `0.10000000000000001` |
+/// | `%.3f` of 1.2345678901234569e23 | `123456789012345690000000.000` | `…685803008.000` |
+///
+/// Those first two are `format.floatRoundingHalfUp` and
+/// `format.formatterAppendable` in `probes/ShadowDifferentialProbe.java`. The
+/// exact expansion is the *better* number and the *wrong* answer: a caller who
+/// asked `%.2f` of 1.005 and got 1.00 disagrees with every other Java runtime.
+///
+/// `format_double` is `Double.toString` (`cratonvm_types::java_double_to_string`),
+/// which was measured byte-identical to HotSpot 25's on the values above — so
+/// taking the digits from it is also what keeps `%s` and `%f` of the same value
+/// telling the same story, which is precisely what the sentence above asks for.
+fn fmt_shortest_decimal(v: f64) -> (Vec<u8>, i32) {
+    fmt_decimal_digits(&format_double(v))
 }
 
 /// Round an exact digit string to `n` significant digits, HALF_UP — ties away
@@ -5866,6 +6442,34 @@ fn fmt_hex_float(v: f64, prec: usize) -> String {
     }
 }
 
+/// `Formatter.addZeros` over a `digits.digitsPexp` hex float: pad the
+/// fractional hex digits out to `prec`, leaving the exponent alone.
+///
+/// `prec == 0` is the JDK's "all of the digits", where nothing is padded.
+/// This applies above 13 too — `hexDouble` stops ROUNDING at 13 hex digits
+/// but `addZeros` still pads, so `%.14a` of `Double.MIN_VALUE` is
+/// `0x0.00000000000010p-1022`.
+fn fmt_hex_pad(s: &str, prec: usize) -> String {
+    if prec == 0 {
+        return s.to_string();
+    }
+    let idx = match s.find('p') {
+        Some(i) => i,
+        None => return s.to_string(),
+    };
+    let (mant, exp) = s.split_at(idx);
+    let have = match mant.find('.') {
+        Some(dot) => mant.len() - dot - 1,
+        // `fmt_hex_digits` always writes a point, but `addZeros` adds one when
+        // it has to and this stays faithful to that.
+        None => return format!("{mant}.{}{exp}", "0".repeat(prec)),
+    };
+    if have >= prec {
+        return s.to_string();
+    }
+    format!("{mant}{}{exp}", "0".repeat(prec - have))
+}
+
 /// One value through `java.util.Formatter`'s floating-point conversions.
 ///
 /// `precision` is the spec's precision if it carried one. The DEFAULTS live
@@ -5886,22 +6490,72 @@ pub(crate) fn java_float_conversion(v: f64, spec: char, precision: Option<usize>
         return format!("{sign}{}", if upper { "INFINITY" } else { "Infinity" });
     }
     let mag = v.abs();
-    let body = match spec {
-        'a' | 'A' => {
-            // Formatter emits the prefix itself and upper-cases the digits and
-            // the 'p' for %A; the exponent is decimal either way.
-            let digits = fmt_hex_float(mag, precision.map_or(0, |p| p.max(1)));
-            if upper {
-                format!("0X{}", digits.to_uppercase())
-            } else {
-                format!("0x{digits}")
-            }
-        }
+    if matches!(spec, 'a' | 'A') {
+        // Formatter emits the prefix itself and upper-cases the digits and
+        // the 'p' for %A; the exponent is decimal either way.
+        //
+        // The JDK normalises a MISSING precision to 0 ("assume that we want all
+        // of the digits") and an explicit `%.0a` to 1, then pads the mantissa
+        // back out to it — `if (prec != 0) addZeros(va, prec)`, outside
+        // `hexDouble`. W7-3 argued the opposite from the javadoc, that "nothing
+        // pads the digits back out, and `%.4a` of 1.0 is `0x1.0p0`, not
+        // `0x1.0000p0`". Measured on HotSpot 25 on 2026-08-12 it is
+        // `0x1.0000p0`: a 1763-case sweep of the float family against HotSpot
+        // failed on this row and nothing else.
+        let prec = precision.map_or(0, |p| p.max(1));
+        let digits = fmt_hex_pad(&fmt_hex_float(mag, prec), prec);
+        let body = if upper {
+            format!("0X{}", digits.to_uppercase())
+        } else {
+            format!("0x{digits}")
+        };
+        return format!("{sign}{body}");
+    }
+    let (digits, exp) = fmt_shortest_decimal(mag);
+    format!(
+        "{sign}{}",
+        fmt_decimal_conversion(&digits, exp, spec, precision)
+    )
+}
+
+/// A `java.math.BigDecimal`'s `toPlainString()` through %f/%e/%g.
+///
+/// Formatter formats a BigDecimal from its OWN digits — `print(BigDecimal,
+/// Locale)` never converts it to a double — so `%.2f` of `new
+/// BigDecimal("2.345")` is `2.35`, the HALF_UP rounding of the exact literal
+/// 2.345, and not the 2.34 that the nearest double (2.34499999999999975…)
+/// would give. `%a` has no BigDecimal arm at all in the JDK and raises
+/// `IllegalFormatConversionException`; the caller rejects it before reaching
+/// here.
+///
+/// The sign follows `signum()`, not the leading character: `new
+/// BigDecimal("-0.00")` has signum 0 and prints without a sign.
+fn java_decimal_conversion(plain: &str, spec: char, precision: Option<usize>) -> String {
+    let (digits, exp) = fmt_decimal_digits(plain);
+    let negative = plain.starts_with('-') && digits.iter().any(|&d| d != 0);
+    let sign = if negative { "-" } else { "" };
+    format!(
+        "{sign}{}",
+        fmt_decimal_conversion(&digits, exp, spec, precision)
+    )
+}
+
+/// %f / %e / %g over an already-extracted non-negative magnitude
+/// `digits × 10^exp`, which is the only part of the family that does not care
+/// where the digits came from — a double's `Double.toString` or a
+/// BigDecimal's `toPlainString`.
+fn fmt_decimal_conversion(
+    digits: &[u8],
+    exp: i32,
+    spec: char,
+    precision: Option<usize>,
+) -> String {
+    let upper = matches!(spec, 'E' | 'G');
+    match spec {
         'e' | 'E' => {
             let prec = precision.unwrap_or(6);
-            let (digits, exp) = fmt_exact_decimal(mag);
             // One digit before the point plus `prec` after it.
-            let (digits, exp) = fmt_round_significant(&digits, exp, prec + 1);
+            let (digits, exp) = fmt_round_significant(digits, exp, prec + 1);
             fmt_render_scientific(&digits, exp, prec, upper)
         }
         'g' | 'G' => {
@@ -5912,16 +6566,15 @@ pub(crate) fn java_float_conversion(v: f64, spec: char, precision: Option<usize>
                 Some(0) => 1,
                 Some(p) => p,
             };
-            if mag == 0.0 {
+            if digits.iter().all(|&d| d == 0) {
                 // Formatter special-cases zero to mantissa "0" with a rounded
                 // exponent of 0, which lands in the decimal branch: `%g` of 0.0
                 // is "0.00000", never "0.000000e+00".
                 fmt_render_fixed(&[0], 0, prec - 1)
             } else {
-                let (digits, exp) = fmt_exact_decimal(mag);
                 // The branch is decided by the magnitude AFTER rounding, which
                 // is why 999999.5 at `%g` prints 1.00000e+06 and not 1000000.
-                let (digits, exp) = fmt_round_significant(&digits, exp, prec);
+                let (digits, exp) = fmt_round_significant(digits, exp, prec);
                 if exp >= -4 && exp < prec as i32 {
                     fmt_render_fixed(&digits, exp, (prec as i32 - 1 - exp) as usize)
                 } else {
@@ -5933,23 +6586,22 @@ pub(crate) fn java_float_conversion(v: f64, spec: char, precision: Option<usize>
         // this argument is a float.
         _ => {
             let prec = precision.unwrap_or(6);
-            let (digits, exp) = fmt_exact_decimal(mag);
-            let (digits, exp) = fmt_round_at_fraction(&digits, exp, prec);
+            let (digits, exp) = fmt_round_at_fraction(digits, exp, prec);
             fmt_render_fixed(&digits, exp, prec)
         }
-    };
-    format!("{sign}{body}")
+    }
 }
 
 /// Format a single argument with flags, width, and precision support.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn format_arg_full(
+fn format_arg_full(
     ctx: &mut dyn NativeContext,
     val: &Value,
     spec: char,
     flags: &str,
     width: Option<usize>,
     precision: Option<usize>,
+    sym: FmtSymbols,
 ) -> Result<String, MethodCallFailed> {
     // Uppercase string-family conversions ('S'/'B'/'C') format identically to
     // their lowercase form, then the whole result is upper-cased — per
@@ -5981,14 +6633,25 @@ pub(crate) fn format_arg_full(
         'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A'
             if precision.is_some() && !matches!(val, Value::Object(None)) =>
         {
-            java_float_conversion(extract_float_value(ctx, val), spec, precision)
+            match float_source(ctx, val) {
+                // `%.Nf` of a BigDecimal must round the BigDecimal's OWN
+                // digits, which is why the source is asked for rather than
+                // `extract_float_value`d into a double.
+                Some(FloatSource::Decimal(plain)) => {
+                    java_decimal_conversion(&plain, spec, precision)
+                }
+                Some(FloatSource::Double(v)) => java_float_conversion(v, spec, precision),
+                None => raw,
+            }
         }
-        's' if precision.is_some() => {
+        // "The precision is the maximum number of characters to be written to
+        // the output" — for every GENERAL conversion, not just %s. `%.2b` of
+        // true is "tr".
+        's' | 'b' | 'h' if precision.is_some() => {
             let prec = precision.unwrap();
-            if raw.len() > prec {
-                raw[..prec].to_string()
-            } else {
-                raw
+            match raw.char_indices().nth(prec) {
+                Some((byte_idx, _)) => raw[..byte_idx].to_string(),
+                None => raw,
             }
         }
         _ => raw,
@@ -5997,25 +6660,47 @@ pub(crate) fn format_arg_full(
     // Apply width and flags
     let left_justify = flags.contains('-');
     let zero_pad = flags.contains('0') && !left_justify;
-    let plus_sign = flags.contains('+');
+    let numeric_sign = matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A');
 
     let mut formatted = raw;
 
     // ',' grouping flag: insert a thousands separator into the integer part of
-    // %d / %f values (Java's Formatter; the locale separator is ',' for the
-    // root/US locale, which is what CratonVM formats against).
+    // %d / %f values. The separator inserted here is the ASCII ',' whatever the
+    // locale is; `fmt_localize` rewrites it at the very end, once every
+    // length-sensitive step is done — see that function for why.
     if flags.contains(',') && matches!(spec, 'd' | 'f' | 'g' | 'G') {
         formatted = group_thousands(&formatted);
     }
 
-    // Add sign for numeric types. %a takes the '+' flag too, and Formatter puts
-    // the sign OUTSIDE the "0x" prefix ("+0x1.0p0"), which is where prepending
-    // to the whole conversion lands it.
-    if plus_sign
-        && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A')
-        && !formatted.starts_with('-')
-    {
-        formatted = format!("+{formatted}");
+    // `Formatter.leadingSign`/`trailingSign`. A negative value with the '('
+    // flag is written in accountancy form — "the result will enclose negative
+    // numbers in parentheses" — and the '-' disappears rather than being kept
+    // alongside; a positive value takes '+' or, failing that, the ' ' flag's
+    // leading space. `%x`/`%o` reject all three flags before reaching here.
+    if numeric_sign {
+        if let Some(magnitude) = formatted.strip_prefix('-') {
+            if flags.contains('(') {
+                formatted = format!("({magnitude})");
+            }
+        } else if flags.contains('+') {
+            formatted = format!("+{formatted}");
+        } else if flags.contains(' ') {
+            formatted = format!(" {formatted}");
+        }
+    }
+
+    // '#' alternate form. Only the radix conversions have one here: "the output
+    // will always begin with the radix indicator '0x'" for %x (and '0X' for
+    // %X), and "the output will always begin with a '0'" for %o. It goes on
+    // BEFORE the zero padding, so `%#010x` of 255 is `0x000000ff` and not
+    // `00000000xff` — hence the prefix-aware split below.
+    if flags.contains('#') {
+        match spec {
+            'x' => formatted.insert_str(0, "0x"),
+            'X' => formatted.insert_str(0, "0X"),
+            'o' => formatted.insert(0, '0'),
+            _ => {}
+        }
     }
 
     // Apply width padding
@@ -6029,23 +6714,44 @@ pub(crate) fn format_arg_full(
             // accepts '0' for them. %a/%A stay out deliberately: their zeros go
             // AFTER the "0x" prefix, which this generic insert cannot do.
             //
-            // The trailing-digit test stands in for Formatter's structure,
-            // where zero padding happens only inside the FINITE branch —
-            // "Infinity"/"NaN" reach the width justifier and get spaces.
+            // The non-finite test stands in for Formatter's structure, where
+            // zero padding happens only inside the FINITE branch —
+            // "Infinity"/"NaN" reach the width justifier and get spaces. It
+            // used to be "ends with an ASCII digit", which mistook two finite
+            // renderings for infinities the moment this lane gave them
+            // non-digit tails: `%#010x` ends in a HEX digit and `%(08d` ends in
+            // the closing parenthesis, and both silently reverted to space
+            // padding.
             else if zero_pad
                 && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
-                && formatted.ends_with(|c: char| c.is_ascii_digit())
+                && !formatted.ends_with("Infinity")
+                && !formatted.ends_with("INFINITY")
+                && !formatted.ends_with("NaN")
+                && !formatted.ends_with("NAN")
             {
-                if formatted.starts_with('-') || formatted.starts_with('+') {
-                    let (sign, rest) = formatted.split_at(1);
-                    formatted = format!("{sign}{}{rest}", "0".repeat(pad));
+                // The zeros go INSIDE whatever the value already leads with —
+                // a sign, an opening parenthesis, or an alternate-form radix
+                // indicator — never in front of it.
+                let lead = if formatted.starts_with("0x") || formatted.starts_with("0X") {
+                    2
+                } else if formatted.starts_with(['-', '+', ' ', '(']) {
+                    1
                 } else {
-                    formatted = format!("{}{formatted}", "0".repeat(pad));
-                }
+                    0
+                };
+                let (head, rest) = formatted.split_at(lead);
+                formatted = format!("{head}{}{rest}", "0".repeat(pad));
             } else {
                 formatted = format!("{}{formatted}", " ".repeat(pad));
             }
         }
+    }
+
+    // Localization is last, so every width and padding decision above was made
+    // on ASCII. "No localization is applied" to %x, %o and %a, and a %s
+    // argument's digits are the caller's text.
+    if matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') {
+        formatted = fmt_localize(&formatted, sym);
     }
 
     if uppercase_result {
@@ -6083,21 +6789,59 @@ fn group_thousands(s: &str) -> String {
     format!("{sign}{grouped}{frac_part}")
 }
 
-/// Extract a float value from a Value (unboxing wrappers as needed).
-fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
+/// Where a float conversion's digits come from.
+///
+/// `java.util.Formatter.print(Object, Locale)` dispatches the float family to
+/// two different printers — `print(double, …)` and `print(BigDecimal, …)` —
+/// and they are not the same algorithm. Collapsing a BigDecimal into a double
+/// first would round twice and lose the very digits the caller chose a
+/// BigDecimal to keep.
+enum FloatSource {
+    Double(f64),
+    /// A `java.math.BigDecimal`, as its `toPlainString()`.
+    Decimal(String),
+}
+
+/// Classify a `%f`/`%e`/`%g` argument, unboxing wrappers as needed.
+///
+/// `None` means the argument is not one of the types the float conversions
+/// accept — the caller raises `IllegalFormatConversionException` rather than
+/// inventing a value for it.
+fn float_source(ctx: &mut dyn NativeContext, val: &Value) -> Option<FloatSource> {
     match val {
-        Value::Float(v) => *v as f64,
-        Value::Double(v) => *v,
-        Value::Int(v) => *v as f64,
-        Value::Long(v) => *v as f64,
-        Value::Object(Some(obj)) => match ctx.get_field(*obj, 0) {
-            Value::Float(v) => v as f64,
-            Value::Double(v) => v,
-            Value::Int(v) => v as f64,
-            Value::Long(v) => v as f64,
-            _ => 0.0,
-        },
-        _ => 0.0,
+        Value::Float(v) => Some(FloatSource::Double(*v as f64)),
+        Value::Double(v) => Some(FloatSource::Double(*v)),
+        Value::Int(v) => Some(FloatSource::Double(*v as f64)),
+        Value::Long(v) => Some(FloatSource::Double(*v as f64)),
+        Value::Object(Some(obj)) => {
+            let cname = ctx
+                .class_name_of_id(ctx.class_id_of_object(*obj))
+                .unwrap_or_default();
+            if cname == "java/math/BigDecimal" {
+                // `toPlainString`, not `toString`: the latter switches to
+                // scientific notation for some scales, and `fmt_decimal_digits`
+                // would then have to trust an exponent this path can avoid
+                // producing at all.
+                return match ctx.invoke_virtual(*obj, "toPlainString", "()Ljava/lang/String;", &[])
+                {
+                    Ok(Some(Value::Object(Some(s)))) => {
+                        ctx.read_string(s).map(FloatSource::Decimal)
+                    }
+                    _ => None,
+                };
+            }
+            if !matches!(cname.as_str(), "java/lang/Float" | "java/lang/Double") {
+                return None;
+            }
+            match ctx.get_field(*obj, 0) {
+                Value::Float(v) => Some(FloatSource::Double(v as f64)),
+                Value::Double(v) => Some(FloatSource::Double(v)),
+                Value::Int(v) => Some(FloatSource::Double(v as f64)),
+                Value::Long(v) => Some(FloatSource::Double(v as f64)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -6196,6 +6940,61 @@ pub(crate) fn format_arg(
             if spec == 'h' || spec == 'H' {
                 return Ok(ctx.read_string(*obj).unwrap_or_else(|| "null".to_string()));
             }
+
+            // Everything past here is a TYPED conversion, and
+            // `java.util.Formatter.print(Object, Locale)` reaches its
+            // `failConversion` default for an argument whose class the
+            // conversion does not name: "If the argument arg is ... not
+            // otherwise applicable to this conversion, then an
+            // IllegalFormatConversionException will be thrown."
+            //
+            // Answering something anyway is how `String.format("%d",
+            // "notANumber")` became a no-throw and `%.2f` of a BigDecimal became
+            // `0.00` — `unbox_obj` fell through to a slot-0 read that meant
+            // nothing on either class. The refusal has to carry the argument's
+            // Class, because that is half of the message a caller reads.
+            {
+                let class_id = ctx.class_id_of_object(*obj);
+                let cname = ctx.class_name_of_id(class_id).unwrap_or_default();
+                let applicable = match spec {
+                    'd' | 'o' | 'x' | 'X' => matches!(
+                        cname.as_str(),
+                        "java/lang/Byte"
+                            | "java/lang/Short"
+                            | "java/lang/Integer"
+                            | "java/lang/Long"
+                            | "java/math/BigInteger"
+                    ),
+                    // %a has no BigDecimal printer in the JDK at all, which is
+                    // why it is the one float conversion that refuses one.
+                    'f' | 'e' | 'E' | 'g' | 'G' => matches!(
+                        cname.as_str(),
+                        "java/lang/Float" | "java/lang/Double" | "java/math/BigDecimal"
+                    ),
+                    'a' | 'A' => matches!(cname.as_str(), "java/lang/Float" | "java/lang/Double"),
+                    'c' => matches!(
+                        cname.as_str(),
+                        "java/lang/Character"
+                            | "java/lang/Byte"
+                            | "java/lang/Short"
+                            | "java/lang/Integer"
+                    ),
+                    _ => true,
+                };
+                if !applicable {
+                    return Err(fmt_raise(ctx, &FmtFault::WrongType(spec, class_id)));
+                }
+                // A BigDecimal at its DEFAULT precision still has to come from
+                // its own digits — `%f` of `new BigDecimal("2.3")` is
+                // "2.300000", six fraction digits of the decimal literal, not of
+                // a double it was never turned into.
+                if cname == "java/math/BigDecimal" {
+                    if let Some(FloatSource::Decimal(plain)) = float_source(ctx, val) {
+                        return Ok(java_decimal_conversion(&plain, spec, None));
+                    }
+                }
+            }
+
             // BigInteger numeric conversions: its slot-0 field is `signum`, not the
             // value, so it must NOT be unboxed. Java's Formatter formats a
             // BigInteger via its real radix toString (e.g. %x => toString(16));
@@ -6540,12 +7339,21 @@ pub(crate) fn native_string_format_locale(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Skip the Locale argument (args[0]) and delegate to the main format impl
+    // args[0] is the Locale. It used to be DISCARDED, which made
+    // `String.format(Locale.GERMANY, "%,.2f", 1234.5)` answer the US
+    // `1,234.50` where HotSpot 25 answers `1.234,50` — the grouping and
+    // decimal separators are swapped in German, and France's grouping
+    // separator is not even an ASCII space (U+202F). Both rows are in
+    // `docs/known-issues/jdk-only/W7-32-round-2-differential-run.md`.
+    let locale = match args.first() {
+        Some(Value::Object(l)) => *l,
+        _ => None,
+    };
     let format_args = [
         args.get(1).cloned().unwrap_or(Value::Object(None)),
         args.get(2).cloned().unwrap_or(Value::Object(None)),
     ];
-    native_string_format(ctx, &format_args)
+    format_impl(ctx, &format_args, locale)
 }
 
 pub(crate) fn native_string_formatted(
