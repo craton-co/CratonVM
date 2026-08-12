@@ -118,26 +118,121 @@ falsifying observation for this whole analysis.
 
 ## Not fixed here, same family
 
-* **`Method.invoke` has the identical hole** — `lang_class.rs:7533`,
-  `if !is_public { …check… }`. Not exercised by `RJdkModule`, so it is
-  unmeasured and was left alone rather than changed blind.
-* **`ServiceLoader` + an explicit module-path provider.**
-  `native-builtins/src/service_loader.rs` does
-  `getDeclaredConstructor()` → `setAccessible(true)` (result discarded) →
-  `Constructor.newInstance`. For a provider in an *encapsulated* package the
-  `setAccessible` is now refused (that gate landed 2026-08-06), so `override`
-  stays 0 and the new gate refuses the `newInstance` too — the provider is
-  silently skipped. HotSpot does not hit this because *its* ServiceLoader is
-  java.base and takes bypass (3); CratonVM's is a Rust native that pushes no
-  Java frame, so `resolve_caller_class_id` attributes the call to the
-  application frame that entered `ServiceLoader.iterator()`.
-  `RJdkModule.moduleServices()` (`:217`–`:242`) fails today regardless — the
-  static `provider()` factory form is unimplemented — so the corpus count does
-  not move, but whoever takes `moduleServices` must write `override = 1` on the
-  constructor directly instead of relying on the caller-sensitive
-  `setAccessible` invoke.
-* **`is_package_exported_to` fails closed for an unregistered target module**,
-  where `check_module_access` uses an open-world allow. Practically
-  unreachable (`Class::module_name` is set from `module_for_package`, which
-  implies the module is registered), so it was left as-is rather than widened
-  on speculation.
+All three rows were adjudicated on 2026-08-11. None is open.
+
+* ~~**`Method.invoke` has the identical hole**~~ — **FIXED**, by W6-8, which is
+  the page that took this row. Both arms of `native_method_invoke` now ask
+  `check_reflection_export_access_with_target_id`.
+* ~~**`ServiceLoader` + an explicit module-path provider.**~~
+  **ALREADY FIXED IN THE TREE — checked before writing anything.** The filing
+  said `native-builtins/src/service_loader.rs` does `getDeclaredConstructor()`
+  → `setAccessible(true)` (result discarded) → `Constructor.newInstance`; that
+  for a provider in an *encapsulated* package the `setAccessible` is refused,
+  `override` stays 0, the `newInstance` is refused in turn, and the provider is
+  silently skipped. The diagnosis was right and so was the prescription —
+  "write `override = 1` on the constructor directly instead of relying on the
+  caller-sensitive `setAccessible` invoke". It was carried out:
+
+  * `service_loader.rs::grant_reflective_override` writes the JDK-inherited
+    `override` field *and* the CratonVM extra slot (a reflective object built
+    with positional slots has no named `override` at all). Its doc comment
+    reproduces this row's reasoning almost verbatim, down to
+    `com.cratonvm.jdkonly.svc.internal` as the witness.
+  * It is applied at the constructor site under
+    `if module_declared.iter().any(|m| m == &fqn)`, so a **classpath** provider
+    keeps the historic `setAccessible` invoke unchanged. That condition is the
+    JDK's own `if (inExplicitModule(clazz)) ctor.setAccessible(true)`, minus the
+    caller identity a Rust native cannot supply.
+  * The `provider()` static-factory form this row called unimplemented now
+    exists (`findStaticProviderMethod`), with the same override grant on the
+    `Method`. That was why `RJdkModule.moduleServices()` failed regardless; the
+    campaign README records `RJdkModule` passing 44 checks since 2026-08-07.
+
+  No out-of-file patch required. Recorded because this is now the campaign's
+  repeated finding rather than a one-off: a record's hand-off patch is more
+  often already in the tree than not, and re-applying one is how a fix becomes
+  a regression.
+
+* ~~**`is_package_exported_to` fails closed for an unregistered target module**,
+  where `check_module_access` uses an open-world allow.~~
+  **ADJUDICATED: unreachable from the reflection gate — and the "two predicates
+  disagree" framing does not survive contact with the third one.**
+
+  The filing's stated reason was that `Class::module_name` is set from
+  `module_for_package`, which implies the module is registered. That reason is
+  **incomplete** — there are three production writers of `Class::module_name`,
+  not one — but its conclusion holds. Taking them in turn:
+
+  1. `module_for_package(pkg)` (`class_manager.rs`). `ModuleRegistry::register`
+     inserts into `package_to_module` and into `modules` in the same call, and
+     nothing anywhere removes from either map. So
+     `module_for_package(pkg) == Some(M)` implies `modules.contains_key(M)` as
+     an **invariant**, not as a likelihood. This is the filing's own reasoning
+     and it is sound.
+  2. `.or(module_name_from_attr)` — the `Module` attribute's own name, reached
+     only when `module_for_package` misses. Only `module-info` carries a
+     `Module` attribute, its descriptor is `register`ed a few lines earlier in
+     the same function, and `module-info` has no reflectable members.
+  3. **`module_name: Some("java.base")`, hardcoded on every VM-created array
+     class** (`class_manager.rs::synthesize_array_class_for_loader`). Not
+     derived from `module_for_package` at all, so row 1's reasoning does not
+     cover it. This is the writer the filing missed.
+
+  Row 3 is unreachable here too, and for a measurable reason rather than an
+  argued one. `reflective_export_to_accessor` takes `target_cid` from the
+  *declaring class of a reflective member*, and an array class declares no
+  members. Measured on Temurin 25.0.3:
+
+  ```text
+  int[].class.getDeclaredMethods().length     0
+  int[].class.getMethod("clone")              NoSuchMethodException: [I.clone()
+  int[].class.getMethod("hashCode")           declaringClass = class java.lang.Object
+  ```
+
+  No `Method`, `Field` or `Constructor` can have an array class as its
+  declaring class, so `target_cid` is never an array and the hardcode never
+  reaches `is_package_exported_to`. With the registry-empty short-circuit at
+  the top of `reflective_export_to_accessor` (`is_empty()` → `true`) there is
+  no remaining input that reaches the fail-closed arm.
+
+  **And the asymmetry is between two subsystems, not two predicates.** The
+  reflection gate composes *two* registry queries and they agree with each
+  other: `is_package_exported_to` falls through to `false` for an unregistered
+  target module, and `check_deep_reflection_access` falls through to `Err` on
+  the same input — its `modules.get(target_module)` arm simply does not fire.
+  Both fail closed. Only `check_module_access` opens the world, and it serves
+  **bytecode linkage**, which its own doc comment (2026-08-07) already argues
+  at length: tightening it turns every classpath reference to
+  `jdk.internal.misc.Unsafe` & friends into an `IllegalAccessError` at
+  resolution time. So there is no inconsistency *inside* the reflection gate to
+  repair, and widening `is_package_exported_to` to match `check_module_access`
+  would destroy an agreement that currently holds rather than create one.
+  **Left as-is — now with a reason instead of a hunch.**
+
+## Found on the way, NOT fixed: array classes report the wrong module
+
+Row 3 above is unreachable through the reflection gate, but it is still wrong,
+and `Class.getModule()` and bytecode-resolution `check_module_access` both do
+reach it. Measured on Temurin 25.0.3:
+
+```text
+int[].class.getModule()        module java.base
+String[].class.getModule()     module java.base
+ArrProbe[].class.getModule()   unnamed module @691a7f8f    <-- classpath component type
+int[].class.getPackageName()   "java.lang"                 <-- not ""
+```
+
+A reference array's module is its **component type's** module, not java.base.
+`synthesize_array_class_for_loader` hardcodes `Some("java.base")` for every
+array class regardless of component type, so `MyAppClass[].class.getModule()`
+answers java.base where HotSpot answers the unnamed module; `package_of("[I")`
+likewise yields `""` where HotSpot reports `"java.lang"`. `classloading/` is not
+this lane's file and neither divergence has a measured consumer yet. Filed so
+the next lane does not have to rediscover it.
+
+### Out-of-file patch (not applied)
+
+None. Both remaining rows resolved without a source change: one was already in
+the tree, one is proven unreachable. The array-module divergence above is a
+new finding, not a residual of this record, and wants its own measurement
+before anyone edits `classloading/src/class_manager.rs`.

@@ -254,6 +254,83 @@ pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
 /// there. Expected to be ZERO.
 pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many unresolved-kept SEEDS the post-evacuation-failure rset recording
+/// refused to walk because their header did not look like a live object.
+///
+/// Expected to be ZERO. Non-zero means `retry_after_evacuation_failure` handed
+/// [`G1Collector::record_outgoing_rset_edges`] a self-forwarded address that is
+/// region-resident but is not an object start — which, before the guard, was a
+/// SIGSEGV inside that walk (see the internal record
+/// `fixed-suite-bugs/h2-suite-bugs/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
+pub static KEPT_SEED_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`KEPT_SEED_REJECTED`].
+pub fn kept_seeds_rejected() -> usize {
+    KEPT_SEED_REJECTED.load(Ordering::Relaxed)
+}
+
+/// How many CSet-resident ROOTS the evacuator was handed that are not the start
+/// of a live object.
+///
+/// The root array is deliberately over-approximate: `collect_roots`' operand-
+/// stack filter is `is_heap_addr` (a RANGE check), widened from the strict
+/// `is_object_address` on 2026-08-04 because the strict probe dropped genuine
+/// young / mid-initialisation roots. A `long` on the operand stack, or a
+/// computed interior address, whose bits land in the heap range is therefore a
+/// root. That is safe for a non-moving sweep, where a false positive only
+/// over-retains — the moving collectors have to screen it themselves.
+pub static NON_OBJECT_ROOT_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// How many of [`NON_OBJECT_ROOT_SEEN`] were nevertheless COPIED to a new
+/// address by `evacuate_object` — i.e. how many times the evacuator computed a
+/// size from garbage, memcpy'd that many bytes, installed a forwarding entry
+/// for the address, and rewrote the root to point at the copy.
+pub static NON_OBJECT_ROOT_COPIED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`NON_OBJECT_ROOT_SEEN`] and [`NON_OBJECT_ROOT_COPIED`].
+pub fn non_object_root_counts() -> (usize, usize) {
+    (
+        NON_OBJECT_ROOT_SEEN.load(Ordering::Relaxed),
+        NON_OBJECT_ROOT_COPIED.load(Ordering::Relaxed),
+    )
+}
+
+/// Which step of [`G1Collector::classify_candidate_header`] decided an address
+/// is not the start of a live object.
+///
+/// The distinctions matter to whoever reads the rejection warnings:
+/// `AboveCursor` says the word is inside a live region but past everything ever
+/// allocated in it (a stale or recycled address), while `BadKindTag` says it is
+/// *below* the cursor and still not an object (a walk that lost the object
+/// grid). They have different upstream producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderVerdict {
+    /// Passed every check: this is the start of a live object.
+    Object,
+    /// Null, or not 8-aligned.
+    NullOrUnaligned,
+    /// Not inside `[arena_base, arena_end)`.
+    OutsideArena,
+    /// `region_size == 0` — the collector has no region geometry.
+    NoRegionGeometry,
+    /// The computed region index is past the end of the region table.
+    NoSuchRegion,
+    /// The owning region is `Free`.
+    RegionFree,
+    /// Below the owning region's data base (region table / arena disagreement).
+    BelowRegionBase,
+    /// Inside the region's span but at or above its allocation cursor.
+    AboveCursor,
+    /// The `kind` tag byte does not decode to an `ObjectKind`.
+    BadKindTag,
+    /// The element-type tag byte does not decode to an `ArrayElementType`.
+    BadElementTag,
+    /// A humongous filler, which is not walkable.
+    HumongousFiller,
+    /// Tags decode, but the shape word claims an impossible slot/element count.
+    ImplausibleShape,
+}
+
 /// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
 pub fn evacuation_holder_counts() -> (usize, usize) {
     (
@@ -2240,8 +2317,62 @@ impl G1Collector {
             //     regions.
             {
                 let mut regions = self.regions.lock();
+                let mut rejected: Vec<usize> = Vec::new();
                 for &seed in &seeds {
-                    self.record_outgoing_rset_edges(&mut regions, seed);
+                    if !self.record_outgoing_rset_edges(&mut regions, seed) {
+                        rejected.push(seed);
+                    }
+                }
+                // A seed is an identity entry in the pause's own forwarding map,
+                // so "it is not an object" is a statement about the map, not
+                // just about the heap. Ask the map what else it says about the
+                // address before the pause ends and the answer is gone: an
+                // address that is ALSO another key's destination was evacuated
+                // INTO, which makes the identity entry stale rather than a live
+                // self-forward. One O(map) pass, only on a pause that already
+                // rejected something, and only while the warnings are still
+                // being printed.
+                if !rejected.is_empty()
+                    && KEPT_SEED_REJECTED.load(Ordering::Relaxed) <= rejected.len().max(8)
+                {
+                    for seed in rejected {
+                        let inbound = acc
+                            .pointer_map
+                            .iter()
+                            .filter(|(k, v)| **v == seed && **k != seed)
+                            .count();
+                        // Deliberately does NOT consult `kept_unresolved_*`:
+                        // those are behind their own mutexes and this runs
+                        // under the regions lock — the deadlock hazard
+                        // `candidate_header_is_plausible` already documents.
+                        let bytes = self
+                            .lookup_region_for_addr(seed)
+                            .and_then(|i| regions.get(i))
+                            .map(|r| {
+                                hexdump_around(
+                                    r.data.as_ptr() as *mut u8,
+                                    r.cursor,
+                                    seed.wrapping_sub(r.data.as_ptr() as usize),
+                                )
+                            })
+                            .unwrap_or_default();
+                        // Provenance. A seed that is an INTERIOR pointer had to
+                        // enter the pause as one, and there are only two doors:
+                        // the root array the caller handed us, and the
+                        // conservative JIT-root snapshot.
+                        let in_roots = roots.iter().any(|r| r.as_ptr() as usize == seed);
+                        let jit_roots = crate::gc_quiescence::pinned_jit_roots_snapshot();
+                        let in_jit_roots = jit_roots.contains(&seed);
+                        tracing::warn!(
+                            "[g1] rejected seed 0x{seed:x}: seeds={} map={} inbound_forwards={inbound} \
+                             passes={passes} in_roots={in_roots} roots={} in_jit_roots={in_jit_roots} \
+                             jit_roots={} {bytes}",
+                            seeds.len(),
+                            acc.pointer_map.len(),
+                            roots.len(),
+                            jit_roots.len(),
+                        );
+                    }
                 }
             }
             let mut kept_regions = self.kept_unresolved_regions.lock();
@@ -2279,14 +2410,59 @@ impl G1Collector {
     /// counterpart of `post_write_barrier_rset` for slots the collector
     /// itself rewrote. See the unresolved-kept block in
     /// [`Self::retry_after_evacuation_failure`].
-    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) {
+    ///
+    /// Returns `false` iff the seed was refused as not-an-object, so the caller
+    /// can report on the ones it rejected.
+    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) -> bool {
         let Some(src_idx) = self.lookup_region_for_addr(obj_addr) else {
-            return;
+            return false;
         };
         let obj_ptr = obj_addr as *mut u8;
-        // Kept objects are ordinary (humongous regions never enter a CSet),
-        // so flat payload reads are in-bounds.
+        // `lookup_region_for_addr` only answers "is this word inside some
+        // region's SPAN". That is not "is this an object", and the seeds are
+        // not trustworthy enough for the difference to be ignorable: they are
+        // the self-forwarded keys of a FAILED evacuation's pointer map, and
+        // the same pause's ref-scan is on record rejecting holders out of that
+        // very set ("evacuation ref-scan REJECTED a non-object HOLDER"). A
+        // header read at a non-object address yields an arbitrary `num_slots`
+        // / `array_length`, and the walks below then read past the region — the
+        // measured H2 crash was exactly this: `collect_garbage` ->
+        // `retry_after_evacuation_failure` -> `record_outgoing_rset_edges` ->
+        // `for_each_flat_object_reference` faulting on a 4 MiB-aligned address
+        // well past the committed arena.
+        //
+        // Same screen the ref-scan sibling applies to its own holders, and the
+        // same one the reachability verifier gained in `1ccaf9caf`. Dropping a
+        // non-object seed costs nothing: an address that is not an object has
+        // no outgoing references to remember.
+        if !self.candidate_header_is_plausible(regions, obj_addr) {
+            let n = KEPT_SEED_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_addr);
+                tracing::warn!(
+                    "[g1] kept-seed rset recording REJECTED a non-object SEED (#{n}): \
+                     obj=0x{obj_addr:x} {why} — walking its slots would have read outside any \
+                     live region. Skipped; the pause continues."
+                );
+            }
+            return false;
+        }
+        // SAFETY: `candidate_header_is_plausible` validated the tag bytes and
+        // placed the address inside a live region's committed span.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        // Clamp a reference array's element walk to what the holder's own
+        // region actually holds, for the same reason `scan_and_evacuate_refs`
+        // does: `array_length` is a u32 bounded only by `i32::MAX`, so
+        // `HEADER_SIZE + len * 8` is not implied to be inside the region by the
+        // header being plausible. Computed here, before `record` borrows
+        // `regions` mutably.
+        let walkable_elements = if header.kind() == ObjectKind::Array
+            && header.element_type() == ArrayElementType::Reference
+        {
+            self.holder_walkable_slots(regions, obj_ptr, header.array_length() as usize)
+        } else {
+            0
+        };
         // G1AUD-5: GC-internal edges are stamped with the pause's generation,
         // exactly like the mutator barrier's.
         let generation = self.rset_generation();
@@ -2303,17 +2479,15 @@ impl G1Collector {
             }
         };
         if header.kind() == ObjectKind::Array {
-            if header.element_type() == ArrayElementType::Reference {
-                for i in 0..header.array_length() as usize {
-                    // SAFETY: i < array_length — inside the allocation.
-                    let raw =
-                        unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
-                    record(raw as usize);
-                }
+            for i in 0..walkable_elements {
+                // SAFETY: i < the region-clamped element count.
+                let raw = unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
+                record(raw as usize);
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
         }
+        true
     }
 
     /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
@@ -2510,7 +2684,7 @@ impl G1Collector {
         // JIT). Map each published root address to its region and exclude those
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         if gc_flags().g1_dbg_pins {
             eprintln!(
                 "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
@@ -2588,6 +2762,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -2601,6 +2776,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, young): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -2974,7 +3160,7 @@ impl G1Collector {
         // place) — see `young_collection` / `jit_pinned_region_set`. A mixed GC
         // can also select the (now promoted) region of a long-lived JIT-rooted
         // object, so this guard matters for both young and old CSet members.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
 
         // Build CSet: all young regions + worst old regions (skip pinned + any
         // region holding a conservative JIT root)
@@ -3062,6 +3248,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -3075,6 +3262,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, mixed): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -3590,7 +3788,7 @@ impl G1Collector {
         // move. Empty (free) unless a thread is in JIT, and the young path
         // only dispatches here when none is — this keeps the invariant even
         // if that gate is ever loosened or the fn is called directly.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -3758,7 +3956,7 @@ impl G1Collector {
         // bounded by both the percentage cap and the Step-7 pause budget —
         // identical selection to the serial `mixed_collection`.
         // Conservative-JIT-root region exclusion — see young_collection_parallel.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -4344,29 +4542,49 @@ impl G1Collector {
     /// direction for this guard: a false accept is only the pre-guard
     /// behaviour, whereas a false reject would drop a live reference.
     fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        self.classify_candidate_header(regions, addr).0 == HeaderVerdict::Object
+    }
+
+    /// [`Self::candidate_header_is_plausible`], but returning WHICH check said
+    /// no, plus the owning region index when there is one.
+    ///
+    /// The bool wrapper is what the hot guards call. This variant exists so the
+    /// two rejection warnings can name the failing step instead of reporting an
+    /// undifferentiated "not an object": "in-span but above the cursor" and
+    /// "in-span, below the cursor, but the tag bytes are garbage" are different
+    /// defects with different upstream producers, and a counter that cannot
+    /// tell them apart cannot start an investigation.
+    fn classify_candidate_header(
+        &self,
+        regions: &[G1Region],
+        addr: usize,
+    ) -> (HeaderVerdict, Option<usize>) {
         if addr == 0 || addr & 0x7 != 0 {
-            return false;
+            return (HeaderVerdict::NullOrUnaligned, None);
         }
         if addr < self.arena_base || addr >= self.arena_end {
-            return false;
+            return (HeaderVerdict::OutsideArena, None);
         }
         let region_size = self.config.region_size;
         if region_size == 0 {
-            return false;
+            return (HeaderVerdict::NoRegionGeometry, None);
         }
         let idx = (addr - self.arena_base) / region_size;
         let Some(r) = regions.get(idx) else {
-            return false;
+            return (HeaderVerdict::NoSuchRegion, None);
         };
         match r.region_type {
-            RegionType::Free => return false,
+            RegionType::Free => return (HeaderVerdict::RegionFree, Some(idx)),
             // A humongous continuation slice is live in its entirety; only the
             // start region carries the object's full `cursor`.
             RegionType::HumongousContinuation => {}
             _ => {
                 let base = r.data.as_ptr() as usize;
-                if addr < base || addr >= base + r.cursor {
-                    return false;
+                if addr < base {
+                    return (HeaderVerdict::BelowRegionBase, Some(idx));
+                }
+                if addr >= base + r.cursor {
+                    return (HeaderVerdict::AboveCursor, Some(idx));
                 }
             }
         }
@@ -4377,23 +4595,147 @@ impl G1Collector {
         // `is_object_address` does — this is the step that rejects a word which
         // is in-span but is not an object.
         let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
-            return false;
+            return (HeaderVerdict::BadKindTag, Some(idx));
         };
         if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
         {
-            return false;
+            return (HeaderVerdict::BadElementTag, Some(idx));
         }
         if kind == ObjectKind::HumongousFiller {
-            return false;
+            return (HeaderVerdict::HumongousFiller, Some(idx));
         }
         // SAFETY: tags validated above.
         let header = unsafe { &*(ptr as *const ObjectHeader) };
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
-        if kind == ObjectKind::Array {
+        let sane_shape = if kind == ObjectKind::Array {
             header.array_length() <= i32::MAX as u32
         } else {
             header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        };
+        if !sane_shape {
+            return (HeaderVerdict::ImplausibleShape, Some(idx));
         }
+        (HeaderVerdict::Object, Some(idx))
+    }
+
+    /// One line of context for a rejected address: the verdict, and what the
+    /// owning region looks like right now.
+    fn describe_rejected_address(&self, regions: &[G1Region], addr: usize) -> String {
+        let (verdict, idx) = self.classify_candidate_header(regions, addr);
+        match idx.and_then(|i| regions.get(i).map(|r| (i, r))) {
+            Some((i, r)) => {
+                let base = r.data.as_ptr() as usize;
+                format!(
+                    "verdict={verdict:?} region={i} type={:?} base=0x{base:x} cursor=0x{:x} \
+                     off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={} {}",
+                    r.region_type,
+                    r.cursor,
+                    addr.wrapping_sub(base),
+                    r.age,
+                    r.pinned,
+                    r.reuse_epoch,
+                    r.recycled_in_generation,
+                    self.locate_in_object_grid(r, addr),
+                )
+            }
+            None => format!("verdict={verdict:?} region=none"),
+        }
+    }
+
+    /// Count (and, for the first few, describe) a CSet-resident root that is not
+    /// the start of a live object. Returns whether it IS one, so the caller can
+    /// report what the evacuator then did with it.
+    ///
+    /// Measurement only — the caller's behaviour is unchanged.
+    fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
+        if self.candidate_header_is_plausible(regions, addr) {
+            return true;
+        }
+        let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] CSet ROOT is not an object (#{n}): addr=0x{addr:x} {}",
+                self.describe_rejected_address(regions, addr),
+            );
+        }
+        false
+    }
+
+    /// Where `addr` falls in its region's OWN object grid, walked linearly from
+    /// the region base exactly as `scan_source_region_for_cset_refs` walks it.
+    ///
+    /// This is the question that separates the candidate explanations for a
+    /// rejected address. "It is 0x18 bytes inside a live `class_id=42` object"
+    /// means someone produced an INTERIOR pointer; "it is inside a TLAB skip
+    /// span" means the address is in memory no object grid covers; "the walk
+    /// desynced before reaching it" means the region's own grid is broken and
+    /// the address is a symptom rather than the cause.
+    fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
+        let base = region.data.as_ptr() as usize;
+        if addr < base {
+            return "grid=below-base".to_string();
+        }
+        let target = addr - base;
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut offset = 0usize;
+        let mut objects = 0usize;
+        while offset < region.cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                if target < offset + skip {
+                    return format!("grid=IN-JIT-TLAB-SKIP span_start=0x{offset:x} len=0x{skip:x}");
+                }
+                offset += skip;
+                continue;
+            }
+            if let Some(gap) = gap_filler_len(obj_ptr) {
+                if target < offset + gap {
+                    return format!("grid=IN-TLAB-GAP-FILLER gap_start=0x{offset:x} len=0x{gap:x}");
+                }
+                offset += gap;
+                continue;
+            }
+            // The tag half of the real walk's validation (the region-bounds half
+            // is implied by the loop). A desync here is itself the answer, so
+            // report where it happened rather than guessing past it.
+            let ptr = obj_ptr as *const u8;
+            let kind_ok = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }.is_some();
+            let elem_ok =
+                unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }
+                    .is_some();
+            if !kind_ok || !elem_ok {
+                return format!(
+                    "grid=DESYNC-BEFORE-TARGET at=0x{offset:x} after={objects} objects \
+                     (target=0x{target:x})"
+                );
+            }
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if is_humongous_filler(header) {
+                return format!("grid=HUMONGOUS-FILLER at=0x{offset:x}");
+            }
+            let obj_size = object_total_size(header);
+            if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+                return format!(
+                    "grid=WALK-BROKE at=0x{offset:x} obj_size=0x{obj_size:x} after={objects} \
+                     objects (target=0x{target:x})"
+                );
+            }
+            if target == offset {
+                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x}");
+            }
+            if target < offset + obj_size {
+                return format!(
+                    "grid=INTERIOR of=0x{offset:x} delta=0x{:x} size=0x{obj_size:x} cid={} \
+                     kind={:?} idx={objects}",
+                    target - offset,
+                    header.class_id.as_u32(),
+                    header.kind(),
+                );
+            }
+            offset += obj_size;
+            objects += 1;
+        }
+        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x}")
     }
 
     fn scan_and_evacuate_refs(
@@ -4414,8 +4756,9 @@ impl G1Collector {
         if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
             let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_ptr as usize);
                 tracing::warn!(
-                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} {why} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
                     obj_ptr as usize,
                 );
             }
@@ -7975,6 +8318,70 @@ impl G1Collector {
         coverage_incomplete.filter(|_| lever_on)
     }
 
+    /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
+    /// not the start of a live object.
+    ///
+    /// The root array is over-approximate by design. `collect_roots` filters
+    /// operand-stack slots with `is_heap_addr` — a RANGE check — because the
+    /// strict `is_object_address` probe dropped genuine young / mid-init roots
+    /// when it was used there (2026-08-04). So a primitive `long` (a file size,
+    /// a hash, a computed interior address) whose bits land in the heap range is
+    /// handed to the collector as a root. For a NON-MOVING sweep that is safe:
+    /// a false positive only over-retains, which is what that comment says.
+    ///
+    /// A MOVING collector cannot leave it at that. The root loops screened a
+    /// root for CSet membership and nothing else, so `evacuate_object` read a
+    /// header at whatever address arrived, sized a memcpy from those bytes and
+    /// copied them (measured: 6-8 such roots per affected H2 pause, all COPIED,
+    /// and the copy then broke the destination region's object grid), installed
+    /// old→new in the pointer map — which the VM's post-GC remap then applies to
+    /// the very operand-stack slot the address came from, rewriting a Java
+    /// `long` — and, when to-space ran out instead, self-forwarded it into an
+    /// identity entry that `retry_after_evacuation_failure` picked up as a
+    /// "live self-forwarded seed".
+    ///
+    /// Evacuating such a root is unsound and so is skipping it, for the same
+    /// reason: the collector cannot tell a real reference from a long, so it may
+    /// neither rewrite the slot nor drop what it might point at. Pin the region
+    /// instead — precisely what this collector already does with a conservative
+    /// JIT root it cannot rewrite.
+    ///
+    /// **What this does not catch.** The screen reads the bytes AT the address,
+    /// so an interior pointer whose bytes happen to decode as a header is
+    /// indistinguishable from an object start — a zeroed field cell is the
+    /// standard example (`class_id=0, num_slots=0, kind=Object` sizes to exactly
+    /// `HEADER_SIZE`), and the rset-source walk documents the same hole. Every
+    /// non-object root measured on H2 was of the shape this DOES catch
+    /// (`BadElementTag`, `ImplausibleShape`), but "no such root reached the
+    /// evacuator" is not what this guarantees; "no root whose bytes are not a
+    /// header did" is.
+    fn pinned_region_set_including_non_object_roots(
+        &self,
+        regions: &[G1Region],
+        roots: &[ObjectRef],
+    ) -> std::collections::HashSet<usize> {
+        let mut set = self.jit_pinned_region_set();
+        for root in roots {
+            let addr = root.as_ptr() as usize;
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            if set.contains(&idx) || self.candidate_header_is_plausible(regions, addr) {
+                continue;
+            }
+            let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] root is not an object (#{n}): addr=0x{addr:x} {} — pinning region \
+                     {idx} instead of evacuating it.",
+                    self.describe_rejected_address(regions, addr),
+                );
+            }
+            set.insert(idx);
+        }
+        set
+    }
+
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
         let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
@@ -10109,6 +10516,250 @@ mod tests {
         assert!(
             matches!(gc.get_field(obj, 1), Value::Int(2)),
             "the dropped write must not have reached the object at all"
+        );
+    }
+
+    /// The root array is over-approximate on purpose (`collect_roots` screens
+    /// operand-stack slots with the RANGE check `is_heap_addr`, because the
+    /// strict probe dropped genuine young / mid-init roots), so a word that is
+    /// not an object start reaches the evacuator. It must neither be evacuated —
+    /// `evacuate_object` would size a memcpy from those bytes and install a
+    /// forwarding entry the VM's post-GC remap applies to the slot, rewriting a
+    /// Java `long` — nor be dropped, since the collector cannot prove it is not
+    /// a reference. Its region is pinned instead.
+    ///
+    /// Measured shape, on `org.h2.test.unit.TestValueMemory`: 6-8 such roots per
+    /// affected pause, every one of them COPIED before this fix.
+    #[test]
+    fn an_interior_pointer_root_pins_its_region_instead_of_being_evacuated() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 4);
+        let interior_addr = holder.as_ptr() as usize + HEADER_SIZE;
+
+        // Fabricate a header at the interior address whose TAG byte does not
+        // decode — the measured verdicts were `BadElementTag` /
+        // `ImplausibleShape`, i.e. bytes that are not a header at all.
+        // `object_total_size` still returns >= HEADER_SIZE for it, which is all
+        // the pre-fix evacuator checked before copying.
+        //
+        // SAFETY: `interior_addr` is the first field cell of a live 4-slot
+        // object this test owns, so both writes are in-bounds.
+        unsafe {
+            std::ptr::write(
+                interior_addr as *mut ObjectHeader,
+                ObjectHeader::new(
+                    ClassId::new(2),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                ),
+            );
+            (interior_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let interior = unsafe { ObjectRef::from_raw(interior_addr as *mut u8) };
+
+        let mut roots = vec![holder, interior];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            roots[1].as_ptr() as usize,
+            interior_addr,
+            "a root that is not an object must not be rewritten: the collector \
+             cannot tell it from a primitive long, and rewriting it changes a \
+             Java value"
+        );
+        assert!(
+            !result.pointer_map.contains_key(&interior_addr),
+            "no forwarding entry may be installed for a non-object address — the \
+             VM's post-GC remap applies the map to the very slot it came from"
+        );
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            holder.as_ptr() as usize,
+            "the cost of the pin, stated: the real object in that region does \
+             not move either"
+        );
+    }
+
+    /// The other arm: an ordinary root must NOT pin its region, or the fix above
+    /// would be satisfied by pinning everything and G1 would stop collecting.
+    #[test]
+    fn an_ordinary_object_root_does_not_pin_its_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = gc
+            .lookup_region_for_addr(obj.as_ptr() as usize)
+            .expect("the allocation is in a region");
+        let regions = gc.regions.lock();
+        assert!(
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[obj])
+                .contains(&idx),
+            "a real object root must leave its region collectable"
+        );
+        // The limitation, pinned so it cannot be forgotten: the screen reads the
+        // BYTES at the address, so an interior pointer whose bytes happen to
+        // decode is indistinguishable from an object start. A zeroed field cell
+        // is the standard example — `class_id=0, num_slots=0, kind=Object`
+        // yields exactly `HEADER_SIZE`, which is why the rset-source walk
+        // documents the same hole.
+        let zeroed_cell =
+            unsafe { ObjectRef::from_raw((obj.as_ptr() as usize + HEADER_SIZE) as *mut u8) };
+        assert!(
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[zeroed_cell])
+                .contains(&idx),
+            "a zeroed cell decodes as a plausible header — this screen cannot \
+             see it, and a test claiming otherwise would be describing a \
+             collector we do not have"
+        );
+
+        // What it DOES catch is the measured shape: bytes that do not decode.
+        let garbage_addr = obj.as_ptr() as usize + HEADER_SIZE;
+        // SAFETY: the first field cell of a live 1-slot object this test owns.
+        unsafe {
+            (garbage_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let garbage = unsafe { ObjectRef::from_raw(garbage_addr as *mut u8) };
+        assert!(
+            gc.pinned_region_set_including_non_object_roots(&regions, &[garbage])
+                .contains(&idx),
+            "an address whose tag bytes do not decode is not an object start"
+        );
+    }
+
+    /// A self-forwarded SEED handed to `record_outgoing_rset_edges` only has to
+    /// be region-RESIDENT to reach the walk — `lookup_region_for_addr` answers
+    /// "inside some region's span", not "is an object". A word above the
+    /// source region's allocation cursor satisfies the first and fails the
+    /// second, and the walk then reads an arbitrary `array_length` /
+    /// `num_slots` out of whatever bytes are there.
+    ///
+    /// That is the measured H2 crash (`TestKillProcessWhileWriting`,
+    /// `TestRandomMapOps`, both SIGSEGV at `addr=0x20084400000` with the fault
+    /// PC symbolizing to `collect_garbage -> retry_after_evacuation_failure ->
+    /// record_outgoing_rset_edges -> for_each_flat_object_reference`). Here the
+    /// fabricated header is deliberately *readable* so the pre-fix behaviour is
+    /// an observable wrong rset edge rather than a process-killing fault.
+    #[test]
+    fn kept_seed_rset_recording_refuses_a_non_object_seed() {
+        let gc = make_collector();
+        let live = gc.alloc_object(ClassId::new(1), 1);
+        let src_idx = gc
+            .lookup_region_for_addr(live.as_ptr() as usize)
+            .expect("the live allocation is in a region");
+
+        // A second live region to be the edge's TARGET: an edge is only
+        // recorded when the destination is a different, non-Free region.
+        let (dst_idx, target_addr) = {
+            let mut regions = gc.regions.lock();
+            let dst_idx = if src_idx + 1 < regions.len() {
+                src_idx + 1
+            } else {
+                src_idx - 1
+            };
+            regions[dst_idx].region_type = RegionType::Old;
+            regions[dst_idx].cursor = 4096;
+            let addr = regions[dst_idx].data.as_ptr() as usize;
+            (dst_idx, addr)
+        };
+
+        // The seed: inside the source region's span, above its cursor. The
+        // fabricated header is a one-element reference array pointing at the
+        // target region — what the pre-fix walk would have followed.
+        let seed_addr = {
+            let mut regions = gc.regions.lock();
+            let region = &mut regions[src_idx];
+            let addr = region.data.as_ptr() as usize + region.cursor + 64;
+            assert_eq!(addr & 0x7, 0, "seed must stay 8-aligned");
+            // SAFETY: `addr` is inside the region's own `region_size`-byte
+            // buffer (the cursor is far below it in a fresh collector), so both
+            // writes are in-bounds of an allocation this test owns.
+            unsafe {
+                std::ptr::write(
+                    addr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        ClassId::new(1),
+                        ObjectKind::Array,
+                        ArrayElementType::Reference,
+                        1,
+                        0,
+                    ),
+                );
+                std::ptr::write((addr + HEADER_SIZE) as *mut u64, target_addr as u64);
+            }
+            addr
+        };
+        assert_eq!(
+            gc.lookup_region_for_addr(seed_addr),
+            Some(src_idx),
+            "the seed has to be region-resident, or the walk would be skipped \
+             for the wrong reason and this test would pass vacuously"
+        );
+
+        let before = KEPT_SEED_REJECTED.load(Ordering::Relaxed);
+        {
+            let mut regions = gc.regions.lock();
+            gc.record_outgoing_rset_edges(&mut regions, seed_addr);
+        }
+
+        let regions = gc.regions.lock();
+        assert!(
+            !regions[dst_idx].rset.sources().contains(&src_idx),
+            "a seed above its region's allocation cursor is not an object; its \
+             fabricated header must not be walked, and no rset edge may be \
+             recorded from it"
+        );
+        assert_eq!(
+            KEPT_SEED_REJECTED.load(Ordering::Relaxed),
+            before + 1,
+            "the refusal must be counted, so a real run can be asked whether \
+             the guard ever fired"
+        );
+    }
+
+    /// The other arm of the same guard: a genuine live object seed is still
+    /// walked, and its cross-region edge is still recorded. Without this, the
+    /// test above could be satisfied by a `record_outgoing_rset_edges` that
+    /// refuses everything.
+    #[test]
+    fn kept_seed_rset_recording_still_records_a_real_object_seed() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let src_idx = gc
+            .lookup_region_for_addr(holder.as_ptr() as usize)
+            .expect("the live allocation is in a region");
+
+        let (dst_idx, target_addr) = {
+            let mut regions = gc.regions.lock();
+            let dst_idx = if src_idx + 1 < regions.len() {
+                src_idx + 1
+            } else {
+                src_idx - 1
+            };
+            regions[dst_idx].region_type = RegionType::Old;
+            regions[dst_idx].cursor = 4096;
+            let addr = regions[dst_idx].data.as_ptr() as usize;
+            (dst_idx, addr)
+        };
+
+        // Point the holder's only field at the other region.
+        // SAFETY: `target_addr` is the non-null base of a live region's buffer.
+        let target = unsafe { ObjectRef::from_raw(target_addr as *mut u8) };
+        gc.set_field(holder, 0, Value::Object(Some(target)));
+
+        {
+            let mut regions = gc.regions.lock();
+            gc.record_outgoing_rset_edges(&mut regions, holder.as_ptr() as usize);
+        }
+
+        let regions = gc.regions.lock();
+        assert!(
+            regions[dst_idx].rset.sources().contains(&src_idx),
+            "a real live seed's cross-region edge must still be remembered"
         );
     }
 

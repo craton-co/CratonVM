@@ -14333,7 +14333,60 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xb4 | 0xb5) {
         return precise_field_ops_enabled();
     }
+    if matches!(op, 0xb2 | 0xc0) {
+        return precise_getstatic_checkcast_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `getstatic` / `checkcast` may be treated as publishing a
+/// precise exceptional frame.
+///
+/// Both already did, on every path that can throw — this admission is a
+/// bookkeeping correction, not new codegen, exactly as
+/// `precise_field_ops_enabled` was for `getfield`/`putfield` (see
+/// `rbc6-protected-field-ops-FIXED-20260802`, where the exclusion had outlived
+/// its cause by five days).
+///
+/// `checkcast` (0xc0) has ONE lowering: it always calls `helpers.checkcast` and
+/// always follows it with `emit_post_invoke_exception_check(b'L')`, which
+/// records the reason-9 frame at the trapping bci whenever the pc is protected.
+/// A failed cast returns the `i64::MIN` sentinel through that same guard, so
+/// the CCE and the frame are published together.
+///
+/// `getstatic` (0xb2) has two, and neither leaves a handler without a frame:
+///
+/// * the helper arm calls `helpers.getstatic` and then
+///   `emit_post_invoke_exception_check(type_tag)`. That is the arm that can
+///   throw — the helper runs `<clinit>` on first touch and stashes
+///   `ExceptionInInitializerError`/`NoClassDefFoundError` behind the sentinel.
+/// * the inline arm (`try_emit_inline_getstatic`) emits a baked address plus
+///   two loads and no call at all. It is reached only when
+///   `resolve_static_base` answers, and the VM side of that resolver
+///   (`jit_resolve_static_base`) returns 0 unless
+///   `class_init_memo::is_initialized` already holds for the owning class.
+///   Initialization is monotonic in the JVM, so a site compiled on that arm can
+///   never later run `<clinit>`: it is a plain memory read that cannot throw,
+///   and a site that raises no exception cannot hand a handler an unpublished
+///   frame.
+///
+/// Deliberately NOT extended to `arraylength` (0xbe), the third opcode the
+/// WebSocket-latency investigation turned up. Its null check goes through
+/// `emit_null_check_arraylength` -> `emit_null_check_array_load`, which routes
+/// to the SHARED `null_check_store_stubs` stub — `jit_npe_with_action`, the
+/// deopt sentinel, and a plain epilogue, with no frame recorded at the bci.
+/// Admitting it would hand a handler a frame nobody wrote. Closing it means
+/// giving it a precise variant along the lines of
+/// `emit_precise_null_check_field_store`, and deciding what to do about the
+/// JEP-358 action code (`ARRAY_LENGTH`) that the reason-10 stub path does not
+/// currently carry.
+///
+/// `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST=1` withdraws the admission so
+/// one binary can be A/B'd against its own pre-change behaviour; comparing
+/// against a separately built branch would confound this with everything else
+/// that landed.
+fn precise_getstatic_checkcast_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST").is_none()
 }
 
 /// Whether a protected `getfield`/`putfield` may be treated as publishing a
@@ -14445,9 +14498,22 @@ fn first_unsupported_precise_frame_site(
     // the fixture says so in its own comment. On the Hibernate concurrency
     // workload it is one of five distinct opcodes blocking five of the hottest
     // still-interpreted methods (`reason=rbc6-handler-reads-unsafe-local`, which
-    // now names the pc and opcode). The other four — `new` (0xbb), `ldc` (0x12),
-    // `getstatic` (0xb2) and `athrow` (0xbf) — genuinely throw and stay here
-    // until their lowerings publish the snapshot.
+    // now names the pc and opcode).
+    //
+    // 2026-08-11: `getstatic` (0xb2) has left that list too, along with
+    // `checkcast` (0xc0) — both were ALREADY publishing on every path that can
+    // throw and were simply never revisited here, the same way `getfield`/
+    // `putfield` outlived their exclusion by five days in
+    // `rbc6-protected-field-ops-FIXED-20260802`. The argument for each is on
+    // `precise_getstatic_checkcast_enabled`. They stay listed in the
+    // `may_throw_without_precise_frame` set below — that set is the CANDIDATE
+    // set, and `precise_frame_publishing_opcode` is what exempts them.
+    //
+    // Still genuinely blocking, because their lowerings really do not publish:
+    // `new` (0xbb), `ldc` (0x12), `athrow` (0xbf), and `arraylength` (0xbe) —
+    // the last routes its NPE through the SHARED null-check stub, which records
+    // no frame at the bci. It was the one site blocking Tomcat's
+    // `IntrospectionUtils.setProperty` in the WebSocket-latency run.
     let may_throw_without_precise_frame = |op: u8| {
         matches!(
             op,
@@ -19307,6 +19373,98 @@ mod code_buffer_retry_tests {
 #[cfg(test)]
 mod tests {
 
+    /// RBC.6's admission list must match what the lowerings actually publish.
+    ///
+    /// The failure mode this pins is asymmetric. Admitting an opcode whose
+    /// lowering does NOT publish hands a handler a frame nobody wrote — a
+    /// miscompile that only surfaces when an exception really crosses that
+    /// site. Excluding one that DOES publish is invisible: the method just
+    /// stays interpreted forever, which is how `getfield`/`putfield` sat for
+    /// five days after their capability landed, and `getstatic`/`checkcast`
+    /// sat until 2026-08-11 while they held down Tomcat's WebSocket send path.
+    #[test]
+    fn rbc6_admits_exactly_the_opcodes_whose_lowerings_publish() {
+        // Publishes via `emit_post_invoke_exception_check` (reason-9) on every
+        // throwing path, or cannot throw at all.
+        for op in [
+            0xb2u8, // getstatic  — helper arm publishes; inline arm needs an
+            //           already-initialized class and so cannot throw
+            0xb4, // getfield
+            0xb5, // putfield
+            0xb6, // invokevirtual
+            0xb7, // invokespecial
+            0xb8, // invokestatic
+            0xb9, // invokeinterface
+            0xc0, // checkcast   — single arm, always publishes
+            0xc2, // monitorenter
+            0xc3, // monitorexit
+        ] {
+            assert!(
+                super::precise_frame_publishing_opcode(op),
+                "opcode {op:#04x} publishes a precise frame but is not admitted —                  every method with one in a protected range stays interpreted"
+            );
+        }
+
+        // Do NOT publish. `arraylength` routes its NPE through the shared
+        // `null_check_store_stubs` stub (`jit_npe_with_action` + sentinel +
+        // epilogue), which records nothing at the bci; `new`, `ldc` and
+        // `athrow` are the other three named on
+        // `first_unsupported_precise_frame_site`.
+        for op in [
+            0x12u8, // ldc
+            0x13,   // ldc_w
+            0xbb,   // new
+            0xbe,   // arraylength
+            0xbf,   // athrow
+        ] {
+            assert!(
+                !super::precise_frame_publishing_opcode(op),
+                "opcode {op:#04x} does not publish a precise frame — admitting it                  hands a handler a frame that was never written"
+            );
+        }
+    }
+
+    /// The candidate set and the exemption are different questions.
+    ///
+    /// `getstatic`/`checkcast` stay in `may_throw_without_precise_frame` (they
+    /// really can throw); what changed is that
+    /// `precise_frame_publishing_opcode` now exempts them. A protected
+    /// `checkcast` must therefore no longer refuse a compile, while a protected
+    /// `arraylength` still must.
+    #[test]
+    fn rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+        // One protected range covering the whole body.
+        let table = [ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 4,
+            handler_pc: 4,
+            catch_type: 0,
+        }];
+        // `checkcast #0` (3 bytes) then `nop`.
+        let checkcast = [0xc0u8, 0x00, 0x00, 0x00];
+        assert_eq!(
+            super::first_unsupported_precise_frame_site(&checkcast, checkcast.len(), &table),
+            None,
+            "a protected checkcast must no longer refuse the compile"
+        );
+        // `getstatic #0` (3 bytes) then `nop`.
+        let getstatic = [0xb2u8, 0x00, 0x00, 0x00];
+        assert_eq!(
+            super::first_unsupported_precise_frame_site(&getstatic, getstatic.len(), &table),
+            None,
+            "a protected getstatic must no longer refuse the compile"
+        );
+        // `aload_0; arraylength` — still unsupported, and reported AT the
+        // arraylength, which is the actionable half of the bail message.
+        let arraylength = [0x2au8, 0xbe, 0x00, 0x00];
+        assert_eq!(
+            super::first_unsupported_precise_frame_site(&arraylength, arraylength.len(), &table),
+            Some((1, 0xbe)),
+            "a protected arraylength must still refuse, at its own pc"
+        );
+    }
+
     /// Two VMs, two answers — the property JDK-ONLY-WAVE2 §2 was filed about.
     ///
     /// `direct_native_helper`'s policy input used to be the process-global
@@ -19532,6 +19690,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -19759,6 +19918,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -19837,6 +19997,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21042,6 +21203,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21186,6 +21348,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21278,6 +21441,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21398,6 +21562,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21522,6 +21687,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21588,6 +21754,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -21666,6 +21833,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -24782,6 +24950,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -25417,6 +25586,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -25436,6 +25606,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -25566,6 +25737,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -26609,8 +26781,41 @@ mod tests {
             None
         );
 
-        // The neighbour it used to share a range arm with is UNCHANGED:
-        // `checkcast` (0xc0) does throw, and the site must still be named.
+        // The contrast case needs an opcode that genuinely still withholds.
+        //
+        // It used to be `checkcast` (0xc0), which was a valid foil until
+        // 2026-08-11: `checkcast` throws, but its ONE lowering always follows
+        // `helpers.checkcast` with `emit_post_invoke_exception_check`, so it
+        // was publishing all along and is now admitted
+        // (`precise_getstatic_checkcast_enabled`). Using it here would assert
+        // the opposite of what the backend does.
+        //
+        // `arraylength` (0xbe) is the honest replacement: it throws NPE on a
+        // null array through `emit_null_check_arraylength` ->
+        // `emit_null_check_array_load`, which routes to the SHARED
+        // `null_check_store_stubs` stub — `jit_npe_with_action`, the deopt
+        // sentinel, a plain epilogue, and no frame recorded at the bci.
+        let mut with_arraylength = code.clone();
+        with_arraylength.splice(1..1, [0xbe]);
+        let al_table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 14,
+            handler_pc: 14,
+            catch_type: 0,
+        }];
+        assert_eq!(
+            first_unsupported_precise_frame_site(
+                &with_arraylength,
+                with_arraylength.len(),
+                &al_table,
+            ),
+            Some((1, 0xbe)),
+            "arraylength must still withhold coverage, and must name its own pc"
+        );
+
+        // And the opcode that changed sides must now be clear, in the same
+        // shape the old assertion used — so this test fails if the admission
+        // is ever reverted without revisiting the argument for it.
         let mut with_checkcast = code.clone();
         with_checkcast.splice(1..1, [0xc0, 0x00, 0x03]);
         let cc_table = vec![ExceptionTableEntry {
@@ -26625,8 +26830,8 @@ mod tests {
                 with_checkcast.len(),
                 &cc_table,
             ),
-            Some((1, 0xc0)),
-            "checkcast must still withhold coverage, and must name its own pc"
+            None,
+            "checkcast publishes via emit_post_invoke_exception_check and must be admitted"
         );
     }
 

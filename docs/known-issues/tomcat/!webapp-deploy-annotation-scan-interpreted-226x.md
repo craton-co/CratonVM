@@ -248,6 +248,149 @@
 > all after this change, so the push-side move is either already elided by the
 > compiler or below 0.5%. Re-measure before building it.
 >
+> ### Second piece taken: the interception chain is classified once per call site
+>
+> `intercept_force_registered_native_cached` runs on every inline-cache hit.
+> Below its memoized `force_native_cache` sat three arms still evaluated from
+> scratch every time, and **every one of their keys is a function of the call
+> site's own triple**:
+>
+> * a `ClassLoader` null-resource re-target — `(method_name, descriptor)`
+>   against three pairs;
+> * a `java/lang/Class` reflection re-target — the same pair against four more;
+> * `real_http_url_connection_native`, whose *entire* gate is `class_name`
+>   against five literals.
+>
+> `CachedBytecodeMethod` now carries an `intercept_shape_cache: OnceLock<u8>`
+> classifying the triple against all three, once. The argument- and
+> receiver-dependent halves are untouched: a set bit still runs the original
+> test in full, and a clear bit skips a test whose name-keyed half could not
+> have matched.
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `intercept_force_registered_native_cached` | 1.44% | **0.99%** |
+> | `real_http_url_connection_native` | 1.29% | **absent** |
+> | **total** | **2.73%** | **0.99%** |
+>
+> **-1.74 percentage points, a 64% cut**, and one function leaves the hot path
+> entirely. Wall clock, four interleaved passes at load 20: before mean 318 ns
+> per invoke (303-344), after 300.5 (275-326) — the ranges overlap, so as with
+> the frame change the mechanism is the evidence and the wall clock is not.
+> 2490 unit tests and the 38-class regression suite green.
+>
+> **A recorded negative, because it is the interesting half.** The first
+> version added a `shape == 0` early return into a shared tail function, on the
+> reasoning that the common call site should not even step over three bit
+> tests. Measured, that was **worse than leaving the control flow alone**:
+> entry 1.05% + tail 1.12% = 2.17%, against 0.99% for the same string-work
+> removal with the arms guarded in place and no split. The function boundary
+> cost more than the three bit tests it skipped. The comment in
+> `intercept_force_registered_native_cached` says so, so the shortcut does not
+> get reinvented.
+>
+> ### Third piece: half the per-invoke class-manager lock, and a working instrument
+>
+> **The instrument first.** `--call-graph=dwarf` could not attribute this: it
+> named two inlined callers, `intercept_classloader_set_default_assertion_status`
+> and `init_locals_from_parts`, and **neither takes a lock** (checked against
+> the source). `--no-inline` collapsed the chains to the symbol itself with one
+> arm at a bare `0x18700000000` — the unwinder had no usable parents at all.
+> A rebuild with `RUSTFLAGS="-C force-frame-pointers=yes"` and
+> `perf record --call-graph=fp` named the caller immediately and correctly.
+> **Use a frame-pointer build for any call-graph question on this binary.**
+>
+> It put both acquisitions directly in `execute_invokevirtual_cached`:
+> `try_read` 1.85%, `read` 1.43%, read-guard `drop_glue` 1.28%.
+>
+> **What `try_read` was.** The virtual tier-up gate computed two predicates
+> into `let` bindings *above* the `if` that consumes them:
+> `has_registered_native` (a `NativeMethodRegistry` resolve) and
+> `receiver_is_java_util` (class-manager `try_read` + `get_class` +
+> `starts_with("java/util/")`). The `&&` chain below them is ordered cheapest-
+> first and short-circuits — but eager `let`s never see it. Under `--nojit`,
+> where `!disable_jit()` makes the chain fail several conditions earlier, the
+> work was done anyway, on **every cached invoke in the VM**, to decide an
+> optional tier-up that could not happen.
+>
+> Both are now closures called in place in the chain, and
+> `has_registered_native()` is ordered after the JIT kill-switch. Every
+> condition here is a pure predicate, so `&&` may order them freely.
+>
+> `try_read` **disappears from the profile entirely**. And with the host
+> finally quiet (load 3.5), six interleaved passes, arm order reversed each
+> pass, ns per interpreted invoke:
+>
+> | | p1 | p2 | p3 | p4 | p5 | p6 | mean |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | before | 203 | 202 | 201 | 201 | 201 | 202 | **201.7** |
+> | after | 193 | 195 | 194 | 193 | 194 | 195 | **194.0** |
+>
+> **-3.8%, 6/6, and no overlap between the two columns** — the first fully
+> separated wall-clock reading in this whole sequence, which is what a quiet
+> host buys and nothing else does. 2490 unit tests and the 38-class regression
+> suite green.
+>
+> **The other half is now attributed, not fixed.** The remaining `::read`
+> (2.01%, same function) is `dispatch_virtual.rs`'s annotation-proxy gate: on
+> every non-`invokespecial` virtual invoke it takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against the
+> single literal `"java/lang/annotation/AnnotationProxy"`. Unlike the tier-up
+> predicates it is a **correctness** gate consumed immediately, so it cannot be
+> deferred — it has to become an identity test. Resolve that one class's
+> `ClassId` once and compare ids; a name comparison per invoke is also exactly
+> the shape `reference_class_name_shape_tests_are_dispatch_bugs` warns about.
+> It needs generation-aware memoization (a class defined later must not be
+> missed), which is why it is recorded here rather than guessed at.
+>
+> ### The annotation-proxy gate: scoped, and why it is a cache-population change
+>
+> The last named item, ~2.0% of the invoke arm. On every non-`invokespecial`
+> virtual invoke `execute_invokevirtual_cached` takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against one
+> literal, `"java/lang/annotation/AnnotationProxy"`, to decide whether to force
+> a `CacheMiss`.
+>
+> Two things were checked before proposing anything, and both change the answer:
+>
+> * **It cannot be memoized on `CachedBytecodeMethod`**, which is where the
+>   other two per-call-site memos on this path live
+>   (`force_native_cache`, `intercept_shape_cache`). That struct describes the
+>   resolved *target method*, whose declaring class is frequently a supertype —
+>   an `AnnotationProxy` receiver calling an inherited `Object` method shares
+>   its entry with every other receiver of that method. A bit cached there
+>   would answer for the wrong class.
+> * **It cannot be deferred** the way the tier-up predicates were. Those gate an
+>   optional promotion; this one is consumed immediately and decides
+>   correctness.
+>
+> What makes it tractable is the branch above it: when
+> `actual_class_id != receiver_class_id` the code either rebinds to the
+> polymorphic entry **for `actual_class_id`** or returns `CacheMiss`. So by the
+> time the gate runs, the live `CachedInvokeTarget::VirtualBytecode` is the
+> entry for exactly this receiver class — and "is this receiver class the
+> annotation proxy" is a **per-cache-entry constant**.
+>
+> **So the fix is to compute it once at cache-population time**
+> (`populate_virtual_invoke_cache` already holds the class manager) and store a
+> bool on the `VirtualBytecode` variant, leaving the hit path a field test.
+> Entry invalidation is already handled by `entry_gate.generation`, so this
+> needs no epoch key of its own — unlike the alternative of a global
+> `ClassId`-keyed memo, which would have to answer two questions this
+> investigation has not: whether that name can be defined under more than one
+> loader, and whether a `ClassId` can be recycled after class unloading
+> (`RClassUnloadSweep` says unloading exists). Guessing either one wrong in a
+> correctness gate is the failure mode this page already documents five times.
+>
+> It touches `CachedInvokeTarget` — a hot enum cloned on every cache hit — and
+> every site that constructs the variant, which is why it is scoped here rather
+> than done alongside the three smaller fixes above. `class_definition_epoch()`
+> (one `Acquire` load) is the right key if a global memo is chosen instead.
+>
+> **Coordinate first**: `fix/jdk-only-strict-annotation-proxy-20260811` was an
+> active worktree while this was written and is likely editing the same
+> predicate for policy reasons.
+>
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
 > inside `execute_invokevirtual_cached`, which would have been a spectacular

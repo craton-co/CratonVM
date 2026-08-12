@@ -8199,15 +8199,30 @@ pub(crate) fn fjp_state_get(o: ObjectRef) -> (bool, Value) {
 /// and `join()`/`get()` handed back `v` instead of raising — a fabricated
 /// success for a task the caller had explicitly failed. Nothing clears `thrown`
 /// any more. The one real API that DOES reset a task's status is
-/// `reinitialize()` (`aux = null; status &= 1<<24`), and this VM registers no
-/// native for it, so no caller here wants the reset.
+/// `reinitialize()` (`aux = null; status &= 1<<24`), which as of W6-9 §7.2 IS
+/// registered — by `register_forkjointask_w6_9_residual_bridge`, and it drops
+/// the side-table entry rather than reaching through this function. No caller
+/// here wants the reset.
 ///
 /// A cancelled task stays cancelled and keeps its null result: `cancel()`
 /// already completed it, and the real `setDone()` likewise cannot clear
-/// `CANCELLED` once `trySetCancelled` has stamped it. (The real `setRawResult`
-/// inside `complete` IS still executed for a cancelled task, so this diverges
-/// on a bare `getRawResult()` alone — `join()`/`get()` raise
-/// `CancellationException` either way.)
+/// `CANCELLED` once `trySetCancelled` has stamped it. The real `setRawResult`
+/// inside `complete` IS still executed for a cancelled task; that half is
+/// [`fjp_state_set_raw_result`], which `fjp_complete_body` now calls first, so
+/// a bare `getRawResult()` no longer diverges (W6-9 §7.4).
+/// The `setRawResult(v)` half of `complete(V)`, for a receiver whose
+/// raw-result slot IS the side table.
+///
+/// Split out from [`fjp_state_set_done`] because the two halves have different
+/// write-once rules: `setDone()` ORs into a status word that `trySetCancelled`
+/// has already stamped, so it is suppressed on a cancelled task — but
+/// `setRawResult` is an ordinary virtual call that the real `complete(V)` runs
+/// before it, cancelled or not.
+pub(crate) fn fjp_state_set_raw_result(o: ObjectRef, result: Value) {
+    let mut m = fjp_state().lock();
+    m.entry(fjp_key(o)).or_insert_with(FjpEntry::new).result = result;
+}
+
 pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
     let mut m = fjp_state().lock();
     {
@@ -8881,6 +8896,13 @@ fn fjp_complete_body(
     val: Value,
 ) -> Result<(), MethodCallFailed> {
     if !fjt_has_own_raw_result_slot(ctx, this) {
+        // `setRawResult(v); setDone();` — as two calls, because only the
+        // second is write-once. The real `complete(V)` runs `setRawResult`
+        // BEFORE `setDone()`, cancelled or not; suppressing both made
+        // `t.cancel(false); t.complete(v); t.getRawResult()` answer null where
+        // the real one answers `v` (W6-9 §7.4). `fjp_state_set_done` re-stores
+        // `result` for the ordinary path, which is the same value.
+        fjp_state_set_raw_result(this, val);
         fjp_state_set_done(this, val);
         return Ok(());
     }
@@ -9900,20 +9922,17 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "java/util/concurrent/RecursiveTask",
         "java/util/concurrent/RecursiveAction",
     ] {
-        r.register(
-            task_class,
-            "getException",
-            "()Ljava/lang/Throwable;",
-            |_ctx, args| {
-                let this = obj_arg(args, 0)?;
-                Ok(Some(match fjp_state_thrown(this) {
-                    Some(t) => Value::Object(Some(t)),
-                    None => Value::Object(None),
-                }))
-            },
-        );
+        // `getException()` is registered by
+        // `phases_late::concurrent::register_forkjointask_w6_9_residual_bridge`,
+        // which runs later on both boot paths — the body that used to be here
+        // answered null for a cancelled task, contradicting the
+        // `isCompletedAbnormally()` that reads the same side table (W6-9 §7.1).
+        // Do not re-add one: registration is last-write-wins, so a copy here
+        // would look live and be dead, and would also cost the duplicate-
+        // registration gate three shadowed rows per task class.
+        //
         // W6-9: `completeExceptionally(Throwable)` — the WRITER for the record
-        // `getException()` above reads. It was registered nowhere and named in
+        // `getException()` reads. It was registered nowhere and named in
         // neither allow-list, so real bytecode CASed the real `aux`/`status`
         // fields that nothing here reads: the task stayed `done == false`, the
         // next `join()` ran its body, and the trio `getException()` /
@@ -14219,6 +14238,245 @@ pub(crate) const CIPHER_IV: usize = 3;
 const CIPHER_ACCUM: usize = 4;
 const CIPHER_AAD: usize = 5;
 
+/// Return a FRESH copy of the `byte[]` in slot `idx`, so key material never
+/// leaves a native accessor as a live reference into the object.
+///
+/// The real key classes all end `return this.key.clone()`, and the javadoc says
+/// why: "The contents of the array are copied to protect against subsequent
+/// modification." Handing the stored array back is not a shortcut — it lets a
+/// caller zero a key through its own accessor, and it is one half of the
+/// mechanism that produced an all-zero AES key
+/// (W7-21-keygen-and-the-synthetic-secretkeyspec-twin.md).
+///
+/// A slot that does not hold an array reference answers null. Several unrelated
+/// key carriers in this file keep an `Int` at slot 0 (the legacy keystore
+/// shape), and the previous code returned that `Int` straight out of a method
+/// declared `()[B` — a null is at least a value the descriptor admits.
+fn clone_key_bytes_field(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    idx: usize,
+) -> Option<ObjectRef> {
+    let src = match ctx.get_field(obj, idx) {
+        Value::Object(Some(arr)) => arr,
+        // Not an array reference — leave the historical answer alone.
+        other => return other.as_object(),
+    };
+    let len = ctx.array_length(src);
+    let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
+    for i in 0..len {
+        ctx.set_array_element(copy, i, ctx.get_array_element(src, i));
+    }
+    Some(copy)
+}
+
+/// The algorithm a synthetic key carries in slot 1, or `"AES"` if slot 1 holds
+/// something else.
+///
+/// The fallback preserves what this file answered for every carrier before the
+/// algorithm was recorded at all; only `KeyGenerator.generateKey` writes a
+/// String there.
+fn carrier_algorithm(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Value {
+    if let Value::Object(Some(s)) = ctx.get_field(obj, 1) {
+        if ctx.read_string(s).is_some() {
+            return Value::Object(Some(s));
+        }
+    }
+    Value::Object(Some(ctx.create_string("AES")))
+}
+
+/// SunJCE's per-algorithm default key size in BITS, for `KeyGenerator`.
+///
+/// Every row measured on HotSpot 25 (`KeyGenerator.getInstance(a).generateKey()
+/// .getEncoded().length * 8`), not recalled — the defaults are not a family
+/// rule and several are surprising. `HmacSHA1` defaults to its 512-bit BLOCK
+/// size while `HmacSHA224`/`384`/`512` default to their digest size, and AES
+/// has defaulted to 256 since JDK 21.
+///
+/// `None` means refuse. This is the same rule the `Cipher` admission table
+/// follows and for the same reason: a default arm here is how
+/// `KeyGenerator.getInstance("Blowfish")` came to answer with a key generated
+/// under a different algorithm's rules. The set below is exactly the set
+/// HotSpot's SunJCE serves; every one of them is a plain random-byte key except
+/// DES and DESede, whose parity rule `des_set_odd_parity` implements.
+fn keygen_default_bits(algo: &str) -> Option<i32> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AES" => Some(256),
+        "DESEDE" | "TRIPLEDES" => Some(168),
+        "DES" => Some(56),
+        "CHACHA20" => Some(256),
+        "BLOWFISH" | "RC2" | "ARCFOUR" | "RC4" => Some(128),
+        "HMACSHA1" | "HMACMD5" => Some(512),
+        "HMACSHA224" => Some(224),
+        "HMACSHA256" => Some(256),
+        "HMACSHA384" => Some(384),
+        "HMACSHA512" => Some(512),
+        _ => None,
+    }
+}
+
+/// The key sizes in BITS an algorithm's `KeyGenerator.init(int)` accepts, or
+/// `None` if any positive multiple of 8 is allowed (the HMAC family).
+///
+/// Measured refusals, in HotSpot 25's exact wording:
+///
+/// ```text
+/// AES    init(129) -> InvalidParameterException: Wrong keysize: must be equal to 128, 192 or 256
+/// DESede init(128) -> InvalidParameterException: Wrong keysize: must be equal to 112 or 168
+/// ```
+fn keygen_allowed_bits(algo: &str) -> Option<(&'static [i32], &'static str)> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AES" => Some((&[128, 192, 256], "must be equal to 128, 192 or 256")),
+        "DESEDE" | "TRIPLEDES" => Some((&[112, 168], "must be equal to 112 or 168")),
+        "DES" => Some((&[56], "must be equal to 56")),
+        "CHACHA20" => Some((&[256], "must be equal to 256")),
+        _ => None,
+    }
+}
+
+/// The number of key BYTES an algorithm produces for a given key size in bits.
+///
+/// DESede is the one algorithm where these disagree: a "168-bit" DESede key is
+/// **24 bytes**, and a "112-bit" one is also 24 bytes. The missing bits are the
+/// per-byte parity bits, which are carried but not counted. Measured on
+/// HotSpot 25 — `init(112)` and `init(168)` both yield `getEncoded().length ==
+/// 24` — which is why `key_size / 8` was wrong here and would have produced a
+/// 14-byte "DESede key" that is not a DESede key at all.
+fn keygen_byte_len(algo: &str, key_size_bits: i32) -> usize {
+    match algo.to_ascii_uppercase().as_str() {
+        "DESEDE" | "TRIPLEDES" => 24,
+        "DES" => 8,
+        _ => (key_size_bits / 8) as usize,
+    }
+}
+
+/// Force odd parity on the 8 bytes at `offset`, as DES keys require: the low
+/// bit of each byte is set so that the byte's population count is odd.
+///
+/// This is SunJCE's `DESKeyGenerator.setParityBit`, and it is the reason a
+/// DESede key cannot be 21 random bytes widened. The rule was VERIFIED rather
+/// than recalled: applied to a fixed buffer it produces a value the JDK's own
+/// checker accepts, identically on HotSpot 25 and on this VM —
+///
+/// ```text
+/// raw24    = 00070e151c232a31383f464d545b626970777e858c939aa1
+/// parity24 = 01070e151c232a31383e464c545b626870767f858c929ba1
+/// javax.crypto.spec.DESedeKeySpec.isParityAdjusted(parity24, 0) == true
+/// ```
+///
+/// — which is the vector pinned by `des_parity_matches_the_jdk_checker` below.
+fn des_set_odd_parity(key: &mut [u8], offset: usize) {
+    for byte in key.iter_mut().skip(offset).take(8) {
+        if (*byte & 0xfe).count_ones() % 2 == 0 {
+            *byte |= 1;
+        } else {
+            *byte &= 0xfe;
+        }
+    }
+}
+
+/// Turn `len` raw CSPRNG bytes into a valid key for `algo`.
+///
+/// For everything but DES/DESede a key IS its random bytes. The two DES
+/// families need their parity bits, and 2-key Triple DES additionally needs its
+/// shape: SunJCE's `DESedeKeyGenerator` draws only 16 bytes for `init(112)` and
+/// copies the first 8 into the last 8, so K3 == K1. Measured on HotSpot 25 over
+/// three runs — `init(112)` gave `K3==K1: true, K2==K1: false` every time, and
+/// `init(168)` gave `K3==K1: false` — and `DESedeKeySpec.isParityAdjusted` was
+/// true for both.
+fn keygen_condition_key(algo: &str, key: &mut [u8]) {
+    match algo.to_ascii_uppercase().as_str() {
+        "DES" => des_set_odd_parity(key, 0),
+        "DESEDE" | "TRIPLEDES" => {
+            des_set_odd_parity(key, 0);
+            des_set_odd_parity(key, 8);
+            des_set_odd_parity(key, 16);
+        }
+        _ => {}
+    }
+}
+
+/// The 2-key Triple DES shape: K3 := K1. Applied only for `init(112)`.
+fn keygen_fold_two_key_desede(key: &mut [u8]) {
+    if key.len() == 24 {
+        let (head, tail) = key.split_at_mut(16);
+        tail.copy_from_slice(&head[..8]);
+    }
+}
+
+/// The algorithm a `KeyGenerator` synthetic recorded at `getInstance`.
+fn keygen_algorithm_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// `KeyGenerator.getInstance(String)`, `(String, String)` and
+/// `(String, Provider)` — one body for all three.
+///
+/// The two provider-bearing overloads ignore the provider argument: this VM has
+/// one implementation per algorithm, so "BC" and "SunJCE" yield the same bytes.
+/// What none of them may do is accept an algorithm this VM cannot generate for.
+///
+/// One body because there were three, and three copies of a default is how the
+/// default goes wrong in only some of them. Here they had already agreed on the
+/// wrong answer (128 for everything); the next edit is the one that would have
+/// split them.
+fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let algo = obj_arg(args, 0)?;
+    let algo_str = ctx.read_string(algo).unwrap_or_default();
+    let bits = match keygen_default_bits(&algo_str) {
+        Some(bits) => bits,
+        None => {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("{algo_str} KeyGenerator not available"),
+            ))
+        }
+    };
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
+    ctx.set_field(obj, 0, Value::Object(Some(algo)));
+    ctx.set_field(obj, 1, Value::Int(bits));
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// `KeyGenerator.init(int)` and `init(int, SecureRandom)`.
+///
+/// The size was previously stored unchecked, so `init(129)` on AES produced a
+/// 16-byte key (129/8 truncating) under a name the caller believed was 129
+/// bits, and `init(128)` on DESede produced a 16-byte "DESede key". HotSpot
+/// refuses both with `InvalidParameterException`, whose wording is measured in
+/// `keygen_allowed_bits`. An algorithm with no fixed set (the HMAC family)
+/// accepts any positive multiple of 8, which is the JCE rule and what HotSpot
+/// does — `HmacSHA256` really will hand back a 64-bit key for `init(64)`.
+fn keygen_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let algo = keygen_algorithm_of(ctx, this);
+    let key_size = args
+        .get(1)
+        .and_then(|v| v.as_int())
+        .unwrap_or_else(|| keygen_default_bits(&algo).unwrap_or(128));
+    if let Some((allowed, wording)) = keygen_allowed_bits(&algo) {
+        if !allowed.contains(&key_size) {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/InvalidParameterException",
+                &format!("Wrong keysize: {wording}"),
+            ));
+        }
+    } else if key_size <= 0 || (key_size & 7) != 0 {
+        return Err(throw_jca_exc(
+            ctx,
+            "java/security/InvalidParameterException",
+            &format!("Wrong keysize: {key_size}"),
+        ));
+    }
+    ctx.set_field(this, 1, Value::Int(key_size));
+    Ok(None)
+}
+
 pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14447,11 +14705,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(out)))
         }
     });
-    // getIV() -> byte[]
-    r.register(cipher, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, CIPHER_IV)))
-    });
+    // getIV() -> byte[] — DELETED, see `jca::cipher::register_cipher_dispatch`.
+    //
+    // The third aliasing accessor in this registrar, and superseded like the
+    // other two: real `Cipher.getIV` ends `return (iv == null) ? null :
+    // iv.clone()` in the SPI (`CipherCore.getIV`, JDK 25 src.zip), this copy
+    // handed back the stored array, and `jca::cipher`'s copy — which registers
+    // after this one and therefore wins — builds a fresh array from its own
+    // side table. An IV a caller can rewrite in place after `init` is a nonce
+    // that can be made to repeat, which for GCM is a key-recovery bug rather
+    // than an untidiness.
     // Constants — KEEP. These are `static final int` FIELD reads (note the "I"
     // field descriptor, not a method descriptor), and 1/2/3/4 are the literal
     // values `javax.crypto.Cipher` declares. A constant is the correct
@@ -14469,58 +14732,39 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(4)))
     });
 
-    // --- javax.crypto.spec.IvParameterSpec — 1-field (iv=0 byte[]) ---
-    let ivps = "javax/crypto/spec/IvParameterSpec";
-    r.register(ivps, "<init>", "([B)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Copy the IV bytes
-        let iv_arr = obj_arg(args, 1)?;
-        let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
-        for i in 0..len {
-            ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
-        }
-        ctx.set_field(this, 0, Value::Object(Some(copy)));
-        Ok(None)
-    });
-    r.register(ivps, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    // --- IvParameterSpec / GCMParameterSpec — DELETED, same reason as SecretKeySpec ---
+    //
+    // Five more registrations (`IvParameterSpec.<init>`/`getIV`,
+    // `GCMParameterSpec.<init>`/`getIV`/`getTLen`) that duplicated
+    // `jca::cipher::register_param_specs` exactly, and lost to it in the one
+    // mode where they registered at all — see the SecretKeySpec tombstone at
+    // the end of this function for the ordering argument. Both `getIV` copies
+    // here handed back the STORED array; the surviving pair clones, because
+    // the real classes end `return this.iv.clone()`. A GCM nonce a caller can
+    // edit in place after the fact is not the same class of disaster as an
+    // all-zero key, but it is the same aliasing mistake, and it is now gone
+    // from this file rather than fixed twice.
 
-    // --- javax.crypto.spec.GCMParameterSpec — 2-field (iv=0, tLen=1) ---
-    let gcmps = "javax/crypto/spec/GCMParameterSpec";
-    r.register(gcmps, "<init>", "(I[B)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let t_len = args[1].as_int().unwrap_or(128);
-        let iv_arr = obj_arg(args, 2)?;
-        let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
-        for i in 0..len {
-            ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
-        }
-        ctx.set_field(this, 0, Value::Object(Some(copy)));
-        ctx.set_field(this, 1, Value::Int(t_len));
-        Ok(None)
-    });
-    r.register(gcmps, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(gcmps, "getTLen", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-
-    // --- javax.crypto.SecretKey — 1-field synthetic (encoded=0 byte[]) ---
+    // --- javax.crypto.SecretKey — 2-field synthetic (encoded=0 byte[], algorithm=1 String) ---
+    //
+    // This carrier is what `KeyGenerator.generateKey` below hands back, and it
+    // was a one-field object whose `getAlgorithm` answered the string "AES" for
+    // every algorithm — so in synthetic mode
+    // `KeyGenerator.getInstance("DESede").generateKey().getAlgorithm()` returned
+    // "AES". A key that misreports its own algorithm is the same species of
+    // defect as a cipher that ignores the requested one: every caller that
+    // branches on `getAlgorithm()` (and `Cipher.init` implementations do)
+    // branches wrong, with nothing raised. The algorithm now travels with the
+    // key in slot 1; `generateKey` is the only allocator of this shape in the
+    // tree, so there is no older 1-field instance to be compatible with.
     let sk = "javax/crypto/SecretKey";
     r.register(sk, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_key_bytes_field(ctx, this, 0))))
     });
-    r.register(sk, "getAlgorithm", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("AES");
-        Ok(Some(Value::Object(Some(s))))
+    r.register(sk, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(carrier_algorithm(ctx, this)))
     });
     r.register(sk, "getFormat", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("RAW");
@@ -14530,8 +14774,19 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     let key = "java/security/Key";
     r.register(key, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_key_bytes_field(ctx, this, 0))))
     });
+    // Deliberately NOT slot-1-aware, unlike the `javax/crypto/SecretKey` copy
+    // above. This triple serves any object whose own class is literally
+    // `java/security/Key`, and this file alone mints several unrelated key
+    // shapes (a 4-slot `java/security/PrivateKey`, `jca::key_factory`'s 5-slot
+    // keys). `NativeContext` exposes no slot count, and `Heap::get_field`
+    // asserts on an out-of-range index rather than answering null — so a
+    // speculative read of slot 1 here would turn an unknown 1-slot carrier into
+    // a panic. The stale "AES" is wrong for a non-AES key, but it is the
+    // behaviour that was already here, and narrowing the fix to the carrier
+    // whose allocators are all known is the part that can be made safe without
+    // building.
     r.register(key, "getAlgorithm", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("AES");
         Ok(Some(Value::Object(Some(s))))
@@ -14542,18 +14797,22 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     });
 
     // --- javax.crypto.KeyGenerator — 2-field synthetic (algorithm=0, keySize=1) ---
+    //
+    // The default key size used to be the literal 128 for every algorithm, and
+    // `generateKey` never read slot 0 at all — so this shim answered a 128-bit
+    // key to every caller of `KeyGenerator.getInstance(a).generateKey()`
+    // regardless of `a`. Measured against HotSpot 25, that is wrong three ways
+    // at once: AES defaults to 256 (16 bytes where HotSpot gives 32), DESede
+    // defaults to 168 and must be 24 bytes with odd parity per byte (this shim
+    // gave 16 unconditioned random bytes, which is not a DESede key), and an
+    // algorithm this VM cannot generate for was accepted rather than refused.
+    // See `keygen_default_bits`, `keygen_byte_len` and `des_set_odd_parity`.
     let kg = "javax/crypto/KeyGenerator";
     r.register(
         kg,
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128)); // default key size
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
     // Round 15 (BcProbe): KeyGenerator.getInstance("AES", "BC") used by
     // BouncyCastle clients. Without this shim the real-JDK 2-arg overload
@@ -14567,13 +14826,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         kg,
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128)); // default key size
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
     // Provider-instance overload — same synthetic layout, ignores the
     // Provider arg entirely (we synthesise the SPI via the init / generateKey
@@ -14582,35 +14835,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         kg,
         "getInstance",
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
-    // KeyGenerator.init(I)V — store keySize at field 1; never touch spi
-    // (spi is null on synthetic instances, and the real JDK bytecode for
-    // init(I) calls this.spi.engineInit(...) → NPE on the real path).
-    r.register(kg, "init", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key_size = args[1].as_int().unwrap_or(128);
-        ctx.set_field(this, 1, Value::Int(key_size));
-        Ok(None)
-    });
-    // KeyGenerator.init(I, SecureRandom)V — store keySize, ignore SecureRandom
-    r.register(
-        kg,
-        "init",
-        "(ILjava/security/SecureRandom;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let key_size = args[1].as_int().unwrap_or(128);
-            ctx.set_field(this, 1, Value::Int(key_size));
-            Ok(None)
-        },
-    );
+    // KeyGenerator.init(I)V — validate against the algorithm, then store
+    // keySize at field 1; never touch spi (spi is null on synthetic instances,
+    // and the real JDK bytecode for init(I) calls this.spi.engineInit(...) →
+    // NPE on the real path).
+    r.register(kg, "init", "(I)V", keygen_init_int);
+    // KeyGenerator.init(I, SecureRandom)V — same validation, ignore SecureRandom
+    r.register(kg, "init", "(ILjava/security/SecureRandom;)V", keygen_init_int);
     // init(SecureRandom) — W2: this was a no-op, which is not the same thing as
     // "leave keySize at its default": after an earlier `init(256)` the field
     // still held 256, so `kg.init(256); kg.init(random); kg.generateKey()`
@@ -14623,7 +14856,13 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(128));
+            // "the provider default", not the literal 128 — which for AES is
+            // 256 and for DESede is 168. Resetting to 128 here re-introduced
+            // the very defect `keygen_default_bits` exists to fix, one method
+            // along.
+            let algo = keygen_algorithm_of(ctx, this);
+            let bits = keygen_default_bits(&algo).unwrap_or(128);
+            ctx.set_field(this, 1, Value::Int(bits));
             Ok(None)
         },
     );
@@ -14655,6 +14894,12 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let key_size = ctx.get_field(this, 1).as_int().unwrap_or(128);
+            // The algorithm was recorded at `getInstance` and, until this
+            // change, never read again — which is how one code path served
+            // every algorithm. It decides the byte length and the
+            // conditioning, both of which differ from `key_size / 8` for the
+            // DES families.
+            let algo = keygen_algorithm_of(ctx, this);
             // Reject obviously invalid sizes. Upper bound is generous — the
             // JCE spec allows any positive multiple of 8 up to provider limits.
             if key_size <= 0 || key_size > 1 << 20 || (key_size & 7) != 0 {
@@ -14667,7 +14912,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                     .into(),
                 );
             }
-            let byte_len = (key_size / 8) as usize;
+            let byte_len = keygen_byte_len(&algo, key_size);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
 
             // Fill with cryptographic OS entropy. Fallback loop exists only
@@ -14680,6 +14925,13 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // Parity first, then the 2-key fold, mirroring SunJCE's
+            // `DESedeKeyGenerator`: it parity-adjusts the 16-byte draw and then
+            // copies K1 over K3, so K3 arrives already adjusted.
+            keygen_condition_key(&algo, &mut buf);
+            if key_size == 112 && algo.eq_ignore_ascii_case("DESede") {
+                keygen_fold_two_key_desede(&mut buf);
+            }
             for (i, &b) in buf.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int((b as i8) as i32));
             }
@@ -14687,34 +14939,51 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             for b in buf.iter_mut() {
                 *b = 0;
             }
-            let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 1)?;
+            // Two slots now: the algorithm travels with the key, so
+            // `SecretKey.getAlgorithm()` stops answering "AES" for everything.
+            // `arr` must survive the allocation below, and the algorithm string
+            // must survive it too.
+            let arr_pin = ctx.pin_native_root(arr);
+            let algo_str = ctx.create_string(&algo);
+            let algo_pin = ctx.pin_native_root(algo_str);
+            let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 2)?;
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let algo_str = ctx.read_native_pin(algo_pin, algo_str);
+            ctx.unpin_native_roots(arr_pin);
             ctx.set_field(sk, 0, Value::Object(Some(arr)));
+            ctx.set_field(sk, 1, Value::Object(Some(algo_str)));
             Ok(Some(Value::Object(Some(sk))))
         },
     );
 
-    // --- javax.crypto.spec.SecretKeySpec — 2-field (encoded=0, algorithm=1) ---
-    let sks = "javax/crypto/spec/SecretKeySpec";
-    r.register(sks, "<init>", "([BLjava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key_bytes = obj_arg(args, 1)?;
-        let algo = obj_arg(args, 2)?;
-        ctx.set_field(this, 0, Value::Object(Some(key_bytes)));
-        ctx.set_field(this, 1, Value::Object(Some(algo)));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(sks, "getEncoded", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(sks, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(sks, "getFormat", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("RAW");
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // --- javax.crypto.spec.SecretKeySpec — DELETED, see `jca::cipher::register_param_specs` ---
+    //
+    // This registrar used to carry a second `SecretKeySpec` — `<init>`,
+    // `getEncoded`, `getAlgorithm`, `getFormat` — byte-for-byte a weaker
+    // duplicate of the pair in `jca::cipher::register_param_specs`. Weaker in
+    // the way that matters: its `<init>` stored the caller's `byte[]` by
+    // reference and its `getEncoded` handed the stored array straight back,
+    // where the real class clones on both sides *because callers scrub*. That
+    // aliasing is the mechanism behind the all-zero AES key recorded in
+    // W7-21-keygen-and-the-synthetic-secretkeyspec-twin.md.
+    //
+    // It is deleted rather than fixed, and the reachability is the reason it
+    // could be. `register_phase53_crypto` is reached only from
+    // `register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]`
+    // AND gated on `config.use_synthetic_jdk` — so in real-JDK and `--jdk-only`
+    // modes these four registrations never existed at all. In synthetic mode
+    // they did register, and were then immediately overwritten:
+    // `register_synthetic_overrides` calls `register_phase53_natives` and THEN
+    // `jca::cipher::register_cipher_clinit_shim`, and `register()` is
+    // last-registration-wins. So the fixed copy won in every mode and this one
+    // never ran anywhere.
+    //
+    // Which is exactly why it had to go rather than be corrected. A shadowed
+    // second implementation of a key-material primitive is not a dormant defect,
+    // it is a live trap: swapping those two call sites in
+    // `register_synthetic_overrides` — a change nobody would think of as
+    // touching crypto — would have silently restored the zero-key bug. One
+    // primitive, one implementation, and the ordering stops mattering.
     r.set_category(__prev_cat);
 }
 
@@ -15252,7 +15521,10 @@ pub(crate) fn drive_real_cipher(
 // needs this to decrypt PKCS#8 (PBES2) encrypted private keys. We compute
 // PBKDF2 directly with HMAC over the `sha1`/`sha2` crates — a real,
 // RFC-2898-correct derivation, not a synthetic stub (verified byte-identical
-// to HotSpot). Only the 64-byte-block PRFs PEMFile uses are wired.
+// to HotSpot). SHA-1/224/256 (64-byte HMAC block) go through the hand-rolled
+// `hmac_block64`; SHA-384/512 (128-byte HMAC block, needed by pgjdbc's SCRAM
+// client) go through `pbkdf2_derive_wide`, which uses the `hmac` crate so the
+// block size is derived correctly instead of hardcoded.
 // ---------------------------------------------------------------------------
 
 /// HMAC over a 64-byte-block hash (`SHA-1` / `SHA-224` / `SHA-256`).
@@ -15310,15 +15582,61 @@ fn pbkdf2_derive<D: sha2::Digest + Clone>(
 }
 
 /// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
-/// Only 64-byte-block PRFs are supported (the ones PEMFile uses).
 pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     match alg {
         "PBKDF2WithHmacSHA1" => Some(1),
         "PBKDF2WithHmacSHA224" => Some(224),
         "PBKDF2WithHmacSHA256" => Some(256),
+        "PBKDF2WithHmacSHA384" => Some(384),
+        "PBKDF2WithHmacSHA512" => Some(512),
         _ => None,
     }
 }
+
+/// PBKDF2 (PKCS#5 v2.0) over a 128-byte-block PRF (`SHA-384` / `SHA-512`) —
+/// `hmac_block64` above hardcodes a 64-byte HMAC block, which is wrong for
+/// these (RFC 2104 derives the block size from the underlying hash's own
+/// block size, 128 bytes for SHA-384/512), so it would silently derive the
+/// wrong key instead of throwing. Uses the `hmac` crate (already a dependency,
+/// see `t27_tls_cbc.rs`) so the block size is correct by construction rather
+/// than guessed. pgjdbc's SCRAM-SHA-256 client needs `PBKDF2WithHmacSHA384`
+/// wired for `com.ongres.scram.common.ScramMechanism`'s static init to
+/// succeed, even though SHA-384 itself is only used for the (unrelated)
+/// SCRAM-SHA-256-PLUS channel-binding negotiation path.
+macro_rules! pbkdf2_derive_wide_impl {
+    ($name:ident, $digest:ty) => {
+        fn $name(pw: &[u8], salt: &[u8], iters: u32, dklen: usize) -> Vec<u8> {
+            use hmac::Mac;
+            type HmacImpl = hmac::Hmac<$digest>;
+            let mut out: Vec<u8> = Vec::with_capacity(dklen);
+            let mut block_index: u32 = 1;
+            while out.len() < dklen {
+                let mut salt_i = salt.to_vec();
+                salt_i.extend_from_slice(&block_index.to_be_bytes());
+                let mut mac =
+                    HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                mac.update(&salt_i);
+                let mut u = mac.finalize().into_bytes().to_vec();
+                let mut t = u.clone();
+                for _ in 1..iters.max(1) {
+                    let mut mac =
+                        HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                    mac.update(&u);
+                    u = mac.finalize().into_bytes().to_vec();
+                    for (a, b) in t.iter_mut().zip(u.iter()) {
+                        *a ^= *b;
+                    }
+                }
+                out.extend_from_slice(&t);
+                block_index += 1;
+            }
+            out.truncate(dklen);
+            out
+        }
+    };
+}
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha384, sha2::Sha384);
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512, sha2::Sha512);
 
 /// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
 /// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
@@ -15336,8 +15654,8 @@ pub(crate) fn pbkdf2_derive_for(
     match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
-        384 => pbkdf2_derive::<sha2::Sha384>(pw, salt, iters, dklen),
-        512 => pbkdf2_derive::<sha2::Sha512>(pw, salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(pw, salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(pw, salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
@@ -15498,7 +15816,7 @@ fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<usi
 }
 
 /// `SecretKeyFactory.getInstance(algorithm[, provider])` for PBKDF2.
-/// Recognises only `PBKDF2WithHmacSHA1/224/256`; any other algorithm throws
+/// Recognises `PBKDF2WithHmacSHA1/224/256/384/512`; any other algorithm throws
 /// the same `NoSuchAlgorithmException` (mapped to `SecurityException`) the real
 /// JCA path would have thrown.
 pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15607,6 +15925,8 @@ pub(crate) fn pbkdf2_generate_secret(
     let dk = match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(&pw_bytes, &salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(&pw_bytes, &salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
     };
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
@@ -20249,26 +20569,47 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `logmanager.rs` already patches around it for that specific case.
 
     // --- LogManager (singleton) ---
+    //
+    // NOT `Intrinsic`, unlike the rest of this function, and the distinction is
+    // load-bearing rather than cosmetic. These two FABRICATE a manager and a
+    // logger in front of real bytecode — a `Bridge` by definition; an intrinsic
+    // is the kind that cannot give an answer the bytecode would not.
+    //
+    // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
+    // while the function-wide ambient category applied here these rows SURVIVED
+    // `--jdk-only` after the retirement refused every OTHER registrar of the
+    // same triples — and a refusal does not remove the registration it would
+    // have overwritten. What was left holding `getLogManager()` was an uncached
+    // fabricator returning a fresh, unconstructed manager on every call
+    // (identityHashCode 7, 8, 9 on three successive calls), whose null
+    // `systemContext` is the first NPE any JUL user hits.
+    //
+    // The real `LogManager.<init>` is itself retired, so the static
+    // `LogManager.manager` already comes out of the real constructor — this
+    // builds no state, it stops shadowing state that is already there.
+    // W7-25-jul-getlogger-regression.md
     let lm = "java/util/logging/LogManager";
-    r.register(
-        lm,
-        "getLogManager",
-        "()Ljava/util/logging/LogManager;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        lm,
-        "getLogger",
-        "(Ljava/lang/String;)Ljava/util/logging/Logger;",
-        |ctx, _args| {
-            // Return a new Logger stub
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            lm,
+            "getLogManager",
+            "()Ljava/util/logging/LogManager;",
+            |ctx, _args| {
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
+                Ok(Some(Value::Object(Some(obj))))
+            },
+        );
+        r.register(
+            lm,
+            "getLogger",
+            "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+            |ctx, _args| {
+                // Return a new Logger stub
+                let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
+                Ok(Some(Value::Object(Some(logger))))
+            },
+        );
+    });
     r.set_category(__prev_cat);
 }
 
@@ -24004,5 +24345,124 @@ mod t2_tests {
     fn pkcs7_unpad_rejects_bad_length() {
         assert!(pkcs7_unpad(&[]).is_err());
         assert!(pkcs7_unpad(&[1, 2, 3]).is_err()); // not a multiple of 16
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyGenerator — the parts that are arithmetic rather than heap access.
+    // The registrations themselves need a VM; these do not, and they are the
+    // parts where being wrong is silent.
+    // -----------------------------------------------------------------------
+
+    fn hex24(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The exact vector `javax.crypto.spec.DESedeKeySpec.isParityAdjusted`
+    /// accepted, computed by running this same rule in Java on HotSpot 25 and
+    /// on this VM and feeding the result to the JDK's own checker. If this
+    /// assertion fails, the parity rule has drifted from the one the JDK
+    /// validates against — which is the failure that would otherwise surface as
+    /// `InvalidKeyException` deep inside somebody's DESede cipher.
+    #[test]
+    fn des_parity_matches_the_jdk_checker() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 7) as u8).collect();
+        assert_eq!(hex24(&key), "00070e151c232a31383f464d545b626970777e858c939aa1");
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        assert_eq!(hex24(&key), "01070e151c232a31383e464c545b626870767f858c929ba1");
+        // …and the property the checker actually tests, stated independently of
+        // the vector: every byte has odd population count.
+        for (i, b) in key.iter().enumerate() {
+            assert_eq!(b.count_ones() % 2, 1, "byte {i} is not odd parity");
+        }
+    }
+
+    /// A DES key is 8 bytes of odd parity. Same construction, same checker.
+    #[test]
+    fn des_parity_single_block() {
+        let mut key: Vec<u8> = (0..8u32).map(|i| (0x10 + i * 11) as u8).collect();
+        assert_eq!(hex24(&key), "101b26313c47525d");
+        des_set_odd_parity(&mut key, 0);
+        assert_eq!(hex24(&key), "101a26313d46525d");
+    }
+
+    /// Parity must be idempotent: conditioning an already-conditioned key must
+    /// not move it. A rule that flipped bit 0 unconditionally would pass the
+    /// vector test above and fail this one.
+    #[test]
+    fn des_parity_is_idempotent() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 37 + 5) as u8).collect();
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        let once = key.clone();
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        assert_eq!(once, key);
+    }
+
+    /// 2-key Triple DES: 24 bytes with K3 == K1 and K2 != K1 — the shape
+    /// HotSpot 25 produced on every `init(112)` run.
+    #[test]
+    fn desede_112_folds_k3_onto_k1() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 13 + 1) as u8).collect();
+        keygen_condition_key("DESede", &mut key);
+        keygen_fold_two_key_desede(&mut key);
+        assert_eq!(key.len(), 24);
+        assert_eq!(&key[0..8], &key[16..24], "K3 must equal K1");
+        assert_ne!(&key[0..8], &key[8..16], "K2 must not equal K1");
+        // The fold must not smuggle in a byte that lost its parity.
+        for b in key.iter() {
+            assert_eq!(b.count_ones() % 2, 1);
+        }
+    }
+
+    /// `key_size / 8` is the wrong length for exactly one family, and this is
+    /// the assertion that says so: 168 bits of DESede is 24 bytes, not 21.
+    #[test]
+    fn desede_key_length_carries_its_parity_bits() {
+        assert_eq!(keygen_byte_len("DESede", 168), 24);
+        assert_eq!(keygen_byte_len("DESede", 112), 24);
+        assert_eq!(keygen_byte_len("DES", 56), 8);
+        // Everything else really is bits/8.
+        assert_eq!(keygen_byte_len("AES", 256), 32);
+        assert_eq!(keygen_byte_len("HmacSHA256", 256), 32);
+    }
+
+    /// Every default measured on HotSpot 25. The AES row is the one that was
+    /// wrong in the field: 128 where HotSpot gives 256.
+    #[test]
+    fn keygen_defaults_match_hotspot() {
+        assert_eq!(keygen_default_bits("AES"), Some(256));
+        assert_eq!(keygen_default_bits("aes"), Some(256));
+        assert_eq!(keygen_default_bits("DESede"), Some(168));
+        assert_eq!(keygen_default_bits("DES"), Some(56));
+        assert_eq!(keygen_default_bits("HmacSHA1"), Some(512));
+        assert_eq!(keygen_default_bits("HmacSHA224"), Some(224));
+        assert_eq!(keygen_default_bits("HmacSHA256"), Some(256));
+        assert_eq!(keygen_default_bits("HmacSHA384"), Some(384));
+        assert_eq!(keygen_default_bits("HmacSHA512"), Some(512));
+        assert_eq!(keygen_default_bits("Blowfish"), Some(128));
+        assert_eq!(keygen_default_bits("ChaCha20"), Some(256));
+        // No default arm: an algorithm this VM cannot generate for is refused,
+        // not served with somebody else's default.
+        assert_eq!(keygen_default_bits("CRATONVM-NO-SUCH-KEYGEN"), None);
+        assert_eq!(keygen_default_bits(""), None);
+    }
+
+    /// The sizes HotSpot refuses, and the ones it accepts.
+    #[test]
+    fn keygen_size_admission_matches_hotspot() {
+        let (aes, _) = keygen_allowed_bits("AES").expect("AES has a fixed set");
+        assert_eq!(aes, &[128, 192, 256][..]);
+        assert!(!aes.contains(&129));
+        let (desede, _) = keygen_allowed_bits("DESede").expect("DESede has a fixed set");
+        assert_eq!(desede, &[112, 168][..]);
+        assert!(!desede.contains(&128));
+        // The HMAC family takes any positive multiple of 8 — HotSpot really
+        // does hand back an 8-byte key for `HmacSHA256` `init(64)`.
+        assert!(keygen_allowed_bits("HmacSHA256").is_none());
     }
 }

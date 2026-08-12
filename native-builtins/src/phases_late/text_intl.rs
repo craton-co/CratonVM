@@ -757,6 +757,29 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         }
     });
 
+    // Read an arbitrary `CharSequence` argument, not just `String`.
+    // `ctx.read_string` only understands the compact-string `String` layout;
+    // called on any other `CharSequence` (e.g. pgjdbc's SCRAM stringprep
+    // wraps a `char[]` in `java.nio.CharBuffer` before calling
+    // `Normalizer.normalize`) it silently returns `None`, and the old
+    // `.unwrap_or_default()` at the two call sites below turned that into an
+    // empty string instead of the real content — surfacing downstream as an
+    // `ArrayIndexOutOfBoundsException` in `Character.codePointAt` on the
+    // now-empty array. Mirrors the `String.format("%s", ...)` fast-path in
+    // `lang_string.rs` (real `String` read directly; everything else via its
+    // own `toString()`, which every `CharSequence` must provide).
+    fn read_char_sequence(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+        if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(obj)) {
+            if let Some(s) = ctx.read_string(obj) {
+                return s;
+            }
+        }
+        match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     // --- Normalizer — real Unicode normalization via unicode-normalization crate ---
     let norm = "java/text/Normalizer";
     r.register(
@@ -766,7 +789,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
             };
             // Read the Form's ordinal via `Enum.ordinal()` so this works for
@@ -803,7 +826,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),
             };
             let form_ordinal = match args.get(1) {

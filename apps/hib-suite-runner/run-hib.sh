@@ -39,7 +39,7 @@ export MSYS_NO_PATHCONV=1
 # ($COMMON, the test lists, the compiled runner -- none of them tracked in
 # git) is fully self-contained, while a copy of the script that still sits
 # next to the original fixture data keeps resolving there exactly as before.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && { pwd -W 2>/dev/null || pwd; })"
 COMMON="$HERE/common.args"          # -cp + sysprops + junit timeout
 RUNNER_CLASS="CratonRunner"         # compiled in $HERE, already on the classpath
 # The override table below is tracked, so it exists next to whichever copy of

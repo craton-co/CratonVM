@@ -1936,22 +1936,48 @@ pub(super) fn execute_invokevirtual_cached(
                     // seen -- which matters here, because a missed native means
                     // tier-up compiles the REAL BYTECODE and permanently
                     // bypasses the override.
-                    let has_registered_native = cached
-                        .native_call_site()
-                        .resolve(
-                            &shared.natives.native_methods,
-                            &cached.class_name,
-                            &cached.method_name,
-                            &cached.method_descriptor,
-                        )
-                        .is_some();
+                    // BOTH of these are CLOSURES now, and that is the point.
+                    //
+                    // They used to be `let` bindings evaluated HERE, above the
+                    // `if` that consumes them -- so every cached invoke in the
+                    // VM paid a `NativeMethodRegistry` resolve and a
+                    // class-manager `try_read` + `get_class` +
+                    // `starts_with("java/util/")` to decide an OPTIONAL JIT
+                    // tier-up, including on invokes where the `&&` chain below
+                    // could never reach them. `--nojit` is the extreme case:
+                    // `!disable_jit()` is false, so the chain short-circuits
+                    // several conditions EARLIER, and the work was done anyway.
+                    // `perf --call-graph=fp` on
+                    // `probes/InvokeAttributionProbe.java` under `--nojit` put
+                    // `OrderedPlRwLock<ClassManager>::try_read` at 1.67% and
+                    // `::read` at 1.38% of the interpreted-invoke arm, both
+                    // attributed straight to this function. See
+                    // known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md.
+                    //
+                    // Called in place in the `&&` chain they inherit its
+                    // short-circuit, which is what the ordering of that chain
+                    // was already written to express: cheap field reads first,
+                    // then these. Both are pure -- `resolve` fills an
+                    // idempotent memo, `try_read` is a read -- so deferring
+                    // them changes nothing except how often they run.
+                    let has_registered_native = || {
+                        cached
+                            .native_call_site()
+                            .resolve(
+                                &shared.natives.native_methods,
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            )
+                            .is_some()
+                    };
                     // `cached.class_name` is the call site's symbolic owner;
                     // for an interface call it need not be the concrete
                     // receiver that this monomorphic cache just validated.
                     // Consult the receiver ClassId for the java.util virtual
                     // tier-up exclusion so subtypes reached through List/Map
                     // or Iterator are covered as well.
-                    let receiver_is_java_util = {
+                    let receiver_is_java_util = || {
                         // This dispatch can run while the current thread still
                         // owns the class-manager write lock during bootstrap.
                         // A blocking read here self-deadlocks. If the table is
@@ -1969,9 +1995,14 @@ pub(super) fn execute_invokevirtual_cached(
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
-                        && !has_registered_native
                         && entry_gate.generation == 0
                         && !crate::runtime::env_cache::disable_jit()
+                        // Ordered AFTER the cheap field reads and the JIT
+                        // kill-switch on purpose: every condition in this chain
+                        // is a pure predicate, so `&&` may order them freely,
+                        // and this one costs a `NativeMethodRegistry` resolve.
+                        // Under `--nojit` it is now never evaluated at all.
+                        && !has_registered_native()
                         // The generic-conversion regression reaches a hot
                         // java.util graph while Spring creates annotation and
                         // conversion metadata. Its instance-method tier-ups
@@ -1980,7 +2011,7 @@ pub(super) fn execute_invokevirtual_cached(
                         // receiver-specific entry and then spin. Keep only
                         // this virtual promotion out of java.util; static
                         // compilation and ordinary direct dispatch remain on.
-                        && !receiver_is_java_util
+                        && !receiver_is_java_util()
                         // A handler-bearing callee must never be entered by a
                         // DIRECT compiled call. `execute_jit_call_decoded`
                         // below has no interpreter boundary at which the
@@ -3609,6 +3640,7 @@ pub(super) fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

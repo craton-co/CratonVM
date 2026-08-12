@@ -79,7 +79,22 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep"
+#
+# Two members — RPriorityQueueGc and RTreeRangeGc — are INERT without the
+# CratonVM-only launcher flags class_cv_args() supplies for them. Scheduling
+# either one without that hook manufactures a green gate; see class_cv_args.
+#
+# RJdkViews is in CORE despite its RJdk* name. The RJdk* prefix is the JDK-only
+# corpus's naming convention, but that corpus is about `--jdk-only` POLICY, and
+# RJdkViews asserts `--real-jdk` COMPATIBILITY behaviour — TreeMap navigable
+# views, the Iterator.remove state machine, %e/%g float formatting,
+# StringBuilder.delete bounds, IntStream.summaryStatistics. That is a default-
+# mode concern, so it belongs to the set a plain `bash run.sh` runs. It is
+# deliberately NOT also in JDKONLY_CLASSES: under CRATONVM_ARGS="--jdk-only"
+# every scheduled class already receives that flag, so a second registration
+# would run the identical command twice. Nothing schedules by glob — every list
+# here is explicit — so the name collision is cosmetic.
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -92,7 +107,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
@@ -101,17 +116,6 @@ JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJ
 #   RConcurrent      heavy multi-threaded execution; trips the documented
 #                    cross-thread JIT-frame root-scan gap (README "Known
 #                    gaps") and flakes. Run with ONLY="RConcurrent".
-#   RPriorityQueueGc needs BOTH --nojit and --Xmx 64m (a live JIT frame
-#                    downgrades the young gen to a non-moving sweep, under
-#                    which the stale reference still resolves; the small heap
-#                    is what makes a collection happen inside the native at
-#                    all). With --nojit alone the vector PASSES ON A BROKEN
-#                    VM -- it becomes a no-op gate that reads as green.
-#                    See class_cv_args.
-#   RTreeRangeGc     needs a small heap (--Xmx 64m) or no collection happens
-#                    during the walk at all. It must NOT get --nojit: it
-#                    reproduces with the JIT on, so registering it keeps the
-#                    compiling config under test. See class_cv_args.
 #   RCanAccessOutsider
 #                    not a vector: it has no main. It is the FOREIGN-package
 #                    half of RCanAccessRules, which lives in the unnamed
@@ -120,16 +124,28 @@ JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJ
 #                    runtime package" arm has to be asked from a file that
 #                    declares one.
 #
-# Both GC vectors pass on HotSpot 25 with byte-identical output over repeated
-# runs, so they are sound vectors; what is missing is a CratonVM run under the
-# arguments their own doc comments assume. Registering them is a task for a
-# lane that can build and run the VM.
+# RPriorityQueueGc and RTreeRangeGc were HERE until 2026-08-11 and are now in
+# CORE_CLASSES. History, because it is the whole reason they were absent: both
+# were in the runner's class list with a cv_extra_args hook when their fixes
+# landed (6cd01bcba, b2e13e441), and both were validated FAIL-then-PASS under
+# it. A later run.sh merge resolution silently discarded the registrations AND
+# the hook. The hook came back first, as class_cv_args() below, but the two
+# classes stayed parked here with a note saying scheduling them was "a task for
+# a lane that can build and run the VM" — so the repair was half-done and the
+# two documented permanent gates for a heap-corruption defect still never ran.
 #
-# NOTE on history: these two were NOT "never run under this runner". Both were
-# in CLASSES with a cv_extra_args hook when their fixes landed (6cd01bcba,
-# b2e13e441) and both were validated FAIL-then-PASS under it. A later run.sh
-# merge resolution silently discarded the registrations and the hook.
-UNREGISTERED_CLASSES="RConcurrent RPriorityQueueGc RTreeRangeGc RCanAccessOutsider"
+# The scheduling half is now done too. The ordering mattered and is worth
+# stating: re-registering these WITHOUT class_cv_args would have been worse
+# than leaving them out, because both pass on a broken VM without their flags
+# (see class_cv_args) and the suite would have gained two green-forever vectors
+# that look like coverage. The hook is in place first; the registration second.
+#
+# NOT YET VERIFIED against a CratonVM binary — this lane could not build or run
+# one. Both pass on HotSpot 25 with byte-identical output over repeated runs, so
+# they are sound vectors, but the first CratonVM run of them under these flags
+# is still ahead. If either comes back red, that is the gate doing its job and
+# means the underlying fix regressed; it is not a bad registration.
+UNREGISTERED_CLASSES="RConcurrent RCanAccessOutsider"
 
 # ---- list hygiene, computed before anything is pruned --------------------
 #
@@ -263,8 +279,31 @@ class_args() {
 # fail the cross-VM diff for a reason that has nothing to do with the VM.
 #
 # The two entries below are the reproduction conditions their vectors' own doc
-# comments already claim the suite supplies; both vectors are still in
-# UNREGISTERED_CLASSES until a lane that can run the VM verifies them.
+# comments already claim the suite supplies. Both vectors are in CORE_CLASSES as
+# of 2026-08-11, so these arguments are now load-bearing on every default run.
+#
+# BOTH GATES ARE INERT WITHOUT THEIR ARGUMENT — they do not merely lose
+# sensitivity, they PASS ON A BROKEN VM, which is worse than not running at all
+# because it reads as coverage. The two mechanisms, from the internal records
+# fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
+# and fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
+#
+#   * on the default heap no collection happens during the walk at all, so the
+#     stale ObjectRef is never created; and
+#   * with a live JIT frame on the stack the young generation falls back to a
+#     non-moving sweep, under which a stale reference still resolves and the
+#     defect hides entirely.
+#
+# Hence --Xmx 64m for both, and --nojit for RPriorityQueueGc only. RTreeRangeGc
+# must NOT get --nojit: it reproduces with the JIT on (3/3, b2e13e441), so
+# withholding the flag is what keeps the default compiling configuration under
+# test. Do not "make the two entries consistent" by adding it.
+#
+# Do not drop these again. A previous merge resolution did, silently. Nothing
+# caught it: a vector that stops being scheduled does not turn a run red, it
+# only makes the pass count smaller, and nobody diffs the pass count. The
+# UNREGISTERED_CLASSES census and the COVERAGE ERROR below exist because of
+# this — they are what makes the next such drop visible.
 class_cv_args() {
   case "$1" in
     RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;

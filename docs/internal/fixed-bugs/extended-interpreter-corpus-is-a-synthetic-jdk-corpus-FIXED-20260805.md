@@ -148,13 +148,25 @@ Both live in `require_extended_interpreter_tests`:
 
 ## The pinned baseline
 
-`KNOWN_SYNTHETIC_JDK_GAPS` in `vm/tests/interpreter_tests.rs` lists the 11
+`KNOWN_SYNTHETIC_JDK_GAPS` in `vm/tests/interpreter_tests.rs` listed the 11
 remaining `(class, method)` pairs, each verified twice: **real JDK 25 agrees
 with the expectation** (`probes/CorpusOracle`), and each **still fails run
 alone** via `--exact` in a fresh process, so none is an artefact of the ~900
 VMs that precede it. It is a two-way gate: an unlisted mismatch fails the run,
 and a listed pair that starts passing also fails it, telling you to delete the
-entry. See `docs/known-issues/synthetic-jdk-class-library-gaps-20260802.md`.
+entry.
+
+**All 11 were closed on 2026-08-11**; the list is now empty (the gate stays, as
+a ratchet) and the corpus is 924/924. Not one of them turned out to be missing
+code — see fixed-bugs/synthetic-jdk-class-library-gaps-FIXED-20260811.md. Both
+verifications above also proved weaker than they read. The oracle constructs a
+receiver for a non-`static` fixture method (`Modifier.isStatic` →
+`getDeclaredConstructor().newInstance()`) and `Vm::invoke` has no receiver
+argument, so a non-`static` fixture asks the two sides different questions —
+one entry was exactly that. And two entries did fail alone, yet were still an
+artefact of the ~900 preceding VMs for a reason `--exact` cannot see: the
+serialization side tables are keyed by the stream object's raw address, and
+addresses get recycled.
 
 ### A measurement trap worth naming
 
