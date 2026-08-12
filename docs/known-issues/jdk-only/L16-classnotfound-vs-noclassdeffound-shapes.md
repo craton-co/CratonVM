@@ -1,10 +1,39 @@
 # An absent array element type is thrown as `NoClassDefFoundError`, so `catch (ClassNotFoundException)` misses it
 
-**Status:** ROOT-CAUSED, fix PARTIAL (the helper landed in
-`classloading/src/class_manager.rs`; the two one-line guard patches that consume
-it are in `native-builtins/`, which this lane does not own, and are recorded
-verbatim below). Unverified — no binary was built in the session that wrote
-this. Lane L16 of the jdk-wave2 pool.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED, and now verified.** The old status line — *"fix PARTIAL …
+  the two one-line guard patches that consume it are in `native-builtins/`,
+  which this lane does not own"* — was **stale**. Both guard patches are in the
+  tree, verbatim, since commit `f88feaef1`:
+  `native-builtins/src/classloader_real.rs:990-992` and
+  `native-builtins/src/classloader.rs:2939`. The helper they consume,
+  `array_descriptor_element_class`, is at
+  `classloading/src/class_manager.rs:20344` (commit `cb3134447`), re-exported at
+  `classloading/src/lib.rs:84`, with its unit test at `class_manager.rs:18753`.
+  The verification the record said it was missing was taken 2026-08-12 against
+  the dev binary at `ba65f1a19`: `RJdkFailure` runs to `PASS RJdkFailure
+  (43 checks)` in **both** `--jdk-only` and `--real-jdk`.
+* **Residual: CLOSED — the four "WRONG — latent" inventory rows.** All four
+  blockers this record filed as latent behind the L16 fix are fixed elsewhere:
+  case 14 `System.loadLibrary(absent)` returning normally — commit `ba50b498b`,
+  `native-builtins/src/lang_system.rs:2064` `load_library_or_throw`, raising
+  `UnsatisfiedLinkError` at `:2096-2099`; case 16 `ModuleLayer.boot()
+  .findModule(absent)` fabricating a Module — same commit,
+  `native-builtins/src/jboss_jdkspecific.rs:673`; case 21
+  `ModuleFinder.ofSystem().find(absent)` — commit `066856380`,
+  `native-builtins/src/reflect_annotations.rs:2055-2062`; case 23
+  `Cipher.getInstance("CRATONVM-NO-SUCH-CIPHER")` minting a synthetic `Cipher` —
+  commit `eb41d9730`, `native-builtins/src/jca/cipher.rs:887` / `:953`, with the
+  refusal asserted at `cipher.rs:4354`. Read the inventory tables below with
+  that correction applied.
+* **Residual: STILL OPEN — one, and it is deliberate.** Our `ClassNotFoundException`
+  message for an array form is the array *descriptor*, not the element name,
+  because `native_class_for_name` (`native-builtins/src/lang_class.rs:2571`)
+  still hands array descriptors to `loadClass` without stripping `[`.
+  `RJdkFailure` does not assert on that message, which is why the vector is
+  green while the divergence is live. Re-grepped 2026-08-12; nothing in
+  `lang_class.rs` calls `array_descriptor_element_class`.
 
 ## The failure
 
@@ -187,7 +216,15 @@ non-array case keeps today's behaviour exactly.
 
 Unit test: `l16_array_descriptor_element_class_strips_every_dimension`.
 
-### Not landed — two guard patches this lane does not own
+### ~~Not landed~~ — LANDED. The two guard patches this lane did not own
+
+> **Reconciled 2026-08-12.** Both patches below are **in the tree, verbatim**,
+> and have been since commit `f88feaef1` *wip(jdk-only): array-descriptor forName
+> must throw CNFE, not NCDFE* — `native-builtins/src/classloader_real.rs:990-992`
+> (real-JDK mode) and `native-builtins/src/classloader.rs:2939` (synthetic-JDK
+> mode), each carrying the three-line predicate exactly as written below. The
+> heading is kept so the text stays findable; read the section as a record of
+> what landed, not as pending work.
 
 Both are the same edit, and both are recorded verbatim in the lane report. Each
 narrows the "a *different* class is missing, so a dependency must be absent"

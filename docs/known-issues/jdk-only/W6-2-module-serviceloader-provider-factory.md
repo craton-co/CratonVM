@@ -1,10 +1,29 @@
 # `ServiceLoader` had no `provider()` factory form, and discarded the `setAccessible` it depended on
 
-**Status:** FIX WRITTEN, UNVERIFIED (this lane may not run `cargo` and cannot
-run the VM). Lane W6-2 of the wave-6 pool. **Sixth** consecutive wall on the
-`regression-suite/src/RJdkModule.java` vector; the five before it were each
-real and each moved the vector forward (check 1 -> 4 -> ~14 -> ~20 -> ~26 ->
-~30 of 44).
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED, verified, and the wall is gone.** This was the **sixth**
+  consecutive wall on `regression-suite/src/RJdkModule.java`; the five before it
+  each moved the vector forward (check 1 → 4 → ~14 → ~20 → ~26 → ~30 of 44). The
+  verification this record said it could not take was taken 2026-08-12 against
+  the dev binary at `ba65f1a19`: `RJdkModule` is **44 of 44** in **both**
+  `--jdk-only` and `--real-jdk`. The vector needs `--module-path
+  regression-suite/build-modules --add-modules cratonvm.jdkonly.svc` (`run.sh`
+  supplies these via `class_args`); without them it fails on a harness error,
+  not a VM defect — the misclassification this record's *Verify* section warns
+  about.
+* **Residual: none unapplied.** The fix is confined to
+  `native-builtins/src/service_loader.rs` and needed no out-of-file patch.
+* **Two deliberate scope decisions stand, and neither is pending work** — see
+  *Deliberately scoped to module-declared providers* and *Deliberately NOT done*
+  below. The second one is a real, argued refusal (adding the constructor-form
+  subtype check would hard-fail every module-declared service in the JDK's own
+  boot modules if our `isAssignableFrom` disagrees on any one of them), not an
+  unfinished task.
+* **A question this record left open is now answered.** *"Where `--jdk-only`
+  stops next on this vector"* — it does not stop. Strict drops this file's
+  `SyntheticStub` rows at registration and runs the real
+  `java.util.ServiceLoader` bytecode all the way to 44/44.
 
 ## The failure
 

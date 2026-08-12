@@ -1,5 +1,6 @@
 # Windows process enumeration: one snapshot per tree node, and one `OpenProcess` too many per `info()`
 
+<!-- merge: both sides kept; the lane's finding and the reconciliation's commit attribution are complementary -->
 **Status: FINDINGS 1, 2 AND 4 CONFIRMED PRESENT 2026-08-12 (W7-46). One
 follow-up, and it is finding 2's own shape one native along.**
 
@@ -33,11 +34,42 @@ The two structural costs landed 2026-08-07; finding 4 — a snapshot failure
 indistinguishable from an empty machine — on 2026-08-11. Lane W6-10 of the
 jdk-wave2 pool.
 **Files changed:** `native-io/src/process.rs`.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-**Not verified.** Nothing has been built or run for the 2026-08-11 change: it is
-a source change only, and the claims below are, as in the rest of this record,
-provable by reading the code. The Windows arm is the only one this dev host
-could compile even in principle — see "Which arm could not be compiled".
+* **All four findings: CLOSED in source.** Finding 1 (one snapshot for the whole
+  `descendants()` walk, `1+D` → `1`, `O(N·D)` → `O(N+D)`) — the Windows arm of
+  `collect_descendant_pids` indexes a single `os_snapshot_processes` by parent
+  pid. Finding 2 (`start_time_and_cpu(pid)`, one `OpenProcess` instead of two) —
+  present in `native-io/src/process.rs`, with the catch-all arm narrowed to
+  `#[cfg(not(any(target_os = "linux", windows)))]`. Finding 3 is a no-op claim:
+  the remaining `OpenProcess` cost is **inherent** because `PROCESSENTRY32`
+  carries no creation time. Finding 4 (a snapshot failure indistinguishable from
+  an empty machine) landed 2026-08-11 as commit `278688257` *fix(process): a
+  failed process enumeration must throw, not report an empty machine* — the
+  `ProcessScanError` return channel, five widened signatures, three natives
+  throwing `java.lang.RuntimeException`. Downstream corroboration:
+  `p60_delegate_to_real_handle`'s doc comment at
+  `native-builtins/src/phases_late.rs:2433-2439` explicitly relies on that
+  `RuntimeException` propagating untouched.
+* **Residual: STILL OPEN — the out-of-file addition, and it is now
+  UN-APPLIABLE AS WRITTEN.** The `## Out-of-file addition (not applied)` below
+  asks for a sixth row in the table of
+  `W2-7-fabricated-success-where-the-spec-mandates-failure.md`. That record no
+  longer lives in this directory — it was retired on 2026-08-11 into the
+  internal fixed-bugs tree as
+  `jdk-only-W2-7-fabricated-success-where-the-spec-mandates-failure-FIXED-20260811.md`,
+  and that file's table stops at row 4. Whoever picks this up must decide where
+  the row now belongs; do not go looking for the original path.
+* **Cannot adjudicate without a run — two, one needing a different host.**
+  1. The 2026-08-11 change has not been built or run. The record's claims are
+     stated in syscall counts and asymptotics, provable by reading; the only
+     falsifier it names is a profile of `Process.descendants()` on a deep tree.
+  2. The `not(any(linux, windows))` arms were changed to return `Err` and are
+     **not compilable on this dev host** — type-correctness there is settled
+     only by the advisory macOS CI job (`.github/workflows/cross-platform.yml`).
+     See "Which arm could not be compiled".
+
+Lane W6-10 of the jdk-wave2 pool. **Files changed:** `native-io/src/process.rs`.
 
 This lane is a follow-up on a cost that this campaign introduced. Wave 3
 (`W3-6-processimpl-missing-natives.md`) gave Windows real process enumeration —
@@ -312,11 +344,19 @@ real new control flow (the captured-then-`CloseHandle` ordering on the
 `Process32FirstW` failure) is the Windows one. `ProcessScanError::new` is
 constructed on all three platforms, so no arm leaves it `dead_code`.
 
-## Out-of-file addition (not applied)
+## Out-of-file addition (not applied — and the target has MOVED)
 
-`docs/known-issues/jdk-only/W2-7-fabricated-success-where-the-spec-mandates-failure.md`
-is the inventory for this defect species and is not this lane's file to edit. Its
-table should gain a row:
+> **Reconciled 2026-08-12.** Still unapplied, and no longer appliable as
+> written. The target record was retired out of this directory on 2026-08-11
+> into the internal fixed-bugs tree as
+> `jdk-only-W2-7-fabricated-success-where-the-spec-mandates-failure-FIXED-20260811.md`,
+> whose table stops at row 4 and contains no row naming
+> `CreateToolhelp32Snapshot` / `Process32First` / `opendir("/proc")`. Decide
+> where the row belongs before writing it; do not go looking for the path
+> quoted below.
+
+The inventory for this defect species was `W2-7-fabricated-success-where-the-spec-mandates-failure.md`,
+which was not this lane's file to edit. Its table should gain a row:
 
 | # | Symptom | Spec answer | Site | Disposition |
 |---|---------|-------------|------|-------------|

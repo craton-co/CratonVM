@@ -1,5 +1,19 @@
 # The VM-internal door, swept: 44 classes, two gates, and four verdicts
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** Section 6 Hunk A
+> is **APPLIED**: `ctx.ensure_vm_internal_class(HS_LOOP_CLASS, 1);` at
+> `native-builtins/src/net_phase_e.rs:16397`, immediately above the surviving
+> `try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?` at `:16398`, commit
+> `a8b5342a5`. Hunk B was **withdrawn by this record itself**; W7-14's fix is in
+> the tree instead. The two hunks the status line claims are confirmed:
+> `native-builtins/src/lang_class.rs:13720` and
+> `classloading/src/class_manager.rs:11261`.
+>
+> * **Headline: CLOSED in source; section 6 carries no pending work.**
+> * **Residual: STILL OPEN** — section 8's "what this record does not fix", plus
+>   the optional `fabricated_origin_for_name` arm for `CratonVM$...` names,
+>   which was not added.
+
 **Status: two hunks APPLIED IN SOURCE, sweep COMPLETE, 2026-08-11. NOT
 REBUILT.** Every number in this record was taken by running the already-built
 `dev` binary at `C:/craton/CratonVM/target/release/cratonvm.exe` (built

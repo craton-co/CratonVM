@@ -1,5 +1,31 @@
 # `Cipher.getInstance("ChaCha20")` returned AES-256-ECB
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — THREE OF THE FOUR
+> "recorded, NOT applied" PATCHES ARE NOW SETTLED.**
+>
+> * **Patch 1** (the synthetic `SecretKeySpec` twin) — **APPLIED**, via this
+>   record's own "better still: delete both registrations" option. Tombstones at
+>   `native-builtins/src/phases_early.rs:14959` and `:14735`, commit `911ddb84b`.
+> * **Patch 2** (`keygen_default_bits`) — **APPLIED IN PART, and the half that
+>   is missing is the half the patch text names.** `keygen_default_bits` exists
+>   at `native-builtins/src/phases_early.rs:14302` and is used by
+>   `keygen_get_instance_named` (`:14429`, `None` ⇒ `NoSuchAlgorithmException`),
+>   with a ratchet test at `native-builtins/src/jca/provider_chain.rs:4202-4238`.
+>   But the two 2-arg `KeyGenerator.getInstance` overloads in
+>   `register_keygen_dispatch` — `native-builtins/src/jca/cipher.rs:3300` and
+>   `:3312` — **still** do `ctx.set_field(obj, 1, Value::Int(128));` with no
+>   algorithm check, so the 1-arg and 2-arg paths now diverge. **This is the
+>   live item.**
+> * **Patch 3** (generalise ChaCha20) — **APPLIED.** `chacha20_xor` at
+>   `native-builtins/src/crypto_impl.rs:1158` with four new KATs at `:5925-5996`;
+>   `CipherFamily::ChaCha20`/`ChaCha20Poly1305` at
+>   `native-builtins/src/jca/cipher.rs:1007`/`:1015`, admitted at `:1231-1232`,
+>   advertised at `provider_chain.rs:1187-1188`. Commit `3a594f304`.
+> * **Patch 4** (`keystore.rs`) — recorded only; no action was ever needed.
+>
+> Everything under *"What is deliberately still missing"* remains open and is
+> deliberate.
+
 **Status:** FIXED in source 2026-08-11 (lane W7-15). **Nothing was rebuilt** —
 this lane could not run `cargo build`, so every claim below is either a
 measurement taken against the *pre-fix* release binary at

@@ -1,11 +1,49 @@
 # A blocked reader never woke up — `close()` cannot reach a thread parked in `recv`
 
-**Status:** FIXED on the two real socket surfaces (code landed 2026-08-07;
-**verified 2026-08-11**, see "Measured 2026-08-11" below — the default-mode arm
-now wakes and throws `SocketException`). The third reader, the *synthetic*
-`java.net.Socket` surface, was **still live on 2026-08-11** and is fixed by the
-code landed that day in `native-builtins/src/net_phase_e.rs` — unverified, no
-binary was built in that session either. Lane W2-2 of the jdk-wave2 pool.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED on all three named surfaces.** Surfaces 1 and 2 landed
+  2026-08-07 (commit `ba50b498b`) and were verified 2026-08-11 —
+  `net_read_close_aware` at `native-io/src/net.rs:1736`, used from `net_read0` at
+  `:1863`; `read_close_aware` at `native-io/src/socket_channel.rs:2647`. Surface
+  3, the synthetic `java.net.Socket` reader, landed 2026-08-11 in commit
+  `e2fb45609` *fix(jdk-only): wake the synthetic Socket's blocked reader on an
+  async close*: `re1_stream_still_registered`
+  (`native-builtins/src/net_phase_e.rs:4006`), `re1_read_close_aware` (`:4070`),
+  `re1_socket_exception` (`:4129`), call site inside `re1_socket_read_stream`
+  (`:4213`), `SocketException("Socket closed")` at `:4235`, and all three public
+  entry points funnel into it (`:4355`, `:4368`, `:4380`). The three-state
+  `re1_socket_poll_readable` contract is at `:4494`/`:4535`/`:4574` with the
+  timeout-0 wrapper at `:4596`. **Surface 3 is still unverified against a
+  binary** — that is the one open piece of the headline.
+* **Residual: STILL OPEN — the idiom collapse.** The
+  `## Out-of-file patch (not applied)` below is genuinely not applied.
+  `poll_stream_readable` is still `pub(crate)` at `native-io/src/net.rs:2421`,
+  and all three `re1_socket_poll_readable` arms are still duplicated. Re-grepped
+  2026-08-12. This is a duplicate-idiom cleanup, not a defect.
+* **Finding for another lane — a FOURTH surface of this species, PLAUSIBLE not
+  confirmed.** `native-builtins/src/phases_early.rs:18236-18320` registers
+  `java/net/SocketInputStream` `read()I` and `read([BII)I` against the same
+  `s2_registry()`. Both clone the `Arc` out, drop the lock, and park in a bare
+  `read_retry_eintr` with **no** close-awareness and no registry re-ask, mapping
+  `Ok(0)` to `-1` (clean EOF) where `Socket.close()` mandates an exception —
+  the exact pre-fix `re1_socket_read_stream` shape. It is only *plausible*
+  because the class name is the pre-JDK-13 spelling that JDK 25 does not
+  declare, and it is absent from `native-api/src/no_image_receiver.rs`, so it
+  is probably reachable only in a `synthetic-jdk` build. The fixed registrations
+  use the different name `java/net/Socket$SocketInputStream`
+  (`net_phase_e.rs:5254`). Settling it needs one run — see *Cannot adjudicate*
+  below.
+* **Cannot adjudicate without a run** — two things, both cheap:
+  1. Surface 3's fix: the `AsyncCloseProbe` across three arms (`java`,
+     `cratonvm.exe`, `CRATONVM_REAL=-net-sockets cratonvm.exe`), plus
+     `cargo test -p cratonvm-native-io --lib net::tests socket_channel::tests`
+     and `vm/tests/socket_input_stream_timeout.rs`.
+  2. The fourth surface: `cratonvm --dump-native-registry` to name the surviving
+     owner of `java/net/SocketInputStream.read`, plus `AsyncCloseProbe` on a
+     `synthetic-jdk` binary.
+
+Lane W2-2 of the jdk-wave2 pool.
 
 ## The failure
 

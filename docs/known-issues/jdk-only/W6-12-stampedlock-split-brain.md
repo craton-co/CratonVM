@@ -1,10 +1,57 @@
 # StampedLock was already fixed; Phaser was the live split-brain
 
-**Status:** the brief this lane was handed is **refuted on its primary claim**
-and **confirmed on its sibling**. `StampedLock` needs no change — the losing
-registrar was disabled on 2026-07-28 and the call site is a `let _ =`. `Phaser`
-had the exact defect the brief described for `StampedLock`, plus a second one,
-and is fixed here.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Primary claim: REFUTED, and nothing about it is outstanding.** `StampedLock`
+  needs no change — the losing `native-collections` registrar was disabled on
+  2026-07-28 and its call site is a `let _ =`. The surviving implementation is
+  `native-builtins/src/util_concurrent_ext.rs::register_stamped_lock_natives`.
+  This half of the record is closed and should not be reopened by a future
+  duplicate-registration census: the census counts `r.register(...)` call sites
+  and **does not ask whether the function is reachable**, which is exactly how
+  the false brief was produced.
+* **Sibling claim: CONFIRMED and fixed in source.** `Phaser` had the described
+  defect plus a second one; the fix is the dropped call site
+  (`let _ = register_phaser_natives;`) in
+  `native-collections/src/lib.rs::register_collections_natives`.
+* **Residual: CLOSED — the two miswritten `native-collections` comments** (CHM
+  `KeySetView`, `LinkedList` `first`/`size`) were corrected in place,
+  `native-collections/src/lib.rs:2597` and `:30860-30870`, and written up in
+  W2-1-strict-refuses-the-synthetic-stream-stack.md.
+* **Residual: CLOSED ELSEWHERE, and BOTH of this record's prescriptions were
+  rejected.** §3's `ForkJoinPool.commonPool()` defect — a factory class named
+  `…$DefaultCommonPoolForkJoinWorkerThreadFactory`, a JDK-21 name JDK 25 does
+  not declare — is fixed by commit `46bb0ad2e` *fix(jdk-only): resolve the
+  common-pool factory from the image, not a JDK-21 name*, filed as
+  W7-14-fjp-common-factory-bound-by-name.md.
+  `common_factory_from_image`
+  (`native-builtins/src/phases_late/concurrent.rs:8524-8538`) reads the **public
+  static field** `ForkJoinPool.defaultForkJoinWorkerThreadFactory` instead of
+  naming any nested class. Neither recorded variant was taken, deliberately:
+  the *conservative* variant's ordering is refused in a comment at
+  `concurrent.rs:8566-8577` — *"ORDER IS THE CONTRACT HERE … probing the policy
+  first (the variant recorded in W6-12) would mint the class one call earlier"* —
+  and the *fidelity* variant's three-name candidate list was not taken because
+  it would have changed `--real-jdk`, which this record itself said was not this
+  lane's to take. **Do not apply the patch below.**
+* **Residual: STILL OPEN, and unmeasurable on a shipping binary.** The
+  `Collections` fidelity residual is structurally confined to `synthetic-jdk` —
+  both shipping modes drop the contested factories and run real
+  `java.util.Collections` bytecode, and all 37 rows of
+  `probes/JdkOnlyCollectionViewProbe` are byte-identical across HotSpot,
+  `--real-jdk` and `--jdk-only`. It is open only in the sense that **no
+  `synthetic-jdk` binary has ever been built to measure it**.
+* **Cannot adjudicate without a run — two.**
+  1. The `Phaser` fix: `cargo build --features synthetic-jdk`, then the 2-party
+     arrive/`getUnarrivedParties` race described below. This is still the
+     record's own reason to treat that fix as unproven.
+  2. §3's falsifier: `target/release/cratonvm --jdk-only -cp
+     regression-suite/build RJdkForkJoin`, reaching `parallelStreams()`'s
+     remaining assertions and exiting 0.
+* **One stale hazard note:** the record warns that
+  `regression-suite/src/RJdkPhaser.java` and `RJdkFieldModule.java` are
+  untracked. They are tracked in this worktree now; `git status` is clean apart
+  from this reconciliation.
 
 Filed 2026-08-07 (JDK-only wave 2, lane W6-12). Companion to
 `W6-4-duplicate-registration-gate.md`, whose static census produced the brief.
@@ -278,7 +325,18 @@ Note what the middle row means on its own: `Compatible` is not right here
 either, it is merely quiet. It hands back an instance of a class the running
 image does not declare.
 
-#### Out-of-file patch (not applied)
+#### Out-of-file patch — SUPERSEDED, DO NOT APPLY
+
+> **Reconciled 2026-08-12.** The observation was right and was acted on; both
+> prescribed variants were considered and **rejected on the merits**. The defect
+> is fixed by commit `46bb0ad2e`, which resolves the factory from the image's
+> own public static field (`common_factory_from_image`,
+> `native-builtins/src/phases_late/concurrent.rs:8524-8538`) rather than naming
+> any nested class. The conservative variant's ordering is explicitly refused in
+> a comment at `concurrent.rs:8566-8577` — probing the policy before
+> `try_alloc_concurrent_synthetic` would mint the class one call earlier. The
+> fidelity variant would have changed `--real-jdk`, which this record itself
+> said was out of lane. Write-up: W7-14-fjp-common-factory-bound-by-name.md.
 
 **Owner: `native-builtins/src/phases_late/concurrent.rs`** (this lane owns
 `native-collections/src/lib.rs` and this record only). Function

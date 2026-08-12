@@ -1,6 +1,47 @@
 # The field reflection path has the same caller-step gap `Method.invoke` had
 
-Status: fix written, unbuilt (lane L15 cannot run cargo or the VM).
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED in source.** `check_field_access` consults
+  `lang_reflect::caller_may_access_member` — commit `8429fcbbc`,
+  `native-builtins/src/lang_class.rs:669` (fn), `:696` (the call), `:633`
+  (`UNRESOLVED_DECLARING_CLASS_ID`). All four field call sites funnel through
+  `field_access_phase` (`lang_class.rs:6683`), and the five new unit tests are
+  at `lang_class.rs:23068`, `:23092`, `:23116`, `:23349`, `:23371`.
+* **Residual: CLOSED — the `protected` widening. This record still lists it as
+  open; it is not.** Commit `dcfe77cb8` gave `check_field_access` a
+  `receiver_class_id: Option<ClassId>` parameter and added
+  `reflective_target_class_id` (`native-builtins/src/lang_class.rs:732`), which
+  is HotSpot's `targetClass` — `Modifier.isStatic ? null : obj.getClass()` —
+  shared by all four field entry points, with the JLS §6.6.2.1 refinement in
+  `caller_may_access_member`.
+* **Residual: STILL OPEN — constructor access is unchecked.** This is the item
+  re-homed here from L1. `native_constructor_new_instance`
+  (`native-builtins/src/lang_class.rs:11017`) has **no** member-modifier gate:
+  lines 11017-11400 contain no `check_access`, `check_field_access` or
+  `caller_may_access_member` call. The only gates are
+  `check_reflection_module_access_with_target_id` (`:11165`) and
+  `check_reflection_export_access_with_target_id` (`:11184`), both JPMS. A
+  private constructor is still reachable without `setAccessible(true)`.
+  Re-grepped 2026-08-12. **Note the shape of the work:** L1's residual named a
+  check to *route*; there is no check to route, so this is a **narrowing**, and
+  the blast radius is every reflective instantiation in the corpus.
+* **Residual: STILL OPEN — hidden classes are never nestmates by this helper.**
+  `NativeContext::is_hidden_class` does not exist (`grep -rn "fn is_hidden_class"`
+  over `native-api/src` and `native-builtins/src` returns nothing), and
+  `confirmed_nest_host_name` (`native-builtins/src/lang_reflect.rs:1439`) has no
+  hidden-class exemption — contrast `classloading/src/access_control.rs`. This
+  fails **closed**, so it over-denies rather than under-denies.
+* **Residual: STILL OPEN — the missing vector.** The targeted probe this record
+  asks for (a nestmate field read with **no** `setAccessible`, inserted before
+  `regression-suite/src/RJdkReflect.java:182`) was never added; `:181-183` still
+  calls `setAccessible(true)` first. The only nestmate-without-`setAccessible`
+  assertion in the corpus is the **method** one at `:160`, so the field
+  narrowing this record landed is **unexercised**.
+* **Cannot adjudicate without a run:** `cargo test -p cratonvm-native-builtins
+  field_access_`; `target/release/cratonvm --real-jdk -cp
+  regression-suite/classes RJdkReflect`; the same with `--jdk-only`.
+
 Applies to: **both** `--real-jdk` (Compatible) and `--jdk-only` (JdkOnly).
 Follow-up to `L1-reflect-setaccessible-invoke.md`, which fixed the method half
 and named this as its known residual.

@@ -1,8 +1,47 @@
 # W5-1 — the `System.loadLibrary` allowlist was too wide
 
-Status: fixed. Its named residual — no loader-scoped `loadedLibraryNames` — is
-fixed too, **in strict mode only**, 2026-08-11; see "The residual, closed"
-below. Nothing has been built or run for that change.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED, and now verified.** The allowlist narrowing is in
+  `is_vm_provided_jdk_library` (`native-builtins/src/lang_system.rs:1950-1975`):
+  `zip`, `sunec`, `jvm` are gone from every platform, `PLATFORM_ONLY` is
+  `["sunmscapi"]` on Windows and `["jsig"]` elsewhere, and `zip` moved to
+  `DYNAMIC_ALREADY_LOADED` (`:1987`). The binary verification this record said
+  it lacked was taken 2026-08-12 against the dev binary at `ba65f1a19`:
+  `RJdkJni` runs to `PASS RJdkJni (35 checks)` in **both** `--jdk-only` and
+  `--real-jdk`, so the one-character `CK RJdkJni loadedLibrary=` divergence
+  this record opened for is gone.
+* **Residual: CLOSED — loader-scoped `loadedLibraryNames`.** Commit `adbe284ab`,
+  `LOADED_LIBRARIES` at `native-builtins/src/lang_system.rs:1757`, `claim_library`
+  at `:1777`, `requesting_loader_id` at `:1821`, teardown at `:3143`. **Strict
+  mode only** is not a caveat that has since expired — it is the design: the
+  mode fork is at `lang_system.rs:1473`, the strict arm registers the four
+  triples with `LoaderScoping::On` and the `else` arm with `LoaderScoping::Off`,
+  and `load_library_or_throw` early-returns on `Off` (`:1859`). Compatible mode
+  is byte-identical to before by construction.
+* **Residual: STILL OPEN — three, re-grepped 2026-08-12.**
+  1. **`BootLoader.loadLibrary` is still unarmed.** `record_boot_loader_library`
+     exists at `lang_system.rs:3183` and its own doc comment at `:3150` says
+     *"THIS HAS NO CALLER IN THE TREE."* The registration it would feed is still
+     `|_ctx, _args| Ok(None)` at `native-builtins/src/lib.rs:13813-13818`. The
+     "Not applied here" closure body in this record is genuinely unapplied. This
+     is also the reason W6-6's boot-loader case still cannot fire.
+  2. **Compatible-mode `Runtime.load0`/`loadLibrary0` still read the wrong
+     argument index.** `runtime_load_args` (`lang_system.rs:1658`) is used only
+     on the strict arm (`:1479`, `:1497`); the `else` arm still does
+     `match args.get(1)` at `:1547` and `:1569`.
+  3. **`load_native_library` still returns a table index, not the resolved
+     path** (`native-builtins/src/lib.rs:13913`), so "the key is the spelling,
+     not the file" stands.
+* **Cannot adjudicate without a run:** whether arming (1) flips `RJdkJni`'s `net`
+  probe. Source cannot decide whether `BootLoader.loadLibrary("net")` is reached
+  before `RJdkJni.java:189-202`. The A/B is
+  `target/release/cratonvm --jdk-only -cp regression-suite/build RJdkJni` and the
+  same with `--real-jdk`, compared against `java -cp regression-suite/build
+  RJdkJni` on the `CK RJdkJni loadedLibrary=` line, with and without the arming.
+* **The "Out-of-file: the campaign README's row" patch is discharged** — the
+  README in this directory was rebuilt on 2026-08-12 and no longer claims there
+  is no loader-scoped bookkeeping.
 
 Measured on 2026-08-07 on JDK 25.0.3 Windows x64, HotSpot as the oracle. The
 JDK path in the original text was `C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot`;

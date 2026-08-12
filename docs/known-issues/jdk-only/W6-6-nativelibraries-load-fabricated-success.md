@@ -1,16 +1,30 @@
 # `NativeLibraries.load` returned `true` for every library in the universe
 
-**Status:** FIXED in source 2026-08-07 (lane W6-6, JDK-only wave 2). Not yet
-verified against a binary — see *How to verify* below.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-Its named residual — no loader-scoped `loadedLibraryNames` — is fixed as of
-2026-08-11, **in strict mode only, and not on this road**. The distinction
-matters and §4 below already had it right: on *this* road the JDK's own
-`ClassLoader.loadLibrary` bytecode enforces the rule above this native, so
-nothing changed here. The fix landed on the road W5-1 owns, where CratonVM
-intercepts that bytecode. See *Known residual*, rewritten below, and
-W5-1-loadlibrary-allowlist-too-wide.md for the mechanism. Nothing has been
-built or run for it.
+* **Headline: CLOSED, and now verified.** The unconditional
+  `return Ok(Some(Value::Int(1)))` is gone; commit `b3aca74c8` replaced it with
+  three ordered branches at `native-builtins/src/lib.rs:13894-13973` — real load
+  at `:13913`, allowlist at `:13942-13945` (`zip` added on this path only), and
+  a truthful failure at `:13964-13970` that raises `UnsatisfiedLinkError` when
+  the caller asked for one and otherwise answers `Int(0)`. `throwExceptionIfFail`
+  is now **read from the argument** (`lib.rs:13907`), not assumed. The
+  registration is unconditional and `NativeKind::Bridge`, so **the fix is live
+  in both modes** — there is no mode fork around it, and
+  `NativeKind::allowed_in` (`native-api/src/registry.rs:4624-4629`) rejects only
+  `SyntheticStub` under `JdkOnly`. `NativeLibraries.unload(String,ZJ)V` is
+  registered too (`lib.rs:13991-14007`). The revert knob
+  `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK=1` is at `lib.rs:13961`.
+  Binary verification, taken 2026-08-12 on the dev binary at `ba65f1a19`: the
+  shared vector `RJdkJni` runs to `PASS RJdkJni (35 checks)` in **both**
+  `--jdk-only` and `--real-jdk`.
+* **Residual: CLOSED elsewhere, and this record was already right about why.**
+  The loader-scoped `loadedLibraryNames` landed 2026-08-11 on W5-1's road, in
+  strict mode only, and correctly changed nothing here — §4 below had that
+  distinction right. See W5-1-loadlibrary-allowlist-too-wide.md.
+* **Residual: STILL OPEN — one, and it is W5-1's to arm.** The boot-loader case
+  cannot fire on either road because `BootLoader.loadLibrary` is still a no-op
+  (`native-builtins/src/lib.rs:13813-13818`). Re-grepped 2026-08-12.
 
 ## The hole, and why it was worth a lane on its own
 
