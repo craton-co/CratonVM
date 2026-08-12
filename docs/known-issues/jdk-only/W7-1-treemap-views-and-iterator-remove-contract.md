@@ -191,11 +191,14 @@ the equivalent and was already correct.
     broken snapshot iterator.
   * **`native_map_key_itr_next` returning `null` past the end** where the JDK
     throws `NoSuchElementException`. Real, adjacent, and not on either table
-    above; left alone rather than widened into.
+    above; left alone rather than widened into. **CLOSED 2026-08-12 — see the
+    residual section at the end of this record.**
   * **`sort` / `replaceAll` do not bump `modCount`.** The JDK bumps there and we
     do not, so those two remain undetected. Under-reporting is the safe
     direction — it is exactly the pre-fix behaviour — where a spurious bump
-    would fail a loop the real JDK runs to completion.
+    would fail a loop the real JDK runs to completion. **Still open on purpose;
+    the residual section at the end says why the 2026-08-12 pass did not take
+    it either.**
   * **No version stamp on the view cache.** It is rebuilt on every operation.
     A stamp has to be bumped at every site that mutates a TreeMap's contents,
     and a site missed there is a silently stale view — the exact defect class
@@ -230,3 +233,55 @@ the equivalent and was already correct.
      `native_ts_itr_remove` falls back to the old cursor heuristic for a
      3-field shape, so a foreign construction path would degrade rather than
      read past the object, but no such path is known to exist.
+
+## The three residuals, 2026-08-12 — one closed, two left with a reason
+
+Source-only again. Nothing here was built or run.
+
+### `native_map_key_itr_next` past the end — CLOSED
+
+`native-collections/src/lib.rs`, `native_map_key_itr_next`. The exhausted branch
+raised `NoSuchElementException("No more elements")` instead of answering
+`Value::Object(None)`.
+
+`null` was the worst answer available and for the reason this record keeps
+finding: **a null is also a legitimate ELEMENT of a `HashMap` key set**, so a
+caller that over-ran its own `hasNext()` received something it could not tell
+from a real entry, and failed one or more frames away from the mistake. The
+message is `native_snapshot_itr_next`'s verbatim — that function is the other
+half of this iterator family (it *delegates here* for a `HashMap$KeyItr`
+receiver, and already threw exactly this on all three of its own exhausted
+paths), so the two cannot drift into two different reports.
+
+**This makes a call throw that previously returned.** The only in-tree caller is
+`native_snapshot_itr_next`'s delegation; every out-of-tree caller is bytecode
+written against the real `HashMap$KeyIterator`, which throws here, so correct
+code cannot reach it. Covered by `RJdkViews.keyIteratorExhaustion`.
+
+### `sort` / `replaceAll` and `modCount` — NOT TAKEN, and not by oversight
+
+The change is small and it is spec-correct: `ArrayList.sort` and
+`ArrayList.replaceAll` both `modCount++` in the JDK, `al_set_size` is the only
+funnel this crate has and neither changes the size, so it takes a
+`al_bump_mod_count` helper plus two call sites.
+
+It was not made because **the comodification machinery it would extend has
+still never been executed.** Everything under "Family 2" above is source that
+no build has seen; the record's own "What still needs measuring" item 2 asks
+whether the *existing* CME change breaks a Spring Boot or Tomcat workload, and
+that question is open. Stacking a second, wider set of bumps onto an unverified
+first set is the merge-time hazard the campaign records as "concurrent fix
+combination untested": if the arms then go red, no bisect separates the two.
+Take this one *after* the first CME measurement, not with it. The vector is one
+line — a `for (String s : list) list.sort(..)` beside `RJdkViews.failFast`'s two
+existing bounded loops — and writing it now would have been a gate for code
+nobody can run.
+
+### The view-cache version stamp — NOT TAKEN
+
+Unchanged from the reasoning above: a stamp has to be bumped at every site that
+mutates a TreeMap's contents, and a site missed there is a silently stale view.
+That is worse than the rebuild-every-time cost it replaces, and "did I find
+every mutation site" is not a question a source read can answer honestly in a
+file of this size. It needs the retained-view cost measurement (item 3) to
+justify it at all.

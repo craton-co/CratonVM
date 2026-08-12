@@ -1,5 +1,36 @@
 # W7-62 — three stale ratchets, six tests guarding nothing, and a fix that widened its own residual
 
+> **2026-08-12, MEASURED — the stub ratchet now FIRES, and it is deliberately
+> left firing.** First actual execution of
+> `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`
+> after the multi-lane campaign. It prints:
+>
+> ```
+> stub-ratchet: const BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT: usize = 1261;
+> ... exceeding the frozen baseline of 1253 ... 8 passed; 1 failed
+> ```
+>
+> **1253 → 1261, i.e. +8, of which only +2 is attributed.** The +2 is the pair
+> of `Cipher.getMaxAllowedKeyLength` / `getMaxAllowedParameterSpec` natives added
+> to repair `RCrypto`; they sit inside `register_cipher_clinit_shim`'s
+> `SyntheticStub` window and were deliberately left that kind so strict
+> no-stubs mode drops that family together, matching the sibling `isRestricted`.
+> **The remaining +6 has no owner.** Two candidates were checked and REFUTED:
+> `register_datagram_channel` sets `Bridge` (native-io/src/lib.rs), so the ten
+> new `DatagramSocketAdaptor` registrations do not count here; and the new
+> `Selector.provider` / `Stream.forEachOrdered` registrations are ambient
+> `Bridge` too.
+>
+> **Not re-frozen, on this record's own rule**: a firing gate is loud, a wrongly
+> frozen one is silent forever, and the gate's own failure text says *"Make the
+> new native a real Bridge/Intrinsic instead of a fake — do NOT just raise the
+> baseline."* Re-freezing to 1261 without naming those six would convert a real
+> signal into a permanent lie. `--dump-native-registry` produced no output when
+> tried, so the per-row diff that would settle it is itself an open instrument
+> question. Next lane: get a per-row `SyntheticStub` census out of a built
+> binary, diff it against the control binary
+> (`scratchpad/bin/cratonvm-control-44044c7e2.exe`), and name the six.
+
 **Status: SOURCE COMPLETE 2026-08-12, NOTHING BUILT OR RUN.** No `cargo`
 command and no CratonVM invocation happened in this session. The one thing that
 was executed is `probes/ListItrInterfaceProbe.java` on HotSpot 25.0.3+9
@@ -189,6 +220,30 @@ Not re-frozen, for the §2.3 reason, with a `# PENDING` block written above the
 constant. Recount with
 `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`
 and paste the constant the run names.
+
+**2026-08-12, second pass — two things this section could not know.**
+
+* **The +6 is not the only pending contribution, and the other two move it by
+  different amounts.** The four new scalar `StringBuilder.insert` overloads
+  (`IZ`/`IJ`/`IF`/`ID`, on three receiver class names) move this ratchet by
+  **zero** — the ambient kind at that registration site is `Bridge`, so the
+  twelve rows are outside this census's population entirely, while they do move
+  row 2 and row 1. The unlanded 7-row `java/io/Print*` shadow retirement would
+  move it **up by as much as seven**, in the same direction as the +6 and for
+  the same reason. Both are now written above the constant, apart, so the run's
+  diff can be attributed instead of averaged. Neither is a value anyone may
+  paste.
+* **Row 3's companion instrument — the source witness that guards this gate's
+  SCOPE — was blind, and had been since it landed.** It located `vm_init`'s
+  real-JDK arm with a `contains` match that hits a COMMENT quoting the
+  attribute 44 lines above the attribute itself, so it scanned 39 lines of the
+  sibling synthetic arm, observed 8 registrars instead of 48, and passed. The
+  identical code was in row 4's file. Both are fixed and collapsed into one
+  shared model; the account is in
+  W7-30-stub-ratchet-boot-path-scope.md §9. It changes no number here — a
+  source scan is not a count over the registry — but it means row 3's and row
+  4's "the scope is checked" status was, until 2026-08-12, the same kind of
+  claim this table exists to distrust.
 
 ### 2.5 The one gate whose kind-flip population this session checked and cleared
 
@@ -395,7 +450,13 @@ default build.
 
 ```sh
 # item 1 — both gates from one census; expect the kind map to PASS and the
-# bridge ratchet to fire with exactly the §2.3 movement and nothing else
+# bridge ratchet to fire with exactly the §2.3 movement and nothing else.
+#
+# MUST BE RUN ON LINUX AGAINST JDK 25. Both artefacts are keyed
+# `<jdk-feature>/<os>`; `jdk-only-bridge-ratchet.py`'s `host_os()` and this
+# script's `--os` both come from the running host, so on Windows the gates look
+# up `25/windows`, find no baseline, and exit 2 — "REFUSING", which is neither a
+# pass nor a fail and cannot re-freeze anything.
 bash regression-suite/bridge-ratchet.sh
 
 # item 1 — the third ratchet; expect 1269 (management) and re-freeze from the

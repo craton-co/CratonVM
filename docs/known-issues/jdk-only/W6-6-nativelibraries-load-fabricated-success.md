@@ -1,5 +1,53 @@
 # `NativeLibraries.load` returned `true` for every library in the universe
 
+**Status (re-read 2026-08-12, second pass — source and committed baselines only;
+nothing here was built or run):**
+
+* **Line cites refreshed; the ones below had rotted by roughly twenty lines.**
+  In the tree today: the `BootLoader.loadLibrary` no-op is
+  `native-builtins/src/lib.rs:14068-14073`; `NativeLibraries.findBuiltinLib` is
+  `:14078-14084`; `NativeLibraries.load`'s three ordered branches are
+  `:14149-14228` (real load `:14168`, allowlist `:14197-14200`, revert knob
+  `:14216`, truthful failure `:14219-14225`), all under an explicit
+  `register_with_kind(.., NativeKind::Bridge)` at `:14227`;
+  `NativeLibraries.unload` is `:14246`. `record_boot_loader_library` is
+  `native-builtins/src/lang_system.rs:3244`, still zero callers.
+* **The ambient-kind hazard this record amended in is now MEASURED, not
+  inferred.** `scripts/baselines/jdk-only-kind-map-25-linux.tsv:9400` carries
+  one row for `jdk/internal/loader/BootLoader loadLibrary
+  (Ljava/lang/String;)V`: kind `bridge`, `kind_stated` **0** (ambient),
+  `kind_chosen` 1. One row is also the single-registrar proof, since that file's
+  unit is one registration — `setBootLoaderUnnamedModule0` has two rows
+  (`:9401-9402`), `loadLibrary` has one. The constraint stands exactly as
+  amended below, and it now has a number behind it.
+* **It is being written where a retagger will see it.** The guard belongs at
+  the registration site in `lib.rs`, not only in this directory. That is an
+  out-of-file patch (patch A) in W5-1-loadlibrary-allowlist-too-wide.md, along
+  with the reason not to "harden" it into a `register_with_kind`: identical
+  behaviour, but it flips that baseline row's `kind_stated` 0 -> 1, and only
+  `regression-suite/bridge-ratchet.sh` on Linux can re-freeze it.
+* **Residual, the boot-loader case: STILL OPEN, STILL W5-1's, and the two
+  records now agree.** W5-1 carries the exact arming patch, the ambient-kind
+  guard that must land with it, and — new — the argument that the A/B is
+  uninformative on Windows, because the road at risk is the Linux boot-class
+  `<clinit>` one (`lib.rs:14062-14067`).
+* **NEW FINDING, on this record's own headline surface: the two roads' library
+  admission HAS drifted, which is the exact species this record legislated
+  against.** §"What the body does now" says the allowlist is *"reused, not
+  copied — two lists would drift"*, and that is still true of
+  `is_vm_provided_jdk_library`. But `System.loadLibrary`'s road has since grown
+  a **second** admission that this road never got:
+  `lang_system::jdk_image_ships_library` (`lang_system.rs:2077-2092`), a
+  file-presence test over `<java.home>/{bin|lib}`, added because
+  `java.awt.Toolkit.<clinit>` started dying on the newly-real
+  `UnsatisfiedLinkError`. `NativeLibraries.load` branch 2 (`lib.rs:14198`) still
+  tests only `is_vm_provided_jdk_library(bare) || bare == "zip"`. So for the
+  java.desktop family — `awt`, `fontmanager`, `javajpeg`, `lcms`, `jsound`,
+  `freetype`, `mlib_image`, `splashscreen` — the intercepted road answers
+  success and the real-bytecode road answers `Can't load library: <path>`.
+  HotSpot loads all of them. Fixing it is one disjunct, plus a visibility
+  change, and it is out of the lane that found it — patch and caveats below.
+
 **Status (re-reconciled 2026-08-12 — W7-79-loadlibrary-compatible-arm.md):**
 
 * **Headline: CLOSED, present, single-registrar, and INERT on every vector this
@@ -347,3 +395,57 @@ never actually reached in either arm** — because `System.loadLibrary`,
 correct but inert. Cheapest check is a `WARN`-level trace on entry to the native,
 or `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK=1` producing *no* behavioural
 difference anywhere.
+
+## The drift, and the two-line patch — OUT OF FILE, UNMEASURED
+
+Found 2026-08-12 by reading both roads side by side; not applied, and it is not
+this record's headline moving.
+
+`System.loadLibrary`'s road admits a library on **three** grounds
+(`lang_system::load_library_or_throw`, `lang_system.rs:2123-2159`): the real
+open succeeded (`:2134`), the name is on `is_vm_provided_jdk_library` (`:2141`),
+or the JDK image ships the file (`:2149`, `jdk_image_ships_library`). This
+record's road admits on **two**: the real open, and
+`is_vm_provided_jdk_library(bare) || bare == "zip"` (`lib.rs:14198`). The third
+was added later, for `awt` — `java.awt.Toolkit.<clinit>` is reached by merely
+constructing a `java.awt.event.ActionEvent`, and H2's `TestTools.testConsole`
+went from an 8-minute run to dying in under a second on that one constructor
+once the `UnsatisfiedLinkError` became real. Nothing carried it across.
+
+Patch, two edits, both out of the lane that found this:
+
+1. `native-builtins/src/lang_system.rs:2077` — widen visibility so the other
+   road can reuse it rather than growing the second copy this record's §"What
+   the body does now" forbids:
+
+   ```rust
+   pub(crate) fn jdk_image_ships_library(ctx: &dyn NativeContext, name: &str) -> bool {
+   ```
+
+2. `native-builtins/src/lib.rs:14198` — add the third ground as a disjunct:
+
+   ```rust
+            if crate::lang_system::is_vm_provided_jdk_library(&bare)
+                || bare == "zip"
+                || crate::lang_system::jdk_image_ships_library(&*ctx, &bare)
+            {
+                return Ok(Some(Value::Int(1)));
+            }
+   ```
+
+   `bare` is already the decoded bare name (`bare_native_library_name(&name)`,
+   `:14197`), which is what `jdk_image_ships_library` expects; it re-derives the
+   decorated file name itself through `platform_lib_name`. `&*ctx` reborrows the
+   `&mut dyn NativeContext` immutably, the same reborrow `runtime_load_args`'s
+   call sites use.
+
+**Why it is not applied here.** It is a behaviour widening — a failure becomes a
+success — on a road this host cannot reach: the knob A/B at the top of this
+record shows `NativeLibraries.load` moves nothing observable in either mode on
+Windows. So it would land unmeasured, and its one real target (a Linux real-JDK
+`Toolkit.<clinit>` arriving by bytecode rather than through the intercepted
+`System.loadLibrary`) is exactly the road nobody has run. It is also *not*
+symmetrical with `zip`: `zip` is on this road and off the other deliberately, and
+`jdk_image_ships_library` screens `zip` out itself (`DYNAMIC_ALREADY_LOADED`,
+`lang_system.rs:2046`, tested at `:2078`), so adding the disjunct does not
+disturb it.

@@ -72,8 +72,17 @@ public class RJdkJni {
         Object o = new Object();
         int viaReflection = (Integer) hashCode.invoke(o);
         check(viaReflection == o.hashCode(), "reflective native invoke must agree with direct");
+        // `> 0` was satisfied by a reflective path that answered a constant, or
+        // dropped through to a stub, without ever reaching the binding this
+        // line is named for. Bracketed by two DIRECT calls to the same native
+        // instead: relational, computed by the test, and it can only widen on a
+        // slower host. Not a wall-clock window -- no fixed duration appears.
+        long before = System.currentTimeMillis();
         long t = (Long) millis.invoke(null);
-        check(t > 0, "reflective static native invoke");
+        long after = System.currentTimeMillis();
+        check(t >= before && t <= after,
+                "reflective static native invoke returned " + t + ", outside ["
+                        + before + "," + after + "]");
 
         // arraycopy is a native with strict argument checks that must raise the
         // spec'd exception rather than corrupting memory.
@@ -200,6 +209,25 @@ public class RJdkJni {
         }
         check(loaded.equals("zip") || loaded.equals("net"),
                 "a JDK-shipped native library must be loadable, got: " + loaded);
+        // ...and WHICH one, which the line above cannot see. "zip" is exactly
+        // the answer a too-wide VM allowlist manufactures: main() runs
+        // zipNatives() first, so java.base has already boot-loaded zip into the
+        // BOOT loader by the time this runs, and the JDK refuses the same
+        // library file to a second class loader -- HotSpot 25 therefore throws
+        // here and falls through to the net probe. A VM answering "zip" is
+        // reporting success for a load the JDK forbids. Asserted rather than
+        // left to the cross-VM CK diff, because that diff is SKIPPED whenever
+        // no HotSpot is present on the host (run.sh says so), which is the
+        // configuration this line has to survive.
+        //
+        // It is also the trip-wire for the other direction: recording the boot
+        // loader's own libraries (jdk/internal/loader/BootLoader.loadLibrary is
+        // a no-op today) would claim "net" first, turning this into "none". See
+        // docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md and
+        // section 2.6 of that directory's README.
+        check(loaded.equals("net"),
+                "System.loadLibrary must FAIL for zip once java.util.zip has boot-loaded it"
+                        + " and fall through to net, got: " + loaded);
 
         // A library that does not exist must be a real UnsatisfiedLinkError. Its
         // MESSAGE embeds java.library.path, so only the type is asserted.

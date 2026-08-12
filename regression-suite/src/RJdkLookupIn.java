@@ -268,6 +268,51 @@ public class RJdkLookupIn {
         System.out.println("CK RJdkLookupIn lookupClass=" + l.in(String.class).lookupClass().getName());
     }
 
+    /**
+     * {@code previousLookupClass()} must answer a REFERENCE, on every layout.
+     *
+     * <p>This is W7-13's second item, which had no witness anywhere. The native
+     * behind it is declared {@code ()Ljava/lang/Class;} and used to read a FIXED
+     * slot 2 -- which on the real JDK 25 {@code MethodHandles$Lookup} layout
+     * ({@code lookupClass}(0), {@code prevLookupClass}(1),
+     * {@code allowedModes}(2), {@code cachedProtectionDomain}(3)) is
+     * {@code allowedModes}, an {@code int}. So it handed back the mode word (95
+     * for a full-power lookup) out of a method whose declared return type is
+     * {@code Class}. It now resolves the slot from a class-side witness and
+     * coerces any non-reference read to null, so no layout can produce that.
+     *
+     * <p>Every value below was measured on HotSpot 25: null for every lookup
+     * that never crossed a module boundary, which is all five of these.
+     */
+    static void previousLookupClassIsAReference() {
+        Lookup l = MethodHandles.lookup();
+        check(l.previousLookupClass() == null, "lookup().previousLookupClass() is null");
+        check(MethodHandles.publicLookup().previousLookupClass() == null,
+                "publicLookup().previousLookupClass() is null");
+        check(l.in(RJdkLookupIn.class).previousLookupClass() == null,
+                "in(own class) leaves previousLookupClass null");
+        check(l.in(Nested.class).previousLookupClass() == null,
+                "in(nestmate) leaves previousLookupClass null");
+        check(l.dropLookupMode(Lookup.PRIVATE).previousLookupClass() == null,
+                "dropLookupMode(PRIVATE) leaves previousLookupClass null");
+        // The one MODULE-CROSSING case, and the WEAK check here on purpose.
+        // HotSpot 25 reports the original lookup class; CratonVM models no
+        // modules and neither `alloc_lookup` nor `in()` ever populates the
+        // field, so it reports null. A check demanding HotSpot's answer would be
+        // permanently red for a modelling gap no fix in this area clears, and a
+        // permanently-red vector teaches operators to ignore the red. What is
+        // asserted instead is the part that is common to both and is the actual
+        // W7-13 claim: whatever comes back is usable AS a Class -- assigned to a
+        // Class<?> local and compared by reference -- and is one of the two
+        // legal answers, never a mode word.
+        Class<?> crossed = l.in(String.class).previousLookupClass();
+        check(crossed == null || crossed == RJdkLookupIn.class,
+                "in(other module) reports null or the original lookup class, never an int");
+        // Deliberately NOT printed as a value: this is the one line that differs
+        // between the oracle and this VM, and `run.sh` diffs CK lines.
+        System.out.println("CK RJdkLookupIn previousLookupClass=ok");
+    }
+
     public static void main(String[] args) throws Throwable {
         inFromFullPower();
         publicLookupIsUnconditional();
@@ -275,6 +320,7 @@ public class RJdkLookupIn {
         dropLookupModes();
         modesDecideAccess();
         lookupClassFollows();
+        previousLookupClassIsAReference();
         System.out.println("CK RJdkLookupIn checks=" + checks);
         System.out.println("PASS RJdkLookupIn (" + checks + " checks)");
     }

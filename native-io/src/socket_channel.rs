@@ -2741,11 +2741,13 @@ fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io:
 /// readiness", which is exactly the question here, and its `Failed` verdict is
 /// a pending `SO_ERROR` that the following `send` would report anyway.
 ///
-/// `net::poll_stream_readable` has no writable sibling exported today. Adding
-/// a `poll_stream_writable` (tracker task #46) is small and would be the tidier
-/// long-term home — it gets `net_poll_stream`'s real timeout instead of this
-/// sleep cadence, and drops the two `SO_ERROR` reads `nb_connect::poll` does per
-/// pass. It is NOT a like-for-like swap, which is why it has not been made:
+/// `net::poll_stream_writable` NOW EXISTS (`net.rs`, added with the blocking-
+/// close-awareness family) and is the tidier long-term home — it gets
+/// `net_poll_stream`'s real timeout instead of this sleep cadence, and drops the
+/// two `SO_ERROR` reads `nb_connect::poll` does per pass. **Its existence is not
+/// a reason to swap**, and the paragraph below is why; it is restated here
+/// because the sibling arriving is exactly the event that makes someone reach
+/// for the swap. It is NOT like-for-like:
 /// `net_poll_raw` answers `Ok(count > 0)` for ANY `revents` — `POLLERR`,
 /// `POLLHUP` and `POLLNVAL` all read as "writable" — whereas `nb_connect::poll`
 /// distinguishes `WSAPOLLWRNORM` (`Connected`) from `POLLERR|POLLHUP`

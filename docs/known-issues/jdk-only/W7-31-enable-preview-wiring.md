@@ -1,6 +1,10 @@
 # The preview gate had no switch, and HotSpot's nameless-class placeholder is `<Unknown>`
 
-**Status: all four parts of W7-28's handback are APPLIED. Nothing was rebuilt.**
+**Status: CLOSED 2026-08-12. All four parts of W7-28's handback are APPLIED, and
+the one residual — the `<Unknown>` vs `""` nameless-define distinction — is
+ADJUDICATED WILL NOT FIX in §6, which is this record's own §3.1 argument
+carried to a decision. Nothing was rebuilt; what this record still needs is a
+build, not a patch.**
 Every measurement below is of HotSpot Adoptium 25.0.3.9
 (`C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot`) or of the
 **pre-change** binary at `C:/craton/CratonVM/target/release/cratonvm.exe` (built
@@ -262,6 +266,62 @@ for `defineClass("")`: change `read_optional_internal_name` to return
 `jni_define_class` (`vm/src/native/jni.rs:4192`, which already has its own `""`
 placeholder and a comment saying so) and `define_class_with_options`, then render
 `None` as `<Unknown>` and `Some("")` as `""`. §3.1 argues this is not worth it.
+
+## 6. ADJUDICATED 2026-08-12 — the nameless-define distinction is WILL NOT FIX, and this record is closed
+
+§3.1 argued against it; a later lane was asked to decide rather than implement
+reflexively, and the decision is to **decline it and close the record**. A record
+left open on the one residual its own author argued against is bookkeeping debt,
+and it was the only thing keeping this one open.
+
+Five reasons, in the order that decided it:
+
+1. **The reachable half is already exactly right.** JNI `DefineClass` with a NULL
+   name and `ClassLoader.defineClass(null, …)` both arrive as `String::new()` and
+   both now render `<Unknown>`, which §3 measured on HotSpot. The only input the
+   patch changes is `defineClass("")` — an explicitly empty binary name, which is
+   not a valid binary name at all, which `javac` cannot emit and which no
+   framework in the corpus produces. The patch buys fidelity on an input nobody
+   has.
+2. **The observable is one word inside an exception message.** Not a type, not a
+   thrown-or-not decision, not a field value. `UnsupportedClassVersionError`'s
+   sentence already carries the type and the version; §3's five HotSpot arms
+   differ from ours only in `<Unknown>` versus a doubled space. Nothing in the
+   tree parses that message, and if anything ever does, the message it will parse
+   is the reachable one.
+3. **The cost is a signature change on the class-definition funnel.**
+   `define_class_with_options` is the one entry every define path converges on —
+   classpath loads, `ClassLoader.defineClass`, `Lookup.defineClass`,
+   `defineHiddenClass`, JNI. Threading `Option<&str>` through it plus
+   `read_optional_internal_name` and `jni_define_class` puts three files in two
+   crates, two of them outside any one lane, in the blast radius of a placeholder
+   spelling. The campaign's own record of what a define-path edit costs when it
+   goes wrong is W7-82-forname-duplicate-define.md.
+4. **It cannot be closed by a scheduled assertion in the shape it would need
+   one.** A vector could subclass `ClassLoader` and call
+   `defineClass("", b, 0, b.length)` on a hand-stamped `69.65535` file, but the
+   check it would assert is "CratonVM prints a doubled space where it currently
+   prints `<Unknown>`" — a fixture whose only purpose is to pin the fix, on an
+   input the JVMS does not admit. The falsifier this record already carries ("a
+   nameless define of a 69.65535 class file must say `<Unknown>`, not blank") is
+   the assertion worth having, and it covers the half that ships.
+5. **Declining loses no information.** §3.1 states the divergence in place, at
+   `read_optional_internal_name`'s own trade-off, and names the shape
+   (`Option<&str>`, not a second sentinel string) for anyone who ever needs it.
+   That is the correct end state for a knowing, documented, unobservable
+   inaccuracy.
+
+**What would reopen it**, stated so this is a decision and not a shrug: a real
+consumer that branches on the placeholder text; HotSpot changing either spelling
+so ours is wrong on the *reachable* half too; or `read_optional_internal_name`
+being refactored to `Option<String>` for an unrelated reason, at which point
+rendering `None` as `<Unknown>` and `Some("")` as `""` is free and should be
+taken.
+
+**Nothing else in this record is open.** §4's four parts (A–D) are applied or
+measured unnecessary, §5's hazards are checked, and the remaining caveats are
+labelled unmeasured rather than unresolved — §"What is not claimed" is a build
+dependency, not a defect.
 
 ## Falsifier
 

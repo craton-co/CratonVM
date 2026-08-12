@@ -298,13 +298,16 @@ currently be wrong. `--features synthetic-jdk` + `--synthetic-jdk` exercises the
    The probe's oracle is measured on HotSpot; its CratonVM column has still never
    been produced — for this lane, W7-76, W7-69 or W7-58. That column is still the
    single highest-value next step and it is one command in each mode.
+   **Qualified 2026-08-12 by §8**: the `seg.*` section of that column cannot be
+   produced at all until `MemorySegment.asByteBuffer()` is registered, and the
+   part of it a scheduled fixture *can* answer is §7.1, which §8.1 now schedules.
 2. **`arrayOffset()` on a direct receiver.** `s2`'s `arrayOffset` returns
    `s2_bb_heap_base(..)` unconditionally and never throws; HotSpot throws
    `UnsupportedOperationException`. Pre-existing, untouched here, and already
    covered by the probe's `direct.arrayOffset.throws` /
    `seg.native.arrayOffset.throws` rows (expected red on CratonVM). Fixing it is
    a Compatible-mode parity change of the same species as §4 and a natural next
-   lane.
+   lane. **Prescription and scheduled assertions written 2026-08-12 — see §8.**
 3. **`native-api/src/test_mock.rs::object_is_array`** still answers `false` for
    its own arrays (§2.2), and its `superclass_of` still answers `None`
    unconditionally (W7-69 §2.1).
@@ -318,3 +321,92 @@ currently be wrong. `--features synthetic-jdk` + `--synthetic-jdk` exercises the
    panic needs a build to price.
 7. Everything W7-76 §9 left open is still open, minus its item 4, which is this
    record.
+
+---
+
+## 8. §4's Compatible-mode receiver cannot be CONSTRUCTED today (2026-08-12)
+
+§4's table is labelled a source-level prediction, and it is one. Verifying it —
+rather than inheriting it — found that the row it predicts is currently
+**unreachable**, and the reason is one grep away.
+
+**`MemorySegment.asByteBuffer()` has no native registration in either crate.**
+Searched tree-wide: the string `asByteBuffer` appears only in comments (in
+`native-builtins/src/{servlet.rs,charset.rs}` and `native-io/src/lib.rs`) and in
+this campaign's records. It is also on no forced-native list. So:
+
+| receiver | route in Compatible mode | can `asByteBuffer()` answer? |
+|---|---|---|
+| `Arena.ofAuto().allocate(16)` | `Arena.ofAuto` → `p67_new_arena`, `allocate` → `panama::pe_arena_allocate` → a **synthetic** 6-slot object stamped with the `java/lang/foreign/MemorySegment` INTERFACE | **No.** `asByteBuffer` is abstract on the interface, nothing declares `Code`, and there is no native. This is the shape §6.3 already records for `copyFrom` (`AbstractMethodError: … has no Code attribute`), and it is almost certainly why the probe's section `G` "produced **no** output at all" |
+| `MemorySegment.ofArray(byte[])` | `ofArray([B)` has **no** registration either, so the JDK's own static interface method runs → a genuine `HeapMemorySegmentImpl$OfByte` (whose `scope` holds one of OUR sessions, as W7-89 §4.2(2) measured) | Yes — real bytecode, giving a real `HeapByteBuffer` with `hb` set and `segment` null |
+
+So the only receiver that puts a non-null `MemorySegment` in slot 5 of a real
+`java.nio.Buffer` is the one CratonVM cannot mint. **Nothing in this VM currently
+writes `Buffer.segment` on a real-layout ByteBuffer at all** — `bb_write_hb`
+writes seven named fields and `address`, none of them `segment`, and the indexed
+slot-5 write is gated behind `s2_bb_synthetic_layout`, which is false on the real
+layout by construction (§6 of W7-76).
+
+**What this does and does not change:**
+
+* The screen in `s2_bb_arr` is **correct and not wasted**. It is the guard that
+  makes the row safe *when* a receiver of that shape appears — and the shape
+  arrives the moment anyone registers `asByteBuffer`, which §6.3's `copyFrom`
+  finding says is a live gap. Landing the screen before the receiver exists is
+  the right order, and it is the opposite mistake from the one W7-89 §5.3
+  warns about.
+* **§4's `before` column is not a measurement and cannot become one on today's
+  tree.** Read it as "what would have happened", not "what happened". The
+  `native-io` half (§3) is unaffected by this: its receivers are
+  `native-builtins`' typed views, which genuinely do park an array at slot 5, and
+  that population exists in synthetic mode.
+* **No scheduled fixture can assert the `seg.*` battery.** Every `seg.native.*`
+  and `seg.confined.*` row in the probe needs `Arena…asByteBuffer()`, which
+  raises before the first assertion; the `seg.heap*` rows would work but they are
+  the arm that was already green, so they discriminate nothing. §7.1 is
+  therefore **the only part of this record a scheduled fixture can reach**, and
+  it is what the fixture below asserts.
+
+### 8.1 §7.1 — the prescription, and the assertions that pin it
+
+`arrayOffset()` is three lines in the JDK and the two throws are the whole of
+what a VM gets wrong, because the happy path is a plain field read that comes out
+right by accident:
+
+```java
+public final int arrayOffset() {
+    if (hb == null) throw new UnsupportedOperationException();
+    if (isReadOnly) throw new ReadOnlyBufferException();
+    return offset;
+}
+```
+
+`array()` in the same file (`native-builtins/src/servlet.rs`, the
+`r.register(bb, "array", "()[B", …)` block) already has exactly that shape.
+`arrayOffset` is one line and has none of it. **Out-of-file for the lane that
+found this** (`servlet.rs` is another lane's file); the replacement body is a
+transcription of `array()`'s match with `Value::Int(s2_bb_heap_base(..))` in
+place of the array, and it keeps the storage-less synthetic's historic benign
+zero for the same reason `array()` keeps its benign null.
+
+The scheduled assertions are `RDirectBufferElem.arrayOffsetContract()` — group 7
+of `regression-suite/src/RDirectBufferElem.java`, which is in `CORE_CLASSES`
+already, so there is no `run.sh` change. 26 checks, each value copied from
+`probes/DirectByteBufferStateProbe.expected.txt`:
+
+| assertion | oracle row | before |
+|---|---|---|
+| `direct arrayOffset()` → `UnsupportedOperationException` **exactly** | `direct.arrayOffset.throws` | returns `0` |
+| `direct window arrayOffset()` → same | `direct.win.arrayOffset.throws` | returns `0` |
+| `direct read-only arrayOffset()` → same | `direct.win.readOnly.arrayOffset.throws` | returns `0` |
+| `heap read-only arrayOffset()` → `ReadOnlyBufferException` **exactly** | `heap.win.readOnly.arrayOffset.throws` | returns `4` |
+| `a fresh heap buffer's arrayOffset is 0` | `heap.arrayOffset = 0` | green — the guard |
+| `a heap window's arrayOffset is 4`, `…array is the parent's, by identity`, `…array is the PARENT's 16 elements` | `heap.win.arrayOffset`, `heap.win.array.identity`, `heap.win.array.length` | green — and these are the rows a fabricated right-sized copy fails |
+| every `array()` row and every `get(0)` row beside them | `*.array.throws`, `*.win.get0` | green — the over-correction arm: a fix that refuses everything satisfies the four red rows and fails these |
+
+`checkThrowsExactly` is a new helper and is not decoration:
+`ReadOnlyBufferException extends UnsupportedOperationException`, so the
+subclass-tolerant `checkThrows` the file already had would pass a heap read-only
+`ReadOnlyBufferException` against an expectation of the wider type — making the
+measured heap/direct split unobservable in exactly the direction §6's
+`seg.heapRO` rows exist to pin.

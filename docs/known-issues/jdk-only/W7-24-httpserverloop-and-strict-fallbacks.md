@@ -360,6 +360,35 @@ registration or a table:
   `compatibility-class-requested` row for `HttpExchange$ResponseBody` and now
   **none** for `CratonVM$HttpServerLoop`.
 
+### 7.1 Re-verified 2026-08-12 — both residuals are STILL OPEN, and both landed fixes are STILL PRESENT
+
+Source-level re-read on this tree, because this campaign has fifteen records
+claiming a patch was never applied when it was, and the inverse mistake is
+cheaper to make than to notice:
+
+* **§1's door fix is present** — `net_phase_e.rs`'s `re10_spawn_dispatcher` calls
+  `ctx.ensure_vm_internal_class(HS_LOOP_CLASS, 1)` before the mint, with the W7-24
+  reasoning on the site.
+* **§3's fallback is present** — `re10_real_jdk_response_body` exists and is
+  reached from the `Err` arm of the `getResponseBody` mint.
+* **§4 is unchanged and still loud** — the `RE5_REPLAY_SUBSCRIPTION` mint is a
+  bare `try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION,
+  RE5_SUB_NUM_FIELDS)?`, so `--jdk-only` still refuses it by name at
+  `HttpClient.send`. **Do not "fix" this by allocating a `Flow.Subscription`**:
+  the table in §4 shows every candidate either counts demand without delivering
+  (a HANG in place of a loud refusal) or moves delivery off the caller's thread.
+* **§5 is unchanged** — `register_re1_socket`'s two mints are still there
+  (`net_phase_e.rs`), still behind the `io.real_net_sockets` early return that
+  makes them unreachable in a default run, and their live twins are still in
+  `phases_late/ssl_security.rs` with all eight natives registered there.
+
+**No fixture assertion was added for either residual, deliberately.** Both are
+strict-only refusals whose current correct reading is a *failure*: an assertion
+over §4 would be a scheduled RED, and §5 is unreachable without
+`CRATONVM_SYNTHETIC_NET_SOCKETS`, which no `class_args` entry sets. The coverage
+this lane did add is for a different record and a landed fix — see
+W7-53-blocking-close-family.md, "Two of the thirteen shapes are now SCHEDULED".
+
 ## 8. How to re-take all of this
 
 ```sh

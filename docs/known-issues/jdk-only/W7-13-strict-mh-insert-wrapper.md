@@ -5,6 +5,20 @@ measurement below was taken by running the already-built `dev` binary at
 `C:/craton/CratonVM/target/release/cratonvm.exe`; nothing in this record claims
 that the source change works, only that the measurements were taken.
 
+> **RETIRE-FIXED CANDIDATE as of 2026-08-12.** Both of this record's two
+> remaining items are closed: the stale §9 row in
+> `docs/architecture/natives-over-real-jdk-classes.md` is edited in place, and
+> the neighbouring `lk_previous_lookup_class` slot-2 claim has been checked and
+> is **also stale** — the function resolves the slot from a class-side witness
+> and coerces a non-reference read to null, so it can neither read slot 2 on the
+> real layout nor return an `Int` from a `()Ljava/lang/Class;` native. See *Both
+> §9 items are now settled*, below. Nothing is left to apply. What the record
+> still needs before it is retired is a REBUILD of the headline carrier fix,
+> which is the `--jdk-only-report` command in *How to falsify this*. One new
+> subject was found on the way and is NOT closed: a second, disagreeing slot map
+> for `java/lang/invoke/MethodHandle` in `classloader.rs`, almost certainly
+> unreached, recorded in that same section.
+
 Branch: `fix/jdk-only-strict-mh-insert-wrapper-20260811`.
 File changed: `native-builtins/src/lang_invoke.rs`, and nothing else.
 
@@ -316,6 +330,77 @@ touched by the change.
    value — the same family as
    `fixed-bugs/jdk-only-W3-1-invokeexact-must-not-fabricate-a-zero-FIXED-20260811.md`.
 
+## Both §9 items are now settled (2026-08-12)
+
+> **This record's two remaining items are CLOSED.** The stale §9 row is edited in
+> place in `docs/architecture/natives-over-real-jdk-classes.md`, and the
+> neighbouring claim it flagged as unchecked has now been checked — and is stale
+> too. Nothing is left to apply from this record. What follows is the original
+> §9 write-up, kept because the second half is now a measurement rather than a
+> deferral.
+>
+> **The neighbour: `classloader.rs::lk_previous_lookup_class` reading slot 2
+> unconditionally. CHECKED. The claim is FALSE of the tree.** The function reads:
+>
+> ```rust
+> let value = match lk_real_prev_lookup_class_slot(ctx, this) {
+>     Some(slot) => ctx.get_field(this, slot),
+>     None => ctx.get_field(this, LK_PREVIOUS_LOOKUP_CLASS),
+> };
+> Ok(Some(match value {
+>     Value::Object(_) => value,
+>     _ => Value::Object(None),
+> }))
+> ```
+>
+> Three separate things are right about it, and the audit row predates all three:
+>
+> 1. **The slot is chosen by a CLASS-side witness**, `lk_real_prev_lookup_class_slot`
+>    → `resolve_field_index_by_class_id(class_id_of_object(obj), "prevLookupClass")`.
+>    That is the same witness `lk_real_allowed_modes_slot` uses, and the module's
+>    doc comment says explicitly that `Some` from one and `Some` from the other are
+>    *the same layout verdict* — which is what lets `alloc_lookup`, `lk_set_modes`,
+>    `lk_modes_of` and this function agree about which object they are holding.
+> 2. **`LK_PREVIOUS_LOOKUP_CLASS` (= 2) is reached only on the FABRICATED
+>    layout**, where the witness has already answered `None`. On the real JDK 25
+>    layout (`lookupClass`(0), `prevLookupClass`(1), `allowedModes`(2),
+>    `cachedProtectionDomain`(3)) the resolved slot is used instead, so the `Int`
+>    at slot 2 is never read as a `Class`.
+> 3. **The descriptor is enforced at the return.** Whatever the layout turned out
+>    to be, a non-reference read is coerced to `Value::Object(None)` — and `null`
+>    is this method's own legal answer, because CratonVM models no modules and
+>    nothing ever populates the field. So the `()Ljava/lang/Class;` native cannot
+>    hand back an `Int` on ANY layout, including one this VM does not model.
+>
+> **This is the "loud if it is wrong" answer the brief asked for, and it is loud
+> in the good direction: slot 2 is not wrong on the real layout, because slot 2 is
+> not read on the real layout.** No slot-count witness was widened to reach that
+> verdict, and none needed to be: the fix already in the tree replaced the raw
+> index with a resolved one rather than justifying the raw index.
+>
+> **Not settled, and not this item: a SECOND, disagreeing slot map for
+> `java/lang/invoke/MethodHandle`.** Found while checking the above.
+> `classloader.rs:9084-9090` declares `MH_BASE = 16` with
+> `MH_KIND`(16), `MH_TARGET_CLASS`(17), `MH_NAME`(18), `MH_TYPE`(19),
+> `MH_CLASS_ID`(20) and a comment asserting it *"matches the layout used by
+> lang_invoke::alloc_method_handle (MH_BASE = 16)"*. It does not: `lang_invoke`'s
+> map is `MH_CLASS`(16), `MH_NAME`(17), `MH_DESC`(18), `MH_KIND`(19),
+> `MH_BOUND`(20). Only the BASE matches; the field order does not, so slot 16
+> holds a `String` reference in one map and an `Int` in the other, and slot 20
+> holds a reference in one and a `ClassId` `Int` in the other. Its only allocator
+> is `classloader::alloc_method_handle`, whose only callers are `lk_unreflect` /
+> `lk_unreflect_special` — and `unreflect` is registered TWICE on
+> `MethodHandles$Lookup`, by `classloader.rs:9752` and by
+> `lang_invoke.rs:10754`, so one of the two is dead by registrar order.
+> W7-19 §3.3's census answers which: its `unreflect` row reports
+> `type()` = `(H,int)int`, which is `lang_invoke`'s shape —
+> `classloader::alloc_method_handle` passes `method_type: None` and would report
+> `()void`. So the disagreeing map is very probably UNREACHED, which is why it has
+> never corrupted anything, and it is exactly the shape that stops being harmless
+> the moment registrar order changes. It wants a `--dump-native-registry` diff and
+> then a deletion, not a repair. Not taken here: it is a third subject on a
+> two-item record.
+
 ## One correction to `docs/architecture/natives-over-real-jdk-classes.md`
 
 That document's §9 lists, among findings it could not correct itself, an
@@ -339,7 +424,10 @@ The audit was source-only and its §9 is honest about that. This is the shape
 the campaign already has a rule for: an audit row can be stale while its
 neighbours are live, so run every row. The neighbouring claim in the same
 paragraph — `classloader.rs::lk_previous_lookup_class` reading slot 2
-unconditionally — is in a file this lane does not own and was **not** checked.
+unconditionally — was in a file that lane did not own and was **not** checked
+then. **It has been checked now, and it is stale too — see the CHECKED block at
+the top of this section. The §9 row itself is edited in place as of
+2026-08-12.**
 
 ## Out-of-file patch (not applied)
 

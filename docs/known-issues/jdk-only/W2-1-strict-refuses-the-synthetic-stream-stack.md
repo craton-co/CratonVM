@@ -28,16 +28,21 @@
   unwritten `tail`"*. That is not what it was — it was the missing spare slot in
   the ring buffer, which HotSpot keeps and we did not. W7-16 carries the
   correction. Do not chase `tail`.
-* **Residual 3: STILL OPEN.** Seven names on `NO_IMAGE_JDK_RECEIVERS` are minted
-  outside `native-collections` and were never probed: `HashMap$Entry`,
-  `IteratorEnumeration`, `ServiceLoader$Itr`, `CompletedFuture`, and three
-  `Atomic*FieldUpdater$RustJvmImpl`. All still listed at
-  `native-api/src/no_image_receiver.rs:147-157`, unchanged. Re-grepped
-  2026-08-12.
-* **Residual 4: STILL OPEN, cosmetic.** `cratonvm/internal/StreamChainCollector`
-  (`native-collections/src/lib.rs:18840`) is still an unguarded
-  `try_alloc_synthetic(..)?` — unreachable under strict, so it cannot bite
-  today, but it is the last instance of the shape this record was opened for.
+* **Residual 3: HALF SETTLED 2026-08-12 — the *shipping-reachability* half is
+  now source-verified; the fabricate-or-refuse half still needs a run.** See
+  *"2026-08-12 — residual 3, probed by call graph"* below. Five of the seven are
+  reachable on both shipping modes and two are `register_synthetic_overrides`-only,
+  which is the opposite of what "minted outside `native-collections`" suggested:
+  the two synthetic-only ones are the two the earlier text listed first.
+* **Residual 4: CLOSED 2026-08-12.** `drain_spliterator_inline`
+  (`native-collections/src/lib.rs`, anchor on the function name) now takes the
+  same `Err(_refused) =>` fallback as `drain_spliterator_to_array_capped`, into a
+  new `drain_spliterator_inline_via_real_iterator` that drives the source through
+  `java.util.Spliterators.iterator(Spliterator)` and keeps the per-element
+  interleaving and the short-circuit. **It is still unreachable under strict**
+  (`stream_has_chain` gates all five `stream_pull` entry points and strict never
+  writes slot 3), so this closes the *shape*, not an observable defect — see
+  *"the swallow question"* note at the end of that section.
 
 The inventory below is the more durable half of this record.
 
@@ -193,7 +198,7 @@ these names, so "let the real class load" is not available for any of them.
 |---|---|---|---|---|
 | `cratonvm/stream/LazyOp` | 3 (kind:Int, lambda:Object?, aux:Long) | `native-collections/src/lib.rs` `stream_make_lazy_derived` | none | **fixed here** — refusal falls back to the eager pipeline |
 | `cratonvm/internal/StreamCollector` | 2 (Object[] storage, Int len) | 3 sites: `native-collections` `drain_spliterator_to_array_capped`; `native-builtins/src/phases_late/streams.rs` `drain_spliterator`; `native-builtins/src/service_loader.rs` `drain_real_spliterator` | none — but `java.util.Spliterators.iterator(Spliterator)` is public JDK API and replaces the need for it | already handled (L7): all three fall back to `drain_spliterator_via_real_iterator` |
-| `cratonvm/internal/StreamChainCollector` | 0 | `native-collections/src/lib.rs` `drain_spliterator_inline` | none | reachable **only** through a deferred op-chain, which strict no longer builds after this fix — now unreachable under `--jdk-only`. Still an unguarded `try_alloc_synthetic(..)?` if a future path reaches it |
+| `cratonvm/internal/StreamChainCollector` | 0 | `native-collections/src/lib.rs` `drain_spliterator_inline` | none | reachable **only** through a deferred op-chain, which strict no longer builds after this fix — so unreachable under `--jdk-only`. **Guarded 2026-08-12** anyway: falls back to `drain_spliterator_inline_via_real_iterator` |
 
 Adjacent, same file, not stream-specific but on the same refusal list (visible
 in the boot WARNs of every strict run): `cratonvm/internal/Unmodifiable{Collection,
@@ -337,7 +342,7 @@ the NAME and nothing else: no supported image declares it ⇒ refused.
 |---|---|---|---|
 | `cratonvm/stream/LazyOp` | `stream_make_lazy_derived` (deferred `filter`/`map`/`flatMap`/`limit`/`skip`/`peek`) | yes | **already gated** (2026-08-07, this record). Falls back to the eager pipeline; all stream probe rows byte-identical in all three arms |
 | `cratonvm/internal/StreamCollector` | 3 drain sites | yes | **already gated** (L7). Falls back to `drain_spliterator_via_real_iterator` |
-| `cratonvm/internal/StreamChainCollector` | `drain_spliterator_inline` | yes | unreachable under strict — strict never builds a deferred op-chain. Still a bare `?`; a future path that reaches it fails loudly, which is the correct order of events |
+| `cratonvm/internal/StreamChainCollector` | `drain_spliterator_inline` | yes | unreachable under strict — strict never builds a deferred op-chain. **Guarded 2026-08-12** (`drain_spliterator_inline_via_real_iterator`), so a future path that reaches it degrades to the real-iterator drive instead of failing |
 | `cratonvm/internal/Unmodifiable*` (11) | the `Collections.unmodifiable*` / `*.of` / `copyOf` factories | yes — the 13 boot WARNs | **already closed** by retag: the factories are `SyntheticStub`, strict drops them, real `java.util.Collections` bytecode runs. All 37 `JdkOnlyCollectionViewProbe` rows identical across the three arms |
 | `cratonvm/internal/ArrayListSubList` | `List.subList`, `Pattern.split` | yes | closed the same way — probe rows identical |
 | `cratonvm/util/MapViewBacking` | map key/value/entry views | yes | never reached under strict in any probe; `keySet`/`values`/`entrySet` all identical across arms |
@@ -475,6 +480,101 @@ receiver recorded as the backing, and the discriminator, not the fallback, is
 wrong. If instead any of the three fixed iterations comes back **empty**, the
 snapshot was taken from a collection the natives no longer own and the
 fallback is reading the real fields after all.
+
+---
+
+## 2026-08-12 — residual 3, probed by call graph
+
+Not by a run: nobody in this pool may build. What a source read CAN settle is
+the question the earlier text got backwards — *which of the seven mint sites a
+shipping binary can reach at all*. `register_synthetic_overrides` is a no-op shim
+when the `synthetic-jdk` feature is off (`vm/src/native/builtins.rs:29`), so a
+mint reachable only from it is absent from both `--real-jdk` and `--jdk-only`.
+
+| `NO_IMAGE_JDK_RECEIVERS` name | mint site | registrar chain | on a shipping mode? |
+|---|---|---|---|
+| `java/util/HashMap$Entry` | `native-builtins/src/phases_late/collections.rs:1778` | `register_phase5x_natives` → `register_synthetic_overrides` | **no** |
+| `java/util/ServiceLoader$Itr` | five sites — `phases_late/streams.rs:134`/`:152`, `phases_late.rs:3993`, `servlet.rs:1924` (`register_s1_classloading`, called only at `lib.rs:24071`), `native-builtins/src/streams.rs:307` | every one of them under `register_synthetic_overrides` | **no** |
+| `java/util/IteratorEnumeration` | `native-builtins/src/keystore.rs:2666` | `keystore::register_keystore_real` ← `register_essential_natives_with_shims` (`lib.rs:18498`) | **yes** |
+| `java/util/concurrent/CompletedFuture` | `native-io/src/lib.rs:19305`, a bare `try_alloc_synthetic(..)?` | `register_io_natives` (`vm_init.rs:2403`) | **yes** |
+| `Atomic{Integer,Long,Reference}FieldUpdater$RustJvmImpl` | `native-builtins/src/atomic_updater.rs::alloc_impl` | `register_atomic_updater_natives` ← `register_essential_natives_with_shims` (`lib.rs:19167`) | **yes** |
+
+So the framing to drop is "minted outside `native-collections`, therefore
+unprobed". The ownership split is not the interesting axis; **the registrar chain
+is**, and it splits the seven 5/2 with the two the old text named first landing
+on the dead side.
+
+**What is still genuinely open, and it is one question per live row:** whether
+strict *refuses* the mint or *fabricates* it. The three rows differ in shape,
+which is why one answer will not do:
+
+* `CompletedFuture` is `try_alloc_synthetic(..)?` — the refusal propagates, and a
+  strict run that reaches it gets a `NoClassDefFoundError` naming the class. That
+  is §5 enforcing. **Loud, therefore already correct**; the open item is whether
+  anything reaches it.
+* `IteratorEnumeration` is `match try_alloc_concurrent_synthetic(..) { .. }` — it
+  has a fallback arm, so it will neither refuse loudly nor fabricate. What the
+  fallback answers is the question.
+* The three `$RustJvmImpl` rows go through `ensure_class_initialized` and reach
+  `util_concurrent_ext::refused_class` only on `Err`. `ensure_class_initialized`
+  **fabricates rather than failing** for several name families
+  (`classloading/src/class_manager.rs` gives `$RustJvmImpl` a synthesised
+  supertype at `:10611-10619` and an interface list at `:13799-13801`), so `Ok` is
+  not evidence that the class was real. If it fabricates under `--jdk-only`, these
+  three belong on `STRICT_STILL_FABRICATES` — which is empty today on the strength
+  of a 2026-08-10 census taken before nothing changed here, so the census is the
+  instrument, not this file.
+
+The run that settles all three is the one `no_image_receiver.rs`'s module docs
+already prescribe, and it must be pointed at the atomic updaters, because
+*"no vector builds an atomic field updater"* is that file's own recorded finding:
+
+    cratonvm --jdk-only --java-home <JDK> --dump-class-origins cls.json \
+        -cp probes DeadSweepReachProbe
+
+## 2026-08-12 — the staged path: step 1 has landed, step 2 is NOT taken
+
+**Step 1 is in the tree.** The `ForkJoinTask.invoke()` bridge the recommendation
+below blocks on — *"a `ForkJoinTask.invoke()` bridge answering the void
+`compute()`'s null instead of `getRawResult()`"* — is implemented in
+`native-builtins/src/phases_early.rs` (`invoke()` is `doInvoke(); return
+getRawResult();`, at `:8514-8534` and `:8605-8622`, with a `method_exists` guard
+and a documented degrade-to-null). `phases_early` is reached from
+`register_essential_natives_with_shims`, so it is live on both shipping modes.
+Unrun on this branch.
+
+**Step 2 is not taken, and the reason is not the one the recommendation
+predicts.** Two findings, both source-verified, and the second is the one that
+matters:
+
+1. The mechanism is *available*. `StreamSupport.stream(Spliterator,Z)` — which
+   real `Collection.stream()` calls, and which this record's split table lists as
+   intercepted — is registered in
+   `native-builtins/src/service_loader.rs::register_service_loader_natives`,
+   whose ambient category is **`SyntheticStub`** (`:3700`). `--jdk-only` therefore
+   already drops it, so a retagged `Collection.stream()` would reach the real
+   `StreamSupport` and a real `ReferencePipeline$Head`. The four `Spliterator`
+   abstracts the head then drives are all registered live (W7-9 §3), so the head
+   would even work over a synthetic spliterator.
+2. **It would be observably inert.** Step 3's pull-backs are not a later problem;
+   they are in the way now. `java/util/stream/ReferencePipeline.collect` is
+   registered in `native-collections`'s `register_stream_natives`
+   (`native-collections/src/lib.rs:19965`), whose ambient category is
+   **`Bridge`** — the one kind `--jdk-only` does *not* drop. A newly-real pipeline
+   would have its terminal yanked straight back into `stream_elements`, whose
+   real-pipeline branch re-materialises through `toArray()`. So step 2 alone
+   changes which bytecode produces the elements and nothing about the answer,
+   while doubling the number of pipelines every stream defect has to be measured
+   against. **Steps 2 and 3 have to move together, and the retag order is
+   `ReferencePipeline`/`AbstractPipeline` FIRST**, which is the reverse of the
+   ordering below. Corrected here rather than in the list, so the evidence stays
+   next to it.
+
+The remaining blocker is a measurement, not a mechanism: retagging
+`Collection.stream()`/`List.stream()` is the highest-traffic single change in the
+collections surface, its stated oracle is a three-arm `parallelStream()`
+comparison on the same receiver, and no lane that can build has taken it. Do not
+take it from a lane that cannot run the Spring Boot and Tomcat arms.
 
 ### Verification (updated)
 

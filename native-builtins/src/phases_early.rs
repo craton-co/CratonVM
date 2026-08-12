@@ -8,21 +8,30 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
 
-/// POSIX permits a blocking socket read to be interrupted before it consumes
-/// bytes. Retry that transient condition instead of exposing it as a Java EOF
-/// or a zero-length read. Some socket wrappers preserve Linux EINTR only as
-/// raw OS error 4, so accept both representations.
-fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-        match reader.read(buf) {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
-            {
-                continue
-            }
-            result => return result,
-        }
-    }
+/// The deadline a `java/net/SocketInputStream` read must honour, derived from
+/// the socket's own `SO_RCVTIMEO`.
+///
+/// This is the rule W7-53 states per regime: a syscall that is no longer issued
+/// until the socket is ready is a syscall `SO_RCVTIMEO` can never bound. The
+/// close-aware read parks in `poll` and only then reads, so without this the
+/// timeout a caller set with `setSoTimeout` would never fire and the fix for one
+/// hang would have introduced another. `SO_RCVTIMEO` stays set and remains the
+/// first line; this is what still ends the park where it cannot.
+///
+/// `None` — no timeout configured, or the query itself failed — means "no
+/// deadline", which is what an untimed socket asked for. Guessing one would be
+/// the `SocketTimeoutException`-on-a-socket-with-no-timeout regression that
+/// record names as its own falsifier.
+///
+/// (The private `read_retry_eintr` that used to sit here went with its last
+/// caller: the three reads below were its only users and
+/// `re1_read_close_aware` reissues EINTR itself.)
+fn sis_read_deadline(stream: &std::net::TcpStream) -> Option<std::time::Instant> {
+    stream
+        .read_timeout()
+        .ok()
+        .flatten()
+        .map(|d| std::time::Instant::now() + d)
 }
 
 #[cfg(feature = "legacy-synthetic-crypto")]
@@ -18510,6 +18519,44 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
     });
 
     // ===== SocketInputStream — real read from TcpStream =====
+    //
+    // THE FOURTH SURFACE of W2-2's blocked-reader defect, converged 2026-08-12.
+    //
+    // All three reads below cloned the `Arc<TcpStream>` out of `s2_registry`,
+    // dropped the lock, and parked in a plain blocking `read` — so a
+    // `Socket.close()` on another thread could not end the park. `close()`
+    // removes the registry entry and shuts the socket down, but it cannot close
+    // the OS handle while this reader holds an `Arc` clone of it; on Windows no
+    // `shutdown` aborts a pending blocking call at all, so the reader stayed
+    // parked forever. `java.net.Socket.close()` is unconditional in JDK 25:
+    // "Any thread currently blocked in an I/O operation upon this socket will
+    // throw a SocketException" — *will*, not *may*.
+    //
+    // Fixed by calling the surface that already solved it,
+    // `net_phase_e::re1_read_close_aware`, rather than by copying its loop or by
+    // deleting these registrations. The two surfaces key the SAME
+    // `s2_registry().streams` map with the same `sid`, so the registry re-ask
+    // that ends the park is the identical question here. `re1`'s own reader is
+    // registered on the DIFFERENT class name `java/net/Socket$SocketInputStream`
+    // (W2-2 records the correction), so neither shadows the other and this had
+    // to be fixed on its own terms.
+    //
+    // Deleting them was the other defensible option and was NOT taken: these are
+    // the only registrations of `java/net/SocketInputStream` in the tree, its
+    // methods have no bytecode to fall back to, and the configuration that
+    // reaches them (`--synthetic-jdk` plus `CRATONVM_SYNTHETIC_NET_SOCKETS`,
+    // since `register_phase53_socket_stubs` early-returns on the default-true
+    // `io.real_net_sockets`) is one this lane cannot run. Trading an unwakeable
+    // read for an `UnsatisfiedLinkError` in a mode nobody measured is not a
+    // repair.
+    //
+    // The deadline is read back off the socket's own `SO_RCVTIMEO` rather than
+    // invented or defaulted. That is not optional: the close-aware loop does not
+    // issue the `read` until the socket is ready, so `SO_RCVTIMEO` can never
+    // fire, and passing `None` would have turned every `setSoTimeout` reader
+    // into a new unbounded park. `re1_read_close_aware` answers `TimedOut` on
+    // expiry, which the existing arm below already maps to
+    // `SocketTimeoutException`.
     let sis = "java/net/SocketInputStream";
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -18523,14 +18570,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
             reg.streams.get(&sid).cloned()
         };
         if let Some(stream) = stream {
-            let mut stream_ref = &*stream;
-            match read_retry_eintr(&mut stream_ref, &mut buf) {
+            let deadline = sis_read_deadline(&stream);
+            match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut buf, deadline) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
                 // A blocking TcpStream only yields WouldBlock here when the
-                // configured SO_RCVTIMEO expires. InputStream.read must throw
-                // the typed Java timeout instead of returning the forbidden
-                // zero-byte read (or pretending the peer closed).
+                // configured SO_RCVTIMEO expires; TimedOut is additionally the
+                // close-aware loop's own deadline expiry. InputStream.read must
+                // throw the typed Java timeout instead of returning the
+                // forbidden zero-byte read (or pretending the peer closed).
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -18542,7 +18590,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                     }
                     .into())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
+                // `Interrupted` is this family's close carrier, NOT a real
+                // EINTR — `re1_read_close_aware` reissues every genuine EINTR
+                // itself and its poll reports EINTR as "not ready". It arrives
+                // only once the registry entry is gone, i.e. `close()` ran.
+                // Answering `0` here (the old arm) would have been a zero-byte
+                // read, which `InputStream.read()` may never return.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Err(
+                    crate::net_phase_e::re1_socket_exception(ctx, "Socket closed"),
+                ),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
         } else {
@@ -18568,8 +18624,8 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 reg.streams.get(&sid).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match read_retry_eintr(&mut stream_ref, &mut tmp) {
+                let deadline = sis_read_deadline(&stream);
+                match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut tmp, deadline) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e)
@@ -18583,7 +18639,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                         }
                         .into());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                    // The close carrier — see the block comment above. Was `0`,
+                    // a zero-byte read `InputStream.read([BII)` may never
+                    // return for a non-zero `len`.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(crate::net_phase_e::re1_socket_exception(
+                            ctx,
+                            "Socket closed",
+                        ));
+                    }
                     Err(_) => -1,
                 }
             } else {
@@ -18615,8 +18679,8 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 reg.streams.get(&sid).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match read_retry_eintr(&mut stream_ref, &mut tmp) {
+                let deadline = sis_read_deadline(&stream);
+                match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut tmp, deadline) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e)
@@ -18630,7 +18694,13 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                         }
                         .into());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                    // The close carrier — see the block comment above.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(crate::net_phase_e::re1_socket_exception(
+                            ctx,
+                            "Socket closed",
+                        ));
+                    }
                     Err(_) => -1,
                 }
             } else {

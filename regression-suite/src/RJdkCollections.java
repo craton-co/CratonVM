@@ -196,6 +196,88 @@ public class RJdkCollections {
         System.out.println("CK RJdkCollections stream=" + new TreeMap<>(byMod) + " total=" + total);
     }
 
+    /**
+     * {@code AbstractPipeline.linkedOrConsumed} at the two sites W7-65 left open:
+     * {@code close()} (its site 7, which sets UNCONDITIONALLY and does not check)
+     * and {@code onClose(Runnable)} (its one check-only site, which throws and
+     * does not set).
+     *
+     * Every expected value here was measured on HotSpot 25 and recorded in
+     * docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md -- two of them are
+     * not what a reading of the JDK source alone predicts, which is why the
+     * record says they were measured: {@code onClose} after a consume DOES throw
+     * even though it never marks, and {@code close()} twice does NOT, even though
+     * it always marks.
+     *
+     * The reds and the controls are labelled, because a flag set once too often
+     * is the failure mode this whole area was declined twice for. Rows 1 and 2
+     * fail on the pre-2026-08-12 behaviour (no-throw). Rows 3 and 4 are the
+     * over-set controls: an implementation that marked-and-checked in
+     * {@code close()}, or that marked in {@code onClose}, passes 1 and 2 and
+     * fails these. Row 5 is the sibling-stream control -- it fails an
+     * implementation that put the flag anywhere process-wide instead of on the
+     * receiver.
+     */
+    static void streamReuse() {
+        // 1. RED -- close() marks, so the next terminal must refuse.
+        Stream<String> closedFirst = Stream.of("a", "b");
+        closedFirst.close();
+        boolean threw = false;
+        try {
+            closedFirst.count();
+        } catch (IllegalStateException expected) {
+            threw = true;
+        }
+        check(threw, "count() after close() must throw IllegalStateException");
+
+        // 2. RED -- onClose() is the check-only site.
+        Stream<String> consumed = Stream.of("a", "b");
+        check(consumed.count() == 2, "the first terminal must still work");
+        threw = false;
+        try {
+            consumed.onClose(() -> { });
+        } catch (IllegalStateException expected) {
+            threw = true;
+        }
+        check(threw, "onClose() after a terminal must throw IllegalStateException");
+
+        // 3. CONTROL -- close() does not CHECK, so closing twice is legal.
+        Stream<String> twice = Stream.of("a");
+        threw = false;
+        try {
+            twice.close();
+            twice.close();
+        } catch (IllegalStateException unexpected) {
+            threw = true;
+        }
+        check(!threw, "close() twice must not throw");
+
+        // 4. CONTROL -- consume then close is the try-with-resources shape and
+        //    must stay silent, which is the whole reason close() marks without
+        //    checking.
+        Stream<String> thenClosed = Stream.of("a", "b", "c");
+        check(thenClosed.count() == 3, "terminal before close");
+        threw = false;
+        try {
+            thenClosed.close();
+        } catch (IllegalStateException unexpected) {
+            threw = true;
+        }
+        check(!threw, "close() after a terminal must not throw");
+
+        // 5. CONTROL -- the flag lives on the receiver. A fresh stream over the
+        //    same source, taken after another was closed, must work; and a
+        //    handler registered BEFORE the terminal must still run at close().
+        List<String> src = Arrays.asList("x", "y");
+        StringBuilder ran = new StringBuilder();
+        Stream<String> fresh = src.stream().onClose(() -> ran.append("closed"));
+        check(fresh.count() == 2, "a fresh stream after a closed sibling");
+        fresh.close();
+        check(ran.toString().equals("closed"),
+                "a close handler registered before the terminal must still run");
+        System.out.println("CK RJdkCollections streamReuse=" + ran);
+    }
+
     static void optionals() {
         Optional<String> some = Optional.of("v");
         Optional<String> none = Optional.empty();
@@ -235,6 +317,7 @@ public class RJdkCollections {
         lists();
         maps();
         streams();
+        streamReuse();
         optionals();
         System.out.println("CK RJdkCollections checks=" + checks);
         System.out.println("PASS RJdkCollections (" + checks + " checks)");

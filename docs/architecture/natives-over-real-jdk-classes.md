@@ -484,14 +484,31 @@ tree where other lanes are landing changes while you write.
   are now correct (the class-side witness was added as a disjunct); the stated
   reason is not, and the next person to "simplify" them back to the value-shape
   test will be doing it on a false premise.
-* **Two un-recorded §5 residuals**, found while verifying this document:
-  `native-builtins/src/lang_invoke.rs::lk_write_allowed_modes` still does a bare
-  `ctx.set_field(obj, 1, Value::Int(modes))` on its **error branch** with no
-  class-side witness — the exact shape §5 describes, in a third file; and
-  `native-builtins/src/classloader.rs::lk_previous_lookup_class` reads slot 2
-  unconditionally and hands an `Int` back from a `()Ljava/lang/Class;` native.
-  Neither is covered by W4-1, W4-4 or W6-3. Filing them is a native-owning
-  lane's call.
+* ~~**Two un-recorded §5 residuals**~~ — **BOTH RESOLVED. Row re-run and
+  corrected 2026-08-12 by the lane that owns
+  `known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md`; kept here because
+  what it demonstrates is this section's own rule.** The row read: *"`lang_invoke.rs::lk_write_allowed_modes`
+  still does a bare `ctx.set_field(obj, 1, Value::Int(modes))` on its error
+  branch with no class-side witness … and `classloader.rs::lk_previous_lookup_class`
+  reads slot 2 unconditionally and hands an `Int` back from a
+  `()Ljava/lang/Class;` native."* Neither half is true of the tree. Both
+  functions now open on the CLASS-side witness
+  (`resolve_field_index_by_class_id(..., "allowedModes")` /
+  `(..., "prevLookupClass")`), and the fixed-index arm each keeps is reachable
+  only after that witness has said the receiver does NOT carry the real
+  `MethodHandles$Lookup` layout — i.e. on the fabricated 2-field stub, where the
+  fixed index is the right one. `lk_previous_lookup_class` additionally coerces a
+  non-reference read to `Value::Object(None)`, so the `()Ljava/lang/Class;`
+  descriptor can no longer return an `Int` on any layout. **The rule this row now
+  illustrates: an audit row can be stale while its neighbours are live, and the
+  two halves of one bullet can rot independently — run every row, and re-read the
+  function rather than the citation.** (The source-only audit that wrote this row
+  was honest about being source-only. The `lk_write_allowed_modes` half was
+  already repaired when it was written — W7-13 dates that rewrite to 2026-08-07 —
+  and the `lk_previous_lookup_class` half was repaired at some point after,
+  carrying a doc comment that recites the old defect as the thing it replaced. No
+  commit is cited for the second because this lane ran no `git` command; the
+  evidence is the code.)
 * `regression-suite/jdk-only-coverage.txt` and `regression-suite/README.md`
   state that `run.sh` *"prints a SKIP line with the reason"* for unscheduled
   `--jdk-only` vectors. `run.sh` has no such code.

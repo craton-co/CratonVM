@@ -8,6 +8,49 @@ is indistinguishable from one reporting all-clear, which is this campaign's
 dominant species; it had taken up residence inside the instrument built to
 detect that species.
 
+> **RE-VERIFIED 2026-08-12, and this record's own §2.2 argument lands on it.**
+> Both triggers are present in the tree and correct — `vm-cli/src/main.rs:4281`,
+> `vm/src/vm/vm_init.rs:7965`, `native-builtins/src/lang_system.rs:137` with its
+> three call sites at `:1354`, `:2628`, `:2664`, and links 7–9 of
+> `native-api/tests/read_alias_coverage.rs`. HANDOFF-20260812.md's
+> *"`verify_declared_slot_maps` still has no caller"* and W7-77's §7.2 as
+> originally written are **stale**, not open.
+>
+> Two things in this record are, however, wrong as written, and both are the
+> kind of wrong it warns about elsewhere:
+>
+> * **"Seven `SlotMap`s" is now EIGHT.** W7-88 published
+>   `SSC_P58_SLOT_MAP` (`java/nio/channels/ServerSocketChannel`,
+>   `native-builtins/src/phases_late/net_channels.rs:55`). §4.6.1 and the
+>   corrected §4.7 totals are below. The population is a moving number and every §4 figure
+>   in this file is a snapshot; count `declare_slot_map(` before quoting one.
+> **THE THIRD DOOR IS NOW WIRED (2026-08-12, later pass).** `§2.2.1`'s two
+> patches are applied and link 10 is in the tree:
+> `native-builtins/src/lang_system.rs`'s helper is `pub(crate)`, and all three
+> `ForkedBooter` bodies in `native-builtins/src/test_frameworks.rs` call it with
+> their own trigger label immediately above their `std::process::exit`
+> (`:3684`→`ForkedBooter.acknowledgedExit`, `:3710`→`ForkedBooter.exit1`,
+> `:3735`→`ForkedBooter.exit`). Link 10
+> (`the_surefire_exit_paths_sweep_before_they_terminate`) was simulated RED on
+> all three bodies before the patch, so it goes green **because** of it, not
+> alongside it. §2.2.1 and §7 below are updated in place; the sweep now has
+> **seven** exit-path call sites plus the launcher, and a Surefire fork is no
+> longer silent.
+>
+> * **§2.2 closed three of four doors, and the fourth is the one it named.**
+>   §2.2's whole argument is that `System.exit` is how "SbRunner, Surefire's
+>   `ForkedBooter`, every Spring Boot application" ends — and a **Surefire fork
+>   does not reach `System.exit` at all** on this VM. Four triples on
+>   `org/apache/maven/surefire/booter/ForkedBooter` are registered from
+>   `register_essential_natives_with_shims` (`native-builtins/src/lib.rs:10758`,
+>   `:10764`, `:10770`, `:10776` — LIVE in **both** modes) onto three bodies in
+>   `native-builtins/src/test_frameworks.rs` that each end in their own
+>   `std::process::exit` (`:3684`, `:3710`, `:3735`) and never call
+>   `native_system_exit`. §2.4 has the measurement and the patch; it is **not
+>   applied here** — `test_frameworks.rs` is out of this lane's file set.
+>   This is `reference_classpath_exclusion_leaked_through_four_process_wide_lookups`
+>   arriving one layer out, in the paragraph that cites it.
+
 **Nothing here was built or run.** This lane writes code, tests and docs; the
 orchestrator builds. The three new gates were re-implemented outside the tree
 and run against the real worktree and against six mutated copies (§5). The one
@@ -129,6 +172,85 @@ the launcher's printing `rows=0`.
 `native_shutdown_halt0`'s first parameter was `_ctx` and is now `ctx`. That is
 the only signature-adjacent change in the lane and it is a rename, not a
 signature change.
+
+### 2.2.1 Trigger C — the Surefire fork. **NOW WIRED (2026-08-12).**
+
+**Status: APPLIED.** The section below is kept in its original diagnostic voice
+because the argument is the deliverable; the two patches it proposed are in the
+tree, and "**Not fixed here**" further down now reads "fixed in a later pass on
+this branch". What changed:
+
+* `native-builtins/src/lang_system.rs` — the helper is `pub(crate) fn`, with the
+  reason (seven `std::process::exit` sites, not three) written into its doc
+  comment so the next reader of `lang_system` learns about `test_frameworks`
+  without having to find this record.
+* `native-builtins/src/test_frameworks.rs` — one
+  `crate::lang_system::sweep_declared_slot_maps_before_exit(&*ctx, "…")` per
+  body, immediately above the `std::process::exit`, **below** each body's
+  `nbflags().soft_exit` early return, each carrying its own trigger label. The
+  shared helper is reused rather than a fourth gate open-coded, because the
+  no-`else` property link 9 asserts lives in that helper and a copy would not
+  inherit it.
+* `native-api/tests/read_alias_coverage.rs` — link 10, plus a correction to the
+  module header's item 9, which read as though `System.exit` were the whole
+  self-terminating population.
+
+`&*ctx` reborrows the bodies' `&mut dyn NativeContext` as the `&dyn
+NativeContext` the helper takes — the same expression `lang_system.rs:1354`
+already uses.
+
+**One body serves two triples.** `native_surefire_forkedbooter_exit1` is
+registered for both `exit()V` (`lib.rs:10764`) and `exit1()V` (`:10776`), so the
+four registrations reach **three** bodies and carry **three** labels. Reading
+three labels as three triples, or four triples as four bodies, both get the
+arithmetic wrong.
+
+### 2.2.1.1 The original finding, as filed
+
+`std::process::exit` in the native crates has **seven** call sites, not three.
+The four §2.2 does not cover are all on one class:
+
+| registered at | triple | body | ends in |
+|---|---|---|---|
+| `lib.rs:10758` | `ForkedBooter.acknowledgedExit()V` | `native_surefire_forkedbooter_acknowledged_exit` | `exit(0)` `test_frameworks.rs:3684` |
+| `lib.rs:10764` | `ForkedBooter.exit()V` | `native_surefire_forkedbooter_exit1` | `exit(1)` `:3710` |
+| `lib.rs:10770` | `ForkedBooter.exit(I)V` | `native_surefire_forkedbooter_exit_code` | `exit(code)` `:3735` |
+| `lib.rs:10776` | `ForkedBooter.exit1()V` | `native_surefire_forkedbooter_exit1` | `exit(1)` `:3710` |
+
+All four sit in `register_essential_natives_with_shims`
+(`native-builtins/src/lib.rs:7103`).
+
+`register_essential_natives_with_shims` runs in **both** modes, so these are not
+the synthetic-only population — they are the live teardown of every Surefire
+fork this VM runs. Registration is the gate on the cold and reflective paths, so
+real `ForkedBooter` bytecode never runs and `System.exit` is never reached: on a
+Surefire fork the launcher's post-`main` line is skipped **and** trigger B is
+skipped, and the sweep prints nothing at all.
+
+That matters more than the arithmetic suggests. §2.2's justification for wiring
+all three of `lang_system`'s natives rather than one was *"a sweep wired only to
+the return path reports nothing on exactly the runs that would produce a real
+transcript"*, and it named Surefire as the case. The `--jdk-only` corpus's
+Spring Boot and Tomcat fixtures go through Surefire, so the fixture population
+this instrument exists for is precisely the population still uncovered.
+
+~~**Not fixed here** (`test_frameworks.rs` and `lang_system.rs` are other lanes'
+files).~~ **Fixed in a later pass on this branch — see the status block at the
+top of §2.2.1.** The patch is two edits, and it deliberately reuses the existing
+helper rather than open-coding a fourth gate — the shared helper is what link 9
+asserts has no `else`:
+
+1. `native-builtins/src/lang_system.rs:137` — `fn` → `pub(crate) fn`.
+2. `native-builtins/src/test_frameworks.rs` — one call immediately above each of
+   the three `std::process::exit` lines, **below** each body's
+   `nbflags().soft_exit` early return, carrying its own trigger label
+   (`"ForkedBooter.acknowledgedExit"`, `"ForkedBooter.exit1"`,
+   `"ForkedBooter.exit"`). Per-call labels, not the helper's name: link 9's own
+   §5.1 lesson is that a name-only predicate stays green when two of three call
+   sites are deleted.
+
+A fourth link (`the_surefire_exit_paths_sweep_before_they_terminate`) belongs
+beside links 7–9 and is written out in §7. **It is now link 10 in that file.**
 
 ### 2.3 Cost, and Compatible mode
 
@@ -308,13 +430,47 @@ the **real** JDK classes the maps would read:
 | `java/lang/Thread` 4 | `contextClassLoader` | `contextClassLoader` — **clean** |
 | `java/lang/Thread` 5 | `isVirtual` | **`holder`** |
 
+### 4.6.1 `java/nio/channels/ServerSocketChannel` — 4 rows of 4 slots (W7-88)
+
+**Added to this section 2026-08-12.** `SSC_P58_SLOT_MAP`,
+`native-builtins/src/phases_late/net_channels.rs:55`, declared from
+`register_p58_nio_channels` ← `register_phase58_natives` ← `lib.rs:23973`, which
+is inside `register_synthetic_overrides` — so like `Month` and `Thread` this map
+is **never declared in real-JDK mode** and these four rows can only appear under
+`--synthetic-jdk`. The real transitive layout is 10 fields:
+`closeLock(0) closed(1) interruptor(2) interruptedTarget(3)` from
+`AbstractInterruptibleChannel`, then `provider(4) keys(5) keyCount(6) keyLock(7)
+regLock(8) nonBlocking(9)` from `AbstractSelectableChannel` — cited from that
+map's own doc comment, which states the same `javap -p` oracle and convention.
+
+| slot | map | real |
+|---:|---|---|
+| 0 | `open` | **`closeLock`** |
+| 1 | `bound` | **`closed`** — the flag a real `isOpen()` reads |
+| 2 | `fd` (int) | **`interruptor`** (`sun.nio.ch.Interruptible`) |
+| 3 | `socket` | **`interruptedTarget`** |
+
+Four of four disagree and none is out of range (highest slot 3 against a width
+of 10), so §4's "not one `absent-slot` row is expected" survives the addition.
+
 ### 4.7 Totals
+
+**Corrected 2026-08-12** — the seven-map figures below the line are what this
+lane wrote and are kept so a reader comparing transcripts can see the shift.
 
 | population | maps | slots | wrong-field rows | clean |
 |---|---:|---:|---:|---:|
-| all seven, against the real JDK 25 classes | 7 | 38 | **29** | 9 |
+| all **eight**, against the real JDK 25 classes | 8 | 42 | **33** | 9 |
 | the five declared in **real-JDK** mode | 5 | 32 | **24** | 8 |
-| the two synthetic-only, against the real classes | 2 | 6 | 5 | 1 |
+| the **three** synthetic-only, against the real classes | 3 | 10 | 9 | 1 |
+
+| ~~as written 2026-08-12, before `SSC_P58_SLOT_MAP`~~ | ~~7~~ | ~~38~~ | ~~29~~ | ~~9~~ |
+|---|---:|---:|---:|---:|
+| ~~the two synthetic-only~~ | ~~2~~ | ~~6~~ | ~~5~~ | ~~1~~ |
+
+The real-JDK-mode row is unchanged, and that is the point of splitting it out:
+every map added since this lane landed has been synthetic-only, so the figure a
+Compatible-mode run can produce has not moved.
 
 **A run reports a subset of its mode's figure, and `unresolved` names the
 difference.** A trivial `Hello, world` in real-JDK mode is unlikely to have
@@ -342,6 +498,10 @@ own test so a break names which link broke.
    `native_runtime_exit` and `native_shutdown_halt0` each call the helper
    **carrying their own trigger label**, before their `std::process::exit`; and
    the shared helper's `if layout_alias::enabled()` block has no `else`.
+   **This link enumerates three natives by name and is green on a tree where
+   four other registered natives exit without sweeping** — §2.2.1. A gate that
+   lists its own population cannot report that the population was wrong, which
+   is the same shape as link 6 and is why link 10 is written out in §7.
 
 The existing six links were re-checked green against the changed tree, links 1–3
 mechanically (§5.2).
@@ -451,7 +611,9 @@ wrong by three orders of magnitude.
    not "clean".
 9. **Embedders have no trigger.** `libcratonvm`, `cratonvm-embed` and the JNI
    Invocation API (`DestroyJavaVM`) are unwired. Only the `cratonvm` / `java`
-   launcher and the three exit natives sweep. A JNI-embedded run reports nothing
+   launcher, `lang_system`'s three exit natives and — since the later pass of
+   2026-08-12 — `test_frameworks`'s three `ForkedBooter` bodies sweep. A
+   JNI-embedded run reports nothing
    — and reports it silently, which is the same shape as the defect this lane
    closed, one layer out.
 10. **Everything in §4 is a prediction.** The first real product of this
@@ -467,6 +629,66 @@ wrong by three orders of magnitude.
 ## 7. For follow-up lanes
 
 Nothing below was repaired here.
+
+* ~~**Trigger C — the four `ForkedBooter` exit triples (§2.2.1).**~~
+  **DONE 2026-08-12.** Both edits and the gate are in the tree; see the status
+  block at the top of §2.2.1. The gate below is reproduced as landed, so a
+  future reader can see what shape it took — it is link 10 of
+  `native-api/tests/read_alias_coverage.rs` and was simulated **RED on all three
+  bodies** before the patch:
+
+  ```rust
+  /// LINK 10. `System.exit` is not the only way a fixture leaves. Four triples on
+  /// `ForkedBooter` are registered from `register_essential_natives_with_shims`
+  /// — LIVE in both modes — onto three bodies that each end in their own
+  /// `std::process::exit` and never reach `native_system_exit`. A Surefire fork
+  /// therefore skips the launcher's post-`main` line AND link 9's three natives,
+  /// which is the population W7-90 §2.2 named as its whole reason for existing.
+  ///
+  /// Each call is matched WITH its own trigger label, not by the helper's name:
+  /// three bodies share one helper, so a name-only predicate stays green when two
+  /// of the three are deleted (§5.1).
+  #[test]
+  fn the_surefire_exit_paths_sweep_before_they_terminate() {
+      let src = strip_comments(&read("native-builtins/src/test_frameworks.rs"));
+      // The label is matched WITH its quotes, exactly as link 9 does: an
+      // unquoted "ForkedBooter.exit" is a prefix of "ForkedBooter.exit1".
+      for (body, label) in [
+          (
+              "native_surefire_forkedbooter_acknowledged_exit",
+              "\"ForkedBooter.acknowledgedExit\"",
+          ),
+          ("native_surefire_forkedbooter_exit1", "\"ForkedBooter.exit1\""),
+          ("native_surefire_forkedbooter_exit_code", "\"ForkedBooter.exit\""),
+      ] {
+          let b = fn_body(&src, body)
+              .unwrap_or_else(|| panic!("{body} not found in test_frameworks.rs"));
+          let sweep = b.find("sweep_declared_slot_maps_before_exit(").unwrap_or_else(|| {
+              panic!(
+                  "{body} terminates the process with std::process::exit and never \
+                   sweeps. A Surefire fork skips the launcher trigger AND the three \
+                   lang_system natives, so the declared slot-map sweep prints nothing \
+                   on exactly the fixtures W7-90 section 2.2 was written for."
+              )
+          });
+          assert!(
+              b[sweep..].contains(label),
+              "{body}'s sweep call must carry its own trigger label {label:?}; three \
+               bodies share one helper and a name-only match stays green when two of \
+               the three calls are deleted"
+          );
+          let exit = b.find("std::process::exit").unwrap_or_else(|| {
+              panic!("{body} no longer exits — re-derive this gate before deleting it")
+          });
+          assert!(sweep < exit, "{body} sweeps AFTER it has already exited");
+      }
+  }
+  ```
+
+  `fn_body`, `strip_comments` and `read` are already in that file, used by links
+  7–9. Simulated against the tree as it stands: **RED on all three bodies**,
+  which is the failing observation, not a prediction.
+* **Embedders still have nothing** (§6.9), unchanged.
 
 * The 24 real-JDK-mode rows of §4.1–§4.5. `Continuation` and `ForkJoinPool` were
   given name-first resolution by W7-75 and `ByteBuffer` slot 0 by W7-58, so those

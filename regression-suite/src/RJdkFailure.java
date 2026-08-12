@@ -153,12 +153,47 @@ public class RJdkFailure {
 
         // Same for an absent array element type and an absent nested class.
         threw = false;
+        String arrayMessage = "";
         try {
             Class.forName("[L" + absent + ";");
         } catch (ClassNotFoundException expected) {
             threw = true;
+            arrayMessage = expected.getMessage();
         }
         check(threw, "an array of an absent class must also fail");
+        // L16 - HotSpot never hands an array descriptor to a class loader:
+        // JVMS 5.3.3 creates an array class from its ELEMENT type, so
+        // Class.forName strips the '[' itself and the name that reaches a
+        // loader - and therefore the CNFE message - is the element's.
+        check(absent.equals(arrayMessage),
+                "an array CNFE must name the element, not the descriptor: " + arrayMessage);
+
+        threw = false;
+        arrayMessage = "";
+        try {
+            Class.forName("[[L" + absent + ";");
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+            arrayMessage = expected.getMessage();
+        }
+        check(threw, "a two-dimensional array of an absent class must also fail");
+        check(absent.equals(arrayMessage),
+                "every dimension is stripped before naming the element: " + arrayMessage);
+
+        // The OTHER shape, and the reason the fix went into Class.forName and
+        // not into the loader: ClassLoader.loadClass never resolves an array
+        // form at all, so its CNFE names the descriptor it was given.
+        threw = false;
+        String loaderArrayMessage = "";
+        try {
+            loader.loadClass("[L" + absent + ";");
+        } catch (ClassNotFoundException expected) {
+            threw = true;
+            loaderArrayMessage = expected.getMessage();
+        }
+        check(threw, "ClassLoader.loadClass of an array descriptor must throw");
+        check(("[L" + absent + ";").equals(loaderArrayMessage),
+                "loadClass names the descriptor it was asked for: " + loaderArrayMessage);
 
         // A malformed name is rejected too.
         threw = false;

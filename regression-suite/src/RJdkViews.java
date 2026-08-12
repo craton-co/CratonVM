@@ -3,6 +3,7 @@
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.ConcurrentModificationException;
 import java.util.IntSummaryStatistics;
 import java.util.Iterator;
@@ -12,9 +13,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.NavigableSet;
+import java.util.OptionalDouble;
+import java.util.OptionalLong;
 import java.util.SortedMap;
+import java.util.SortedSet;
 import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.stream.BaseStream;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 
 /**
  * Permanent gate for the four defect families recorded in
@@ -376,14 +383,260 @@ public class RJdkViews {
                 + "," + empty.getAverage());
     }
 
+    // ---- family 4b: the rest of the primitive-stream surface ---------------
+
+    /**
+     * W7-2 §7.2 -- the members of {@code IntStream}/{@code LongStream}/
+     * {@code DoubleStream} that were DECLARED and never REGISTERED. On a
+     * CratonVM synthetic primitive stream the receiver's runtime class is the
+     * INTERFACE, so an unregistered member resolves to the abstract declaration
+     * and the call dies with {@code AbstractMethodError: ... has no Code
+     * attribute} -- the same death {@code summaryStatistics()} died in
+     * streams() above, which is why this section sits beside it.
+     *
+     * EVERY stream below must be SYNTHETIC or this section measures nothing.
+     * {@code IntStream.of(int...)} and {@code Arrays.stream} return a real
+     * {@code IntPipeline$Head} whose own bytecode implements all of this; only
+     * {@code range}/{@code rangeClosed} and the intermediate ops built on them
+     * (map / filter / asDoubleStream / mapToDouble) mint the interface-stamped
+     * object this record is about. That is the difference between a gate and a
+     * test of the real JDK.
+     */
+    static void primitiveStreamSurface() {
+        // IntStream.distinct: 1,2,0,1,2 -> first occurrence of each.
+        int[] id = IntStream.rangeClosed(1, 5).map(i -> i % 3).distinct().toArray();
+        check(Arrays.toString(id).equals("[1, 2, 0]"), "IntStream.distinct: " + Arrays.toString(id));
+
+        // LongStream: sorted / distinct / findFirst / findAny were all missing.
+        long[] ls = LongStream.range(0, 5).map(x -> x % 3).sorted().toArray();
+        check(Arrays.toString(ls).equals("[0, 0, 1, 1, 2]"), "LongStream.sorted: " + Arrays.toString(ls));
+        long[] ld = LongStream.range(0, 5).map(x -> x % 3).distinct().toArray();
+        check(Arrays.toString(ld).equals("[0, 1, 2]"), "LongStream.distinct: " + Arrays.toString(ld));
+        OptionalLong lf = LongStream.range(0, 5).filter(x -> x > 2).findFirst();
+        check(lf.isPresent() && lf.getAsLong() == 3L, "LongStream.findFirst: " + lf);
+        OptionalLong la = LongStream.range(0, 5).filter(x -> x > 2).findAny();
+        check(la.isPresent() && la.getAsLong() == 3L, "LongStream.findAny: " + la);
+        // ... and both must be EMPTY when nothing survives the filter, or a
+        // "return the first element unconditionally" stub would pass above.
+        check(LongStream.range(0, 5).filter(x -> x > 99).findFirst().isEmpty(),
+                "LongStream.findFirst on an empty stream must be empty");
+        System.out.println("CK RJdkViews longStream=" + Arrays.toString(ls) + Arrays.toString(ld)
+                + " first=" + lf.getAsLong());
+
+        // DoubleStream -- the largest of the three holes. anyMatch is the
+        // conspicuous one: allMatch and noneMatch beside it were registered.
+        check(IntStream.rangeClosed(1, 4).asDoubleStream().anyMatch(x -> x == 3.0),
+                "DoubleStream.anyMatch positive");
+        check(!IntStream.rangeClosed(1, 4).asDoubleStream().anyMatch(x -> x > 9.0),
+                "DoubleStream.anyMatch negative");
+        double seeded = IntStream.rangeClosed(1, 4).asDoubleStream().reduce(0.0, Double::sum);
+        check(seeded == 10.0, "DoubleStream.reduce(seed, op): " + seeded);
+        OptionalDouble red = IntStream.rangeClosed(1, 4).asDoubleStream().reduce(Double::sum);
+        check(red.isPresent() && red.getAsDouble() == 10.0, "DoubleStream.reduce(op): " + red);
+        // The no-identity overload must answer EMPTY on an empty stream -- the
+        // whole reason it returns OptionalDouble rather than 0.0.
+        check(IntStream.rangeClosed(1, 0).asDoubleStream().reduce(Double::sum).isEmpty(),
+                "DoubleStream.reduce(op) on an empty stream must be empty");
+        OptionalDouble df = IntStream.rangeClosed(1, 4).asDoubleStream().findFirst();
+        check(df.isPresent() && df.getAsDouble() == 1.0, "DoubleStream.findFirst: " + df);
+        check(IntStream.rangeClosed(1, 4).asDoubleStream().findAny().isPresent(),
+                "DoubleStream.findAny");
+        double[] dsorted = IntStream.rangeClosed(1, 4).map(i -> 5 - i)
+                .asDoubleStream().sorted().toArray();
+        check(Arrays.toString(dsorted).equals("[1.0, 2.0, 3.0, 4.0]"),
+                "DoubleStream.sorted: " + Arrays.toString(dsorted));
+        double[] ddist = IntStream.rangeClosed(1, 4).map(i -> i % 2)
+                .asDoubleStream().distinct().toArray();
+        check(Arrays.toString(ddist).equals("[1.0, 0.0]"),
+                "DoubleStream.distinct: " + Arrays.toString(ddist));
+
+        // The two rows that separate Java's double ordering from Rust's (and
+        // from `==`): Double.compare puts -0.0 strictly BELOW 0.0, and
+        // Double.equals keeps them distinct. An implementation built on `<`
+        // and `==` passes everything above and fails both of these.
+        double[] zsorted = IntStream.rangeClosed(1, 2)
+                .mapToDouble(i -> i == 1 ? 0.0 : -0.0).sorted().toArray();
+        check(Arrays.toString(zsorted).equals("[-0.0, 0.0]"),
+                "DoubleStream.sorted orders -0.0 below 0.0: " + Arrays.toString(zsorted));
+        double[] zdist = IntStream.rangeClosed(1, 2)
+                .mapToDouble(i -> i == 1 ? 0.0 : -0.0).distinct().toArray();
+        check(Arrays.toString(zdist).equals("[0.0, -0.0]"),
+                "DoubleStream.distinct keeps -0.0 and 0.0 apart: " + Arrays.toString(zdist));
+        System.out.println("CK RJdkViews doubleStream=" + Arrays.toString(dsorted)
+                + Arrays.toString(ddist) + Arrays.toString(zsorted));
+
+        // `BaseStream.iterator()` -- the ()Ljava/util/Iterator; bridge, which is
+        // a DIFFERENT registration from IntStream.iterator()OfInt and is the one
+        // reached whenever the static type is BaseStream/Stream. Its backing
+        // store on a primitive stream is a primitive array, so the elements have
+        // to be BOXED on the way out: Iterator.next() is declared to return a
+        // reference, and an unboxed word there is untyped, not merely wrong.
+        // Bounded by `guard` for the reason failFast() is bounded.
+        BaseStream<?, ?> bs = IntStream.rangeClosed(1, 3);
+        Iterator<?> bit = bs.iterator();
+        int isum = 0;
+        int seen = 0;
+        int guard = 0;
+        while (bit.hasNext() && ++guard <= 8) {
+            Object o = bit.next();
+            seen++;
+            check(o instanceof Integer, "BaseStream.iterator() must yield boxed Integers"
+                    + " (element " + seen + " was not an Integer)");
+            isum += ((Integer) o).intValue();
+        }
+        check(seen == 3 && isum == 6,
+                "BaseStream.iterator() over an IntStream: seen=" + seen + " sum=" + isum);
+        System.out.println("CK RJdkViews baseStreamIterator=" + seen + "," + isum);
+    }
+
+    // ---- W7-36 residuals: refusals the sorted containers never made --------
+
+    /**
+     * The natural-ordering key check. {@code TreeMap.getEntry} runs
+     * {@code if (key == null) throw new NullPointerException();} and the
+     * {@code (Comparable) key} checkcast BEFORE it looks at {@code root}, so an
+     * EMPTY container refuses too -- and {@code NavigableSubMap}'s constructor
+     * runs {@code m.compare(hi, hi)} for a single-bound view for the same
+     * reason. CratonVM returned normally from all of it.
+     *
+     * Each refusal is paired with the case that must NOT refuse, because a
+     * container that threw from every key would satisfy the positive half on
+     * its own -- the W6-5 shape.
+     */
+    static void sortedContainerRefusals() {
+        boolean ck = false;
+        try {
+            new TreeMap<String, Integer>().containsKey(null);
+        } catch (NullPointerException expected) {
+            ck = true;
+        }
+        check(ck, "TreeMap.containsKey(null) under natural ordering must throw NullPointerException");
+
+        boolean rm = false;
+        try {
+            new TreeMap<String, Integer>().remove(null);
+        } catch (NullPointerException expected) {
+            rm = true;
+        }
+        check(rm, "TreeMap.remove(null) under natural ordering must throw NullPointerException");
+
+        boolean god = false;
+        try {
+            new TreeMap<String, Integer>().getOrDefault(null, 7);
+        } catch (NullPointerException expected) {
+            god = true;
+        }
+        check(god, "TreeMap.getOrDefault(null, d) must throw NullPointerException, not answer d");
+
+        boolean tsc = false;
+        try {
+            new TreeSet<String>().contains(null);
+        } catch (NullPointerException expected) {
+            tsc = true;
+        }
+        check(tsc, "TreeSet.contains(null) under natural ordering must throw NullPointerException");
+
+        // The type half of the same check, on an EMPTY container -- where no
+        // comparison happens and so nothing raised it before.
+        boolean cce = false;
+        try {
+            new TreeMap<Object, Integer>().containsKey(new Object());
+        } catch (ClassCastException expected) {
+            cce = true;
+        }
+        check(cce, "TreeMap.containsKey(non-Comparable) must throw ClassCastException");
+
+        // Single-bound views: NavigableSubMap's `else` arm, a type-and-null
+        // check on the one bound. Not the reversed-bounds check, which only the
+        // two-bound entry points reach.
+        boolean hm = false;
+        try {
+            abcd().headMap(null);
+        } catch (NullPointerException expected) {
+            hm = true;
+        }
+        check(hm, "TreeMap.headMap(null) must throw NullPointerException");
+        boolean tmn = false;
+        try {
+            abcd().tailMap(null);
+        } catch (NullPointerException expected) {
+            tmn = true;
+        }
+        check(tmn, "TreeMap.tailMap(null) must throw NullPointerException");
+
+        // TreeSet.subSet(hi, lo) -- the TreeMap twin was fixed and this was not.
+        TreeSet<String> ts = new TreeSet<>(Arrays.asList("a", "b", "c"));
+        // Asserted so a construction failure is attributed here rather than
+        // showing up as an empty subSet two lines down.
+        check(ts.size() == 3 && ts.first().equals("a"), "TreeSet(Collection) populated: " + ts);
+        boolean rev = false;
+        try {
+            ts.subSet("c", "a");
+        } catch (IllegalArgumentException expected) {
+            rev = true;
+        }
+        check(rev, "TreeSet.subSet(hi, lo) must throw IllegalArgumentException");
+
+        // NEGATIVE CONTROLS.
+        // 1. A comparator that permits nulls legitimately holds them, and the
+        //    JDK scopes the whole check to `comparator == null`. A VM that
+        //    refused here would break `new TreeSet<>(nullsFirst(..))`.
+        Comparator<String> nullsFirst = (a, b) -> a == null
+                ? (b == null ? 0 : -1)
+                : (b == null ? 1 : a.compareTo(b));
+        TreeMap<String, Integer> nullOk = new TreeMap<>(nullsFirst);
+        nullOk.put("a", 1);
+        check(!nullOk.containsKey(null), "a null-permitting comparator must not refuse containsKey(null)");
+        check(nullOk.remove(null) == null, "a null-permitting comparator must not refuse remove(null)");
+        check(nullOk.getOrDefault(null, 7) == 7,
+                "a null-permitting comparator must not refuse getOrDefault(null, d)");
+        // 2. The ordinary cases still answer.
+        check(!new TreeMap<String, Integer>().containsKey("nope"), "absent key is still absent");
+        check(abcd().headMap("c").size() == 2, "a valid single bound still builds the view");
+        SortedSet<String> okSub = ts.subSet("a", "c");
+        check(okSub.toString().equals("[a, b]"), "a valid subSet is unaffected: " + okSub);
+        // 3. getOrDefault over a PRESENT null value answers null, not the
+        //    default -- W7-36 suspected this was broken here and it was not;
+        //    the assertion locks the correction rather than a change.
+        TreeMap<String, Integer> withNull = new TreeMap<>();
+        withNull.put("k", null);
+        check(withNull.getOrDefault("k", 7) == null,
+                "getOrDefault over a present null VALUE answers null, not the default");
+        System.out.println("CK RJdkViews refusals=" + ck + rm + god + tsc + cce + hm + tmn + rev
+                + " sub=" + okSub);
+    }
+
+    // ---- W7-1 residual: the map key iterator past its end ------------------
+
+    static void keyIteratorExhaustion() {
+        // `HashMap$KeyItr.next()` past the end answered null, where the JDK
+        // throws. null is also a legitimate ELEMENT of a key set, so a caller
+        // that over-ran its own hasNext() could not tell the two apart.
+        Iterator<String> it = new java.util.HashSet<>(Arrays.asList("only")).iterator();
+        check(it.next().equals("only"), "the one element comes out");
+        check(!it.hasNext(), "and the iterator is then exhausted");
+        boolean nse = false;
+        try {
+            it.next();
+        } catch (java.util.NoSuchElementException expected) {
+            nse = true;
+        }
+        check(nse, "Iterator.next() past the end must throw NoSuchElementException");
+        System.out.println("CK RJdkViews keyItrExhausted=" + nse);
+    }
+
     public static void main(String[] args) {
         navigableViews();
         iteratorContract();
         failFast();
         formats();
+        sortedContainerRefusals();
+        keyIteratorExhaustion();
         // streams() last on purpose: the summaryStatistics defect killed the
-        // process outright, so anything after it would report nothing.
+        // process outright, so anything after it would report nothing. The rest
+        // of the primitive-stream surface fails the same way, so it goes with it.
         streams();
+        primitiveStreamSurface();
         System.out.println("CK RJdkViews checks=" + checks);
         System.out.println("PASS RJdkViews (" + checks + " checks)");
     }

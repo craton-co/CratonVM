@@ -485,12 +485,17 @@ mod platform {
     /// would be strictly worse than `None` — it would spin a loop that could
     /// never report readiness while the caller believed it was close-aware.
     ///
-    /// `None` routes the caller to one plain blocking `WriteFile`, i.e. exactly
-    /// the pre-2026-08-12 behaviour, with the generation check still applied
-    /// BEFORE it and the deferred close still applied after. So a Windows sink
-    /// write no longer risks a use-after-close, and observes a close that has
-    /// already happened — it is only a close arriving while it is inside
-    /// `WriteFile` that it still cannot see.
+    /// `None` routes the caller to a plain blocking `WriteFile`, with the
+    /// generation check still applied BEFORE it and the deferred close still
+    /// applied after. So a Windows sink write does not risk a use-after-close,
+    /// and observes a close that has already happened — it is only a close
+    /// arriving while it is inside `WriteFile` that it still cannot see.
+    ///
+    /// That `WriteFile` is SLICED to `PIPE_WRITE_SLICE_MAX` rather than issued
+    /// once for the whole remainder, so the generation check runs between
+    /// slices. Read that as a narrowing of the blind window (one slice instead
+    /// of the whole payload), NOT as the wakeup: a reader that has stopped
+    /// entirely still parks the first slice forever. The row stays open.
     pub(super) fn poll_pipe(
         raw: u64,
         want_write: bool,
@@ -668,14 +673,46 @@ fn pipe_write_close_aware(id: i32, raw: u64, data: &[u8]) -> std::io::Result<isi
             return Err(pipe_closed_err());
         }
         match poll_pipe(raw, true, PIPE_CLOSE_POLL_MS) {
-            // No write-readiness probe on this target — Windows, today. One
-            // plain blocking write of the remainder, exactly the
-            // pre-2026-08-12 behaviour, with the generation check above still
-            // applied before it. See `platform::poll_pipe`'s doc comment for
-            // why answering `Some(Ok(false))` here instead would be worse.
+            // No write-readiness probe on this target — Windows, today. There
+            // is no wakeup to be had here and none is invented: a close that
+            // lands while this thread is inside `WriteFile` is still invisible
+            // to it, and W7-53-blocking-close-family.md keeps that row OPEN.
+            //
+            // What IS done is bound how long "inside `WriteFile`" lasts. The
+            // remainder used to be handed to ONE unsliced write, so a close
+            // arriving during a 1 MiB payload was unobservable for the whole
+            // payload — the generation check above ran once and then the thread
+            // was gone for the duration. Slicing it to `PIPE_WRITE_SLICE_MAX`
+            // makes that check run between slices, which is the identical
+            // argument `net.rs`'s `NET_WRITE_SLICE_MAX` makes for a blocking
+            // `send` ("a single unsliced send parks for an unbounded time and
+            // observes no close"), and it needs no new Win32 binding.
+            //
+            // The bound this buys is honest and worth stating precisely: the
+            // window is now one slice, i.e. as long as the reader takes to
+            // drain 4 KiB, rather than as long as it takes to drain everything.
+            // On a reader that has stopped entirely the FIRST slice still parks
+            // forever, which is exactly the residual the record names and is
+            // why this is a narrowing rather than a fix.
             None => {
-                let n = write_pipe(raw, &data[written..])?;
-                return Ok(written as isize + n);
+                let end = (written + PIPE_WRITE_SLICE_MAX).min(data.len());
+                match write_pipe(raw, &data[written..end]) {
+                    Ok(n) if n > 0 => written += n as usize,
+                    // Accepted nothing and reported no error. Unlike the
+                    // `Some(Ok(true))` arm there is no probe here to bound a
+                    // retry, so looping would be a busy spin; answer the
+                    // partial count instead, which is what a caller of a
+                    // gathering write can already receive.
+                    Ok(_) => {
+                        return if written > 0 {
+                            Ok(written as isize)
+                        } else {
+                            Err(pipe_closed_err())
+                        };
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
             }
             Some(Err(e)) => return Err(e),
             Some(Ok(false)) => continue,

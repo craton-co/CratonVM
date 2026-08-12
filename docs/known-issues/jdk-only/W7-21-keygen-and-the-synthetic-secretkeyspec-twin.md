@@ -1,5 +1,127 @@
 # `KeyGenerator` ignored its algorithm, and the "shadowing" twin was shadowed
 
+> **PATCH A IS VINDICATED, AND IT UNCOVERED A SECOND WALL ONE FRAME FURTHER IN.
+> 2026-08-12 (fourth pass, JCA lane). `RCrypto` went RED after Patch A; the
+> deletion was not the defect.**
+>
+> **Symptom.** `--jdk-only RCrypto` died with `ExceptionInInitializerError` at
+> `RCrypto.java:545`, the new `KeyGenerator.getInstance("AES","SunJCE")` line.
+>
+> **The actual exception**, which the truncated trace hid, is
+> `NullPointerException: Cannot invoke "Object.equals(Object)" because "e0" is
+> null`, thrown in `java/util/ImmutableCollections$Set12.<init>` from
+> `Set.of(…)` from `javax/crypto/JceSecurityManager.<clinit>` line 71:
+>
+>     WALKER = StackWalker.getInstance(
+>         Set.of(Option.DROP_METHOD_INFO, Option.RETAIN_CLASS_REFERENCE));
+>
+> `e0` is `StackWalker$Option.DROP_METHOD_INFO`. **Every**
+> `java/lang/StackWalker$Option` constant reads back null in this VM. The chain
+> is all real JDK bytecode we do not intercept:
+> `KeyGenerator.getInstance` → `JceSecurity.getInstance` →
+> `GetInstance.getInstance` → `AESKeyGenerator.<init>` →
+> `SecurityProviderConstants.getDefAESKeySize` →
+> `Cipher.getMaxAllowedKeyLength("AES")` → `Cipher.getConfiguredPermission` →
+> `getstatic JceSecurityManager.INSTANCE` → that clinit.
+>
+> **Not a regression, and not the deletion.** Measured on the pristine-dev
+> `44044c7e2` control binary: `StackWalker$Option.RETAIN_CLASS_REFERENCE` is
+> null there too, and `Cipher.getMaxAllowedKeyLength("AES")` raises the same
+> `ExceptionInInitializerError`. The wall predates this wave. What Patch A
+> changed is only that the real path is now WALKED far enough to reach it — the
+> deleted shims used to return before the first real frame. The A/B is not
+> "green→red on the same input": the control binary fails `RCrypto` too, one
+> line later (`NullPointerException: … "this.spi" is null` at
+> `KeyGenerator.generateKey`), which is precisely the defect Patch A cut out.
+>
+> **The existing `JceSecurityManager.getCryptoPermission` native cannot help.**
+> It is an INSTANCE method reached through `getstatic INSTANCE`, and the
+> getstatic is what runs the clinit. Its doc comment describes a later wall
+> (`defaultPolicy` null ⇒ NPE in `getPermissionCollection`) that the class never
+> survives long enough to reach on JDK 25. It is dead code today and stays only
+> because it becomes live the moment `StackWalker$Option` is fixed.
+>
+> **Fix (applied).** Natives for `javax/crypto/Cipher.getMaxAllowedKeyLength`
+> and its twin `getMaxAllowedParameterSpec`, next to `getCryptoPermission` in
+> `register_cipher_clinit_shim` — the two PUBLIC doors into the chokepoint —
+> answering `Integer.MAX_VALUE` and `null`. Those are measured on HotSpot 25 on
+> this host, not assumed: `getMaxAllowedKeyLength("AES"|"DES"|"RC4") =
+> 2147483647`, `getMaxAllowedParameterSpec("AES") = null`, which is what the
+> `crypto.policy=unlimited` shipped by default since Java 9 gives. Both refuse
+> exactly what the real method refuses and no more: an unmessaged
+> `NullPointerException` for a null transformation (the explicit check in
+> `getConfiguredPermission`, which runs BEFORE tokenizing, so it is NOT
+> `NoSuchAlgorithmException: No transformation given`), and
+> `tokenizeTransformation`'s own messages for a malformed one, via this file's
+> existing `tokenize_transformation` port. Neither method validates that the
+> ALGORITHM exists — measured, `getMaxAllowedKeyLength("Bogus")` is also
+> `2147483647` — so the natives do not either.
+>
+> **Verification without a rebuild** (this lane could not build). The rest of
+> the real path was proved sound on the wave binary by pre-seeding
+> `sun.security.util.SecurityProviderConstants.DEF_AES_KEY_SIZE` to 256
+> reflectively, which is exactly what a working `getMaxAllowedKeyLength` causes
+> `getDefAESKeySize` to store, and which makes it return before calling into
+> `Cipher`. With only that one call removed, `--jdk-only` gives
+> `kg2Key.length = 32`, not all zeros, and `new SecretKeySpec(new byte[0],
+> "AES")` ⇒ `IllegalArgumentException` — the three `keygen2arg` checks, exactly
+> as HotSpot. Independently, all 16 `CK` lines `RCrypto` emits before that block
+> already diff clean against a same-session HotSpot run.
+>
+> **Out of this lane, still open, NOT fixed here.**
+> `java/lang/StackWalker$Option`'s constants are null under `--jdk-only`.
+> `native-builtins/src/phases_late.rs:5222-5255` registers static-field natives
+> for three of them (`RETAIN_CLASS_REFERENCE`, `SHOW_HIDDEN_FRAMES`,
+> `SHOW_REFLECT_FRAMES`) — `DROP_METHOD_INFO`, added in JDK 22, has none — and
+> none of the three is consulted for a `getstatic` when the real class bytes are
+> authoritative. Anything else that reaches `JceSecurityManager` or a real
+> `StackWalker.getInstance(Set)` hits this.
+>
+> **Refuted, both named as suspects and both innocent.** Patch C's
+> `SecretKeySpec` guard reproduces the real `<init>`'s two checks in the real
+> order and measures `IllegalArgumentException` for the empty key, matching
+> HotSpot. `jca/message_digest.rs`'s `canonical_algorithm` fold matches only
+> `SHAKE128`/`SHAKE256` and returns its argument unchanged otherwise; `RCrypto`'s
+> `sha256` and `hmacSha256` lines are byte-identical to HotSpot's.
+
+> **PATCHES A AND C ARE APPLIED, 2026-08-12 (third pass, JCA lane). Read this
+> before the two reconciliation blocks below, both of which now overstate what
+> is open.**
+>
+> * **Patch A — APPLIED as option 1, DELETION.** Both 2-arg
+>   `KeyGenerator.getInstance` registrations, the enclosing
+>   `register_keygen_dispatch`, and its call site are gone from
+>   `native-builtins/src/jca/cipher.rs`; a tombstone stands where the function
+>   was. `keygen_default_bits` was **not** made `pub(crate)` and is not needed —
+>   option 2 would have wired a synthetic default into a path that now has a
+>   real one. Verified before cutting: the shims' matching `init` /
+>   `generateKey` natives live in `phases_early::register_phase53_crypto`, which
+>   is reachable **only** from `lib::register_synthetic_overrides`, so in both
+>   shipping modes the synthetic they returned had no working `init` at all —
+>   and under real-JDK `try_alloc_concurrent_synthetic` upsizes it to the real
+>   layout, where slot 0 is `spi`, so the algorithm String was written into the
+>   SPI field. The real path they bypassed is live: thirteen (not twelve)
+>   `SunJCE` `KeyGenerator` services under real JDK class names, and the
+>   `sun/security/jca/GetInstance` named-provider **and** search bridges, both
+>   gated on `ec_real`, whose `route_ec_to_real()` disjunct is default ON.
+> * **Patch C — APPLIED as written**, `SecretKeySpec.<init>([BLjava/lang/String;)V`.
+>   The null test runs **before** `obj_arg`, which is the whole point: `obj_arg`
+>   raises `NullPointerException` and a caller's `catch
+>   (IllegalArgumentException)` does not catch it, so ordering the checks the
+>   other way would have kept the defect while looking fixed.
+> * **Both are Compatible-mode behaviour changes**, deliberate and of the shape
+>   §5 of W7-63 catalogues: from "returns an object that fails later on a
+>   different line" and "accepts a zero-length key" to HotSpot's own refusals.
+> * **Coverage.** `regression-suite/src/RCrypto.java` (in `CORE_CLASSES`) gains
+>   three checks that fail on the pre-fix behaviour:
+>   `KeyGenerator.getInstance("AES","SunJCE").generateKey().getEncoded()` is
+>   **32 bytes** — SunJCE's JDK 25 AES default is 256-bit, measured on the
+>   oracle, not the 128 the deleted shim hardcoded — is **not all zeros**, and
+>   `new SecretKeySpec(new byte[0], "AES")` is `IllegalArgumentException`.
+> * **Still open, unchanged:** the synthetic `KeyGenerator` serving a wider set
+>   than the seed advertises, `init(AlgorithmParameterSpec)` accepting and
+>   ignoring, and `java/security/Key.getAlgorithm` hardcoding `"AES"`.
+
 > **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — TWO OF THE FOUR
 > "recorded, NOT applied" PATCHES ARE IN THE TREE.**
 >
@@ -23,6 +145,54 @@
 > algorithm set than the real-mode provider seed advertises;
 > `KeyGenerator.init(AlgorithmParameterSpec)` accepts and ignores; and
 > `java/security/Key.getAlgorithm` still hardcodes `"AES"`.
+
+> **RE-GREPPED 2026-08-12 (crypto lane, second pass). One residual closed from
+> the other side; two patches still live; one patch discharged by a third
+> lane.**
+>
+> * **Patch A — STILL NOT APPLIED, re-anchored, and its preferred form now has
+>   evidence behind it.** `native-builtins/src/jca/cipher.rs::
+>   register_keygen_dispatch` is at `:3334`; the two hardcoded defaults are at
+>   `:3346` and `:3358`, not `:3288-3315`. `keygen_default_bits` still never
+>   appears in `cipher.rs`. **Take option 1 — drop both registrations.** The
+>   option-1 precondition this record named ("re-measure the doc comment's
+>   stated NPE at `service.getProvider()`; `provider_chain` has been seeded with
+>   real `Service` entries since that comment was written") is now settled in
+>   source rather than needing a run: W7-39 seeded twelve `KeyGenerator`
+>   services on 2026-08-12 (`provider_chain.rs:1418-1440`), and that file's
+>   comment at `:1401` states outright that `KeyGenerator` is **not** natively
+>   intercepted in `--real-jdk` mode. These two registrations are the only thing
+>   making that sentence false, and Result 4 above is the cost of keeping them:
+>   `getInstance(algo, "SunJCE")` succeeds and the next call NPEs on
+>   `this.spi`, in `Compatible` and `--jdk-only` alike.
+> * **Patch C — STILL NOT APPLIED, re-anchored.** `register_param_specs` is at
+>   `cipher.rs:4078`; the `SecretKeySpec.<init>` that copies the array with
+>   neither a length nor a null check is at `:4154-4170`, not `:3936-3949`.
+> * **Patch B — DISCHARGED by a third lane, in the form this record predicted.**
+>   The concurrent-work note in Result 3 was right: the tree does now carry a
+>   second, whole `native-builtins/src/chacha20.rs` with its own
+>   `chacha20_block`, `chacha20_apply`, **`poly1305`** and AEAD. The two-cores
+>   question resolved the way this record said it should — the one wired to
+>   `Cipher` is the one that survived (`jca/cipher.rs:2282`/`:2296`,
+>   `provider_chain.rs:1226-1227`), and it carries the RFC 8439 §2.5.2 Poly1305
+>   vector that both this record and W7-15 set as the non-negotiable
+>   precondition for advertising the AEAD.
+> * **Residual CLOSED — "the synthetic `KeyGenerator` serves a wider set than
+>   real mode advertises", and it closed from the direction this record argued
+>   for.** This record called the three-name seed "the narrower and more
+>   suspicious of the two". W7-39 widened it to twelve
+>   (`AES`, `ARCFOUR`, `Blowfish`, `ChaCha20`, `DES`, `DESede`, `HmacMD5`,
+>   `HmacSHA1`, `HmacSHA224/256/384/512` — `provider_chain.rs:1418-1440`),
+>   matching the table in *"What the synthetic shim now does"* above, and
+>   through the real SunJCE generator classes rather than a reimplementation.
+> * **Two residuals unchanged.** `init(AlgorithmParameterSpec)` still accepts
+>   and ignores, which remains defensible. `java/security/Key.getAlgorithm`
+>   still answers `"AES"`: the fallback lives in
+>   `native-builtins/src/phases_early.rs::carrier_algorithm` (`:14466-14473`)
+>   and fires only when slot 1 is not a readable String. The blocker stated in
+>   Result 2 is unchanged — `NativeContext` exposes no slot count and
+>   `Heap::get_field` asserts rather than answering null — so this is not a
+>   deferral, it is a missing capability. Synthetic-jdk only.
 
 **Status:** FIXED in source 2026-08-11 (lane W7-21). **Nothing was rebuilt** —
 this lane could not run `cargo build`, so every number below is either a

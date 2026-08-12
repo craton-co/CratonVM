@@ -5817,9 +5817,45 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Object(None))),
         }
     });
+    // `arrayOffset()` has the SAME two refusals as `array()` eighteen lines
+    // above, and had neither — a direct receiver answered `0`, which is a
+    // perfectly ordinary offset, so `hasArray()`-less code that reached for the
+    // offset got a number instead of the exception that tells it to take the
+    // direct path. The real JDK body is three lines and both of them are in it:
+    //
+    // ```java
+    // if (hb == null)  throw new UnsupportedOperationException();
+    // if (isReadOnly)  throw new ReadOnlyBufferException();
+    // return offset;
+    // ```
+    //
+    // Transcribed from the `array()` arm rather than written afresh, so the two
+    // cannot drift; the storage classification and both `RuntimeError` variant
+    // shapes are that arm's. Measured oracle rows, probes/DirectByteBufferStateProbe.expected.txt
+    // on jdk-25.0.3.9: `direct.arrayOffset.throws`, `direct.win.arrayOffset.throws`
+    // and `direct.win.readOnly.arrayOffset.throws` are `UnsupportedOperationException`;
+    // `heap.win.readOnly.arrayOffset.throws` is `ReadOnlyBufferException`; the
+    // happy paths are `heap.arrayOffset = 0` and `heap.win.arrayOffset = 4`, so
+    // the window's base still has to come through. Record: W7-83 §7.1.
     r.register(bb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
+        match s2_bb_arr(ctx, this) {
+            Some(_) => {
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
+                Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
+            }
+            None if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(RuntimeError::UnsupportedOperationException {
+                    message: "direct buffer has no backing array".to_string(),
+                }
+                .into())
+            }
+            // Storage-less synthetic: keep the historic benign zero, for the
+            // same reason `array()` keeps its historic benign null.
+            None => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+        }
     });
     r.register(bb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5892,13 +5928,44 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // advanced native `address`. The bare-synthetic 6-slot layout has no
     // `offset` field to carry a base, so it keeps the legacy copying
     // behaviour (data-correct, aliasing not representable).
+    //
+    // BYTE ORDER IS **NOT** CARRIED ACROSS ANY OF THESE FOUR. All four ran
+    // `let ord = s2_bb_order(ctx, this)` and propagated it, and that is wrong in
+    // a way no amount of aliasing correctness compensates for.
+    //
+    // The mechanism, because it is not obvious from any javadoc: each of these
+    // four returns a NEW buffer built by a `ByteBuffer` constructor, and
+    // `boolean bigEndian = true` is a FIELD INITIALISER on `ByteBuffer` — it
+    // runs on every construction, so a derived view comes back BIG_ENDIAN
+    // however the source was set. These methods preserve CONTENT, not ORDER.
+    // And `order()` is `public final`, reading the field directly, so there is
+    // no per-subclass override point at which a propagated order could be
+    // corrected afterwards.
+    //
+    // The `s2` registrar WINS in Compatible mode and all four descriptors are
+    // force-native, so the propagation was live:
+    // `ByteBuffer.allocate(16).order(LITTLE_ENDIAN).slice().order()` answered
+    // LITTLE_ENDIAN where HotSpot answers BIG_ENDIAN, and **every typed read
+    // through such a view was byteswapped relative to HotSpot** — a wrong value,
+    // not an exception, which is the quiet kind.
+    //
+    // Measured, jdk-25.0.3.9:
+    // `{direct,heap}.ord.{slice,sliceRange,duplicate,readOnly}.order = BIG_ENDIAN`.
+    // Record: W7-76 §10.
+    //
+    // THE EXCLUSION, and it is the reason this is a comment and not a one-line
+    // diff: `as<T>Buffer()` DOES carry the order, and must keep doing so. It
+    // reaches it through `s2_bb_order`'s `java/nio/ByteBufferAs…{B,L}`
+    // class-name arm — a different mechanism at a different site — because the
+    // JDK picks the `B` or the `L` view class from the source's order at
+    // construction time. Do not "fix the inconsistency" by unifying the two.
     r.register(bb, "slice", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this).max(0);
         let lim = s2_bb_limit(ctx, this).max(pos);
         let rem = lim - pos;
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         if s2_bb_synthetic_layout(ctx, this) {
             let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
             if let Some(src) = s2_bb_arr(ctx, this) {
@@ -5949,7 +6016,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let lim = s2_bb_limit(ctx, this);
         s2_check_from_index_size(index, length, lim)?;
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                 s2_bb_new_heap_view(
@@ -5999,7 +6066,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = s2_bb_cap(ctx, this);
         let mark = s2_bb_get_mark(ctx, this);
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                 s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, ro, ord)
@@ -6037,7 +6104,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let lim = s2_bb_limit(ctx, this);
             let cap = s2_bb_cap(ctx, this);
             let mark = s2_bb_get_mark(ctx, this);
-            let ord = s2_bb_order(ctx, this);
+            let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
             let buf = match s2_bb_storage(ctx, this) {
                 Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                     s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, true, ord)

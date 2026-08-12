@@ -6390,7 +6390,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     );
 
     // MethodHandle.asVarargsCollector(arrayType) / MethodHandle.asFixedArity()
-    // → the receiver, unchanged.
+    // → the receiver, with only the `MH_VARARGS` marking changed.
     //
     // Why the real bytecode cannot run here: `asVarargsCollector` wraps the
     // receiver in `MethodHandleImpl$AsVarargsCollector`, a
@@ -6413,28 +6413,82 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     // `invoke` that supplies more flat values than the target descriptor
     // declares into a fresh array of the array-typed parameter's component
     // type. That trigger is arity/shape driven, so a "this handle is a
-    // collector" marking adds nothing to it. `asFixedArity()` is the inverse
+    // collector" marking adds nothing to it — the `MH_VARARGS` bit below is
+    // answered to reflective callers and is never consulted by dispatch.
+    // `asFixedArity()` is the inverse
     // and is likewise the identity: `collect_trailing_varargs` returns an
     // already-packed call (exactly N args, an array in the array slot)
     // untouched, which is precisely fixed-arity behaviour.
     //
-    // Known deviation, deliberately not papered over: `isVarargsCollector()`
-    // keeps answering `false` (the base-class bytecode) because the marking is
-    // not stored anywhere. Recording it would need a sixth synthetic slot on
-    // every MethodHandle (`MH_BOUND + 1` is the allocated width today), and no
-    // caller in the corpus reads the flag back.
-    for (name, desc) in [
-        (
-            "asVarargsCollector",
-            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        ),
-        ("asFixedArity", "()Ljava/lang/invoke/MethodHandle;"),
-    ] {
-        r.register("java/lang/invoke/MethodHandle", name, desc, |_ctx, args| {
-            // args[0] is the receiver; hand it straight back.
+    // W7-19 §5.2, the former "known deviation": `isVarargsCollector()` used to
+    // answer `false` for every handle, including one just returned by
+    // `asVarargsCollector`, because the marking was stored nowhere. It is now
+    // stored — in `MH_VARARGS`, the sixth synthetic slot, set here and cleared
+    // by `asFixedArity` — and read back by an `isVarargsCollector` native
+    // registered below. Both writers are width-guarded (see `MH_VARARGS`), so a
+    // handle minted by some other allocator is untouched and still answers
+    // `false`, exactly as before.
+    //
+    // DECLARED DEVIATION that survives, and it is a consequence of the identity
+    // shim above rather than of the marking: HotSpot's `asVarargsCollector`
+    // returns a NEW handle and leaves the receiver fixed-arity, so on HotSpot
+    // `h.isVarargsCollector()` stays false and `h.asVarargsCollector(t)
+    // .isVarargsCollector()` is true. Here there is only ONE handle, so the
+    // marking is visible through the receiver too, and `asFixedArity()` clears
+    // it on that same object. Minting a copy instead would have to reproduce all
+    // six synthetic slots plus the `type` field of an arbitrary handle kind, and
+    // dispatch is unaffected either way — `collect_trailing_varargs` derives
+    // varargs behaviour from arity, never from this bit. `RJdkHandles` therefore
+    // asserts the marking on the RESULT of `asVarargsCollector` and does not
+    // re-read the receiver afterwards; W7-19 §5.2 records why.
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asVarargsCollector",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            // args[0] is the receiver; hand it straight back, marked.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                mh_set_varargs_collector(ctx, *this, true);
+            }
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        });
-    }
+        },
+    );
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "asFixedArity",
+        "()Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            if let Some(Value::Object(Some(this))) = args.first() {
+                mh_set_varargs_collector(ctx, *this, false);
+            }
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        },
+    );
+    // `MethodHandle.isVarargsCollector()` is CONCRETE in the real JDK — the base
+    // class returns `false` and `MethodHandleImpl$AsVarargsCollector` overrides
+    // it — so this registration shadows real bytecode. That is the default per
+    // `docs/architecture/natives-over-real-jdk-classes.md` §1: on the cold
+    // interpreter paths a registered native beats bytecode with no list
+    // consulted, and this block's ambient `NativeKind` is `Bridge`, which
+    // `--jdk-only` keeps. The warm/cached/JIT paths reinstate the preference
+    // from `vm_exec.rs`'s `check_override` mirror, which lists
+    // `asVarargsCollector`/`asFixedArity` but not this method; a lane that owns
+    // that file should add it, and until then the only cost is that a JIT-warm
+    // caller may read the base class's `false` instead of the marking. Answering
+    // `false` is what the whole VM did before this change, so the fallback is
+    // the old behaviour rather than a new wrong answer.
+    r.register(
+        "java/lang/invoke/MethodHandle",
+        "isVarargsCollector",
+        "()Z",
+        |ctx, args| {
+            let flagged = match args.first() {
+                Some(Value::Object(Some(this))) => mh_is_varargs_collector(ctx, *this),
+                _ => false,
+            };
+            Ok(Some(Value::Int(if flagged { 1 } else { 0 })))
+        },
+    );
 
     // MethodHandles.explicitCastArguments(target, newType) → passthrough that
     // stamps the new type (mirrors the `asType` shim). The real bytecode runs
@@ -6918,6 +6972,39 @@ const MH_NAME: usize = MH_BASE + 1;
 const MH_DESC: usize = MH_BASE + 2;
 const MH_KIND: usize = MH_BASE + 3;
 const MH_BOUND: usize = MH_BASE + 4;
+
+/// The `asVarargsCollector` marking — `Int(1)` when this handle is a
+/// variable-arity collector, `Int(0)`/absent otherwise (W7-19 §5.2).
+///
+/// Sixth and last synthetic slot; `alloc_method_handle` and
+/// `alloc_string_concat_method_handle` allocate `MH_VARARGS + 1`.
+///
+/// **Never read it raw.** Not every `java/lang/invoke/MethodHandle` in this VM
+/// carries this layout: `MethodHandles.empty`/`zero` allocate 17 slots and
+/// `panama.rs` uses a compact layout whose field 0 is a native address, so a
+/// bare `get_field(mh, MH_VARARGS)` is an out-of-bounds read on a real
+/// receiver — the same shape as the inert `arrayElementGetter` handle recorded
+/// on [`MH_KIND_ARRAY_GET`], where slots 18 and 19 were read off the end of a
+/// 17-slot object. [`mh_is_varargs_collector`] and
+/// [`mh_set_varargs_collector`] width-guard with `object_num_fields` for that
+/// reason.
+const MH_VARARGS: usize = MH_BASE + 5;
+
+/// Is this handle marked a variable-arity collector? Width-guarded — see
+/// [`MH_VARARGS`]. A handle that is too narrow to carry the marking simply is
+/// not one, which is the pre-W7-19 answer for every handle.
+fn mh_is_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef) -> bool {
+    ctx.object_num_fields(mh) > MH_VARARGS && matches!(ctx.get_field(mh, MH_VARARGS), Value::Int(1))
+}
+
+/// Set or clear the marking, width-guarded — see [`MH_VARARGS`]. A handle
+/// narrower than the standard synthetic layout is left exactly as it was; the
+/// write is never allowed off the end of the object.
+fn mh_set_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef, on: bool) {
+    if ctx.object_num_fields(mh) > MH_VARARGS {
+        ctx.set_field(mh, MH_VARARGS, Value::Int(if on { 1 } else { 0 }));
+    }
+}
 
 /// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
 /// points at.
@@ -7455,11 +7542,15 @@ pub(crate) fn alloc_method_handle(
     desc: &str,
     kind: i32,
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
-    // C15: Allocate MH_BOUND+1 slots so our synthetic fields (at slots 16-20)
+    // C15: Allocate MH_VARARGS+1 slots so our synthetic fields (at slots 16-21)
     // live PAST the real JDK's instance-field count (6). This prevents
     // `set_field_by_name(mh, "type", ...)` — which resolves to slot 0 — from
     // overwriting our class/name/desc/kind/bound data.
-    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1)?;
+    // W7-19 §5.2 moved this from `MH_BOUND + 1` to `MH_VARARGS + 1` for the
+    // `asVarargsCollector` marking. Widening is safe in one direction only:
+    // handles minted HERE gain a slot, handles minted elsewhere do not, which
+    // is why every reader of `MH_VARARGS` width-guards.
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_VARARGS + 1)?;
     // GC-safety: the `create_string` calls below (and `build_method_type_
     // from_descriptor` further down) can trigger a collection that
     // relocates `mh`; `cls`/`nm` are each also read again after a LATER
@@ -7479,6 +7570,12 @@ pub(crate) fn alloc_method_handle(
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
     ctx.set_field(mh, MH_KIND, Value::Int(kind));
     ctx.set_field(mh, MH_BOUND, Value::Object(None));
+    // Definitively NOT a varargs collector until `asVarargsCollector` says so.
+    // Written rather than left to the allocator so the read in
+    // `mh_is_varargs_collector` never has to interpret an unwritten slot: a raw
+    // slot can read back as stale padding, and "is this handle a collector"
+    // must not be answered from one.
+    ctx.set_field(mh, MH_VARARGS, Value::Int(0));
     // Populate the real-JDK MethodHandle.type:MethodType field at its
     // resolved slot (0) so `mh.type()` and JDK-internal reads (LambdaForm,
     // MemberName, Invokers, ObjectStreamClass) see a MethodType, not null.
@@ -7617,10 +7714,10 @@ pub(crate) fn alloc_string_concat_method_handle(
     recipe: &str,
     constants: Option<cratonvm_types::ObjectRef>,
 ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
-    // Reuse the MethodHandle synthetic skeleton — same field layout as
-    // alloc_method_handle, but the class slot carries the recipe string
-    // instead of a class name.
-    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1)?;
+    // Reuse the MethodHandle synthetic skeleton — same field layout AND the
+    // same width as alloc_method_handle (W7-19 §5.2), but the class slot
+    // carries the recipe string instead of a class name.
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_VARARGS + 1)?;
     // GC-safety: see `alloc_method_handle` above -- the same triple-
     // `create_string` + subsequent-allocation shape, on the same
     // MethodHandle-skeleton object. Pin everything and re-read the
@@ -7638,6 +7735,8 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
     ctx.set_field(mh, MH_KIND, Value::Int(MH_KIND_STRING_CONCAT));
+    // Same reason as `alloc_method_handle`: never leave `MH_VARARGS` unwritten.
+    ctx.set_field(mh, MH_VARARGS, Value::Int(0));
     // Wrap the constants array in a 1-field holder so MH_BOUND is a single
     // ObjectRef (the rest of mh_dispatch assumes that shape).
     let holder = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1)?;
@@ -10274,6 +10373,22 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // not render, means the leading parameter is UNKNOWN and the bind
             // is allowed through — a refusal is only ever raised on a positive
             // reading.
+            //
+            // NOT done here, and W7-19 §5.1 carries the reason: the JDK's one-line
+            // body is `type.leadingReferenceParameter().cast(x)`, so it also
+            // raises `ClassCastException` for a wrong REFERENCE type
+            // (`(String,int)int`.bindTo(Integer.valueOf(1))). The test below is
+            // syntactic — is the first descriptor token `L…;`/`[…` — and cannot
+            // be wrong for a reason outside its own two lines. A `cast` check is
+            // an assignability question, and the only predicate `NativeContext`
+            // offers is `is_subclass`, which answers FALSE for a fabricated
+            // stand-in against a real JDK interface (a fabricated class declares
+            // no interfaces, so every type test against one fails). `bindTo` is
+            // on the Groovy-indy / SpEL-FunctionReference / log4j-provider path
+            // in this tree, all of which bind interfaces and subtypes, so that
+            // false negative would be a FALSE `ClassCastException` on a hot path
+            // — a refusal of working code, which is worse than the wrong answer
+            // it replaces. It wants a lane that can run those workloads.
             if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
                 if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
                     if let Some((params, _)) = split_descriptor_params(&tdesc) {
@@ -10353,7 +10468,12 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &desc) {
                     ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                 }
-            } else if kind == MH_KIND_STATIC {
+            } else if kind == MH_KIND_STATIC
+                || kind == MH_KIND_GETTER
+                || kind == MH_KIND_SETTER
+                || kind == MH_KIND_ARRAY_GET
+                || kind == MH_KIND_ARRAY_SET
+            {
                 // STATIC `bindTo` captures the leading PARAMETER (not a receiver),
                 // so the bound handle's `type()` must drop that leading parameter
                 // — `(String,String[])R`.bindTo(s) -> `(String[])R`. The dispatch
@@ -10362,6 +10482,29 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 // repackaging, and a chained `bindTo` (#messageStaticBound) derives
                 // its own arity from this one. Leaving the full type here left a
                 // stale extra parameter that mis-packed the varargs.
+                //
+                // W7-19 §5.3 added the four accessor kinds, which take the same
+                // drop for the same reason and were the only kinds left out.
+                // Measured on the shipped binary against HotSpot 25, same class
+                // file: `findGetter(H,"i",int)` bound to a receiver reported
+                // `(H)int` where HotSpot reports `()int`, and
+                // `arrayElementGetter(int[])` bound to an array reported
+                // `([I,int)int` where HotSpot reports `(int)int`. A getter's
+                // `type` is its raw descriptor `(LH;)I` — `alloc_method_handle`
+                // prepends a receiver only for VIRTUAL/SPECIAL — so slot 0 of the
+                // parameter list IS the value `bindTo` just captured, exactly as
+                // for STATIC. Static getters/setters (`()I`, `(I)V`) never reach
+                // here: the guard at the top of this native already refuses a
+                // zero-arity or primitive-leading target, which is what HotSpot
+                // does too.
+                //
+                // This TIGHTENS the guard above on those two shapes, and that is
+                // the point rather than a side effect: those were the only two
+                // rows in W7-19 §3.3's thirteen-shape census where CratonVM
+                // under-refused a second `bindTo` that HotSpot refuses. Before
+                // this, a second bind on a bound getter fell through to the
+                // allocation below and silently OVERWROTE the first capture;
+                // now it raises HotSpot's `IllegalArgumentException`.
                 if let Some(tdesc) = mh_type_descriptor(ctx, this) {
                     if let Some((mut params, ret)) = split_descriptor_params(&tdesc) {
                         if !params.is_empty() {

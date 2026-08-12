@@ -356,188 +356,32 @@ const KIND_CONST: &str = "BASELINE_KIND_DISAGREEMENTS_NO_MANAGEMENT";
 /// decorative guard.
 const UNSEEDED_GRACE_ENDS_UNIX: u64 = 1_788_739_200;
 
-/// Registrars `vm_init`'s real-JDK arm calls that this file CANNOT replay,
-/// because they live in the `vm` crate and `native-builtins` must not
-/// dev-depend on it (that is a dependency cycle).
-///
-/// Both are `crate::runtime::instrument::*`. Anything else appearing in
-/// `vm_init` and not in [`VM_INIT_SEQUENCE`] means the model has gone stale and
-/// the winner column can no longer be trusted — hence the `<=` below rather
-/// than a comment.
-const UNMODELLED_VM_CRATE_REGISTRARS: usize = 2;
-
 // ===========================================================================
-// THE BOOT PATH
+// THE BOOT PATH — one model, shared with `stub_ratchet.rs`
 // ===========================================================================
 
-/// The registrar sequence of `vm_init.rs`'s `#[cfg(not(feature =
-/// "synthetic-jdk"))]` arm, in its order, by bare function name.
+/// `VM_INIT_SEQUENCE`, the replay, and the source witness over
+/// `vm/src/vm/vm_init.rs`.
 ///
-/// Read by [`the_replayed_sequence_matches_vm_init`] and replayed by
-/// [`vm_init_real_jdk_boot_path`]. The two must not drift, because ORDER is the
-/// entire content of a "which registration wins" answer.
+/// This file and `stub_ratchet.rs` each carried a near-identical copy. The
+/// duplication was deliberate — two integration-test binaries cannot share a
+/// module without a file like this one — and its recorded failure mode was
+/// *redundant maintenance* rather than silent disagreement, because two
+/// witnesses read the same source file. On 2026-08-12 the maintenance came due:
+/// **both witnesses located the arm with a `contains` match that hit a COMMENT
+/// quoting `#[cfg(not(feature = "synthetic-jdk"))]` 44 lines above the
+/// attribute**, so both scanned 39 lines of the SIBLING synthetic arm, both
+/// observed 8 registrars instead of 48, and both passed while asserting nothing
+/// about the arm they name. One locator defect, two files — which is the whole
+/// argument for collapsing them.
 ///
-/// **Deliberately NOT `cfg`-gated, unlike the replay.** The witness reads
-/// `vm_init.rs` as TEXT, and the ten `jmx::*` calls are textually present in
-/// that file whether or not `management` is enabled here. Gating this list on
-/// the feature would make the witness report ten unmodelled registrars in the
-/// default build and blow past `UNMODELLED_VM_CRATE_REGISTRARS`. The list
-/// describes the source; the replay describes this build.
-const VM_INIT_SEQUENCE: &[&str] = &[
-    "register_essential_natives_with_shims",
-    "register_concurrent_natives",
-    "register_forkjoin_quiescence",
-    "register_stamped_lock_natives",
-    "register_p61_file_handler",
-    "register_url_classloader_close_bridge",
-    "register_io_natives",
-    "register_p60_process_handle",
-    "register_classvalue_natives",
-    // ╔══ LAST-WRITE-WINS BOUNDARY — do not reorder ═══════════════════════╗
-    // `vm_init` carries this banner verbatim. The two calls that follow
-    // `register_collections_natives` exist BECAUSE it overwrites them.
-    "register_collections_natives",
-    "register_random_and_securerandom_natives",
-    "register_properties_sidetable",
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    "register_t12_unsafe_natives",
-    "register_t14_system_bootstrap",
-    "register_boot_loader_natives",
-    "register_phase57_nio_file",
-    "register_phase57_file",
-    "register_p59_jar",
-    "register_p59_bulk_stream_transfer",
-    "register_p59_zip_output_primitives",
-    "register_spring_boot_logback_apply",
-    "register_url_codec",
-    "register_charset_natives_pub",
-    "register_p58_charset_coder",
-    "register_real_charset_natives",
-    "register_deprecated_internal_natives",
-    "register_arrays_support_natives",
-    "register_string_latin1_natives",
-    "register_classloader_real_natives",
-    "register_phase54_method_handle",
-    "register_p63_method_handles_lookup",
-    "register_t4_method_handle_invoke",
-    "register_t28_method_handle_completeness",
-    "register_p68_invoke_extras",
-    "register_reflect_proxy_natives",
-    "register_vm_management_impl",
-    "register_jmx_natives",
-    "register_thread_impl",
-    "register_class_loading_impl",
-    "register_garbage_collector_impl",
-    "register_memory_pool_impl",
-    "register_memory_manager_impl",
-    "register_operating_system_impl",
-    "register_hotspot_diagnostic",
-    "register_flag_impl",
-    "register_slf4j_binder_stubs_pub",
-];
+/// Collapsed per
+/// docs/known-issues/jdk-only/W7-30-stub-ratchet-boot-path-scope.md §7. The
+/// witness is compiled into both binaries and runs once per binary.
+#[path = "common/vm_init_boot_path.rs"]
+mod boot_path;
 
-/// Build the registry the way `vm_init.rs`'s real-JDK arm does.
-///
-/// `set_drop_real_layout_synthetic(true)` is first and load-bearing, exactly as
-/// in `vm_init` (:2138): it drops the synthetic `java/util/StringJoiner`
-/// natives whose fake 5-field layout corrupts the real 7-field object. Setting
-/// it after a pass would leave them in — and, for this gate specifically, would
-/// invent duplicate rows for registrations the shipping VM never accepts.
-///
-/// `ShimSelection::ALL` matches `stub_ratchet.rs`'s choice. `vm_init` derives
-/// its selection from config; ALL is the superset, so this over-covers rather
-/// than under-covers, which is the safe direction for a ratchet.
-fn vm_init_real_jdk_boot_path(r: &mut NativeMethodRegistry) {
-    use cratonvm_native_builtins as nb;
-
-    r.set_drop_real_layout_synthetic(true);
-
-    nb::register_essential_natives_with_shims(r, nb::app_shims::ShimSelection::ALL);
-    nb::register_concurrent_natives(r);
-    // MUST follow `register_concurrent_natives` — same last-write-wins ordering
-    // constraint `vm_init` documents at its own call site (:2163).
-    nb::register_forkjoin_quiescence(r);
-    nb::register_stamped_lock_natives(r);
-    nb::phases_late::register_p61_file_handler(r);
-    nb::servlet::register_url_classloader_close_bridge(r);
-
-    cratonvm_native_io::register_io_natives(r);
-    nb::phases_late::register_p60_process_handle(r);
-    nb::phases_late::register_classvalue_natives(r);
-
-    // ╔══ LAST-WRITE-WINS BOUNDARY — do not reorder ═══════════════════════╗
-    // Verbatim from `vm_init` (:2360). The two calls after this one exist
-    // *because* `register_collections_natives` overwrites earlier, correct
-    // implementations: `securerandom` (collections re-registers every
-    // `java/util/Random` method against a synthetic 2-field layout, so a seeded
-    // `Random` returned all zeroes) and `properties_sidetable` (collections
-    // re-registers `Properties` against the legacy HashMap layout, breaking
-    // Surefire's load -> stringPropertyNames -> getProperty round-trip).
-    //
-    // This is the reason the gate cannot be built on `stub_ratchet.rs`'s
-    // `register_boot_path`, which stops here.
-    cratonvm_native_collections::register_collections_natives(r);
-    nb::securerandom::register_random_and_securerandom_natives(r);
-    nb::properties_sidetable::register_properties_sidetable(r);
-    // ╚═══════════════════════════════════════════════════════════════════╝
-
-    nb::unsafe_jdk25::register_t12_unsafe_natives(r);
-    nb::system_bootstrap::register_t14_system_bootstrap(r);
-    nb::boot_loader::register_boot_loader_natives(r);
-    nb::phases_late::register_phase57_nio_file(r);
-    nb::phases_late::register_phase57_file(r);
-    nb::phases_late::register_p59_jar(r);
-    nb::phases_late::register_p59_bulk_stream_transfer(r);
-    nb::phases_late::register_p59_zip_output_primitives(r);
-    nb::register_spring_boot_logback_apply(r);
-    nb::deprecated_io_util::register_url_codec(r);
-    nb::register_charset_natives_pub(r);
-    nb::phases_late::register_p58_charset_coder(r);
-    nb::charset::register_real_charset_natives(r);
-    nb::deprecated_internal::register_deprecated_internal_natives(r);
-    nb::phases_early::register_arrays_support_natives(r);
-    nb::phases_early::register_string_latin1_natives(r);
-    nb::classloader_real::register_classloader_real_natives(r);
-    nb::lang_invoke::register_phase54_method_handle(r);
-    nb::lang_invoke::register_p63_method_handles_lookup(r);
-    nb::lang_invoke::register_t4_method_handle_invoke(r);
-    nb::lang_invoke::register_t28_method_handle_completeness(r);
-    nb::lang_invoke::register_p68_invoke_extras(r);
-    nb::register_reflect_proxy_natives(r);
-    // `crate::runtime::instrument::register_instrumentation_natives` and
-    // `register_self_attach_natives` sit here in `vm_init`. They live in the
-    // `vm` crate; see `UNMODELLED_VM_CRATE_REGISTRARS`.
-
-    // ╔══ `#[cfg(feature = "management")]` — COPIED FROM `vm_init`, not added ═╗
-    // Every one of the ten calls below carries this exact `cfg` at its
-    // `vm_init` call site (vm/src/vm/vm_init.rs:2728–:2784), and `nb::jmx` is
-    // itself `#[cfg(feature = "management")]` (native-builtins/src/lib.rs:4128).
-    // Replaying them unconditionally therefore did two wrong things at once: it
-    // modelled a registry no build produces, and it made this test target
-    // uncompilable in this crate's own default feature set (ten `E0433`s), so
-    // the gate could only be built where feature unification happened to supply
-    // `management`.
-    //
-    // The consequence for the census is stated rather than hidden: WITHOUT this
-    // feature the number is ten registrars short of the shipping registry, and
-    // the baseline is a different constant. See `MEASURED_CONFIG`.
-    #[cfg(feature = "management")]
-    {
-        nb::jmx::register_vm_management_impl(r);
-        nb::jmx::register_jmx_natives(r);
-        nb::jmx::register_thread_impl(r);
-        nb::jmx::register_class_loading_impl(r);
-        nb::jmx::register_garbage_collector_impl(r);
-        nb::jmx::register_memory_pool_impl(r);
-        nb::jmx::register_memory_manager_impl(r);
-        nb::jmx::register_operating_system_impl(r);
-        nb::jmx::register_hotspot_diagnostic(r);
-        nb::jmx::register_flag_impl(r);
-    }
-    // ╚═══════════════════════════════════════════════════════════════════════╝
-
-    nb::register_slf4j_binder_stubs_pub(r);
-}
+use boot_path::vm_init_real_jdk_boot_path;
 
 fn shadowed() -> Vec<ShadowedRegistration> {
     let mut registry = NativeMethodRegistry::new();
@@ -812,149 +656,18 @@ fn no_new_kind_disagreements_between_a_winner_and_the_native_it_shadows() {
     );
 }
 
-/// SOURCE WITNESS — the replayed sequence must still be `vm_init`'s.
-///
-/// This is the test that keeps the other two honest, and unlike them it needs
-/// no measurement and is green today. A duplicate census answers "which
-/// registration wins", and that answer is **entirely** a function of ORDER. If
-/// `vm_init` grows a registrar this file does not replay, or runs two in the
-/// other order, every winner column downstream of the change is wrong — and
-/// wrong in the confident, plausible way that made this species cost four build
-/// cycles.
-///
-/// Two separate failures, because they need different fixes:
-///
-///   * an **order inversion** — two registrars this file replays, run by
-///     `vm_init` in the opposite relative order — is a hard failure with no
-///     baseline, because it means the model is actively lying.
-///   * an **unmodelled registrar** ratchets against
-///     [`UNMODELLED_VM_CRATE_REGISTRARS`], which is 2 (both in the `vm` crate,
-///     which this crate cannot depend on).
-///
-/// Reads the working tree rather than a frozen copy, so it measures the source
-/// as it is now. It is skipped, not failed, if `vm_init.rs` is not on disk —
-/// a packaged crate has no sibling `vm/`.
-#[test]
-fn the_replayed_sequence_matches_vm_init() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("vm")
-        .join("src")
-        .join("vm")
-        .join("vm_init.rs");
-    let Ok(src) = std::fs::read_to_string(&path) else {
-        println!("vm_init.rs not on disk at {path:?}; witness skipped");
-        return;
-    };
-
-    // Isolate the `#[cfg(not(feature = "synthetic-jdk"))]` arm — the DEFAULT
-    // `cratonvm-cli` build. The sibling `#[cfg(feature = "synthetic-jdk")]`
-    // block has its own real-JDK arm, and a prior lane established that the
-    // phase registrars there run only when `config.use_synthetic_jdk` is true
-    // AT RUNTIME, not merely when the Cargo feature is on. Scanning the whole
-    // file would splice the two into one imaginary sequence.
-    let lines: Vec<&str> = src.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| l.contains("cfg(not(feature = \"synthetic-jdk\"))"))
-        .expect("vm_init.rs must still have a real-JDK-only arm");
-    let mut depth: i32 = 0;
-    let mut opened = false;
-    let mut end = lines.len();
-    for (i, line) in lines.iter().enumerate().skip(start + 1) {
-        depth += line.matches('{').count() as i32;
-        if !opened && depth > 0 {
-            opened = true;
-        }
-        depth -= line.matches('}').count() as i32;
-        if opened && depth <= 0 {
-            end = i;
-            break;
-        }
-    }
-
-    // Bare `register_*` calls at the start of a statement. Deliberately not a
-    // general call matcher: nested `registry.register(...)` calls inside the
-    // arm are registrations, not registrars, and belong to whichever registrar
-    // encloses them.
-    let mut observed: Vec<String> = Vec::new();
-    for line in &lines[start..end] {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        let Some(open) = trimmed.find('(') else {
-            continue;
-        };
-        let head = &trimmed[..open];
-        if !head
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-        {
-            continue;
-        }
-        let name = head.rsplit("::").next().unwrap_or(head);
-        if name.starts_with("register_") {
-            observed.push(name.to_string());
-        }
-    }
-
-    let unmodelled: Vec<&String> = observed
-        .iter()
-        .filter(|n| !VM_INIT_SEQUENCE.contains(&n.as_str()))
-        .collect();
-    println!(
-        "vm_init real-JDK arm: {} registrar calls, {} replayed here, \
-         {} unmodelled",
-        observed.len(),
-        observed.len() - unmodelled.len(),
-        unmodelled.len()
-    );
-    for n in &unmodelled {
-        println!("  UNMODELLED: {n}");
-    }
-
-    // Order inversion: for every pair this file replays, the relative order in
-    // `vm_init` must match. This is the assertion that protects the winner
-    // column, and it carries no baseline on purpose.
-    let modelled: Vec<&String> = observed
-        .iter()
-        .filter(|n| VM_INIT_SEQUENCE.contains(&n.as_str()))
-        .collect();
-    let mut expected = VM_INIT_SEQUENCE.iter().peekable();
-    for name in &modelled {
-        loop {
-            match expected.peek() {
-                Some(e) if **e == name.as_str() => {
-                    expected.next();
-                    break;
-                }
-                Some(_) => {
-                    expected.next();
-                }
-                None => panic!(
-                    "vm_init runs `{name}` in an order VM_INIT_SEQUENCE does \
-                     not allow. Registration is last-write-wins, so this makes \
-                     every 'which registration wins' answer in this gate \
-                     WRONG. Re-derive VM_INIT_SEQUENCE and \
-                     `vm_init_real_jdk_boot_path` from vm_init.rs."
-                ),
-            }
-        }
-    }
-
-    assert!(
-        unmodelled.len() <= UNMODELLED_VM_CRATE_REGISTRARS,
-        "vm_init's real-JDK arm calls {} registrars this gate does not replay \
-         (allowed: {}, the two `crate::runtime::instrument::*` ones that live \
-         in the `vm` crate). Every registration made by an unmodelled \
-         registrar is invisible to the shadow census, and one that runs LATE \
-         can make this gate name the wrong winner. Add it to \
-         VM_INIT_SEQUENCE and to `vm_init_real_jdk_boot_path`, in position.",
-        unmodelled.len(),
-        UNMODELLED_VM_CRATE_REGISTRARS
-    );
-}
+// SOURCE WITNESS — `the_replayed_sequence_matches_vm_init` moved to
+// `tests/common/vm_init_boot_path.rs`, alongside the model it checks, and is
+// compiled into this binary through the `mod boot_path;` above. It still runs
+// under `cargo test -p cratonvm-native-builtins --test duplicate_registration_gate`.
+//
+// It is the test that keeps the two ratchets above honest: a duplicate census
+// answers "which registration wins", and that answer is ENTIRELY a function of
+// ORDER. It was also BLIND until 2026-08-12 — its arm locator matched a comment
+// quoting the `cfg` attribute, so it scanned the sibling synthetic arm and
+// observed 8 registrars instead of 48. The shared copy fixes the locator and
+// adds the assertion that would have caught it: every name in
+// `VM_INIT_SEQUENCE` must actually be OBSERVED in the scanned arm.
 
 /// The gate must be measuring a real registry, not an empty one.
 ///

@@ -1,3 +1,4 @@
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -10,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.EnumSet;
 import java.util.HashSet;
@@ -128,10 +130,78 @@ public class RNioNoFollow {
         String refusals = symlinks ? symlinkArms() : "no-symlink-privilege";
 
         plainFileArms();
+        optionListIsRead();
 
         System.out.println("CK RNioNoFollow refusals=" + refusals);
         System.out.println("CK RNioNoFollow checks=" + checks);
         System.out.println("PASS RNioNoFollow (" + checks + " checks)");
+    }
+
+    /**
+     * Whether the option list is READ AT ALL — the other half of the defect
+     * this vector was filed for, and the half that needs no symlink and no
+     * privilege, so unlike every arm below it actually executes on Windows.
+     *
+     * The scanner that ignored `NOFOLLOW_LINKS` also never rejected an option
+     * the JDK refuses outright. Note the two exception types are deliberately
+     * DIFFERENT: `newInputStream` raises `UnsupportedOperationException` for a
+     * write option, `newOutputStream` raises `IllegalArgumentException` for
+     * `READ`. A VM that mapped both onto one class would satisfy neither row.
+     *
+     * The three trailing `=ok` rows are not decoration: without them a VM that
+     * threw on EVERY option would satisfy all three refusals above.
+     * `copyStream.REPLACE=ok` matters most — `REPLACE_EXISTING` is the one
+     * option the copy path is supposed to accept, and it is what a too-eager
+     * refusal would break. See W7-8-fabricated-success-io-sweep.md §8.5.
+     */
+    static void optionListIsRead() throws Exception {
+        Path f = Files.createTempFile("rnio-opt", ".tmp");
+        try {
+            String in = "none";
+            try {
+                Files.newInputStream(f, StandardOpenOption.WRITE).close();
+            } catch (UnsupportedOperationException e) {
+                in = "UnsupportedOperationException";
+            } catch (Exception e) {
+                in = e.getClass().getSimpleName();
+            }
+            System.out.println("CK RNioNoFollow newInputStream.WRITE=" + in);
+
+            String out = "none";
+            try {
+                Files.newOutputStream(f, StandardOpenOption.READ).close();
+            } catch (IllegalArgumentException e) {
+                out = "IllegalArgumentException";
+            } catch (Exception e) {
+                out = e.getClass().getSimpleName();
+            }
+            System.out.println("CK RNioNoFollow newOutputStream.READ=" + out);
+
+            String cp = "none";
+            try (InputStream src = new ByteArrayInputStream(new byte[] { 1, 2, 3 })) {
+                Files.copy(src, f, LinkOption.NOFOLLOW_LINKS);
+            } catch (UnsupportedOperationException e) {
+                cp = "UnsupportedOperationException";
+            } catch (Exception e) {
+                cp = e.getClass().getSimpleName();
+            }
+            System.out.println("CK RNioNoFollow copyStream.NOFOLLOW=" + cp);
+
+            // Anti-vacuity: the LEGAL spellings must still work, or a VM that
+            // refused every option would satisfy all three refusals above.
+            try (InputStream ok = Files.newInputStream(f, StandardOpenOption.READ)) {
+                System.out.println("CK RNioNoFollow newInputStream.READ=ok");
+            }
+            try (OutputStream ok = Files.newOutputStream(f, StandardOpenOption.WRITE)) {
+                System.out.println("CK RNioNoFollow newOutputStream.WRITE=ok");
+            }
+            try (InputStream src = new ByteArrayInputStream(new byte[] { 1, 2, 3 })) {
+                Files.copy(src, f, StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("CK RNioNoFollow copyStream.REPLACE=ok");
+            }
+        } finally {
+            Files.deleteIfExists(f);
+        }
     }
 
     /**
@@ -271,6 +341,87 @@ public class RNioNoFollow {
         check(createNew.equals("io"), "CREATE_NEW on an existing file: " + createNew);
         check(content(app).equals("one-two"), "a refused CREATE_NEW must not have written");
         System.out.println("CK RNioNoFollow createNew=" + createNew);
+
+        // ------------------------------------------------------------------
+        // NOFOLLOW_LINKS ASSERTED WITHOUT A SYMBOLIC LINK.
+        //
+        // Everything above about NOFOLLOW_LINKS needs `symlinkArms()`, which
+        // needs a privilege Windows does not grant — so on the primary platform
+        // this vector has never once executed an assertion about that option
+        // against a link. This block is the part of that gap that CAN be closed
+        // unprivileged, and it closes it from the other side: not "what does the
+        // option DO to a link", but "is the option list read at all".
+        //
+        // That is the same question the defect was. The scanner read APPEND and
+        // CREATE_NEW and nothing else, so an option it did not recognise was
+        // silently accepted and ignored — which is exactly how NOFOLLOW_LINKS
+        // came to be honoured nowhere. JDK 25 REFUSES three option/method pairs
+        // outright, with no file access and no link involved:
+        //
+        //   Files.copy(InputStream, Path, CopyOption...)   Files.java
+        //       every option but REPLACE_EXISTING -> UnsupportedOperationException
+        //   FileSystemProvider.newInputStream(Path, OpenOption...)
+        //       APPEND or WRITE -> UnsupportedOperationException
+        //   FileSystemProvider.newOutputStream(Path, OpenOption...)
+        //       READ -> IllegalArgumentException
+        //
+        // A scanner that ignores what it does not recognise answers "accepted"
+        // to all three.
+        //
+        // ONLY THE FIRST OF THE THREE IS ASSERTED HERE, and the reason is a
+        // reachability fact rather than caution. `Files.copy(InputStream, Path,
+        // CopyOption[])` has exactly ONE registration tree-wide
+        // (`register_p71_files_bridge` in
+        // native-builtins/src/phases_late/nio_file.rs), and that registrar is
+        // reached only from `register_synthetic_overrides` — so in BOTH shipping
+        // modes the real JDK bytecode above runs and the refusal is the JDK's
+        // own. The other two are served by shipping natives
+        // (`fsp_new_input_stream` / `fsp_new_output_stream`, registered by
+        // `register_phase57_nio_file`) which scan the option list for
+        // NOFOLLOW_LINKS and nothing else, so they accept `WRITE` on an input
+        // stream and `READ` on an output stream where the JDK refuses both.
+        // Those two rows are recorded in W7-8-fabricated-success-io-sweep.md
+        // with the patch that unlocks them; adding them here before that patch
+        // would only paint a known, unowned divergence red.
+        Path optSrc = dir.resolve("optionScan.src");
+        Files.writeString(optSrc, "payload");
+        Path optDst = dir.resolve("optionScan.dst");
+        String copyNofollow;
+        try (InputStream in = Files.newInputStream(optSrc)) {
+            Files.copy(in, optDst, LinkOption.NOFOLLOW_LINKS);
+            copyNofollow = "accepted";
+        } catch (UnsupportedOperationException expected) {
+            copyNofollow = "uoe";
+        } catch (Exception other) {
+            copyNofollow = "wrong-type:" + other.getClass().getName();
+        }
+        check(copyNofollow.equals("uoe"),
+                "Files.copy(stream, path, NOFOLLOW_LINKS) must be refused: " + copyNofollow);
+        check(!Files.exists(optDst), "a refused copy must not have created the target");
+        System.out.println("CK RNioNoFollow copyStreamNofollow=" + copyNofollow);
+
+        // The positive controls, and these ARE hard assertions: without them a
+        // VM that refused EVERY option list would satisfy all three rows above
+        // and look like the fix. `Files.copy(InputStream, Path)` with no options
+        // and with REPLACE_EXISTING is the pair the JDK does accept.
+        Path plainCopy = dir.resolve("optionScan.plain");
+        try (InputStream in = Files.newInputStream(optSrc)) {
+            check(Files.copy(in, plainCopy) == 7, "Files.copy(stream, path) must copy 7 bytes");
+        }
+        check(content(plainCopy).equals("payload"), "copied content: " + content(plainCopy));
+        try (InputStream in = Files.newInputStream(optSrc)) {
+            Files.copy(in, plainCopy, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+        check(content(plainCopy).equals("payload"), "REPLACE_EXISTING must be accepted");
+        // ... and an existing target WITHOUT that option is a refusal, so the
+        // option is doing work rather than being ignored in the other direction.
+        String noReplace = outcome(() -> {
+            try (InputStream in = Files.newInputStream(optSrc)) {
+                Files.copy(in, plainCopy);
+            }
+        });
+        check(noReplace.equals("io"),
+                "copy onto an existing target without REPLACE_EXISTING: " + noReplace);
 
         // The Files.write* statics now open through the fd table and write via a
         // buffered writer rather than a single std::fs::write. Assert the three

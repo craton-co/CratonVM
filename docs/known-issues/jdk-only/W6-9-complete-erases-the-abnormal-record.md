@@ -509,6 +509,28 @@ shape as 7.1, one level up. Naming it here rather than fixing it: it changes wha
 every cancelled-task `pool.invoke` call site sees, from a value to a raised
 exception, and that needs the blast-radius survey §4 did for `complete`.
 
+> **2026-08-12 — THAT DIVERGENCE NOW HAS A README ROW, and until today it did
+> not.** It was named in the middle of a section whose heading says "LANDED",
+> inside a record whose §8 heading has already been misread twice, so the one
+> genuinely open finding in §7.5 was the least findable text in the file.
+> `docs/known-issues/jdk-only/README.md` §2.2 carries it as a `W6-9` row —
+> the directory's own convention is that a record with a live residual has a row
+> naming the residual, not the headline, and this record had **no row at all**.
+>
+> The row states, and this is the part that must not be lost on the next merge:
+> the `pool.invoke` / `join()` disagreement is **not** the §7.5 patch. The §7.5
+> patch (`fjp_state_set_raw_result`) landed in `e643b5893` and is **inert** —
+> `fjt_has_own_raw_result_slot`'s side-table arm tests three ABSTRACT class names
+> and `method_exists` walks the superclass chain, so no Java receiver reaches it
+> (`W7-48-fjp-unapplied-patches.md` §3). Anyone who reads "§7.5 landed" and
+> closes the section closes the wrong thing. There is also **no vector**:
+> `regression-suite/src/RJdkForkJoin.java` never calls `pool.invoke` on a
+> cancelled task, so a green `RJdkForkJoin` says nothing about it.
+>
+> Nothing else in this record was touched, and in particular the
+> `duplicate_registration_gate` number is untouched: §8.2 forbids re-seeding it
+> without a real run, and README §2.6 repeats that. It is still not re-seeded.
+
 **2026-08-12 — the narrow scope is NARROWER THAN THIS, and the divergence was
 never observable.** The paragraph below is right that it is visible only through
 a bare `getRawResult()` on a receiver whose raw-result slot IS the side table.

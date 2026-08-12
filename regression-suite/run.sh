@@ -292,6 +292,26 @@ compile_modules() {
       return 1
     fi
   fi
+  # Same ground-truthing for the two constructor-form providers (W6-2). Each
+  # names a shape javac refuses in a `provides` clause, so the overlay pass is
+  # the only thing that can produce it: NotSubProvider must implement nothing,
+  # and HiddenCtor's no-arg constructor must be private.
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/NotSubProvider.class" ]; then
+    if "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.NotSubProvider 2>/dev/null \
+        | grep -q 'implements'; then
+      echo "ERROR: modules-overlay did not land — NotSubProvider must implement nothing"
+      return 1
+    fi
+  fi
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/HiddenCtor.class" ]; then
+    if ! "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.HiddenCtor 2>/dev/null \
+        | grep -q 'private com.cratonvm.jdkonly.svc.internal.HiddenCtor('; then
+      echo "ERROR: modules-overlay did not land — HiddenCtor() must be private"
+      return 1
+    fi
+  fi
   copy_tree "$MODSRC/$JDKONLY_MODULE" "$MODBUILD/$JDKONLY_MODULE"
   HAVE_MODULE=1
   return 0

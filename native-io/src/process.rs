@@ -1087,8 +1087,12 @@ fn signal_pid(pid: i64, force: bool) -> bool {
 #[cfg(windows)]
 fn signal_pid(pid: i64, _force: bool) -> bool {
     use std::ffi::c_void;
-    // Signatures are IDENTICAL to `foreign_pid_is_alive`'s and `pipe.rs`'s
-    // declarations so the `clashing_extern_declarations` deny-lint does not fire.
+    // Signatures are IDENTICAL to `win_liveness_and_start_time`'s and
+    // `pipe.rs`'s declarations so the `clashing_extern_declarations` deny-lint
+    // does not fire. (This used to name `foreign_pid_is_alive`, whose Windows
+    // arm was folded into `win_liveness_and_start_time` and no longer exists —
+    // a dangling name in a lint rationale is how the next reader concludes the
+    // rationale is obsolete.)
     type Handle = *mut c_void;
     type Bool = i32;
     const PROCESS_TERMINATE: u32 = 0x0001;
@@ -2288,6 +2292,22 @@ fn linux_proc_stat_times(pid: i64) -> Option<(i64, i64)> {
         return None;
     }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_stat_line_times(&stat)
+}
+
+/// The PARSE half of [`linux_proc_stat_times`], split out from the READ so that
+/// one line of `/proc/<pid>/stat` can answer more than one question.
+///
+/// [`linux_liveness_and_start_time`] needs exactly that: the fact that the file
+/// opened at all is `isAlive0`'s liveness answer, and field 22 of the same
+/// buffer is its start time. Keeping the split at the function boundary rather
+/// than copying the parser is deliberate — the field indices below share one
+/// off-by-three and the `rfind(')')` rule exists because field 2 may contain
+/// spaces AND parentheses, so a second copy is a second chance to get both
+/// wrong, and the two copies would then disagree about a start time that
+/// `ProcessHandleImpl$Info.info(pid, startTime)` compares with a bare `!=`.
+#[cfg(target_os = "linux")]
+fn linux_stat_line_times(stat: &str) -> Option<(i64, i64)> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     let hz = clock_ticks_per_second();
@@ -2818,17 +2838,18 @@ pub fn current_process_start_time() -> i64 {
 /// only value `isAlive()` reads as not-alive.
 const PROCESS_STARTTIME_ANY: i64 = 0;
 
-/// Is a pid we did not spawn still alive?
-///
-/// `/proc/<pid>` is present for a zombie too, which is the answer we want: a
-/// process that has exited but not been reaped is still a process.
-#[cfg(target_os = "linux")]
-fn foreign_pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
+// There is no `#[cfg(target_os = "linux")] fn foreign_pid_is_alive` any more
+// either, and for the same reason the Windows one went (below). It was
+// `std::path::Path::new(&format!("/proc/{pid}")).exists()`, and its only caller
+// went straight on to `start_time_or_any(pid)` -> `/proc/<pid>/stat`: two
+// filesystem probes of two DIFFERENT files for one question, in the one native
+// whose return value exists so that `ProcessHandleImpl.isAlive()` and `destroy0`
+// can detect a RECYCLED pid. Cheaper than Windows' two `OpenProcess` calls, and
+// the attribution hole is identical — see [`linux_liveness_and_start_time`],
+// which is now the single door. What the boolean knew is preserved there: a
+// zombie is still a process (`/proc/<pid>/stat` exists until it is reaped, and
+// reporting it alive is what the JDK's reaper needs), and a non-positive pid
+// names none.
 
 // There is no `#[cfg(windows)] fn foreign_pid_is_alive` any more, deliberately.
 // It existed to answer liveness ALONE, and its one caller
@@ -2971,16 +2992,79 @@ fn win_liveness_and_start_time(pid: i64) -> (bool, Option<i64>) {
     }
 }
 
+/// Liveness AND start time for a foreign pid, from **one** `/proc/<pid>/stat`
+/// read — the Linux counterpart of [`win_liveness_and_start_time`], and the
+/// same argument.
+///
+/// # Why one read rather than two probes
+///
+/// `isAlive0(pid)` used to ask `foreign_pid_is_alive(pid)` — an `exists()` on
+/// `/proc/<pid>` — and then `start_time_or_any(pid)`, which reads
+/// `/proc/<pid>/stat`. Two probes of two different paths for one question, and
+/// the objection is not the cost (two file reads, not two handle opens) but the
+/// ATTRIBUTION: a pid recycled between them yields "alive" about one process and
+/// a start time about another, and that start time is precisely the number
+/// `ProcessHandleImpl.isAlive()` compares against `this.startTime` and
+/// `destroy0`'s recycled-pid guard trusts. A probe whose whole job is to detect
+/// a recycled pid must not itself straddle one. One `read_to_string` cannot:
+/// the existence of the line and field 22 of that same line describe one
+/// process instance by construction.
+///
+/// It is also what the oracle does. `ProcessHandleImpl_unix.c`'s `isAlive0` is
+/// `os_getParentPidAndTimings(env, pid, &totalTime, &startTime)` — a single
+/// `/proc/<pid>/stat` open — returning `-1` when it fails, so this is HotSpot's
+/// shape rather than a local invention.
+///
+/// # The answers, and where each came from before
+///
+/// Every arm is one of the two old probes' arms, unchanged; this is a merge,
+/// not a re-decision:
+///
+/// * non-positive pid — `(false, None)`. Both old probes refused it.
+/// * the file opened — `(true, ...)`. `/proc/<pid>/stat` exists for a ZOMBIE
+///   too, which is the answer the old `exists()` on `/proc/<pid>` gave and the
+///   one the JDK's reaper needs: a process that has exited but not been reaped
+///   is still a process.
+/// * the file opened but the line will not parse (a `/proc/stat` with no
+///   `btime`, an `_SC_CLK_TCK` of 0, a truncated line) — `(true, None)`, which
+///   the caller degrades to `STARTTIME_ANY` (0) exactly as the old
+///   `start_time_or_any` did. This is why the READ and the PARSE are separate
+///   functions: collapsing them would report a live process as DEAD on a
+///   machine-wide condition that says nothing about that process.
+/// * `ENOENT` — `(false, None)`. On this platform that IS the liveness answer;
+///   `/proc/<pid>/stat` is mode 0444, so a live process cannot be missing it.
+/// * any other error — `(true, None)`. Refusing to say "dead" on an error we
+///   cannot attribute is the same asymmetry the Windows arm makes for
+///   `ERROR_ACCESS_DENIED`: claiming a running process had exited is the
+///   fabrication in the direction that breaks callers.
+#[cfg(target_os = "linux")]
+fn linux_liveness_and_start_time(pid: i64) -> (bool, Option<i64>) {
+    if pid <= 0 {
+        return (false, None);
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => (
+            true,
+            linux_stat_line_times(&stat).map(|(start_ms, _)| start_ms),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(_) => (true, None),
+    }
+}
+
 /// `isAlive0`'s answer for a pid this VM did not spawn: `-1` when it is not
 /// alive, its start time (or `STARTTIME_ANY`) when it is.
 ///
-/// Split per platform so that Windows can answer from the single
-/// [`win_liveness_and_start_time`] probe while every other target keeps the
-/// original two-step — `foreign_pid_is_alive` then `start_time_or_any` — byte
-/// for byte. On Linux those two are two reads of two DIFFERENT files
-/// (`/proc/<pid>` for existence, `/proc/<pid>/stat` for the start time), so
-/// merging them is a separate change on a platform this lane cannot compile;
-/// it is recorded, not attempted.
+/// Split per platform so that each can answer from the SINGLE probe that
+/// carries both halves — [`win_liveness_and_start_time`] on Windows,
+/// [`linux_liveness_and_start_time`] on Linux. The two bodies are deliberately
+/// identical below the probe name; the pair `(alive, start)` is the whole
+/// interface, and a platform that grows a real probe joins by supplying one
+/// rather than by re-deriving the mapping onto `-1` / `STARTTIME_ANY`.
+///
+/// Only the platform-of-last-resort arm still takes two steps, because there
+/// `os_process_start_time` has no probe at all and answers `None` outright —
+/// there is no second read to straddle a recycle with.
 #[cfg(windows)]
 fn foreign_start_time_or_dead(pid: i64) -> i64 {
     match win_liveness_and_start_time(pid) {
@@ -2989,7 +3073,15 @@ fn foreign_start_time_or_dead(pid: i64) -> i64 {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn foreign_start_time_or_dead(pid: i64) -> i64 {
+    match linux_liveness_and_start_time(pid) {
+        (true, start) => start.unwrap_or(PROCESS_STARTTIME_ANY),
+        (false, _) => -1,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn foreign_start_time_or_dead(pid: i64) -> i64 {
     if foreign_pid_is_alive(pid) {
         start_time_or_any(pid)
@@ -3071,10 +3163,11 @@ fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) ->
             None => Ok(Some(Value::Long(start_time_or_any(pid)))),
         },
         // Someone else's process: ask the OS — for BOTH facts at once. This was
-        // `foreign_pid_is_alive(pid)` followed by `start_time_or_any(pid)`, two
-        // separate `OpenProcess`/`CloseHandle` pairs on Windows for one
-        // question, straddling a pid-recycle window in the one native whose
-        // return value exists to detect recycled pids. See
+        // `foreign_pid_is_alive(pid)` followed by `start_time_or_any(pid)`: two
+        // separate `OpenProcess`/`CloseHandle` pairs on Windows, and two reads
+        // of two different `/proc` paths on Linux, for one question — straddling
+        // a pid-recycle window in the one native whose return value exists to
+        // detect recycled pids. Both arms now answer from one probe; see
         // `foreign_start_time_or_dead`.
         None => Ok(Some(Value::Long(foreign_start_time_or_dead(pid)))),
     }
@@ -5708,6 +5801,57 @@ mod tests {
             (false, None),
             "a pid outside the DWORD range cannot name a process, and is \
              refused without a syscall"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(i64::MAX),
+            -1,
+            "-1 is the only value `ProcessHandleImpl.isAlive()` reads as dead"
+        );
+    }
+
+    /// The Linux twin of the test above, asserting the same identity for the
+    /// same reason — and it is the only scheduled witness this arm has.
+    ///
+    /// The Linux merge has no Java-visible witness: what it removes is a
+    /// pid-recycle attribution window and a race between two `/proc` reads,
+    /// neither of which a regression-suite vector can provoke on demand. What
+    /// IS assertable, and is the thing that would break if the merge were wrong,
+    /// is the identity `Info.info(pid, startTime)` depends on — `isAlive0`'s
+    /// start time and `start_time_or_any`'s must be ONE number, compared there
+    /// with a bare `!=` that wipes five fields on a mismatch of one
+    /// millisecond. The moment `linux_liveness_and_start_time` parses field 22
+    /// differently from `linux_proc_stat_times`, W5-2's two silently-skipped
+    /// `RJdkProcess` checks come straight back; a shared
+    /// `linux_stat_line_times` is what makes that unfalsifiable, and this is
+    /// what checks it stayed shared.
+    ///
+    /// The third row is the arm the deleted boolean `foreign_pid_is_alive`
+    /// carried: a pid no process holds is not alive, and `-1` is the only value
+    /// `ProcessHandleImpl.isAlive()` reads that way. `i64::MAX` is far outside
+    /// `pid_max`, so `/proc/<pid>/stat` is `ENOENT` for it on any host.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn one_stat_read_reports_the_same_start_time_as_the_separate_probe() {
+        let me = std::process::id() as i64;
+        let (alive, start) = linux_liveness_and_start_time(me);
+        assert!(alive, "this process is running");
+        assert_eq!(
+            start,
+            os_process_start_time(me),
+            "the merged probe and `start_time_or_any`'s source must be ONE \
+             number; `Info.info(pid, startTime)` compares them with a bare `!=`"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(me),
+            start_time_or_any(me),
+            "and so must what `isAlive0` hands back"
+        );
+
+        assert_eq!(
+            linux_liveness_and_start_time(i64::MAX),
+            (false, None),
+            "no process holds that pid, and an absent /proc/<pid>/stat is how \
+             this platform says so"
         );
         assert_eq!(
             foreign_start_time_or_dead(i64::MAX),

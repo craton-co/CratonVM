@@ -10,19 +10,38 @@
 > registrations survive at `:1558` and `:1675`. W7-23-thread-container-registration.md
 > is why: the preferred form was measured to **hang** when landed without its
 > de-registration half.
-> **B is NOT APPLIED** — 49 `ShutdownOnSuccess`/`ShutdownOnFailure` mentions
-> remain in `native-builtins/src/jdk25_concurrency.rs`, with the address-keyed
-> `SCOPE_OWNERS`/`SCOPE_JOINERS` tables still referenced at `:583` and `:595`.
-> **C is NOT APPLIED** — `classloading/src/class_manager.rs:12594-12597` is
-> still `instance_fields(8)`, and `$Config` (a name no JDK ships) is still at
-> `:12603`.
+> **B is PARTIALLY APPLIED as of 2026-08-12** — see
+> [B](#b-jdk25_concurrencyrs-still-models-the-jdk-21-shape) for what landed, what
+> did not, and the named decision. In one line: the **third** registrar
+> (`util_concurrent_ext.rs::register_pd_structured_concurrency`) is retired to a
+> tombstone and the shadowing question is now settled by a **test**
+> (`w7_18_jep505_surface_is_not_shadowed_here`), while the JDK-21-shaped
+> registrations in `jdk25_concurrency.rs` are kept, deliberately, because ~20
+> `#[test]`s in a blocking gate pin them and the only mode they can be observed
+> in has never been run.
+> **C is NOT APPLIED and is now DECLINED with a reason** — see
+> [C](#c-two-joiners-cannot-be-served-by-the-8-slot-layout).
+> `classloading/src/class_manager.rs` is still `instance_fields(8)` with `$Config`
+> (a name no JDK ships) beside it.
 >
-> * **Residual: STILL OPEN, and B is the dangerous one.**
->   `jdk25_concurrency.rs` runs last and owns every shared triple, so it can
->   silently re-impose the JDK-21 shape over this record's fix.
->   `allSuccessfulOrThrow`/`allUntil` answer `Void` because slot 8 does not
->   exist; `allUntil`'s `Predicate` is never consulted; there is no preview
->   gating in either direction.
+> * **Residual: OPEN, but the "silently" is gone from B's hazard.**
+>   `jdk25_concurrency.rs` does run last and does own every shared triple — the
+>   call order was re-derived from the boot path on 2026-08-12 and is
+>   `register_phase67_natives` → `register_phase_d_natives` →
+>   `register_jdk25_concurrency_natives`, all three inside
+>   `register_synthetic_overrides`. But the two triple sets were compared, and
+>   **the JEP 505 surface is not shadowed today**; a `#[test]` in
+>   `jdk25_concurrency.rs` now fails if that changes.
+>   `allSuccessfulOrThrow`/`allUntil` still answer `Void` because slot 8 does not
+>   exist; `allUntil`'s `Predicate` is still never consulted; there is still no
+>   preview gating in either direction.
+> * **Scope, which bounds everything B and C can be worth:** all three
+>   `StructuredTaskScope` registrars are reachable **only** from
+>   `register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]`
+>   and called only on `vm_init`'s `use_synthetic_jdk` arm. So none of them is in
+>   either shipping binary, `--jdk-only` and `--real-jdk` serve this whole API
+>   from real JDK bytecode (§5), and B and C can only move `--synthetic-jdk`
+>   **mode** — which, per this directory's §2.6, has never been executed once.
 > * **This is the record in the directory most dependent on a run.** See its
 >   verification section: `probes/StructuredTaskScopeProbe` on both arms,
 >   checking `joinWaits.taskFinishedWhenJoinReturned`,
@@ -571,6 +590,10 @@ arms and check `configuration.default.subtaskThreadKind=virtual` as well as the
 
 ### B. `jdk25_concurrency.rs` still models the JDK-21 shape
 
+> **PARTIALLY APPLIED 2026-08-12, unrun.** What landed, what did not, and why, is
+> the subsection *"B, worked 2026-08-12"* below. The original text is kept
+> unedited above it because its inventory is still accurate.
+
 Out of scope for this lane and listed so it is not rediscovered.
 `native-builtins/src/jdk25_concurrency.rs` registers, in synthetic mode:
 `<init>` ×3, `joinUntil`, `shutdown`, `isShutdown`, `join()LStructuredTaskScope;`,
@@ -581,6 +604,124 @@ the scope→joiner association in two `HashMap`s keyed on
 `ObjectRef::as_ptr() as usize` (`SCOPE_OWNERS`, `SCOPE_JOINERS`) — the
 address-keyed side table whose recycled-address hazard this tree has recorded
 before. Since it runs last, it owns every triple it shares with this file.
+
+#### B, worked 2026-08-12
+
+**First: the registration ORDER, established from the call sequence and not from
+brace-scanning, because that is the mechanism the whole hazard rests on.** All
+three registrars of `java/util/concurrent/StructuredTaskScope` sit inside
+`native-builtins/src/lib.rs`'s `register_synthetic_overrides`, which sets ambient
+`NativeKind::Intrinsic` at its top. In call order:
+
+| # | registrar | reached via | ambient kind |
+|---|---|---|---|
+| 1 | `phases_late/concurrent.rs::register_p67_structured_task_scope` → `…_j25` | `register_phase67_natives` | sets **`Bridge`** locally |
+| 2 | `util_concurrent_ext.rs::register_pd_structured_concurrency` | `register_phase_d_natives` | sets **nothing** — inherits `register_synthetic_overrides`' `Intrinsic` |
+| 3 | `jdk25_concurrency.rs::register_jdk25_concurrency_natives` | called directly, last of the three | sets **`Bridge`** locally |
+
+`register()` is last-registration-wins, so **#3 wins every triple it shares with
+either of the others** — which is what this section says, now checked rather than
+asserted. Registrar #2 setting no category of its own is worth noting separately:
+it is the one registration window in this family whose kind is decided by a
+`set_category` several thousand lines away in a different file.
+
+**What landed (1) — the third registrar is retired.**
+`register_pd_structured_concurrency` is now an empty tombstone carrying its own
+proof. It was the copy nobody had counted, and it was the dangerous one for a
+reason this section did not name: its bodies read and write `$Subtask` **state at
+slot 3**, where the registrar that owns the readers (`jdk25_concurrency.rs`:
+`SUBTASK_FIELD_STATE = 0`, `RESULT = 1`, `EXCEPTION = 2`, `CALLABLE = 3`) has the
+callable **reference**. So deleting a JDK-21-shaped triple from #3 would not have
+made a method *absent*; it would have un-shadowed a body that puts an `Int` in a
+slot the collector scans as an oop — heap corruption rather than a wrong answer
+(docs/architecture/natives-over-real-jdk-classes.md §5).
+`t3_impl.rs::register_t31_structured_concurrency` is already a tombstone for
+exactly this defect, with the consequence spelled out in place ("registering them
+here caused the canonical 8-field layout to be overridden with the earlier
+2-field stubs, silently breaking `close()`, `result()`, and `throwIfFailed()`").
+This is the copy that pass missed.
+
+**What retiring #2 exposed, and it is a new finding: the two surviving
+registrars disagree about `Subtask.State`'s numeric encoding, in the same slot of
+the same object.**
+
+| | `Subtask` state slot | UNAVAILABLE | SUCCESS | FAILED |
+|---|---|---|---|---|
+| `jdk25_concurrency.rs` (`SUBTASK_STATE_*`) — owns `get()`, `state()`, `exception()` | 0 | 0 | **1** | **2** |
+| `phases_late/concurrent.rs` (`J25_SUBTASK_STATE_*`) — owns `fork(Runnable)`, `join()Object`, `isCancelled()` | 0 | 0 | **2** | **3** |
+
+Both agree on the slot and disagree on the values, and the split runs straight
+through the API: the writers of one JEP 505 path are in the file with one
+encoding, the readers are in the file with the other. `SUCCESS` written as `2` is
+read back as `FAILED`, so `Subtask.get()` on a *successful* `fork(Runnable)`
+subtask raises `IllegalStateException` and `exception()` hands out slot 2. The two
+files even carry a comment each explaining that they "agree by value, not by
+import" — they do not. This is unreachable in both shipping modes for the same
+structural reason as everything else here, which is exactly why nothing has ever
+noticed it, and it is the strongest single argument that B's remainder needs the
+run rather than more reading.
+
+The retirement is **provably inert**, which is why it was safe to take blind:
+#2's `StructuredTaskScope` and `$Subtask` triples are a strict subset of #3's, so
+every one of them was already overwritten. The only two registrations it ever
+won are the covariant-return `join()`s —
+`$ShutdownOnFailure.join()L…$ShutdownOnFailure;` and
+`$ShutdownOnSuccess.join()L…$ShutdownOnSuccess;`, which #3 spelled with the base
+`L…StructuredTaskScope;` return and so did not collide with — and both are on
+classes JEP 505 deleted. That is the same covariant-return pattern §3 found when
+comparing this file against #1.
+
+**What landed (2) — the shadowing question is now a test.**
+`jdk25_concurrency.rs` grows `w7_18_jep505_surface_is_not_shadowed_here`, which
+asserts that none of the nine JEP 505 triples owned by #1 is registered by #3.
+It is a **ratchet, not coverage**: it does not fail on the old behaviour, because
+the old behaviour does not have the shadow — the two sets were compared and the
+JEP 505 surface is clean today. What it does is convert "runs last, so it *can*
+silently re-impose the JDK-21 shape" from a standing hazard into a compile-and-
+test-time refusal. It is a `cargo test`, not a scheduled fixture, and it is
+labelled as such at the site.
+
+**What did NOT land, named as a decision.** The ~24 `$ShutdownOnSuccess` /
+`$ShutdownOnFailure` triples, `$Config`, `Joiner.policy()I`, and the JDK-21-only
+`StructuredTaskScope` methods (`<init>` ×3, `joinUntil`, `shutdown`,
+`isShutdown`, `join()LStructuredTaskScope;`) are all still registered. An
+in-file `JDK-ONLY-NOTE (W7-18)` at the `ShutdownOnFailure` block records the
+measured verdict so the next reader does not re-derive it. The decision rests on
+two conditions of which only one holds:
+
+* *It cannot move either shipping mode.* **True** — and therefore the deletion is
+  also worth nothing there. §5 measured `compatibility_classes: 0`,
+  `synthetic_stub_invocations: 0` and zero StructuredTaskScope violations in 1,454
+  under `--jdk-only`; real JDK bytecode serves the whole API.
+* *The deletion is checkable.* **False.** Roughly twenty `#[test]`s in
+  `jdk25_concurrency.rs`'s own module pin these registrations by triple — the
+  nine `test_register_sof_*` / `test_register_sos_*`,
+  `test_all_shutdown_on_failure_methods_registered` and its `_success_` twin,
+  `s52_joiner_policy_registered`, `s52_total_registration_count`, and the
+  fork/join/close/shutdown lists.
+  Deleting the registrations means rewriting a **blocking gate's** assertions to
+  match an expectation that no run has ever produced, in the one mode
+  (`--synthetic-jdk`) that this directory's §2.6 records as never having been
+  executed. That is the shape
+  docs/known-issues/jdk-only/W6-5-vacuous-tests.md warns about from the other
+  direction: a test that freezes VM output locks the divergence in, and editing it
+  blind moves the freeze rather than removing it.
+
+**What the next person needs, and it is one run, not a redesign.** Build
+`--features synthetic-jdk` and run `probes/StructuredTaskScopeProbe` in
+`--synthetic-jdk` **mode** (W7-50 built the feature binary but ran it under
+`--jdk-only`, where none of this registers). With that transcript in hand the
+deletion becomes a measured change and the twenty tests can be rewritten against
+an observed answer instead of a guessed one. Until then, deleting is the more
+expensive of the two mistakes available.
+
+**Untouched, and still open as written:** `SCOPE_OWNERS` / `SCOPE_JOINERS` are
+still keyed on `ObjectRef::as_ptr() as usize`. `SCOPE_FORKS`, immediately above
+them in the same file, carries the correct remedy in its own doc comment (key by
+`ctx.identity_hash_code(scope)`, re-read values through the
+`(identity_key, ObjectRef)` var-handle-root pattern) and has not taken it either,
+so all three want one pass rather than three. That pass needs a `ctx` at every
+call site, which several of them do not have today.
 
 ### C. Two joiners cannot be served by the 8-slot layout
 
@@ -607,6 +748,39 @@ The patch for both is one change: widen
 five-valued kind rather than the three-valued scope policy. It touches two files
 this lane does not own and it changes an allocation width every existing
 allocation site must move with, which is why it is written down rather than done.
+
+> **DECLINED 2026-08-12, with the reason, rather than left open-ended.** Three
+> things have to be true for this to be worth taking blind, and none of them is:
+>
+> 1. **It is not a one-file change and the widening is the dangerous half.**
+>    `classloading/src/class_manager.rs`'s `instance_fields(8)` is a *contract*
+>    between three modules: `jdk25_concurrency.rs` allocates against it,
+>    `phases_late/concurrent.rs` reads slots 0–7 by index against it, and
+>    `class_manager.rs` fabricates it. A ninth index written against an
+>    allocation that is still eight wide is heap corruption, not a wrong answer
+>    (docs/architecture/natives-over-real-jdk-classes.md §5), and the three edits
+>    have to land in one commit or the intermediate state is the corruption. Two
+>    of the three files belong to other lanes.
+> 2. **The only mode it can be observed in has never been run.** Everything here
+>    is `--synthetic-jdk`-mode-only, structurally (see the status block). So the
+>    change would be written, landed, and validated by nothing — which is the
+>    same position W6-12's residual is in, and this directory has stopped
+>    treating that as progress.
+> 3. **The record's own reasoning says the safe direction is where we already
+>    are.** `allUntil` currently mints an `awaitAll` joiner: a predicate that
+>    never fires, i.e. it **over-waits** rather than under-waits, which is the
+>    safe error when every subtask has already run under this file's synchronous
+>    fork. `join()` answering `Void` for the two stream joiners is likewise a
+>    refusal rather than a fabricated empty `Stream` — and this section already
+>    argues, correctly, that the fabricated stream is the worse outcome. Taking
+>    the patch blind risks converting a documented refusal into an unmeasured
+>    wrong answer.
+>
+> **What would unblock it:** the same single run B needs — a
+> `--features synthetic-jdk` binary in `--synthetic-jdk` **mode** with
+> `probes/StructuredTaskScopeProbe`. With that transcript, C becomes a
+> three-file change with an oracle. Without it, C is a three-file change with a
+> hypothesis.
 
 ## What is not claimed
 

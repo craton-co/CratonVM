@@ -1,5 +1,92 @@
 # W7-3 — `String.format`'s float conversions, and the `StringBuilder` bounds checks that were not there
 
+> ## 2026-08-12 — the four "deliberately left" residuals are CLOSED, and one of them was not a trade-off at all
+>
+> All four items under "Deliberately left, with reasons" are fixed in
+> `native-builtins/src/lang_string.rs`, and the pinning unit test that made the
+> first one un-landable is corrected in the same pass. Nothing here was built or
+> run; the evidence is the JDK 25 body quoted per item.
+>
+> | residual | disposition |
+> |---|---|
+> | `append(CharSequence,int,int)` clamps | **FIXED** — `checkRange(start, end, s.length())` → `IndexOutOfBoundsException`, null substituted to `"null"` FIRST so the check runs against 4. The pin `sb_append_charsequence_off_len_clamps_out_of_range` is replaced by `…_rejects_an_out_of_range_window` (both polarities) plus `…_null_is_the_null_literal_then_checked`. |
+> | `appendCodePoint` truncates | **FIXED, and the argument for it was a misreading** — see below. |
+> | `insert(int, boolean/long/float/double)` have no native | **FIXED** — four natives on the shared `sb_insert_text` splice, registered in `register_string_builder_natives`. |
+> | `%a` with the `0` flag and a width | **FIXED** — `a`/`A` join the zero-pad set and the `lead` split is now sign-then-prefix. |
+>
+> **The `appendCodePoint` item is the one worth reading.** Its comment argued a
+> trade-off — "`Character.toChars` would throw for an unpaired surrogate, but
+> WHATWG callers must not die" — and both halves are wrong about JDK 25.
+> `appendCodePoint`'s first statement is
+> `if (Character.isBmpCodePoint(codePoint)) return append((char) codePoint);`,
+> and `0xD800..=0xDFFF` **are** BMP code points, so `Character.toChars` is never
+> reached for them and an unpaired surrogate is appended verbatim. The WHATWG
+> path was never in tension with the spec. What the truncation actually covered
+> was `codePoint < 0 || codePoint > 0x10FFFF`, where it wrote `cp as u16` — the
+> low 16 bits of a number that is not a code point at all.
+>
+> **And the correct expansion was already in the file, shadowed.**
+> `register_string_builder_natives` registers `appendCodePoint(I)` **twice** —
+> first to `native_sb_append_codepoint`, which delegates to
+> `native_sb_repeat_codepoint`'s three-way expansion (BMP verbatim / surrogate
+> pair / `IllegalArgumentException`, i.e. the JDK's rule exactly), and then to
+> `native_sb_append_code_point`, whose body truncated. `register()` is
+> last-registration-wins, so the truncating copy owned the slot and the correct
+> one never ran — the `Integer.toString(II)` shape of
+> docs/architecture/natives-over-real-jdk-classes.md §3, **inside a single
+> registrar function**, where "compare by enclosing registrar" gives no signal
+> and only reading the two bodies does. The winner is now the delegation.
+>
+> **Which registrar wins, and its ambient kind.** All of these ride
+> `register_string_builder_natives`, called from
+> `register_essential_natives_with_shims` (`native-builtins/src/lib.rs:18229-18231`,
+> for `StringBuilder`/`StringBuffer`/`AbstractStringBuilder`) — the real-JDK boot
+> path, under the ambient `NativeKind::Bridge` that function sets at its head and
+> restores at its tail. `register_synthetic_overrides` re-registers the same
+> triples (`lib.rs:22908-22909`) under `Intrinsic`, but that arm runs only in
+> `--synthetic-jdk`, so on both shipping modes the `Bridge` copy is the one that
+> dispatches. No `java/lang/StringBuilder` triple is in
+> `RETIRED_SHADOW_TRIPLES`, so `--jdk-only` keeps them.
+>
+> **Coverage.** `regression-suite/src/RStrings.java` (scheduled in
+> `CORE_CLASSES`, so it runs in a plain `bash run.sh` and again under
+> `CRATONVM_ARGS=--jdk-only`) gains both polarities of the
+> `append(CharSequence,int,int)` check, the `appendCodePoint` surrogate/refusal
+> pair, the four `insert` overloads with an out-of-range `insert` beside them,
+> and `%a`/`%020a`/`%+020a`. Unit cover:
+> `sb_append_charsequence_off_len_rejects_an_out_of_range_window`,
+> `sb_append_charsequence_off_len_null_is_the_null_literal_then_checked`,
+> `sb_append_code_point_admits_surrogates_and_refuses_non_code_points`,
+> `sb_scalar_insert_overloads_render_and_check_the_offset`.
+>
+> **Ratchet effect — arithmetic, not a measurement. Do not paste this into a
+> baseline.** Only the four new `insert` overloads add REGISTRATIONS; the other
+> three fixes change bodies and flag sets and register nothing. Those four are
+> registered once per class name by `register_string_builder_natives`, which
+> `register_essential_natives_with_shims` calls for `java/lang/StringBuilder`,
+> `java/lang/StringBuffer` and `java/lang/AbstractStringBuilder` — so **up to
+> twelve new `Bridge`-over-bytecode rows** (4 descriptors × 3 receivers; every
+> one is declared with `Code` in the JDK 25 image, `AbstractStringBuilder`
+> declaring them and the two subclasses declaring covariant overrides).
+> `bridge_shadows_bytecode` in `scripts/baselines/jdk-only-bridge-ratchet.json`
+> therefore moves UP by 12 and the per-row kind freeze
+> `scripts/baselines/jdk-only-kind-map-25-linux.tsv` gains 12 rows.
+> `BASELINE_SYNTHETIC_STUBS` does **not** move: the ambient kind here is
+> `Bridge`, not `SyntheticStub`. Both artefacts are keyed `25/linux` and must be
+> re-frozen from one real run on that platform; note that
+> `jdk-only-bridge-ratchet.json` is already recorded as firing for an unrelated
+> reason (`W7-20`'s row in this directory's README), so this delta lands on top
+> of an existing red rather than creating one.
+>
+> **Message wording carries the same caveat this record already records for
+> `setLength(-1)`**: only the exception CLASS is pinned by the javadoc.
+> `append(CharSequence,int,int)` raises `Preconditions`' `Range [from, to) out of
+> bounds for length n` text — shared with the `append(char[],int,int)` sibling so
+> the two overloads cannot drift — where the JDK's hand-rolled `checkRange`
+> spells it `start …, end …, length …`. `appendCodePoint` reproduces
+> `Character.toChars`' `Not a valid Unicode code point: 0x%X`. Neither text has
+> been run against JDK 25; both classes have.
+
 **Status: source landed, UNVERIFIED.** Nothing in this record has been built or
 run against a VM. It takes two of the four families in
 `docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md`
@@ -241,6 +328,12 @@ guard and throws. Making them consistent would be wrong.
 `checkFromIndexSize` message prints the addition unevaluated.
 
 ## Deliberately left, with reasons
+
+> **ALL FOUR ARE NOW FIXED — 2026-08-12, see the block at the head of this
+> record.** The four bullets are kept unedited because the *reasons* are the
+> reusable part: three were honest scoping calls and the fourth
+> (`appendCodePoint`) was a misreading of `Character.isBmpCodePoint`, which is
+> the only way to tell those two categories apart afterwards.
 
 * **`append(CharSequence, int, int)` still clamps.** The comment on
   `native_sb_append_charsequence_off_len` records a prior session's deliberate

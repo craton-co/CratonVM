@@ -383,6 +383,35 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         &format!("(I[C)L{class};"),
         native_sb_insert_char_array,
     );
+    // The four scalar `insert` overloads that had NO native. Without them real
+    // `AbstractStringBuilder.insert` bytecode ran against the synthetic
+    // char[]/count layout — the layout mismatch every neighbour above exists to
+    // prevent. See `native_sb_insert_boolean`'s doc comment and
+    // docs/known-issues/jdk-only/W7-3-format-conversions-and-stringbuilder-bounds.md.
+    registry.register(
+        class,
+        "insert",
+        &format!("(IZ)L{class};"),
+        native_sb_insert_boolean,
+    );
+    registry.register(
+        class,
+        "insert",
+        &format!("(IJ)L{class};"),
+        native_sb_insert_long,
+    );
+    registry.register(
+        class,
+        "insert",
+        &format!("(IF)L{class};"),
+        native_sb_insert_float,
+    );
+    registry.register(
+        class,
+        "insert",
+        &format!("(ID)L{class};"),
+        native_sb_insert_double,
+    );
     registry.register(
         class,
         "delete",
@@ -2136,6 +2165,26 @@ fn charsequence_chars(
     Ok(out)
 }
 
+/// `CharSequence.length()`, by the same three-shapes-then-`invoke_virtual`
+/// route [`charsequence_chars`] uses to read the characters.
+///
+/// Exists because `AbstractStringBuilder.append(CharSequence, int, int)` must
+/// range-check against the sequence's length BEFORE it reads a character, and
+/// `charsequence_chars` clamps rather than reports — the clamp being the whole
+/// defect W7-3 left standing.
+fn charsequence_length(
+    ctx: &mut dyn NativeContext,
+    cs: cratonvm_types::ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if let Some(text) = charsequence_fast_text(ctx, cs)? {
+        return Ok(text.encode_utf16().count() as i32);
+    }
+    match ctx.invoke_virtual(cs, "length", "()I", &[])? {
+        Some(Value::Int(n)) => Ok(n),
+        _ => Ok(0),
+    }
+}
+
 /// The three shapes whose text can be read in Rust without changing the answer
 /// -- see [`charsequence_chars`]. `Ok(None)` means "walk `charAt`".
 fn charsequence_fast_text(
@@ -2190,6 +2239,29 @@ pub(crate) fn native_sb_append_charsequence(
 /// bogus multi-megabyte buffer → OutOfMemoryError deep inside
 /// `java.util.Formatter.format`. Intercept the call natively so JDK
 /// bytecode never touches our incompatible field layout.
+///
+/// **The window is range-checked, not clamped — reversed 2026-08-12.** A prior
+/// session clamped deliberately ("silent clamping keeps JUnit's
+/// error-reporting path alive, and every caller inside JDK internals passes
+/// in-bounds indices") and pinned the clamp with a unit test; W7-3 listed it as
+/// the same species as the twelve bounds defects it fixed and declined to
+/// reverse a tested, argued decision. The argument does not survive the
+/// species: a clamp converts an argument the caller got wrong into one the
+/// callee accepts, so `sb.append(cs, 0, 100)` on a 3-char sequence appended a
+/// SHORT slice and reported success. The in-bounds callers the comment names
+/// are unaffected by a check they pass, and JUnit's reporting path builds its
+/// windows from `length()` — it never relied on the clamp, it merely never
+/// exercised it.
+///
+/// JDK 25's body is `if (s == null) s = "null"; checkRange(start, end,
+/// s.length());`, so the null substitution happens FIRST and the check runs
+/// against 4 — `append((CharSequence) null, 0, 9)` throws. `checkRange` is the
+/// `IndexOutOfBoundsException` sibling of `checkRangeSIOOBE`, i.e. the same
+/// check [`native_sb_append_char_array_off_len`] runs, and the message helper
+/// is shared with it so the two overloads cannot drift. Only the exception
+/// CLASS is pinned by the javadoc; the text is `Preconditions`' rather than
+/// `checkRange`'s hand-rolled wording, unverified against JDK 25 — the same
+/// caveat W7-3 records for `setLength(-1)`.
 pub(crate) fn native_sb_append_charsequence_off_len(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2211,21 +2283,47 @@ pub(crate) fn native_sb_append_charsequence_off_len(
         _ => 0,
     };
 
-    // null CharSequence → append "null" per AbstractStringBuilder.appendNull.
-    let Some(cs_obj) = cs else {
-        let this = sb_append_str(ctx, this, "null");
+    // Producer-#12 fix: the length probe and the charAt walk both re-enter
+    // Java and can move `this` and the sequence, so both are rooted before
+    // either runs.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let cs_handle = cs.map(|o| scope.root(o));
+
+    // `s == null` becomes the four-character "null" BEFORE the range check, so
+    // the length the check runs against is 4 and not the caller's window.
+    let length = match &cs_handle {
+        Some(handle) => {
+            let cs_now = scope.get(handle);
+            charsequence_length(&mut *scope, cs_now)?
+        }
+        None => 4,
+    };
+    // `checkRange(start, end, length)`.
+    if start < 0 || start > end || end > length {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(start),
+                i64::from(end),
+                i64::from(length),
+            ),
+        )
+        .into());
+    }
+
+    let Some(cs_handle) = cs_handle else {
+        // null CharSequence → append "null" per AbstractStringBuilder.appendNull,
+        // over the window the check above admitted.
+        let this = scope.get(&this_handle);
+        let text: String = "null"[start as usize..end as usize].to_string();
+        let this = sb_append_str(&mut *scope, this, &text);
         return Ok(Some(Value::Object(Some(this))));
     };
 
     // Read the sequence's CHARACTERS over [start, end) — `charsequence_chars`
-    // states why `toString()` is the wrong question here, and does the clamping
-    // this native has always done rather than the JDK's
-    // IndexOutOfBoundsException (the comment that used to sit here: silently
-    // clamping keeps JUnit's error-reporting path alive, and every real caller
-    // inside JDK internals passes in-bounds indices).
-    // Producer-#12 fix: the charAt walk re-enters Java and can move `this`.
-    let mut scope = NativeHandleScope::new(ctx);
-    let this_handle = scope.root(this);
+    // states why `toString()` is the wrong question here. Its own clamp is now
+    // unreachable from this caller: the range was validated above.
+    let cs_obj = scope.get(&cs_handle);
     let chars = charsequence_chars(&mut *scope, cs_obj, Some((start, end)))?;
     let this = scope.get(&this_handle);
     let this = sb_append_chars(&mut *scope, this, &chars);
@@ -2577,34 +2675,45 @@ pub(crate) fn native_sb_code_point_count(
 /// compact `byte[] value` field (growing/re-coding it via
 /// `ensureCapacityNewCoder`), which CratonVM's synthetic `char[]`-backed
 /// StringBuilder does not have — corrupting the backing array.
+///
+/// **The truncation W7-3 left standing is gone, and the argument that justified
+/// it was resolvable rather than a trade-off.** The old body ran
+/// `char::from_u32`, which refuses an unpaired surrogate because it is not a
+/// Unicode SCALAR value, and truncated on that refusal — with a comment saying
+/// `Character.toChars` would throw for these but WHATWG callers must not die.
+/// Both halves of that sentence are wrong about the JDK: `appendCodePoint`'s
+/// first statement is `if (Character.isBmpCodePoint(codePoint)) return
+/// append((char) codePoint);`, and `0xD800..=0xDFFF` **are** BMP code points,
+/// so `Character.toChars` is never reached and an unpaired surrogate is
+/// appended verbatim. The WHATWG path therefore keeps working by the JDK's own
+/// rule instead of by a local exemption, and the only inputs left for the
+/// truncation to cover are the ones the JDK genuinely refuses:
+/// `codePoint < 0 || codePoint > 0x10FFFF`, where `Character.toChars` throws
+/// `IllegalArgumentException`. Truncating those wrote `cp as u16` — a
+/// low-order-16-bits alias of a number that is not a code point at all, i.e. a
+/// silent wrong character where the caller asked for a refusal.
+///
+/// `char::from_u32` was not the predicate for this method: it answers "is this
+/// a Rust `char`", which excludes exactly the surrogates the JDK admits.
+///
+/// **The correct expansion was already in this file, and this registration was
+/// shadowing it.** `register_string_builder_natives` registers
+/// `appendCodePoint(I)` TWICE — first to [`native_sb_append_codepoint`], which
+/// delegates to [`native_sb_repeat_codepoint`]'s three-way expansion (BMP
+/// verbatim including surrogates / surrogate pair / `IllegalArgumentException`,
+/// which is the JDK's rule exactly), and then to this function, whose body
+/// truncated. `register()` is last-registration-wins, so the truncating copy
+/// owned the slot and the correct one never ran — the `Integer.toString(II)`
+/// shape from docs/architecture/natives-over-real-jdk-classes.md §3, inside one
+/// registrar function. This body is now the delegation, so there is one
+/// expansion rule in the file rather than two that disagree; the duplicate
+/// registration is left in place because removing it would move a census count
+/// for no behavioural gain.
 pub(crate) fn native_sb_append_code_point(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
-    };
-    let cp = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let mut buf = [0u16; 2];
-    let encoded: &[u16] = match char::from_u32(cp as u32) {
-        Some(c) => c.encode_utf16(&mut buf),
-        None => {
-            // Not a valid Unicode scalar value (e.g. an unpaired surrogate
-            // used internally by the parser) — Character.toChars would throw
-            // IllegalArgumentException for these, but WHATWG callers only
-            // ever appendCodePoint values already validated as scalar
-            // values/ASCII, so fall back to truncating to a single UTF-16
-            // unit rather than diverging further.
-            buf[0] = cp as u16;
-            &buf[..1]
-        }
-    };
-    let this = sb_append_chars(ctx, this, encoded);
-    Ok(Some(Value::Object(Some(this))))
+    native_sb_append_codepoint(ctx, args)
 }
 
 pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2799,6 +2908,118 @@ pub(crate) fn native_sb_insert_object(
     result.extend_from_slice(&chars[offset..]);
     let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// The splice every scalar `insert(int, X)` overload performs: `checkOffset`,
+/// then insert `text` at `offset`.
+///
+/// Extracted so the four overloads below are one line each and cannot drift
+/// from the six that already had natives — JDK 25 writes them the same way
+/// (`insert(int offset, long l) { return insert(offset, String.valueOf(l)); }`),
+/// so the check, the bound and the splice are shared by construction rather
+/// than by four copies agreeing.
+fn sb_insert_text(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    offset: i32,
+    text: &str,
+) -> MethodCallResult {
+    let insert_chars: Vec<u16> = text.encode_utf16().collect();
+    let chars = sb_read_chars(ctx, this);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+    result.extend_from_slice(&chars[..offset]);
+    result.extend_from_slice(&insert_chars);
+    result.extend_from_slice(&chars[offset..]);
+    let this = sb_write_chars(ctx, this, &result);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// Read `args[1]` as an `insert` destination offset.
+fn sb_insert_offset(args: &[Value]) -> i32 {
+    match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    }
+}
+
+/// `insert(int, boolean)`.
+///
+/// **These four overloads had no native at all**, which is not the same defect
+/// as the clamps W7-3 fixed: with nothing registered, real
+/// `AbstractStringBuilder.insert` bytecode ran against CratonVM's synthetic
+/// `char[] value` @0 / `int count` @1 layout, reading slot 2 as `count` and
+/// slot 0 as a compact `byte[]` — the layout mismatch every other member of
+/// this family has a native to prevent (see `native_sb_get_coder`). W7-3
+/// recorded them as "a layout bug, not a bounds bug, and not in this lane".
+pub(crate) fn native_sb_insert_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = match args.get(2) {
+        Some(Value::Int(v)) if *v != 0 => "true",
+        _ => "false",
+    };
+    sb_insert_text(ctx, this, sb_insert_offset(args), text)
+}
+
+/// `insert(int, long)`.
+pub(crate) fn native_sb_insert_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let v = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
+        _ => 0,
+    };
+    sb_insert_text(ctx, this, sb_insert_offset(args), &v.to_string())
+}
+
+/// `insert(int, float)` — rendered by `Float.toString`, not by Rust's
+/// `Display`; see [`format_float`].
+pub(crate) fn native_sb_insert_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let v = match args.get(2) {
+        Some(Value::Float(v)) => *v,
+        Some(Value::Double(v)) => *v as f32,
+        _ => 0.0,
+    };
+    sb_insert_text(ctx, this, sb_insert_offset(args), &format_float(v))
+}
+
+/// `insert(int, double)` — rendered by `Double.toString`; see [`format_double`].
+pub(crate) fn native_sb_insert_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let v = match args.get(2) {
+        Some(Value::Double(v)) => *v,
+        Some(Value::Float(v)) => f64::from(*v),
+        _ => 0.0,
+    };
+    sb_insert_text(ctx, this, sb_insert_offset(args), &format_double(v))
 }
 
 /// `insert(int, char[], int, int)` — insert a char[] slice at `offset`.
@@ -5571,6 +5792,94 @@ fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: Option<cratonvm_types::O
     resolved.unwrap_or_default()
 }
 
+thread_local! {
+    /// Re-entrancy latch for [`fmt_date_name`] — the `DateFormatSymbols` twin
+    /// of [`FMT_SYMBOLS_RESOLVING`], and it exists for the same reason.
+    ///
+    /// `DateFormatSymbols.getInstance` runs real JDK bytecode: the locale
+    /// provider chain, `ResourceBundle`, and (since W7-80) the CLDR bundle
+    /// classes out of the JDK image. Any of that is free to call
+    /// `String.format` itself — a `tracing`-style diagnostic or an exception
+    /// message is enough — which re-enters this native and asks for the same
+    /// locale's symbols while they are still mid-construction. While the latch
+    /// is set the inner call answers `None` and the caller falls back to the
+    /// English table, which is what the JDK's own null-locale branch prints
+    /// and cannot recurse.
+    static FMT_DATE_NAMES_RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One element of one `java.text.DateFormatSymbols` name array, for the
+/// `%t`/`%T` conversions that render a NAME rather than a number.
+///
+/// `getter` is the no-arg `()[Ljava/lang/String;` accessor
+/// `java.util.Formatter` itself calls — `getMonths`, `getShortMonths`,
+/// `getWeekdays`, `getShortWeekdays` or `getAmPmStrings` — and `index` is the
+/// index into it, in that array's own convention (months 0-based over 13
+/// entries, weekdays 1-based over 8 with slot 0 unused).
+///
+/// `locale` is the `Locale` an explicit-locale overload was given.
+/// **`None` means the no-locale overload**, and resolves through
+/// `DateFormatSymbols.getInstance()`, whose body is
+/// `getInstance(Locale.getDefault(Locale.Category.FORMAT))` — i.e. exactly the
+/// `Locale` a real `java.util.Formatter` built by `String.format(String,
+/// Object...)` would be carrying. Asking the JDK for it rather than composing
+/// one here is what keeps this from becoming a fourth opinion about what the
+/// default locale is.
+///
+/// `None` on any failure, and the caller then prints the English name it
+/// printed before. Every failure mode is a legitimate one: synthetic-JDK mode
+/// has no `java.text.DateFormatSymbols.getInstance`, a jlinked image can be
+/// missing `jdk.localedata`, and an entry can be the empty string (both arrays
+/// carry one). The `Err` from `invoke` is dropped on purpose — the caller is
+/// owed a formatted string, not this lookup's failure, and CratonVM carries a
+/// thrown exception in the return value rather than in thread state, so
+/// nothing is left pending to clear (the same argument `fmt_raise` makes for
+/// its speculative `load_class`).
+fn fmt_date_name(
+    ctx: &mut dyn NativeContext,
+    locale: Option<cratonvm_types::ObjectRef>,
+    getter: &str,
+    index: usize,
+) -> Option<String> {
+    if FMT_DATE_NAMES_RESOLVING.with(std::cell::Cell::get) {
+        return None;
+    }
+    FMT_DATE_NAMES_RESOLVING.with(|f| f.set(true));
+    let resolved = (|| {
+        let instance = match locale {
+            Some(l) => ctx.invoke(
+                "java/text/DateFormatSymbols",
+                "getInstance",
+                "(Ljava/util/Locale;)Ljava/text/DateFormatSymbols;",
+                &[Value::Object(Some(l))],
+            ),
+            None => ctx.invoke(
+                "java/text/DateFormatSymbols",
+                "getInstance",
+                "()Ljava/text/DateFormatSymbols;",
+                &[],
+            ),
+        };
+        let dfs = match instance {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let arr = match ctx.invoke_virtual(dfs, getter, "()[Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => return None,
+        };
+        if index >= ctx.array_length(arr) {
+            return None;
+        }
+        match ctx.get_array_element(arr, index) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        }
+    })();
+    FMT_DATE_NAMES_RESOLVING.with(|f| f.set(false));
+    resolved.filter(|s| !s.is_empty())
+}
+
 /// Rewrite an ASCII numeric body into the locale's digits and separators.
 ///
 /// Runs LAST, after grouping, signs and width padding, so everything upstream
@@ -6019,7 +6328,14 @@ fn format_impl(
                                 ))
                             }
                         };
-                        let text = format_temporal_field(ctx, &elem, field, &flags, width)?;
+                        // The `Locale` goes through so the name fields can ask
+                        // `DateFormatSymbols` for it. Unlike the numeric
+                        // conversions above there is no cached `FmtSymbols`
+                        // here: `fmt_date_name` resolves only at a field that
+                        // renders a name, so a `%tY`-only format string still
+                        // runs no locale bytecode at all.
+                        let text =
+                            format_temporal_field(ctx, &elem, field, &flags, width, locale)?;
                         result.push_str(&if uppercase {
                             text.to_uppercase()
                         } else {
@@ -6320,12 +6636,24 @@ fn day_of_week_sun0(year: i32, month: i32, day: i32) -> usize {
 /// following the `t`/`T` prefix — e.g. `b` in `%tb`). See
 /// [`extract_temporal_fields`] for how the source value is decoded and
 /// `java.util.Formatter`'s own `%t` conversion table for the field meanings.
+///
+/// The six name-bearing fields — `%tB` `%tb`/`%th` `%tA` `%ta` `%tp`, and
+/// `%tc`, which is a composite over two of them — go through
+/// [`fmt_date_name`], i.e. through `java.text.DateFormatSymbols`, because that
+/// is what `java.util.Formatter.print(TemporalAccessor, char, Locale)` does.
+/// They used to be answered from the four English tables below **whatever the
+/// locale was**, so every `java.util.logging.SimpleFormatter` line rendered its
+/// month in English on a host that is not English — its default pattern opens
+/// `%1$tb`. The tables survive as the fallback for the configurations where
+/// there is no `DateFormatSymbols` to ask, which is the same value they always
+/// produced.
 fn format_temporal_field(
     ctx: &mut dyn NativeContext,
     val: &Value,
     field: char,
     flags: &str,
     width: Option<usize>,
+    locale: Option<cratonvm_types::ObjectRef>,
 ) -> Result<String, MethodCallFailed> {
     const MONTHS_ABBR: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -6376,7 +6704,12 @@ fn format_temporal_field(
             h
         }
     };
-    let ampm = if hour < 12 { "am" } else { "pm" };
+    // `Calendar.AM`/`Calendar.PM` are 0 and 1, which is the index into
+    // `getAmPmStrings()`. The English pair is the JDK's own literal
+    // `String[] ampm = { "AM", "PM" }` for the null-locale branch, lower-cased
+    // the way `printDateTime` lower-cases whatever it read.
+    let ampm_idx = if hour < 12 { 0usize } else { 1usize };
+    let ampm_en = if hour < 12 { "am" } else { "pm" };
     let epoch_sec = || {
         temporal_to_epoch_day(year32, month, day) * 86_400
             + hour as i64 * 3600
@@ -6394,7 +6727,9 @@ fn format_temporal_field(
         'S' => format!("{:02}", second),
         'L' => format!("{:03}", millis),
         'N' => format!("{:09}", nanos),
-        'p' => ampm.to_string(),
+        'p' => fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| ampm_en.to_string()),
         // CratonVM's Calendar/Date model has no real timezone offset (see
         // extract_temporal_fields) — 'z'/'Z' report the fixed UTC identity
         // consistent with that.
@@ -6403,10 +6738,18 @@ fn format_temporal_field(
         's' => format!("{}", epoch_sec()),
         'Q' => format!("{}", epoch_sec() * 1000 + millis as i64),
         // Date
-        'B' => MONTHS_FULL[month_idx].to_string(),
-        'b' | 'h' => MONTHS_ABBR[month_idx].to_string(),
-        'A' => DAYS_FULL[dow].to_string(),
-        'a' => DAYS_ABBR[dow].to_string(),
+        'B' => fmt_date_name(ctx, locale, "getMonths", month_idx)
+            .unwrap_or_else(|| MONTHS_FULL[month_idx].to_string()),
+        'b' | 'h' => fmt_date_name(ctx, locale, "getShortMonths", month_idx)
+            .unwrap_or_else(|| MONTHS_ABBR[month_idx].to_string()),
+        // `getWeekdays()` is indexed by `Calendar.SUNDAY`..`SATURDAY`, i.e.
+        // 1..7 with slot 0 unused, so the 0=Sunday `dow` shifts by one. The
+        // JDK reaches the same index from the other direction, as
+        // `DAY_OF_WEEK % 7 + 1` over an ISO 1=Monday field.
+        'A' => fmt_date_name(ctx, locale, "getWeekdays", dow + 1)
+            .unwrap_or_else(|| DAYS_FULL[dow].to_string()),
+        'a' => fmt_date_name(ctx, locale, "getShortWeekdays", dow + 1)
+            .unwrap_or_else(|| DAYS_ABBR[dow].to_string()),
         'C' => format!("{:02}", year.div_euclid(100)),
         'Y' => format!("{:04}", year),
         'y' => format!("{:02}", year.rem_euclid(100)),
@@ -6422,14 +6765,27 @@ fn format_temporal_field(
             hour12,
             minute,
             second,
-            ampm.to_uppercase()
+            fmt_date_name(ctx, locale, "getAmPmStrings", ampm_idx)
+                .unwrap_or_else(|| ampm_en.to_string())
+                .to_uppercase()
         ),
         'D' => format!("{:02}/{:02}/{:02}", month, day, year.rem_euclid(100)),
         'F' => format!("{:04}-{:02}-{:02}", year, month, day),
-        'c' => format!(
-            "{} {} {:2} {:02}:{:02}:{:02} UTC {:04}",
-            DAYS_ABBR[dow], MONTHS_ABBR[month_idx], day, hour, minute, second, year
-        ),
+        // `%tc` is the JDK's own composite `%ta %tb %td %tT %tZ %tY` — so its
+        // day is `DAY_OF_MONTH_0`, ZERO-padded (`Sat Nov 04 …`, the javadoc's
+        // own example). It was space-padded here, which is `%te`'s rule.
+        // The zone stays the fixed `UTC` identity `extract_temporal_fields`
+        // models; see the `'z'`/`'Z'` arms above and W7-91.
+        'c' => {
+            let weekday = fmt_date_name(ctx, locale, "getShortWeekdays", dow + 1)
+                .unwrap_or_else(|| DAYS_ABBR[dow].to_string());
+            let month_name = fmt_date_name(ctx, locale, "getShortMonths", month_idx)
+                .unwrap_or_else(|| MONTHS_ABBR[month_idx].to_string());
+            format!(
+                "{} {} {:02} {:02}:{:02}:{:02} UTC {:04}",
+                weekday, month_name, day, hour, minute, second, year
+            )
+        }
         // Unreachable today: the caller already screened `field` against
         // `FMT_DATETIME_FIELDS`, which is `DateTime.isValid`'s own set, and
         // every one of its 31 characters has an arm above. Kept as the arm a
@@ -7016,8 +7372,14 @@ fn format_arg_full(
                 formatted = format!("{formatted}{}", " ".repeat(pad));
             }
             // %g/%G were missing from the zero-pad set even though Formatter
-            // accepts '0' for them. %a/%A stay out deliberately: their zeros go
-            // AFTER the "0x" prefix, which this generic insert cannot do.
+            // accepts '0' for them. %a/%A are IN it since 2026-08-12: their
+            // zeros go after the "0x" prefix, which the prefix-aware split
+            // below now does — `%020a` of 1.0 is `0x00000000000001.0p0`, and
+            // with a sign the zeros go after BOTH (`%+020a` is
+            // `+0x0000000000001.0p0`). Before this they fell to the `else`
+            // branch and got leading spaces. W7-3 left this as the family's
+            // last flag defect; it needed the `lead` split W7-34 added for
+            // `%#010x`, which is why the two waves could not close it together.
             //
             // The non-finite test stands in for Formatter's structure, where
             // zero padding happens only inside the FINITE branch —
@@ -7028,22 +7390,28 @@ fn format_arg_full(
             // the closing parenthesis, and both silently reverted to space
             // padding.
             else if zero_pad
-                && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
+                && matches!(
+                    spec,
+                    'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'a' | 'A'
+                )
                 && !formatted.ends_with("Infinity")
                 && !formatted.ends_with("INFINITY")
                 && !formatted.ends_with("NaN")
                 && !formatted.ends_with("NAN")
             {
                 // The zeros go INSIDE whatever the value already leads with —
-                // a sign, an opening parenthesis, or an alternate-form radix
-                // indicator — never in front of it.
-                let lead = if formatted.starts_with("0x") || formatted.starts_with("0X") {
-                    2
-                } else if formatted.starts_with(['-', '+', ' ', '(']) {
-                    1
-                } else {
-                    0
-                };
+                // a sign, an opening parenthesis, or a radix indicator — never
+                // in front of it. The two stack: `%a` puts the sign OUTSIDE the
+                // `0x` prefix (`+0x1.0p0`), so a signed hex float leads with
+                // three characters, and testing the radix indicator only at
+                // byte 0 would have put the zeros in front of the `0x`.
+                let mut lead = 0usize;
+                if formatted.starts_with(['-', '+', ' ', '(']) {
+                    lead = 1;
+                }
+                if formatted[lead..].starts_with("0x") || formatted[lead..].starts_with("0X") {
+                    lead += 2;
+                }
                 let (head, rest) = formatted.split_at(lead);
                 formatted = format!("{head}{}{rest}", "0".repeat(pad));
             } else {
@@ -9034,19 +9402,56 @@ mod tests {
         assert_eq!(ctx.read_string(out_obj).unwrap(), "cde");
     }
 
+    /// The pin this test carries was REVERSED on 2026-08-12.
+    ///
+    /// It used to assert that `[-1, 100)` over `"abc"` clamps to `[0, 3)` and
+    /// appends `"abc"`, which pinned the clamp W7-3 listed as a defect and
+    /// declined to reverse. JDK 25's body is `checkRange(start, end,
+    /// s.length())` and every out-of-range end of that window throws
+    /// `IndexOutOfBoundsException` — the sibling `append(char[], int, int)`
+    /// has raised it since W7-3. A clamp is not a lenient success, it is a
+    /// SHORT append reported as a complete one, so the builder ends up holding
+    /// text the caller never asked for.
+    ///
+    /// Both polarities are asserted here, because a check that only rejects
+    /// would pass on a native that rejects everything.
+    /// docs/known-issues/jdk-only/W7-3-format-conversions-and-stringbuilder-bounds.md
     #[test]
-    fn sb_append_charsequence_off_len_clamps_out_of_range() {
+    fn sb_append_charsequence_off_len_rejects_an_out_of_range_window() {
         let mut ctx = mock_ctx();
         let sb = make_sb(&mut ctx);
         let s = ctx.create_string("abc");
-        // [-1, 100) should clamp to [0, 3) — never panic, never crash.
+        for (start, end) in [(-1, 3), (0, 100), (-1, 100), (2, 1)] {
+            let e = native_sb_append_charsequence_off_len(
+                &mut ctx,
+                &[
+                    Value::Object(Some(sb)),
+                    Value::Object(Some(s)),
+                    Value::Int(start),
+                    Value::Int(end),
+                ],
+            )
+            .expect_err(&format!("[{start}, {end}) over \"abc\" must be refused"));
+            // `checkRange`, not `checkRangeSIOOBE`: the javadoc names the plain
+            // IndexOutOfBoundsException for this overload, and a caller
+            // catching SIOOBE specifically must NOT see it.
+            assert_eq!(err_kind(&ctx, &e), "ioobe", "[{start}, {end})");
+        }
+        // The builder is untouched by every refusal above — a rejected append
+        // must not be a partial one.
+        let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
+        assert_eq!(ctx.read_string(out_obj).unwrap(), "");
+        // The positive half: the in-range boundary window still appends.
         let r = native_sb_append_charsequence_off_len(
             &mut ctx,
             &[
                 Value::Object(Some(sb)),
                 Value::Object(Some(s)),
-                Value::Int(-1),
-                Value::Int(100),
+                Value::Int(0),
+                Value::Int(3),
             ],
         );
         assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
@@ -9055,6 +9460,127 @@ mod tests {
             panic!()
         };
         assert_eq!(ctx.read_string(out_obj).unwrap(), "abc");
+    }
+
+    /// `s == null` becomes the four-character `"null"` BEFORE the range check,
+    /// so the window is checked against 4 rather than against the caller's
+    /// numbers — `append(null, 0, 9)` throws, `append(null, 1, 3)` appends
+    /// `"ul"`. Getting the ORDER wrong here reads as a harmless difference and
+    /// is not: it decides whether a null sequence can produce an exception at
+    /// all.
+    #[test]
+    fn sb_append_charsequence_off_len_null_is_the_null_literal_then_checked() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb(&mut ctx);
+        let e = native_sb_append_charsequence_off_len(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .expect_err("[0, 9) over the \"null\" literal must be refused");
+        assert_eq!(err_kind(&ctx, &e), "ioobe");
+        let r = native_sb_append_charsequence_off_len(
+            &mut ctx,
+            &[
+                Value::Object(Some(sb)),
+                Value::Object(None),
+                Value::Int(1),
+                Value::Int(3),
+            ],
+        );
+        assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
+        let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
+        assert_eq!(ctx.read_string(out_obj).unwrap(), "ul");
+    }
+
+    /// `appendCodePoint` admits every BMP code point INCLUDING lone surrogates
+    /// (JDK: `isBmpCodePoint` is `cp >>> 16 == 0`, so `Character.toChars` — the
+    /// only thrower — is never reached for them), encodes a supplementary one
+    /// as a surrogate pair, and REFUSES anything outside `0..=0x10FFFF`.
+    ///
+    /// The refusal is the half that regressed: the old body truncated an
+    /// invalid code point to `cp as u16`, writing a character the caller never
+    /// named. The lone-surrogate case is asserted alongside it because that is
+    /// the input the truncation was justified by, and a fix that "tightened"
+    /// this into `char::from_u32` would break it.
+    #[test]
+    fn sb_append_code_point_admits_surrogates_and_refuses_non_code_points() {
+        let mut ctx = mock_ctx();
+        let sb = make_sb(&mut ctx);
+        for cp in [0x41, 0x1_F600, 0xD800, 0xDFFF, 0x10_FFFF] {
+            native_sb_append_code_point(&mut ctx, &[Value::Object(Some(sb)), Value::Int(cp)])
+                .unwrap_or_else(|_| panic!("appendCodePoint(0x{cp:X}) must be admitted"));
+        }
+        // 1 + 2 + 1 + 1 + 2 code units.
+        let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+        let Some(Value::Object(Some(out_obj))) = out_r else {
+            panic!()
+        };
+        let text = ctx.read_string(out_obj).unwrap();
+        assert_eq!(text.encode_utf16().count(), 7, "got {text:?}");
+
+        for cp in [-1, 0x11_0000, i32::MIN, i32::MAX] {
+            let r = native_sb_append_code_point(&mut ctx, &[Value::Object(Some(sb)), Value::Int(cp)]);
+            let refused = matches!(
+                r,
+                Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
+                    )
+                ))
+            );
+            assert!(refused, "appendCodePoint(0x{cp:X}) must raise IllegalArgumentException");
+        }
+    }
+
+    /// The four scalar `insert` overloads that had no native at all. Each
+    /// value is chosen so a wrong renderer cannot produce it by accident: a
+    /// long past `int` range, a `float`/`double` pair that `Float.toString` and
+    /// `Double.toString` spell differently from Rust's `Display` for other
+    /// inputs, and `checkOffset` on the far side.
+    #[test]
+    fn sb_scalar_insert_overloads_render_and_check_the_offset() {
+        for (args_tail, expected) in [
+            (Value::Int(1), "atruec"),
+            (Value::Long(1_234_567_890_123), "a1234567890123c"),
+            (Value::Float(1.5), "a1.5c"),
+            (Value::Double(2.25), "a2.25c"),
+        ] {
+            let mut ctx = mock_ctx();
+            let sb = make_sb_with(&mut ctx, "ac");
+            let args = [Value::Object(Some(sb)), Value::Int(1), args_tail];
+            let r = match args_tail {
+                Value::Int(_) => native_sb_insert_boolean(&mut ctx, &args),
+                Value::Long(_) => native_sb_insert_long(&mut ctx, &args),
+                Value::Float(_) => native_sb_insert_float(&mut ctx, &args),
+                _ => native_sb_insert_double(&mut ctx, &args),
+            };
+            assert!(matches!(r.unwrap(), Some(Value::Object(Some(_)))));
+            let out_r = native_sb_to_string(&mut ctx, &[Value::Object(Some(sb))]).unwrap();
+            let Some(Value::Object(Some(out_obj))) = out_r else {
+                panic!()
+            };
+            assert_eq!(ctx.read_string(out_obj).unwrap(), expected);
+        }
+
+        // `checkOffset(offset, count)` — the same check the six overloads that
+        // already had natives run. An offset past the end must throw, not
+        // append at the end.
+        let mut ctx = mock_ctx();
+        let sb = make_sb_with(&mut ctx, "ab");
+        let e = native_sb_insert_long(
+            &mut ctx,
+            &[Value::Object(Some(sb)), Value::Int(99), Value::Long(1)],
+        )
+        .expect_err("insert(99, 1L) on a 2-char builder must be refused");
+        assert_eq!(err_kind(&ctx, &e), "sioobe");
     }
 
     #[test]

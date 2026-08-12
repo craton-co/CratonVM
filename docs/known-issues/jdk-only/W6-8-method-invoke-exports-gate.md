@@ -27,19 +27,39 @@
   `new19_java_public_invoke_cross_module_without_exports_is_refused`. It is
   still `#[ignore]`d, for an unrelated synthetic-JDK `getDeclaredMethods` gap
   (`:332`).
-* **Residual: STILL OPEN — four, three deliberate and one a missing vector.**
+* **Residual: STILL OPEN — three deliberate; the fourth is half closed.**
   1. `unreflectSetter` on a trusted-final field is unchecked. Only a comment
      exists (`lang_invoke.rs:11189`); there is no `is_trusted_final` predicate
-     anywhere in the crate.
+     anywhere in the crate. **Re-read 2026-08-12 and deliberately still not
+     written.** The JDK rule is narrow and knowable —
+     `MemberName.isTrustedFinalField()` is `final && (static || the declaring
+     class is hidden or a record)`, so `static final` may never be set and a
+     plain instance `final` may — but writing it blind is how the
+     `setAccessible`-then-`unreflectSetter` idiom that every deserialization
+     framework uses would start throwing. It wants the paired ALLOW/DENY probe
+     this record already asks for, not a third lane's guess.
   2. The **module/`exports`** half for `find*`/`unreflect*` is still absent by
      design — neither gate calls any `check_reflection_*`.
   3. `unreflectSpecial`'s `specialCaller != lookupClass()` conjunct is not
      enforced; the reason is in source at `lang_invoke.rs:4385` and `:4430`.
-  4. **No vector asserts the POSITIVE.** `regression-suite/src/RJdkModule.java`
-     still carries only the `newInstance()` witness at `:172`; the
-     `internal.getMethod("greet").invoke(...)` assertion this record asks for
-     next to `:168` was never added. The headline fix is therefore
-     **unexercised** by the corpus.
+     Unchanged, and it stays: W4-1's standing rule is that a wrong answer from
+     the `lookupClass` stack walk must never become a refusal.
+  4. **The POSITIVE vector — half closed 2026-08-12.**
+     * **CLOSED for the `unreflect*` mode gate** (the `3644142d5` fix, which had
+       no vector of any polarity). `regression-suite/src/RJdkHandles.java`
+       `accessChecks()` now asserts all three polarities in one block, ordered
+       so the accessible flag cannot do the work: `publicLookup().unreflect(
+       Holder::secret)` must throw; `MethodHandles.lookup().unreflect(` the same
+       `Method` `)` must succeed **before** anything sets the flag; and
+       `publicLookup().unreflect(` it `)` must succeed **after**
+       `setAccessible(true)`, which is the JDK's `m.isAccessible() ? IMPL_LOOKUP
+       : this` rule. Each polarity alone is passable by a broken gate; the three
+       together are not. `RJdkHandles` goes **51 → 54 checks**.
+     * **STILL OPEN for the headline `Method.invoke` exports gate.**
+       `regression-suite/src/RJdkModule.java` still carries only the
+       `newInstance()` witness at `:172`. **That file is not this lane's**; the
+       two-line addition is in the lane report as an out-of-file edit. The
+       headline fix remains **unexercised** by the corpus.
 * **RETIREMENT-20260811.md is stale on this record.** Its kept-list reason —
   *"`Field.get`/`Field.set` ask the `opens` question unconditionally … and the
   whole `Lookup.unreflect*`/`find*` family has no module check of any kind"* — is
@@ -351,14 +371,51 @@ order of directness:
 5. `regression-suite/src/RJdkModule.java:172` — the constructor witness, passing
    since wave 4; the sibling this change mirrors.
 
-No vector yet asserts the POSITIVE: a public method of a public class in a
-  non-exported module-path package must throw `IllegalAccessException` on
+6. **`regression-suite/src/RJdkHandles.java`, `accessChecks()`** — added
+   2026-08-12, the three-polarity vector for the `unreflect*` mode gate. It is
+   the *mode* half of this family, not the module half, so it does not touch the
+   headline; it is listed here because it is the first thing in the corpus that
+   fails if `lk_enforce_unreflect_access` is removed, over-fires, or ignores the
+   `accessible` flag.
+
+No vector yet asserts the POSITIVE **of the headline**: a public method of a
+  public class in a non-exported module-path package must throw
+  `IllegalAccessException` on
   `Method.invoke`. `RJdkModule` already has the module-path fixture
   (`com.cratonvm.jdkonly.svc.internal.EnGreeter`) for exactly this; adding
   `internal.getMethod("greet").invoke(...)` next to the existing
-  `newInstance()` assertion at :168 is a two-line addition and is the right
+  `newInstance()` assertion is a two-line addition and is the right
   measurement to add. (`EnGreeter.greet()` is public on a public final class in
   the encapsulated package — the fixture already has exactly the shape.)
+
+**Line numbers corrected 2026-08-12, and the patch written out**, because this
+row has now been carried across lanes on stale coordinates: the `newInstance()`
+witness is `RJdkModule.java:186-190`, not `:168`/`:172`. Insert immediately
+after `check(threw, "instantiating a class in a non-exported package must be
+refused");`:
+
+```java
+        // W6-8: the POSITIVE half. `EnGreeter.greet()` is PUBLIC on a public
+        // final class, so nothing but the module gate can refuse it -- which is
+        // why it, and not the constructor row above, is the witness for
+        // `native_method_invoke`'s exports arm. HotSpot 25 throws
+        // IllegalAccessException here with no --add-exports.
+        threw = false;
+        try {
+            internal.getMethod("greet")
+                    .invoke(internal.getDeclaredConstructor().newInstance());
+        } catch (IllegalAccessException expected) {
+            threw = true;
+        }
+        check(threw, "invoking a PUBLIC method of a class in a non-exported "
+                + "package must be refused");
+```
+
+`RJdkModule` goes 104 → 105 checks. The receiver is constructed inside the
+`try` on purpose: HotSpot refuses at the first of the two gates and pinning
+which one would make the vector depend on an ordering neither the spec nor this
+record fixes. `regression-suite/src/RJdkModule.java` was outside the 2026-08-12
+lane's file scope, so this is written down rather than applied.
 
 ## One stale expectation this change contradicts
 

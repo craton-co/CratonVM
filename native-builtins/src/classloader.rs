@@ -3271,7 +3271,24 @@ fn cl_load_class_base_delegation_rooted(
                 Ok(Some(Value::Object(Some(mirror)))) => {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
-                _ => {}
+                // W7-26 R1 -- the synthetic-mode twin of the narrowing applied to
+                // `classloader_real.rs`'s step 0. JDK 25 `ClassLoader.loadClass`
+                // wraps its parent delegation in exactly one `catch
+                // (ClassNotFoundException)`; the bare `_ =>` also caught a
+                // `LinkageError` and every `RuntimeException` the parent raised
+                // and reported the class as merely absent, turning a diagnosable
+                // failure into a wrong answer. `absorb_class_absent` keeps the
+                // fall-through for the two class-absent shapes only, tested by
+                // `ClassId` hierarchy rather than by name.
+                //
+                // The two `read_native_pin` refreshes above this `match` are
+                // GC-correctness, not style: the `invoke_virtual` ran arbitrary
+                // Java and every address captured before it is a pre-move one on
+                // the fall-through path.
+                Ok(_) => {}
+                Err(failed) => {
+                    crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                }
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
@@ -12078,28 +12095,78 @@ mod classloader_tests {
 
     // --- MethodHandles$Lookup registration tests ---
 
+    /// The class every LIVE `MethodHandles` static is registered on.
+    ///
+    /// `lookup()`, `publicLookup()` and `privateLookupIn(..)` are `static`
+    /// members of `java.lang.invoke.MethodHandles`. `MethodHandles$Lookup`
+    /// declares none of the three in any real JDK, so this module's
+    /// registrations of those names on [`LK_CLASS`] address triples that
+    /// `--real-jdk` and `--jdk-only` can never dispatch to — and
+    /// `register_classloader_natives` is itself reachable only through
+    /// `register_synthetic_overrides`, so they exist at all only in a
+    /// `--features synthetic-jdk` build.
+    const MH_STATICS_CLASS: &str = "java/lang/invoke/MethodHandles";
+
+    /// W4-1's live residual, and it is the same species as the six tests W7-62
+    /// moved out of this module: an assertion aimed only at the `LK_CLASS`
+    /// triple reads as coverage of `MethodHandles.lookup()` while guarding a
+    /// registration no live path reaches. W7-62 kept `lk_lookup` /
+    /// `lk_public_lookup` on the grounds that they ARE registered; registered
+    /// is not reachable, and the tests are the half that had to move.
+    ///
+    /// Both halves are asserted, LIVE FIRST: the first assertion is the one
+    /// that goes red if `lang_invoke::register_p63_method_handles_lookup` ever
+    /// stops registering the static, which is the failure that would actually
+    /// break a running VM. The second is kept and labelled so that dropping the
+    /// synthetic-mode twin still surfaces here rather than silently.
     #[test]
     fn test_lk_lookup_registered() {
         let r = make_registry();
-        assert!(r
-            .find(
+        assert!(
+            r.find(
+                MH_STATICS_CLASS,
+                "lookup",
+                "()Ljava/lang/invoke/MethodHandles$Lookup;"
+            )
+            .is_some(),
+            "the LIVE MethodHandles.lookup() static must stay registered"
+        );
+        assert!(
+            r.find(
                 LK_CLASS,
                 "lookup",
                 "()Ljava/lang/invoke/MethodHandles$Lookup;"
             )
-            .is_some());
+            .is_some(),
+            "this module's MethodHandles$Lookup twin (synthetic-jdk only)"
+        );
     }
 
+    /// See [`test_lk_lookup_registered`] — same rule, and this is the exact
+    /// entry point W4-1 was filed for. `publicLookup()` reaching a private
+    /// method was the defect; a green test on the unreachable `LK_CLASS` twin
+    /// was part of what made it look covered.
     #[test]
     fn test_lk_public_lookup_registered() {
         let r = make_registry();
-        assert!(r
-            .find(
+        assert!(
+            r.find(
+                MH_STATICS_CLASS,
+                "publicLookup",
+                "()Ljava/lang/invoke/MethodHandles$Lookup;"
+            )
+            .is_some(),
+            "the LIVE MethodHandles.publicLookup() static must stay registered"
+        );
+        assert!(
+            r.find(
                 LK_CLASS,
                 "publicLookup",
                 "()Ljava/lang/invoke/MethodHandles$Lookup;"
             )
-            .is_some());
+            .is_some(),
+            "this module's MethodHandles$Lookup twin (synthetic-jdk only)"
+        );
     }
 
     #[test]

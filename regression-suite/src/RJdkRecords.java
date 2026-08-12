@@ -110,7 +110,14 @@ public class RJdkRecords {
             sb.append(rc.getName()).append(':').append(rc.getType().getName()).append(' ');
             Method acc = rc.getAccessor();
             check(acc.getName().equals(rc.getName()), "accessor name");
-            check(acc.invoke(new Point(7, 8)) != null, "accessor invoke");
+            // NOT `!= null`. A reflective read that answers a boxed 0 for a
+            // field it cannot resolve -- this VM's recorded failure mode for
+            // get-field-by-name -- is non-null and was green here. The value is
+            // what the component is for.
+            Object got = acc.invoke(new Point(7, 8));
+            Object want = rc.getName().equals("x") ? Integer.valueOf(7) : Integer.valueOf(8);
+            check(want.equals(got), "accessor " + rc.getName() + " returned " + got
+                    + ", want " + want);
         }
         check(sb.toString().equals("x:int y:int "), "component list: " + sb);
 

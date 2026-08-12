@@ -56,6 +56,99 @@ import java.util.logging.StreamHandler;
 public class RJdkLogging {
     static int checks;
 
+    /**
+     * The source pair is a STATE MACHINE, not two fields, and the machine is
+     * `needToInferCaller`. JDK 25:
+     *
+     *   getSourceClassName()  { if (needToInferCaller) inferCaller(); return sourceClassName; }
+     *   setSourceClassName(s) { this.sourceClassName = s; needToInferCaller = false; }
+     *   inferCaller()         { needToInferCaller = false; CallerFinder.get().ifPresent(...); }
+     *
+     * Three properties fall out of that, and each is a defect some arrangement
+     * of CratonVM's four shadow accessors produces:
+     *
+     *  * an explicit set must NOT be overwritten by inference on the next read
+     *    — what a GETTER-ONLY retirement breaks, because the real getter would
+     *    then honour a flag the surviving shadow setter never cleared;
+     *  * setting ONE half clears the flag for BOTH, so the other half stays
+     *    null rather than being inferred — a setter that forgets the clear
+     *    fills it in, and a weaker check would call that a pass;
+     *  * a record built by hand, with no `java.util.logging.Logger` frame on
+     *    the stack, infers NOTHING: CallerFinder's latch never trips. A VM that
+     *    answers a class name here is inferring from a stack HotSpot refuses to.
+     *
+     * docs/known-issues/jdk-only/W7-56-infercaller-strict.md
+     */
+    static void sourcePairStateMachine() {
+        LogRecord explicit = new LogRecord(Level.INFO, "explicit");
+        explicit.setSourceClassName("A_CLASS");
+        explicit.setSourceMethodName("a_method");
+        check("A_CLASS".equals(explicit.getSourceClassName()),
+                "an explicit source class must survive the next read, not be overwritten by"
+                        + " inference; got " + explicit.getSourceClassName());
+        check("a_method".equals(explicit.getSourceMethodName()),
+                "an explicit source method must survive the next read; got "
+                        + explicit.getSourceMethodName());
+
+        LogRecord halfSet = new LogRecord(Level.INFO, "half");
+        halfSet.setSourceClassName("B_CLASS");
+        check("B_CLASS".equals(halfSet.getSourceClassName()),
+                "got " + halfSet.getSourceClassName());
+        check(halfSet.getSourceMethodName() == null,
+                "setting the class alone clears needToInferCaller, so the METHOD must stay null"
+                        + " rather than be inferred; got " + halfSet.getSourceMethodName());
+
+        LogRecord bare = new LogRecord(Level.INFO, "bare");
+        check(bare.getSourceClassName() == null,
+                "no java.util.logging.Logger frame is on this stack, so CallerFinder's latch"
+                        + " never trips and the pair must stay null; got "
+                        + bare.getSourceClassName());
+        check(bare.getSourceMethodName() == null,
+                "and the method half likewise; got " + bare.getSourceMethodName());
+        bare.setSourceClassName("LATE");
+        check("LATE".equals(bare.getSourceClassName()),
+                "a set AFTER a failed inference must still stick; got "
+                        + bare.getSourceClassName());
+
+        System.out.println("CK RJdkLogging sourcePair=" + explicit.getSourceClassName() + "/"
+                + explicit.getSourceMethodName() + " halfSetMethod=" + halfSet.getSourceMethodName()
+                + " bare=" + bare.getSourceClassName());
+    }
+
+    /**
+     * #59 at RECORD level rather than through the formatter, so an inference
+     * regression and a formatting regression cannot be confused for each other.
+     *
+     * Read INSIDE `publish`, deliberately. HotSpot's inference is LAZY and
+     * fails once its frames are gone, so the pair read AFTER the log call has
+     * returned is a known, measured divergence and is not asserted here.
+     */
+    static void publishedRecordCarriesItsCaller() {
+        Logger l = logger("rjdklogging.srcpair");
+        l.setUseParentHandlers(false);
+        l.setLevel(Level.ALL);
+        final String[] seen = new String[2];
+        Handler h = new Handler() {
+            @Override public void publish(LogRecord r) {
+                seen[0] = r.getSourceClassName();
+                seen[1] = r.getSourceMethodName();
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        h.setLevel(Level.ALL);
+        l.addHandler(h);
+        l.warning("SRC-PAIR-MARK");
+        l.removeHandler(h);
+
+        check("RJdkLogging".equals(seen[0]),
+                "a record published through a Logger must name the CALLING class, read during"
+                        + " publish; got " + seen[0]);
+        check("publishedRecordCarriesItsCaller".equals(seen[1]),
+                "...and the calling method; got " + seen[1]);
+        System.out.println("CK RJdkLogging publishedSource=" + seen[0] + "/" + seen[1]);
+    }
+
     static void check(boolean c, String m) {
         checks++;
         if (!c) {
@@ -410,7 +503,31 @@ public class RJdkLogging {
         String formatted = new SimpleFormatter().formatMessage(r);
         check("one=A two=B".equals(formatted),
                 "Formatter.formatMessage must substitute; got " + formatted);
-        System.out.println("CK RJdkLogging recordPayloads formatted='" + formatted + "'");
+
+        // `log(LogRecord)` is LEVEL-GATED. JDK 25's body opens with
+        // `if (!isLoggable(record.getLevel())) return;`, and this was the one
+        // member of the eight-overload `log` family that published
+        // unconditionally — so a record below the logger's threshold arrived
+        // anyway, and a caller who set a level to suppress diagnostics got
+        // them. The section above cannot see it: it runs at `Level.ALL`, where
+        // the gate admits everything, which is exactly how a missing gate
+        // hides behind a passing delivery check.
+        //
+        // Both polarities, in that order: a native that dropped every record
+        // would satisfy the negative half on its own, and the positive half
+        // after it is what stops this check from being satisfied by silence.
+        c.records.clear();
+        l.setLevel(Level.WARNING);
+        l.log(new LogRecord(Level.FINEST, "RECORD-GATE-DROPPED"));
+        check(c.records.isEmpty(),
+                "log(LogRecord) must drop a record below the logger's level; got " + c.rendered());
+        l.log(new LogRecord(Level.SEVERE, "RECORD-GATE-ADMITTED"));
+        check(c.rendered().equals(Collections.singletonList("SEVERE:RECORD-GATE-ADMITTED")),
+                "log(LogRecord) must deliver a record at or above the level; got " + c.rendered());
+        l.setLevel(Level.ALL);
+
+        System.out.println("CK RJdkLogging recordPayloads formatted='" + formatted
+                + "' recordGate=ok");
     }
 
     /**
@@ -442,6 +559,33 @@ public class RJdkLogging {
                 "the formatted output must contain the logged message; got [" + text + "]");
         check(text.contains("BYTES-MARK-TWO"),
                 "the supplier overload must reach the stream too; got [" + text + "]");
+        // NOTE, and it is a real hole rather than an oversight: this is a
+        // `contains` over an English token, and an all-English rendering
+        // satisfies it whatever the format locale is — so a VM whose locale
+        // data collapsed back to `en` passes. The locale-sensitive half of
+        // SimpleFormatter's default pattern is its DATE prefix
+        // (`%1$tb %1$td, %1$tY … %1$Tp`), and an assertion on it would be
+        // date-dependent, which the suite forbids. The locale-sensitivity
+        // assertion therefore lives in `RStrings` (`DecimalFormatSymbols` vs
+        // `%,.2f`), where the surface is one CratonVM implements per-locale and
+        // the check is an implication rather than a pinned rendering. Do not
+        // "strengthen" this line into a month name.
+        //
+        // That prefix is nonetheless where TWO measured defects lived, and both
+        // were found by the cross-VM diff over `streamBytes` below rather than
+        // by any assertion in this file — each cost exactly one character per
+        // rendered line, `2M + 2H + 167` bytes total:
+        //   * the MONTH (`%1$tb`) came from hard-coded English tables in
+        //     `native-builtins/src/lang_string.rs`, so it rendered `Aug` where
+        //     HotSpot rendered this host's locale's four-character form —
+        //     W7-91-format-date-symbols-hardcoded-english.md;
+        //   * the HOUR (`%1$tl`, unpadded 12-hour) came from a system default
+        //     zone that was the string `"UTC"` on every host, so it rendered
+        //     one digit where HotSpot rendered two —
+        //     W7-92-system-timezone-answers-utc.md.
+        // `defaultZoneReachesTheFormatter()` below is the durable, zone- and
+        // month-agnostic cover for the second; there is no app-level witness
+        // for either, which is the point being recorded here.
         check(text.contains("WARNING"),
                 "SimpleFormatter must render the level name; got [" + text + "]");
         // SimpleFormatter's default pattern renders the SOURCE class and
@@ -495,6 +639,107 @@ public class RJdkLogging {
         System.out.println("CK RJdkLogging handlerLevelGate=ok bytes=" + text.length());
     }
 
+    /**
+     * THE DATE PREFIX'S ZONE. `SimpleFormatter.format` renders
+     * `ZonedDateTime.ofInstant(record.getInstant(), ZoneId.systemDefault())`,
+     * so the clock reading in every line {@link #formattedOutputIsRealBytes()}
+     * captures is the SYSTEM DEFAULT ZONE's. Until W7-92 CratonVM's system
+     * default zone was UTC on every host — `TimeZone.getSystemTimeZoneID`
+     * returned the literal string `"UTC"`, and in `--real-jdk` mode the
+     * `TimeZone.getDefault()` native fell back to the same constant — so every
+     * logged timestamp on a host that is not at UTC was off by a whole offset.
+     *
+     * Nothing here pins a zone, an offset, a month, a clock reading or a byte
+     * count. A Java program cannot know its host's zone except through the JVM,
+     * so this defect has NO app-level witness; the two quantities below are
+     * therefore PRINTED for the same-session cross-VM diff, which is what
+     * caught it. `getRawOffset()` is the printed one on purpose: it is a
+     * per-zone constant, so it is stable across the two VMs' different start
+     * instants and across a DST transition, and it is identical for every IANA
+     * id that shares the host's platform zone — so it does not go red merely
+     * because the two VMs spell the zone's NAME differently.
+     *
+     * The `check()` is an implication that holds in every zone in every month:
+     * the formatter's clock reading must be the record's own instant expressed
+     * in the zone the JVM itself calls default. It does NOT catch W7-92, where
+     * both were UTC and agreed. It catches a HALF fix — which, with two
+     * independent producers of the default zone on two dispatch routes, is the
+     * likely way this regresses.
+     */
+    static void defaultZoneReachesTheFormatter() throws Exception {
+        java.util.TimeZone def = java.util.TimeZone.getDefault();
+        check(def != null, "TimeZone.getDefault() returned null");
+        java.time.ZoneId zone = java.time.ZoneId.systemDefault();
+        check(zone != null, "ZoneId.systemDefault() returned null");
+
+        Logger l = logger("rjdklogging.zone");
+        l.setUseParentHandlers(false);
+        l.setLevel(Level.ALL);
+        Capture c = new Capture();
+        l.addHandler(c);
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        StreamHandler sh = new StreamHandler(sink, new SimpleFormatter());
+        sh.setLevel(Level.ALL);
+        l.addHandler(sh);
+        // One record, two handlers: the Capture keeps the very object the
+        // StreamHandler formatted, so the instant compared below is the
+        // formatter's own input and not a second reading of the clock.
+        l.warning("ZONE-MARK");
+        sh.flush();
+        String text = sink.toString("UTF-8");
+        l.removeHandler(sh);
+        l.removeHandler(c);
+        sh.close();
+        check(c.records.size() == 1, "the Capture must hold the formatted record");
+        java.time.Instant when = c.records.get(0).getInstant();
+        check(when != null, "LogRecord.getInstant() returned null");
+
+        // SimpleFormatter's DEFAULT pattern only — a run that overrides it
+        // through the system property or a logging.properties has a different
+        // prefix and this implication does not apply to it.
+        String pattern = System.getProperty("java.util.logging.SimpleFormatter.format");
+        if (pattern == null) {
+            pattern = LogManager.getLogManager()
+                    .getProperty("java.util.logging.SimpleFormatter.format");
+        }
+        boolean defaultPattern = pattern == null;
+        if (defaultPattern) {
+            // `%1$tl:%1$tM:%1$tS` — 12-hour clock WITHOUT padding (so hour 12
+            // for midnight and noon), then two padded fields.
+            java.time.ZonedDateTime zdt = java.time.ZonedDateTime.ofInstant(when, zone);
+            int hour12 = zdt.getHour() % 12 == 0 ? 12 : zdt.getHour() % 12;
+            // Built with String.format, not concatenation: `%1$tl` and friends
+            // go through java.util.Formatter's localized digits, and a locale
+            // whose zero digit is not ASCII '0' would make a hand-built string
+            // disagree with the formatter for a reason that is not a defect.
+            String clock = String.format("%d:%02d:%02d", hour12, zdt.getMinute(), zdt.getSecond());
+            check(text.contains(clock),
+                    "SimpleFormatter must render the record's instant in ZoneId.systemDefault()"
+                            + " (" + zone + "): expected the clock reading " + clock
+                            + " in [" + text + "]");
+        }
+
+        // `ZoneId.systemDefault()` IS `TimeZone.getDefault().toZoneId()` by
+        // definition, and the two reach it through different code in CratonVM,
+        // so their agreement is worth reading back. Reported rather than
+        // asserted, and the throw is caught: a `toZoneId()` that fails is
+        // evidence for the next lane, not a reason for this vector to die
+        // somewhere other than at the thing it is gating.
+        String zoneAgrees;
+        try {
+            zoneAgrees = String.valueOf(zone.equals(def.toZoneId()));
+        } catch (RuntimeException e) {
+            zoneAgrees = "threw:" + e.getClass().getSimpleName();
+        }
+        // Printed, not asserted — see this method's doc comment. `getRawOffset`
+        // is a per-zone constant in milliseconds, so this line is identical on
+        // both VMs whenever they agree about the host's zone and differs by the
+        // whole offset when they do not.
+        System.out.println("CK RJdkLogging defaultZoneRawOffsetMs=" + def.getRawOffset()
+                + " zoneAgrees=" + zoneAgrees
+                + " defaultPattern=" + defaultPattern);
+    }
+
     public static void main(String[] args) throws Exception {
         logManagerSingleton();
         getLoggerIdentityAndParents();
@@ -503,8 +748,11 @@ public class RJdkLogging {
         parentHandlerDelivery();
         supplierOverloads();
         recordPayloads();
+        sourcePairStateMachine();
+        publishedRecordCarriesItsCaller();
         formattedOutputIsRealBytes();
         handlerLevelIsASecondGate();
+        defaultZoneReachesTheFormatter();
         System.out.println("CK RJdkLogging checks=" + checks);
         System.out.println("PASS RJdkLogging (" + checks + " checks)");
     }
