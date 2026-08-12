@@ -130,11 +130,44 @@ asks first:
 | `afterClose.scope.isAlive` | `false` | `true` |
 
 Unstable **before any `allocate()`**, and unstable for an arena that never
-allocates at all. So the state word never survived its own write, and the rival
-allocator's cross-layout write (§4.3) — which would also have clobbered it — is
-not the cause of this. It is a separate defect, fixed anyway.
+allocates at all. So the rival allocator's cross-layout write (§4.3) — which
+would also have clobbered the state word — is not the cause of this. It is a
+separate defect, fixed anyway.
 
-### 3.3 Why the write does not survive
+### 3.3 The failing predicate, read directly
+
+§3.1 reaches `p67_session_modelled` by eliminating four other predicates. That
+is sound but it is still elimination, so `probes/MemorySessionModelledProbe.java`
+asks the last one on its own, with no arena, no segment and no resolution chain
+in the way: take a session object, call `MemorySessionImpl.close()` **directly**
+on it by reflection, then ask `isAlive()`.
+
+| row | HotSpot | CratonVM |
+|---|---|---|
+| `beforeClose.isAlive` | `true` | `true` |
+| `close` | `ok` | `ok` |
+| `afterClose.isAlive` | **`false`** | **`true`** |
+| `arenaScope.close` | `IllegalStateException: Already closed` | `ok` |
+| `arenaScope.afterClose.isAlive` | `false` | `true` |
+
+CratonVM's `close` native is `p67_session_just_close`, which opens
+`if !p67_session_modelled(session) { return Ok(()) }` and otherwise writes the
+state word; `isAlive` is `!p67_session_modelled(session) || state == 1`. A
+modelled session therefore *must* answer `false` on the row after its own
+`close()`. It answers `true`. **`p67_session_modelled` is false, measured on the
+one object, with nothing else in the chain.**
+
+Combined with the layout instrument's silence on this class — which for
+`classify(4, real)` means `real == 4`, so `object_num_fields` is 4 and the width
+half of the predicate holds — the failing half is
+`matches!(ctx.get_field(session, 0), Value::Int(_))`: **the state word does not
+read back as an int.**
+
+(HotSpot's `arenaScope.beforeClose.isAlive` is already `false` because the row
+above closed the same session object — `seg.scope()` and `arena.scope()` are one
+object there. That is the contrast the probe is for.)
+
+### 3.4 Why the write does not survive — inferred, not measured
 
 Source-level, and the one step of the chain that is not measured here.
 
@@ -142,10 +175,25 @@ In Compatible mode the carrier is the **real, loaded**
 `jdk/internal/foreign/MemorySessionImpl`, which declares `resourceList` and
 `owner` (references) and `state` and `acquireCount` (ints). The model wrote its
 `Int` state word into **slot 0**, and on that class slot 0 is a declared
-reference. A primitive written into a declared-reference compact slot does not
-read back as a `Value::Int` — that family is W7-84-primitive-in-reference-store.md,
-which converged the four heaps on auto-boxing; whatever the read returns here it
-is measurably not an `Int`, because `p67_session_modelled` answers false.
+reference. That is the primitive-in-a-reference-slot family,
+W7-84-primitive-in-reference-store.md.
+
+**This much is honest inference and not measurement, and one fact cuts against
+the simple version of it.** W7-84 converged all four heaps on auto-boxing with
+an un-boxing read, and HANDOFF-20260812.md records that
+`cargo test -p cratonvm-gc --test primitive_in_reference_slot` passes 10/10
+including `every_collector_agrees_on_a_primitive_in_a_reference_slot` — on a
+tree this binary was built from. So "the primitive is dropped" is *not* a
+sufficient account: either this object is not on the arm that test covers, or
+`NativeContext::get_field` does not reach the un-boxing read. Naming which is a
+question for a lane that can build and instrument the heap, and it is left open
+rather than guessed at (§6.7).
+
+What is measured, and what the repair rests on, is narrower and enough: slot 0
+of this object does not read back as a `Value::Int`, and slot 0 is the one slot
+in the four that the real class types as a reference and the model used for an
+int. Putting the int in the class's own int field removes the question rather
+than answering it.
 
 This is why the model looks correct in every unit test and in `--synthetic-jdk`:
 there the carrier is a fabricated stub with **no** declared fields, the slots are
@@ -372,7 +420,14 @@ Named exactly, because "the gate works now" would be the wrong summary.
    singleton (`NULL.scope==global.scope` is `true` on HotSpot, `false` here).
    Harmless for liveness because nothing closes the global arena, so it is
    recorded rather than fixed.
-7. **The `state` encoding collision.** The model writes `1 = open` / `0 = closed`
+7. **Why the slot-0 write does not survive is not fully explained** (§3.4).
+   That slot 0 does not read back as an `Int` is measured; whether the value is
+   dropped, boxed-without-an-unboxing-read, or something else needs a lane that
+   can build and instrument the heap. The repair does not depend on the answer —
+   it stops writing an int into a reference slot — but the next reader should
+   not take §3.4 for a closed question, because W7-84's own gc-crate test passes
+   on this tree.
+8. **The `state` encoding collision.** The model writes `1 = open` / `0 = closed`
    into the real class's `state` field, whose JDK meaning is `0 = OPEN`,
    `-1 = CLOSED`, `1 = NONCLOSEABLE`. Every method that reads `state` is on
    `force_native_over_real_jdk_bytecode`'s list for `MemorySessionImpl`, and no
@@ -452,7 +507,31 @@ has none: its output is runtime class names, which differ between the VMs by
 design, and an expected file would assert HotSpot's implementation classes as
 though they were a contract.
 
-## 9. The single next step
+## 9. This record is NOT discharged by the 70/0 suite green
+
+HANDOFF-20260812.md established that `run.sh` schedules `CORE_CLASSES` and
+`JDKONLY_CLASSES` only, and that **`probes/` is never run at any `SUITE=`
+value**. Every piece of evidence here is a probe. So a green regression run is
+non-regression evidence for this change and nothing more: it says the widening
+in §5.1 broke none of the scheduled fixtures, which is worth knowing and is not
+the same as showing the gate now fires.
+
+Checked rather than assumed. Grepping all 70 scheduled classes (the
+`CORE_CLASSES`/`JDKONLY_CLASSES` lists read out of `regression-suite/run.sh`)
+for `java.lang.foreign` or `Arena.` returns exactly one file,
+`regression-suite/src/RForeignLayoutJdkInterfaces.java` — and its only hit is a
+**javadoc sentence** explaining that `MemorySegment` is sealed and so cannot
+receive a foreign implementor. It makes no FFM call. **No scheduled fixture
+opens an `Arena`**, so there is no vector on the defect path today, and none of
+the §5.1 widenings can be reached by the suite either.
+
+Writing one is the honest way to make this record dischargeable, and it is a
+smaller job than the probes: close an arena and assert the throw, plus the two
+over-correction arms from §5.2 (a live arena still reads and writes; a global or
+heap segment still does). Both assertions in one fixture, because the arm that
+catches an over-correction is the arm a "fix" is most likely to have broken.
+
+## 10. The single next step
 
 **Run the two behavioural probes on a binary built from this branch.** Every
 CratonVM column here is the *before*; the *after* column has never been
