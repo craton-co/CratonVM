@@ -4817,6 +4817,29 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
+    // not addable. `Map.values`: "The collection supports element removal ... It
+    // does not support the `add` or `addAll` operations"; the JDK's
+    // `HashMap$Values extends AbstractCollection`, whose `add` is a bare
+    // `throw new UnsupportedOperationException()`.
+    //
+    // `values.addUnsupported` measured `m.values().add(99)` returning `true`
+    // here, leaving a value in the snapshot that no key in `m` maps to.
+    //
+    // The marker is the same one `native_al_remove_obj` / `native_al_clear` /
+    // the iterator's `remove()` already consult to write removals through, so
+    // this adds no new notion of "is a view" — it answers the question those
+    // three already ask. A plain `ArrayList` cannot match it: the trailing
+    // capacity slot of a normal list is null, and this test requires both a
+    // non-null trailing slot AND `length > size`.
+    if values_view_source(ctx, this).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     // GC-SAFETY: `al_ensure_capacity` allocates (and can GC) internally on a
@@ -10852,15 +10875,57 @@ fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // hashCode/equals (arbitrary, GC-capable bytecode), and the DEFAULT value
     // sat raw in `args` across it — the common absent-key branch then
     // returned a pre-move address. Pin the default across the lookup.
+    //
+    // `this` and `key` are pinned for the same reason, added with the
+    // `containsKey` re-ask below: that second lookup needs BOTH of them AFTER
+    // the first one has run arbitrary bytecode, and re-reading them out of
+    // `args` would hand the disambiguating question a pre-move receiver — the
+    // very defect this comment block was written about, one call later.
+    let this0 = args.first().copied().unwrap_or(Value::Object(None));
+    let key0 = args.get(1).copied().unwrap_or(Value::Object(None));
     let default0 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let this_pin = pin_value(ctx, this0);
+    let key_pin = pin_value(ctx, key0);
     let default_pin = pin_value(ctx, default0);
+    let pin_base = [this_pin, key_pin, default_pin]
+        .into_iter()
+        .find(|p| *p != usize::MAX);
     let result = native_map_get(ctx, args);
+    let this_now = read_pinned_elem(ctx, this_pin, this0);
+    let key_now = read_pinned_elem(ctx, key_pin, key0);
     let default_now = read_pinned_elem(ctx, default_pin, default0);
-    if default_pin != usize::MAX {
-        ctx.unpin_native_roots(default_pin);
+    if let Some(base) = pin_base {
+        ctx.unpin_native_roots(base);
     }
     match result? {
-        Some(Value::Object(None)) => Ok(Some(default_now)),
+        // A null answer from `get` is ambiguous in exactly the way
+        // `Map.getOrDefault` is specified to resolve: "the value to which the
+        // specified key is mapped, or `defaultValue` if this map contains **no
+        // mapping** for the key". A key present with a null value has a
+        // mapping, so it answers `null` — not the default.
+        //
+        // `HashMap.getOrDefaultOverNullValue` measured `DEFAULT` here against
+        // HotSpot's `null`, after `nm.put("k", null)`. `HashMap.getOrDefault`
+        // reads the NODE (`(e = getNode(key)) == null ? defaultValue : e.value`)
+        // and so never has to ask twice; this path only has the value, so it
+        // asks the second question the `Map` interface's own default
+        // implementation asks — `(((v = get(key)) != null) || containsKey(key))`.
+        //
+        // The extra `containsKey` costs one more lookup on a MISS, which is the
+        // common case for this method. That is the price of the distinction and
+        // the interface default pays it too; the alternative is answering
+        // "absent" for a mapping that exists, which no caller can detect.
+        Some(Value::Object(None)) => {
+            let present = matches!(
+                native_map_contains_key(ctx, &[this_now, key_now])?,
+                Some(Value::Int(1))
+            );
+            if present {
+                Ok(Some(Value::Object(None)))
+            } else {
+                Ok(Some(default_now))
+            }
+        }
         other => Ok(other),
     }
 }
@@ -12856,6 +12921,34 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // A keySet()/entrySet() view is not addable. `Map.keySet`: "The set supports
+    // element removal ... It does not support the `add` or `addAll`
+    // operations"; the JDK's `HashMap$KeySet extends AbstractSet`, and
+    // `AbstractCollection.add` is a bare `throw new
+    // UnsupportedOperationException()`.
+    //
+    // `keySet.addUnsupported` measured `m.keySet().add("nope")` returning
+    // normally here. That is worse than it looks: the key landed in the VIEW's
+    // backing and not in `m`, so the caller was left holding a "view" that
+    // disagrees with the map it is a view of — the same silent-divergence shape
+    // the write-through rows are about, arrived at from the other side.
+    //
+    // The predicate is the view marker itself, not a class-name test: an
+    // ordinary `HashSet`'s backing is a real `java/util/HashMap` with fewer
+    // than `VIEW_BACKING_FIELDS` slots, so `view_backing_source` answers `None`
+    // for it by construction. Construction of the view is unaffected —
+    // `make_view_set_of` populates the backing through `native_map_put` and
+    // never comes through here.
+    if view_backing_source(ctx, backing).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                // HotSpot's is message-less; `thrownDetail` prints a message
+                // when there is one.
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // put(element, PRESENT) — the previous value being null is how this
     // reports "the element was not already in the set". See `present_marker`
     // for why the marker must be a reference.
@@ -15428,6 +15521,36 @@ fn native_collections_unmodifiable_list(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `Collections.unmodifiableList` is idempotent by identity:
+    //
+    // ```java
+    // if (list.getClass() == UnmodifiableList.class ||
+    //     list.getClass() == UnmodifiableRandomAccessList.class)
+    //     return (List<T>) list;
+    // ```
+    //
+    // `unmodifiableList.rewrapIsNewObject` measured
+    // `Collections.unmodifiableList(un) == un` as `false` here against HotSpot's
+    // `true`. A second wrapper is not merely wasteful — it is a different
+    // object, so a caller that re-wraps defensively and then compares by
+    // identity (or uses the result as a map key) sees two distinct lists where
+    // the JDK has one, and every extra layer costs another delegation hop on
+    // every read.
+    //
+    // The test is exact class identity, as the JDK's is, and NOT
+    // [`unmod_is_immutable`]: a `List.of(...)` shares this wrapper class here
+    // but reports `ImmutableCollections$ListN` from `getClass()`, and the JDK
+    // does wrap that one — its two `==` comparands are the `Collections$Unmodifiable*`
+    // classes only. So the immutable marker has to exclude, not include.
+    if ctx.object_num_fields(src) > UNMOD_FIELD_IMMUTABLE
+        && ctx
+            .class_name_of_id(ctx.class_id_of_object(src))
+            .as_deref()
+            == Some(UNMOD_LIST_CLASS)
+        && !matches!(ctx.get_field(src, UNMOD_FIELD_IMMUTABLE), Value::Int(1))
+    {
+        return Ok(Some(Value::Object(Some(src))));
+    }
     let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src)?;
     Ok(Some(Value::Object(Some(w))))
 }
@@ -16621,6 +16744,26 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // `HashMap.merge` opens with
+    // `if (value == null || remappingFunction == null) throw new NullPointerException();`
+    // — `Map.merge`: "@throws NullPointerException if ... the value or
+    // remappingFunction is null". `Map.mergeNullValueThrows` measured
+    // `m.merge("g", null, Integer::sum)` returning normally here.
+    //
+    // The refusal is not decoration. A null value means "remove the mapping" to
+    // the rest of this function (see the `new_val == null` branch below, which
+    // is the correct handling of a null RESULT), so a caller that reached
+    // `merge` with a null argument silently got a delete where it asked for an
+    // insert — and on an absent key, a silent no-op.
+    //
+    // The refusal is on an explicitly-passed null, not on a missing argument:
+    // `args.get(3)` returning `None` is a malformed call, and turning that into
+    // an NPE would report a dispatch defect as a program error.
+    if matches!(value, Value::Object(None))
+        || matches!(args.get(3), Some(Value::Object(None)))
+    {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
     let bi_function = match args.get(3) {
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
