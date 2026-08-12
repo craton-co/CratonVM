@@ -2208,7 +2208,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -2593,7 +2593,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3298,7 +3298,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3640,7 +3640,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord);
@@ -3850,7 +3850,7 @@ pub(crate) fn native_cond_await_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_raw, unit_ordinal).max(0) as u64;
@@ -4517,7 +4517,7 @@ pub(crate) fn native_sem_try_acquire_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2, // MILLISECONDS
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -5192,7 +5192,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;

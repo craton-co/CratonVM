@@ -32029,6 +32029,35 @@ fn native_cb_init_action(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     native_cb_init(ctx, args)
 }
 
+/// Throw the REAL `java.util.concurrent.BrokenBarrierException` /
+/// `TimeoutException` for a barrier failure, rather than an
+/// `IllegalStateException` whose *message* merely names them.
+///
+/// `CyclicBarrier.await` declares both as checked exceptions and callers
+/// discriminate on the TYPE: `catch (TimeoutException)` to retry vs
+/// `catch (BrokenBarrierException)` to abandon the generation. An
+/// `IllegalStateException` matches neither, so a correct caller propagates a
+/// fatal error where HotSpot would have recovered.
+///
+/// Falls back to the historic `IllegalStateException` when the class cannot be
+/// constructed (synthetic-JDK mode without these classes registered), so no
+/// configuration loses the failure entirely.
+fn cb_throw(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
+    match ctx.new_object_initialized(class_name, "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalStateException {
+            message: format!(
+                "{}: CyclicBarrier await",
+                class_name.rsplit('/').next().unwrap_or(class_name)
+            ),
+        }
+        .into(),
+    }
+}
+
+const CB_BROKEN_BARRIER: &str = "java/util/concurrent/BrokenBarrierException";
+const CB_TIMEOUT: &str = "java/util/concurrent/TimeoutException";
+
 /// Shared barrier-await. `deadline: None` blocks indefinitely (the plain
 /// `await()`, which previously returned WITHOUT waiting for the other
 /// parties — wrong for any real barrier user once the storage works).
@@ -32044,10 +32073,7 @@ fn cb_await_inner(
     ctx.monitor_enter(this);
     if cb_get(ctx, this, CB_H_BROKEN) != 0 {
         ctx.monitor_exit(this);
-        return Err(RuntimeError::IllegalStateException {
-            message: "BrokenBarrierException".to_string(),
-        }
-        .into());
+        return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
     }
     let parties = cb_get(ctx, this, CB_H_PARTIES).max(1);
     let count = cb_get(ctx, this, CB_H_COUNT);
@@ -32074,10 +32100,7 @@ fn cb_await_inner(
         }
         if cb_get(ctx, this, CB_H_BROKEN) != 0 {
             ctx.monitor_exit(this);
-            return Err(RuntimeError::IllegalStateException {
-                message: "BrokenBarrierException".to_string(),
-            }
-            .into());
+            return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
         }
         let wait_ms = match deadline {
             Some(dl) => {
@@ -32088,10 +32111,7 @@ fn cb_await_inner(
                     let notify_result = ctx.monitor_notify_all(this);
                     ctx.monitor_exit(this);
                     notify_result?;
-                    return Err(RuntimeError::IllegalStateException {
-                        message: "TimeoutException: CyclicBarrier await timed out".to_string(),
-                    }
-                    .into());
+                    return Err(cb_throw(ctx, CB_TIMEOUT));
                 }
                 bounded_monitor_wait_ms(remaining, 10)
             }
@@ -32127,7 +32147,7 @@ fn native_cb_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
