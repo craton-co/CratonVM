@@ -7294,16 +7294,101 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
 // java.nio — ByteBuffer, Channels (Phase 23)
 // ===========================================================================
 
-/// ByteBuffer layout: 5-field synthetic
+// ByteBuffer layout: CratonVM's 5-field SYNTHETIC one. It is not
+// `java/nio/ByteBuffer`'s layout and never was — the real one, `javap -p` on
+// Eclipse Adoptium 25.0.3.9, transitive, `static` excluded, superclass first
+// (W7-76-bytebuffer-alias-residuals.md re-derived it independently of W7-58
+// and W7-69 and agrees with both):
+//
+//     java.nio.Buffer:      mark(0) position(1) limit(2) capacity(3)
+//                           address(4) segment(5)
+//     java.nio.ByteBuffer:  hb(6) offset(7) isReadOnly(8) bigEndian(9)
+//                           nativeByteOrder(10)
+//     java.nio.HeapByteBuffer: declares NO instance fields — the 11 above are
+//                           the whole of it.
+//
+// So of the five below, only `position` and `limit` mean the same thing on
+// both layouts, and that is a coincidence of declaration order.
+//
+// Every production reader in this module resolves BY NAME first and reaches
+// these indices only when the name does not resolve — the standing W4-4
+// remedy, and the reason these constants have survived. W7-76 established
+// per slot whether a real receiver can reach the numeric arm at all; the
+// verdicts live on the constants themselves, so the next reader does not
+// re-derive them and, in particular, does not renumber one crate's copy.
 const BB_FIELD_ARRAY: usize = 0; // byte[] backing array
 const BB_FIELD_POS: usize = 1; // Int position
 const BB_FIELD_LIMIT: usize = 2; // Int limit
 const BB_FIELD_CAPACITY: usize = 3; // Int capacity
+/// Synthetic-layout `mark`. **On the real layout slot 4 is
+/// `java.nio.Buffer.address`, a `long`** — see [`BB_ADDRESS_SLOT`], which is
+/// the same index under the name of what is really there.
+///
+/// Reachability, W7-76: `buf_read_mark`'s by-name read of `mark` resolves on
+/// every real receiver (`Buffer.mark` is a declared `int`), so this fallback
+/// is DEAD on the real layout and live only on the synthetic one, where it is
+/// correct. `buf_set_mark`'s write is not dead — it is unconditional — which
+/// is why that function saves and restores `address` around it.
 const BB_FIELD_MARK: usize = 4; // Int mark (-1 = not set)
 const BB_NUM_FIELDS: usize = 5;
 
-/// The `BB_FIELD_*` constants above, restated as a machine-readable
-/// `(slot, field name)` table for the READ-side alias census.
+/// Slot 4 again, under the name of what is really there on the real layout:
+/// `java.nio.Buffer.address`.
+///
+/// **Deliberately the same index as [`BB_FIELD_MARK`], and deliberately not a
+/// renumber.** W7-76 chose name-resolution over renumbering here for a reason
+/// that is a property of the tree rather than a preference:
+///
+/// * On the REAL layout slot 4 *is* `address`, so `bb_resolve_direct_address`'s
+///   numeric fallback is right — and it is the one fallback in this family a
+///   real receiver genuinely reaches, because a real `HeapByteBuffer` carries
+///   `address = ARRAY_BYTE_BASE_OFFSET = 16`, which
+///   [`is_plausible_native_addr`] refuses, dropping through to this read.
+/// * On `native-builtins`' six-slot synthetic layout slot 4 is *also* the
+///   direct address: `servlet.rs`'s independently-declared `BB_MARK = 4`
+///   carries the `NativeMemoryTable` pointer that `s2_bb_alloc_direct` seeds,
+///   and those buffers are precisely the receivers this module's direct arm
+///   exists to serve.
+///
+/// So moving `mark` off 4 in this crate alone would move the disagreement
+/// rather than close it — W7-68-live-under-allocations.md §3.2's `FileChannel`
+/// rule, met here in the direction where the shared index is the CORRECT one.
+/// What was actually wrong was that one index carried one name while three
+/// call sites held two different beliefs about it; both beliefs are now named,
+/// and both are published in [`BB_SLOT_MAP`] so the census reports the wrong
+/// one and stays clean on the right one.
+///
+/// The two readers are separated only by VALUE TYPE — `Value::Int` is a mark,
+/// `Value::Long` past [`is_plausible_native_addr`] is an address. That is
+/// thin, and it is what the census row is for.
+const BB_ADDRESS_SLOT: usize = BB_FIELD_MARK;
+
+/// The slot [`bb_resolve_heap_offset`]'s numeric fallback reads, expecting
+/// `ByteBuffer.offset`. It was a bare `6` until W7-76; naming it is the point
+/// of the exercise, because on the real layout **slot 6 is `hb`** — the
+/// backing `byte[]` — and `offset` is 7.
+///
+/// W7-76's verdict: right on NO layout, and reachable on none of them.
+///
+/// * Real layout: 6 is `hb`, a reference. The `Value::Int` match is the only
+///   thing between it and a fabricated offset — and it is unreachable anyway,
+///   because `offset` is a declared `int` on every real `ByteBuffer` subclass,
+///   so the by-name arm above always answers.
+/// * CratonVM's five-slot synthetic layout: there is no slot 6.
+/// * `native-builtins`' six-slot synthetic layout: slot 6 is `BB_NATIVE_ID`,
+///   a `Long` alloc id — refused by the same match. Its typed views encode
+///   their byte start at slot 4 as `-(start + 1)` (`s2_bb_int_byte_off`), not
+///   here.
+///
+/// Not renumbered to 7, because a second numeric guess buys nothing the
+/// by-name arm does not already answer on every receiver that has the field.
+/// Not deleted, because `bb_get_bulk_reads_real_heap_layout_slot_hb` in this
+/// file's test module drives exactly this arm, and retiring a live test on a
+/// branch that cannot run `cargo` is how a silent behaviour change ships.
+const BB_HEAP_OFFSET_FALLBACK_SLOT: usize = 6;
+
+/// The constants above, restated as a machine-readable `(slot, field name)`
+/// table for the READ-side alias census.
 ///
 /// W7-59-layout-detector-coverage.md section 6 named exactly this gap: the
 /// per-native slot maps are `const F_x: usize = k` constants "with no
@@ -7311,22 +7396,56 @@ const BB_NUM_FIELDS: usize = 5;
 /// is `mark`, not `hb`". This is that link, and it is `const` data — it costs
 /// nothing at runtime and nothing when the flag is off.
 ///
-/// Swept against the loaded `java/nio/ByteBuffer` it reports three of these six
-/// slots as `direction=wrong-field`; see W7-69-read-side-alias-instrument.md.
-/// It is published, not repaired: every production reader below resolves by
-/// NAME first and only falls through to the slot when the name does not
-/// resolve, which is the standing W4-4 remedy, so on a real receiver these
-/// indices are the fallback rather than the answer.
+/// **W7-76 corrected the shape this table publishes**, which was wrong in two
+/// ways that pull in opposite directions:
+///
+/// 1. It was INCOMPLETE and did not say so. `bb_resolve_heap_offset`'s slot-6
+///    read — the third wrong slot, and the one
+///    W7-69-read-side-alias-instrument.md §6.3 files as a defect — was not in
+///    the table at all, so `verify_declared_slot_maps` could sweep the map
+///    clean of it forever. A table that looks total and is not reads as
+///    coverage.
+/// 2. It gave slot 4 ONE name where three call sites hold TWO beliefs.
+///    `buf_read_mark`/`buf_set_mark` believe `mark` (true on the synthetic
+///    layout, false on the real one); `bb_resolve_direct_address` believes
+///    `address` (true on both, and the live one). Publishing only `mark` made
+///    the sweep print one wrong-field row for slot 4, which reads as "the
+///    reader that reaches slot 4 is broken" when the reader that reaches it on
+///    a real receiver is correct. Both are published now: `slots` is a slice,
+///    not a map, so a slot may legitimately appear twice, and
+///    `already_reported` dedupes on `(class, slot, expected, site)` and so
+///    keeps them apart.
+///
+/// Swept against the loaded `java/nio/ByteBuffer` it should therefore report
+/// exactly three `wrong-field` rows — `0 hb→mark`, `4 mark→address`,
+/// `6 offset→hb` — and stay clean on the other five, including the second
+/// slot-4 row. Nothing here is repaired by renumbering; see [`BB_ADDRESS_SLOT`]
+/// and [`BB_HEAP_OFFSET_FALLBACK_SLOT`] for why, per slot.
 pub static BB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
     cratonvm_native_api::read_alias::SlotMap {
         class: "java/nio/ByteBuffer",
         slots: &[
+            // WRONG on the real class: 0 is `Buffer.mark`. The calibration
+            // case — a real `DirectByteBuffer` reaches it, because `hb`
+            // resolves by name to NULL rather than failing to resolve.
             (BB_FIELD_ARRAY, "hb"),
             (BB_FIELD_POS, "position"),
             (BB_FIELD_LIMIT, "limit"),
             (BB_FIELD_CAPACITY, "capacity"),
+            // WRONG on the real class: 4 is `Buffer.address`. Dead on a real
+            // receiver for the READ (`buf_read_mark` resolves `mark` by name);
+            // live for the WRITE (`buf_set_mark` is unconditional and
+            // compensates with a save/restore).
             (BB_FIELD_MARK, "mark"),
+            // The same slot, the other belief, and this one is CORRECT — the
+            // deliberate non-firing control W7-69 §3 built the instrument
+            // around, now published rather than only wired at the call site.
+            (BB_ADDRESS_SLOT, "address"),
             (BB_SEGMENT_SLOT, "segment"),
+            // WRONG on the real class: 6 is `ByteBuffer.hb`, an array, where
+            // an `Int` offset is read. Unreachable on every layout this tree
+            // has; see the constant.
+            (BB_HEAP_OFFSET_FALLBACK_SLOT, "offset"),
         ],
         origin: "native-io/src/lib.rs BB_FIELD_*",
     };
@@ -7548,6 +7667,53 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // copy bytecode relies on this value when ScopedMemoryAccess hands the
     // backing byte[] and offset to Unsafe.copyMemory.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
+    // W7-76 — HotSpot parity, and the one behaviour change in that lane.
+    //
+    // `java.nio.ByteBuffer` declares `boolean bigEndian = true` as a FIELD
+    // INITIALISER (checked in `lib/src.zip` on 25.0.3.9), so javac compiles
+    // the write into every `ByteBuffer` constructor and nothing else writes
+    // it. This allocator mints the object with a raw `alloc_object` and runs
+    // no constructor, so without the two writes below the field stays at the
+    // Java default `false`. Real `ByteBuffer.order()` is
+    //
+    //     public final ByteOrder order() {
+    //         return bigEndian ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+    //     }
+    //
+    // — `final`, reading the field directly — so no per-subclass native can
+    // correct it after the fact. HotSpot answers BIG_ENDIAN for
+    // `ByteBuffer.allocate(n)` at every size
+    // (`probes/DirectByteBufferStateProbe.java`, `fresh.allocate8.order`,
+    // measured on Eclipse Adoptium 25.0.3.9).
+    //
+    // This is NOT synthetic-only, which is why it is a parity fix rather than
+    // a synthetic-mode tidy-up. `register_nio_natives` — the registrar for
+    // `ByteBuffer.allocate`/`wrap`/`slice`/`duplicate`, all of which land here
+    // — is gated off the real-JDK arm, but `stream_decoder.rs`'s
+    // `Channels.newReader` branch calls this allocator too and
+    // `register_stream_decoder_natives` is registered unconditionally. So a
+    // Compatible-mode run mints these buffers over the real 11-field
+    // `java/nio/ByteBuffer`, where `bigEndian` resolves BY NAME, reads back
+    // `Int(0)`, and `native-builtins`' `s2_bb_order` decodes that as
+    // LITTLE_ENDIAN. s2 owns `ByteBuffer.order()` in both modes — native-io
+    // registers `order` for the six typed classes and never for ByteBuffer —
+    // so it is the reader that sees this.
+    //
+    // Same two writes for the same reason as `native-builtins/src/servlet.rs`'s
+    // `bb_write_hb` and `native-io/src/direct_buffer.rs`'s
+    // `dbb_allocate_direct0`; a third divergent copy of this seed is exactly
+    // what a shared helper would prevent, and is noted in
+    // W7-76-bytebuffer-alias-residuals.md rather than fixed here.
+    //
+    // `nativeByteOrder` is `bigEndian == (native order is big)`, i.e. false on
+    // every little-endian target — the same value as the default. Written
+    // anyway so the pair cannot drift if a big-endian target ever appears.
+    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        obj,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
     obj
 }
 
@@ -7628,7 +7794,7 @@ fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<TbView, MethodCa
     Err(MethodCallFailed::InternalError(VmError::Internal {
         message: format!(
             "Buffer has no backing storage: hb/slot{BB_SEGMENT_SLOT}/slot{BB_FIELD_ARRAY} \
-             resolved no array and address/slot{BB_FIELD_MARK} no native block \
+             resolved no array and address/slot{BB_ADDRESS_SLOT} no native block \
              (slot{BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
             ctx.get_field(this, BB_FIELD_ARRAY),
             ctx.get_field_by_name(this, "address"),
@@ -7700,19 +7866,22 @@ fn bb_resolve_heap_offset(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     // W7-69, observation only. On JDK 25 slot 6 is `ByteBuffer.hb` — the
     // backing ARRAY — and `offset` is 7. So this fallback names a reference
     // field and reads it as an `Int`; the `Value::Int` match is the only thing
-    // between it and a fabricated offset. Left as found: the by-name read above
-    // resolves on every real receiver, so repairing the index here is a
-    // different lane's call.
+    // between it and a fabricated offset.
+    //
+    // W7-76 named the literal and settled the verdict rather than leaving it
+    // to "a different lane": the arm is right on no layout and reachable on
+    // none, and is neither renumbered nor deleted. Both refusals are argued at
+    // `BB_HEAP_OFFSET_FALLBACK_SLOT`.
     if layout_alias::enabled() {
         read_alias::observe_read(
             ctx,
             this,
-            6,
+            BB_HEAP_OFFSET_FALLBACK_SLOT,
             "offset",
             "native-io/src/lib.rs::bb_resolve_heap_offset",
         );
     }
-    match ctx.get_field(this, 6) {
+    match ctx.get_field(this, BB_HEAP_OFFSET_FALLBACK_SLOT) {
         Value::Int(v) if v >= 0 => v as usize,
         _ => 0,
     }
@@ -7745,21 +7914,29 @@ fn bb_resolve_direct_address(ctx: &dyn NativeContext, this: ObjectRef) -> Option
             return Some(v);
         }
     }
-    // W7-69, observation only. `BB_FIELD_MARK` is 4, and on the REAL layout
-    // slot 4 is `address` — so this fallback is right for a reason its constant
-    // name denies. The census answers CLEAN here, and that is the second
-    // non-firing control: the instrument is keyed on what the slot MEANS, not
-    // on what the constant is called.
+    // W7-69, observation only. Slot 4 on the REAL layout is `address`, so this
+    // fallback is right — and W7-76 stopped it being spelled with a constant
+    // whose name denies that: it reads [`BB_ADDRESS_SLOT`], which is the same
+    // index under the name of what is there. The census answers CLEAN here,
+    // and that is the second non-firing control: the instrument is keyed on
+    // what the slot MEANS, not on what the constant is called.
+    //
+    // This is also the ONE numeric fallback in this family a real receiver
+    // genuinely reaches. A real `HeapByteBuffer` carries
+    // `address = ARRAY_BYTE_BASE_OFFSET = 16`; `is_plausible_native_addr`
+    // refuses it above, control arrives here, and slot 4 hands back the same
+    // `Long(16)`, which is refused again. Correct on both passes, and the
+    // refusal is what keeps `addr=0x10` out of `copy_from_native_memory`.
     if layout_alias::enabled() {
         read_alias::observe_read(
             ctx,
             this,
-            BB_FIELD_MARK,
+            BB_ADDRESS_SLOT,
             "address",
             "native-io/src/lib.rs::bb_resolve_direct_address",
         );
     }
-    match ctx.get_field(this, BB_FIELD_MARK) {
+    match ctx.get_field(this, BB_ADDRESS_SLOT) {
         Value::Long(v) if is_plausible_native_addr(v) => Some(v),
         _ => None,
     }
