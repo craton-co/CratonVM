@@ -2,6 +2,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountedCompleter;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -299,11 +300,102 @@ public class RJdkForkJoin {
         }
     }
 
+    /**
+     * The completion RECORD, as opposed to the completion FLAGS.
+     *
+     * ForkJoinTask's status is a write-once word that setDone/trySetCancelled/
+     * trySetThrown only ever OR into; the sole method that clears a bit is
+     * reinitialize(). Three consequences fall out of that, and each one is
+     * written here so that it distinguishes a correct implementation from the
+     * plausible wrong one rather than merely restating the flag it reads:
+     *
+     *   1. a later complete(v) CANNOT erase an abnormal completion, and it
+     *      cannot turn an abnormally completed task into a normal one;
+     *   2. a cancelled task's getException() is a CancellationException, not
+     *      null -- otherwise isCompletedAbnormally() and getException() give
+     *      opposite verdicts about the same task;
+     *   3. reinitialize() must make compute() RUN again, not replay a
+     *      memoised value -- a replay answers the same number, so the answer
+     *      alone proves nothing and the run counter is the real assertion.
+     */
+    static void completionRecord() {
+        // (1) complete(v) after completeExceptionally(ex).
+        ForkJoinTask<Integer> t = new RecursiveTask<Integer>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected Integer compute() {
+                return 1;
+            }
+        };
+        t.completeExceptionally(new IllegalStateException("ce-boom"));
+        // Asserted BEFORE complete(), on purpose: without these two, the three
+        // assertions after complete() cannot tell "complete() erased the
+        // record" from "completeExceptionally() never wrote one".
+        check(t.isDone(), "completeExceptionally must complete the task");
+        check(t.isCompletedAbnormally(), "completeExceptionally completes ABNORMALLY");
+
+        t.complete(99);
+        check(t.isCompletedAbnormally(), "the abnormal record survives a later complete()");
+        check(!t.isCompletedNormally(), "complete() must not fabricate a normal completion");
+        check(t.getException() instanceof IllegalStateException,
+                "the recorded throwable survives complete(): " + t.getException());
+        boolean threw = false;
+        try {
+            t.join();
+        } catch (IllegalStateException e) {
+            threw = e.getMessage().contains("ce-boom");
+        }
+        check(threw, "join() replays the throwable, not the value passed to complete()");
+
+        // (2) getException() on a task whose only fault is cancellation.
+        ForkJoinTask<Integer> c = new RecursiveTask<Integer>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected Integer compute() {
+                return 1;
+            }
+        };
+        check(c.cancel(false), "cancel a never-submitted task");
+        check(c.isCancelled() && c.isCompletedAbnormally(), "a cancelled task is abnormal");
+        // trySetCancelled ORs DONE|ABNORMAL and never touches `aux`, so
+        // getException() reaches its "no recorded throwable but abnormal"
+        // branch and allocates a fresh CancellationException.
+        Throwable cancelledEx = c.getException();
+        check(cancelledEx instanceof CancellationException,
+                "a cancelled task SAYS what went wrong: " + cancelledEx);
+
+        // (3) reinitialize().
+        final AtomicInteger runs = new AtomicInteger();
+        RecursiveTask<Integer> r = new RecursiveTask<Integer>() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected Integer compute() {
+                runs.incrementAndGet();
+                return 7;
+            }
+        };
+        check(r.invoke() == 7, "first invoke");
+        check(runs.get() == 1, "compute() ran once: " + runs.get());
+        r.reinitialize();
+        check(!r.isDone(), "reinitialize() un-completes the task");
+        check(r.invoke() == 7, "second invoke");
+        // THE discriminator. A memoised replay also answers 7; only a genuine
+        // re-execution moves this counter.
+        check(runs.get() == 2, "reinitialize() makes compute() RUN again: " + runs.get());
+
+        System.out.println("CK RJdkForkJoin completionRecord runs=" + runs.get()
+                + " cancelledEx=" + cancelledEx.getClass().getName());
+    }
+
     public static void main(String[] args) throws Exception {
         recursiveTasks();
         countedCompleter();
         parallelStreams();
         workerException();
+        completionRecord();
         System.out.println("CK RJdkForkJoin checks=" + checks);
         System.out.println("PASS RJdkForkJoin (" + checks + " checks)");
     }

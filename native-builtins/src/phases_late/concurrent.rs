@@ -7334,11 +7334,15 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 //   * `RecursiveAction.complete(Object)` was registered on neither boot path.
 //
 // The fourth — `complete(v)` on a cancelled task must still perform the
-// `setRawResult(v)` half — needs a write inside `fjp_complete_body`
-// (`native-builtins/src/phases_early.rs`), outside this lane's files. The exact
-// patch, and the verdict on the `ForkJoinPool.invoke` consequence that made
-// W6-9 defer it, are recorded in §8 of
-// docs/known-issues/jdk-only/W6-9-complete-erases-the-abnormal-record.md.
+// `setRawResult(v)` half — needed a write inside `fjp_complete_body`
+// (`native-builtins/src/phases_early.rs`), outside this lane's files. It
+// LANDED on 2026-08-11 as `fjp_state_set_raw_result`, called before
+// `fjp_state_set_done` on the side-table arm. W7-48 then measured that arm and
+// found it has no reachable caller: all three class names it tests are
+// ABSTRACT, and `method_exists` walks the superclass chain, so every Java
+// receiver takes the virtual-`setRawResult` arm instead. The patch is correct
+// and is defence in depth — see `fjt_has_own_raw_result_slot`'s header, which
+// carries the measurement.
 //
 // WHY THESE CAN LIVE HERE. `NativeMethodRegistry::register` UPDATES AN EXISTING
 // TRIPLE'S SLOT IN PLACE (the `match prior_slot` arm), and this registrar rides
@@ -7349,22 +7353,25 @@ pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry)
 // `register_essential_natives`. Whichever of those two registrars ran, one of
 // these hooks runs after it, so `fjt_get_exception` below SUPERSEDES the
 // `getException` slot installed in `register_real_jdk_forkjoin_essentials`.
-// That body is now unreachable; the patch deleting it is in W6-9 §8, so the
-// tree does not keep two registrars for one triple longer than it must.
+// That body was then unreachable, and the patch deleting it landed on
+// 2026-08-11: `register_real_jdk_forkjoin_essentials` now keeps only the
+// `completeExceptionally` registration in that loop, with a pointer here. So
+// the tree no longer holds two registrars for the `getException` triple.
 //
 // ALLOW-LISTS. `("getException", "()Ljava/lang/Throwable;")` and
 // `("complete", "(Ljava/lang/Object;)V")` are already named in both
 // (`keep_real_forkjointask_bridge`, native-api/src/registry.rs;
 // `is_forkjoin_native_override`, vm/src/runtime/interpreter/native_override.rs),
 // for all three task classes, so those two registrations are live in every
-// mode. **`("reinitialize", "()V")` is in neither**, and on the default
-// real-ForkJoinPool path `registry.rs` DROPS any Bridge on these classes whose
-// triple `keep_real_forkjointask_bridge` does not name — so until the two
-// one-line entries recorded in W6-9 §8 land, the `reinitialize` registration
-// below is live only under `CRATONVM_SYNTHETIC_FORKJOINPOOL`. That is stated
-// rather than assumed away: a registration present in neither list is the
-// `awaitQuiescence` failure mode, and half a fix that reads as a whole one is
-// what this campaign keeps finding.
+// mode. `("reinitialize", "()V")` is now named in BOTH as well — it was in
+// NEITHER when this block was written, which on the default real-ForkJoinPool
+// path would have left the registration below live only under
+// `CRATONVM_SYNTHETIC_FORKJOINPOOL`, because `registry.rs` DROPS any Bridge on
+// these classes whose triple `keep_real_forkjointask_bridge` does not name.
+// Both one-line entries landed on 2026-08-11 and each carries a comment
+// pointing at the other; keep them in step. A registration present in neither
+// list is the `awaitQuiescence` failure mode, and half a fix that reads as a
+// whole one is what this campaign keeps finding.
 
 /// `ForkJoinTask.getException()` — the recorded throwable, or a FRESH
 /// `CancellationException` for a task that is abnormal with nothing recorded.
