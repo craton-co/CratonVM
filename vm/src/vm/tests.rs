@@ -1591,7 +1591,10 @@ use std::sync::Arc;
         )
         .unwrap();
         if let Some(Value::Double(v)) = r {
-            assert!((v - std::f64::consts::PI).abs() < 1e-10);
+            // Exact. JDK 25 computes `toRadians` as `angdeg * DEGREES_TO_RADIANS`
+            // against a precomputed literal bit-identical to Rust's `PI / 180.0`,
+            // so 180.0 maps to exactly `PI`. W7-54-strictmath-fdlibm-family.md.
+            assert_eq!(v.to_bits(), std::f64::consts::PI.to_bits());
         } else {
             panic!("Expected double");
         }
@@ -14330,7 +14333,9 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!((v - 5.0).abs() < 1e-10),
+            // Exact: hypot(3, 4) is 5.0 with no rounding at all. The old 1e-10
+            // was ~10^6x `Math.hypot`'s own 1-ULP contract.
+            Value::Double(v) => assert_eq!(v.to_bits(), 5.0f64.to_bits()),
             _ => panic!("expected double"),
         }
     }
@@ -14388,7 +14393,11 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!((v - 1.0_f64.sinh()).abs() < 1e-10),
+            // Exact. `Math.sinh` IS `f64::sinh` (see `native_math_sinh`), so
+            // both sides are the same expression and a tolerance's only effect
+            // is to stop the test noticing a rewiring — e.g. onto the fdlibm
+            // body, which `StrictMath.sinh` now uses and `Math.sinh` must not.
+            Value::Double(v) => assert_eq!(v.to_bits(), 1.0_f64.sinh().to_bits()),
             _ => panic!("expected double"),
         }
     }
@@ -14436,7 +14445,9 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!(v > 1.0 && (v - 1.0) < 1e-10),
+            // Exact: `nextUp` is specified bit manipulation, not an estimate.
+            // The old bound admitted ~4.5e8 ULP of wrong answers above 1.0.
+            Value::Double(v) => assert_eq!(v.to_bits(), 1.0f64.next_up().to_bits()),
             _ => panic!("expected double"),
         }
 
@@ -14452,7 +14463,8 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!(v < 1.0 && (1.0 - v) < 1e-10),
+            // Exact: `nextDown` is specified bit manipulation.
+            Value::Double(v) => assert_eq!(v.to_bits(), 1.0f64.next_down().to_bits()),
             _ => panic!("expected double"),
         }
     }
@@ -14506,7 +14518,9 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!(v > 0.0 && v < 1e-10),
+            // Exact: `ulp(1.0)` is 2^-52 == f64::EPSILON, one specific double.
+            // `v > 0.0 && v < 1e-10` passes for around a million wrong answers.
+            Value::Double(v) => assert_eq!(v.to_bits(), f64::EPSILON.to_bits()),
             _ => panic!("expected double"),
         }
 
@@ -14522,7 +14536,8 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Float(v) => assert!(v > 0.0 && v < 1e-5),
+            // Exact: `ulp(1.0f)` is 2^-23 == f32::EPSILON.
+            Value::Float(v) => assert_eq!(v.to_bits(), f32::EPSILON.to_bits()),
             _ => panic!("expected float"),
         }
 
@@ -14583,7 +14598,9 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!(v > 1.0),
+            // Exact: `nextAfter` is specified bit manipulation, so an
+            // ordering-only assertion admits arbitrarily large divergence.
+            Value::Double(v) => assert_eq!(v.to_bits(), 1.0f64.next_up().to_bits()),
             _ => panic!("expected double"),
         }
 
@@ -14599,7 +14616,8 @@ use std::sync::Arc;
         .unwrap()
         .unwrap();
         match r {
-            Value::Double(v) => assert!(v < 1.0),
+            // Exact — see the sibling above.
+            Value::Double(v) => assert_eq!(v.to_bits(), 1.0f64.next_down().to_bits()),
             _ => panic!("expected double"),
         }
 

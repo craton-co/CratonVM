@@ -2393,8 +2393,18 @@ fn test_compile_math_sqrt_intrinsic() {
                                           // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
                                           // produced by the JIT compiler from valid bytecode and the mmap region is executable.
     let result2 = unsafe { compiled.try_call(&[input2]).expect("test JIT call") };
-    assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14);
-    // Cast: JIT ABI convention
+    // Bits, not a tolerance. IEEE 754 requires `sqrt` to be CORRECTLY ROUNDED,
+    // so there is exactly one right answer and `SQRT_2` is it. The `1e-14` this
+    // used to allow is about 45 million ULP at 1.414 — wide enough to accept a
+    // wrong instruction, a wrong operand width, or a lost rounding mode. The
+    // `sqrt(4.0)` assertion six lines up was already exact, so this was the odd
+    // one out rather than a considered choice.
+    // W7-54-strictmath-fdlibm-family.md.
+    assert_eq!(
+        f64::from_bits(result2 as u64).to_bits(), // Cast: JIT ABI convention
+        std::f64::consts::SQRT_2.to_bits(),
+        "sqrtsd must be exactly rounded"
+    );
 }
 
 #[test]

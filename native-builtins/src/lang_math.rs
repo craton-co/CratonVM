@@ -5485,7 +5485,16 @@ mod tests {
         let r = native_math_to_radians(&mut ctx, &[Value::Double(180.0)]);
         match r.unwrap() {
             Some(Value::Double(v)) => {
-                assert!((v - std::f64::consts::PI).abs() < 1e-10);
+                // Exact, not within 1e-10. JDK 25 computes this as
+                // `angdeg * DEGREES_TO_RADIANS` against a precomputed literal
+                // whose bit pattern (0x3f91df46a2529d39) is identical to Rust's
+                // `PI / 180.0`, so `toRadians(180.0)` is exactly `PI` on both —
+                // there is a single right answer and a tolerance only hides a
+                // future rewiring. (JDK 8 used `angdeg / 180.0 * PI`, a
+                // different expression that rounds differently; if this ever
+                // fails, check which formula the backing uses before widening
+                // anything.) W7-54-strictmath-fdlibm-family.md.
+                assert_eq!(v.to_bits(), std::f64::consts::PI.to_bits());
             }
             other => panic!("expected Double, got {other:?}"),
         }
@@ -5497,7 +5506,10 @@ mod tests {
         let r = native_math_to_degrees(&mut ctx, &[Value::Double(std::f64::consts::PI)]);
         match r.unwrap() {
             Some(Value::Double(v)) => {
-                assert!((v - 180.0).abs() < 1e-10);
+                // Exact — see `math_to_radians_180`. JDK 25's
+                // `RADIANS_TO_DEGREES` literal is bit-identical to Rust's
+                // `180.0 / PI`, and `toDegrees(PI)` is exactly 180.0.
+                assert_eq!(v.to_bits(), 180.0f64.to_bits());
             }
             other => panic!("expected Double, got {other:?}"),
         }
