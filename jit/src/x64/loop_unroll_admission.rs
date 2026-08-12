@@ -1218,6 +1218,8 @@ fn compile_indy_fixture(code: &[u8]) -> Option<CompiledMethod> {
         "T.f:(I)I",
         // (pc, arg_slots, ret_type, arg_type_tags, concat_site)
         vec![(19, 0, b'I', Vec::new(), 0)],
+        // elidable_init_pcs: fixture resolves no constant pool.
+        None,
     )
 }
 
