@@ -64,6 +64,7 @@ export inherited from a parent shell.
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
+| `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
@@ -818,6 +819,7 @@ export inherited from a parent shell.
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
+| `thread-containers` | `CRATONVM_THREAD_CONTAINERS` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 
 ## `CRATONVM_SECURITY`
