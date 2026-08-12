@@ -5245,8 +5245,31 @@ fn fmt_check_spec(
         if offending.is_empty() {
             Ok(())
         } else {
-            Err(FmtFault::FlagsMismatch(offending, conversion))
+            // `failMismatch` reports the LOWER-case conversion, because
+            // `Conversion.isValid` folds `%X`/`%E`/`%S` down to `x`/`e`/`s`
+            // and keeps the upper-casing in a separate internal flag. Only
+            // `UnknownFormatConversionException` sees the character as typed,
+            // since an unknown one is never folded — `%Q` really does say
+            // "Conversion = 'Q'".
+            Err(FmtFault::FlagsMismatch(
+                offending,
+                conversion.to_ascii_lowercase(),
+            ))
         }
+    };
+    // `IllegalFormatFlagsException` reports `Flags.toString(flags)` over the
+    // WHOLE set, and that set carries the JDK's INTERNAL `UPPERCASE` flag —
+    // added by `Conversion.isValid` for every upper-case conversion and
+    // rendered as `'^'`, between `'-'` and `'#'`. So `%+ X` says
+    // "Flags = '^+ '" where `%+ x` says "Flags = '+ '". `FormatSpecifier`'s
+    // own `toString` explicitly REMOVES it again, which is why `spec_text`
+    // does not carry it.
+    let all_flags = || {
+        let mut s = fmt_flags_string(flags);
+        if conversion.is_ascii_uppercase() {
+            s.insert(usize::from(s.starts_with('-')), '^');
+        }
+        s
     };
     // `checkNumeric`, shared by the integral and float families.
     let check_numeric = || -> Result<(), FmtFault> {
@@ -5256,7 +5279,7 @@ fn fmt_check_spec(
         if (flags.contains('+') && flags.contains(' '))
             || (flags.contains('-') && flags.contains('0'))
         {
-            return Err(FmtFault::IllegalFlags(fmt_flags_string(flags)));
+            return Err(FmtFault::IllegalFlags(all_flags()));
         }
         Ok(())
     };
@@ -6419,6 +6442,34 @@ fn fmt_hex_float(v: f64, prec: usize) -> String {
     }
 }
 
+/// `Formatter.addZeros` over a `digits.digitsPexp` hex float: pad the
+/// fractional hex digits out to `prec`, leaving the exponent alone.
+///
+/// `prec == 0` is the JDK's "all of the digits", where nothing is padded.
+/// This applies above 13 too — `hexDouble` stops ROUNDING at 13 hex digits
+/// but `addZeros` still pads, so `%.14a` of `Double.MIN_VALUE` is
+/// `0x0.00000000000010p-1022`.
+fn fmt_hex_pad(s: &str, prec: usize) -> String {
+    if prec == 0 {
+        return s.to_string();
+    }
+    let idx = match s.find('p') {
+        Some(i) => i,
+        None => return s.to_string(),
+    };
+    let (mant, exp) = s.split_at(idx);
+    let have = match mant.find('.') {
+        Some(dot) => mant.len() - dot - 1,
+        // `fmt_hex_digits` always writes a point, but `addZeros` adds one when
+        // it has to and this stays faithful to that.
+        None => return format!("{mant}.{}{exp}", "0".repeat(prec)),
+    };
+    if have >= prec {
+        return s.to_string();
+    }
+    format!("{mant}{}{exp}", "0".repeat(prec - have))
+}
+
 /// One value through `java.util.Formatter`'s floating-point conversions.
 ///
 /// `precision` is the spec's precision if it carried one. The DEFAULTS live
@@ -6442,7 +6493,17 @@ pub(crate) fn java_float_conversion(v: f64, spec: char, precision: Option<usize>
     if matches!(spec, 'a' | 'A') {
         // Formatter emits the prefix itself and upper-cases the digits and
         // the 'p' for %A; the exponent is decimal either way.
-        let digits = fmt_hex_float(mag, precision.map_or(0, |p| p.max(1)));
+        //
+        // The JDK normalises a MISSING precision to 0 ("assume that we want all
+        // of the digits") and an explicit `%.0a` to 1, then pads the mantissa
+        // back out to it — `if (prec != 0) addZeros(va, prec)`, outside
+        // `hexDouble`. W7-3 argued the opposite from the javadoc, that "nothing
+        // pads the digits back out, and `%.4a` of 1.0 is `0x1.0p0`, not
+        // `0x1.0000p0`". Measured on HotSpot 25 on 2026-08-12 it is
+        // `0x1.0000p0`: a 1763-case sweep of the float family against HotSpot
+        // failed on this row and nothing else.
+        let prec = precision.map_or(0, |p| p.max(1));
+        let digits = fmt_hex_pad(&fmt_hex_float(mag, prec), prec);
         let body = if upper {
             format!("0X{}", digits.to_uppercase())
         } else {
