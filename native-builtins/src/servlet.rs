@@ -3947,13 +3947,13 @@ fn listener_pollreq_fd(listener: &TcpListener) -> i64 {
 }
 
 #[cfg(unix)]
-fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
+pub(crate) fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
     use std::os::unix::io::AsRawFd;
     sock.as_raw_fd() as i64
 }
 
 #[cfg(windows)]
-fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
+pub(crate) fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
     use std::os::windows::io::AsRawSocket;
     sock.as_raw_socket() as i64
 }
@@ -4352,6 +4352,110 @@ fn poll_empty_selector(ctx: &mut dyn NativeContext, sel: ObjectRef, timeout_ms: 
     }
 }
 
+// ---- Close-awareness for the synthetic NIO surface -------------------------
+//
+// A thread parked in a blocking accept/read/write on one of these sockets must
+// come back when another thread closes the channel. It could not: `close`
+// removes the entry from `s2_registry()`, but the parked thread cloned the
+// `Arc` / `try_clone`d the handle out before it started, so the OS socket stays
+// open and the syscall stays in the kernel. That is the same defect the three
+// readers fixed on 2026-08-07/11 had, and the loop below is the same loop —
+// park in `poll`, re-ask the registry every slice — rather than a second
+// mechanism doing the same job.
+//
+// `net_phase_e.rs` documents this file's accept as broken in a comment of its
+// own ("on Windows, closing one duplicated socket handle does not unblock a
+// thread blocked in `accept()` on another duplicate"); the fix landed there and
+// not here.
+
+/// How long a parked synthetic-NIO operation waits inside one poll before
+/// re-asking `s2_registry()` whether its socket was closed under it. Same value
+/// and same role as `native-io/src/net.rs`'s `NET_READ_CLOSE_POLL_MS`.
+const S2_CLOSE_POLL_MS: i32 = 25;
+
+/// Readiness with a bounded wait, over this file's existing [`selector_poll`]
+/// abstraction rather than a fresh binding of `poll(2)`/`WSAPoll`.
+///
+/// `Some(true)` ready (including POLLERR/POLLHUP, which the following syscall
+/// then surfaces as the concrete error); `Some(false)` the slice expired;
+/// `None` the OS poll itself failed — the caller's signal to fall back to one
+/// plain blocking syscall rather than spin on something that can never report
+/// readiness.
+pub(crate) fn s2_poll_ready(fd: i64, want_write: bool, timeout_ms: i32) -> Option<bool> {
+    let req = PollReq {
+        fd,
+        events: if want_write { POLL_OUT } else { POLL_IN },
+    };
+    let revents = selector_poll(&[req], timeout_ms);
+    let bits = *revents.first()?;
+    let wanted = if want_write { POLL_OUT } else { POLL_IN };
+    Some(bits & (wanted | POLL_ERR | POLL_HUP) != 0)
+}
+
+/// Is `lid` still a live listener? `ServerSocketChannel.close()` removes the
+/// entry, so this flips exactly when Java closed it.
+fn s2_listener_still_registered(lid: i32) -> bool {
+    s2_registry().lock().listeners.contains_key(&lid)
+}
+
+/// Is `sid` still a live stream? `SocketChannel.close()` removes the entry.
+pub(crate) fn s2_stream_still_registered(sid: i32) -> bool {
+    s2_registry().lock().streams.contains_key(&sid)
+}
+
+/// Is `sid` still a live datagram socket? `DatagramChannel.close()` removes the
+/// entry. Exposed for `phases_late::net_channels`, whose `DatagramChannel` sites
+/// share this registry.
+pub(crate) fn s2_dgram_still_registered(sid: i32) -> bool {
+    s2_registry().lock().dgrams.contains_key(&sid)
+}
+
+/// The error a parked synthetic-NIO operation reports once its socket has been
+/// closed from another thread. `ErrorKind::Interrupted` is the carrier all
+/// three landed close-aware readers use, and it is unambiguous here because
+/// [`s2_poll_ready`] never reports EINTR as an error.
+pub(crate) fn s2_async_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "channel closed")
+}
+
+/// Park until `fd` is ready or the socket `still_registered` names is closed.
+///
+/// `Ok(true)` ready; `Ok(false)` no usable poll primitive, fall back to one
+/// plain blocking syscall; `Err(Interrupted)` closed from another thread.
+///
+/// The registry lock is taken inside `still_registered` for that lookup alone
+/// and is never held across the poll — the whole point of cloning the handle
+/// out first, and the reason `s2_registry()` being a single process-wide mutex
+/// is survivable at all.
+///
+/// # On expiry
+///
+/// The per-pass `S2_CLOSE_POLL_MS` slice expiring is not an outcome — it is
+/// only the point at which the registry is re-asked, and the loop continues.
+/// There is no second deadline here because none of these call sites has a
+/// `SO_TIMEOUT` to honour: this synthetic `SocketChannel` surface exposes no
+/// timed read, and `ServerSocketChannel.accept()` is untimed by contract.
+pub(crate) fn s2_wait_ready_close_aware(
+    fd: i64,
+    want_write: bool,
+    still_registered: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    loop {
+        let Some(ready) = s2_poll_ready(fd, want_write, S2_CLOSE_POLL_MS) else {
+            return Ok(false);
+        };
+        // Asked AFTER the poll so a close landing while we are parked is seen
+        // on the very next pass, and a close that raced a readiness edge still
+        // wins.
+        if !still_registered() {
+            return Err(s2_async_closed_err());
+        }
+        if ready {
+            return Ok(true);
+        }
+    }
+}
+
 fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> {
     let listener = reg.listeners.get(&lid)?;
     let _ = listener.set_nonblocking(true);
@@ -4383,6 +4487,34 @@ pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
         let _ = l.set_nonblocking(false);
         l.try_clone().ok()?
     };
+    // CLOSE-AWARENESS 2026-08-12: `try_clone()` is precisely why the close
+    // could not reach this accept. `ServerSocketChannel.close()` removes the
+    // registry entry and drops ITS listener; this thread is parked on a
+    // DUPLICATE handle, and on Windows closing one duplicate does not abort a
+    // blocking call on another. So park in `poll` and re-ask the registry —
+    // the same loop `net::net_accept_close_aware`,
+    // `socket_channel::accept_close_aware` and `re2_accept_into` all use.
+    //
+    // `Ok(false)` (no poll primitive on this target) falls through to the plain
+    // blocking accept, which cannot see the close but at least still accepts.
+    match s2_wait_ready_close_aware(
+        listener_pollreq_fd(&listener),
+        false,
+        &|| s2_listener_still_registered(lid),
+    ) {
+        Ok(_) => {}
+        // Closed under us. `None` is this function's existing "no connection"
+        // answer and every caller already handles it.
+        Err(_) => return None,
+    }
+    // NAMED RESIDUAL: with two threads accepting the same `lid`, the loser of
+    // the race between the poll above and this `accept()` parks again until the
+    // next connection, and that park is not close-aware. It is not closed by
+    // flipping the clone non-blocking: `try_clone` shares the blocking mode with
+    // the registry's listener on both platforms (a `dup`'s O_NONBLOCK lives on
+    // the open file description; a Windows duplicate shares the socket's FIONBIO
+    // state), so this thread would be changing the other one's contract. Every
+    // accept parked before this change; at most one loser parks after it.
     match listener.accept() {
         Ok((stream, _)) => {
             let mut reg = s2_registry().lock();
@@ -6785,18 +6917,44 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut tmp = vec![0u8; cap];
+        // `s2_blocking_accept` leaves the streams it registers in BLOCKING
+        // mode, so a `SocketChannel.read` on one of them parks in `recv` — and
+        // `close` only removes the map entry, which cannot reach a thread
+        // holding an `Arc` clone of the stream. Gate on the channel's own
+        // recorded mode: a non-blocking channel must keep answering 0
+        // (`IOStatus.UNAVAILABLE`) immediately, which is what every
+        // selector-driven reactor on this surface depends on.
+        let blocking = ctx.get_field(this, S2SC_BLOCKING).as_int().unwrap_or(1) != 0;
         let n = {
             let stream = {
                 let reg = s2_registry().lock();
                 reg.streams.get(&sock_id).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
-                    Ok(0) => -1i32,
-                    Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                    Err(_) => -1,
+                let closed_first = blocking
+                    && matches!(
+                        s2_wait_ready_close_aware(stream_pollreq_fd(&stream), false, &|| {
+                            s2_stream_still_registered(sock_id)
+                        }),
+                        Err(_)
+                    );
+                if closed_first {
+                    // Closed from another thread while parked. -1 is this
+                    // surface's end-of-input answer and unwinds the caller's
+                    // read loop, which is the outcome the close has to produce;
+                    // it is a weaker answer than the
+                    // `AsynchronousCloseException` the real `SocketChannel`
+                    // path raises, and is named as such in
+                    // W7-53-blocking-close-family.md.
+                    -1i32
+                } else {
+                    let mut stream_ref = &*stream;
+                    match stream_ref.read(&mut tmp) {
+                        Ok(0) => -1i32,
+                        Ok(n) => n as i32,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(_) => -1,
+                    }
                 }
             } else {
                 -1
@@ -6826,17 +6984,32 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         if data.is_empty() {
             return Ok(Some(Value::Int(0)));
         }
+        // Write twin of the read above — a blocking `send` parks behind peer
+        // backpressure exactly as a `recv` parks behind peer silence, and the
+        // close reaches neither.
+        let blocking = ctx.get_field(this, S2SC_BLOCKING).as_int().unwrap_or(1) != 0;
         let n = {
             let stream = {
                 let reg = s2_registry().lock();
                 reg.streams.get(&sock_id).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match stream_ref.write(&data) {
-                    Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                    Err(_) => -1,
+                let closed_first = blocking
+                    && matches!(
+                        s2_wait_ready_close_aware(stream_pollreq_fd(&stream), true, &|| {
+                            s2_stream_still_registered(sock_id)
+                        }),
+                        Err(_)
+                    );
+                if closed_first {
+                    -1i32
+                } else {
+                    let mut stream_ref = &*stream;
+                    match stream_ref.write(&data) {
+                        Ok(n) => n as i32,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(_) => -1,
+                    }
                 }
             } else {
                 -1

@@ -3721,13 +3721,50 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; capacity];
-        let result = {
+        // FIX 2026-08-12 (W7-53). Two defects in one expression, and the census
+        // that found `receive`'s copy of the first did not name this one.
+        //
+        // (1) `recv` ran with `reg` — the guard on the PROCESS-WIDE
+        //     `s2_registry` mutex — still alive, because it sat inside the
+        //     block that owns it. On a blocking datagram channel that parks
+        //     every synthetic socket operation in the VM until a packet
+        //     arrives, INCLUDING the `close` that would end the wait. The lock
+        //     is the wait's own gate, so the wedge is self-sustaining. Fixed by
+        //     the rule both TCP read paths have followed since AUDIT
+        //     2026-05-17: take the handle out under a brief guard, drop the
+        //     guard, then make the blocking call.
+        //
+        // (2) The park that remains is not close-aware by itself — closing one
+        //     duplicated socket handle does not abort a blocking call on
+        //     another duplicate. So it goes through the same
+        //     poll-and-re-ask-the-registry loop as every other site in this
+        //     family.
+        let sock = {
             let reg = crate::servlet::s2_registry().lock();
             match reg.dgrams.get(&sid) {
-                Some(sock) => sock.recv(&mut buf),
+                Some(sock) => match sock.try_clone() {
+                    Ok(dup) => dup,
+                    // A dup failure is an ordinary IO error, not a reason to
+                    // fall back to receiving under the lock — that is the
+                    // behaviour being removed.
+                    Err(_) => return Ok(Some(Value::Int(-1))),
+                },
                 None => return Ok(Some(Value::Int(-1))),
             }
         };
+        // `Ok(_)` — ready, or no poll primitive on this target (fall through to
+        // the plain blocking `recv`). `Err(_)` — closed from another thread,
+        // which this surface reports as -1, its end-of-input answer.
+        if crate::servlet::s2_wait_ready_close_aware(
+            crate::servlet::dgram_pollreq_fd(&sock),
+            false,
+            &|| crate::servlet::s2_dgram_still_registered(sid),
+        )
+        .is_err()
+        {
+            return Ok(Some(Value::Int(-1)));
+        }
+        let result = sock.recv(&mut buf);
         match result {
             Ok(n) => {
                 let arr = match ctx.get_field(bb, 0) {
