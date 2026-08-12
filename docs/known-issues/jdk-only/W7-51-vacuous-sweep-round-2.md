@@ -1,7 +1,7 @@
 # W7-51 — the vacuous-test population, measured instead of sampled
 
 Status: **W6-5's two open residuals are closed structurally**, and a systematic
-sweep of the whole test surface found **45 further findings** plus one
+sweep of the whole test surface found **55 further findings** plus one
 population of 23. Round 1 (`W6-5-vacuous-tests.md`) found six by accident, while
 reading source for something else. This round asked the question on purpose.
 
@@ -19,9 +19,9 @@ gates), `vm/tests/probe_compile_guard.rs`, `vm/tests/common/mod.rs`.
 | how found | by accident, reading for another reason | swept on purpose |
 | Rust `#[test]` fns examined | — | **16,376** across 13 crates |
 | Java vectors examined | 55, for two shapes | **72 / 72**, executed, 7 mutated |
-| findings | 6 | **45**, plus a population of 23 fixtures / ~286 call sites |
+| findings | 6 | **55**, plus a population of 23 fixtures / ~286 call sites |
 | proved by MUTATION | 4 | **14** |
-| fixed here | 4 | 7 fixtures + 11 tests + 3 gates armed |
+| fixed here | 4 | 7 fixtures + 21 tests + 3 gates armed |
 
 **Round 1's estimate of its own §3.2 was low by half.** It reported eleven
 missing fixtures out of twelve referenced. The real numbers are **23 missing out
@@ -418,7 +418,67 @@ shape the brief expected to find is essentially clean — every `abs() <` in sco
 is `1e-6` or tighter apart from one appropriate `< 10.0` on a projected growth
 percentage and one inside the already-condemned F1.
 
-### 2.6 The second gate nothing was setting
+### 2.6 The tolerance species — a bound on a quantity that has no error term
+
+The first sweep pass reported the tolerance surface as "essentially clean",
+because every `abs() <` in scope was `1e-6` or tighter and nothing looked
+egregious. That reading was wrong, and it was wrong in an instructive way: **a
+tolerance is not judged by its magnitude, it is judged against the error term it
+absorbs.** Ten sites here have no error term at all.
+
+The gaussian test is the case that made it legible. Its comment names the gap it
+is sized for — *"the JDK's multiplier goes through `StrictMath.log` (fdlibm)
+while this uses the platform libm, and those may differ in the last ulp"* — and
+then asserts *"a DIFFERENT sequence cannot come within 1e-12 of this one, so the
+tolerance costs the assertion nothing."* Both halves are false, and the gap is
+measurable. On Temurin jdk-25.0.3+9, over the three accepted pairs of the exact
+`new Random(42)` sequence the test pins:
+
+| measurement | value |
+| --- | --- |
+| worst disagreement between `StrictMath.log(s)` and `Math.log(s)` | **1.000 ulp** |
+| worst induced relative error in the returned value | **1.77e-16** |
+| the committed tolerance, `1e-12`, expressed in ulps of `g[0]` | **5,143 ulps** |
+
+`sqrt` is IEEE-exact, so `log` is the only source of divergence and the square
+root halves whatever it contributes. The tolerance was **~5,650x wider than the
+largest disagreement it names**, and ~9,000x wider than a one-ulp justification.
+
+The deeper error is in what the comment treats as noise. `Random.nextGaussian()`
+is **specified** in terms of `StrictMath` — a JVM that computes the multiplier
+with the platform libm and lands a few ulps away has diverged from the specified
+stream, which is a conformance defect, not measurement scatter. The tolerance
+was sized to admit exactly the thing it was written about. It is now four ulps
+of the expected value: 5x the measured worst case, 1,100x tighter than what it
+replaced, and the failure message now says a drift of a few ulps here is a
+finding rather than a reason to widen the bound.
+
+**Nine more sites of the same species**, each a value read back out of storage or
+a pure bit reinterpretation. There is no arithmetic anywhere on the path, so the
+round trip is exact or the slot corrupted it — and a tolerance can only hide the
+second case:
+
+| file | what it round-trips | what the tolerance admitted |
+| --- | --- | --- |
+| `gc/src/heap.rs:3115` | a `Value::Double` reinterpretation | ~5,100 ulps of drift in a value that has been through no arithmetic |
+| `vm/tests/t10_9_e_descriptor_aware.rs:156` | the same, in a test literally named `reinterprets_bits` | ~5,100 ulps |
+| `vm/src/runtime/value_stack.rs:2672`, `:2664` | `push_double`/`pop_double`, `push_float`/`pop_float` | a slot that narrowed the double to `f32` and back |
+| `types/src/compact_value.rs:2260`, `:2232`, `:3043` | the NaN-box round trip | **a box that silently truncated 40 bits of mantissa.** `CompactValue::double` stores `v.to_bits()` verbatim, so the test that proves the box is lossless permitted it to be lossy |
+| `gc/src/zgc/page.rs:2241`, `:2303` | `live_ratio()` of 512/512 and 512/8192, both exact in binary | the first test's own comment says *"no threshold short of 1.0 admits it"*, which the tolerance quietly contradicted |
+
+All ten are fixed, compared via `to_bits()` so the assertion is integral and does
+not depend on `clippy::float_cmp` policy.
+
+**Checked and left alone**, because a sweep that only reports hits is not a
+measurement: `gc/src/zgc/census.rs:2229` (shares summing to 1 — genuine
+accumulated floating error, tolerance justified),
+`vm/src/bin/bench_hotspot_compare.rs:802` (a geomean ratio), and the two
+arithmetic round-trips at `types/src/compact_value.rs:2851`/`:2856` — those
+results are exactly representable and the operations are IEEE-exact, but an
+operation *is* on the path, so tightening them is a smaller and less clear-cut
+win.
+
+### 2.7 The second gate nothing was setting
 
 `run.sh:37-41` documents `STRICT_COVERAGE=1` — which makes an unscheduled vector
 a failure rather than a warning — and says *"CI should set it"*. No workflow did.
@@ -437,7 +497,8 @@ green today and red the moment it should be.
 
 **Fixed:** the 7 fixtures and the census ratchet (§1.1); the
 `CRATONVM_REQUIRE_E2E` producer, the consumer test and the workflow guard
-(§1.2); the gaussian test (§2.2); `STRICT_COVERAGE` (§2.6); the
+(§1.2); the gaussian test (§2.2) and all ten over-wide tolerances (§2.6);
+`STRICT_COVERAGE` (§2.7); the
 `synthetic-jdk` × experimental CI step (§2.4); the stale-`.class` trap in seven
 harnesses; and the Rust and Java repairs listed in the commit log for this
 branch.
@@ -446,7 +507,8 @@ branch.
 fixtures (§1.1); F27's `gpu-offload` tests (a placement decision for that
 surface's owner); the `jdk-only-strict-probes.sh` absent-arm agreement; and the
 `RForNameGcStress` / `ROverlaySystemGcStress` constant booleans, which are low
-severity because the rest of each `CK` line does discriminate.
+severity because the rest of each `CK` line does discriminate; and the two
+arithmetic tolerances named at the end of §2.6.
 
 **Nothing was deleted or weakened to resolve a finding.** Where a test could not
 be made meaningful, it is named here with why.
@@ -492,3 +554,15 @@ vacuous test is not found by reading tests; it is found by breaking the code
 they claim to cover.** The three vectors in §2.5 had been read many times by
 people who wrote careful headers about what they measured. What nobody had done
 was run them against a broken VM and check that anything changed.
+
+The tolerance family in §2.6 is the same lesson in miniature, and it caught this
+sweep out once before it was corrected. The first pass judged tolerances by
+their magnitude — `1e-12` looks tight — and pronounced the surface clean. The
+right question is not "is this bound small" but **"what error term is this bound
+absorbing, and how large is that term?"** Asked that way, `1e-12` on a value
+whose only error source is one ulp of `log` is 5,650x too wide, and `1e-12` on a
+value read straight back out of a storage slot is infinitely too wide, because
+that value has no error term at all. In both cases the bound's own comment
+named the thing it was sized to admit. **A tolerance that names its
+justification is not thereby justified — the justification has to be measured,
+and the measurement takes about ten minutes.**
