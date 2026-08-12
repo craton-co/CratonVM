@@ -72,10 +72,10 @@
 //!
 //! The shadow getters are that getter with the `inferCaller()` call deleted —
 //! a bare field read — and the shadow setters are that setter with the
-//! `needToInferCaller` clear deleted. So under `--jdk-only` the real ctor set
-//! `needToInferCaller = true`, the real `inferCaller()` was never reached by
-//! anybody, and every `logger.warning(...)` record reached `SimpleFormatter`
-//! with a null pair, which that formatter renders as the LOGGER NAME.
+//! `needToInferCaller` clear deleted. So under `--jdk-only` the real
+//! `inferCaller()` was never reached by anybody, and every
+//! `logger.warning(...)` record reached `SimpleFormatter` with a null pair,
+//! which that formatter renders as the LOGGER NAME.
 //!
 //! Measured, one binary, three arms (probes/SrcProbe3.java):
 //!
@@ -90,6 +90,32 @@
 //! and our `StackWalker` hands `LogRecord$CallerFinder` exactly the frame list
 //! HotSpot's walks. Nothing was broken except that the code which would have
 //! CALLED them never ran.
+//!
+//! ## Necessary and NOT sufficient — read this before trusting a table entry
+//!
+//! Retiring these four was measured to take effect —
+//! `CRATONVM_DBG_DROPPED_STUBS=1` prints `[JDK-ONLY-REFUSED]` for all four —
+//! and the vector still failed. With the real lazy getter running, the flag it
+//! consults was false: `needToInferCaller` is `true` on HotSpot and `false`
+//! here on a fresh record, because a shadow CONSTRUCTOR never wrote it.
+//!
+//! `LogRecord.<init>(Level,String)` was already in the table below, and had
+//! been INERT since the 2026-08-11 wave. The retag in
+//! `NativeMethodRegistry::register` fires only on an effective category of
+//! `Bridge`, and the triple's OTHER registration
+//! (`native-builtins/src/phases_early.rs`) sat under an ambient `Intrinsic`.
+//! Strict refused the `Bridge` one and the `Intrinsic` one owned the slot —
+//! which is why retiring the `Bridge` one measured verdict-neutral.
+//!
+//! **An entry in this table is not evidence that a triple has no live native.**
+//! It retires the registrations whose effective category is `Bridge`, and says
+//! nothing about a second registration of the same triple under `Intrinsic`.
+//! `getLevel`, `getMessage` and `getSequenceNumber` are in that position today.
+//! Two instruments, and they answer different questions:
+//! `CRATONVM_DBG_DROPPED_STUBS=1` lists REFUSALS, not surviving natives; the
+//! census kind is what distinguishes them — `synthetic-native-registered` is a
+//! refusal record, `native-shadows-bytecode` is a live dispatching shadow.
+//! W7-56-infercaller-strict.md
 //!
 //! **All four or none.** Retiring only the getters would be a NEW defect:
 //! the real getter would then honour `needToInferCaller`, which the surviving

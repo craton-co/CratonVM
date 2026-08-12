@@ -10,10 +10,19 @@
 # rows: 11636
 # unchosen: 0
 # note: Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.
-# amended: 2026-08-12, W7-56-infercaller-strict.md. FOUR rows edited by hand,
+# amended: 2026-08-12, W7-56-infercaller-strict.md. FIVE rows edited by hand,
 #   not re-measured: java/util/logging/LogRecord {get,set}Source{Class,Method}Name
-#   ordinal 0, intrinsic -> synthetic-stub, kind_stated 0 -> 1. Those are the
-#   four triples that branch adds to RETIRED_SHADOW_TRIPLES, and the retag in
+#   and <init>(Level,String), all ordinal 0, intrinsic -> synthetic-stub,
+#   kind_stated 0 -> 1.
+#
+#   The <init> row is the one that closes the vector, and it is NOT a new table
+#   entry: that triple has been in RETIRED_SHADOW_TRIPLES since 2026-08-11 and
+#   was INERT, because the retag fires only on an effective category of Bridge
+#   and this registration's ambient category was Intrinsic. Its ordinal-1
+#   sibling has read `synthetic-stub 1 1` here all along -- the two rows
+#   disagreeing was the visible trace of the defect.
+#
+#   Those are the triples this branch retires, and the retag in
 #   NativeMethodRegistry::register is deterministic (effective category Bridge +
 #   retired => SyntheticStub, kind_stated true), so the value is derived rather
 #   than guessed -- it is byte-identical in shape to the sibling retired rows
@@ -8250,7 +8259,7 @@ java/util/logging/LogManager	updateConfiguration	(Ljava/io/InputStream;Ljava/uti
 java/util/logging/LogManager	updateConfiguration	(Ljava/util/function/Function;)V	0	synthetic-stub	1	1
 java/util/logging/LogManager$StringEnumeration	hasMoreElements	()Z	0	synthetic-stub	1	1
 java/util/logging/LogManager$StringEnumeration	nextElement	()Ljava/lang/Object;	0	synthetic-stub	1	1
-java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	0	intrinsic	0	1
+java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	1	synthetic-stub	1	1
 java/util/logging/LogRecord	getLevel	()Ljava/util/logging/Level;	0	intrinsic	0	1
 java/util/logging/LogRecord	getLevel	()Ljava/util/logging/Level;	1	synthetic-stub	1	1
