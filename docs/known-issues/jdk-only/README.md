@@ -1,6 +1,6 @@
 # JDK-only mode — open defects
 
-**Status:** OPEN, **21 records** (W3-6 and W5-2 retired 2026-08-12 by W7-46, W7-46 filed), reduced 2026-08-04, 2026-08-06, and
+**Status:** OPEN, **22 records** (W3-6 and W5-2 retired 2026-08-12 by W7-46; W7-46 and W7-60 filed), reduced 2026-08-04, 2026-08-06, and
 **2026-08-11** (thirty records retired — see `RETIREMENT-20260811.md`). Filed
 2026-07-31 from wave-1 implementation findings.
 
@@ -88,6 +88,7 @@ the record says so and says why. Take these when you are already in the file.
 | `W6-2-module-serviceloader-provider-factory.md` | The constructor-form provider **subtype** check is absent — adding it could hard-fail every module-declared service in the JDK's own boot modules, and that was unmeasurable from the lane. |
 | `W6-12-stampedlock-split-brain.md` | `java/util/Collections` is served by two registrars at different fidelities, so `unmodifiableSet(s).add(x)` throws while `unmodifiableList(l).add(x)` succeeds. Synthetic-jdk only. |
 | `W7-46-process-cluster.md` | Two recorded-not-fixed, both stated rather than deferred: on **Linux**, one `isAlive0` still reads `/proc/<pid>` and then `/proc/<pid>/stat` — the same two-probe pid-recycle attribution hole the Windows arm just lost, on an arm this host cannot compile; and the four `java/lang/ProcessBuilder` triples registered by BOTH `register_phase57_process` (as `SyntheticStub`) and an untagged block in `register_enterprise_natives`, which collide only in **synthetic-jdk** mode. |
+| `W7-60-harness-extract-blindness.md` | **The instrument, not a defect in the VM.** `regression-suite/run.sh`'s `extract()` deleted the evidence of three scheduled vectors, which therefore could not fail; the blind population is now measured at **zero** across all 70 scheduled vectors and held there by four mutation-checked guards. Recorded-not-fixed: `RPriorityQueueGc` and `RTreeRangeGc` publish no check count and are baselined in `regression-suite/harness-uncounted.txt`, because a count for them is only meaningful measured under the `--nojit --Xmx 64m` reproduction flags this lane could not run. Read its §6 before the next suite run — the pass count is expected to move, and downwards is the good direction. |
 
 ### 2.2 Whole surfaces that are still wrong
 
