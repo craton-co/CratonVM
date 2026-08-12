@@ -17562,13 +17562,92 @@ const STREAM_FIELD_ELEMENTS: usize = 0;
 // runs them once; intermediate ops propagate them; flatMap/concat follow the JDK
 // close-handler contract. See docs/known-issues/keycloak-16-stream-onclose-and-laziness.md.
 const STREAM_FIELD_CLOSE_HANDLERS: usize = 1;
-const STREAM_NUM_FIELDS: usize = 2;
+/// The full synthetic-Stream layout: slots 0..=4 (see `STREAM_FIELD_LINKED`).
+///
+/// Was 2 until W7-65 added the linked-or-consumed slot. Growing it makes slots
+/// 2 (lazy spliterator) and 3 (op chain) *readable* on streams built by
+/// `make_stream` for the first time, which is safe because
+/// `Heap::try_alloc_object` allocates through `try_alloc_zeroed`: an unwritten
+/// slot reads back as the zero `Value`, so `stream_lazy_spliterator` and
+/// `stream_has_chain` both still answer "no". Every reader of slots 2/3/4
+/// guards on `object_num_fields` anyway, so the many 1-field ad-hoc stream
+/// allocations elsewhere in the workspace are unaffected.
+const STREAM_NUM_FIELDS: usize = 5;
 /// Lazy source spliterator slot, populated only by
 /// `StreamSupport.stream(realSpliterator, false)` (see service_loader.rs). When
 /// present (and `STREAM_FIELD_ELEMENTS` is still null), the stream has NOT been
 /// drained: `forEach` drives the spliterator one element at a time, and every
 /// other op materialises it first via `materialize_lazy_stream`.
 const STREAM_FIELD_LAZY_SPLITERATOR: usize = 2;
+// Slot 3 is `STREAM_FIELD_OP_CHAIN` (declared with the lazy-pipeline code
+// below, which is the only thing that writes it).
+/// W7-65 — `java.util.stream.AbstractPipeline.linkedOrConsumed`, modelled.
+///
+/// `Value::Int(1)` once this stream stage has been linked (an intermediate op
+/// was applied to it) or consumed (a terminal op read its elements); anything
+/// else — including the zero a fresh slot reads back as — means "not yet".
+/// Deliberately asymmetric: only the exact `Int(1)` counts, so a stream whose
+/// slot was never written can never be mistaken for a used one.
+const STREAM_FIELD_LINKED: usize = 4;
+
+/// HotSpot's own message text, measured from
+/// `AbstractPipeline.MSG_STREAM_LINKED` in `jdk-25.0.3.9-hotspot/lib/src.zip`.
+const STREAM_LINKED_MSG: &str = "stream has already been operated upon or closed";
+
+/// True when `stream` carries the linked-or-consumed slot AND it is set.
+///
+/// A short-layout stream (the 1-field `Stream` objects several native modules
+/// still mint, and the legacy 2-field layout) has no slot to carry the flag and
+/// is therefore never reported as used. That is the deliberate direction of the
+/// error: a missed reuse is a residual divergence, a spurious one breaks a
+/// working pipeline.
+fn stream_is_linked(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
+    if ctx.object_num_fields(stream) <= STREAM_FIELD_LINKED {
+        return false;
+    }
+    matches!(ctx.get_field(stream, STREAM_FIELD_LINKED), Value::Int(1))
+}
+
+/// Set the linked-or-consumed flag. No-op on a stream with no slot for it.
+fn stream_mark_linked(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+    if ctx.object_num_fields(stream) <= STREAM_FIELD_LINKED {
+        return;
+    }
+    ctx.set_field(stream, STREAM_FIELD_LINKED, Value::Int(1));
+}
+
+/// The JDK's `linkOrConsume()`: throw if this stage was already linked or
+/// consumed, otherwise mark it.
+///
+/// WHERE THIS IS CALLED FROM, and why there is exactly one call site.
+/// `AbstractPipeline` sets the flag in eight places — the two
+/// intermediate-stage constructors, `linkOrConsume`, `evaluate(TerminalOp)`,
+/// `evaluateToArrayNode`, `sourceStageSpliterator`, `close` and `spliterator`.
+/// CratonVM does not run that bytecode: a synthetic stream is an element
+/// snapshot, and *every* operation that links or consumes one — intermediate
+/// and terminal alike — reads that snapshot through `stream_elements`. So the
+/// JDK's eight sites collapse onto that one funnel, and putting the check
+/// there is what makes this a 1-site change rather than a 99-site one.
+///
+/// Reference streams only. `IntStream`/`LongStream`/`DoubleStream` reach the
+/// funnel through `int_stream_elements`, which is INFALLIBLE
+/// (`.unwrap_or_default()`) at 25 call sites: throwing there would be swallowed
+/// and silently degrade the stream to empty, which is worse than the divergence
+/// it would close. The primitive streams are left unguarded on purpose — see
+/// docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md.
+fn stream_link_or_consume(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if stream_is_linked(ctx, stream) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: STREAM_LINKED_MSG.to_string(),
+        }
+        .into());
+    }
+    stream_mark_linked(ctx, stream);
+    Ok(())
+}
 
 /// The lazy source spliterator stashed on a synthetic stream by
 /// `StreamSupport.stream(realSpliterator, false)`, or `None` for an ordinary
@@ -17839,6 +17918,11 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    // W7-65: stated here rather than left to `try_alloc_zeroed` two crates
+    // away, so the "a fresh stream is unlinked" invariant lives where the
+    // layout is built. Slots 2 and 3 still rely on that zeroing, which is why
+    // only the exact `Int(1)` is read as linked.
+    ctx.set_field(stream, STREAM_FIELD_LINKED, Value::Int(0));
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         stream_pin
     } else {
@@ -17914,7 +17998,11 @@ fn make_derived_stream(
 /// field2=aux:Long). Present only on streams produced by a deferred intermediate
 /// op under `CRATONVM_LAZY_STREAMS`; older 2/3-field streams simply have no chain.
 const STREAM_FIELD_OP_CHAIN: usize = 3;
-const STREAM_NUM_FIELDS_LAZY: usize = 4;
+/// A deferred-op stream's layout. Kept as its own name for the call site's
+/// intent, but equal to `STREAM_NUM_FIELDS` since W7-65: a lazy stage must
+/// carry the linked-or-consumed slot too, or the terminal that finally reads it
+/// would have nowhere to record the consume.
+const STREAM_NUM_FIELDS_LAZY: usize = STREAM_NUM_FIELDS;
 
 const LAZY_OP_PEEK: i32 = 0;
 const LAZY_OP_MAP: i32 = 1;
@@ -19186,8 +19274,23 @@ fn stream_elements(
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    // W7-65: `AbstractPipeline.linkedOrConsumed`. This is the single funnel
+    // every operation on a synthetic stream reaches, so it is the single place
+    // the flag is read and written. Reference streams only (see
+    // `stream_link_or_consume` for why the primitive ones are excluded), and
+    // ahead of any work: the JDK also throws before it evaluates anything.
+    //
+    // Nothing has allocated between `stream_pin` and here — `class_id_of_object`
+    // and `class_name_of_id` are pure lookups — so `stream` is still current.
+    let linked = if class_name == "java/util/stream/Stream" {
+        stream_link_or_consume(ctx, stream)
+    } else {
+        Ok(())
+    };
     // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
-    let result: Result<Vec<Value>, MethodCallFailed> = if is_synthetic_stream(&class_name) {
+    let result: Result<Vec<Value>, MethodCallFailed> = if let Err(e) = linked {
+        Err(e)
+    } else if is_synthetic_stream(&class_name) {
         // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
         // ops onto slot 3 while sharing the upstream SOURCE (slot 0, which may
         // itself still be an undrained lazy spliterator -- slot 2). Apply the
@@ -60748,8 +60851,17 @@ mod tests {
         for (i, v) in elements.iter().enumerate() {
             ctx.set_array_element(arr, i, *v);
         }
-        let stream = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
-        ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+        // W7-65: a FRESH stream stage per iteration. This loop used to collect
+        // twice from one stream object, which `AbstractPipeline` has always
+        // rejected (`IllegalStateException: stream has already been operated
+        // upon or closed`) and which CratonVM now rejects too. The assertion
+        // being made — that `minBy`/`maxBy` answer an `Optional` — is unchanged
+        // and is still made twice; only the illegal sharing is gone.
+        let new_stream = |ctx: &mut MockCtx| {
+            let s = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+            ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            s
+        };
 
         let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER)
             .expect("Compatible mode never refuses a comparator stand-in");
@@ -60767,6 +60879,7 @@ mod tests {
         ] {
             let collector = tag_maker(&mut ctx, Value::Object(Some(natural)))
                 .expect("Compatible mode never refuses a collector stand-in");
+            let stream = new_stream(&mut ctx);
             let result = native_stream_collect(
                 &mut ctx,
                 &[Value::Object(Some(stream)), Value::Object(Some(collector))],
@@ -60776,6 +60889,99 @@ mod tests {
                 other => panic!("collect returned {other:?}"),
             };
             assert_eq!(ctx.get_field(opt, OPT_FIELD_VALUE), expected);
+        }
+    }
+
+    /// W7-65 — `AbstractPipeline.linkedOrConsumed`, both directions.
+    ///
+    /// TWO-SIDED ON PURPOSE. The dangerous failure for this change is not the
+    /// missing throw (a residual divergence, visible in the shadow
+    /// differential); it is a flag set once too often, which turns a working
+    /// stream into an `IllegalStateException` on the most pervasive path in the
+    /// Spring Boot and Tomcat arms and shows up in neither the differential nor
+    /// the 70-vector corpus. So this test asserts BOTH halves against the same
+    /// funnel, and neither half is true independently of the code under test:
+    ///
+    ///   * delete the check -> the first half fails;
+    ///   * mark at allocation, or mark twice per operation, or mark a stream
+    ///     other than the receiver -> the second half fails.
+    ///
+    /// The third over-set shape — marking the RESULT of an intermediate op as
+    /// well as its receiver — needs a real intermediate op, whose lambdas this
+    /// mock cannot dispatch. `probes/StreamReuseThrowsProbe` section B covers
+    /// it on a real VM, against the HotSpot values in its `.expected.txt`.
+    #[test]
+    fn a_consumed_stream_refuses_a_second_operation() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        fn new_stream(ctx: &mut MockCtx) -> ObjectRef {
+            let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+            let arr = ctx.new_ref_array(ClassId::new(0), elements.len());
+            for (i, v) in elements.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            let s = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+            ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            s
+        }
+
+        // -- the under-set half: one stream, two terminals -------------------
+        let s = new_stream(&mut ctx);
+        match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+            Ok(Some(Value::Long(3))) => {}
+            other => panic!("the FIRST terminal on a fresh stream must succeed, got {other:?}"),
+        }
+        match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                cratonvm_types::error::RuntimeError::IllegalStateException { ref message },
+            ))) => assert_eq!(
+                message, STREAM_LINKED_MSG,
+                "the class is only half the contract; HotSpot's wording is the other half"
+            ),
+            other => panic!("second terminal must raise IllegalStateException, got {other:?}"),
+        }
+
+        // -- the over-set half: independent streams stay independent ---------
+        // Each of these is a FRESH stage over equal elements. A flag set at
+        // allocation, or set on anything but the receiver, fails here.
+        for attempt in 0..3 {
+            let fresh = new_stream(&mut ctx);
+            match native_stream_count(&mut ctx, &[Value::Object(Some(fresh))]) {
+                Ok(Some(Value::Long(3))) => {}
+                other => panic!(
+                    "attempt {attempt}: a fresh stream must never inherit another \
+                     stream's linked flag, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// A stream with no slot for the flag (the 1-field ad-hoc layout several
+    /// native modules still mint, and the historical 2-field layout) must be
+    /// left alone entirely. Under-setting there is the deliberate direction of
+    /// the error — see `stream_is_linked`.
+    #[test]
+    fn a_short_layout_stream_is_never_reported_as_linked() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        let arr = ctx.new_ref_array(ClassId::new(0), 2);
+        ctx.set_array_element(arr, 0, Value::Int(7));
+        ctx.set_array_element(arr, 1, Value::Int(8));
+        let s = ctx.alloc_object(ClassId::new(0), 1);
+        ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+
+        for attempt in 0..3 {
+            match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+                Ok(Some(Value::Long(2))) => {}
+                other => panic!(
+                    "attempt {attempt}: a stream with no linked slot must never be \
+                     refused, got {other:?}"
+                ),
+            }
         }
     }
 }
