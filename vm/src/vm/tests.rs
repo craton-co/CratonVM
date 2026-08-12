@@ -63804,6 +63804,115 @@ use std::sync::Arc;
         assert!(skip_set.is_empty(), "JIT skip set should start empty");
     }
 
+    /// The positive gate memo (`JitRealm::jit_gate_pass`) must be
+    /// epoch-invalidated, and the direction matters: a stale SEAL only costs
+    /// throughput (the method stays interpreted), but a stale PASS would let a
+    /// redefined body — whose new bytecode may call a native-shadowed target —
+    /// reach the compiler, which is what the seal exists to prevent.
+    ///
+    /// Asserted on the redemption rule rather than by driving `execute()`,
+    /// because that is the rule the gate reads: an entry whose stamp is not the
+    /// current `redefine_epoch()` is a miss.
+    #[test]
+    fn jit_gate_pass_memo_is_invalidated_by_a_redefine() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        assert!(
+            shared.jit.jit_gate_pass.read().is_empty(),
+            "the gate-pass memo should start empty"
+        );
+
+        let key: (ClassId, Arc<str>, Arc<str>) =
+            (ClassId::new(7), Arc::from("bar"), Arc::from("()V"));
+        let epoch_at_fill = cratonvm_jit::redefine_epoch();
+        shared
+            .jit
+            .jit_gate_pass
+            .write()
+            .insert(key.clone(), (epoch_at_fill, false));
+
+        // Same epoch -> the memo answers, which is the whole point.
+        let redeem = |shared: &SharedVm| -> Option<bool> {
+            let epoch = cratonvm_jit::redefine_epoch();
+            shared
+                .jit
+                .jit_gate_pass
+                .read()
+                .get(&key)
+                .copied()
+                .and_then(|(e, iface)| (e == epoch).then_some(iface))
+        };
+        assert_eq!(
+            redeem(&shared),
+            Some(false),
+            "an entry stamped with the current epoch must be redeemable"
+        );
+
+        // A redefinition bumps the epoch; the stale PASS must stop answering.
+        cratonvm_jit::bump_redefine_epoch();
+        assert_ne!(cratonvm_jit::redefine_epoch(), epoch_at_fill);
+        assert_eq!(
+            redeem(&shared),
+            None,
+            "a pass recorded before a redefine must NOT be redeemable after it — \
+             the new body may call a native-shadowed target the old one did not"
+        );
+    }
+
+    /// Two same-named classes from different loaders must NOT share a memo
+    /// entry. `jit_skip_set` keys on the class NAME and is safe doing so
+    /// (`is_jit_bail_listed`: a collision there conservatively skips a
+    /// compilable method). The positive memo inverts that — a PASS redeemed by
+    /// a different class of the same name would compile a body that does call a
+    /// native-shadowed target — so it keys on `ClassId`. This is the assertion
+    /// that the key actually separates them.
+    #[test]
+    fn jit_gate_pass_memo_does_not_collide_across_same_named_classes() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let epoch = cratonvm_jit::redefine_epoch();
+        let method: Arc<str> = Arc::from("equals");
+        let desc: Arc<str> = Arc::from("(Ljava/lang/Object;)Z");
+
+        // Loader A's class passed the gate.
+        let a = (ClassId::new(101), method.clone(), desc.clone());
+        shared.jit.jit_gate_pass.write().insert(a, (epoch, false));
+
+        // Loader B's same-named class must be a MISS, not a redemption.
+        let b = (ClassId::new(202), method, desc);
+        assert_eq!(
+            shared.jit.jit_gate_pass.read().get(&b).copied(),
+            None,
+            "a different ClassId with the same method name+descriptor must not \
+             redeem another class's PASS"
+        );
+    }
+
+    /// The memo carries `is_interface_default` because the gate's other three
+    /// outputs are all "false/None" on the pass path but that one is a real
+    /// value the caller uses. Storing it is what makes the short-circuit
+    /// equivalent to re-running the gate rather than merely cheaper.
+    #[test]
+    fn jit_gate_pass_memo_round_trips_is_interface_default() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let epoch = cratonvm_jit::redefine_epoch();
+        for iface in [false, true] {
+            let key: (ClassId, Arc<str>, Arc<str>) = (
+                ClassId::new(11),
+                Arc::from(if iface { "dflt" } else { "plain" }),
+                Arc::from("()V"),
+            );
+            shared
+                .jit
+                .jit_gate_pass
+                .write()
+                .insert(key.clone(), (epoch, iface));
+            assert_eq!(
+                shared.jit.jit_gate_pass.read().get(&key).copied(),
+                Some((epoch, iface)),
+                "is_interface_default must survive the memo, not be defaulted"
+            );
+        }
+    }
+
     #[test]
     fn m5_jit_scan_accepts_getfield_putfield() {
         // Bytecode: aload_0, getfield #1, ireturn

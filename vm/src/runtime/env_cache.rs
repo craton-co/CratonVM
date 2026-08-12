@@ -1772,3 +1772,19 @@ mod tests {
         assert!(!EnforceShadowScope::Off.covers("javax/management/MBeanServer"));
     }
 }
+
+/// The positive half of `execute()`'s static JIT-eligibility short-circuit —
+/// `JitRealm::jit_gate_pass`.
+///
+/// Default ON. `CRATONVM_JIT_GATE_PASS_MEMO=0` restores the pre-fix behaviour
+/// (re-run the whole gate, including the O(bytecode) native-shadow scan, on
+/// every `execute()` entry for every method that passes it) so the fix can be
+/// A/B'd in one binary. Off is a MEASUREMENT configuration; it is correct, just
+/// slow.
+pub fn jit_gate_pass_memo() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATE_PASS_MEMO")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}

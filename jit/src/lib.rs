@@ -28059,3 +28059,34 @@ mod invalidate_early_out {
         assert_eq!(cache.invalidate_for_class("Helper"), 0);
     }
 }
+
+/// Census of `execute()`'s static JIT-eligibility gate: how often the positive
+/// memo (`JitRealm::jit_gate_pass`) answered, versus how often the full gate —
+/// including `jit_method_calls_native_shadowed`'s O(method-bytecode) decode —
+/// had to run and fill it.
+///
+/// `fills` is bounded by the number of distinct eligible methods; `hits` is the
+/// number of `execute()` entries that would previously have re-run the whole
+/// gate. The ratio is the fix's whole justification, so it is measured rather
+/// than asserted. Always on: two relaxed increments on a path that already
+/// takes an `RwLock`.
+static JIT_GATE_PASS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_GATE_PASS_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn note_jit_gate_pass_hit() {
+    JIT_GATE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn note_jit_gate_pass_fill() {
+    JIT_GATE_PASS_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(hits, fills)` for the stats dump.
+pub fn jit_gate_pass_census() -> (u64, u64) {
+    (
+        JIT_GATE_PASS_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        JIT_GATE_PASS_FILLS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}

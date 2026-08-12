@@ -32110,57 +32110,157 @@ struct SemState {
 
 // Same descriptor-coercion trap as Semaphore/CountDownLatch above: the real
 // `java.util.concurrent.CyclicBarrier` layout is lock(0,L), trip(1,L),
-// parties(2,I), barrierCommand(3,L), generation(4,L), count(5,I) — so the
-// synthetic Int writes to slots 0/1 were coerced to null and the "broken"
-// write to slot 2 landed in the REAL `parties` int. Keep the three ints in an
-// int[3] holder ([0]=parties, [1]=count, [2]=broken) stored in slot 0 (an
-// `L` slot — an object survives). Raw-Int fallback covers legacy synthetic
-// allocations.
+// parties(2,I), barrierCommand(3,L), generation(4,L), count(5,I) — so a
+// synthetic Int write to slot 0/1 is coerced to null and a "broken" write to
+// slot 2 lands in the REAL `parties` int. All the state therefore lives in a
+// holder object parked in slot 0, which is an `L` slot in the real layout (an
+// object survives there) and an untyped slot in the synthetic stub.
+//
+// HOLDER LAYOUT — receiver slot 0 holds a REFERENCE array of length 2:
+//
+//     [0] = long[4] { parties, count, generation, broken_gen }
+//     [1] = the barrier action `Runnable`, or null
+//
+// The nesting exists so the action can be stored **without** punning a second
+// slot. It used to be a bare `int[3]` and the two-arg constructor threw the
+// `Runnable` away with a "Simplified: ignore the barrier action" comment, so
+// `new CyclicBarrier(2, action)` ran the action zero times where HotSpot runs
+// it once per trip. Parking a reference in another declared-`int` slot to fix
+// that is exactly the shape the GC's W7-84 guard reports and auto-boxes; one
+// reference array holding one primitive array and one `Runnable` is type-clean
+// on both sides and costs one extra indirection per access.
+//
+// `generation`/`broken_gen` are `long` and not `int` so that the
+// "is this generation broken" comparison below can never alias by wraparound.
+// Raw-Int fallback covers legacy synthetic allocations whose slots were
+// written before any native ran.
+
+/// Holder-array indices (NOT receiver object slots).
+const CB_HOLDER_STATE: usize = 0;
+const CB_HOLDER_ACTION: usize = 1;
+const CB_HOLDER_LEN: usize = 2;
+
+/// `long[4]` state indices (NOT receiver object slots).
+const CB_H_PARTIES: usize = 0;
+const CB_H_COUNT: usize = 1;
+/// Trip counter. A waiting party is released iff this has moved past the value
+/// it read on arrival — which is what makes the barrier CYCLIC. The previous
+/// "released iff `count` is back to 0" test was only valid while nobody
+/// re-entered the barrier: a released waiter preempted before it re-read `count`
+/// would find a faster party had already bumped it to 1.., conclude it had NOT
+/// been released, and wait again with its wake-up already spent. That left the
+/// barrier permanently one party short and deadlocked every later trip (100%
+/// reproducible with 4 parties over 20 rounds, JIT on and `--nojit`).
+const CB_H_GENERATION: usize = 2;
+/// The generation that was broken, or [`CB_NO_BREAK`]. Per-generation, not a
+/// flag: `reset()` has to break the generation its parked parties are waiting
+/// in — they must wake with `BrokenBarrierException` — while leaving the FRESH
+/// generation unbroken, so `isBroken()` reads false immediately afterwards.
+const CB_H_BROKEN_GEN: usize = 3;
+const CB_STATE_LEN: usize = 4;
+
+/// `broken_gen` value meaning "no generation has been broken". Generations
+/// start at 0 and only increase, so this can never collide with a real one.
+const CB_NO_BREAK: i64 = -1;
+
+/// Resolve (or lazily install) the receiver's holder array. Returns the
+/// possibly-relocated receiver alongside it — installing the holder allocates.
 fn cb_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
     if let Value::Object(Some(h)) = ctx.get_field(this, CB_FIELD_PARTIES) {
         return (this, h);
     }
     let legacy_parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
-        Value::Int(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     };
     let legacy_count = match ctx.get_field(this, CB_FIELD_COUNT) {
-        Value::Int(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     };
     let legacy_broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
         Value::Int(v) => v,
         _ => 0,
     };
-    // Pin across the allocation (moving-GC receiver-relocation hazard).
-    let this_pin = ctx.pin_native_root(this);
-    let h = ctx.new_array(cratonvm_types::ArrayElementType::Int, 3);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.set_array_element(h, 0, Value::Int(legacy_parties));
-    ctx.set_array_element(h, 1, Value::Int(legacy_count));
-    ctx.set_array_element(h, 2, Value::Int(legacy_broken));
-    ctx.set_field(this, CB_FIELD_PARTIES, Value::Object(Some(h)));
-    (this, h)
+    // Two allocations, so the receiver AND the first array must be rooted
+    // across the second (moving-GC relocation hazard).
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let state = scope.new_array(cratonvm_types::ArrayElementType::Long, CB_STATE_LEN);
+    let state_h = scope.root(state);
+    let holder = scope.new_array(cratonvm_types::ArrayElementType::Reference, CB_HOLDER_LEN);
+    let state = scope.get(&state_h);
+    let this = scope.get(&this_h);
+    scope.set_array_element(state, CB_H_PARTIES, Value::Long(legacy_parties));
+    scope.set_array_element(state, CB_H_COUNT, Value::Long(legacy_count));
+    scope.set_array_element(state, CB_H_GENERATION, Value::Long(0));
+    scope.set_array_element(
+        state,
+        CB_H_BROKEN_GEN,
+        Value::Long(if legacy_broken != 0 { 0 } else { CB_NO_BREAK }),
+    );
+    scope.set_array_element(holder, CB_HOLDER_STATE, Value::Object(Some(state)));
+    scope.set_array_element(holder, CB_HOLDER_ACTION, Value::Object(None));
+    scope.set_field(this, CB_FIELD_PARTIES, Value::Object(Some(holder)));
+    (this, holder)
 }
 
-fn cb_get(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize) -> i32 {
-    let (_, h) = cb_holder(ctx, this);
-    match ctx.get_array_element(h, idx) {
-        Value::Int(v) => v,
+/// The `long[4]` state array inside a holder.
+fn cb_state(ctx: &dyn NativeContext, holder: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_array_element(holder, CB_HOLDER_STATE) {
+        Value::Object(Some(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn cb_get(ctx: &dyn NativeContext, state: ObjectRef, idx: usize) -> i64 {
+    match ctx.get_array_element(state, idx) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
         _ => 0,
     }
 }
 
-fn cb_set(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize, v: i32) {
-    let (_, h) = cb_holder(ctx, this);
-    ctx.set_array_element(h, idx, Value::Int(v));
+fn cb_set(ctx: &dyn NativeContext, state: ObjectRef, idx: usize, v: i64) {
+    ctx.set_array_element(state, idx, Value::Long(v));
 }
 
-// Holder indices (NOT object slots).
-const CB_H_PARTIES: usize = 0;
-const CB_H_COUNT: usize = 1;
-const CB_H_BROKEN: usize = 2;
+/// Receiver + holder + state in one step, for every native below.
+fn cb_parts(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, ObjectRef, ObjectRef)> {
+    let (this, holder) = cb_holder(ctx, this);
+    let state = cb_state(ctx, holder)?;
+    Some((this, holder, state))
+}
+
+/// Shared constructor body. `action` is the `Runnable` from the two-arg form.
+fn cb_init_common(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    parties: i32,
+    action: Option<ObjectRef>,
+) -> MethodCallResult {
+    if parties <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "parties must be > 0".to_string(),
+        }
+        .into());
+    }
+    // `cb_holder` allocates, so the action has to be rooted across it too —
+    // it arrives as a raw `ObjectRef` from the caller's operand stack.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let action_h = action.map(|a| scope.root(a));
+    let this = scope.get(&this_h);
+    let Some((_, holder, state)) = cb_parts(&mut *scope, this) else {
+        return Ok(None);
+    };
+    scope.set_array_element(state, CB_H_PARTIES, Value::Long(parties as i64));
+    scope.set_array_element(state, CB_H_COUNT, Value::Long(0)); // number currently waiting
+    scope.set_array_element(state, CB_H_GENERATION, Value::Long(0));
+    scope.set_array_element(state, CB_H_BROKEN_GEN, Value::Long(CB_NO_BREAK));
+    let action_now = action_h.as_ref().map(|h| scope.get(h));
+    scope.set_array_element(holder, CB_HOLDER_ACTION, Value::Object(action_now));
+    Ok(None)
+}
 
 fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -32171,23 +32271,28 @@ fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if parties <= 0 {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "parties must be > 0".to_string(),
-        }
-        .into());
-    }
-    let (this, h) = cb_holder(ctx, this);
-    let _ = this;
-    ctx.set_array_element(h, CB_H_PARTIES, Value::Int(parties));
-    ctx.set_array_element(h, CB_H_COUNT, Value::Int(0)); // number currently waiting
-    ctx.set_array_element(h, CB_H_BROKEN, Value::Int(0));
-    Ok(None)
+    cb_init_common(ctx, this, parties, None)
 }
 
+/// `CyclicBarrier(int parties, Runnable barrierAction)`.
+///
+/// The action is stored in the holder's reference slot and run by
+/// [`cb_await_inner`] on the last arriving thread. It used to be discarded
+/// outright.
 fn native_cb_init_action(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Simplified: ignore the barrier action Runnable
-    native_cb_init(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let parties = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let action = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    cb_init_common(ctx, this, parties, action)
 }
 
 /// Throw the REAL `java.util.concurrent.BrokenBarrierException` /
@@ -32229,46 +32334,92 @@ fn cb_await_inner(
 ) -> MethodCallResult {
     // Install the holder up-front so no allocation happens inside the
     // monitor section (re-binds `this` across the possible allocation).
-    let (this, _) = cb_holder(ctx, this);
+    let Some((this, holder, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    // Rebound after the barrier action runs, which can move all three.
+    let (mut this, mut holder, mut state) = (this, holder, state);
 
     ctx.monitor_enter(this);
-    if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+    if cb_get(ctx, state, CB_H_BROKEN_GEN) == cb_get(ctx, state, CB_H_GENERATION) {
         ctx.monitor_exit(this);
         return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
     }
-    let parties = cb_get(ctx, this, CB_H_PARTIES).max(1);
-    let count = cb_get(ctx, this, CB_H_COUNT);
+    let parties = cb_get(ctx, state, CB_H_PARTIES).max(1);
+    let my_gen = cb_get(ctx, state, CB_H_GENERATION);
+    let count = cb_get(ctx, state, CB_H_COUNT);
     let new_count = count + 1;
 
     if new_count >= parties {
-        // All parties arrived: reset count for the next generation and wake
-        // the waiters. Return 0 (the last arrival's index).
-        cb_set(ctx, this, CB_H_COUNT, 0);
+        // Last party in. The barrier action runs HERE — still holding the
+        // monitor, with no party released yet — which is where
+        // `CyclicBarrier.nextGeneration` runs it under its own ReentrantLock.
+        // A caller can therefore rely on the action having completed before
+        // any `await()` returns.
+        let action = match ctx.get_array_element(holder, CB_HOLDER_ACTION) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let (run_result, this_now, holder_now, state_now) = {
+                let mut scope = NativeHandleScope::new(ctx);
+                let this_h = scope.root(this);
+                let holder_h = scope.root(holder);
+                let state_h = scope.root(state);
+                let action_h = scope.root(action);
+                let receiver = scope.get(&action_h);
+                let r = scope.invoke_virtual(receiver, "run", "()V", &[]);
+                (
+                    r,
+                    scope.get(&this_h),
+                    scope.get(&holder_h),
+                    scope.get(&state_h),
+                )
+            };
+            this = this_now;
+            holder = holder_now;
+            state = state_now;
+            let _ = holder;
+            if let Err(e) = run_result {
+                // HotSpot breaks the barrier and propagates: every other party
+                // must fail rather than silently proceed past an action that
+                // did not complete.
+                cb_set(ctx, state, CB_H_BROKEN_GEN, my_gen);
+                let _ = ctx.monitor_notify_all(this);
+                ctx.monitor_exit(this);
+                return Err(e);
+            }
+        }
+        // Trip: open the next generation and wake everyone parked in this one.
+        cb_set(ctx, state, CB_H_COUNT, 0);
+        cb_set(ctx, state, CB_H_GENERATION, my_gen.wrapping_add(1));
         let notify_result = ctx.monitor_notify_all(this);
         ctx.monitor_exit(this);
         notify_result?;
         return Ok(Some(Value::Int(0)));
     }
 
-    // Not all parties yet — record the arrival and wait for the trip (count
-    // reset to 0) or a timeout/broken barrier.
-    cb_set(ctx, this, CB_H_COUNT, new_count);
+    // Not all parties yet — record the arrival and wait for this generation to
+    // trip, break, or time out.
+    cb_set(ctx, state, CB_H_COUNT, new_count);
+    let arrival_index = (parties - new_count) as i32;
     loop {
-        let current_count = cb_get(ctx, this, CB_H_COUNT);
-        if current_count == 0 || current_count >= parties {
-            ctx.monitor_exit(this);
-            return Ok(Some(Value::Int(parties - new_count)));
-        }
-        if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+        if cb_get(ctx, state, CB_H_BROKEN_GEN) == my_gen {
             ctx.monitor_exit(this);
             return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
+        }
+        if cb_get(ctx, state, CB_H_GENERATION) != my_gen {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(arrival_index)));
         }
         let wait_ms = match deadline {
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    // Timeout — break the barrier so other waiters fail too.
-                    cb_set(ctx, this, CB_H_BROKEN, 1);
+                    // Timeout — break THIS generation so the other parties
+                    // waiting in it fail too, and leave it broken until
+                    // `reset()`, which is what `isBroken()` reports.
+                    cb_set(ctx, state, CB_H_BROKEN_GEN, my_gen);
                     let notify_result = ctx.monitor_notify_all(this);
                     ctx.monitor_exit(this);
                     notify_result?;
@@ -32322,8 +32473,10 @@ fn native_cb_get_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let parties = cb_get(ctx, this, CB_H_PARTIES);
-    Ok(Some(Value::Int(parties)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(cb_get(ctx, state, CB_H_PARTIES) as i32)))
 }
 
 fn native_cb_get_number_waiting(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32331,32 +32484,315 @@ fn native_cb_get_number_waiting(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let count = cb_get(ctx, this, CB_H_COUNT);
-    Ok(Some(Value::Int(count)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    Ok(Some(Value::Int(cb_get(ctx, state, CB_H_COUNT) as i32)))
 }
 
+/// `isBroken()` asks about the CURRENT generation, not about whether the
+/// barrier was ever broken — which is why `reset()` below can leave a broken
+/// generation behind and still report false.
 fn native_cb_is_broken(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let broken = cb_get(ctx, this, CB_H_BROKEN);
-    Ok(Some(Value::Int(broken)))
+    let Some((_, _, state)) = cb_parts(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let broken = cb_get(ctx, state, CB_H_BROKEN_GEN) == cb_get(ctx, state, CB_H_GENERATION);
+    Ok(Some(Value::Int(broken as i32)))
 }
 
+/// `reset()` — break the generation the parked parties are waiting in, then
+/// open a fresh, unbroken one.
+///
+/// Both halves matter: parties already at the barrier must wake with
+/// `BrokenBarrierException` (they were promised a trip that will not happen),
+/// while `isBroken()` must read false immediately afterwards. Clearing a single
+/// "broken" flag cannot express that — the waiters have not run yet when
+/// `reset()` returns, so by the time they look, the flag they needed to see is
+/// already gone.
 fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let (this, _) = cb_holder(ctx, this);
+    let Some((this, _, state)) = cb_parts(ctx, this) else {
+        return Ok(None);
+    };
     ctx.monitor_enter(this);
-    cb_set(ctx, this, CB_H_COUNT, 0);
-    cb_set(ctx, this, CB_H_BROKEN, 0);
+    let gen = cb_get(ctx, state, CB_H_GENERATION);
+    cb_set(ctx, state, CB_H_BROKEN_GEN, gen);
+    cb_set(ctx, state, CB_H_COUNT, 0);
+    cb_set(ctx, state, CB_H_GENERATION, gen.wrapping_add(1));
     let notify_result = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
     notify_result?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod cyclic_barrier_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeHeapAccess;
+    use cratonvm_types::ArrayElementType;
+
+    /// Slot the counting hook keeps its tally in, on the action object itself —
+    /// the hook is a plain `fn` and cannot capture a counter.
+    const ACTION_RUN_COUNT_SLOT: usize = 0;
+
+    fn count_run_calls(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "run" && descriptor == "()V" {
+            let prev = match ctx.get_field(receiver, ACTION_RUN_COUNT_SLOT) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            ctx.set_field(receiver, ACTION_RUN_COUNT_SLOT, Value::Int(prev + 1));
+            return Some(Ok(None));
+        }
+        None
+    }
+
+    fn failing_run(
+        _ctx: &mut crate::test_utils::MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "run" && descriptor == "()V" {
+            return Some(Err(RuntimeError::IllegalStateException {
+                message: "barrier action blew up".to_string(),
+            }
+            .into()));
+        }
+        None
+    }
+
+    fn new_barrier_obj(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
+        match ctx.new_object("java/util/concurrent/CyclicBarrier") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("expected a receiver, got {other:?}"),
+        }
+    }
+
+    fn runs(ctx: &crate::test_utils::MockNativeContext, action: ObjectRef) -> i32 {
+        match ctx.get_field(action, ACTION_RUN_COUNT_SLOT) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+
+    /// The `Runnable` handed to `CyclicBarrier(int, Runnable)` must run once per
+    /// trip, on the last party in.
+    ///
+    /// It used to be discarded by the constructor — `native_cb_init_action` was
+    /// `native_cb_init` with a "Simplified: ignore the barrier action" comment —
+    /// so `barrierActionRuns` was 0 where HotSpot says 1. One party is enough to
+    /// measure it: `await()` with `parties == 1` IS the last arrival.
+    #[test]
+    fn barrier_action_runs_once_per_trip() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(count_run_calls);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(1),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        for expected in 1..=3 {
+            let idx = native_cb_await(&mut ctx, &[Value::Object(Some(barrier))])
+                .unwrap()
+                .unwrap();
+            assert_eq!(idx, Value::Int(0), "the last arrival's index is 0");
+            assert_eq!(
+                runs(&ctx, action),
+                expected,
+                "the barrier action must run once per trip"
+            );
+        }
+    }
+
+    /// The ONE-arg constructor has no action, and must not invent one by reading
+    /// whatever the holder's action slot happens to hold.
+    #[test]
+    fn barrier_without_an_action_runs_nothing() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(count_run_calls);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(1)]).unwrap();
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(runs(&ctx, action), 0);
+    }
+
+    /// The action is stored in a REFERENCE slot of a reference array, not punned
+    /// into a slot the class declares as an `int`.
+    ///
+    /// That is the whole reason the holder gained a level: the receiver's slot 0
+    /// is `lock` in the real layout and an untyped stub slot in the synthetic
+    /// one, and parking a `Runnable` in a second slot would be the shape the
+    /// GC's W7-84 guard reports and auto-boxes.
+    #[test]
+    fn holder_keeps_state_and_action_in_typed_arrays() {
+        let mut ctx = mock_ctx();
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(4),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder in slot 0, got {other:?}"),
+        };
+        assert_eq!(ctx.heap_element_type_of(holder), ArrayElementType::Reference);
+        assert_eq!(ctx.array_length(holder), CB_HOLDER_LEN);
+        assert_eq!(
+            ctx.get_array_element(holder, CB_HOLDER_ACTION),
+            Value::Object(Some(action))
+        );
+
+        let state = cb_state(&ctx, holder).expect("state array");
+        assert_eq!(ctx.heap_element_type_of(state), ArrayElementType::Long);
+        assert_eq!(ctx.array_length(state), CB_STATE_LEN);
+        assert_eq!(cb_get(&ctx, state, CB_H_PARTIES), 4);
+        assert_eq!(cb_get(&ctx, state, CB_H_BROKEN_GEN), CB_NO_BREAK);
+    }
+
+    /// A trip opens a NEW generation instead of only clearing `count`.
+    ///
+    /// The old release test was "`count` is back to 0", which is only valid
+    /// while nobody re-enters the barrier: a released waiter preempted before it
+    /// re-read `count` would find a faster party had already bumped it, decide
+    /// it had not been released, and park again with its wake-up spent — one
+    /// party short, and every later trip deadlocked. The generation only ever
+    /// moves forward, so a waiter's "did my generation end" test cannot be
+    /// undone by the next round starting.
+    #[test]
+    fn a_trip_advances_the_generation() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(1)]).unwrap();
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder, got {other:?}"),
+        };
+        let state = cb_state(&ctx, holder).expect("state array");
+
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 0);
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 1);
+        assert_eq!(cb_get(&ctx, state, CB_H_COUNT), 0);
+        native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 2);
+    }
+
+    /// `reset()` breaks the generation its parked parties are waiting in, and
+    /// still reports `isBroken() == false` — the two are not in conflict, they
+    /// are about different generations.
+    #[test]
+    fn reset_breaks_the_old_generation_and_reports_unbroken() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(3)]).unwrap();
+        let holder = match ctx.get_field(barrier, CB_FIELD_PARTIES) {
+            Value::Object(Some(h)) => h,
+            other => panic!("expected the holder, got {other:?}"),
+        };
+        let state = cb_state(&ctx, holder).expect("state array");
+        // Two of three parties have arrived and are parked.
+        cb_set(&ctx, state, CB_H_COUNT, 2);
+
+        native_cb_reset(&mut ctx, &[Value::Object(Some(barrier))]).unwrap();
+
+        assert_eq!(
+            cb_get(&ctx, state, CB_H_BROKEN_GEN),
+            0,
+            "generation 0 — the one the parked parties are in — must be broken"
+        );
+        assert_eq!(cb_get(&ctx, state, CB_H_GENERATION), 1);
+        assert_eq!(
+            native_cb_is_broken(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(0)),
+            "the FRESH generation is not broken"
+        );
+        assert_eq!(
+            native_cb_get_number_waiting(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    /// An action that throws breaks the barrier and propagates, rather than
+    /// letting the parties past a trip whose action did not complete.
+    #[test]
+    fn a_failing_barrier_action_breaks_the_barrier() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(failing_run);
+
+        let action = new_barrier_obj(&mut ctx);
+        let barrier = new_barrier_obj(&mut ctx);
+        native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(1),
+                Value::Object(Some(action)),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).is_err(),
+            "the action's failure must reach the caller"
+        );
+        assert_eq!(
+            native_cb_is_broken(&mut ctx, &[Value::Object(Some(barrier))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        // ...and the barrier stays broken for the next party in.
+        assert!(native_cb_await(&mut ctx, &[Value::Object(Some(barrier))]).is_err());
+    }
+
+    /// `parties <= 0` is rejected by BOTH constructors.
+    #[test]
+    fn zero_parties_is_rejected_by_both_constructors() {
+        let mut ctx = mock_ctx();
+        let barrier = new_barrier_obj(&mut ctx);
+        assert!(native_cb_init(&mut ctx, &[Value::Object(Some(barrier)), Value::Int(0)]).is_err());
+        assert!(native_cb_init_action(
+            &mut ctx,
+            &[
+                Value::Object(Some(barrier)),
+                Value::Int(-1),
+                Value::Object(None)
+            ]
+        )
+        .is_err());
+    }
 }
 
 // ===========================================================================
