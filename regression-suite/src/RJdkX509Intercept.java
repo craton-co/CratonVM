@@ -166,8 +166,63 @@ public class RJdkX509Intercept {
 
         // verify(): a self-signed certificate verifies against its OWN public
         // key, and must NOT verify against a different one.
+        //
+        // THE SECOND HALF OF THAT SENTENCE WAS ONLY EVER A COMMENT. Until
+        // 2026-08-12 this arm was the bare `c.verify(pk)` below and nothing
+        // else, so a delegating X509Certificate whose verify() is a no-op — a
+        // VM that accepts ANY certificate under ANY key, which is the whole
+        // failure mode worth having a certificate vector for — produced
+        // identical output and passed (W7-51-vacuous-sweep-round-2.md §2.5).
+        // A positive arm alone cannot tell "verified" from "did not look".
+        //
+        // Two negative controls, and they fail for different reasons, which is
+        // why both are here: the first proves the KEY is consulted, the second
+        // proves the SIGNATURE BYTES are. A verify() that compared only key
+        // identity would pass the second; one that ignored the key entirely
+        // would pass the first.
         c.verify(pk);
-        System.out.println("CK RJdkX509Intercept verify=ok");
+
+        // (a) the wrong key. Derived from this certificate's own SPKI with one
+        // bit flipped inside the modulus, so it is a well-formed RSA-2048
+        // public key of the right size that simply is not this one. No key
+        // generation, so the vector stays deterministic and gains no dependency
+        // on a working KeyPairGenerator under --jdk-only.
+        byte[] spki = pk.getEncoded();
+        byte[] bentSpki = spki.clone();
+        bentSpki[100] ^= 0x01;
+        PublicKey bent = java.security.KeyFactory.getInstance("RSA")
+                .generatePublic(new java.security.spec.X509EncodedKeySpec(bentSpki));
+        check(!java.util.Arrays.equals(bent.getEncoded(), spki),
+                "the bent key must actually differ from the certificate's own");
+        String wrongKey = "VERIFIED";
+        try {
+            c.verify(bent);
+        } catch (Exception e) {
+            wrongKey = e.getClass().getSimpleName();
+        }
+        check(!wrongKey.equals("VERIFIED"),
+                "a certificate must NOT verify against a different public key");
+
+        // (b) the wrong bytes. One bit flipped inside the signature BIT STRING,
+        // the last element of the DER, so the certificate still parses and only
+        // its signature is wrong.
+        byte[] bentDer = der.clone();
+        bentDer[bentDer.length - 10] ^= 0x01;
+        X509Certificate tampered = (X509Certificate) CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(bentDer));
+        check(!java.util.Arrays.equals(tampered.getSignature(), c.getSignature()),
+                "the tampered certificate must carry a different signature");
+        String tamperedOutcome = "VERIFIED";
+        try {
+            tampered.verify(tampered.getPublicKey());
+        } catch (Exception e) {
+            tamperedOutcome = e.getClass().getSimpleName();
+        }
+        check(!tamperedOutcome.equals("VERIFIED"),
+                "a certificate with a tampered signature must NOT verify");
+
+        System.out.println("CK RJdkX509Intercept verify=ok wrongKey=" + wrongKey
+                + " tampered=" + tamperedOutcome);
 
         // Two certificates parsed from the same DER are equal and hash alike —
         // both are Certificate bytecode over getEncoded(), so a getEncoded()
