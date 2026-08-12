@@ -11,6 +11,46 @@ orchestrator builds. Every claim about CratonVM in §§1-7 is source-level and
 says so. The only thing executed for those sections was `rustfmt --check` as a
 parser on the nine edited files — that proves they parse, and nothing else.
 
+> **2026-08-12 (lane B8) — §8's identity claim is INDEPENDENTLY CONFIRMED by
+> running, and the warning's own instruction does not work.**
+>
+> §8 named `ClassId(12)` as `java/lang/Class` and slot 0 as `cachedConstructor`.
+> Confirmed on `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only`,
+> on an unrelated probe class, i.e. the guard fires on the boot path of *any*
+> program:
+>
+> ```
+> WARN cratonvm::gc::guard: a non-reference value was stored into a slot the class
+> declares as a REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper …
+> class_id=ClassId(12) index=0 value=Int(-1) occurrence=0     (… through occurrence=8)
+> ```
+>
+> and `ClassId(12)` resolved from the layout stream, not from the record:
+>
+> ```
+> $ CRATONVM_DBG_LAYOUT=1 cratonvm --jdk-only -cp . W37Probe
+> [layout] java/lang/Class cid=12 body=136 refs=16 fields=19
+> ```
+>
+> Nine occurrences per boot, `value=Int(-1)` every time — consistent with
+> `cachedConstructor` being seeded with a sentinel rather than with a live
+> `ClassId`, which is worth stating because it changes what the repair has to
+> preserve.
+>
+> **The warning text tells the reader to do something that does not work.** It
+> says "Run with `CRATONVM_DBG_TOARRAY=1` to resolve class_id to a name"; run
+> with that variable set, the message is byte-identical and still prints the
+> unresolved `ClassId(12)`. §8.2 already records that the warning's *advice*
+> was falsified; this confirms it is still shipping in the message a reader
+> hits first. `CRATONVM_DBG_LAYOUT=1` is the instruction that actually works.
+> **NOMINATION**: in the `gc::guard` warning body, replace the sentence
+> `Run with CRATONVM_DBG_TOARRAY=1 to resolve class_id to a name.` with
+> `Run with CRATONVM_DBG_LAYOUT=1 to resolve class_id to a name.`
+>
+> **Scheduling: none.** The guard is a `WARN` on stderr with no assertion
+> anywhere; the suite passes with nine of these per run. Nothing fails if the
+> count goes to nine hundred. Record stays **OPEN**.
+>
 > **2026-08-12 — §8 is the first MEASURED section, and it moves this record.**
 > The guard now fires on every boot. `ClassId(12)` is **`java/lang/Class`** and
 > slot 0 is **`cachedConstructor`**; the store is **not a native** — it is the

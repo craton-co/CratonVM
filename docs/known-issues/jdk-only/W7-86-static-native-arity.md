@@ -8,6 +8,38 @@ that exits **0 for every status**, on the default configuration.
 
 Branch `fix/continuation-pin-static-arity-20260812`.
 
+> **2026-08-12 (lane B8) — §4.1 row 4 (`Runtime.exit`) is RETIRED ON A
+> TRANSCRIPT.** Every pass on this record so far read source and ran nothing;
+> the headline claim was that `Runtime.exit(int)` "exits **0** for every
+> status, on the default configuration". Run on
+> `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only` against
+> Temurin `jdk-25.0.3.9-hotspot`, all three exit routes, requested status 3 and
+> 0, reading the **process** exit code:
+>
+> ```
+> how=runtime requested=3  HotSpot_exit=3  CratonVM_exit=3
+> how=runtime requested=0  HotSpot_exit=0  CratonVM_exit=0
+> how=system  requested=3  HotSpot_exit=3  CratonVM_exit=3
+> how=system  requested=0  HotSpot_exit=0  CratonVM_exit=0
+> how=halt    requested=3  HotSpot_exit=3  CratonVM_exit=3
+> how=halt    requested=0  HotSpot_exit=0  CratonVM_exit=0
+> ```
+>
+> Status 3 was chosen deliberately over 1: a VM that dies on an unrelated error
+> also exits 1, so a `1` row cannot tell a working `exit` from a crash. The
+> `0` rows are the negative control — they confirm the 3s are carried through
+> rather than a constant. The repair recorded at
+> `native-builtins/src/lib.rs:14483` (the `lib.rs` registration re-pointed so
+> last-write-wins no longer kills `lang_system.rs:1580`) is therefore live in
+> the shipping binary. **Row 4 closed.**
+>
+> **Scheduling: still none.** No suite vector asserts a non-zero process exit
+> status, so this row was fixed and stayed unwitnessed; the transcript above is
+> the only evidence, and it is not repeatable by any gate. §4.2's four sampled
+> rows (`HexFormat.fromHexDigits`, `fromHexDigitsToLong`,
+> `NetworkInterface.getByName`) were **not** exercised by this lane and remain
+> open as written. Record **STAYS OPEN** for §4.2.
+>
 > **RE-VERIFIED 2026-08-12 (lane A1, `--jdk-only` field-updater lane). STAYS
 > OPEN, with one row closed and one correction.** Source-level only: this lane
 > may not invoke `cargo` either, and it ran nothing. Every claim below says

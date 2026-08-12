@@ -13,6 +13,136 @@
 **Status: source landed, UNVERIFIED against a VM.** Nothing below has been
 built.
 
+> ## §12 — B8, 2026-08-12: RUN in `--synthetic-jdk`, and defect A is NOT fixed in behaviour
+>
+> Binaries: `/c/craton/synjdk-target/release/cratonvm.exe` (`--features
+> synthetic-jdk`) run with `--synthetic-jdk`;
+> `/c/craton/jdkonly-wave2-target/release/cratonvm.exe` `--jdk-only` as the
+> in-VM control; Temurin `jdk-25.0.3.9-hotspot` as oracle.
+>
+> **The mode gate reproduces verbatim.** The shipping binary refuses:
+> "synthetic-JDK mode was selected but this binary was built without the
+> `synthetic-jdk` Cargo feature, so none of the ~5,200 synthetic stubs are
+> compiled in", exit 1. The feature binary boots and runs to
+> `main-vm run() returned Ok`, exit 0.
+>
+> ### §12.1 — defect A is live: `OutputStreamWriter` silently discards writes
+>
+> §0's re-verification confirmed the three fixes are *in the tree*. They are,
+> and the surface is still broken. Measured, one probe, three arms:
+>
+> ```
+>                     HotSpot   --synthetic-jdk   --jdk-only
+> raw_fos_len              5           5              5
+> bos_len                  5           5              5
+> osw_flushed_len          5           0              5     <-- write + explicit flush + close
+> osw_closeonly_len        5           0              5
+> ```
+>
+> No exception. `write()` returns, `flush()` returns, `close()` returns, the
+> file is empty. That is fabricated success on the plainest `java.io` idiom
+> there is, and `--jdk-only` is green beside it, so it is the synthetic class
+> library and not the file layer.
+>
+> **Which overloads, exactly** — and this is what identifies the cause:
+>
+> | call | descriptor | bytes written |
+> |---|---|---|
+> | `w.write("hello")` | `(Ljava/lang/String;)V` | **0** |
+> | `w.write("hello", 0, 5)` | `(Ljava/lang/String;II)V` | **5** ✓ |
+> | `w.write(char[], 0, 5)` | `([CII)V` | **0** |
+> | `w.write('h')` | `(I)V` | **0** |
+> | `w.append("hello")` | `(Ljava/lang/CharSequence;)Ljava/io/Writer;` | `NoSuchMethodError` |
+>
+> One overload works. That rules out the wrapped-stream lookup being broken in
+> general and points at *which registrar owns which descriptor*.
+>
+> ### §12.2 — the cause: two registrars, one class, two incompatible slot-0 conventions
+>
+> `register()` is last-write-wins, and `java/io/OutputStreamWriter` is
+> registered from **two** files under the same synthetic guard:
+>
+> * `native-io/src/lib.rs:6656-6686` registers `<init>(OutputStream)V`,
+>   `<init>(OutputStream,String)V`, **`write(Ljava/lang/String;II)V`**,
+>   `flush()V`, `close()V` — and nothing else.
+> * `native-builtins/src/lib.rs:9478-9525` registers all of those *plus*
+>   `write(Ljava/lang/String;)V`, `write([CII)V`, `write(I)V`.
+>
+> The two families disagree about what slot 0 of the receiver holds.
+> `native_osw_init` (native-io, the `<init>` winner) stores an **`Int` fd**:
+>
+> ```rust
+> let fd = ctx.get_field(output_stream, 0);
+> ctx.set_field(this, 0, fd);
+> ```
+>
+> while `osw_wrapped_output` (native-builtins, `logging_shims.rs:12`), which
+> the three orphaned overloads call, wants an **object** there and answers
+> `None` for anything else:
+>
+> ```rust
+> match ctx.get_field_by_name(this, "out") {
+>     Value::Object(Some(out)) => Some(out),
+>     _ => match ctx.get_field(this, 0) {
+>         Value::Object(Some(out)) => Some(out),
+>         _ => None,
+>     },
+> }
+> ```
+>
+> `"out"` is not a field of the synthetic layout — measured,
+> `osw_fields=java.io.OutputStreamWriter:_vm0,lock,se java.io.Writer:` against
+> HotSpot's `se` / `writeBuffer,WRITE_BUFFER_SIZE,lock` — so the fallback runs,
+> reads `Value::Int(fd)`, and returns `None`. Then
+> `write_bytes_from_output_stream_writer` ends with a bare
+> `if let Some(out) = … { … }` and **no `else`**, so `None` returns `Ok(None)`:
+> the write is dropped and reported as success.
+>
+> So the descriptor `native-io` happens to register works, and the three only
+> `native-builtins` registers are dead drops. Nobody wrote a bug; two correct
+> halves were composed by a last-write-wins registry across a crate boundary.
+>
+> ### §12.3 — the `native_br_read_line` row: LIVE, but my first probe measured its own setup
+>
+> §11 recorded this row as "CONFIRMED LIVE and wider than recorded". It is
+> live, and the slot-0-`Int`-fd convention in §12.2 is the same root. But a
+> first probe here read back an empty string from `readLine()` and that was
+> **not** evidence: the file had never been written, because of §12.1. Stated
+> so the next taker does not re-derive a conclusion from a broken fixture.
+> Independent of file contents, in `--synthetic-jdk`:
+> `InputStreamReader.read([C)I` → `NoSuchMethodError`, and
+> `FileReader.<init>(Ljava/io/File;)V` → `NoSuchMethodError`.
+>
+> ### §12.4 — the `to_be_bytes` endianness row is BLOCKED, and §11's reason for it is stale
+>
+> §11 says `order(ByteOrder)` "writes the order flag over the backing array and
+> **kills the VM** before any typed accessor runs". That is fixed — the
+> `ByteBuffer.order()` repair landed today and the VM no longer dies. The row is
+> still unadjudicable, for a smaller and different reason:
+>
+> ```
+> ByteOrder_declaredFields =                       (HotSpot: name BIG_ENDIAN LITTLE_ENDIAN NATIVE_ORDER)
+> ByteOrder.BIG_ENDIAN     = NoSuchFieldError: java/nio/ByteOrder.BIG_ENDIAN
+> ByteOrder.nativeOrder()  = LITTLE_ENDIAN         (agrees with HotSpot)
+> buffer.order()           = BIG_ENDIAN            (agrees with HotSpot)
+> putInt default order     = 01020304              (agrees with HotSpot)
+> ```
+>
+> The synthetic `ByteOrder` declares **no fields**, so the two constants cannot
+> be named, so no program can select little-endian, so the hard-coded
+> `to_be_bytes` cannot be observed. The default order is big-endian and the
+> hard-coding is big-endian, which is why every default-order check agrees.
+> **Change the status of this row from "superseded" to "blocked on a
+> one-field gap"**, and note that the gap is *hiding* the defect rather than
+> being it.
+>
+> ### §12.5 — scheduling
+>
+> None of §12 is scheduled. `regression-suite/run.sh` has no `--synthetic-jdk`
+> arm at any `SUITE=` value, and CI's `synthetic-jdk` job is `cargo check` /
+> `cargo test` only — it never launches the binary (`.github/workflows/ci.yml`,
+> per §0). Every defect above is invisible to every gate that runs today.
+
 > **RE-VERIFIED IN TREE 2026-08-12.** All three fixes are still present; line
 > numbers have drifted and are corrected here:
 > `native-builtins/src/lib.rs:9478` and `:9541` (defect A, `OutputStreamWriter`

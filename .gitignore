@@ -118,3 +118,7 @@ dim4-*.log*
 build-win.log
 cv-url.txt
 hs-url.txt
+
+# H2 corpus runs write their database here (regression-suite/corpus).
+# Test output, not source.
+data/

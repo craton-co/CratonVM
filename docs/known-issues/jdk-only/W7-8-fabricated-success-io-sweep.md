@@ -5,6 +5,50 @@ of any kind was executed for this record and no CratonVM binary exists carrying
 it. Every claim below is a claim about *source* and about the *JDK 25 oracle*,
 never about observed behaviour.
 
+> ## §10 — B8, 2026-08-12: a NEW fabricated-success row, found by running
+>
+> This sweep is about `java.io` natives that report success and do nothing. It
+> has a member it never found, and it is on the most ordinary call in the
+> package. In `--synthetic-jdk`
+> (`/c/craton/synjdk-target/release/cratonvm.exe`), an `OutputStreamWriter`
+> accepts a write, accepts an explicit `flush()`, accepts `close()`, throws
+> nothing, and leaves a **zero-byte file**:
+>
+> ```
+>                     HotSpot   --synthetic-jdk   --jdk-only
+> osw_flushed_len          5           0              5
+> osw_closeonly_len        5           0              5
+> raw_fos_len              5           5              5      <-- FileOutputStream is fine
+> bos_len                  5           5              5      <-- BufferedOutputStream is fine
+> ```
+>
+> Three of five `Writer` write overloads drop their bytes silently
+> (`write(String)`, `write(char[],int,int)`, `write(int)`); `write(String,int,int)`
+> works; `append(CharSequence)` throws `NoSuchMethodError`.
+>
+> **The shape is this record's §7 shape, one level up.** §7's lesson was that a
+> fix can land in a registrar nothing calls. Here both registrars are called,
+> and that is the defect: `java/io/OutputStreamWriter` is registered from
+> `native-io/src/lib.rs:6656-6686` **and** `native-builtins/src/lib.rs:9478-9525`,
+> `register()` is last-write-wins, and the two disagree about slot 0.
+> `native_osw_init` (native-io) wins `<init>` and stores an **`Int` fd** there;
+> `osw_wrapped_output` (native-builtins, `logging_shims.rs:12`), which the three
+> overloads only *it* registers must call, requires a `Value::Object` in slot 0
+> and answers `None` otherwise. `write_bytes_from_output_stream_writer` then
+> ends with a bare `if let Some(out) = … { … }` and **no `else`** — so `None`
+> is `Ok(None)`, and the failure is laundered into success.
+>
+> That trailing `if let` with no `else` is the exact idiom this record exists to
+> sweep for, so it belongs in the §2 tier table. Full transcript, per-overload
+> breakdown and the slot-convention analysis are in
+> `W7-50-synthetic-jdk-strict-six.md` §12; the NOMINATION is filed there rather
+> than duplicated here.
+>
+> **Scope:** `--jdk-only` and `--real-jdk` are green on this probe — the block
+> is guarded by `drops_real_layout_synthetic()`, and that guard is doing its
+> job. This is a `--synthetic-jdk`-only row. **Scheduling: none** — no suite
+> arm runs `--synthetic-jdk` at any `SUITE=` value.
+
 > **2026-08-12 — read §7 before §3.1, and §8 before either.** The §3.6 residuals
 > were re-opened and four of five settled from source. The one that mattered most
 > was not on that list: **§3.1's entire fix set landed in a registrar that neither

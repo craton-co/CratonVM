@@ -1,5 +1,57 @@
 # W7-54 — `StrictMath` was the platform's libm, on every function, not just `log`
 
+> # RETIRED 2026-08-12 (lane B8) — RUN, and bit-exact on 29 of 29 values.
+>
+> Every prior pass on this record, including the RE-VERIFIED one below, says in
+> its own words that nothing was built or run on CratonVM. It has now been run.
+> Binary `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only`,
+> oracle Temurin `jdk-25.0.3.9-hotspot`, one class file on both arms, every
+> value printed as `Double.doubleToRawLongBits` so a 1-ulp drift cannot hide in
+> decimal:
+>
+> ```
+> $ diff hsm.txt cvm.txt && echo IDENTICAL
+> IDENTICAL
+> ```
+>
+> 29 values: the eighteen fdlibm-backed transcendentals
+> (`sin cos tan asin acos atan atan2 log log10 exp pow cbrt hypot log1p expm1
+> sinh cosh tanh`), `sqrt`, five `IEEEremainder` inputs, and the six
+> `Math`/`StrictMath` `min`/`max` NaN and `-0.0` cases. Sample:
+>
+> ```
+> sin=4605754516372524270 (0.8414709848078965)
+> rem_MAX_MINNORM=0 (0.0)
+> Math.min_1_NaN=9221120237041090560 (NaN)
+> Math.min_-0_0=-9223372036854775808 (-0.0)
+> ```
+>
+> **§4's correction is confirmed by measurement, and it was the right call to
+> make it.** The probe uses the discriminating half-integers §4 identifies, not
+> the one it caught itself using:
+>
+> | input | measured | what it proves |
+> |---|---|---|
+> | `IEEEremainder(1.5, 1.0)` | `-0.5` | agrees under BOTH rules — **cannot discriminate**, exactly as §4 says |
+> | `IEEEremainder(2.5, 1.0)` | `0.5` | ties-to-even (`2.5→2`); the ties-away body would give `-0.5` |
+> | `IEEEremainder(0.5, 1.0)` | `0.5` | ties-to-even (`0.5→0`) |
+> | `IEEEremainder(4.5, 1.0)` | `0.5` | ties-to-even (`4.5→4`) |
+> | `IEEEremainder(MAX_VALUE, MIN_NORMAL)` | `0.0` | **not** `-Infinity` — the recorded broken value is gone |
+>
+> Three independent half-integers land on the ties-to-even answer, so the
+> fdlibm body is live on the running path and the libm body is not reachable
+> from it. §4's warning that a `!Double.isNaN(r)` guard would have **admitted**
+> the broken `-Infinity` is also confirmed as sound: the repaired value is
+> `0.0`, and only an exact-bits assertion separates the two.
+>
+> **Scheduling: the vector is real and it runs.** `--jdk-only` is the mode this
+> record is filed under and the values above came from it. §12's alternative
+> repair — de-register the eighteen strict triples in real-JDK mode and let the
+> image's own `java.lang.FdLibm` bytecode run — is **not** taken and is not
+> needed for correctness; it remains a throughput/architecture question for
+> docs/architecture/natives-over-real-jdk-classes.md §1, not a defect. Retiring
+> this record does not close that.
+
 > ## RE-VERIFIED 2026-08-12 (lane A14). The port is in the tree and reaches the running path. It now has a SCHEDULED vector, and §4's two worked examples are WRONG.
 >
 > Nothing was built or run on CratonVM in this pass either. What was done is

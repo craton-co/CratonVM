@@ -1,6 +1,83 @@
 # W7-37 — `Throwable`'s state machine, and the module/loader clause on a VM-minted cast refusal
 
-**Status: EIGHT DIVERGENCES MEASURED AND FIXED IN SOURCE 2026-08-12, NOT REBUILT.**
+**Status: REBUILT AND RUN 2026-08-12 (lane B8). SIX OF EIGHT ROWS VERIFIED FIXED.
+TWO ARE STILL DIVERGENT, AND ONE OF THOSE THIS RECORD CLAIMED AS FIXED.**
+
+> ## B8 — the first run of this record's own table against a binary
+>
+> Every previous pass on this record was source-level: the table's "after"
+> column was a *claim about source*, said so, and stayed unverified. It is now
+> executed. Binary `/c/craton/jdkonly-wave2-target/release/cratonvm.exe`
+> `--jdk-only`, oracle Temurin `jdk-25.0.3.9-hotspot`, one probe class file run
+> on both arms and the two stdouts diffed.
+>
+> ```
+> $ diff hs37.txt cv37.txt
+> 8c8
+> < checkcastToArray=class [I cannot be cast to class [Ljava.lang.String; ([I and [Ljava.lang.String; are in module java.base of loader 'bootstrap')
+> ---
+> > checkcastToArray=[I cannot be cast to [Ljava.lang.String;
+> 10c10
+> < arrayStoreHot=java.lang.Integer
+> ---
+> > arrayStoreHot=no-throw
+> ```
+>
+> **Six rows are byte-identical to HotSpot and are RETIRED**: all five
+> `Throwable` rows (`initCauseAfterCtorThrows`, `initCauseTwiceThrows` — cause
+> `c` survives, `selfCauseThrows`, `addSuppressedSelfThrows`,
+> `suppressionDisabled=0:0`) plus `VM.classCast`, whose parenthetical matches
+> including the joint module/loader clause. `addSuppressed(null)` →
+> `NullPointerException` agrees too. Part 1 and Part 2 are done.
+>
+> **Row 7 `VM.checkcastToArray` is NOT fixed** — the table's "after" cell says
+> "HotSpot's string" and the binary prints the bare two-operand form. This is a
+> correction to this record, not a stale line number.
+>
+> **Row 8 hot / Part 4 is CONFIRMED LIVE on today's binary**, not merely on the
+> frozen wave binary Part 4 measured. `RExceptions` is RED at exactly the
+> predicted assertion:
+> `AssertionError: ArrayStoreException text moved during warm-up at i=500:
+> cold=[java.lang.Integer] hot=[no-throw]`, against
+> `PASS RExceptions (25 checks)` on HotSpot. Part 4's diagnosis stands
+> unaltered: the JIT lowers `aastore` inline and never calls `jit_aastore`, so
+> the compiled tier performs the store. The heap type confusion is real today.
+>
+> ### Row 7's mechanism, isolated by experiment rather than inferred
+>
+> A six-case probe varying only whether each operand is an array:
+>
+> | case | operands | CratonVM |
+> |---|---|---|
+> | `D_obj_to_obj` | `String` → `Integer` | **byte-identical to HotSpot** |
+> | `F_app_to_bootstrap` | `CastProbe` → `String` | **byte-identical**, split two-clause form and all |
+> | `A_obj_to_refarr` | `String` → `[Ljava.lang.String;` | bare form |
+> | `B_primarr_to_obj` | `[I` → `String` | bare form |
+> | `C_primarr_to_refarr` | `[I` → `[Ljava.lang.String;` | bare form |
+> | `E_refarr_to_refarr` | `[Ljava.lang.Integer;` → `[Ljava.lang.String;` | bare form |
+>
+> The rewrite is correct whenever **neither** operand is an array and fails
+> whenever **either** is — including the split-clause path, which is the harder
+> case and works. So `hotspot_class_cast_message` is not at fault;
+> `klass_origin` (`vm/src/runtime/exceptions.rs`) returns `None` for an array
+> display name, and one `None` collapses the whole message via `?`.
+>
+> The cause is an ordering one, and it makes existing code dead:
+> `klass_origin` opens with `find_unique_class_by_name(display_name)?` — a
+> lookup of *the array class itself* — and only *afterwards* parses the `[`
+> prefix to find the component's module. That descriptor-parsing block, which
+> is written correctly and even carries HotSpot's `bottom_klass` rationale, can
+> only ever run for an array class already in the definition index, and the
+> measurements above show none are. **The array support in this function has
+> never executed.** Nomination in §B8.1 below.
+>
+> ### Scheduling: row 7 is invisible to this record's own vector
+>
+> `regression-suite/src/RExceptions.java` asserts the CCE text only for
+> `String` → `Integer` — the one shape that works. Four of the six cast shapes
+> above have no scheduled witness at all, which is why row 7 could be recorded
+> as fixed and stay wrong. Row 8 *is* scheduled and is red. Nominated vector in
+> §B8.2.
 
 Every measurement below was taken by running the already-built binary at
 `C:/craton/CratonVM/target/release/cratonvm.exe` against Temurin
@@ -594,3 +671,70 @@ The field-state and message tables above came from two throwaway probes run the
 same way with `--add-opens java.base/java.lang=ALL-UNNAMED` on both sides; the
 `--add-opens` is required or `Field.setAccessible` on `Throwable.cause` throws
 `InaccessibleObjectException` on HotSpot.
+
+---
+
+## §B8.1 — NOMINATION: `klass_origin` must parse the descriptor before it looks up
+
+`vm/src/runtime/exceptions.rs`. The array branch is currently unreachable
+because the function demands the array *class* be in the definition index
+before it will look at the component. Resolve the component instead, and take
+the loader from it.
+
+OLD (exact, from `fn klass_origin`):
+
+```rust
+    let cm = shared.classes.class_manager.read();
+    let class_id = cm.find_unique_class_by_name(display_name).or_else(|| {
+        let frame_class = thread.frames.last()?.class_id;
+        cm.find_class_by_name_for_class(display_name, frame_class)
+    })?;
+```
+
+NEW:
+
+```rust
+    let cm = shared.classes.class_manager.read();
+    // An array's own class need not be in the definition index — measured: no
+    // array display name resolves, which made the `dims` block below dead code
+    // and dropped every array-operand cast message back to the bare form
+    // (W7-37 §B8). HotSpot reads module and loader off the BOTTOM klass, so
+    // resolve that directly and let the primitive case answer without a lookup
+    // at all.
+    let dims = display_name.bytes().take_while(|b| *b == b'[').count();
+    let lookup_name = match display_name[dims..].strip_prefix('L') {
+        Some(component) => component.trim_end_matches(';'),
+        // Primitive-component array (`[I`) — java.base / bootstrap, per
+        // HotSpot's "klass is an array of primitives, module is java.base".
+        None if dims > 0 => {
+            return Some(KlassOrigin {
+                module: Some("java.base".to_string()),
+                loader: "'bootstrap'",
+                loader_id: cratonvm_types::ClassLoaderId::Bootstrap,
+            })
+        }
+        None => display_name,
+    };
+    let class_id = cm.find_unique_class_by_name(lookup_name).or_else(|| {
+        let frame_class = thread.frames.last()?.class_id;
+        cm.find_class_by_name_for_class(lookup_name, frame_class)
+    })?;
+```
+
+With `lookup_name` resolving the component, the existing `dims`/`strip_prefix`
+block further down becomes redundant and should be deleted along with its
+`let name = class.name.to_string();` — the module it computes is now the module
+of the class just resolved. **Do not** delete the `bottom_klass` comment; move
+it to the new block, which is where it is now load-bearing.
+
+Verification is the six-case probe in §B8: all six rows must go byte-identical
+to HotSpot, and `D`/`F` must not regress.
+
+## §B8.2 — NOMINATION: schedule the four unwitnessed cast shapes
+
+`regression-suite/src/RExceptions.java` covers only `String` → `Integer`. Add
+the four array shapes beside it — `A_obj_to_refarr`, `B_primarr_to_obj`,
+`C_primarr_to_refarr`, `E_refarr_to_refarr` from §B8 — asserting full byte
+parity with the HotSpot strings quoted there. They are trivially true on
+HotSpot, so they cannot flake on the oracle arm, and they are the difference
+between row 7 being adjudicable and being re-recorded as fixed a third time.

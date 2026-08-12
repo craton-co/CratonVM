@@ -3,6 +3,29 @@
 **Status: FIXED 2026-08-12. Found by running a probe, not by reading a record.**
 **Both shipping modes were affected. Not `--jdk-only`-specific.**
 
+> **RETIRED 2026-08-12 (lane B8) — independently re-run against the shipping
+> binary, by raw bits.** The fix was verified by its author; this is a second
+> measurement by a lane that did not write it, on
+> `/c/craton/jdkonly-wave2-target/release/cratonvm.exe --jdk-only` vs Temurin
+> `jdk-25.0.3.9-hotspot`, with every value compared as
+> `Double.doubleToRawLongBits` — the comparison this record itself says is the
+> only valid one:
+>
+> ```
+> Math.min_1_NaN=9221120237041090560 (NaN)
+> Math.max_1_NaN=9221120237041090560 (NaN)
+> Math.min_-0_0=-9223372036854775808 (-0.0)
+> Math.max_-0_0=0 (0.0)
+> StrictMath.min_1_NaN=9221120237041090560 (NaN)
+> StrictMath.max_-0_0=0 (0.0)
+> ```
+>
+> All six bit-identical to HotSpot, inside a 29-value diff that came back
+> `IDENTICAL` (the rest is W7-54's `StrictMath` family). Note
+> `Math.min(-0.0, 0.0)` = `0x8000000000000000` and `Math.max(-0.0, 0.0)` = `0`:
+> the two differ in the sign bit only, which is precisely the distinction an
+> `==` assertion cannot see and this record warned about. Retired.
+
 ## The measurement
 
 HotSpot 25.0.3+9 as oracle, same host, same class file, `--real-jdk`:
