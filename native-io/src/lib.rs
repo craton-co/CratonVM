@@ -6415,8 +6415,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // fully real-bytecode path, analogous to the FileInputStream open0/read0
     // surface. The old synthetic ISR natives are kept only under
     // `synthetic-jdk`.
+    //
+    // 2026-08-12 (W7-50): the cfg alone was the WRONG GUARD here, for exactly
+    // the reason spelled out on the `FileOutputStream` block above — it asks
+    // what was COMPILED, and what decides whether a real `InputStreamReader`
+    // is on the other end is which CLASS LIBRARY was LOADED. A
+    // `--features synthetic-jdk` binary run `--jdk-only` (or `--real-jdk`)
+    // satisfied the cfg and registered these over the real class, where slot 0
+    // is `Reader.lock` and slot 1 is `Reader.skipBuffer`. `native_isr_init`
+    // then clobbers the monitor object, writes an `InputStream` into a
+    // `char[]` slot, and never creates the `sd` StreamDecoder.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         registry.register(
             "java/io/InputStreamReader",
             "<init>",
@@ -6479,8 +6489,36 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // synthetic 1-3-field layouts (fd at slot 0) and corrupt state
     // when invoked on real JDK instances (BufferedReader: in + cb +
     // nChars + nextChar + ...).  Keep them gated.
+    //
+    // 2026-08-12 (W7-50): "gated" meant the cfg alone, which is the wrong
+    // guard (see the `FileOutputStream` and `InputStreamReader` notes above).
+    // Measured on a `--features synthetic-jdk` binary under `--jdk-only`,
+    // where every class here is a REAL JDK class:
+    //
+    //  * `native_br_read_line` reads slot 0 expecting a `Value::Int` fd. On a
+    //    real `BufferedReader` slot 0 is `in`, a reference, so the match falls
+    //    to `_` and `readLine()` returns Java `null` on the FIRST call, with
+    //    no I/O attempted and nothing thrown. That is `RJdkNet`'s
+    //    "echo reply: null" and `RJdkServices`' "discovered providers: []" --
+    //    the latter because real `ServiceLoader$LazyClassPathLookupIterator`
+    //    parses its `META-INF/services` descriptor through exactly this
+    //    `readLine`, so it collects zero provider names and the for-each body
+    //    never runs.
+    //  * `native_osw_init` / `native_bw_init` park a value on slot 0 and never
+    //    build the `se` StreamEncoder or set `out`. JDK 25's `PrintStream`
+    //    ctor builds `charOut = new OutputStreamWriter(this, charset)` and
+    //    `textOut = new BufferedWriter(charOut)`, so `print(char[])` reaches
+    //    `BufferedWriter.ensureOpen()` with a null `out`, which throws
+    //    `IOException("Stream closed")`; `PrintStream`'s own exception table
+    //    catches it and sets `trouble = true`. That is `RJdkHello`'s
+    //    "PrintStream reported an error" -- `checkError()` is not registered
+    //    anywhere, so it faithfully reported a flag we caused.
+    //
+    // The runtime flag is the correct guard and is already set in exactly the
+    // arms that matter. The cfg stays too: a default build should not compile
+    // these in at all.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         // --- java.io.BufferedReader ---
         registry.register(
             "java/io/BufferedReader",
@@ -6692,8 +6730,33 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // overrides on a real instance panics with a layout mismatch.  Gate
     // them behind the synthetic-jdk feature so real-JDK mode uses the
     // JDK's own bytecode implementations.
+    //
+    // 2026-08-12 (W7-50): the comment says "real-JDK mode", the guard said
+    // "real-JDK build" -- the same wrong guard as the `FileOutputStream` and
+    // Reader/Writer blocks above. A `--features synthetic-jdk` binary run
+    // `--jdk-only` registered this whole ~60-method surface over the real
+    // `java.nio.ByteBuffer`, and because it runs AFTER the order-aware `s2`
+    // family from `native-builtins`' `register_s2_bytebuffer_essentials` and
+    // registration is last-write-wins, it WON. Two measured consequences:
+    //
+    //  * `native_bb_put_int`/`get_int`/`put_short`/... are hard-coded
+    //    `to_be_bytes`/`from_be_bytes` and never read `bigEndian`, while
+    //    `order(ByteOrder)` is not re-registered here at all. So the order
+    //    write lands, `order()` reports LITTLE_ENDIAN, and `putInt` writes
+    //    big-endian anyway. That asymmetry is `RJdkNio`'s "little-endian
+    //    layout" (big-endian passed, which is what made it look narrow).
+    //  * `native_bb_remaining` goes through `bb_state`, which resolves the
+    //    backing array as `hb`-by-name, then slot 5, then slot 0 -- and has
+    //    no direct-buffer arm. On the real `DirectByteBuffer` that
+    //    `ByteBuffer.allocateDirect` returns, slot 0 is `Buffer.mark`, whose
+    //    initial value is -1. That is `RJdkDefineClass`'s "ByteBuffer missing
+    //    backing array (field 0 returned Int(-1))", raised from the
+    //    `int len = b.remaining()` that opens real
+    //    `ClassLoader.defineClass(String,ByteBuffer,ProtectionDomain)`.
     #[cfg(feature = "synthetic-jdk")]
-    register_nio_natives(registry);
+    if !registry.drops_real_layout_synthetic() {
+        register_nio_natives(registry);
+    }
 
     // --- Phase 26: Extended I/O ---
     register_string_rw_natives(registry);

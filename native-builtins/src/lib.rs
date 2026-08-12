@@ -9234,7 +9234,20 @@ pub fn register_essential_natives_with_shims(
     // `sun.nio.cs.StreamEncoder` shim (native-io/src/stream_encoder.rs),
     // which was validated byte-for-byte against HotSpot's flush granularity.
     // Same gating precedent as the BufferedInputStream block below.
-    if cfg!(feature = "synthetic-jdk") {
+    //
+    // 2026-08-12 (W7-50): every word of the paragraph above is about real-JDK
+    // MODE, but `cfg!(feature = "synthetic-jdk")` tests the BUILD. This
+    // function is reached from BOTH arms of `vm_init` -- directly at the
+    // real-JDK arm, and via `register_builtins` -> `register_essential_natives`
+    // at the synthetic arm -- so in a `--features synthetic-jdk` binary the
+    // cfg was true in real-JDK mode too and this surface shadowed the real OSW
+    // bytecode exactly as described. The `(OutputStream, Charset)` descriptor
+    // below is registered ONLY here, and it is the one JDK 25's `PrintStream`
+    // ctor calls for `charOut`, so this block alone was enough to leave
+    // `PrintStream.textOut` unusable and `checkError()` true (`RJdkHello`).
+    // `drops_real_layout_synthetic()` is the mode-accurate guard: false in the
+    // synthetic arm, true in both real-JDK arms, in both builds.
+    if cfg!(feature = "synthetic-jdk") && !registry.drops_real_layout_synthetic() {
         for descriptor in [
             "(Ljava/io/OutputStream;)V",
             "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
@@ -9290,7 +9303,14 @@ pub fn register_essential_natives_with_shims(
     // its `skip`/`ensureOpen` path through this bridge leaves `buf` looking
     // closed while Jandex indexes a class stream.  Keep the bridge only for
     // synthetic-JDK builds; real-JDK execution must use the class bytecode.
-    if cfg!(feature = "synthetic-jdk") {
+    //
+    // 2026-08-12 (W7-50): "real-JDK execution" is a MODE, and the cfg tests
+    // the BUILD -- same wrong guard as the OutputStreamWriter block above,
+    // which cites this one as its precedent. Corrected together so the
+    // precedent is the right shape for the next reader. Not implicated in any
+    // of the six W7-50 vectors; fixed because leaving one of two identical
+    // wrong guards in one function is how a family gets re-opened.
+    if cfg!(feature = "synthetic-jdk") && !registry.drops_real_layout_synthetic() {
         registry.register(
             "java/io/BufferedInputStream",
             "<init>",
