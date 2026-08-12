@@ -1,5 +1,21 @@
 # W7-82 — a second `Class.forName` through a bare `URLClassLoader` re-drove the define
 
+> # RETIRED-FIXED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.5. The vector is green in both arms
+> (`RLoaderChurnDefine PASS`, close-strict.log:48 / close-compat.log:48) — the
+> vector this record extended with `repeatLookupIsACacheHit()`, the assertion
+> that goes red on the defect.
+>
+> **Read this before working from *What changed* below: the fix in the tree is
+> no longer the one written here.** W7-87-urlclassloader-namespace-asymmetry.md
+> **deleted** this record's additive block and replaced the branch predicate
+> outright (`native-builtins/src/classloader.rs:2707`), stating that its group 8
+> asserts nothing fixed here was given up. W7-87 also owns the residual this
+> record named and deliberately did not fix — the bare `URLClassLoader` reaching
+> the built-in branch's global fallback — and is live, with 17 asymmetric
+> consumers remaining.
+
 **Status: FIXED 2026-08-12, with a vector and a probe.** A repeated
 `Class.forName(name, true, loader)` — or `loadClass` — through **one bare
 `java.net.URLClassLoader`** failed on CratonVM with

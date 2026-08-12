@@ -1,6 +1,18 @@
 # W7-48 — the ForkJoin cluster's "unapplied" patches were all applied; what was
 # missing was the evidence
 
+> # RETIRED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.4. The condition this retirement was
+> made conditional on is **satisfied and was confirmed, not assumed**: W6-9
+> §7.5's `ForkJoinPool.invoke` / `join()` divergence now has its own row in
+> README §2.2, under W6-9. And this record's own deliverable is verified by a
+> run rather than by its author's reading — `completionRecord()` is in
+> `regression-suite/src/RJdkForkJoin.java:370` with all three RED-before
+> assertions (`:388`, `:410`, `:436`), the vector is in `JDKONLY_CLASSES`
+> (`run.sh:119`), and `RJdkForkJoin PASS` in **both** arms of the closing suite.
+> Its remaining §7 items are owned by W3-4, W6-9 and W7-30, all live.
+
 Status: **audit closed; coverage added (unbuilt, unmeasured)**. Wave 7, lane
 W7-48.
 

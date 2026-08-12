@@ -1,5 +1,18 @@
 # W7-67 — the default locale was hardcoded `en_US`, and `Locale.Category` was collapsed
 
+> # RETIRED-FIXED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.7. Both halves are in the tree —
+> `vm/src/vm/vm_init.rs:419`/`:490`/`:520` for the `java_props_md.c` mirror, and
+> the three-slot `Locale.Category` cache rooted by `gc_scan_locale_roots`
+> (`native-builtins/src/lib.rs:26184`, remap companion `:26194`).
+>
+> **The §3 residual is retired WITH a home**, which is the condition for moving
+> a record that still has one: the script/variant-per-category limitation is
+> written at `native-builtins/src/locale_bootstrap.rs:205-210`, in
+> `resolve_default_locale_for`'s own doc comment, citing this record by name.
+> Stages 2 and 3 went to W7-80 and the `%t` half to W7-91; both are live.
+
 **RETIRE-FIXED, with one residual. Source landed 2026-08-12; not re-run.**
 Re-adjudicated 2026-08-12 against the tree. Both halves of the headline are in
 place and the staged work this record scheduled has since been done by other
