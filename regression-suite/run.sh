@@ -107,7 +107,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once

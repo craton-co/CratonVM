@@ -1132,10 +1132,35 @@ pub(crate) fn secure_random_fill(_key: i32, buf: &mut [u8]) {
     chacha20_keystream_fill(&key, &nonce, buf);
 }
 
-/// ChaCha20 keystream generator (RFC 8439).  Used ONLY as the software fallback
-/// inside `secure_random_fill` when the OS CSPRNG is unavailable; it writes its
-/// raw keystream into `buf` (i.e. XOR against an implicit zero plaintext).
-fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+/// RFC 8439 ChaCha20, XOR-ing the keystream into `buf` starting from block
+/// `initial_counter`.
+///
+/// This is the crate's ONE ChaCha20 core. It was previously
+/// `chacha20_keystream_fill`, which wrote its keystream instead of XOR-ing it
+/// and hard-coded the block counter to 0 — the two properties that stood
+/// between an already-correct RFC 8439 implementation and a usable stream
+/// cipher. Generalising in place rather than adding a second entry point is
+/// deliberate: `chacha20_keystream_fill` is now a wrapper over this function,
+/// so the RFC 7539 known-answer test below covers both callers, and there is
+/// no second ChaCha20 to drift.
+///
+/// The counter is the caller's because JCA's `ChaCha20ParameterSpec(nonce,
+/// counter)` lets the caller choose it. Verified against HotSpot 25's own
+/// SunJCE `Cipher.getInstance("ChaCha20")` — see
+/// `chacha20_xor_counter_one_matches_hotspot` — which also confirms the
+/// counter is a plain block index: the same key/nonce at counter 0 produces,
+/// in its second 64-byte block, exactly what counter 1 produces in its first.
+///
+/// Counter wrap is `wrapping_add`, matching the pre-existing behaviour. RFC
+/// 8439 §2.3 caps a single (key, nonce) message at 256 GiB, which this
+/// function does not enforce; no caller in this tree comes near it, and the
+/// only present caller is `secure_random_fill`'s one-shot fallback.
+pub(crate) fn chacha20_xor(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    initial_counter: u32,
+    buf: &mut [u8],
+) {
     #[inline]
     fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
         s[a] = s[a].wrapping_add(s[b]);
@@ -1166,7 +1191,7 @@ fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
             nonce[4 * i + 3],
         ]);
     }
-    let mut counter: u32 = 0;
+    let mut counter: u32 = initial_counter;
     let mut pos = 0;
     while pos < buf.len() {
         let mut working = state0;
@@ -1190,10 +1215,28 @@ fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
             block[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
         }
         let to_copy = (buf.len() - pos).min(64);
-        buf[pos..pos + to_copy].copy_from_slice(&block[..to_copy]);
+        for i in 0..to_copy {
+            buf[pos + i] ^= block[i];
+        }
         pos += to_copy;
         counter = counter.wrapping_add(1);
     }
+}
+
+/// Raw ChaCha20 keystream from block 0, written over whatever `buf` held.
+///
+/// Used ONLY as the software fallback inside `secure_random_fill` when the OS
+/// CSPRNG is unavailable. Kept as a named wrapper rather than folded into its
+/// one call site so that the RFC 7539 known-answer test keeps testing the
+/// shape the fallback actually uses: zero the buffer first, so XOR-ing the
+/// keystream in is the same thing as writing it. Zeroing is not incidental —
+/// `secure_random_fill` hands us a caller's buffer whose prior contents are
+/// arbitrary, and entropy that depends on them is entropy nobody audited.
+fn chacha20_keystream_fill(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    chacha20_xor(key, nonce, 0, buf);
 }
 
 fn native_secure_random_next_bytes(
@@ -5863,6 +5906,102 @@ mod tests {
             "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7\
              da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586"
         );
+    }
+
+    /// The vectors below were MEASURED, not recalled: HotSpot 25's own SunJCE
+    /// `Cipher.getInstance("ChaCha20")` was initialised with the stated key,
+    /// `ChaCha20ParameterSpec(nonce, counter)`, and asked to encrypt an
+    /// all-zero plaintext — which yields the raw keystream. Encrypting zeros is
+    /// the only way to read a stream cipher's keystream through the JCA API,
+    /// and it makes the oracle's output directly comparable with
+    /// `chacha20_xor` over a zero buffer.
+    ///
+    /// The zero-key vector above (`chacha20_keystream_rfc7539_zero_key`) was
+    /// re-derived from the same oracle in passing and matches this tree's
+    /// existing expectation byte for byte, which is independent evidence that
+    /// the pre-existing core was already correct — what it lacked was a
+    /// caller-supplied counter and an XOR, not a working permutation.
+    #[test]
+    fn chacha20_xor_counter_one_matches_hotspot() {
+        // key = 00..1f, nonce = 00 00 00 00 00 00 00 4a 00 00 00 00 (RFC 8439
+        // §2.4.2's key and nonce), block counter 1.
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut out = [0u8; 128];
+        chacha20_xor(&key, &nonce, 1, &mut out);
+        assert_eq!(
+            hex(&out),
+            "224f51f3401bd9e12fde276fb8631ded8c131f823d2c06e27e4fcaec9ef3cf78\
+             8a3b0aa372600a92b57974cded2b9334794cba40c63e34cdea212c4cf07d41b7\
+             69a6749f3f630f4122cafe28ec4dc47e26d4346d70b98c73f3e9c53ac40c5945\
+             398b6eda1a832c89c167eacd901d7e2bf363740373201aa188fbbce83991c4ed"
+        );
+    }
+
+    /// The counter is a plain block index, and this is the observation that
+    /// proves it without trusting either implementation: the same key and nonce
+    /// at counter 0 must produce, as its SECOND 64-byte block, exactly what
+    /// counter 1 produces as its FIRST. HotSpot's output has this property;
+    /// so must ours. A core that ignored `initial_counter` would still pass
+    /// the vector test above if its expectation were taken from itself — this
+    /// one it could not pass.
+    #[test]
+    fn chacha20_xor_counter_is_a_block_index() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut from_zero = [0u8; 128];
+        chacha20_xor(&key, &nonce, 0, &mut from_zero);
+        let mut from_one = [0u8; 64];
+        chacha20_xor(&key, &nonce, 1, &mut from_one);
+        assert_eq!(&from_zero[64..], &from_one[..]);
+        // …and the counter-0 stream is HotSpot's, so neither block is ours alone.
+        assert_eq!(
+            hex(&from_zero[..64]),
+            "af051e40bba0354981329a806a140eafd258a22a6dcb4bb9f6569cb3efe2deaf\
+             837bd87ca20b5ba12081a306af0eb35c41a239d20dfc74c81771560d9c9c1e4b"
+        );
+    }
+
+    /// A length that is not a multiple of the 64-byte block must stop mid-block
+    /// and must not touch the bytes past the end. HotSpot's 70-byte answer is
+    /// the 128-byte answer truncated, which is the property being pinned.
+    #[test]
+    fn chacha20_xor_partial_final_block() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut out = [0u8; 70];
+        chacha20_xor(&key, &nonce, 1, &mut out);
+        assert_eq!(
+            hex(&out),
+            "224f51f3401bd9e12fde276fb8631ded8c131f823d2c06e27e4fcaec9ef3cf78\
+             8a3b0aa372600a92b57974cded2b9334794cba40c63e34cdea212c4cf07d41b7\
+             69a6749f3f63"
+        );
+    }
+
+    /// XOR, not write: running the same keystream over the same buffer twice
+    /// must restore the plaintext. This is the property that makes the function
+    /// a cipher rather than a generator, and the one the old
+    /// `copy_from_slice` body did not have.
+    #[test]
+    fn chacha20_xor_is_an_involution() {
+        let key = [0x5au8; 32];
+        let nonce = [0x3cu8; 12];
+        let plaintext: Vec<u8> = (0..200u32).map(|i| (i * 31) as u8).collect();
+        let mut buf = plaintext.clone();
+        chacha20_xor(&key, &nonce, 7, &mut buf);
+        assert_ne!(buf, plaintext, "ciphertext must differ from plaintext");
+        chacha20_xor(&key, &nonce, 7, &mut buf);
+        assert_eq!(buf, plaintext, "decrypting must restore the plaintext");
     }
 
     #[test]

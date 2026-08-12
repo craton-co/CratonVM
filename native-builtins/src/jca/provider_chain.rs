@@ -1121,19 +1121,103 @@ fn seed_direct_native_engine_services() {
     }
 
     const JCE: &str = "SunJCE";
-    // The generic Cipher.AES service owns standard AES transformations; the
-    // Cipher native separately rejects unsupported transformations such as CCM.
+    // The generic Cipher.AES service owns the AES transformations whose mode
+    // lives in an attribute rather than the service name (ECB/CBC/CFB/OFB); the
+    // fully-spelled names below are separate services on HotSpot and are
+    // separate services here. `jca::cipher::classify_transformation` decides
+    // which mode/padding combinations each one really admits, and this list is
+    // kept equal to what that function can COMPUTE — advertised and implemented
+    // are one set, walked in both directions.
+    //
+    // Four names came OUT of this list in the W7-15 lane, each measured against
+    // jdk-25.0.3.9-hotspot before removal — and all four went back IN on
+    // 2026-08-11 once they were implemented. Removing them was the correct
+    // answer to "advertised but not computable"; it was never the preferred
+    // one, and the preferred one is now available:
+    //
+    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation was
+    //     reachable from `Cipher` at all. Advertising them was not an
+    //     aspiration, it was wrong crypto: the engine's mode-only dispatch
+    //     turned both into AES-256-ECB, byte-identically to
+    //     `AES/ECB/PKCS5Padding`, discarding the nonce and (for the AEAD name)
+    //     producing no tag, so a tampered ciphertext decrypted without an
+    //     authentication failure. An AEAD that cannot fail on a bad tag is
+    //     worse than no AEAD, because callers build integrity guarantees on it.
+    //     **RFC 8439 is now implemented in `native-builtins/src/chacha20.rs`**,
+    //     pinned by the RFC's own vectors and a differential test against the
+    //     `chacha20poly1305` crate, and `regression-suite/src/RChaCha20Cipher.java`
+    //     matches HotSpot byte-for-byte in both modes.
+    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implemented
+    //     either. KWP is RFC 5649, a different padded-wrap scheme with its own
+    //     ICV and length prefix, not RFC 3394 with a padding bolted on;
+    //     `aes_key_wrap` computed RFC 3394 only. **Both are now implemented**
+    //     (`aes_key_wrap_with_padding` for RFC 5649, PKCS#5 at an eight-byte
+    //     block size for the other), against SunJCE's own wrap vectors.
+    //
+    // What went IN is the other direction of the same census — code that works
+    // and was never advertised, which is the quieter half of the same defect:
+    // `DES`/`DESede` (computed through the real SunJCE SPI; measured
+    // byte-identical to HotSpot for `DESede/CBC/PKCS5Padding`), the two
+    // `PBEWithHmacSHA224AndAES_*` names `jca::cipher::pbes2_aes_params` has
+    // always derived, and the size-pinned `AES_128/192/256` transformations,
+    // which now enforce their key length at `init`.
     for algorithm in [
-        "AES", "AES/GCM/NoPadding", "AES/KW/NoPadding", "AES/KW/PKCS5Padding", "AES/KWP/NoPadding",
-        "ChaCha20", "ChaCha20-Poly1305", "RSA", "PBEWithHmacSHA1AndAES_128",
-        "PBEWithHmacSHA1AndAES_256", "PBEWithHmacSHA256AndAES_128", "PBEWithHmacSHA256AndAES_256",
+        "AES",
+        "AES/GCM/NoPadding",
+        "AES/KW/NoPadding",
+        "AES/KW/PKCS5Padding",
+        "AES/KWP/NoPadding",
+        "ChaCha20",
+        "ChaCha20-Poly1305",
+        // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
+        // carries the mode set in a `SupportedModes` attribute. The divergence
+        // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
+        // the bare name defaults to ECB — so advertising `DESede` would name a
+        // transformation `getInstance` refuses. Every entry in this list is one
+        // the engine computes; that invariant is worth more than matching
+        // HotSpot's grouping, and it is what
+        // `every_advertised_sunjce_cipher_is_serviceable` pins.
+        "DES/CBC/NoPadding",
+        "DES/CBC/PKCS5Padding",
+        "DESede/CBC/NoPadding",
+        "DESede/CBC/PKCS5Padding",
+        "RSA",
+        "PBEWithHmacSHA1AndAES_128",
+        "PBEWithHmacSHA1AndAES_256",
+        "PBEWithHmacSHA224AndAES_128",
+        "PBEWithHmacSHA224AndAES_256",
+        "PBEWithHmacSHA256AndAES_128",
+        "PBEWithHmacSHA256AndAES_256",
     ] {
         put_service(JCE, "Cipher", algorithm, "com.sun.crypto.provider.Native");
+    }
+    // The size-pinned family. HotSpot registers the same shape — one service
+    // per (size, mode) with `NoPadding` spelled in the name, and NO bare
+    // `AES_128` service (measured: `Cipher.getInstance("AES_128")` raises while
+    // `AES_128/CBC/NoPadding` resolves). `KWP` and `KW/PKCS5Padding` are in
+    // HotSpot's set and deliberately absent from ours, for the reason above.
+    for size in ["AES_128", "AES_192", "AES_256"] {
+        for mode in ["CBC", "CFB", "ECB", "GCM", "KW", "OFB"] {
+            put_service(
+                JCE,
+                "Cipher",
+                &format!("{size}/{mode}/NoPadding"),
+                "com.sun.crypto.provider.Native",
+            );
+        }
     }
     for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
         put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
     }
+    // SunJCE's own aliases. Aliases are excluded from
+    // `Security.getAlgorithms` (their property key is `Alg.Alias.Cipher.X`, not
+    // `Cipher.X`), so these widen `getInstance`/`getService` resolution without
+    // lengthening the advertised list — which is exactly their role on HotSpot.
     put_alias(JCE, "Cipher", "AESWrap", "AES/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_128", "AES_128/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
+    put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
+    put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
 
     // Windows only — the provider itself is absent from the seed chain on
     // every other platform (see `provider_chain`), and seeding its services
@@ -3872,6 +3956,67 @@ mod tests {
         assert!(get_service_entry("SunJCE", "Cipher", "AES").is_some());
         assert!(get_service_entry("SUN", "Cipher", "AES").is_none());
         assert!(get_service_entry("SunJCE", "Cipher", "AESWrap").is_some());
+    }
+
+    /// W7-15 ratchet: every `Cipher` transformation this provider ADVERTISES
+    /// must be one `jca::cipher` can actually COMPUTE.
+    ///
+    /// The census that opened this lane found the two lists disagreeing in both
+    /// directions simultaneously — `ChaCha20` / `ChaCha20-Poly1305` advertised
+    /// and silently served as AES-256-ECB, `AES/KW/PKCS5Padding` and
+    /// `AES/KWP/NoPadding` advertised and served by nothing, `DES` / `DESede`
+    /// computed correctly and never advertised at all. Both directions are
+    /// defects and only one of them is loud: an advertised-but-absent algorithm
+    /// raises at `getInstance`, while a served-but-unadvertised one is
+    /// whatever the default arm felt like doing.
+    ///
+    /// A census run by hand drifts again by the next wave. This is the same
+    /// closure the bridge-wave population used: the measurement becomes a test,
+    /// so the next person to add a name to either list has to add it to both.
+    #[test]
+    fn every_advertised_sunjce_cipher_is_serviceable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised: Vec<String> = services()
+            .lock()
+            .get("SunJCE")
+            .expect("the SunJCE seed must have run")
+            .values()
+            .filter(|e| e.type_str == "Cipher")
+            .map(|e| e.algorithm.clone())
+            .collect();
+        assert!(
+            advertised.len() >= 12,
+            "the SunJCE Cipher seed looks empty: {advertised:?}"
+        );
+        for algorithm in &advertised {
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(algorithm),
+                "SunJCE advertises Cipher.{algorithm}, but Cipher.getInstance refuses it — \
+                 advertising an algorithm the engine cannot compute is the defect W7-15 closed"
+            );
+        }
+        // And the reverse direction for the names that were the actual bug.
+        // They were removed on 2026-08-11 while unimplemented and put back the
+        // same day once implemented, so what this asserts is the INVARIANT —
+        // advertised and computable are one set — rather than a fixed verdict
+        // about these four names. The loop above already proves each is
+        // serviceable; this proves the seed did not quietly drop them.
+        for implemented in [
+            "ChaCha20",
+            "ChaCha20-Poly1305",
+            "AES/KW/PKCS5Padding",
+            "AES/KWP/NoPadding",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "Cipher", implemented).is_some(),
+                "{implemented} is implemented but no longer advertised: the two lists have drifted, which is the defect this test exists for"
+            );
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(implemented),
+                "{implemented} is advertised but Cipher.getInstance refuses it"
+            );
+        }
     }
 
     /// W3-7. Every name the platform JDK 25 SunJSSE provider registers must be

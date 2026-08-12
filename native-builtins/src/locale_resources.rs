@@ -2375,7 +2375,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             use unicode_normalization::UnicodeNormalization;
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Object(None))),
             };
             // java.text.Normalizer.Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3
@@ -2401,7 +2401,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 is_nfc_quick, is_nfd_quick, is_nfkc_quick, is_nfkd_quick, IsNormalized,
             };
             let input = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => normalizer_read_char_sequence(ctx, *s),
                 _ => return Ok(Some(Value::Int(1))),
             };
             // Form ordinals: NFD=0, NFC=1, NFKD=2, NFKC=3 (JDK enum order).
@@ -2419,6 +2419,27 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 
     registry.set_category(__prev_cat);
     ()
+}
+
+/// Read an arbitrary `CharSequence` argument, not just `String`. `read_string`
+/// only understands the compact-string `String` layout; called on any other
+/// `CharSequence` (e.g. pgjdbc's SCRAM stringprep wraps a `char[]` in
+/// `java.nio.CharBuffer` before calling `Normalizer.normalize`) it silently
+/// returns `None`, and blindly defaulting that to `""` turns real content
+/// into an empty string — surfacing downstream as an
+/// `ArrayIndexOutOfBoundsException` in `Character.codePointAt` on the
+/// now-empty array. Real `String` is read directly; everything else goes
+/// through its own `toString()`, which every `CharSequence` must provide.
+fn normalizer_read_char_sequence(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    if ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(obj)) {
+        if let Some(s) = ctx.read_string(obj) {
+            return s;
+        }
+    }
+    match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

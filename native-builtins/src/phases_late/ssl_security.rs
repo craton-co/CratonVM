@@ -5332,6 +5332,110 @@ fn x509_check_validity_at(
     Ok(None)
 }
 
+/// Read the `type` argument of `CertificateFactory.getInstance`, or `None` when
+/// the caller passed `null`.
+///
+/// Fixed index 0 rather than `mac_algorithm_arg`'s relative scan: both overloads
+/// here already address their arguments positionally (the two-argument one reads
+/// the provider at `args[1]`, and `provider_chain::try_build_real_certificate_factory`
+/// reads the type at `args[0]`), and that indexing is what resolves `X.509`
+/// today — measured, not assumed. Changing it would be a second variable.
+fn cf_type_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<String> {
+    match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    }
+}
+
+/// Can `CertificateFactory.getInstance(type)` be serviced at all?
+///
+/// ## W7-29 — the advertised-vs-implemented census, in its dangerous direction
+///
+/// This registration used to accept **any** type string: the real-SPI path was
+/// tried, and on failure a bare one-field synthetic `CertificateFactory` was
+/// returned unconditionally. That is the same species as the `Cipher` defect the
+/// census named worst — an engine that validates nothing answers every name with
+/// whatever its default arm does — and here the default arm is an X.509 parser.
+///
+/// Measured on the pre-built `target/release/cratonvm.exe` in BOTH default and
+/// `--jdk-only` mode, against `jdk-25.0.3.9-hotspot` running the same class:
+///
+/// ```text
+/// advertised = [X.509]                                        (both VMs agree)
+///
+///                              CratonVM                     HotSpot 25
+/// getInstance("PKCS7")         a factory, getType()==null    CertificateException: PKCS7 not found
+/// getInstance("AES")           a factory, getType()==null    CertificateException: AES not found
+/// getInstance("")              a factory                     CertificateException:  not found
+/// getInstance(null)            a factory                     NullPointerException: null type name
+///
+/// getInstance("PKCS7").generateCertificate(<X.509 DER>)
+///                              sun.security.x509.X509CertImpl, CN=jcagap, 714 bytes
+///                                                            (never reached — the throw is above)
+/// ```
+///
+/// So a caller asking for PKCS#7 got an X.509 certificate back and no error
+/// anywhere on the path. `Security.getAlgorithms("CertificateFactory")` answered
+/// `[X.509]` on both VMs the whole time — advertised and implemented had drifted
+/// apart in the direction nothing tests, because no census enumerates the names
+/// an engine will accept but never advertised.
+///
+/// The predicate is the live provider registry, not a literal list, for the same
+/// reason `KeyManagerFactory`/`TrustManagerFactory.getInstance` above use it:
+/// `Security.getAlgorithms` is answered from that same registry
+/// (`provider_chain::algorithms_for_service`), so advertised and serviceable
+/// cannot drift by construction, and a caller-registered custom `Provider` that
+/// really does implement PKCS#7 is still honoured. It is alias- and case-aware —
+/// `X509`, `x.509` and `x509` all resolve, matching HotSpot, which echoes the
+/// caller's own spelling back from `getType()`.
+fn certificate_factory_type_supported(type_name: &str) -> bool {
+    crate::jca::provider_chain::find_service_provider("CertificateFactory", type_name).is_some()
+}
+
+/// Is this a type the one-field synthetic fallback can honestly serve?
+///
+/// The fallback has exactly one behaviour: `generateCertificate` parses X.509
+/// DER (`x509_manager::parse_certificate`). It is reached when the real SPI
+/// could not be constructed — pure-synthetic mode, or a registered provider
+/// whose implementation class will not load — and returning it for a type that
+/// is not X.509 would hand back an X.509 parser under another name, which is the
+/// defect `certificate_factory_type_supported` exists to close, one layer down.
+///
+/// This is deliberately looser than the JDK's alias table (it also folds `X-509`)
+/// and that is safe only because it runs strictly AFTER the registry gate: a
+/// spelling the registry does not carry has already been refused, so the
+/// looseness can widen nothing. It can only decide, among types the registry
+/// accepted, which ones the fallback may stand in for.
+fn certificate_factory_stub_serves(type_name: &str) -> bool {
+    type_name.to_ascii_uppercase().replace(['.', '-'], "") == "X509"
+}
+
+/// `java.security.cert.CertificateException: <type> not found` — HotSpot's own
+/// wording for a `CertificateFactory` type no provider services.
+///
+/// Measured on jdk-25.0.3.9-hotspot, not recalled: `getInstance("PKCS7")` is
+/// `java.security.cert.CertificateException: PKCS7 not found`, and the
+/// two-argument overload with a valid provider and a bogus type answers the
+/// same message (the provider is resolved first, so a bogus provider is
+/// `NoSuchProviderException` instead — that ordering is already implemented by
+/// the two-argument registration below).
+///
+/// `CertificateException` and NOT `NoSuchAlgorithmException`: it is what
+/// `CertificateFactory.getInstance(String)` declares — *"@throws
+/// CertificateException if no `Provider` supports a `CertificateFactorySpi`
+/// implementation for the specified type"* — so it is the checked exception a
+/// caller's `catch` clause is written against. Throwing the unchecked
+/// `SecurityException` instead would sail straight past that handler, the
+/// mistake `jca::message_digest::md_get_instance` and `mac_no_such_algorithm`
+/// both record having made and corrected.
+fn cert_type_not_found(ctx: &mut dyn NativeContext, type_name: &str) -> MethodCallFailed {
+    crate::phases_early::throw_jca_exc(
+        ctx,
+        "java/security/cert/CertificateException",
+        &format!("{type_name} not found"),
+    )
+}
+
 pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5342,20 +5446,44 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
         |ctx, args| {
+            // W7-29: resolve and validate the type BEFORE either construction
+            // path runs. Neither path validated anything, so every name this VM
+            // does not service was answered with an X.509 parser wearing the
+            // caller's label — see `certificate_factory_type_supported` for the
+            // measurement.
+            let Some(type_name) = cf_type_arg(ctx, args) else {
+                // HotSpot: `CertificateFactory.getInstance(null)` is
+                // `NullPointerException: null type name` — measured. It used to
+                // return a working-looking factory here.
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("null type name".to_string()),
+                }
+                .into());
+            };
+            if !certificate_factory_type_supported(&type_name) {
+                return Err(cert_type_not_found(ctx, &type_name));
+            }
             // Real-JCA bring-up: prefer a genuine `CertificateFactory` wrapping
             // a real provider SPI over the synthetic 1-field stub below — see
             // `provider_chain::try_build_real_certificate_factory`'s doc
             // comment for the root-cause story (real-bytecode-only methods
             // like `generateCertPath` NPE on the synthetic stub's absent
             // `certFacSpi`). Falls back to the stub when the algorithm can't
-            // be resolved (e.g. pure-synthetic mode, or an exotic type
-            // nothing seeds).
+            // be resolved (e.g. pure-synthetic mode, or a registered provider
+            // whose implementation class will not load).
             if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
                 if let Ok(Some(real_cf)) =
                     crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
                 {
                     return Ok(Some(Value::Object(Some(real_cf))));
                 }
+            }
+            // The registry says some provider services this type but its real
+            // SPI could not be built. The fallback only parses X.509, so for
+            // anything else refusing is the honest answer — a wrong parse under
+            // the right name is worse than a missing one.
+            if !certificate_factory_stub_serves(&type_name) {
+                return Err(cert_type_not_found(ctx, &type_name));
             }
             let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1)?;
             ctx.set_field(obj, 0, Value::Object(None));
@@ -6440,5 +6568,79 @@ pub(crate) mod new13_tests {
                 "{algo}: getMacLength() must agree with the bytes doFinal returns"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // W7-29 — `CertificateFactory.getInstance` answers only what SUN advertises
+    // -----------------------------------------------------------------------
+
+    /// The ratchet, in the shape the `Cipher` lane established with
+    /// `provider_chain::every_advertised_sunjce_cipher_is_serviceable`: the
+    /// advertised set and the serviceable set are asserted against each other,
+    /// so the next person to widen one has to widen the other.
+    ///
+    /// `Security.getAlgorithms("CertificateFactory")` is `[X.509]` on both
+    /// HotSpot 25 and CratonVM — measured, and they already agreed. The gap was
+    /// the direction a census does not enumerate: `getInstance` accepted every
+    /// other name too, so `getInstance("PKCS7").generateCertificate(der)`
+    /// returned `sun.security.x509.X509CertImpl` (measured: `CN=jcagap`, 714
+    /// bytes) where HotSpot raises `CertificateException: PKCS7 not found`.
+    ///
+    /// This depends on the provider-chain seed having run, which is why it
+    /// builds the registry through `crate::jca::register_jca_natives` exactly as
+    /// the `KeyManagerFactory`/`TrustManagerFactory` tests above do.
+    #[test]
+    fn certificate_factory_serves_exactly_the_advertised_types() {
+        let _r = build_registry_with_jca();
+        // Advertised by SUN, and every spelling HotSpot resolves — `X509` is
+        // `Alg.Alias.CertificateFactory.X509`, and JCA lookup folds case.
+        for t in ["X.509", "X509", "x.509", "x509"] {
+            assert!(
+                certificate_factory_type_supported(t),
+                "{t} is a real SUN CertificateFactory type and must not be refused"
+            );
+            assert!(
+                certificate_factory_stub_serves(t),
+                "{t} resolves to X.509, so the synthetic fallback must be allowed to serve it"
+            );
+        }
+        // MUST RAISE. Every one of these was probed on jdk-25.0.3.9-hotspot and
+        // answered `CertificateException: <type> not found`; every one of them
+        // was answered with a live X.509-parsing factory by the pre-built
+        // `target/release/cratonvm.exe` in both default and `--jdk-only` mode.
+        for t in ["PKCS7", "PKCS12", "AES", "X.500", "PkiPath", "NO-SUCH-CERT-TYPE", ""] {
+            assert!(
+                !certificate_factory_type_supported(t),
+                "{t} is not advertised by any provider, so getInstance must refuse it rather \
+                 than hand back an X.509 parser under that name"
+            );
+        }
+    }
+
+    /// The fallback's own honesty check, kept as a PURE function test so it
+    /// cannot be voided by provider-registry state the way the ratchet above
+    /// could: the one-field synthetic `CertificateFactory` parses X.509 DER and
+    /// nothing else, so it may only stand in for X.509.
+    ///
+    /// The looseness (`X-509` folds too) is safe only because
+    /// `certificate_factory_type_supported` gates first and the registry carries
+    /// no such alias — the assertion below pins that pairing, so a future change
+    /// that reorders the two gates fails here.
+    #[test]
+    fn certificate_factory_stub_only_stands_in_for_x509() {
+        for t in ["X.509", "X509", "x.509", "x509", "X-509"] {
+            assert!(certificate_factory_stub_serves(t), "{t} folds to X509");
+        }
+        for t in ["PKCS7", "X.500", "X5090", "509", ""] {
+            assert!(
+                !certificate_factory_stub_serves(t),
+                "{t} must not be served by an X.509 parser"
+            );
+        }
+        assert!(
+            !certificate_factory_type_supported("X-509"),
+            "the registry must not carry an X-509 alias — the stub predicate folds it, and only \
+             the registry gate running FIRST keeps that from fabricating a factory"
+        );
     }
 }

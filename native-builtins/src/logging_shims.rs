@@ -75,6 +75,43 @@ pub(crate) fn native_output_stream_writer_init(
 /// System.out/System.err streams (1-field objects) work correctly in real JDK
 /// mode, particularly when System.initPhase1() has not completed successfully.
 /// The fallbacks simply write to the host process stdout/stderr via fd_table.
+///
+/// # These are contract §1.4 SHADOWS, and the two classes have opposite verdicts
+///
+/// Every `java/io/Print*` registration below stands in front of image bytecode
+/// that carries a `Code` attribute — 36 of the census's 6,066
+/// `bridge_shadows_bytecode` rows are this one function. They were measured
+/// triple by triple on 2026-08-11 with `CRATONVM_ENFORCE_NATIVE_SHADOW`
+/// scoped to one class at a time, HotSpot 25.0.3 as the control, and the two
+/// halves came out differently for a reason that is entirely about the
+/// receiver:
+///
+/// * **`java/io/PrintWriter` (7 triples) is retirable.** Verdict-neutral on a
+///   `ByteArrayOutputStream`, on a `StringWriter`, and wrapping `System.out`,
+///   and — the arm that matters — verdict-neutral when the receiver was built
+///   by the NATIVE constructor while the methods yielded. That works because
+///   `native_printwriter_init_outputstream` chains into the real
+///   `PrintWriter(OutputStream, boolean)` (see its `invoke_special`), so
+///   `lock`/`out`/`charOut`/`textOut` are populated by JDK bytecode whichever
+///   construction path ran.
+/// * **`java/io/PrintStream` (29 triples) is BLOCKED**, on `System.out` and
+///   `System.err` specifically. Over a user-constructed stream whose ctor
+///   yielded too, 26 of 26 triples are verdict-neutral; over the VM-minted
+///   `System.out`, *every* output triple silently produces nothing. Silently,
+///   because real `writeln` calls `ensureOpen()`, which throws
+///   `IOException("Stream closed")` on the null `out` the comment further down
+///   describes, and `writeln`'s own exception table catches `IOException` and
+///   sets `trouble = true`. A suite asserting only on exceptions reads green
+///   while the VM prints nothing.
+///
+/// So the fd-backed `System.out`/`System.err` have to be CONSTRUCTED rather
+/// than fabricated before this class's shadows can go, and
+/// `native_printstream_init_outputstream` has to chain to a real ctor the way
+/// the PrintWriter one does — retiring the methods while it does not
+/// reproduces `close()` NPEing on a null `textOut`, which is what the
+/// measurement caught. The full per-row table, the field-by-field diff against
+/// HotSpot, and the `retired_shadow.rs` patch for the PrintWriter half are in
+/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
 pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: PrintStream/PrintWriter natives bridge host stdout/stderr.
     let __prev_cat = registry.current_category();
@@ -206,6 +243,12 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
         "(Ljava/lang/String;)V",
         native_printstream_write_string,
     );
+    // HELD BACK from any future §1.4 retirement, by name. JDK 25 does not
+    // DECLARE this overload — the census row reads `declared: false` against
+    // the image, so there is no bytecode for it to yield to and refusing it
+    // would replace a working native with a `NoSuchMethodError`, which is the
+    // shape `retired_shadow.rs` holds `Logger.log(Level, Supplier, Throwable)`
+    // back for. It is not one of the 29 shadow rows on this class.
     registry.register(
         "java/io/PrintStream",
         "write",
@@ -318,6 +361,16 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
     );
     // PrintWriter — use dedicated variants that route through the underlying
     // Writer when the backing is non-fd (e.g. StringWriter in ModelNode.toString()).
+    //
+    // The seven registrations from here to the end of this function are the
+    // §1.4 shadows measured RETIRABLE (see this function's doc comment). They
+    // are kept as `Bridge` only because the retirement is a re-tag in
+    // `native-api/src/retired_shadow.rs`, which the measuring lane did not own;
+    // the exact table entries are in
+    // docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
+    // Anything ADDED here is a new shadow on a class already adjudicated
+    // retirable, so it needs a row in that table too or the class retires
+    // half-way — the shape that made `close()` NPE on the PrintStream side.
     registry.register(
         "java/io/PrintWriter",
         "write",
