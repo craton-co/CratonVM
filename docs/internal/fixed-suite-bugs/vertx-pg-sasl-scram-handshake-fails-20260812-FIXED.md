@@ -186,8 +186,20 @@ nonce, matches byte-for-byte after the fix (`clientProof`, `serverSignature`, an
 the complete `client-final-message`); before the fix it threw at
 `saltedPassword`.
 
+## What this fix did NOT cover
+
+With the SASL blocker gone, about half the DB-required classes still timed out —
+now in TEARDOWN rather than in a test. That turned out to be a second, unrelated
+defect: `Selector.wakeup()` on a closed selector threw, which killed a Netty
+promise listener and left `vertx.close()` blocked forever. It is fixed in
+`selector-wakeup-after-close-hangs-vertx-close-20260812-FIXED.md`, and it is the
+other half of this doc's "every failing class-fork leaked its Postgres
+container" observation.
+
 ## Related
 
+- `selector-wakeup-after-close-hangs-vertx-close-20260812-FIXED.md` — the
+  teardown hang hiding behind this one.
 - `jna-native-clinit-nativeversion-npe-20260812-FIXED.md` — the other defect from
   the same investigation, fixed alongside this one. Unrelated root cause (a JNI
   handle encoding), same lesson about a symptom naming the wrong subsystem.
