@@ -34829,6 +34829,19 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `java.util.PriorityQueue`: "This queue does not permit null elements",
+    // and both funnels declare `@throws NullPointerException if the specified
+    // element is null`. `offer` opens with the check and `add` delegates to it,
+    // which is why one check here covers the two registrations above.
+    //
+    // Measured on the binary before this line existed:
+    // `PriorityQueue.nullAdd=no-throw` against HotSpot's
+    // `java.lang.NullPointerException`. The reason the JDK refuses is the same
+    // one `ArrayDeque` has — a null has no place in a comparison heap, and
+    // `siftUp` would dereference it on the very next insert — so `ad_refuse_null`
+    // is reused rather than duplicated (only its name is `ArrayDeque`-specific).
+    // See W7-33-differential-dead-sections R1.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `pq_ensure_capacity`
     // reallocates the heap array on grow (GC-capable) — pin `this`/`elem`
     // across it and refresh both, otherwise the store below writes a pre-GC
@@ -35276,12 +35289,15 @@ fn native_stack_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // `java.util.Stack.pop`: "@throws EmptyStackException if this stack is
+        // empty". That class extends `RuntimeException` DIRECTLY, so the
+        // `NoSuchElementException` this used to raise is not a supertype of it
+        // and a `catch (EmptyStackException)` in application code never fired —
+        // a mistyped refusal sends the caller down the wrong branch, which is
+        // worse than no refusal because it looks handled. Measured:
+        // `Stack.popOnEmpty=java.util.NoSuchElementException` against HotSpot's
+        // `java.util.EmptyStackException`. See W7-33-differential-dead-sections R2.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     native_al_remove_at(ctx, &[Value::Object(Some(this)), Value::Int(size - 1)])
 }
@@ -35293,12 +35309,12 @@ fn native_stack_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // Same contract as `pop` above: `java.util.Stack.peek` declares
+        // `@throws EmptyStackException if this stack is empty`. Not measured by
+        // the probe — it only asks `pop` — but the two are one refusal in the
+        // JDK (`peek` is what `pop` calls first) and leaving one behind is how
+        // the pair drifts apart again.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     let elem = data.map_or(Value::Object(None), |buf| {
         ctx.get_array_element(buf, (size - 1) as usize)
