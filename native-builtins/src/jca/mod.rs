@@ -58,6 +58,36 @@ pub mod asn1;
 
 use cratonvm_native_api::NativeMethodRegistry;
 
+/// Build a `java.security.Provider` object carrying `name`.
+///
+/// Every JCA engine class here is served by natives that keep their state
+/// off-object, so the real `provider` field is never written and the real
+/// `getProvider()` body either returns `null` or dies on `synchronized (lock)`
+/// with a null `lock`. Each engine therefore has to answer `getProvider()`
+/// itself — and this is the one place that knows how to shape the object, so
+/// the four that need it (`MessageDigest`, `Mac`, `SecretKeyFactory`,
+/// `Signature`) do not each carry their own copy of the field layout.
+pub(crate) fn make_named_provider(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    name: &str,
+) -> Result<cratonvm_types::ObjectRef, cratonvm_types::MethodCallFailed> {
+    use cratonvm_types::Value;
+    let p = crate::try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
+    let name_s = ctx.create_string(name);
+    let info = ctx.create_string(&format!("{name} provider (cratonvm)"));
+    let ver_str = ctx.create_string("25");
+    ctx.set_field_by_name(p, "name", Value::Object(Some(name_s)));
+    ctx.set_field_by_name(p, "version", Value::Double(25.0));
+    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
+    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
+    // Raw slots too: `message_digest::md_get_provider` established that both the
+    // named fields and slots 0-2 are read depending on how the object is reached.
+    ctx.set_field(p, 0, Value::Object(Some(name_s)));
+    ctx.set_field(p, 1, Value::Double(25.0));
+    ctx.set_field(p, 2, Value::Object(Some(info)));
+    Ok(p)
+}
+
 /// Wire every JCA native override needed by `DigestProbe.java`,
 /// `SigProbe.java`, and any other JDK 25 client that goes through
 /// `Security.getProviders()`, `MessageDigest.getInstance(...)`,

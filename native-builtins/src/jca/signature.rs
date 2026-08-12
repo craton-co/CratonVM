@@ -1249,8 +1249,39 @@ fn sig_set_parameter(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-fn sig_get_provider_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// `Signature.getProvider()`.
+///
+/// Returned a bare `null`, which a real `Signature.getProvider()` never does: a
+/// `Signature` you successfully obtained always has one. Callers write
+/// `sig.getProvider().getName()` — JSSE and the JDK's own JAR verification do —
+/// so `null` is an immediate `NullPointerException: … because the return value
+/// of "java.security.Signature.getProvider()" is null`.
+///
+/// Answer with the provider HotSpot 25 resolves each family to, keyed off this
+/// engine's own algorithm index so the name cannot drift from what
+/// `getAlgorithm()` reports. An algorithm this module does not recognise keeps
+/// returning `null` rather than being assigned a fabricated provider.
+fn sig_get_provider_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Ok(this) = this_arg(args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let idx =
+        get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+            Value::Int(i) => i,
+            _ => -1,
+        });
+    // Measured on jdk-25: *withECDSA and the Edwards curves → SunEC,
+    // *withDSA and ML-DSA → SUN, anything RSA (incl. PSS) → SunRsaSign.
+    let name = match algo_name(idx) {
+        a if a.ends_with("ECDSA") => "SunEC",
+        "Ed25519" | "Ed448" | "EdDSA" => "SunEC",
+        a if a.ends_with("DSA") || a.starts_with("ML-DSA") => "SUN",
+        a if a.contains("RSA") => "SunRsaSign",
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let p = crate::jca::make_named_provider(ctx, name)?;
+    Ok(Some(Value::Object(Some(p))))
 }
 
 // ---------------------------------------------------------------------------

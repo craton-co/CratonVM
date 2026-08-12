@@ -98,18 +98,7 @@ fn mac_short_buffer(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed 
 /// of contradicting it. Mirrors `jca::message_digest::md_get_provider`, which
 /// does the same for `SUN`.
 fn jce_provider_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
-    let name = ctx.create_string("SunJCE");
-    let info = ctx.create_string("SunJCE provider (cratonvm)");
-    let ver_str = ctx.create_string("25");
-    ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
-    ctx.set_field_by_name(p, "version", Value::Double(25.0));
-    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
-    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
-    ctx.set_field(p, 0, Value::Object(Some(name)));
-    ctx.set_field(p, 1, Value::Double(25.0));
-    ctx.set_field(p, 2, Value::Object(Some(info)));
-    Ok(p)
+    crate::jca::make_named_provider(ctx, "SunJCE")
 }
 
 /// Helper: extract the key bytes from a Key object (field 0 = encoded byte[])

@@ -15910,17 +15910,7 @@ pub(crate) fn pbkdf2_get_provider(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
-    let name = ctx.create_string("SunJCE");
-    let info = ctx.create_string("SunJCE provider (cratonvm)");
-    let ver_str = ctx.create_string("25");
-    ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
-    ctx.set_field_by_name(p, "version", Value::Double(25.0));
-    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
-    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
-    ctx.set_field(p, 0, Value::Object(Some(name)));
-    ctx.set_field(p, 1, Value::Double(25.0));
-    ctx.set_field(p, 2, Value::Object(Some(info)));
+    let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
     Ok(Some(Value::Object(Some(p))))
 }
 
@@ -15997,9 +15987,22 @@ pub(crate) fn pbkdf2_generate_secret(
         _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
     };
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
+    //
+    // The comment said `"PBKDF2With…"` but the literal was the bare `"PBKDF2"`,
+    // so `generateSecret(...).getAlgorithm()` answered `PBKDF2` where HotSpot
+    // answers the full `PBKDF2WithHmacSHA256`. Callers that re-key a `Mac` or
+    // `Cipher` from the derived key's own algorithm name — the reason
+    // `SecretKeySpec` carries one — would then ask for an algorithm that does
+    // not exist. Use the name `getInstance` was actually called with.
     let key_arr = make_byte_array(ctx, &dk);
     let kpin = ctx.pin_native_root(key_arr);
-    let algo_s = ctx.create_string("PBKDF2");
+    let requested = skf_algo_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| "PBKDF2".to_string());
+    let algo_s = ctx.create_string(&requested);
     let key_arr_r = ctx.read_native_pin(kpin, key_arr);
     let sk = ctx.new_object_initialized(
         "javax/crypto/spec/SecretKeySpec",

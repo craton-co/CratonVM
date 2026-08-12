@@ -63,14 +63,23 @@ Identical from both contexts, so it was not a missing TLS context or an
 
 ## Fixes
 
-1. **`jclass` handles carry a tag bit (`JCLASS_TAG = 1 << 32`)** so the encoding
-   can never collide with JNI NULL. A HIGH bit rather than a `+1` bias on
-   purpose: the low 32 bits stay exactly the `ClassId`, so all twenty-one
+1. **`jclass` handles carry a tag (`JCLASS_TAG = 0x7F51_0000_0000_0000`)** so the
+   encoding can never collide with JNI NULL. A HIGH tag rather than a `+1` bias
+   on purpose: the low 32 bits stay exactly the `ClassId`, so all twenty-one
    existing `ClassId::new(clazz as u32)` decode sites keep working untouched —
    the truncation discards the tag. A bias would have required every one of them
    to change in lockstep, and a single missed site would have silently decoded
-   the WRONG class instead of failing. Producers (`FindClass`, `GetSuperclass`,
-   `GetObjectClass`, `DefineClass`) go through one `class_id_to_jclass` helper.
+   the WRONG class instead of failing. Bits 48-62 are set, which no canonical
+   x86-64/AArch64 user-space pointer can have, so a `jclass` is distinguishable
+   from either object-handle encoding (raw heap pointer, or tagged
+   `Box<ObjectRef>`) by an exact mask test rather than a guess tried second.
+   Producers — `FindClass`, `GetSuperclass`, `GetObjectClass`, `DefineClass`, and
+   **the `jclass` the interpreter passes as a static native's second C
+   parameter** — all go through one `class_id_to_jclass` helper. That last one
+   matters on its own: JNA's `initIDs` does `NewGlobalRef(cls)` on exactly that
+   argument, and while the two encodings disagreed it reported
+   `UnsatisfiedLinkError: Can't obtain global reference for class
+   com.sun.jna.Native` — the same defect one layer further in.
 
 2. **`NewGlobalRef` / `NewWeakGlobalRef` round-trip a `jclass`.** Both resolved
    their argument as an object handle, which is the one convention `FindClass`
