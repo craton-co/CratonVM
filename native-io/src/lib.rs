@@ -7396,6 +7396,40 @@ fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
     -1
 }
 
+/// Read `capacity`, preferring real JDK slot when present.
+///
+/// This same two-step name-then-slot fallback existed inline in three places
+/// (`bb_state`, `bb_storage_view`, `native_bb_set_limit`). Named once so a
+/// future layout correction has one place to land instead of three.
+fn buf_read_capacity(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    if let Value::Int(v) = ctx.get_field_by_name(obj, "capacity") {
+        return v;
+    }
+    if let Value::Int(v) = ctx.get_field(obj, BB_FIELD_CAPACITY) {
+        return v;
+    }
+    0
+}
+
+/// `(position, limit, capacity)` for any buffer, **without requiring backing
+/// storage**.
+///
+/// This is the half of `bb_state` that `remaining()`, `hasRemaining()` and the
+/// typed `toString()` actually wanted. All three asked for the whole state
+/// tuple, discarded the array with `_`, and inherited its refusal — so
+/// `remaining()` on a `ByteBuffer.allocateDirect(n)` raised
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// while computing `limit - position`, two fields it had already read
+/// correctly. The `-1` is `java.nio.Buffer.mark`, which is what slot 0 is on
+/// the real layout; see `bb_state` for the species.
+fn buf_metadata(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32) {
+    (
+        buf_read_position(ctx, this),
+        buf_read_limit(ctx, this),
+        buf_read_capacity(ctx, this),
+    )
+}
+
 fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
@@ -7413,40 +7447,218 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     obj
 }
 
-fn bb_state(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
-    // Prefer the real-JDK `hb` field. Some real heap-buffer subclasses land
-    // here without superclass by-name field resolution, so fall back to the
-    // real-JDK HeapByteBuffer slot (`hb` @ 5) before synthetic slot 0.
-    let arr = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => a,
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => a,
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => a,
-                other => {
-                    return Err(MethodCallFailed::InternalError(VmError::Internal {
-                        message: format!(
-                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY, other, this
-                    ),
-                    }))
-                }
+/// Element-indexed storage view of a typed NIO buffer — `bb_storage_view`'s
+/// twin for the `CharBuffer` / `IntBuffer` / `LongBuffer` / `FloatBuffer` /
+/// `DoubleBuffer` / `ShortBuffer` families, **and the direct-buffer arm this
+/// function spent its whole life without**.
+///
+/// ## What it used to be, and why that was a defect
+///
+/// It returned `(backing_array, pos, lim, cap)` and resolved the array as
+/// `hb`-by-name → slot 5 → slot 0, with no fourth arm. A buffer that has no
+/// backing array — every `ByteBuffer.allocateDirect` result, and every typed
+/// view over one — therefore fell through to slot 0, which on the real
+/// `java.nio.Buffer` layout is
+///
+/// ```text
+///   mark(0) position(1) limit(2) capacity(3) address(4) segment(5)
+///     then ByteBuffer's own:  hb(6) offset(7) isReadOnly(8) bigEndian(9) nativeByteOrder(10)
+/// ```
+///
+/// i.e. `mark`, initialised to `-1`. That produced
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// — a CratonVM slot index applied to a real JDK object, landing on a field
+/// with an unrelated meaning. Note in passing that the old comment's "real-JDK
+/// HeapByteBuffer slot (`hb` @ 5)" was wrong twice over: on JDK 25 `hb` is
+/// index 6 and index 5 is `Buffer.segment`. The slot-5 probe is kept anyway,
+/// with its real justification: `segment` is the only Object-typed field
+/// `Buffer` declares, so it is where `native-builtins`' typed-buffer views
+/// (`s2_view_buf_fn!`, `BB_SEGMENT_SLOT`) deliberately stash their backing
+/// array. Reading it as "maybe an array" is right for that population and
+/// harmless for a real buffer, where `segment` is null.
+///
+/// ## What it is now
+///
+/// The same three-arm array resolution, then a **direct arm** reading
+/// `address` (by name, else slot 4) exactly as `bb_storage_view` does, and
+/// only then the refusal. The result is element-indexed: a heap receiver's
+/// array already is, and a direct receiver's byte-addressed block is scaled by
+/// [`TbView::elem`]'s width.
+///
+/// The return type changed from a tuple to `TbView` deliberately. This is the
+/// second migration of this family — the first
+/// (spring-bytebuffer-backing-storage-FIXED.md) moved the byte-oriented half
+/// to `bb_storage_view` and left the rest behind, and a partial migration is
+/// invisible until a non-heap buffer reaches one of the stragglers. A changed
+/// return type means any site left behind fails the BUILD instead.
+fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<TbView, MethodCallFailed> {
+    let (pos, lim, cap) = buf_metadata(ctx, this);
+
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
             },
-        },
-    };
-    let pos = buf_read_position(ctx, this);
-    let lim = buf_read_limit(ctx, this);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v
+            // The backing array knows its own element kind, so a HEAP receiver
+            // never has to be asked what class it is stamped with.
+            elem: ctx.heap_element_type_of(arr),
+            big_endian: true, // unused: a heap element read is not byte-decoded
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    if let Some(addr) = bb_resolve_direct_address(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Direct { addr },
+            elem: tb_direct_element_kind(ctx, this),
+            big_endian: tb_receiver_is_big_endian(ctx, this),
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    Err(MethodCallFailed::InternalError(VmError::Internal {
+        message: format!(
+            "Buffer has no backing storage: hb/slot{BB_SEGMENT_SLOT}/slot{BB_FIELD_ARRAY} \
+             resolved no array and address/slot{BB_FIELD_MARK} no native block \
+             (slot{BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+            ctx.get_field(this, BB_FIELD_ARRAY),
+            ctx.get_field_by_name(this, "address"),
+        ),
+    }))
+}
+
+/// Real `java.nio.Buffer.segment` — the only Object-typed field `Buffer`
+/// declares, and therefore the slot `native-builtins`' typed-buffer views use
+/// to carry a backing array that has no `hb` field to go in. Same constant as
+/// `native-builtins/src/servlet.rs`'s `BB_SEGMENT_SLOT`, restated here rather
+/// than shared because the two crates do not depend on each other; if one
+/// moves, the census in W7-58-bytebuffer-direct-arm.md names both.
+const BB_SEGMENT_SLOT: usize = 5;
+
+/// `hb`-by-name → `segment` slot → synthetic slot 0. Extracted from the two
+/// independent copies in `bb_state` and `bb_storage_view` so the two cannot
+/// drift; they had already drifted in their error messages.
+fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
+        return Some(a);
+    }
+    if let Value::Object(Some(a)) = ctx.get_field(this, BB_SEGMENT_SLOT) {
+        return Some(a);
+    }
+    match ctx.get_field(this, BB_FIELD_ARRAY) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// `ByteBuffer.offset` — the element index of logical element 0 inside the
+/// backing array, non-zero only for an aliasing view. Layouts with no such
+/// field (bare synthetics, typed views) answer 0.
+fn bb_resolve_heap_offset(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    if let Value::Int(v) = ctx.get_field_by_name(this, "offset") {
+        if v >= 0 {
+            return v as usize;
+        }
+    }
+    match ctx.get_field(this, 6) {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// A `Buffer.address` below the first mappable page is never a process
+/// pointer: Linux refuses to map below `vm.mmap_min_addr` (65536 by default)
+/// and Windows reserves the low 64 KiB of every address space. What DOES live
+/// down there is an array-relative `Unsafe` offset — `ARRAY_BYTE_BASE_OFFSET +
+/// offset` — which is exactly what `alloc_byte_buffer` seeds into every HEAP
+/// buffer it mints (`Value::Long(16)`), and what the real `HeapByteBuffer`
+/// constructor seeds too.
+///
+/// So this is not defensive padding. Without it, any heap buffer whose array
+/// failed to resolve — the precise condition that brings control here — hands
+/// `16` to `copy_from_native_memory` as a pointer. `addr=0x10` was 51 of the
+/// 53 crashes in the 2026-08-10 three-GC-variant H2 sweep; refusing the read
+/// degrades instead to this module's "no backing storage" error, which a
+/// caller can see and report. `native-builtins/src/servlet.rs`'s
+/// `is_plausible_native_addr` is the same guard for the same reason; this
+/// family did not have it.
+fn is_plausible_native_addr(v: i64) -> bool {
+    v >= 0x1_0000
+}
+
+/// `address`-by-name → slot 4, screened by [`is_plausible_native_addr`].
+fn bb_resolve_direct_address(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i64> {
+    if let Value::Long(v) = ctx.get_field_by_name(this, "address") {
+        if is_plausible_native_addr(v) {
+            return Some(v);
+        }
+    }
+    match ctx.get_field(this, BB_FIELD_MARK) {
+        Value::Long(v) if is_plausible_native_addr(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Element kind of a DIRECT typed buffer.
+///
+/// Only a direct receiver needs this — a heap one is asked through
+/// `heap_element_type_of`, which is the object's own truth. A direct block is
+/// untyped bytes, so the element width has to come from somewhere else, and
+/// the JDK itself puts it in the class: `DirectIntBufferU`,
+/// `ByteBufferAsIntBufferL`, `HeapIntBuffer`. This reads the receiver's class
+/// to decide how wide its elements are — it does NOT pick which native to run
+/// by name, which is the defect this codebase keeps re-finding.
+///
+/// Unknown names answer `Byte` (width 1), which is what a bare
+/// `java/nio/ByteBuffer` receiver is and the only safe default: it can never
+/// scale an index past the end of a block that a wider guess would.
+fn tb_direct_element_kind(ctx: &dyn NativeContext, this: ObjectRef) -> ArrayElementType {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.contains("CharBuffer") {
+        ArrayElementType::Char
+    } else if name.contains("ShortBuffer") {
+        ArrayElementType::Short
+    } else if name.contains("IntBuffer") {
+        ArrayElementType::Int
+    } else if name.contains("LongBuffer") {
+        ArrayElementType::Long
+    } else if name.contains("FloatBuffer") {
+        ArrayElementType::Float
+    } else if name.contains("DoubleBuffer") {
+        ArrayElementType::Double
     } else {
-        0
-    };
-    Ok((arr, pos, lim, cap))
+        ArrayElementType::Byte
+    }
+}
+
+/// Byte order of a DIRECT typed buffer's elements.
+///
+/// Same source the already-registered `order()` native for these classes uses
+/// (`tb_abstract_view_fns!`'s `$order_fn`): real JDK 25 compiles one concrete
+/// view class per endianness — `ByteBufferAsIntBufferB` / `...L`,
+/// `DirectIntBufferU` (native order) — so the class name IS where the order
+/// lives for a view buffer, there being no field to hold it. Factored out so
+/// the accessor and the reported `order()` cannot disagree; before the direct
+/// arm existed there was no accessor that could.
+///
+/// Every CratonVM target is little-endian, so the unsuffixed "native order"
+/// case answers little-endian.
+fn tb_receiver_is_big_endian(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.ends_with('B') || name.ends_with("RB") {
+        return true;
+    }
+    if name.ends_with('L') || name.ends_with("RL") {
+        return false;
+    }
+    cfg!(target_endian = "big")
 }
 
 #[derive(Clone, Copy)]
@@ -7463,57 +7675,172 @@ struct BbView {
     cap: i32,
 }
 
+/// Element-indexed view returned by [`bb_state`]: `pos`/`lim`/`cap` are in
+/// ELEMENTS (as every typed-buffer accessor uses them), and `storage` is
+/// whichever of the two kinds the receiver actually has.
+#[derive(Clone, Copy)]
+struct TbView {
+    storage: BbStorage,
+    /// Element kind, so a DIRECT read knows both how many bytes to move and
+    /// which `Value` variant to produce. Read from the backing array for a
+    /// heap receiver; from the receiver's class for a direct one.
+    elem: ArrayElementType,
+    /// Element byte order — consulted only on the direct arm. A heap element
+    /// read goes through `get_array_element`, which is not byte-decoded.
+    big_endian: bool,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+}
+
+/// Bytes per element of `elem`. `Reference` cannot occur in a typed NIO buffer
+/// and answers 1 rather than panicking; a wrong-but-narrow scale mis-reads,
+/// where a panic takes the VM down.
+fn tb_elem_width(elem: ArrayElementType) -> usize {
+    match elem {
+        ArrayElementType::Boolean | ArrayElementType::Byte | ArrayElementType::Reference => 1,
+        ArrayElementType::Char | ArrayElementType::Short => 2,
+        ArrayElementType::Int | ArrayElementType::Float => 4,
+        ArrayElementType::Long | ArrayElementType::Double => 8,
+    }
+}
+
+/// Read element `index` (an ELEMENT index, not a byte offset) from either
+/// storage kind, in the `Value` variant the element's kind calls for — the
+/// same variant `ctx.get_array_element` yields for a heap array of that kind,
+/// so a caller cannot tell the two arms apart.
+fn tb_read_elem(
+    ctx: &dyn NativeContext,
+    view: TbView,
+    index: usize,
+) -> Result<Value, MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => Ok(ctx.get_array_element(arr, offset + index)),
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let mut raw = [0u8; 8];
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if !ctx.copy_from_native_memory(addr.saturating_add(byte_off), &mut raw[..width]) {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element read failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }));
+            }
+            let bits: u64 = if view.big_endian {
+                raw[..width].iter().fold(0u64, |a, &b| (a << 8) | b as u64)
+            } else {
+                raw[..width]
+                    .iter()
+                    .rev()
+                    .fold(0u64, |a, &b| (a << 8) | b as u64)
+            };
+            Ok(match view.elem {
+                ArrayElementType::Long => Value::Long(bits as i64),
+                ArrayElementType::Double => Value::Double(f64::from_bits(bits)),
+                ArrayElementType::Float => Value::Float(f32::from_bits(bits as u32)),
+                // Char is UNSIGNED and Short is SIGNED — the two differ only
+                // here, and getting it wrong is invisible until a value with
+                // the high bit set goes through.
+                ArrayElementType::Char => Value::Int(bits as u16 as i32),
+                ArrayElementType::Short => Value::Int(bits as u16 as i16 as i32),
+                ArrayElementType::Int => Value::Int(bits as u32 as i32),
+                _ => Value::Int(bits as u8 as i8 as i32),
+            })
+        }
+    }
+}
+
+/// Write element `index` through either storage kind. The inverse of
+/// [`tb_read_elem`], and deliberately tolerant of the `Value` variant a caller
+/// hands over (`Int` where a `Float` was expected, etc.) because the typed
+/// natives forward whatever the interpreter pushed.
+fn tb_write_elem(
+    ctx: &mut dyn NativeContext,
+    view: TbView,
+    index: usize,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            ctx.set_array_element(arr, offset + index, value);
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let bits: u64 = match value {
+                Value::Long(v) => v as u64,
+                Value::Double(v) => v.to_bits(),
+                Value::Float(v) => v.to_bits() as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let mut raw = [0u8; 8];
+            for i in 0..width {
+                let shift = if view.big_endian {
+                    8 * (width - 1 - i)
+                } else {
+                    8 * i
+                };
+                raw[i] = (bits >> shift) as u8;
+            }
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if ctx.copy_to_native_memory(addr.saturating_add(byte_off), &raw[..width]) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element write failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }))
+            }
+        }
+    }
+}
+
+/// Byte-indexed storage view — the `ByteBuffer` half of the same resolution
+/// [`bb_state`] does for the typed families. Both now share
+/// `bb_resolve_heap_array` / `bb_resolve_heap_offset` /
+/// `bb_resolve_direct_address` rather than each carrying its own copy; the two
+/// copies had already drifted apart in their error text, and one of them
+/// (`bb_state`'s) had no direct arm at all.
+///
+/// The one behaviour change here is the address screen: this used to accept
+/// any non-zero `address`, including the `16` that `alloc_byte_buffer` seeds
+/// into every HEAP buffer as `ARRAY_BYTE_BASE_OFFSET`. See
+/// [`is_plausible_native_addr`] for why dereferencing that is not a wrong
+/// answer but a SIGSEGV.
 fn bb_storage_view(ctx: &dyn NativeContext, this: ObjectRef) -> Result<BbView, MethodCallFailed> {
     let pos = buf_read_position(ctx, this).max(0);
     let lim = buf_read_limit(ctx, this).max(pos);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v.max(0)
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v.max(0)
-    } else {
-        lim
+    let cap = match buf_read_capacity(ctx, this) {
+        0 => lim,
+        v => v.max(0),
     };
 
-    if let Some(arr) = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => Some(a),
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => Some(a),
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => Some(a),
-                _ => None,
-            },
-        },
-    } {
-        let offset = match ctx.get_field_by_name(this, "offset") {
-            Value::Int(v) if v >= 0 => v as usize,
-            _ => match ctx.get_field(this, 6) {
-                Value::Int(v) if v >= 0 => v as usize,
-                _ => 0,
-            },
-        };
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
         return Ok(BbView {
-            storage: BbStorage::Heap { arr, offset },
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
+            },
             pos,
             lim,
             cap,
         });
     }
 
-    let addr = match ctx.get_field_by_name(this, "address") {
-        Value::Long(v) if v != 0 => v,
-        _ => match ctx.get_field(this, 4) {
-            Value::Long(v) if v != 0 => v,
-            _ => {
-                return Err(MethodCallFailed::InternalError(VmError::Internal {
-                    message: format!(
-                        "ByteBuffer missing backing storage (hb/slot5/address absent; field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY,
-                        ctx.get_field(this, BB_FIELD_ARRAY),
-                        this
-                    ),
-                }))
-            }
-        },
+    let Some(addr) = bb_resolve_direct_address(ctx, this) else {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!(
+                "ByteBuffer missing backing storage (hb/slot{BB_SEGMENT_SLOT}/address absent; \
+                 field {BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+                ctx.get_field(this, BB_FIELD_ARRAY),
+                ctx.get_field_by_name(this, "address"),
+            ),
+        }));
     };
     Ok(BbView {
         storage: BbStorage::Direct { addr },
@@ -8216,10 +8543,15 @@ fn native_bb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let bb = alloc_byte_buffer(ctx, len);
-    let (arr, _, _, _) = bb_state(ctx, bb)?;
+    // STRUCTURALLY HEAP-ONLY: the receiver is the buffer `alloc_byte_buffer`
+    // just minted two lines up, which always installs a `byte[]` in both `hb`
+    // and slot 0. It is never a caller-supplied buffer, so the direct arm is
+    // unreachable here — but the write still goes through `tb_write_elem` so
+    // this site cannot become a straggler if that ever stops being true.
+    let view = bb_state(ctx, bb)?;
     for i in 0..len {
         let v = ctx.get_array_element(src, i);
-        ctx.set_array_element(arr, i, v);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_position(ctx, bb, 0);
     buf_set_limit(ctx, bb, len as i32);
@@ -8241,10 +8573,12 @@ fn native_bb_wrap_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let arr_len = ctx.array_length(src);
     let bb = alloc_byte_buffer(ctx, arr_len);
-    let (arr, _, _, _) = bb_state(ctx, bb)?;
+    // STRUCTURALLY HEAP-ONLY, same as `native_bb_wrap` above: the receiver is
+    // the freshly minted buffer, not the caller's.
+    let view = bb_state(ctx, bb)?;
     for i in 0..arr_len {
         let v = ctx.get_array_element(src, i);
-        ctx.set_array_element(arr, i, v);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_position(ctx, bb, offset as i32);
     buf_set_limit(ctx, bb, (offset + length) as i32);
@@ -8309,13 +8643,7 @@ fn native_bb_set_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v
-    } else {
-        0
-    };
+    let cap = buf_read_capacity(ctx, this);
     // Same contract as `position(int)` one function up:
     // "if (newLimit > capacity | newLimit < 0) throw
     // createLimitException(newLimit)", "@throws IllegalArgumentException If
@@ -8344,14 +8672,7 @@ fn native_bb_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        return Ok(Some(Value::Int(v)));
-    }
-    let cap = match ctx.get_field(this, BB_FIELD_CAPACITY) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(cap)))
+    Ok(Some(Value::Int(buf_read_capacity(ctx, this))))
 }
 
 fn native_bb_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8359,8 +8680,18 @@ fn native_bb_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (_, pos, lim, _) = bb_state(ctx, this)?;
-    Ok(Some(Value::Int(lim - pos)))
+    // MIGRATED. This is the site that produced `RJdkDefineClass`'s
+    // "ByteBuffer missing backing array (field 0 returned Int(-1))", from the
+    // `int len = b.remaining()` that opens real
+    // `ClassLoader.defineClass(String, ByteBuffer, ProtectionDomain)`. It
+    // asked `bb_state` for the whole tuple and threw the array away — the
+    // refusal it inherited was over storage it never touched. `remaining()` is
+    // `limit - position` and is defined on `java.nio.Buffer`, above any notion
+    // of storage; it must answer for a direct buffer, a heap buffer, and a
+    // read-only view alike. `.max(0)` matches `Buffer.remaining()`'s
+    // `Math.max(lim - pos, 0)`.
+    let (pos, lim, _) = buf_metadata(ctx, this);
+    Ok(Some(Value::Int((lim - pos).max(0))))
 }
 
 fn native_bb_has_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8368,7 +8699,9 @@ fn native_bb_has_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (_, pos, lim, _) = bb_state(ctx, this)?;
+    // MIGRATED, same reason as `native_bb_remaining` above: `hasRemaining()`
+    // is `position < limit`, storage-free by definition.
+    let (pos, lim, _) = buf_metadata(ctx, this);
     Ok(Some(Value::Int(if pos < lim { 1 } else { 0 })))
 }
 
@@ -14647,13 +14980,18 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (arr, pos, lim, _cap) = bb_state(ctx, this)?;
-            let remaining = (lim - pos).max(0) as usize;
+            // MIGRATED — receiver is caller-supplied and may be a direct view
+            // (`ByteBuffer.allocateDirect(n).asIntBuffer()` is direct on
+            // HotSpot). `new_buf` is the freshly minted heap buffer, so its
+            // own view is structurally heap; it still goes through the same
+            // element accessor so the two halves cannot drift apart.
+            let view = bb_state(ctx, this)?;
+            let remaining = (view.lim - view.pos).max(0) as usize;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, remaining);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..remaining {
-                let v = ctx.get_array_element(arr, pos as usize + i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, view.pos as usize + i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -14671,13 +15009,14 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            let (arr, _, _, cap) = bb_state(ctx, this)?;
-            buffer_check_from_index_size(index, length, cap)?;
+            // MIGRATED — same reasoning as `$slice_fn` above.
+            let view = bb_state(ctx, this)?;
+            buffer_check_from_index_size(index, length, view.cap)?;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, length as usize);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..length as usize {
-                let v = ctx.get_array_element(arr, index as usize + i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, index as usize + i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -14687,16 +15026,17 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+            // MIGRATED — receiver is caller-supplied and may be direct.
+            let view = bb_state(ctx, this)?;
             let mark = buf_read_mark(ctx, this);
-            let cap_usize = cap.max(0) as usize;
+            let cap_usize = view.cap.max(0) as usize;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, cap_usize);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..cap_usize {
-                let v = ctx.get_array_element(arr, i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, pos, lim, cap, mark);
+            buf_write_metadata(ctx, new_buf, view.pos, view.lim, view.cap, mark);
             Ok(Some(Value::Object(Some(new_buf))))
         }
 
@@ -14815,9 +15155,10 @@ fn native_cb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, cb, len as i32);
     Ok(Some(Value::Object(Some(cb))))
@@ -14831,9 +15172,9 @@ fn native_cb_wrap_charseq(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let chars: Vec<u16> = s.encode_utf16().collect();
     let len = chars.len();
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, i, Value::Int(ch as i32))?;
     }
     buf_set_limit(ctx, cb, len as i32);
     Ok(Some(Value::Object(Some(cb))))
@@ -14855,9 +15196,9 @@ fn native_cb_wrap_charseq_range(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let chars: Vec<u16> = s.encode_utf16().collect();
     let len = chars.len();
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, i, Value::Int(ch as i32))?;
     }
     buf_set_position(ctx, cb, start as i32);
     buf_set_limit(ctx, cb, end.min(len) as i32);
@@ -14869,11 +15210,12 @@ fn native_cb_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -14887,11 +15229,12 @@ fn native_cb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14903,9 +15246,10 @@ fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, Value::Int(ch));
+        tb_write_elem(ctx, view, pos as usize, Value::Int(ch))?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -14924,11 +15268,12 @@ fn native_cb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, Value::Int(ch));
+    tb_write_elem(ctx, view, idx as usize, Value::Int(ch))?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -14941,12 +15286,13 @@ fn native_cb_put_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let (arr, mut pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (mut pos, lim) = (view.pos, view.lim);
     for ch in s.encode_utf16() {
         if pos >= lim {
             break;
         }
-        ctx.set_array_element(arr, pos as usize, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, pos as usize, Value::Int(ch as i32))?;
         pos += 1;
     }
     buf_set_position(ctx, this, pos);
@@ -14958,10 +15304,11 @@ fn native_cb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     let mut chars = Vec::new();
     for i in pos..lim {
-        if let Value::Int(v) = ctx.get_array_element(arr, i as usize) {
+        if let Value::Int(v) = tb_read_elem(ctx, view, i as usize)? {
             chars.push(v as u16);
         }
     }
@@ -14978,8 +15325,9 @@ fn native_cb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, (pos + idx) as usize)))
+    let view = bb_state(ctx, this)?;
+    let pos = view.pos;
+    Ok(Some(tb_read_elem(ctx, view, (pos + idx) as usize)?))
 }
 
 fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14987,11 +15335,12 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, (pos + i) as usize);
-        ctx.set_array_element(arr, i as usize, v);
+        let v = tb_read_elem(ctx, view, (pos + i) as usize)?;
+        tb_write_elem(ctx, view, i as usize, v)?;
     }
     buf_set_position(ctx, this, remaining);
     buf_set_limit(ctx, this, cap);
@@ -15000,12 +15349,39 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 // --- Typed buffer shared helpers ---
+
+/// `CharBuffer.array()` / `IntBuffer.array()` / … — registered for all six
+/// typed families.
+///
+/// This read raw slot 0 and returned whatever was there. Same species as
+/// `bb_state`'s old fall-through, but reachable from Java rather than only via
+/// an internal error: on a real-layout receiver slot 0 is
+/// `java.nio.Buffer.mark`, so `array()` handed back `Int(-1)` where its
+/// descriptor promises `[C`/`[I`/…; on a DIRECT view it invented a backing
+/// array for a buffer that has none. HotSpot throws
+/// `UnsupportedOperationException` for that case (`Buffer.array()`:
+/// "@throws UnsupportedOperationException If this buffer is not backed by an
+/// accessible array").
+///
+/// The storage-less case keeps its historic benign null rather than becoming
+/// an error: `native-builtins`' typed views can legitimately arrive here with
+/// neither array nor address, and turning that into a throw is a behaviour
+/// change this lane has no vector to measure.
 fn native_tb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, BB_FIELD_ARRAY)))
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    if bb_resolve_direct_address(ctx, this).is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "direct buffer has no backing array".into(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 fn native_tb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15013,7 +15389,7 @@ fn native_tb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (_, pos, lim, cap) = bb_state(ctx, this)?;
+    let (pos, lim, cap) = buf_metadata(ctx, this);
     let s = format!("Buffer[pos={} lim={} cap={}]", pos, lim, cap);
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
@@ -15023,11 +15399,12 @@ fn native_tb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, (pos + i) as usize);
-        ctx.set_array_element(arr, i as usize, v);
+        let v = tb_read_elem(ctx, view, (pos + i) as usize)?;
+        tb_write_elem(ctx, view, i as usize, v)?;
     }
     buf_set_position(ctx, this, remaining);
     buf_set_limit(ctx, this, cap);
@@ -15052,9 +15429,10 @@ fn native_ib_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/IntBuffer", ArrayElementType::Int, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15065,11 +15443,12 @@ fn native_tb_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15083,11 +15462,12 @@ fn native_tb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15096,9 +15476,10 @@ fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15114,11 +15495,12 @@ fn native_tb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15139,9 +15521,10 @@ fn native_lb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/LongBuffer", ArrayElementType::Long, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15152,11 +15535,12 @@ fn native_tb_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Long(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15170,11 +15554,12 @@ fn native_tb_get_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15183,9 +15568,10 @@ fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Long(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15201,11 +15587,12 @@ fn native_tb_put_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Long(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15226,9 +15613,10 @@ fn native_fb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/FloatBuffer", ArrayElementType::Float, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15239,11 +15627,12 @@ fn native_tb_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Float(0.0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Float(0.0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15257,11 +15646,12 @@ fn native_tb_get_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15270,9 +15660,10 @@ fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Float(0.0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15288,11 +15679,12 @@ fn native_tb_put_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Float(0.0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15313,9 +15705,10 @@ fn native_db_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/DoubleBuffer", ArrayElementType::Double, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15326,11 +15719,12 @@ fn native_tb_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Double(0.0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15344,11 +15738,12 @@ fn native_tb_get_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15357,9 +15752,10 @@ fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Double(0.0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15375,11 +15771,12 @@ fn native_tb_put_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Double(0.0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15400,9 +15797,10 @@ fn native_sb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/ShortBuffer", ArrayElementType::Short, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15413,11 +15811,12 @@ fn native_tb_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15431,11 +15830,12 @@ fn native_tb_get_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15444,9 +15844,10 @@ fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15462,11 +15863,12 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -22951,6 +23353,162 @@ mod buffer_bounds_tests {
         alloc_byte_buffer(ctx, cap)
     }
 
+    /// W7-58 — the direct arm, at the exact receiver shape that used to fail.
+    ///
+    /// A real `java.nio.DirectByteBuffer` has no `hb`, and slot 0 is
+    /// `Buffer.mark` = -1. `bb_state` fell through to it and raised
+    /// "ByteBuffer missing backing array (field 0 returned Int(-1))". This
+    /// pins the mark AS -1 so the test cannot pass by the slot happening to
+    /// hold something else.
+    #[test]
+    fn bb_state_resolves_a_direct_buffer_through_address() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![5u8, 6, 7, 8];
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark — the slot that used to be read as `hb`
+        ctx.set_field(bb, 1, Value::Int(1)); // position
+        ctx.set_field(bb, 2, Value::Int(3)); // limit
+        ctx.set_field(bb, 3, Value::Int(4)); // capacity
+        ctx.set_field(bb, 4, Value::Long(native.as_mut_ptr() as i64)); // address
+
+        let view = bb_state(&ctx, bb).expect("direct buffer must resolve, not error");
+        assert!(matches!(view.storage, BbStorage::Direct { .. }));
+        assert_eq!((view.pos, view.lim, view.cap), (1, 3, 4));
+        assert_eq!(tb_read_elem(&ctx, view, 0).unwrap(), Value::Int(5));
+        assert_eq!(tb_read_elem(&ctx, view, 3).unwrap(), Value::Int(8));
+        tb_write_elem(&mut ctx, view, 2, Value::Int(-1)).unwrap();
+        assert_eq!(native[2], 0xFF);
+    }
+
+    /// `remaining()` / `hasRemaining()` are `limit - position` and
+    /// `position < limit`. They are defined on `java.nio.Buffer`, above any
+    /// notion of storage, and must answer on a buffer with NO resolvable
+    /// storage at all — the receiver here has neither array nor address, which
+    /// is strictly harder than the direct case that broke `RJdkDefineClass`.
+    #[test]
+    fn remaining_needs_no_backing_storage() {
+        let mut ctx = MockNativeContext::new();
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 1, Value::Int(2)); // position
+        ctx.set_field(bb, 2, Value::Int(9)); // limit
+        ctx.set_field(bb, 3, Value::Int(16)); // capacity
+
+        assert!(
+            bb_state(&ctx, bb).is_err(),
+            "this receiver genuinely has no storage — if bb_state stopped \
+             refusing it, the assertions below would prove nothing"
+        );
+        assert_eq!(
+            native_bb_remaining(&mut ctx, &[Value::Object(Some(bb))]).unwrap(),
+            Some(Value::Int(7))
+        );
+        assert_eq!(
+            native_bb_has_remaining(&mut ctx, &[Value::Object(Some(bb))]).unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    /// A HEAP buffer's `Buffer.address` is `ARRAY_BYTE_BASE_OFFSET + offset`
+    /// (16 for a fresh one), not a process pointer. If the array fails to
+    /// resolve, the direct arm must NOT accept 16 and dereference it —
+    /// `addr=0x10` was 51 of the 53 crashes in the 2026-08-10 H2 sweep.
+    #[test]
+    fn direct_arm_refuses_an_array_base_offset_as_a_pointer() {
+        let mut ctx = MockNativeContext::new();
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1));
+        ctx.set_field(bb, 1, Value::Int(0));
+        ctx.set_field(bb, 2, Value::Int(4));
+        ctx.set_field(bb, 3, Value::Int(4));
+        ctx.set_field_by_name(bb, "address", Value::Long(16));
+        assert!(bb_state(&ctx, bb).is_err());
+        assert!(bb_storage_view(&ctx, bb).is_err());
+        assert!(!is_plausible_native_addr(16));
+        assert!(is_plausible_native_addr(0x1_0000));
+    }
+
+    /// A DIRECT typed view is byte-addressed: its element index has to be
+    /// scaled by the element width, and the bytes decoded in the receiver's
+    /// byte order. `ByteBufferAsIntBufferL` / `...B` is where real JDK 25 puts
+    /// that order, there being no field to hold it.
+    #[test]
+    fn direct_typed_view_scales_by_element_width_and_honours_order() {
+        let mut ctx = MockNativeContext::new();
+        // 0x01020304 big-endian, then 0x05060708 big-endian.
+        let mut native = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let addr = native.as_mut_ptr() as i64;
+
+        let be = ctx.alloc_object_with_class(8, "java/nio/ByteBufferAsIntBufferB");
+        ctx.set_field(be, 1, Value::Int(0));
+        ctx.set_field(be, 2, Value::Int(2));
+        ctx.set_field(be, 3, Value::Int(2));
+        ctx.set_field_by_name(be, "address", Value::Long(addr));
+        let bev = bb_state(&ctx, be).unwrap();
+        assert_eq!(tb_elem_width(bev.elem), 4);
+        assert!(bev.big_endian);
+        assert_eq!(tb_read_elem(&ctx, bev, 0).unwrap(), Value::Int(0x01020304));
+        // Element 1, not byte 1 — the whole point of the width scaling.
+        assert_eq!(tb_read_elem(&ctx, bev, 1).unwrap(), Value::Int(0x05060708));
+
+        let le = ctx.alloc_object_with_class(8, "java/nio/ByteBufferAsIntBufferL");
+        ctx.set_field(le, 1, Value::Int(0));
+        ctx.set_field(le, 2, Value::Int(2));
+        ctx.set_field(le, 3, Value::Int(2));
+        ctx.set_field_by_name(le, "address", Value::Long(addr));
+        let lev = bb_state(&ctx, le).unwrap();
+        assert!(!lev.big_endian);
+        assert_eq!(tb_read_elem(&ctx, lev, 0).unwrap(), Value::Int(0x04030201));
+
+        // Round-trip a write through the little-endian view.
+        tb_write_elem(&mut ctx, lev, 1, Value::Int(0x0A0B0C0D)).unwrap();
+        assert_eq!(&native[4..8], &[0x0D, 0x0C, 0x0B, 0x0A]);
+    }
+
+    /// `Char` is unsigned and `Short` is signed. They share a width, so the
+    /// only thing that separates them is the sign extension, and getting it
+    /// wrong is invisible until a value with the high bit set goes through.
+    #[test]
+    fn direct_char_is_unsigned_and_short_is_signed() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![0xFFu8, 0xFE];
+        let addr = native.as_mut_ptr() as i64;
+
+        let cb = ctx.alloc_object_with_class(8, "java/nio/DirectCharBufferL");
+        ctx.set_field(cb, 3, Value::Int(1));
+        ctx.set_field_by_name(cb, "address", Value::Long(addr));
+        let cv = bb_state(&ctx, cb).unwrap();
+        assert_eq!(tb_read_elem(&ctx, cv, 0).unwrap(), Value::Int(0xFEFF));
+
+        let sb = ctx.alloc_object_with_class(8, "java/nio/DirectShortBufferL");
+        ctx.set_field(sb, 3, Value::Int(1));
+        ctx.set_field_by_name(sb, "address", Value::Long(addr));
+        let sv = bb_state(&ctx, sb).unwrap();
+        assert_eq!(tb_read_elem(&ctx, sv, 0).unwrap(), Value::Int(-257));
+    }
+
+    /// `array()` on a typed buffer used to return raw slot 0, i.e.
+    /// `Buffer.mark` on any real-layout receiver — an `Int(-1)` returned where
+    /// the descriptor promises `[I`. A direct receiver must throw instead.
+    #[test]
+    fn typed_array_accessor_refuses_a_direct_receiver_and_never_returns_mark() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![0u8; 8];
+        let bb = ctx.alloc_object_with_class(8, "java/nio/DirectIntBufferU");
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 3, Value::Int(2));
+        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as i64));
+        let r = native_tb_array(&mut ctx, &[Value::Object(Some(bb))]);
+        assert!(r.is_err(), "direct array() must throw, got {r:?}");
+
+        // And the heap case still answers with the array itself.
+        let heap = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 3);
+        match native_tb_array(&mut ctx, &[Value::Object(Some(heap))]).unwrap() {
+            Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 3),
+            other => panic!("heap array() must return the backing array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn allocated_heap_bytebuffer_sets_real_address() {
         let mut ctx = MockNativeContext::new();
@@ -23020,9 +23578,9 @@ mod buffer_bounds_tests {
     fn bb_get_bulk_valid_copies_bytes() {
         let mut ctx = MockNativeContext::new();
         let bb = make_bb(&mut ctx, 4);
-        let (arr, _, _, _) = bb_state(&ctx, bb).unwrap();
+        let view = bb_state(&ctx, bb).unwrap();
         for i in 0..4 {
-            ctx.set_array_element(arr, i, Value::Int((i as i32) + 1));
+            tb_write_elem(&mut ctx, view, i, Value::Int((i as i32) + 1)).unwrap();
         }
         let dst = ctx.new_array(ArrayElementType::Byte, 4);
         let r = native_bb_get_bulk(
