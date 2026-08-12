@@ -1253,7 +1253,20 @@ fn classify_transformation(transformation: &str) -> TransformVerdict {
                 // AEAD and key wrap: `NoPadding` is the only padding either
                 // takes, on this engine and on SunJCE alike.
                 "GCM" => aes_padding_verdict(p, &named_padding, &["NOPADDING"], family),
+                // RFC 3394 takes NoPadding, and — since 2026-08-11 — PKCS5
+                // as well: SunJCE's `AES/KW/PKCS5Padding` pads to a multiple of
+                // EIGHT and then wraps, which is why a 16-byte payload comes
+                // back as 32 bytes rather than 24.
                 "KW" => aes_padding_verdict(
+                    p,
+                    &named_padding,
+                    &["NOPADDING", "PKCS5PADDING"],
+                    CipherFamily::AesKeyWrap,
+                ),
+                // RFC 5649, a DIFFERENT scheme: its own ICV and an explicit
+                // length, not RFC 3394 with a padding bolted on. NoPadding is
+                // its only spelling — the padding is intrinsic to the mode.
+                "KWP" => aes_padding_verdict(
                     p,
                     &named_padding,
                     &["NOPADDING"],
@@ -3928,15 +3941,31 @@ mod tests {
     /// AES-256-ECB, byte-identically to `AES/ECB/PKCS5Padding`, with the nonce
     /// discarded and no AEAD tag.
     #[test]
-    fn chacha20_is_refused_rather_than_served_as_aes() {
-        assert!(refuses_algorithm("ChaCha20"));
-        assert!(refuses_algorithm("ChaCha20-Poly1305"));
-        assert!(refuses_algorithm("chacha20-poly1305"));
-        assert!(refuses_algorithm("ChaCha20-Poly1305/None/NoPadding"));
-        // An AEAD this engine cannot authenticate must be refused, never
-        // approximated: a cipher that cannot fail on a bad tag is worse than a
-        // missing one, because the caller's integrity guarantee evaporates
-        // silently. The one AEAD that IS implemented stays admitted.
+    fn chacha20_is_served_as_chacha20_and_never_as_aes() {
+        // This test asserted the opposite for one day, and both verdicts were
+        // right in their moment: while nothing computed ChaCha20 the only safe
+        // answer was to refuse the name, because admitting it meant AES-256-ECB.
+        // `crate::chacha20` (RFC 8439) landed 2026-08-11, so the names are
+        // admitted again — and the DISPATCH now keys on the family, which is
+        // what makes admitting them safe.
+        assert!(!refuses_algorithm("ChaCha20"));
+        assert!(!refuses_algorithm("ChaCha20-Poly1305"));
+        assert!(!refuses_algorithm("chacha20-poly1305"));
+        assert!(!refuses_algorithm("ChaCha20/None/NoPadding"));
+        assert!(!refuses_algorithm("ChaCha20-Poly1305/None/NoPadding"));
+        // …and they resolve to their OWN families, not to AES. This is the
+        // assertion that would have caught the original defect: the name was
+        // admitted then and would have passed the four lines above.
+        assert!(matches!(cipher_family("ChaCha20"), Some(CipherFamily::ChaCha20)));
+        assert!(matches!(
+            cipher_family("ChaCha20-Poly1305"),
+            Some(CipherFamily::ChaCha20Poly1305)
+        ));
+        // A BLOCK-cipher mode on ChaCha20 is still refused: tolerating `ECB`
+        // here is exactly how the substitution happened.
+        assert!(refuses_algorithm("ChaCha20/ECB/NoPadding"));
+        assert!(refuses_algorithm("ChaCha20/CBC/PKCS5Padding"));
+        // The one AEAD that was always implemented stays admitted.
         assert!(!refuses_algorithm("AES/GCM/NoPadding"));
     }
 
@@ -4105,7 +4134,11 @@ mod tests {
     #[test]
     fn the_ecb_default_is_scoped_to_the_family_that_has_one() {
         assert!(transformation_is_serviceable("AES"));
-        assert!(refuses_algorithm("ChaCha20"));
+        // ChaCha20 is serviceable again (RFC 8439 landed 2026-08-11), but the
+        // ECB DEFAULT must still not reach it — that default is what turned the
+        // name into AES-256-ECB, and it belongs to the AES family alone.
+        assert!(transformation_is_serviceable("ChaCha20"));
+        assert!(refuses_algorithm("ChaCha20/ECB/NoPadding"));
         // `AES_128` alone is not a service on SunJCE either — measured,
         // `Cipher.getInstance("AES_128")` raises while `AES_128/CBC/NoPadding`
         // resolves — so the default must not manufacture one.
