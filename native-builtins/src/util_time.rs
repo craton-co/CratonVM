@@ -5480,6 +5480,31 @@ fn native_year_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // ---------------------------------------------------------------------------
 // java.time.Month is an enum with 12 constants. We model each instance
 // as a 1-field synthetic (field 0 = int value 1..=12).
+//
+// THIS MAP IS THE SECOND OF TWO AND IT IS DEAD (W7-77-guarded-slot-maps.md).
+// `phases_early.rs`'s `register_phase52_time_enums` registers the same class
+// with the same slot 0, and it registers LATER:
+// `register_synthetic_overrides` calls `register_t25_natives` at
+// `native-builtins/src/lib.rs:23852` and `register_phase52_natives` at
+// `:23869`, and `NativeMethodRegistry::register` is last-write-wins. All FIVE
+// triples registered from `register_t25_natives` below — `of`, `getValue`,
+// `length(Z)I`, `maxLength`, `minLength` — are overwritten, so not one of the
+// bodies in this section ever executes in a real run. The only callers left
+// are this file's own `#[cfg(test)]` block.
+//
+// It is dead by call ORDER, not by construction. Swap those two lines in
+// `register_synthetic_overrides` and this becomes the winner, which is why it
+// is documented rather than trusted to stay harmless. `phases_early.rs`'s
+// header carries the layout analysis, the JDK 25 oracle and the class-side
+// witness (`month_slot0_is_synthetic`); nothing here has any of them, so if
+// this section is ever revived it must be revived through that funnel.
+//
+// W7-69-read-side-alias-instrument.md's census never saw this run at all — it
+// classified one `MONTH_FIELD_VALUE` and there are two, identically named, in
+// the same crate. That is the same shape as the `alloc_time_synthetic`
+// duplicate (`lib.rs` and this file both declare one, same signature, same
+// body), and it is why §4.3's "Nothing is dead in this population" does not
+// hold for `java/time/Month`.
 
 const MONTH_FIELD_VALUE: usize = 0;
 const MONTH_NUM_FIELDS: usize = 1;

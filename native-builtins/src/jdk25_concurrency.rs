@@ -199,11 +199,50 @@ pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize = 5;
 ///   slot 0 = name, slot 1 = priority, slot 2 = tid, slot 3 = Runnable,
 ///   slot 4 = `contextClassLoader` (REAL, shared with the image),
 ///   slot 5 = virtual flag.
+///
+/// W7-77-guarded-slot-maps.md, against `javap -p java.lang.Thread` on Eclipse
+/// Adoptium 25.0.3.9 (19 instance fields, static excluded, declaration order):
+///
+///     0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+///
+/// so **four** of this run's five slots disagree with the real class, not one:
+/// `NAME`(0) is `eetop`, `PRIORITY`(1) is `tid`, `TARGET`(3) is `interrupted`,
+/// `VIRTUAL`(5) is `holder`. Only slot 4 agrees, and it agrees on purpose --
+/// that is the 2026-08-05 alignment the `SYNTHETIC_THREAD_VIRTUAL_SLOT` doc
+/// above describes.
+///
+/// W7-69-read-side-alias-instrument.md's census listed only slot 5 for this
+/// file, because its scraper keyed on the run containing
+/// `SYNTHETIC_THREAD_VIRTUAL_SLOT` and the `THREAD_FIELD_*` run is a separate
+/// one carrying no class name in its own comment. The three extra rows are not
+/// a new defect -- they are the same fabricated-layout map, and the same
+/// class-side `eetop` witness in `vm_exec.rs::thread_start` decides whether any
+/// of them may be applied. They are recorded because "the census listed one"
+/// reads as "the other four agree", and they do not.
 const THREAD_SYNTHETIC_NUM_FIELDS: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT + 1;
 const THREAD_FIELD_NAME: usize = 0;
 const THREAD_FIELD_PRIORITY: usize = 1;
 const THREAD_FIELD_TARGET: usize = 3;
 const THREAD_FIELD_VIRTUAL: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT;
+
+/// What the fabricated `java/lang/Thread` model believes, published for
+/// `read_alias::verify_declared_slot_maps` (W7-77).
+///
+/// States the BELIEF, not the real layout. Slot 4 is included even though it
+/// agrees: a census with no clean rows is an instrument that fires on
+/// everything, and this map's one deliberate agreement is worth sweeping.
+pub static SYNTHETIC_THREAD_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/lang/Thread",
+        slots: &[
+            (THREAD_FIELD_NAME, "name"),
+            (THREAD_FIELD_PRIORITY, "priority"),
+            (THREAD_FIELD_TARGET, "target"),
+            (4, "contextClassLoader"),
+            (THREAD_FIELD_VIRTUAL, "isVirtual"),
+        ],
+        origin: "native-builtins/src/jdk25_concurrency.rs THREAD_FIELD_*",
+    };
 
 // ===========================================================================
 // 15.1 — ScopedValue natives
@@ -2007,6 +2046,16 @@ fn native_sts_close_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-77: publish the fabricated Thread model's map. This registrar is
+    // synthetic-only (`lib.rs:24110`, inside `register_synthetic_overrides`),
+    // and that is the right scope rather than a limitation: in real-JDK mode
+    // `vm_exec.rs::thread_start`'s `eetop` witness refuses the fabricated read
+    // outright, so a sweep row there would be noise. In SYNTHETIC mode the
+    // sweep asks the question that matters -- does the fabricated
+    // `java/lang/Thread` still declare what these constants believe? -- which
+    // is exactly the drift that put the virtual flag at slot 4 until
+    // 2026-08-05.
+    cratonvm_native_api::read_alias::declare_slot_map(&SYNTHETIC_THREAD_SLOT_MAP);
     // --- ScopedValue ---
     r.register(CLS_SCOPED_VALUE, "<init>", "()V", native_sv_init);
     r.register(

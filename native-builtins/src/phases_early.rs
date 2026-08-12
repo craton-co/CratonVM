@@ -11349,11 +11349,154 @@ pub(crate) fn register_phase52_natives(registry: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // java.time.Month enum — 1-field synthetic (field 0 = Int ordinal 1..12)
 // ---------------------------------------------------------------------------
+//
+// W7-77-guarded-slot-maps.md. Slot 0 is `value` ONLY on the fabricated
+// synthetic `java/time/Month`. On the real JDK 25 class it is something else
+// entirely: `java.time.Month` declares no instance fields of its own, and
+// `javap -p java.lang.Enum` on Eclipse Adoptium 25.0.3.9 gives the whole
+// transitive layout as
+//
+//     0 name (java.lang.String)   1 ordinal (int)   2 hash (int)
+//
+// so slot 0 is `Enum.name`, a String REFERENCE, and every `set_field` below
+// puts a `Value::Int` into it.
+//
+// WHAT THAT ACTUALLY COSTS was measured for W7-77 and is *not* what
+// W7-69-read-side-alias-instrument.md §6 predicted. That record called this
+// "the sharpest shape in the census" and said an escape would leave "a bogus
+// pointer for the collector to mark and move". It would not: both write paths
+// screen the `Value` tag before anything reaches the collector.
+//
+//   * Compact layout (`CRATONVM_COMPACT_REF_FIELDS`, ON by default) —
+//     `types::field_layout::write_compact_field`'s `FieldStorageKind::Reference`
+//     arm maps every non-`Object` `Value` through `_ => 0`. The Int is DROPPED
+//     and the slot reads back null.
+//   * Legacy 16-byte cells — `gc::gen_heap::for_each_ref_slot`'s final arm
+//     matches on the stored `Value` tag (`Value::Object(Some(_))`), not on the
+//     class's declared refs, so an `Int` cell is never visited.
+//
+// So this is a wrong ANSWER, not heap corruption, on both layouts. The real
+// consequence of an escape is quieter and still bad: the write nulls
+// `Enum.name` on a SHARED enum constant, and `getValue()` then reads
+// `Object(None)`, whose `.as_int()` is `None`, so `unwrap_or(1)` answers
+// JANUARY for every month of the year.
+//
+// `month_slot0_is_synthetic` keeps that hypothetical hypothetical. It is the
+// same remedy shape as `vm_exec.rs`'s `eetop` witness for `Thread` and
+// `lang_class.rs`'s `has_named_layout` for `Method`: ask for a field NAME the
+// real class's hierarchy has and the fabricated stub does not. A slot COUNT
+// cannot identify a layout.
+//
+// THERE IS A SECOND, IDENTICAL MAP: `util_time.rs`'s own `MONTH_FIELD_VALUE`
+// (also 0) with its own `alloc_month`. Every one of its five registered
+// triples — `of`, `getValue`, `length(Z)I`, `maxLength`, `minLength` — is
+// overwritten by `register_phase52_time_enums` below, because
+// `register_synthetic_overrides` calls `register_t25_natives` first and
+// `register_phase52_natives` second and `register()` is last-write-wins. It is
+// DEAD, but it is dead by call ORDER, not by construction: reorder those two
+// lines and it becomes the winner. Renumber one of these maps without the
+// other and the tree has two different answers for slot 0.
 const MONTH_FIELD_VALUE: usize = 0;
+
+/// This native's belief about `java/time/Month`, published so
+/// `read_alias::verify_declared_slot_maps` sweeps it against whatever class is
+/// actually loaded.
+///
+/// Deliberately states what this code BELIEVES, not the real JDK layout. A map
+/// that publishes the correct answer sweeps clean and measures nothing — the
+/// point of the declaration is that the sweep reports the disagreement.
+pub static MONTH_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/time/Month",
+        slots: &[(MONTH_FIELD_VALUE, "value")],
+        origin: "native-builtins/src/phases_early.rs MONTH_FIELD_VALUE",
+    };
+
+/// Class-side witness: is this receiver the fabricated 1-field
+/// `java/time/Month` stub, so that slot 0 really is the `int` month value?
+///
+/// Asked by a field name the real class's hierarchy declares and the stub does
+/// not. `java.time.Month` declares no instance fields itself, so the witness
+/// is `java.lang.Enum.name`; `resolve_field_index_by_class_id` searches the
+/// hierarchy, so it resolves on a real `Month` and misses on the stub. Keyed
+/// on the RECEIVER's `ClassId` rather than on the name `java/time/Month`,
+/// because the name-based lookup answers `None` for "two loaders define it" as
+/// well as for "nobody does", and this predicate must not read the first as
+/// the second.
+fn month_slot0_is_synthetic(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "name")
+        .is_none()
+}
+
+/// Write the synthetic month value, refusing on a real-layout receiver.
+///
+/// The refusal is the guard W7-77 added: without it this is `Enum.name := 0`
+/// on a shared enum constant. It cannot fire today (see the registrar note
+/// above — `register_phase52_time_enums` is reachable only from
+/// `register_synthetic_overrides`, which `vm_init.rs` calls only under
+/// `config.use_synthetic_jdk`, and that mode skips boot-classpath discovery
+/// entirely) and `month_registrars_stay_synthetic_only` in
+/// `native-builtins/tests/guarded_slot_maps.rs` is what keeps that true.
+fn month_set_value(ctx: &mut dyn NativeContext, obj: ObjectRef, val: i32) {
+    if cratonvm_native_api::layout_alias::enabled() {
+        cratonvm_native_api::read_alias::observe_read(
+            &*ctx,
+            obj,
+            MONTH_FIELD_VALUE,
+            "value",
+            "native-builtins/src/phases_early.rs::month_set_value (write)",
+        );
+    }
+    if !month_slot0_is_synthetic(&*ctx, obj) {
+        // Real `java.time.Month`: slot 0 is `Enum.name`. Dropping the write is
+        // strictly louder than performing it — performing it nulls the name of
+        // a shared enum constant and still loses the value.
+        return;
+    }
+    ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+}
+
+/// Allocate a synthetic `java/time/Month` carrying `val`.
+///
+/// The one funnel for all four allocation sites, so the witness above cannot
+/// be applied to three of them and forgotten on the fourth — the failure mode
+/// `reference_convert_the_idiom_not_the_sites` names.
+fn month_alloc(ctx: &mut dyn NativeContext, val: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
+    month_set_value(ctx, obj, val);
+    Ok(obj)
+}
+
+/// Read the synthetic month value, defaulting to January (1) exactly as every
+/// call site did before W7-77 routed them through here.
+///
+/// On a real-layout receiver this now answers 1 *because the witness said so*
+/// rather than because `Value::Object(None).as_int()` happened to be `None` —
+/// the same answer, arrived at deliberately, and observed by the census.
+fn month_value(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if cratonvm_native_api::layout_alias::enabled() {
+        cratonvm_native_api::read_alias::observe_read(
+            ctx,
+            this,
+            MONTH_FIELD_VALUE,
+            "value",
+            "native-builtins/src/phases_early.rs::month_value",
+        );
+    }
+    if !month_slot0_is_synthetic(ctx, this) {
+        return 1;
+    }
+    ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1)
+}
 
 pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    // Unconditional, matching `register_io_natives`' publication of
+    // `BB_SLOT_MAP`: gating it on the flag would leave a run that enables
+    // `CRATONVM_DBG_LAYOUT_ALIAS` later with nothing to sweep, which is a
+    // detector reporting clean because it cannot see.
+    cratonvm_native_api::read_alias::declare_slot_map(&MONTH_SLOT_MAP);
     let month = "java/time/Month";
     r.register(month, "of", "(I)Ljava/time/Month;", |ctx, args| {
         let val = args[0].as_int().unwrap_or(1);
@@ -11363,15 +11506,13 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+        let obj = month_alloc(ctx, val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "values", "()[Ljava/time/Month;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
-            let m = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(m, MONTH_FIELD_VALUE, Value::Int(i as i32 + 1));
+            let m = month_alloc(ctx, i as i32 + 1)?;
             ctx.set_array_element(arr, i, Value::Object(Some(m)));
         }
         Ok(Some(Value::Object(Some(arr))))
@@ -11409,35 +11550,34 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+            let obj = month_alloc(ctx, val)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(month, "getValue", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, MONTH_FIELD_VALUE)))
+        Ok(Some(Value::Int(month_value(&*ctx, this))))
     });
     r.register(month, "ordinal", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         Ok(Some(Value::Int(v - 1)))
     });
     r.register(month, "name", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let s = ctx.create_string(p52_month_name(v));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(month, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let s = ctx.create_string(p52_month_name(v));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(month, "length", "(Z)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let leap = args[1].as_int().unwrap_or(0) != 0;
         let len = match v {
             1 => 31,
@@ -11464,7 +11604,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "maxLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let len = match v {
             2 => 29,
             4 | 6 | 9 | 11 => 30,
@@ -11474,7 +11614,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "minLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let len = match v {
             2 => 28,
             4 | 6 | 9 | 11 => 30,
@@ -11484,20 +11624,18 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "plus", "(J)Ljava/time/Month;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let add = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 + add) % 12 + 12) % 12 + 1) as i32;
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
+        let obj = month_alloc(ctx, new_val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "minus", "(J)Ljava/time/Month;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let sub = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 - sub) % 12 + 12) % 12 + 1) as i32;
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
+        let obj = month_alloc(ctx, new_val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -11506,10 +11644,9 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         "()Ljava/time/Month;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+            let v = month_value(&*ctx, this);
             let first = ((v - 1) / 3) * 3 + 1;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(first));
+            let obj = month_alloc(ctx, first)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -11837,8 +11974,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(ldt_ref)) = ctx.get_field(this, ODT_FIELD_LDT) {
             let m = ctx.get_field(ldt_ref, 1).as_int().unwrap_or(1);
-            let mo = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(mo, MONTH_FIELD_VALUE, Value::Int(m));
+            let mo = month_alloc(ctx, m)?;
             Ok(Some(Value::Object(Some(mo))))
         } else {
             Ok(Some(Value::Object(None)))

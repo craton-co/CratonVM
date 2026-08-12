@@ -29616,15 +29616,70 @@ fn native_comparator_then_comparing_double(
 // heap-reference-integrity defect (see interpreter.rs's
 // `synthetic_stub_should_yield_to_real_bytecode` StringJoiner exclusion), so
 // this native must keep owning execution either way.
-const SJ_FIELD_DELIM: usize = 0;
-const SJ_FIELD_PREFIX: usize = 1;
-const SJ_FIELD_SUFFIX: usize = 2;
-const SJ_FIELD_ELEMENTS: usize = 3;
-const SJ_FIELD_EMPTY_VALUE: usize = 4;
+//
+// W7-77-guarded-slot-maps.md renamed these from `SJ_FIELD_*`. The old name read
+// as "StringJoiner's fields" and they are not: on JDK 25.0.3.9 `javap -p
+// java.util.StringJoiner` gives the transitive instance layout
+//
+//     0 prefix   1 delimiter   2 suffix   3 elts (String[])
+//     4 size     5 len         6 emptyValue
+//
+// so slots 0 and 1 are `prefix`/`delimiter` SWAPPED against the map below, and
+// slot 4 is `size`, an `int`, where the map says `emptyValue`, a String. Slot 2
+// (`suffix`) and slot 3 (`elts`, the map's `ELEMENTS`) happen to line up, which
+// is what makes this shape dangerous: two of five agree, both mismatched pairs
+// are String-to-String, and every read resolves.
+//
+// THE MAP IS NOT WRONG — IT IS FOR A DIFFERENT CLASS. It describes the
+// fabricated 5-slot stub (`_f0.._f4`), which really does have this layout. Both
+// classes answer to the binary name `java/util/StringJoiner`, so no `SlotMap`
+// can tell them apart by name and `SJ_STUB_SLOT_MAP` below is published knowing
+// it will read as a disagreement against a loaded real class. That is correct:
+// the row is meant to stay in the census, because a guarded row is not a clean
+// row. The `_SYNTHETIC_SLOT_` infix is the part a reader sees before they reach
+// for these constants on a real receiver.
+//
+// THE GUARD IS `sj_real_layout`, a CLASS-SIDE witness — it resolves all seven
+// real field names or answers `None`, and is therefore all-or-nothing rather
+// than per-receiver. Every entry point that touches a constant below branches on
+// it first: `native_sj_init_delim`, `native_sj_init_full`, `native_sj_add`,
+// `native_sj_merge`, `native_sj_set_empty_value` and `sj_build_string` (which
+// `native_sj_to_string` and `native_sj_length` delegate to). `sj_read_elements`
+// is the one helper that reads a constant without asking, and it is private and
+// called only from the two legacy branches of `sj_build_string`/`native_sj_merge`.
+// `guarded_slot_maps.rs::string_joiner_entry_points_still_branch_on_the_real_layout`
+// mechanises exactly that list, so deleting the branch fails a test instead of
+// silently writing a prefix into a real `delimiter`.
+const SJ_SYNTHETIC_SLOT_DELIM: usize = 0;
+const SJ_SYNTHETIC_SLOT_PREFIX: usize = 1;
+const SJ_SYNTHETIC_SLOT_SUFFIX: usize = 2;
+const SJ_SYNTHETIC_SLOT_ELEMENTS: usize = 3;
+const SJ_SYNTHETIC_SLOT_EMPTY_VALUE: usize = 4;
+
+/// What the legacy numeric path believes about `java/util/StringJoiner`,
+/// published for `read_alias::verify_declared_slot_maps`.
+///
+/// Deliberately states the BELIEF, not JDK 25's layout: a map that publishes
+/// the right answer sweeps clean and measures nothing. Three of these five will
+/// report as `WrongField` whenever the real class is the loaded one — that is
+/// the census row this record is about, and it leaves the census only when the
+/// numeric path does.
+pub static SJ_STUB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/util/StringJoiner",
+        slots: &[
+            (SJ_SYNTHETIC_SLOT_DELIM, "delimiter"),
+            (SJ_SYNTHETIC_SLOT_PREFIX, "prefix"),
+            (SJ_SYNTHETIC_SLOT_SUFFIX, "suffix"),
+            (SJ_SYNTHETIC_SLOT_ELEMENTS, "elts"),
+            (SJ_SYNTHETIC_SLOT_EMPTY_VALUE, "emptyValue"),
+        ],
+        origin: "native-collections/src/lib.rs SJ_SYNTHETIC_SLOT_*",
+    };
 
 // JDK-ONLY-CLASSIFY: stub — `java.util.StringJoiner` declares zero ACC_NATIVE
 // methods in JDK 25; all 7 registrations here shadow concrete bytecode using a
-// fabricated 5-slot layout (`SJ_FIELD_*` above) that does not match the real
+// fabricated 5-slot layout (`SJ_SYNTHETIC_SLOT_*` above) that does not match the real
 // class. This is the repo's clearest worked example of why the category must be
 // a per-registration decision rather than ambient state: the SAME seven
 // registrations are emitted under `Bridge` by `register_string_joiner_natives`
@@ -29638,6 +29693,11 @@ fn register_string_joiner_natives_with_category(
 ) {
     let __prev_cat = registry.current_category();
     registry.set_category(kind);
+    // Unconditional and idempotent-by-pointer, so publishing from BOTH the
+    // `Bridge` and the `SyntheticStub` registrar is one entry, not two. Not
+    // gated on `CRATONVM_DBG_LAYOUT_ALIAS`: a run that enables the flag later
+    // must still have something to sweep.
+    cratonvm_native_api::read_alias::declare_slot_map(&SJ_STUB_SLOT_MAP);
     registry.register(
         "java/util/StringJoiner",
         "<init>",
@@ -29695,8 +29755,15 @@ pub fn register_string_joiner_stub_natives(registry: &mut NativeMethodRegistry) 
 
 /// Real JDK `java/util/StringJoiner`'s actual field indices, resolved by
 /// name. `None` when only the synthetic 5-field fallback class is loaded (no
-/// real bytecode present) — callers fall back to the legacy `SJ_FIELD_*`
-/// constants/ArrayList-of-elements representation in that case.
+/// real bytecode present) — callers fall back to the legacy
+/// `SJ_SYNTHETIC_SLOT_*` constants/ArrayList-of-elements representation in that
+/// case.
+///
+/// This is the guard for the whole `SJ_SYNTHETIC_SLOT_*` census row (W7-77).
+/// It is a CLASS-side witness, not a receiver-side one, and it is
+/// all-or-nothing: one unresolvable name out of seven sends every entry point
+/// down the legacy path. On a loaded real class that would write a prefix into
+/// `delimiter` and an `emptyValue` String into the `int` `size`.
 struct SjRealLayout {
     prefix: usize,
     delimiter: usize,
@@ -29766,11 +29833,11 @@ fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
     ctx.set_field(elements, 1, Value::Int(0));
 
-    ctx.set_field(this, SJ_FIELD_DELIM, delim);
-    ctx.set_field(this, SJ_FIELD_PREFIX, Value::Object(None));
-    ctx.set_field(this, SJ_FIELD_SUFFIX, Value::Object(None));
-    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_DELIM, delim);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_PREFIX, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_SUFFIX, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, Value::Object(None));
     Ok(None)
 }
 
@@ -29812,11 +29879,11 @@ fn native_sj_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
     ctx.set_field(elements, 1, Value::Int(0));
 
-    ctx.set_field(this, SJ_FIELD_DELIM, delim);
-    ctx.set_field(this, SJ_FIELD_PREFIX, prefix);
-    ctx.set_field(this, SJ_FIELD_SUFFIX, suffix);
-    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_DELIM, delim);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_PREFIX, prefix);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_SUFFIX, suffix);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, Value::Object(None));
     Ok(None)
 }
 
@@ -29946,8 +30013,8 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
 
     // Legacy 5-field synthetic fallback: elements live in an internal
-    // ArrayList (field SJ_FIELD_ELEMENTS), added to below.
-    let elements = match ctx.get_field(this, SJ_FIELD_ELEMENTS) {
+    // ArrayList (field SJ_SYNTHETIC_SLOT_ELEMENTS), added to below.
+    let elements = match ctx.get_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS) {
         Value::Object(Some(r)) => r,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
@@ -29998,7 +30065,7 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Helper: read all elements from a legacy-layout StringJoiner's internal
 /// ArrayList as strings. Only used on the synthetic-fallback path.
 fn sj_read_elements(ctx: &mut dyn NativeContext, sj: ObjectRef) -> Vec<String> {
-    let elements = match ctx.get_field(sj, SJ_FIELD_ELEMENTS) {
+    let elements = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_ELEMENTS) {
         Value::Object(Some(r)) => r,
         _ => return Vec::new(),
     };
@@ -30079,22 +30146,22 @@ fn sj_build_string(ctx: &mut dyn NativeContext, sj: ObjectRef) -> String {
 
     // Legacy 5-field synthetic fallback.
     let elements = sj_read_elements(ctx, sj);
-    let delim = match ctx.get_field(sj, SJ_FIELD_DELIM) {
+    let delim = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_DELIM) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
-    let prefix = match ctx.get_field(sj, SJ_FIELD_PREFIX) {
+    let prefix = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_PREFIX) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
-    let suffix = match ctx.get_field(sj, SJ_FIELD_SUFFIX) {
+    let suffix = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_SUFFIX) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
 
     if elements.is_empty() {
         // Check emptyValue
-        if let Value::Object(Some(ev)) = ctx.get_field(sj, SJ_FIELD_EMPTY_VALUE) {
+        if let Value::Object(Some(ev)) = ctx.get_field(sj, SJ_SYNTHETIC_SLOT_EMPTY_VALUE) {
             return ctx.read_string(ev).unwrap_or_default();
         }
         return format!("{prefix}{suffix}");
@@ -30156,7 +30223,7 @@ fn native_sj_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(Some(Value::Object(Some(this))));
     }
     // Join other's elements with other's delimiter and add as a single element
-    let other_delim = match ctx.get_field(other, SJ_FIELD_DELIM) {
+    let other_delim = match ctx.get_field(other, SJ_SYNTHETIC_SLOT_DELIM) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
@@ -30185,7 +30252,7 @@ fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(Some(Value::Object(Some(this))));
     }
 
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, empty_val);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, empty_val);
     Ok(Some(Value::Object(Some(this))))
 }
 
