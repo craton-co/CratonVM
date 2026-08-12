@@ -514,6 +514,12 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         };
         let out_offset = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let out_len = ctx.array_length(out) as i64;
+        // `short_buffer` is carried OUT of the locked block rather than thrown
+        // inside it: building the exception runs a Java constructor, and this
+        // module's rule is that no `ctx` call happens while the state mutex is
+        // held (`std::sync::Mutex` is not reentrant, and a constructor can
+        // reach back into a Mac native).
+        let mut short_buffer = false;
         let hmac_result = {
             let mut t = mac_state_table().lock().unwrap();
             let st = match t.get_mut(&id) {
@@ -545,23 +551,28 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 }
             };
             if out_offset < 0 || out_len - (out_offset as i64) < mac_len {
-                // Real, checked `javax.crypto.ShortBufferException` — a
-                // `RuntimeError` variant would be unchecked and would sail past
-                // the caller's `catch (ShortBufferException)`.
-                return Err(mac_short_buffer(ctx, "Cannot store MAC in output buffer"));
-            }
-            // mem::take resets the accumulator (keeps Mac initialized for reuse).
-            let data = std::mem::take(&mut st.data);
-            match mac_compute_hmac(&st.algo, &st.key, &data) {
-                Some(bytes) => bytes,
-                None => {
-                    return Err(RuntimeError::IllegalStateException {
-                        message: format!("MAC algorithm unavailable: {}", st.algo),
+                short_buffer = true;
+                Vec::new()
+            } else {
+                // mem::take resets the accumulator (keeps Mac initialized for reuse).
+                let data = std::mem::take(&mut st.data);
+                match mac_compute_hmac(&st.algo, &st.key, &data) {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Err(RuntimeError::IllegalStateException {
+                            message: format!("MAC algorithm unavailable: {}", st.algo),
+                        }
+                        .into());
                     }
-                    .into());
                 }
             }
         };
+        if short_buffer {
+            // Real, checked `javax.crypto.ShortBufferException` — a
+            // `RuntimeError` variant would be unchecked and would sail past
+            // the caller's `catch (ShortBufferException)`.
+            return Err(mac_short_buffer(ctx, "Cannot store MAC in output buffer"));
+        }
         ctx.write_byte_array_from(out, out_offset as usize, &hmac_result);
         Ok(None)
     });
