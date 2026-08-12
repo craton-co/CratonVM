@@ -1,3 +1,6 @@
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.BufferOverflowException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
@@ -32,6 +35,21 @@ import java.util.List;
  * transcript stays byte-identical and the expected file diffs additively. The
  * heap arm is still the control in all three.
  *
+ * W7-83 appends `segmentBuffer` on the same terms — 49 further checks, 282 in
+ * total, all green on HotSpot. It is the oracle for one
+ * question: `java.nio.Buffer.segment` (slot 5 on JDK 25) is a `MemorySegment`,
+ * NOT a backing array, and a buffer that has one must answer
+ * `hasArray() == false` and throw `UnsupportedOperationException` from
+ * `array()`. Both CratonVM ByteBuffer families read slot 5 as "maybe an array"
+ * and returned the segment; `array()`'s declared return type is `[B`.
+ *
+ * The section is written against the vacuous shape it would otherwise take.
+ * Asserting that `hasArray()` returns *a boolean* passes against either answer,
+ * so every row states the exact value on BOTH arms — a native-segment buffer
+ * (false) and a heap-segment buffer (true) — and `array()` is driven through
+ * real `invokevirtual java/nio/ByteBuffer.array:()[B` rather than reflection,
+ * so a VM that answers the native must answer it here.
+ *
  * Run: java DirectByteBufferStateProbe
  * Exit 0 = every check matched; exit 1 = at least one FAIL line above.
  */
@@ -52,6 +70,9 @@ public final class DirectByteBufferStateProbe {
         arrayWindow("direct", ByteBuffer.allocateDirect(16), true);
         arrayWindow("heap", ByteBuffer.allocate(16), false);
         freshOrder();
+
+        // W7-83. Appended last, same rule: every line above stays identical.
+        segmentBuffer();
 
         System.out.println("---");
         System.out.println("checks=" + checks + " failures=" + failures.size());
@@ -370,6 +391,144 @@ public final class DirectByteBufferStateProbe {
         eq("fresh.wrapRange.slice.capacity", wrs.capacity(), 8);
         eq("fresh.wrapRange.slice.order", wrs.order().toString(), "BIG_ENDIAN");
         eq("fresh.wrapRange.slice.arrayIdentity", wrs.array() == backing, true);
+    }
+
+    /**
+     * W7-83 — `java.nio.Buffer.segment` is not a backing array.
+     *
+     * Slot 5 of a JDK 25 `Buffer` is `final MemorySegment segment`, and both
+     * CratonVM ByteBuffer families read it as a candidate backing array (it is
+     * the only Object-typed field `Buffer` declares, so `native-builtins`'
+     * typed buffer views deliberately park a real array there). On a receiver
+     * minted by `MemorySegment.asByteBuffer()` the field is a live
+     * `jdk.internal.foreign.NativeMemorySegmentImpl` and `hb` is null, so the
+     * segment was handed back from `array()` — declared `()[B`.
+     *
+     * The two arms are the discriminator and they are the same battery:
+     *
+     * - `seg.native.*` — an `Arena` segment. `hasArray()` is FALSE and both
+     *   accessors throw `UnsupportedOperationException`. A VM that returns the
+     *   segment fails `hasArray` (true where false is expected) and fails
+     *   `array.throws` with a `NO-THROW:` line naming what it returned.
+     * - `seg.heap.*` — `MemorySegment.ofArray(byte[])`. `hasArray()` is TRUE
+     *   and `array()` returns THE VERY ARRAY, asserted by identity. A VM that
+     *   "fixes" the first arm by refusing every slot-5 value fails here.
+     *
+     * `seg.heapSlice.*` is the row that cannot be faked by an accessor that
+     * fabricates a right-sized copy: a sliced heap segment's buffer has
+     * capacity 8, `arrayOffset() == 4`, and `array()` is the WHOLE 16-element
+     * parent array by identity.
+     *
+     * Every value below was measured on Eclipse Adoptium jdk-25.0.3.9.
+     */
+    private static void segmentBuffer() {
+        // --- a NATIVE segment: storage exists, a backing ARRAY does not ---
+        MemorySegment ns = Arena.ofAuto().allocate(16);
+        ByteBuffer nb = ns.asByteBuffer();
+        eq("seg.native.isDirect", nb.isDirect(), true);
+        eq("seg.native.isReadOnly", nb.isReadOnly(), false);
+        eq("seg.native.capacity", nb.capacity(), 16);
+        eq("seg.native.limit", nb.limit(), 16);
+        eq("seg.native.position", nb.position(), 0);
+        eq("seg.native.order", nb.order().toString(), "BIG_ENDIAN");
+        eq("seg.native.hasArray", nb.hasArray(), false);
+        eq("seg.native.array.throws", throwName(() -> nb.array()),
+                "java.lang.UnsupportedOperationException");
+        eq("seg.native.arrayOffset.throws", throwName(() -> nb.arrayOffset()),
+                "java.lang.UnsupportedOperationException");
+        // The storage is real, and it is the segment's: refusing to call it an
+        // array must not degrade to "no storage at all".
+        eq("seg.native.freshGet0", nb.get(0), (byte) 0);
+        nb.put(0, (byte) 0x5A);
+        eq("seg.native.putGet0", nb.get(0), (byte) 0x5A);
+        eq("seg.native.aliasesSegment", ns.get(ValueLayout.JAVA_BYTE, 0), (byte) 0x5A);
+        eq("seg.native.getIntBE", nb.getInt(0), 0x5A000000);
+
+        // A derived view of it is still array-less.
+        ByteBuffer nbs = nb.slice(4, 8);
+        eq("seg.native.slice.capacity", nbs.capacity(), 8);
+        eq("seg.native.slice.isDirect", nbs.isDirect(), true);
+        eq("seg.native.slice.hasArray", nbs.hasArray(), false);
+        eq("seg.native.slice.array.throws", throwName(() -> nbs.array()),
+                "java.lang.UnsupportedOperationException");
+        ByteBuffer nro = nb.asReadOnlyBuffer();
+        eq("seg.native.readOnly.isReadOnly", nro.isReadOnly(), true);
+        eq("seg.native.readOnly.hasArray", nro.hasArray(), false);
+        // UnsupportedOperationException, NOT ReadOnlyBufferException: the
+        // storage kind is decided before the mutability, and W7-58 measured the
+        // same split for `allocateDirect`. Getting it backwards is a
+        // one-word error that a "did it throw" check would not see.
+        eq("seg.native.readOnly.array.throws", throwName(() -> nro.array()),
+                "java.lang.UnsupportedOperationException");
+
+        // A read-only NATIVE segment answers the same way.
+        ByteBuffer roSeg = Arena.ofAuto().allocate(16).asReadOnly().asByteBuffer();
+        eq("seg.nativeRO.isReadOnly", roSeg.isReadOnly(), true);
+        eq("seg.nativeRO.hasArray", roSeg.hasArray(), false);
+        eq("seg.nativeRO.array.throws", throwName(() -> roSeg.array()),
+                "java.lang.UnsupportedOperationException");
+
+        // A confined arena's segment is the same shape with a different
+        // lifetime — included because it is the receiver W7-76 §8.1 measured.
+        try (Arena confined = Arena.ofConfined()) {
+            ByteBuffer cb = confined.allocate(16).asByteBuffer();
+            eq("seg.confined.isDirect", cb.isDirect(), true);
+            eq("seg.confined.hasArray", cb.hasArray(), false);
+            eq("seg.confined.array.throws", throwName(() -> cb.array()),
+                    "java.lang.UnsupportedOperationException");
+        }
+
+        // --- the HEAP control: a segment over a byte[] DOES have an array ---
+        byte[] backing = new byte[16];
+        for (int i = 0; i < 16; i++) {
+            backing[i] = (byte) (i * 7);
+        }
+        ByteBuffer hb = MemorySegment.ofArray(backing).asByteBuffer();
+        eq("seg.heap.isDirect", hb.isDirect(), false);
+        eq("seg.heap.isReadOnly", hb.isReadOnly(), false);
+        eq("seg.heap.capacity", hb.capacity(), 16);
+        eq("seg.heap.order", hb.order().toString(), "BIG_ENDIAN");
+        eq("seg.heap.hasArray", hb.hasArray(), true);
+        eq("seg.heap.arrayLength", hb.array().length, 16);
+        eq("seg.heap.arrayIdentity", hb.array() == backing, true);
+        eq("seg.heap.arrayOffset", hb.arrayOffset(), 0);
+        eq("seg.heap.get0", hb.get(0), (byte) 0);
+        eq("seg.heap.get4", hb.get(4), (byte) 28);
+
+        // The window row: capacity 8, offset 4, and the array is the PARENT's
+        // 16 elements. A fabricated copy of the right size passes every other
+        // check in this section and fails these three.
+        ByteBuffer hs = MemorySegment.ofArray(backing).asSlice(4, 8).asByteBuffer();
+        eq("seg.heapSlice.isDirect", hs.isDirect(), false);
+        eq("seg.heapSlice.capacity", hs.capacity(), 8);
+        eq("seg.heapSlice.hasArray", hs.hasArray(), true);
+        eq("seg.heapSlice.arrayLength", hs.array().length, 16);
+        eq("seg.heapSlice.arrayIdentity", hs.array() == backing, true);
+        eq("seg.heapSlice.arrayOffset", hs.arrayOffset(), 4);
+        eq("seg.heapSlice.get0", hs.get(0), (byte) 28);
+        hs.put(0, (byte) 99);
+        eq("seg.heapSlice.aliasesBacking", backing[4], (byte) 99);
+        backing[4] = (byte) 28;
+
+        // A read-only HEAP segment splits the other way — ReadOnlyBufferException,
+        // not UnsupportedOperationException. Same asymmetry W7-76 §7 measured
+        // for `asReadOnlyBuffer`, reached here through the segment API.
+        ByteBuffer roHeap = MemorySegment.ofArray(backing).asReadOnly().asByteBuffer();
+        eq("seg.heapRO.isReadOnly", roHeap.isReadOnly(), true);
+        eq("seg.heapRO.hasArray", roHeap.hasArray(), false);
+        eq("seg.heapRO.array.throws", throwName(() -> roHeap.array()),
+                "java.nio.ReadOnlyBufferException");
+        eq("seg.heapRO.arrayOffset.throws", throwName(() -> roHeap.arrayOffset()),
+                "java.nio.ReadOnlyBufferException");
+
+        // And a segment over a NON-byte array has no ByteBuffer at all: the
+        // JDK refuses at `asByteBuffer()` rather than minting a buffer whose
+        // `array()` would be an `int[]`. Same species of refusal as the screen
+        // this section is the oracle for, one layer up.
+        int[] ints = new int[4];
+        eq("seg.intArray.asByteBuffer.throws",
+                throwName(() -> MemorySegment.ofArray(ints).asByteBuffer()),
+                "java.lang.UnsupportedOperationException");
     }
 
     // ---- harness ---------------------------------------------------------
