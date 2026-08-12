@@ -6953,6 +6953,124 @@ mod tests {
         }
     }
 
+    /// The exception CLASS every RSA failure mode must become, pinned against
+    /// SunJCE on Temurin 25.0.3+9 (`probes/JcaExceptionTypeProbe.expected.txt`).
+    ///
+    /// Every one of these used to be an unchecked `IllegalStateException` at the
+    /// `Cipher` layer, so a caller's `catch (BadPaddingException e)` — the
+    /// exception `doFinal` DECLARES — was dead. The class is the only thing a
+    /// `catch` selects on, so the class is what this asserts; the round-trip
+    /// test above cannot see any of it, because a round trip never fails.
+    #[test]
+    fn rsa_cipher_failures_carry_the_class_sunjce_raises() {
+        let (pk, sk) = Rsa::generate_keypair(2048);
+        let n = pk.n.to_bytes_be();
+        let e = pk.e.to_bytes_be();
+        let d = sk.d.to_bytes_be();
+        let (other_pk, other_sk) = Rsa::generate_keypair(2048);
+        let other_n = other_pk.n.to_bytes_be();
+        let other_d = other_sk.d.to_bytes_be();
+
+        let bad = "javax/crypto/BadPaddingException";
+        let size = "javax/crypto/IllegalBlockSizeException";
+
+        for pad in [
+            RsaCipherPadding::Pkcs1,
+            RsaCipherPadding::OaepSha1,
+            RsaCipherPadding::OaepSha256,
+        ] {
+            let ct = rsa_cipher_encrypt(&n, &e, pad, b"payload").expect("encrypt");
+
+            // The WRONG PRIVATE KEY and a CORRUPTED CIPHERTEXT are padding
+            // failures. This is the row the regression suite sampled.
+            let wrong_key = rsa_cipher_decrypt(&other_n, &other_d, pad, &ct)
+                .expect_err("the wrong private key must not decrypt");
+            assert_eq!(wrong_key.jca_class(), bad, "{pad:?}: wrong key");
+            let mut corrupt = ct.clone();
+            corrupt[200] ^= 0x01;
+            let flipped = rsa_cipher_decrypt(&n, &d, pad, &corrupt)
+                .expect_err("a flipped ciphertext byte must not decrypt");
+            assert_eq!(flipped.jca_class(), bad, "{pad:?}: corrupted ciphertext");
+
+            // Every padding failure must ALSO still carry the single opaque
+            // message the VULN(1) constant-time repair collapsed them to.
+            // Widening the exception surface must not reopen the
+            // Bleichenbacher/Manger oracle.
+            assert_eq!(wrong_key.message(), RSA_PADDING_ERROR, "{pad:?}");
+            assert_eq!(flipped.message(), RSA_PADDING_ERROR, "{pad:?}");
+
+            // A SHORTER-than-modulus ciphertext is a smaller integer that
+            // decrypts and fails to unpad, NOT a block-size failure. A LONGER
+            // one is the reverse. The asymmetry is SunJCE's, and a
+            // `ct.len() != k` check gets it wrong in one direction while
+            // getting the class wrong in both.
+            let short = rsa_cipher_decrypt(&n, &d, pad, &ct[1..])
+                .expect_err("a short ciphertext must not decrypt");
+            assert_eq!(short.jca_class(), bad, "{pad:?}: short ciphertext");
+            let mut long = ct.clone();
+            long.push(0);
+            let long_err = rsa_cipher_decrypt(&n, &d, pad, &long)
+                .expect_err("an over-long ciphertext must be refused");
+            assert_eq!(long_err.jca_class(), size, "{pad:?}: over-long ciphertext");
+            assert_eq!(
+                long_err.message(),
+                "Data must not be longer than 256 bytes",
+                "{pad:?}: SunJCE's own wording"
+            );
+
+            // Too much plaintext for the padding: 245 for PKCS#1 v1.5, 214 for
+            // OAEP-SHA-1, 190 for OAEP-SHA-256 under a 2048-bit modulus.
+            let max = pad.max_data_size(256).expect("2048-bit modulus fits");
+            assert!(
+                rsa_cipher_encrypt(&n, &e, pad, &vec![0u8; max]).is_ok(),
+                "{pad:?}: exactly max_data_size must still encrypt"
+            );
+            let too_long = rsa_cipher_encrypt(&n, &e, pad, &vec![0u8; max + 1])
+                .expect_err("one byte over the padding limit must be refused");
+            assert_eq!(too_long.jca_class(), size, "{pad:?}: plaintext too long");
+            assert_eq!(
+                too_long.message(),
+                format!("Data must not be longer than {max} bytes"),
+                "{pad:?}: SunJCE's own wording"
+            );
+        }
+
+        // The measured limits, so a change to `hlen` or to the overheads shows
+        // up here as a number rather than as a silently different refusal.
+        assert_eq!(RsaCipherPadding::Pkcs1.max_data_size(256), Some(245));
+        assert_eq!(RsaCipherPadding::OaepSha1.max_data_size(256), Some(214));
+        assert_eq!(RsaCipherPadding::OaepSha256.max_data_size(256), Some(190));
+        // A modulus too small to hold the padding is a KEY problem, not a data
+        // one — SunJCE raises InvalidKeyException from `RSAPadding.getInstance`.
+        assert_eq!(RsaCipherPadding::OaepSha256.max_data_size(66), None);
+        assert_eq!(RsaCipherPadding::Pkcs1.max_data_size(11), None);
+
+        // ANTI-VACUITY: the three variants must map to three DIFFERENT classes.
+        // A `jca_class` that answered `BadPaddingException` for everything
+        // would satisfy most of the assertions above and would be the same
+        // defect one level down.
+        assert_ne!(
+            RsaCipherError::BlockSize(String::new()).jca_class(),
+            RsaCipherError::Padding(String::new()).jca_class()
+        );
+        assert_ne!(
+            RsaCipherError::Key(String::new()).jca_class(),
+            RsaCipherError::Padding(String::new()).jca_class()
+        );
+        // And none of them may be an unchecked class — the whole point.
+        for e in [
+            RsaCipherError::BlockSize(String::new()),
+            RsaCipherError::Padding(String::new()),
+            RsaCipherError::Key(String::new()),
+        ] {
+            assert!(
+                !e.jca_class().starts_with("java/lang/"),
+                "{:?} must not be a java.lang (unchecked) exception",
+                e
+            );
+        }
+    }
+
     #[test]
     fn rsa_cipher_padding_from_transformation() {
         assert_eq!(
