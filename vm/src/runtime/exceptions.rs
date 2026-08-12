@@ -1097,7 +1097,7 @@ fn trace_already_captured_at_current_depth(
 /// HotSpot's `Klass::external_name()` for an already-loaded class: the internal
 /// name with `/` → `.`, **arrays left in descriptor form**.
 ///
-/// Deliberately NOT [`npe_message::class_external`], which renders the *JEP 358*
+/// Deliberately NOT `npe_message::class_external`, which renders the *JEP 358*
 /// spelling (`int[]`, `java.lang.Object[]`, `String`/`Object` shortened).
 /// `ClassCastException` / `ArrayStoreException` use the other one: measured on
 /// JDK 25, `(String[]) (Object) new int[1]` reports
@@ -1634,11 +1634,9 @@ pub fn create_exception_object_for_class(
 /// throwable this module built.
 ///
 /// Only ever reached right after step 3, so no user code has observed the object
-/// yet and there is nothing to clobber. Only `()V` and `(String)V` are ever
-/// invoked above, and in the JDK *both* leave `cause` at the self-sentinel and
-/// `suppressedExceptions` at `SUPPRESSED_SENTINEL`; the four-arg
-/// suppression-disabling constructor is never reachable from here, so there is
-/// no state this can overwrite that HotSpot would have left alone.
+/// yet and there is nothing to clobber. Only `()V` and `(String)V` are invoked
+/// above, and the four-arg suppression-disabling constructor is unreachable from
+/// here, so no state this writes is state HotSpot would have left alone.
 ///
 /// Both fields are now *read as decisions*, which is why the gap had to close:
 ///
@@ -1654,6 +1652,15 @@ pub fn create_exception_object_for_class(
 ///   would silently lose the `close()` failure from every try-with-resources
 ///   whose body threw a VM-minted exception.
 ///
+/// The `cause` half deliberately fills in only a slot that was never written
+/// (`Int(0)` — an *unset* reference slot reads back as that rather than as
+/// `Object(None)`). A genuine stored null must be left alone: several JDK
+/// throwables null their cause on purpose — `ClassNotFoundException()` and
+/// `InvocationTargetException()` both chain to `super((Throwable) null)` — and
+/// HotSpot then correctly refuses `initCause` on them, which was measured on
+/// both VMs. Overwriting that null with the sentinel would turn a specified
+/// refusal into a silent success.
+///
 /// The suppressed half is the `create_exception_object` sibling of
 /// `capture_throwable_trace`'s `init_suppressed_sentinel` in `native-builtins`'
 /// `lang_misc.rs`, which does the same mirroring for the constructor shadows.
@@ -1663,11 +1670,8 @@ pub fn create_exception_object_for_class(
 /// static there is nothing faithful to write, so a bootstrap-era throwable is
 /// left as-is.
 fn mirror_throwable_field_initialisers(shared: &SharedVm, obj: ObjectRef) {
-    // `cause = this`. An *unset* reference slot reads back as `Int(0)` rather
-    // than `Object(None)`, and a `(String)V`/`()V` construction can leave
-    // either, so treat anything that is not already a live reference as unset.
     if let Some(idx) = instance_field_index_by_name(shared, obj, "cause") {
-        if !matches!(shared.mem.heap.get_field(obj, idx), Value::Object(Some(_))) {
+        if matches!(shared.mem.heap.get_field(obj, idx), Value::Int(0)) {
             shared
                 .mem
                 .heap

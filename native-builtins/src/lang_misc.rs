@@ -1135,11 +1135,11 @@ fn throwable_refusal(
 /// `initCause(Throwable)` — the JDK's `Throwable.initCause` **state machine**,
 /// not a bare field write.
 ///
-/// This native SHADOWS the real `Throwable.initCause` bytecode for every
-/// instance (the shape recorded in
-/// a-native-on-a-real-jdk-class-shadows-every-instance), so the two refusals the
-/// method is specified to raise only exist if they are written here. Until
-/// 2026-08-12 neither was, and `initCause` was an unconditional setter — the
+/// This native SHADOWS the real `Throwable.initCause` bytecode for **every**
+/// instance — registering a native on a real JDK class does not add a fallback,
+/// it replaces the method — so the two refusals `initCause` is specified to
+/// raise only exist if they are written here. Until 2026-08-12 neither was, and
+/// `initCause` was an unconditional setter — the
 /// differential probe measured `Throwable.initCauseAfterCtorThrows`,
 /// `Throwable.initCauseTwiceThrows` and `Throwable.selfCauseThrows` all as
 /// `no-throw` where HotSpot raises.
@@ -1211,7 +1211,22 @@ pub(crate) fn native_throwable_init_cause(
         let (this, rendered) = match cause_val {
             Value::Object(Some(c)) => {
                 let pin = ctx.pin_native_root(this);
-                let (_, text) = throwable_to_string_text(ctx, c);
+                let cause_pin = ctx.pin_native_root(c);
+                // `Objects.toString` dispatches the argument's OWN `toString()`,
+                // which a Throwable subclass may override; only fall back to
+                // this file's `Throwable.toString()` reconstruction if that
+                // dispatch cannot answer.
+                let text = match ctx.invoke_virtual(c, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                let text = match text {
+                    Some(t) => t,
+                    None => {
+                        let c = ctx.read_native_pin(cause_pin, c);
+                        throwable_to_string_text(ctx, c).1
+                    }
+                };
                 let this = ctx.read_native_pin(pin, this);
                 ctx.unpin_native_roots(pin);
                 (this, text)
