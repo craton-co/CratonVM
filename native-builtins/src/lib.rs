@@ -117,8 +117,15 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
         } else {
             ":".to_string()
         }),
+        // Both arms used to be `"\n"`, which is a `cfg!(windows)` that decides
+        // nothing — the shape a reader takes for a platform split and a compiler
+        // takes for a constant. `file.separator` and `path.separator` beside it
+        // are platform-correct, which is what makes the wrong one easy to miss.
+        // The authoritative seed is `vm_init`'s property map; this fallback is
+        // reached only before that map exists, and answering `"\n"` there put
+        // LF into anything that terminated a line during bootstrap.
         "line.separator" => Some(if cfg!(windows) {
-            "\n".to_string()
+            "\r\n".to_string()
         } else {
             "\n".to_string()
         }),
@@ -26329,10 +26336,18 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 
 /// Return the current JVM line separator, respecting any
 /// user-overridden `line.separator` system property.  Falls back to
-/// the host-platform default (`\n` on Windows, `\n` elsewhere).
+/// the host-platform default (`\r\n` on Windows, `\n` elsewhere).
+///
+/// The doc comment above used to say "`\n` on Windows, `\n` elsewhere", and the
+/// code said the same thing twice in a `cfg!(windows)` that decided nothing.
+/// `PrintStream.println` and `PrintWriter.println` are SPECIFIED to write the
+/// platform separator, so every `println` in the VM went through this fallback
+/// whenever the property was unseeded — during bootstrap, or through a
+/// `Properties` object that had lost the key.
 fn host_line_separator(ctx: &dyn NativeContext) -> String {
     ctx.get_system_property("line.separator")
-        .unwrap_or_else(|| if cfg!(windows) { "\n" } else { "\n" }.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
 }
 
 /// Write `text` followed by the configured line separator — RB.7 requires

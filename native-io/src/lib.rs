@@ -3023,9 +3023,17 @@ fn native_bw_new_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
+    // The platform separator, not LF. This registration is OVERWRITTEN by
+    // `phases_late::nio_file`'s `BufferedWriter.newLine` — registration is
+    // last-write-wins and `register_phase57_nio_file` runs after
+    // `register_io_natives` in every mode — so the wrong fallback here was
+    // never observable. It is corrected rather than deleted because "the losing
+    // registrar disagrees with the winner" is how a later registration-order
+    // change turns a dead defect into a live one.
     let line_sep = ctx
         .get_system_property("line.separator")
-        .unwrap_or_else(|| "\n".to_string());
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     ctx.fd_table().write_string(fd, &line_sep).map_err(io_err)?;
     Ok(None)
 }

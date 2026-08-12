@@ -10410,12 +10410,43 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/security/DigestException"
         | "java/security/SignatureException"
         | "java/security/InvalidAlgorithmParameterException"
-        | "java/security/UnrecoverableKeyException"
         | "java/security/UnrecoverableEntryException"
+        | "java/security/spec/InvalidKeySpecException"
         | "java/security/cert/CertificateException" => "java/security/GeneralSecurityException",
-        "java/security/InvalidKeyException" | "java/security/InvalidKeySpecException" => {
-            "java/security/KeyException"
-        }
+        // `UnrecoverableKeyException extends UnrecoverableEntryException`, not
+        // `GeneralSecurityException` directly — measured on Temurin 25.0.3+9,
+        // `probes/JcaExceptionTypeProbe.java` section H. Listing it one level
+        // too high still reached `GeneralSecurityException` transitively, so
+        // "is it a Throwable" stayed right and only the one question in between
+        // — does `catch (UnrecoverableEntryException)` match — came out wrong.
+        "java/security/UnrecoverableKeyException" => "java/security/UnrecoverableEntryException",
+        "java/security/InvalidKeyException" => "java/security/KeyException",
+        // `InvalidKeySpecException` lives in `java.security.spec`, so the
+        // `java/security/InvalidKeySpecException` key this arm used to carry
+        // named a class that does not exist and could never be looked up, while
+        // the real name was absent from the table entirely. Its superclass is
+        // `GeneralSecurityException`, not `KeyException` — measured.
+        //
+        // THE `javax.crypto` HALF OF THE SAME HIERARCHY was absent entirely, so
+        // this fallback answered "not a subclass" for `BadPaddingException` /
+        // `IllegalBlockSizeException` / `ShortBufferException` against
+        // `GeneralSecurityException`, and `static_common_superclass_lookup`
+        // widened any two of them to `Object`. Every one is a class this VM now
+        // RAISES from the RSA, AES-GCM and key-wrap paths, so a classfile
+        // catching them is exactly the caller W7-71 exists to unblock.
+        //
+        // `AEADBadTagException` is deliberately NOT flattened to
+        // `GeneralSecurityException`: it extends `BadPaddingException`, and
+        // that link is what makes `catch (BadPaddingException)` catch a GCM tag
+        // failure. Collapsing it would repeat the `UnrecoverableKeyException`
+        // mistake above on the one class where the intermediate step is the
+        // whole point.
+        "javax/crypto/BadPaddingException"
+        | "javax/crypto/IllegalBlockSizeException"
+        | "javax/crypto/NoSuchPaddingException"
+        | "javax/crypto/ShortBufferException"
+        | "javax/crypto/ExemptionMechanismException" => "java/security/GeneralSecurityException",
+        "javax/crypto/AEADBadTagException" => "javax/crypto/BadPaddingException",
         "java/security/AccessControlException" | "java/security/ProviderException" => {
             "java/lang/RuntimeException"
         }
@@ -16755,6 +16786,121 @@ mod tests {
 
     fn empty_constant_pool() -> ConstantPool {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
+    }
+
+    /// The JCA exception hierarchy in the verifier's static fallback table,
+    /// pinned against the HotSpot 25 transcript in
+    /// `probes/JcaExceptionTypeProbe.expected.txt` section H.
+    ///
+    /// Written as a ratchet rather than a spot check because the table is a
+    /// FALLBACK: a wrong or missing row does not fail loudly, it silently
+    /// widens a merge to `Object` or answers "not a subclass" — which is how
+    /// the whole `javax.crypto` half came to be absent while the `java.security`
+    /// half was present and mostly right. The `javax.crypto` classes are the
+    /// ones W7-71 made this VM raise from the RSA, AES-GCM and key-wrap paths.
+    #[test]
+    fn jca_exception_hierarchy_matches_hotspot() {
+        // (child, immediate superclass) — every pair MEASURED, not inferred.
+        let direct = [
+            ("java/security/GeneralSecurityException", "java/lang/Exception"),
+            (
+                "javax/crypto/BadPaddingException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/AEADBadTagException",
+                "javax/crypto/BadPaddingException",
+            ),
+            (
+                "javax/crypto/IllegalBlockSizeException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/NoSuchPaddingException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "javax/crypto/ShortBufferException",
+                "java/security/GeneralSecurityException",
+            ),
+            ("java/security/InvalidKeyException", "java/security/KeyException"),
+            (
+                "java/security/UnrecoverableKeyException",
+                "java/security/UnrecoverableEntryException",
+            ),
+            (
+                "java/security/spec/InvalidKeySpecException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/SignatureException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/DigestException",
+                "java/security/GeneralSecurityException",
+            ),
+            (
+                "java/security/InvalidAlgorithmParameterException",
+                "java/security/GeneralSecurityException",
+            ),
+        ];
+        for (child, parent) in direct {
+            assert_eq!(
+                jdk_superclass(child),
+                parent,
+                "{child} must extend {parent} exactly (HotSpot 25, measured)"
+            );
+        }
+
+        // The transitive question the fallback actually gets asked. Each of
+        // these answered FALSE before the `javax.crypto` rows existed.
+        for child in [
+            "javax/crypto/BadPaddingException",
+            "javax/crypto/AEADBadTagException",
+            "javax/crypto/IllegalBlockSizeException",
+            "javax/crypto/ShortBufferException",
+            "java/security/SignatureException",
+            "java/security/UnrecoverableKeyException",
+            "java/security/spec/InvalidKeySpecException",
+        ] {
+            assert!(
+                jdk_name_is_subclass(child, "java/security/GeneralSecurityException"),
+                "{child} must be catchable as GeneralSecurityException"
+            );
+            assert!(
+                jdk_name_is_subclass(child, "java/lang/Exception"),
+                "{child} must be a checked Exception, not an Error"
+            );
+        }
+
+        // THE AEAD LINK, on its own. Flattening `AEADBadTagException` straight
+        // to `GeneralSecurityException` would satisfy every assertion above and
+        // break the one relationship that decides whether a GCM tag failure is
+        // caught by `catch (BadPaddingException)`.
+        assert!(
+            jdk_name_is_subclass(
+                "javax/crypto/AEADBadTagException",
+                "javax/crypto/BadPaddingException"
+            ),
+            "a GCM tag failure must be catchable as BadPaddingException"
+        );
+
+        // Anti-vacuity: the walk must be able to say NO. Two siblings are not
+        // each other's ancestors, and a JCA exception is not a RuntimeException
+        // — the latter is the whole distinction W7-71 is about.
+        assert!(!jdk_name_is_subclass(
+            "javax/crypto/BadPaddingException",
+            "javax/crypto/IllegalBlockSizeException"
+        ));
+        assert!(!jdk_name_is_subclass(
+            "javax/crypto/BadPaddingException",
+            "java/lang/RuntimeException"
+        ));
+        assert!(!jdk_name_is_subclass(
+            "java/security/SignatureException",
+            "java/lang/RuntimeException"
+        ));
     }
 
     fn make_field(name: &str, is_static: bool) -> cratonvm_reader::field::ClassFileField {
