@@ -56398,21 +56398,23 @@ fn cf_make_completed(ctx: &mut dyn NativeContext, state: CfState) -> Result<Valu
         // `new_object_initialized` above (a static method, no `<init>`
         // interception), so it can succeed where that failed. It writes no
         // index at all: the layout is whatever the loaded class actually is.
-        _ => {
-            if let CfState::Normal(v) = state {
-                if let Ok(Some(real)) = ctx.invoke(
+        _ => match state {
+            CfState::Normal(v) => {
+                match ctx.invoke(
                     "java/util/concurrent/CompletableFuture",
                     "completedFuture",
                     "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
                     &[v],
                 ) {
-                    return Ok(real);
+                    Ok(Some(real @ Value::Object(Some(_)))) => Ok(real),
+                    // The factory is unavailable too (synthetic-JDK mode has no
+                    // such method), or answered null. Re-use the same value in
+                    // the stand-in rather than losing it.
+                    _ => cf_make_synthetic_slots(ctx, CfState::Normal(v)),
                 }
-                // Fall through to the stand-in below, re-using the same value.
-                return cf_make_synthetic_slots(ctx, CfState::Normal(v));
             }
-            cf_make_synthetic_slots(ctx, state)
-        }
+            other => cf_make_synthetic_slots(ctx, other),
+        },
     }
 }
 
