@@ -629,10 +629,7 @@ fn load_cldr_table(
         // …) legitimately have no `cldr` package at all, and a warning on those
         // would be crying wolf — which is how a real fallback notice gets
         // filtered out of a log.
-        if matches!(
-            simple,
-            "FormatData" | "CurrencyNames" | "LocaleNames" | "CalendarData"
-        ) {
+        if matches!(simple, "FormatData" | "CurrencyNames" | "LocaleNames") {
             tracing::warn!(
                 family = simple,
                 language = lang,
@@ -821,6 +818,21 @@ fn overlay_cldr_bundle(
     lang: &str,
     country: &str,
 ) -> bool {
+    // WHITELIST, not "every family CLDR has". `CalendarData` is the reason:
+    // its CLDR `firstDayOfWeek` is not the plain `"1"` this file's curated
+    // table writes, it is a country-list string —
+    //   "1: AG AS BD BR …;2: 001 AD AE …;6: MV;7: AE AF BH …"
+    // — which the real `CLDRCalendarDataProviderImpl` parses per region.
+    // Overlaying it would replace a value a consumer reads as an integer with
+    // one it cannot parse, and the failure would surface far from here. The
+    // same caution covers `TimeZoneNames`, whose values are `String[][]` and
+    // which already has its own real-class path.
+    if !matches!(
+        base_name.rsplit('.').next().unwrap_or_default(),
+        "FormatData" | "CurrencyNames" | "LocaleNames"
+    ) {
+        return false;
+    }
     let Some(table) = load_cldr_table(ctx, base_name, lang, country) else {
         return false;
     };
