@@ -7,6 +7,23 @@ was measured, why the old inference was reasonable — because in this project t
 correction is the durable artefact and a silently rewritten number teaches
 nobody. Nothing here is deleted for being wrong.
 
+> **PHASE 1 IS BUILT AND MEASURED (2026-08-12 evening).** See
+> `docs/known-issues/jdk-only/P1-RESULT-20260812.md`. On a release binary from
+> this branch, against HotSpot 25 as oracle: **53 of 54 probe checks now match,
+> from 28 of 54**, and `compatibility-class-requested` fell **19 → 6** with all
+> six survivors being the recovered-from set. Eight of the nine blocking
+> families are closed; the ninth (FFM) turned out to be a **pre-existing
+> `Arena.allocateFrom(String)` defect** that the carrier fix merely made
+> reachable — the carrier itself matches HotSpot field for field, proved by a
+> positive control.
+>
+> **What that does not license:** 54 deterministic checks are not an
+> application. §6's definition of done — a Spring Boot application, a servlet
+> container serving HTTPS, and a JDBC workload each running to completion — is
+> **unmet and unattempted**. A corpus runner landed this session and **no corpus
+> has been run under `--jdk-only`**. Phase 2's 229 measured shadow rows are
+> untouched. Read the result document before treating any lane here as done.
+
 The goal, stated so it can be falsified: **any Java application that runs on
 HotSpot 25 runs on `cratonvm --jdk-only`, with no synthetic class library
 underneath it.** Not "the regression suite is green" — that suite is 72 small
