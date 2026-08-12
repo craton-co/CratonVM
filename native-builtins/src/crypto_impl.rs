@@ -1105,7 +1105,7 @@ fn secure_random_entropy_seed() -> u64 {
 /// fallback is far stronger than the broken splitmix64 stream — ChaCha20 is a
 /// CSPRNG, not an invertible 64-bit mixer — and the primary path is always the
 /// OS CSPRNG.
-fn secure_random_fill(_key: i32, buf: &mut [u8]) {
+pub(crate) fn secure_random_fill(_key: i32, buf: &mut [u8]) {
     // Primary path: straight from the OS CSPRNG. Retry once on a transient
     // failure before degrading to the software fallback.
     if os_random_bytes(buf) {

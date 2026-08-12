@@ -4161,6 +4161,11 @@ pub mod classfile_api;
 #[allow(dead_code)]
 pub mod classloader;
 pub mod classloader_real;
+// RFC 8439 ChaCha20 / Poly1305 / ChaCha20-Poly1305 AEAD. Separate from
+// `crypto_impl` because it is a self-contained primitive with the RFC's own
+// vectors beside it, and because `crypto_impl`'s ChaCha was a keystream-only
+// SecureRandom fallback that could not encrypt anything.
+pub mod chacha20;
 pub mod crypto_impl;
 pub mod jboss_module_xml;
 pub mod jboss_resource_loader;
