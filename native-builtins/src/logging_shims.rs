@@ -1243,22 +1243,23 @@ pub(crate) fn native_printstream_close(
     // The sink, by the JDK's own field name. A non-object here — including the
     // `Value::Int` fd tag `ensure_system_streams` parks in the legacy
     // synthetic layout's slot 0 — is "no Java sink", i.e. the console.
-    let sink = match ctx.get_field_by_name(this, "out") {
-        Value::Object(Some(out)) => out,
-        _ => {
-            // The process console. HotSpot really would close it; we must not,
-            // so the closest useful behaviour is the flush its close would have
-            // performed. `closing` is deliberately NOT latched: it means "this
-            // stream's sink has been closed", and nothing here closed one — so
-            // a second `System.out.close()` still drains the console rather
-            // than silently skipping it.
-            if let Some(fd) = stream_fd(ctx, args) {
-                if ctx.fd_table().flush(fd).is_err() {
-                    cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
-                }
+    // Bound to a local first, so the `&*ctx` read is fully over before the
+    // `&mut ctx` dispatch below starts — the nested-reborrow shape that had to
+    // be split once already in this file's neighbour.
+    let out_field = ctx.get_field_by_name(this, "out");
+    let Value::Object(Some(sink)) = out_field else {
+        // The process console. HotSpot really would close it; we must not, so
+        // the closest useful behaviour is the flush its close would have
+        // performed. `closing` is deliberately NOT latched here: it means "this
+        // stream's sink has been closed", and nothing on this branch closed
+        // one — so a second `System.out.close()` still drains the console
+        // rather than silently skipping it.
+        if let Some(fd) = stream_fd(ctx, args) {
+            if ctx.fd_table().flush(fd).is_err() {
+                cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
             }
-            return Ok(None);
         }
+        return Ok(None);
     };
     cratonvm_native_api::print_error_state::latch_closing(&*ctx, this);
     let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
