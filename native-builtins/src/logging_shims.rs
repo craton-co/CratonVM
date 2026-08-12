@@ -1038,9 +1038,22 @@ pub(crate) fn native_printstream_flush(
     // User/Tee streams: propagate flush() to the real underlying stream so a
     // redirected file (e.g. DaCapo stdout.log) is durable before its digest is
     // read. Canonical synthetic out/err (out==null) flush the fd directly.
+    //
+    // KEPT SWALLOW, NARROWED. `java.io.PrintStream.flush()` is
+    // `synchronized (this) { try { ensureOpen(); out.flush(); }
+    // catch (IOException x) { trouble = true; } }` — the absorb is the JDK's,
+    // and `PrintStream` declares no checked exception, so propagating
+    // everything would be a fresh divergence. That `catch` names `IOException`
+    // and nothing wider, so an `Error` — a `NoSuchMethodError` from our own
+    // dispatch above all — now comes out.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // Residual: HotSpot records the absorbed failure in `trouble` for
+    // `checkError()`; we do not.
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Value::Object(Some(out)) = ctx.get_field_by_name(*this, "out") {
-            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            let flushed = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
             return Ok(None);
         }
     }

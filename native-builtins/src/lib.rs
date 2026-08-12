@@ -321,13 +321,23 @@ fn native_output_stream_writer_close(
     Ok(None)
 }
 
+/// `InputStreamReader.close()` is a bare `sd.close()` under
+/// `throws IOException`, over a `StreamDecoder.implClose()` that is a bare
+/// `in.close()` / `ch.close()`. Nothing on that chain catches, so the
+/// delegated failure PROPAGATES. W7-57-close-flush-swallow-sweep.md
+///
+/// NOTE: no `register` call names this function anywhere in the workspace —
+/// the live `java/io/InputStreamReader` `close` bodies are
+/// `native-io/src/lib.rs::native_isr_close` and the synthetic one in
+/// `servlet.rs`. Repaired for consistency with those two rather than left as
+/// the odd one out; the deadness is recorded, not resolved here.
 fn native_input_stream_reader_close(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Value::Object(Some(input)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(input, "close", "()V", &[]);
+        ctx.invoke_virtual(input, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -26247,6 +26257,17 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     if !matches!(ctx.get_field_by_name(this, "autoFlush"), Value::Int(v) if v != 0) {
         return;
     }
+    // KEPT SWALLOW, at JDK parity. This is `PrintWriter.println`'s autoflush,
+    // and it dispatches `PrintWriter.flush()` — whose own body is
+    // `try { ensureOpen(); out.flush(); } catch (IOException x)
+    // { trouble = true; }`. HotSpot's autoflush therefore cannot raise an
+    // `IOException` either; `println` declares nothing and never throws one.
+    //
+    // Residual: an `Error` from that dispatch is absorbed here where HotSpot
+    // would let it out. This helper and its caller `stream_writeln` both
+    // return `()` across ten call sites, so propagating is a signature change
+    // rather than a one-line fix. Recorded, not silently kept.
+    // W7-57-close-flush-swallow-sweep.md
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
 }
 
@@ -27103,10 +27124,29 @@ fn native_printwriter_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(None);
     };
+    // KEPT SWALLOW, NARROWED. `java.io.PrintWriter.flush()` is
+    //
+    //     synchronized (lock) {
+    //         try { ensureOpen(); out.flush(); }
+    //         catch (IOException x) { trouble = true; }
+    //     }
+    //
+    // — it really does absorb the delegated failure, and `PrintWriter` does
+    // not declare `throws IOException` at all, so making this propagate would
+    // be a fresh divergence, not a fix. But that `catch` names `IOException`
+    // and nothing wider: a `NoSuchMethodError` out of this dispatch means our
+    // own method lookup failed, and absorbing it here converts a broken VM
+    // into a quietly wrong one. `absorb_io_exception` keeps the JDK's half and
+    // gives back the other. W7-57-close-flush-swallow-sweep.md
+    //
+    // Residual: HotSpot records the absorbed failure in `trouble`, which
+    // `checkError()` reports. We do not, so an absorbed `IOException` stays
+    // unobservable rather than merely unthrown.
     let sink = printwriter_sink(&*ctx, this);
     let console_fd = stream_fd(ctx, args);
     if let Some(sink) = sink {
-        let _ = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+        let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+        cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
     }
     if let Some(fd) = console_fd {
         let _ = ctx.fd_table().flush(fd);
@@ -27169,10 +27209,24 @@ fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let console_fd = stream_fd(ctx, args);
     let is_console =
         console_fd.is_some() || sink.is_some_and(|sink| sink_reaches_system_stream(&*ctx, sink));
+    // KEPT SWALLOW, NARROWED — same reasoning as `native_printwriter_flush`.
+    // `java.io.PrintWriter.close()` is `try { if (out != null) { out.close();
+    // out = null; } } catch (IOException x) { trouble = true; }`: the JDK
+    // absorbs an `IOException` and `close()` declares no checked exception, so
+    // propagating everything would be a fresh divergence. An `Error` is not an
+    // `IOException` and must come out. W7-57-close-flush-swallow-sweep.md
+    //
+    // The preceding `flush()` has no counterpart in HotSpot's `close()` (it
+    // closes without flushing, relying on the sink's own `close()` to do it);
+    // it is ours, so it takes the same `IOException`-absorbing policy rather
+    // than a stricter one — see the `vm_only_best_effort` reasoning in
+    // `native-api/src/delegated_close.rs`.
     if let Some(sink) = sink {
-        let _ = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+        let flushed = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+        cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, flushed)?;
         if !is_console {
-            let _ = ctx.invoke_virtual(sink, "close", "()V", &[]);
+            let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
+            cratonvm_native_api::delegated_close::absorb_io_exception(&*ctx, closed)?;
         }
     }
     if let Some(fd) = console_fd {
