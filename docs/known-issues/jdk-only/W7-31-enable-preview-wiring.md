@@ -1,0 +1,289 @@
+# The preview gate had no switch, and HotSpot's nameless-class placeholder is `<Unknown>`
+
+**Status: all four parts of W7-28's handback are APPLIED. Nothing was rebuilt.**
+Every measurement below is of HotSpot Adoptium 25.0.3.9
+(`C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot`) or of the
+**pre-change** binary at `C:/craton/CratonVM/target/release/cratonvm.exe` (built
+2026-08-11 20:54, which predates the reader change as well as this one). No
+claim is made that the edited source compiles or that the new flag works.
+
+docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md landed the refusal
+in `reader/src/` and wrote out four parts it did not own. This record applies
+them and closes the one caveat it left open by measurement.
+
+## 1. Each part was still needed — verified against the source, not the record
+
+This campaign carries fifteen records claiming a patch was never applied when it
+already was, so each site was read before it was touched. **All four were
+genuinely unapplied**, and the record's structural claims all held:
+
+| claim | verified |
+|---|---|
+| `set_preview_enabled` exists in `reader/src/` and **nothing calls it** | yes — the only hit outside `reader/src/` was a *comment* in `reader/tests/vulnerability_fixes.rs:364` explaining why that test deliberately does not call it |
+| `--enable-preview` is an argument-parse error | yes, run directly (§2) |
+| `isPreviewEnabled` is hardcoded to `Value::Int(0)` | yes, `native-builtins/src/lib.rs:14667` |
+| no `LinkageError::UnsupportedClassVersionError` variant | yes, absent from `types/src/error.rs` |
+| `class_manager.rs:5252` maps every reader error to `ClassFormatError` | yes |
+| **`vm-cli/Cargo.toml` does not depend on `cratonvm-reader`** | **yes** — it lists `cratonvm-vm`, `-jit`, `-classloading`, `-native-api`, `-types`, `-native-builtins`, `-jfr`, and no reader. `native-builtins/Cargo.toml:59` does. The re-export is load-bearing exactly as claimed. |
+
+One disagreement, and it is small: W7-28 §D asserts the two benchmark scripts
+"need `--enable-preview` on the CratonVM side too — which is precisely what the
+out-of-file patch adds". Measured, they do not. See §5.
+
+## 2. The divergence, reproduced directly
+
+A plain `69.0` class file with bytes 4..5 overwritten to `FF FF` — no preview
+API, no `StructuredTaskScope`, so nothing but the version field is in play:
+
+```
+$ od -An -tx1 -N8 Q.class
+ ca fe ba be ff ff 00 45
+
+$ java -cp . Q
+Error: LinkageError occurred while loading main class Q
+	java.lang.UnsupportedClassVersionError: Preview features are not enabled for Q (class file version 69.65535). Try running with '--enable-preview'
+
+$ java --enable-preview -cp . Q
+ran-Q
+
+$ cratonvm.exe -cp . Q                    # pre-change binary
+ran-Q
+[cratonvm] main-vm run() returned Ok — VM main exiting normally
+
+$ cratonvm.exe --enable-preview -cp . Q   # pre-change binary
+error: unexpected argument '--enable-preview' found
+  tip: a similar argument exists: '--enable-native-access'
+```
+
+That is the whole lane: HotSpot has two answers, CratonVM had one, and the flag
+that would have selected the other did not parse.
+
+## 3. The caveat W7-28 left open: HotSpot prints `<Unknown>`
+
+W7-28 §C3 flagged that `jni_define_class` passes `""` for a nameless define, that
+the version check runs before `this_class` is read, and that **HotSpot's
+placeholder was not measured — do not invent it.** Measured.
+
+The reachable analogue of JNI `DefineClass` with a NULL name is
+`ClassLoader.defineClass(null, b, 0, b.length)`; both reach the same VM entry
+point. Loading the 69.65535 `P.class` five ways from a plain `69.0` main class,
+on plain `java`:
+
+```
+ClassLoader.defineClass(name=null) -> java.lang.UnsupportedClassVersionError: Preview features are not enabled for <Unknown> (class file version 69.65535). Try running with '--enable-preview'
+ClassLoader.defineClass(name="")   -> java.lang.UnsupportedClassVersionError: Preview features are not enabled for  (class file version 69.65535). Try running with '--enable-preview'
+ClassLoader.defineClass(name="P")  -> java.lang.UnsupportedClassVersionError: Preview features are not enabled for P (class file version 69.65535). Try running with '--enable-preview'
+Lookup.defineClass                 -> ... for P ...
+Lookup.defineHiddenClass           -> ... for P ...
+```
+
+**`<Unknown>`.** Not blank, not `null`, not the doubled space W7-28 predicted —
+that prediction was right about the *shape* and wrong about the *cause*: the
+doubled space is what HotSpot prints for an explicitly empty name, which is a
+different input from no name at all.
+
+`<Unknown>` is **generic, not preview-specific**. The same nameless define at the
+other four version rejections, with and without `--enable-preview` (identical
+both ways):
+
+```
+68.65535 -> <Unknown> (class file version 68.65535) was compiled with preview features that are unsupported. This version of the Java Runtime only recognizes preview features for class file version 69.65535
+70.65535 -> <Unknown> has been compiled by a more recent version of the Java Runtime (class file version 70.65535), this version of the Java Runtime only recognizes class file versions up to 69.0
+69.1     -> <Unknown> (class file version 69.1) was compiled with an invalid non-zero minor version
+44.0     -> <Unknown> (class file version 44.0) was compiled with an invalid major version
+```
+
+So the substitution goes in the caller, once, for all five messages — which is
+what `class_manager.rs` now does.
+
+### 3.1 The one knowing inaccuracy, stated rather than hidden
+
+**HotSpot distinguishes a null name from an explicitly empty one. CratonVM
+cannot.** `native-builtins/src/classloader.rs:3791`
+(`read_optional_internal_name`) folds Java `null` and Java `""` into the same
+Rust `String::new()`:
+
+```rust
+    match args.get(idx) {
+        Some(Value::Object(Some(o))) => { ... }
+        _ => String::new(),
+    }
+```
+
+and `vm/src/native/jni.rs:4192` uses `""` as its own placeholder for JNI's NULL.
+By the time `define_class_with_options` sees the name, the two inputs are one
+value. Substituting `<Unknown>` therefore makes the reachable case (JNI NULL,
+`ClassLoader.defineClass(null, ..)`) exactly right and gives the pathological
+case (`defineClass("", ..)`, a caller passing a deliberate empty name) null's
+message instead of HotSpot's doubled space.
+
+That is the right trade and it is not free: **it is recorded here rather than
+fixed** because fixing it means threading an `Option<&str>` through
+`read_optional_internal_name`, `jni_define_class` and `define_class_with_options`
+— three files, two of which this lane does not own — to preserve a distinction
+whose only observable consequence is which of two placeholder spellings appears
+in a message for a class nobody named. Should someone want it, the shape is
+`Option<&str>`, not a second sentinel string.
+
+## 4. What was applied
+
+### (A) `vm-cli/src/main.rs`
+
+Declaration beside `enable_native_access`, apply site immediately after its
+block. A bare `bool`, not `Option<String>` — HotSpot's flag takes no value.
+
+The one thing worth checking that W7-28 did not: **a bare boolean needs no
+`VALUE_TAKING_OPTS` entry.** That table (`vm-cli/src/main.rs:1045`) exists so
+the separator inserter does not mistake an option's value token for the main
+class name; its own doc comment says "Boolean flags also need no entry", and
+`--enable-native-access` is absent from it too. Verified by reading the four
+pre-clap stages: an unrecognised `--`-prefixed token in the leading section is
+copied through verbatim (`main.rs:1271-1274`). Two tests pin this — one runs the
+whole pipeline and asserts `Main` survives as the class name, one asserts the
+flag defaults off.
+
+Set **unconditionally** (`set_preview_enabled(args.enable_preview)`) rather than
+under an `if`, so an embedder reusing this path cannot inherit a stale `true` —
+which is the one way this differs from `--enable-native-access` above it, whose
+gate is only ever opened.
+
+### (B) `native-builtins/src/lib.rs`
+
+The closure now reads `cratonvm_reader::preview_enabled()`, and the half of the
+comment that said "we don't parse `--enable-preview` yet" is gone because it is
+no longer true. `NativeKind::Bridge` is unchanged — it was always a Bridge, and
+is arguably more of one now that it reports a real bit rather than a constant.
+No effect on `native-builtins/tests/stub_ratchet.rs`, which censuses
+`SyntheticStub` registrations only.
+
+The `set_preview_enabled` re-export is placed beside `real_jca_mode` at the
+crate's other top-level gate accessors.
+
+### (C) `UnsupportedClassVersionError`
+
+Three files. The arm in `vm/src/runtime/exceptions.rs` does **not** prefix the
+class name, per W7-28: HotSpot's sentence already contains it, mid-sentence, and
+prefixing would render `Q: Preview features are not enabled for Q ...`.
+
+**Exhaustiveness.** A swept census of every `match` over `LinkageError` in the
+workspace found **exactly one exhaustive site**, and this lane owns it:
+
+* `vm/src/runtime/exceptions.rs:1910` (`fn linkage_throwable`) — all ten variants
+  listed, no catch-all, match is the function's tail expression. **Edited.**
+
+Every other site carries `other => other` or `other => panic!(..)` and compiles
+unchanged: `classloading/src/verify_insn.rs:1369`;
+`classloading/src/verifier.rs:739, 948, 1129, 1275`;
+`classloading/src/bytecode_verifier.rs:548, 787, 897, 1052`;
+`vm/src/runtime/resolve/mod.rs:350` (`impl From<LinkageError> for ResolveError`,
+five variants then `other => ResolveError::Internal`). The nested
+`VmError::Linkage(..)` matches in `vm/src/runtime/exceptions.rs:~2060`,
+`native-builtins/src/{lang_system.rs:5564, lib.rs:4726, lang_class.rs:2963}` and
+the verifier tests are all catch-alled too. The `if let` / `matches!` sites never
+break. There is no `use LinkageError::*` anywhere, so no bare-variant arm is
+hiding from the grep. **Nothing was out of reach.**
+
+Note what the new variant does *not* change: `ResolveError::Internal`'s catch-all
+now swallows an `UnsupportedClassVersionError` reaching resolution into a generic
+internal error. That was already true of `ClassFormatError` and is out of scope.
+
+**One residual risk, unmeasured.** `linkage_throwable` returns a class name that
+`create_exception_object` must materialize. `java/lang/UnsupportedClassVersionError`
+is a real `java.base` class, so `--real-jdk` and `--jdk-only` are fine; under
+`--features synthetic-jdk` it is no more registered than `java/lang/ClassFormatError`
+is, so both are in the same position. If it cannot be built, `throw_linkage_error`
+already degrades with a `tracing::warn!` rather than crashing
+(`vm/src/runtime/exceptions.rs:2028-2038`).
+
+### (D) The two benchmark scripts do **not** need the flag
+
+W7-28 said they would. Measured, they do not, for two independent reasons either
+of which is sufficient.
+
+**Both class files are `minor == 0`.** They are checked into the tree, so this is
+a direct read, not an inference:
+
+```
+$ od -An -tx1 -N8 bench-tornado/VectorAddTornado.class
+ ca fe ba be 00 00 00 45
+$ od -An -tx1 -N8 bench-tornado/PolyEvalTornado.class
+ ca fe ba be 00 00 00 45
+```
+
+`00 00` minor, `00 45` major — plain 69.0. This is W7-28 §1.1's own finding
+turned on the actual artifacts: `javac --enable-preview` stamps only files that
+*use* a preview feature, and neither of these does. `--enable-preview` is on
+those `javac` lines for TornadoVM's benefit, not because the sources need it.
+
+**Neither compiled class is ever run by CratonVM.** `bench-tornado/run.sh:43`
+ends `exec tornado ... VectorAddTornado` — there is no `cratonvm` invocation in
+that script at all. In `scripts/internal/bench-poly-4way.sh` the three CratonVM
+arms (lines 53, 62, 71) all run `CpuPolyBench`/`GpuPolyBench` out of
+`$BENCH_CLASSES` (`apps/gpu-bench/classes`, built elsewhere and not with
+`--enable-preview`); the `javac --enable-preview` at line 85 compiles
+`PolyEvalTornado` for arm 5, which runs under the `tornado` launcher.
+
+So: no edit needed, and none made. Recorded rather than guessed, as asked. If a
+future revision of either source adopts a preview language feature, the first
+reason lapses and only the second holds — and the second holds for the tornado
+arm regardless, because that arm is not CratonVM.
+
+## 5. Hazards checked
+
+* **`Compatible` stays byte-for-byte for non-preview class files.** Unchanged by
+  this lane — the verdict logic is entirely in `reader/`, which this lane did not
+  touch. What changed here is the *wording and throwable type* of rejections that
+  already happened, plus the flag that can now turn the gate off.
+* **The over-deny canary.** `45.65535`, `52.65535`, `55.65535` must keep running;
+  no check was added anywhere near them. `class_manager.rs`'s new branch fires
+  only when the reader already returned `UnsupportedVersion`, so it cannot cause
+  a refusal — it can only re-word one.
+* **Flag surface untouched.** `git diff dev | grep -o 'CRATONVM_[A-Z0-9_]*'` over
+  the added lines returns nothing. No `types/src/flag_groups.rs`,
+  `types/tests/flag-surface.txt`, `docs/flag-tokens.md` or
+  `docs/config/flag-inventory.md` change is needed, and none was made. This is
+  W7-28 §3.5's deliberate choice carried forward: `--enable-preview` is a JVM
+  argument with a spec-mandated spelling, and a `CRATONVM_*` twin would give a
+  workload a way to enable preview that HotSpot has no counterpart for.
+* **`native-builtins/tests/stub_ratchet.rs`** is owned by another lane and was
+  not touched. The registration's `NativeKind` is unchanged, so its census is
+  unaffected.
+
+## Out-of-file patch (not applied)
+
+**The index row.** `docs/known-issues/jdk-only/README.md` is not this lane's
+file. Its header currently reads "**22 records**"; W7-28 and this record are both
+new since that count was written, so whoever owns it should reconcile the number
+along with adding rows for both.
+
+**The nameless-name distinction**, if anyone ever wants HotSpot's doubled space
+for `defineClass("")`: change `read_optional_internal_name` to return
+`Option<String>` (`native-builtins/src/classloader.rs:3791`), thread it through
+`jni_define_class` (`vm/src/native/jni.rs:4192`, which already has its own `""`
+placeholder and a comment saying so) and `define_class_with_options`, then render
+`None` as `<Unknown>` and `Some("")` as `""`. §3.1 argues this is not worth it.
+
+## Falsifier
+
+Unchanged from W7-28's, plus:
+
+* `cratonvm --enable-preview -cp . Q` must print `ran-Q` where the pre-change
+  binary printed `error: unexpected argument`, and `cratonvm -cp . Q` must now
+  refuse it — with `Q.class` hand-stamped to `69.65535` as in §2. That single
+  fixture exercises the flag, the gate and the new message without depending on
+  any preview API.
+* `java --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED` printing
+  `PreviewFeatures.isEnabled` must give the same answer under `cratonvm` as under
+  `java` on **both** arms. One arm agreeing proves nothing: a hardcoded `0` also
+  passes the no-flag arm, which is exactly the state this record replaces.
+* A nameless define of a 69.65535 class file must say `<Unknown>`, not blank.
+
+## What is not claimed
+
+Nothing was rebuilt; `cargo build`, `check`, `test`, `clippy` and `fmt` were all
+withheld deliberately. The HotSpot messages in §3, the class-file headers in §4,
+the pre-change binary's behaviour in §2, the Cargo dependency facts in §1 and the
+`LinkageError` match census in §4 are observations. They do **not** establish
+that the edited source compiles, that `--enable-preview` parses, that the two
+bits agree at runtime, or that `java/lang/UnsupportedClassVersionError` can be
+materialized on any given boot path.
