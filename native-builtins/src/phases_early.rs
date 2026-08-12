@@ -8850,6 +8850,26 @@ pub(crate) fn fjp_quietly_body(
 /// The `method_exists` half is what makes this safe in synthetic-JDK mode,
 /// where the task classes are fabricated stubs with no `setRawResult` to call:
 /// it answers `false` there and the caller takes the side-table-only path.
+///
+/// **How narrow the `false` arm actually is, measured (W7-48).** All three
+/// names in the `matches!` below are ABSTRACT classes, so that arm can only
+/// fire on a receiver whose RUNTIME class is literally one of them — which no
+/// Java program can produce. A user subclass of `RecursiveTask` does not
+/// name-match (its class is `Foo$1`), and `NativeContext::method_exists` walks
+/// the superclass chain (`vm/src/vm/vm_exec.rs`), so it finds the inherited
+/// `protected final setRawResult` and this function answers `true`. The caller
+/// then invokes the virtual — which resolves straight back to the registered
+/// `RecursiveTask.setRawResult` native, i.e. to the same side-table write, by a
+/// longer route. The predicate is therefore behaviourally right in every
+/// reachable case, but NOT for the reason the paragraph above gives: a
+/// `RecursiveTask` / `RecursiveAction` subclass has no field of its own either,
+/// and its `setRawResult` is `final` so it cannot acquire one.
+///
+/// The consequence worth knowing: the side-table-only arm of
+/// `fjp_complete_body` — and therefore [`fjp_state_set_raw_result`] — is
+/// defence in depth, not a live path, and cannot be falsified from Java. Do
+/// not write a corpus assertion claiming to cover it; it would be green before
+/// and after.
 fn fjt_has_own_raw_result_slot(ctx: &mut dyn NativeContext, task: ObjectRef) -> bool {
     let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(task)) else {
         return false;
