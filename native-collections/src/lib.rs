@@ -30251,13 +30251,23 @@ fn rnd_uniform_double(next: &mut impl FnMut(u32) -> i32) -> f64 {
 ///
 /// Factored out of the native so the specified sequence is testable without a
 /// VM — `next` is `Random.next(bits)`.
+///
+/// The multiplier is `StrictMath.sqrt(-2 * StrictMath.log(s) / s)` in the JDK,
+/// and the `StrictMath` there is load-bearing: `sqrt`, `*` and `/` are
+/// exactly-rounded IEEE 754 and agree everywhere, but `log` is a bit-for-bit
+/// fdlibm contract that platform libm does not meet. Using `s.ln()` here put
+/// every SEEDED gaussian stream one ULP off HotSpot's —
+/// `new Random(42).nextGaussian()` printed `1.141905315473055` against
+/// HotSpot's `1.1419053154730547`, which is the same double as
+/// `Math.log`-derived, not a `Double.toString` difference. See
+/// W7-44-numberformat-enum-and-double-tostring.md.
 fn rnd_gaussian_pair(mut next: impl FnMut(u32) -> i32) -> (f64, f64) {
     loop {
         let v1 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
         let v2 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let multiplier = (-2.0 * s.ln() / s).sqrt();
+            let multiplier = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return (v1 * multiplier, v2 * multiplier);
         }
     }
@@ -56949,11 +56959,16 @@ mod tests {
             got.push(b);
         }
 
-        // Compared with a relative tolerance rather than by bit pattern: the
-        // JDK's multiplier goes through `StrictMath.log` (fdlibm) while this
-        // uses the platform libm, and those may differ in the last ulp. A
-        // DIFFERENT sequence cannot come within 1e-12 of this one, so the
-        // tolerance costs the assertion nothing.
+        // Compared BY BIT PATTERN. This used to carry a 1e-12 relative
+        // tolerance, excused on the grounds that "the JDK's multiplier goes
+        // through `StrictMath.log` (fdlibm) while this uses the platform libm,
+        // and those may differ in the last ulp" — which was true, and was the
+        // defect, not a property to tolerate. The differential probe read that
+        // last ulp straight out of `Double.toString`
+        // (`1.141905315473055` vs HotSpot's `1.1419053154730547`), so a
+        // tolerance that hid it hid a user-visible divergence. `rnd_gaussian_pair`
+        // now uses the fdlibm `log` and the whole stream is exact.
+        // W7-44-numberformat-enum-and-double-tostring.md.
         let expected: [i64; 6] = [
             4607821503525903750,
             4606456510138157127,
@@ -56965,9 +56980,13 @@ mod tests {
         for (i, want_bits) in expected.iter().enumerate() {
             let want = f64::from_bits(*want_bits as u64);
             let have = got[i];
-            assert!(
-                (have - want).abs() <= 1e-12 * want.abs().max(1.0),
-                "nextGaussian[{i}] diverged from the JDK's seeded sequence:                  got {have:?}, want {want:?}"
+            assert_eq!(
+                have.to_bits(),
+                *want_bits as u64,
+                "nextGaussian[{i}] diverged from the JDK's seeded sequence: \
+                 got {have:?} ({:#018x}), want {want:?} ({:#018x})",
+                have.to_bits(),
+                *want_bits as u64
             );
         }
     }

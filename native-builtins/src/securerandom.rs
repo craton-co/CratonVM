@@ -955,7 +955,11 @@ fn sha1prng_next_gaussian(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
         let v2 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm `log`, not `f64::ln`: this stream is SEEDED and therefore
+            // reproducible, so a last-ULP libm difference is observable as a
+            // divergence from HotSpot. Same reason as `java.util.Random`'s
+            // polar method — W7-44-numberformat-enum-and-double-tostring.md.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             with_prng_write(|t| {
                 if let Some(p) = t.get_mut(&key) {
                     p.next_gaussian = Some(v2 * mult);
@@ -1312,7 +1316,10 @@ pub(crate) fn native_secure_random_next_gaussian(
         let v2 = 2.0 * secure_uniform()? - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm `log` for the same reason as the seeded paths, though
+            // here the uniforms come from the OS CSPRNG so no observer can
+            // tell: kept identical so the three polar sites cannot drift.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return Ok(Some(Value::Double(v1 * mult)));
         }
     }
