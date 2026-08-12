@@ -415,7 +415,7 @@ fn the_thread_virtual_slot_read_keeps_its_eetop_witness() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. All four maps reach the sweep
+// 5. All the maps reach the sweep
 // ---------------------------------------------------------------------------
 
 /// Each of the rows publishes a `SlotMap`, and each publication is wired.
@@ -513,7 +513,7 @@ fn the_published_maps_state_the_belief_not_the_truth() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. `SSC_P58_SLOT_MAP` — the row with no runtime witness, and why it needs none
+// 6. `SSC_P58_SLOT_MAP` — the row with no runtime witness, and why it needs none
 // ---------------------------------------------------------------------------
 
 /// The dead `ServerSocketChannel.socket()` stays deleted, its winner stays
