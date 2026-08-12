@@ -117,7 +117,43 @@ All verified against stock HotSpot 25 on the same host, same classpath.
 Still refused, deliberately: `Poly1305`, `AESCMAC`, `HmacPBESHA*` and the rest of
 HotSpot's 28 `Mac` names. They are not HMAC-over-a-digest, and serving them would
 mean a second unverified construction — the mistake the old
-`_ => hmac_sha256(key, data)` fallback was removed for.
+`_ => hmac_sha256(key, data)` fallback was removed for. `Security.getAlgorithms("Mac")`
+therefore still answers 12 where HotSpot answers 28, and that under-advertisement
+is the intended state: it agrees exactly with what `Mac.getInstance` will serve.
+
+## Residual sweep — the same species, elsewhere
+
+Since the failure mode is structural (off-object state ⇒ any unregistered method
+runs the real body against uninitialised fields), the whole JCA engine surface
+was swept: every public method of `Mac`, `MessageDigest`, `SecretKeyFactory`,
+`Cipher` and `Signature` exercised on both arms and diffed. Four more live
+defects, all fixed here:
+
+* `Cipher.getProvider()` — same null `lock` NPE, on a `Cipher` that encrypts and
+  decrypts correctly.
+* `Cipher.update(ByteBuffer, ByteBuffer)` — unregistered, so
+  `IllegalStateException: Cipher not initialized`. Registered together with
+  `doFinal(ByteBuffer, ByteBuffer)`: registering only `update` would have been
+  worse than registering neither, because the input would be consumed into the
+  accumulator and the `doFinal` meant to flush it would still have thrown,
+  losing the plaintext silently.
+* `Signature.getProvider()` — returned a bare `null`, which a real one never
+  does, so `sig.getProvider().getName()` (an idiom the JDK's own JAR
+  verification uses) NPE'd. Now answers SunRsaSign / SUN / SunEC per family,
+  keyed off this engine's own algorithm index so it cannot drift from
+  `getAlgorithm()`; an unrecognised algorithm still returns `null` rather than a
+  fabricated provider.
+* `SecretKeyFactory.generateSecret(...).getAlgorithm()` — answered the bare
+  `PBKDF2` where HotSpot answers `PBKDF2WithHmacSHA256`. The comment beside the
+  literal already said `"PBKDF2With…"`; the literal did not. A caller re-keying
+  a `Mac` from the derived key's own algorithm name — the reason `SecretKeySpec`
+  carries one — would have asked for an algorithm that does not exist.
+
+The four provider-object builders that had accreted across these engines are now
+one `jca::make_named_provider`.
+
+After these, the engine-surface diff against HotSpot is a single row: the
+deliberate `Mac` under-advertisement above.
 
 ## Verification
 

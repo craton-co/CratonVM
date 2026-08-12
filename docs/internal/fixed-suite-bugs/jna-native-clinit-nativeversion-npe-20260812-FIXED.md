@@ -103,6 +103,28 @@ Identical from both contexts, so it was not a missing TLS context or an
    a NULL `jclass`, and the tag must vanish under the `clazz as u32` decode every
    consumer uses.
 
+## Verification
+
+The C probe above, re-run: every primitive returns a live handle from both
+`JNI_OnLoad` and a registered native, matching HotSpot in kind.
+
+`com.sun.jna.Native` then initializes, and reports the same values HotSpot does:
+`getNativeVersion() = 6.1.6`, `getAPIChecksum() = 147a998f0cbc89681a1ae6c0dd121629`,
+`POINTER_SIZE = 8`.
+
+Real native calls through a JNA `Library` interface work, checked against
+something the VM can independently confirm rather than against plausibility:
+
+| | HotSpot 25 | CratonVM |
+|---|---|---|
+| `LibC.geteuid()` | 1000 | 1000 |
+| `LibC.getpid()` | matches `ProcessHandle.current().pid()` | matches `ProcessHandle.current().pid()` |
+| `RootlessDockerClientProviderStrategy$LibC` class-init | OK | OK |
+
+End to end: Testcontainers auto-detecting Docker with **no `DOCKER_HOST` set**
+provisions `postgres:18.4`, hibernate-reactive's Vert.x client authenticates
+over SCRAM, the query runs and the container stops cleanly.
+
 ## Impact beyond JNA
 
 This was not a JNA bug and the blast radius was not Testcontainers. Any native

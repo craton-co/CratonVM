@@ -1,9 +1,37 @@
-# PostgreSQL SCRAM-SHA-256 auth fails — `PBKDF2WithHmacSHA384 SecretKeyFactory not available`
+# PostgreSQL SCRAM-SHA-256 auth fails — `PBKDF2WithHmacSHA384 SecretKeyFactory not available` — FIXED
 
-**Status:** OPEN (2026-08-07). Found while setting up a real-Postgres run of
-the Hibernate suite (`apps/hib-suite-runner/runs/pgsql-fullsuite-20260807/`).
-Worked around operationally (see below) so the suite could actually run —
-this doc tracks the underlying gap, which is still present.
+**Status:** FIXED (2026-08-12). Filed 2026-08-07 while setting up a
+real-Postgres run of the Hibernate suite
+(`apps/hib-suite-runner/runs/pgsql-fullsuite-20260807/`), worked around
+operationally (see below) so the suite could run.
+
+Closed in two parts, neither of which was visible from this filing alone:
+
+* **The headline gap** — `SecretKeyFactory` not registering
+  `PBKDF2WithHmacSHA384`/`SHA512` — was fixed by `e0598dc55`. The doc's open
+  question ("is `PBKDF2WithHmacSHA256` *also* missing?") is answered: it was
+  present all along; only the 384/512 probe entries were absent, which was
+  enough to kill `ScramMechanism.<clinit>` outright.
+* **What remained after that** was a different defect entirely, found on
+  2026-08-12 while chasing the Vert.x reactive client's SCRAM failure:
+  `javax/crypto/Mac.doFinal([BI)V` was never registered, so
+  `com.ongres.scram`'s PBKDF2 loop died on its second iteration. pgjdbc shades
+  that same library, so both SCRAM clients were blocked by it. See
+  `vertx-pg-sasl-scram-handshake-fails-20260812-FIXED.md`.
+
+Also fixed alongside: `SecretKeyFactory.getProvider()` threw
+`NullPointerException: Cannot enter synchronized block because "this.lock" is
+null` on a factory that derived keys correctly, and
+`generateSecret(...).getAlgorithm()` answered the bare `PBKDF2` where HotSpot
+answers the full `PBKDF2WithHmacSHA256`.
+
+**Verified 2026-08-12** against a `postgres:18.4` container with
+`--auth-host=scram-sha-256` (`pg_hba.conf` confirmed
+`host all all all scram-sha-256`): pgjdbc's `DriverManager.getConnection`
+completes the full
+`SASLInitialResponse` → `SASLContinue` → `SASLResponse` → `SASLFinal` →
+`AuthenticationOk` exchange and runs a query, 3/3 runs. The MD5 downgrade
+below is no longer needed.
 
 ## Symptom
 
@@ -89,14 +117,29 @@ Deterministic — every connection attempt against a scram-only server hits
 this before any query runs, confirmed across the smoke test and the initial
 failed 4-shard launch attempt.
 
-## Not yet investigated
+## Answers to the two open questions
 
-- Whether `PBKDF2WithHmacSHA256` specifically is present or absent (see
-  above) — this determines whether the fix is "register the missing
-  SHA-384/512 algorithm variants too" (broad) or "the SHA-256 variant SCRAM
-  actually needs is also missing" (the real blocker, narrower headline but
-  same class of gap).
-- Where CratonVM's `SecretKeyFactory`/PBKDF2 provider is implemented
-  (`native-builtins/src/jca/` is the likely location based on this
-  session's file layout for other crypto natives, not yet confirmed) and
-  what algorithm set it currently registers.
+- **Was `PBKDF2WithHmacSHA256` also missing?** No. Measured 2026-08-12: all
+  five of `PBKDF2WithHmacSHA1/224/256/384/512` resolve and derive the RFC 7677
+  vector correctly (`pencil`, salt `W22ZaJ0SNY7soEsUEjb6gQ==`, i=4096). Only
+  the 384/512 registrations had been absent — but because
+  `ScramMechanism.<clinit>` fails hard on the FIRST unsupported probe rather
+  than per-algorithm, two missing names blocked every mechanism, SHA-256
+  included. That is the shape worth remembering: the algorithm named in the
+  exception is the one that was probed first, not necessarily the one the
+  caller needs.
+- **Where is the provider implemented?** `phases_early::pbkdf2_get_instance` /
+  `pbkdf2_generate_secret`, with the PRF table in
+  `phases_early::pbkdf2_prf_code`. The guess of `native-builtins/src/jca/` was
+  half right: `jca::cipher` carries the *registration* that is live in
+  real-JDK mode, while the phase-53 copy beside the implementation is reachable
+  only from `register_synthetic_overrides` and so is `#[cfg(feature =
+  "synthetic-jdk")]`. Registering a `SecretKeyFactory` method in the phase-53
+  block ALONE leaves it inert on a default run — that is how
+  `getProvider()` stayed broken through a first attempt at fixing it.
+
+## Related
+
+- `vertx-pg-sasl-scram-handshake-fails-20260812-FIXED.md` — the second half of
+  this defect, and the reason SCRAM stayed broken after the SHA-384/512
+  registrations landed.
