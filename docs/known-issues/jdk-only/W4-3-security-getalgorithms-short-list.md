@@ -1,12 +1,43 @@
 # `Security.getAlgorithms(type)` answered the EMPTY set for every engine type
 
-**Status:** headline defect FIXED in source 2026-08-07 (lane W4-3, JDK-only
-wave 4). Not yet verified against a binary — see *How to verify* below.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-**Residual pass 2026-08-11 (JCA residuals lane).** Both kept residuals
-re-verified as live; one `Mac` defect of the opposite polarity found and fixed
-in source; six out-of-file patches recorded and NOT applied. See the section
-at the foot of this record, which is the current one. Nothing was built or run.
+* **Headline: CLOSED, and now verified.** `Security.getAlgorithms(type)`
+  answering the empty set was fixed in source 2026-08-07. The verification this
+  record said it was missing was taken 2026-08-12 against the dev binary at
+  `ba65f1a19`: `RJdkSecurity` runs to `PASS RJdkSecurity (61 checks)` in **both**
+  `--jdk-only` and `--real-jdk`.
+* **Residual: STILL OPEN — five of the six out-of-file patches.** Re-grepped
+  2026-08-12; each is genuinely unapplied:
+  * **A** (unmodifiable set) — `security_get_algorithms` still returns the bare
+    `HashSet` (`native-builtins/src/jca/provider_chain.rs:2830-2832`); so does
+    `provider_get_services_native` (`:2229`). The *Known divergence* doc comment
+    Patch A says to delete is still at `provider_chain.rs:2757-2762`.
+  * **B** (`MD2` advertised and refused) — still seeded at
+    `provider_chain.rs:1088`; `jca/message_digest.rs:501-518` has no MD2 arm and
+    nothing in the tree implements RFC 1319.
+  * **C** (SHAKE128-256 / SHAKE256-512) — zero `SHAKE` matches in
+    `jca/message_digest.rs`.
+  * **D** (the silent wrong-digest defaults) — `native-builtins/src/lib.rs:35688`
+    is still `_ => Ok(real_sha256(data)), // default to SHA-256`, and
+    `jca/message_digest.rs:535` is still `_ => 32,` (synthetic twin at
+    `lib.rs:36476`).
+  * **F** (`SUN`/`KeyFactory`/`ML-DSA`) — still seeded at
+    `provider_chain.rs:1092`; `jca/key_factory.rs:1391-1403` carries only the
+    three parameterised names and falls to `_ => -1`.
+* **Residual: CLOSED — Patch E, and its prescription was WRONG.** See the
+  warning block on Patch E below. The observation (a ChaCha20 name running
+  AES-256-ECB) was right; the prescribed fix — *delete four algorithm names* —
+  is now destructive, because all four were implemented for real on 2026-08-11
+  (`29429b755` and neighbours). Applying Patch E verbatim would regress working
+  crypto and break the ratchet at `provider_chain.rs:4043`.
+* **Also closed:** the `Mac` defect of the opposite polarity that the 2026-08-11
+  pass found is applied — commit `bb89f3d91`, `mac_normalise` /
+  `mac_algorithm_supported` / `mac_output_length` at
+  `native-builtins/src/phases_late/ssl_security.rs:527`, `:588`, `:677`.
+* **Stale in this record:** the census row *"`Cipher` / SunJCE — 12 advertised,
+  8 correct"* was superseded by the same 2026-08-11 crypto work and by the
+  ratchet test; do not quote it as a current measurement.
 
 ## The failure
 
@@ -643,6 +674,23 @@ the missing algorithm rather than 32. **Mode: synthetic-jdk in practice, all
 modes structurally.**
 
 ### Patch E — `Cipher` ChaCha20 must not be AES-ECB
+
+> **DEAD — DO NOT APPLY. Reconciled 2026-08-12.** The *observation* was right and
+> was taken seriously; the *prescription* is now destructive. This patch says to
+> delete four algorithm names. All four have since been implemented for real, so
+> applying it verbatim would remove working, tested crypto and break the ratchet
+> test at `native-builtins/src/jca/provider_chain.rs:4043`, which asserts every
+> advertised SunJCE `Cipher` transformation resolves through `getInstance`.
+> Commit `29429b755` *fix(jca): Cipher ChaCha20 was AES-256-ECB; implement RFC
+> 8439 for real* added `native-builtins/src/chacha20.rs` and real
+> `CipherFamily::ChaCha20` / `ChaCha20Poly1305` variants
+> (`jca/cipher.rs:1005-1015`, names mapped at `:1231-1232`, routed away from
+> `Aes::key_expansion` at `:2669-2690`). AES key wrap likewise: RFC 5649 at
+> `jca/cipher.rs:1964`, `AES_KWP_AIV` at `:1984`, flavour table `:2123-2124`;
+> `cipher.rs:4561`/`:4584` assert `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding`
+> are serviceable. The full write-up is W7-15-cipher-silently-wrong-algorithm.md.
+> Kept below unedited because the reasoning is the reference statement of *why*
+> a name-validating, mode-dispatching engine is a wrong-algorithm bug.
 
 File: `native-builtins/src/jca/cipher.rs`, `cipher_algorithm_known`.
 

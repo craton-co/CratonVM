@@ -1,12 +1,40 @@
 # `SecureRandom.getProvider()` was null, and `getInstance` fabricated a PRNG for any string
 
-**Status:** headline defect FIXED in source 2026-08-06 (lane L8, JDK-only
-wave 2). Not yet verified against a binary — see *How to verify* below.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-**Residual pass 2026-08-11 (JCA residuals lane).** The kept residual is live,
-but the reason given for keeping it is wrong in a way that matters, and a
-second shadowed registration beside it is worse than the one that was named.
-See the section at the foot of this record. Nothing was built or run.
+* **Headline: CLOSED, and now verified.** `getProvider()` answering null, and
+  `getInstance` fabricating a PRNG for any string, were fixed in source
+  2026-08-06 by commit `8429fcbbc` —
+  `native-builtins/src/securerandom.rs:610` (`secure_random_record_algorithm`
+  now attaches the provider), `:629` `secure_random_static_provider`, `:668`
+  `secure_random_algorithm_supported`, `:693` `secure_random_attach_provider`,
+  `:1399` (`make_secure_random` returns the attached receiver), `:1427` (unknown
+  names refused). The verification this record said it was missing was taken on
+  2026-08-12 against the dev binary at `ba65f1a19`: `RJdkSecurity` runs to
+  `PASS RJdkSecurity (61 checks)` in **both** `--jdk-only` and `--real-jdk`.
+  That is this record's own falsifier, and it is green.
+* **Residual: STILL OPEN.** The `## Out-of-file patch (not applied)` at the foot
+  of this record is genuinely **not** applied — re-grepped 2026-08-12. All three
+  shadowing registrations are live in `native-builtins/src/crypto_impl.rs`:
+  `setSeed(J)V` at `:1408`, `setSeed([B)V` at `:1414`, `<init>([B)V` at `:1420`,
+  with their three no-op bodies at `:1309`, `:1326`, `:1347`, and the stale
+  registration-order comment at `:1389-1395`. Its scope is unchanged and narrow:
+  the block is reachable only through `register_synthetic_overrides`
+  (`native-builtins/src/lib.rs:21151`, `#[cfg(feature = "synthetic-jdk")]`,
+  called from `lib.rs:23845`), so it is absent from a default binary and cannot
+  move either shipping mode.
+* **The residual's stated REASON was wrong, and the 2026-08-11 pass already
+  corrected it — do not re-derive it a third time.** The defect is *not* the
+  discarded constructor seed; that discard matches HotSpot and is deliberate
+  (see *Verdict 3* below). It is that the two `setSeed` no-ops undo SHA1PRNG
+  **reseeding**, which HotSpot does make reproducible and which is the one
+  replay guarantee the JDK gives a `SecureRandom`. Anyone who reads only the
+  older *Out of scope* framing will delete the wrong row.
+* **Line citations in this record have rotted by thousands of lines.** The
+  registrations are at `crypto_impl.rs:1408-1425`, not `:1336`/`:1377`;
+  `register_crypto_impl_natives` is called from `lib.rs:23845`, not `:23623`;
+  `register_synthetic_overrides` is at `lib.rs:21151`, not `:20953`. The patch
+  *text* still applies verbatim; only the anchors moved.
 
 ## The failure
 
