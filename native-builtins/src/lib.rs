@@ -22,6 +22,21 @@ fn dbg_toarray_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::nbflags().dbg_toarray)
 }
 
+/// `CRATONVM_DBG_NPE_TRACE` (`CRATONVM_DBG=npe-trace`) — the same flag
+/// `vm/src/runtime/exceptions.rs` gates its NPE-origin dumps with, read here
+/// for the `[SUREFIRE-NPE]` forensic in `native_exception_init_message`.
+///
+/// Read once: the environment is fixed for a VM process, and this sits on the
+/// constructor of ~50 exception subclasses, which framework code throws as
+/// control flow.
+#[inline]
+fn surefire_npe_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NPE_TRACE").is_some()
+    })
+}
+
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
 fn normalize_java_property_key(key: &str) -> String {
@@ -37380,20 +37395,40 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.
-    if let Value::Object(Some(msg_obj)) = msg {
-        if let Some(message) = ctx.read_string(msg_obj) {
-            let class_name = ctx
-                .class_name_of_id(ctx.class_id_of_object(this))
-                .unwrap_or_default();
-            if class_name == "java/lang/NullPointerException" && message == "Name is null" {
-                let trace = ctx.capture_stack_trace(ctx.identity_hash_code(this));
-                eprintln!("[SUREFIRE-NPE] Name is null thrown; top Java frames:");
-                for (i, f) in trace.iter().take(12).enumerate() {
-                    let src = f.source_file.as_deref().unwrap_or("Unknown Source");
-                    eprintln!(
-                        "[SUREFIRE-NPE]   #{i} {}.{} ({}:{})",
-                        f.class_name, f.method_name, src, f.line_number
-                    );
+    //
+    // OPT-IN since W7-42. This was unconditional, and it fires for ANY
+    // `NullPointerException("Name is null")` — including
+    // `java.lang.Enum.valueOf(null)`, which ordinary application code and
+    // every differential probe reach on purpose. Seven diagnostic frames then
+    // land in the middle of a transcript that is supposed to carry
+    // observables and nothing else; the shadow differential read them as
+    // seven divergences, and worse, they shifted the alignment of every row
+    // after them. They were always on stderr — the emitter is `eprintln!` and
+    // that was measured on the binary, so a transcript that carried them was
+    // captured with the streams merged — but a forensic for a closed
+    // investigation should not be running at all on a normal run.
+    //
+    // `CRATONVM_DBG_NPE_TRACE` (equivalently `CRATONVM_DBG=npe-trace`) is the
+    // flag `vm/src/runtime/exceptions.rs` already gates the sibling NPE-origin
+    // dumps with, and it is already carried by `types/src/flag_groups.rs`,
+    // `types/tests/flag-surface.txt`, `docs/flag-tokens.md` and
+    // `docs/config/flag-inventory.md`. No new flag.
+    if surefire_npe_trace_enabled() {
+        if let Value::Object(Some(msg_obj)) = msg {
+            if let Some(message) = ctx.read_string(msg_obj) {
+                let class_name = ctx
+                    .class_name_of_id(ctx.class_id_of_object(this))
+                    .unwrap_or_default();
+                if class_name == "java/lang/NullPointerException" && message == "Name is null" {
+                    let trace = ctx.capture_stack_trace(ctx.identity_hash_code(this));
+                    eprintln!("[SUREFIRE-NPE] Name is null thrown; top Java frames:");
+                    for (i, f) in trace.iter().take(12).enumerate() {
+                        let src = f.source_file.as_deref().unwrap_or("Unknown Source");
+                        eprintln!(
+                            "[SUREFIRE-NPE]   #{i} {}.{} ({}:{})",
+                            f.class_name, f.method_name, src, f.line_number
+                        );
+                    }
                 }
             }
         }
