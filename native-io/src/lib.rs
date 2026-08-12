@@ -3381,11 +3381,28 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    if len == 0 {
-        return Ok(Some(Value::Int(0)));
-    }
+    // ORDER MATTERS. `ByteArrayInputStream.read(byte[],int,int)` tests EOF
+    // FIRST and the zero-length request SECOND:
+    //
+    //     if (pos >= count) return -1;
+    //     int avail = count - pos; if (len > avail) len = avail;
+    //     if (len <= 0) return 0;
+    //
+    // so a `read(b, off, 0)` on an ALREADY-EXHAUSTED stream answers -1, not
+    // 0. The reversed order answered 0, which is what broke netty's
+    // `AbstractByteBufTest.testStreamTransfer1`: after draining the stream it
+    // asserts `assertEquals(-1, buffer.setBytes(i, in, 0))`, and that test
+    // failed on all 10 concrete ByteBuf test classes.
+    //
+    // The ordering is BAIS-specific. `InputStream.read(byte[],int,int)`'s
+    // default implementation genuinely returns 0 for `len == 0` before it
+    // ever calls `read()` -- that is the `!has_bais_layout` branch above.
+    // Do not "unify" the two.
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
+    }
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
     }
     let avail = (count - pos) as usize;
     let to_read = len.min(avail);
@@ -23345,6 +23362,12 @@ mod bais_layout_tests {
         .expect("read ok");
         assert_eq!(n, Some(Value::Int(-1)));
 
+        // EOF wins over the zero-length short-circuit, exactly as the JDK
+        // orders the two checks. Witnessed on stock HotSpot JDK 25:
+        //   new ByteArrayInputStream(new byte[4], 0, -1) => count = -1
+        //   read(dst, 0, 8) == -1   read(dst, 0, 0) == -1   available() == -1
+        // This assertion used to read `Int(0)`, which froze the divergence
+        // netty's AbstractByteBufTest.testStreamTransfer1 tripped over.
         let zero_length = native_bais_read_bytes(
             &mut ctx,
             &[
@@ -23355,7 +23378,7 @@ mod bais_layout_tests {
             ],
         )
         .expect("zero-length read ok");
-        assert_eq!(zero_length, Some(Value::Int(0)));
+        assert_eq!(zero_length, Some(Value::Int(-1)));
     }
 
     fn make_hibernate_lob_stream(ctx: &mut MockNativeContext, count: i64) -> ObjectRef {
@@ -24035,6 +24058,77 @@ mod buffer_bounds_tests {
         native_bais_init(ctx, &[Value::Object(Some(this)), Value::Object(Some(buf))])
             .expect("init ok");
         this
+    }
+
+    /// JDK order: EOF is reported before the zero-length short-circuit, so
+    /// `read(b, off, 0)` on a drained stream is -1. Regression guard for the
+    /// netty `testStreamTransfer1` failure.
+    #[test]
+    fn bais_read_zero_len_at_eof_is_minus_one() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let drain = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(5),
+            ],
+        )
+        .expect("drain ok");
+        assert_eq!(drain, Some(Value::Int(5)));
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(-1)), "len=0 at EOF must report -1");
+    }
+
+    /// An EMPTY source is at EOF from the first call, so even the very first
+    /// zero-length read reports -1.
+    #[test]
+    fn bais_read_zero_len_empty_source_is_minus_one() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(-1)));
+    }
+
+    /// ... but a zero-length read with bytes still available is 0, not -1.
+    #[test]
+    fn bais_read_zero_len_before_eof_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(0)));
     }
 
     #[test]

@@ -7645,7 +7645,7 @@ pub(crate) fn register_exchanger_natives(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let unit_ordinal = match args.get(3) {
-                Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                Some(Value::Object(Some(u))) => crate::time_unit_ordinal(ctx, *u),
                 _ => 2,
             };
             let timeout_ms = crate::convert_time_unit_to_millis(timeout_val, unit_ordinal);
