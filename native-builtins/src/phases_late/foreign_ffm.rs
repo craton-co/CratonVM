@@ -930,7 +930,8 @@ fn p67_session_check_valid(
     if !p67_session_modelled(ctx, session) {
         return Ok(());
     }
-    let owner = match ctx.get_field(session, p67_session_slots(ctx, session).owner) {
+    let slots = p67_session_slots(ctx, session);
+    let owner = match ctx.get_field(session, slots.owner) {
         Value::Object(Some(owner)) => Some(owner),
         _ => None,
     };
