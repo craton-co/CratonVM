@@ -1358,6 +1358,27 @@ pub(crate) fn repair_ec_key_for_ring<'a>(
     }
 }
 
+/// Build a `CertifiedKey` from raw DER, repairing a JDK-shaped EC key first.
+///
+/// The mTLS `KeyManager` resolver is the one identity path that never sees PEM:
+/// its material arrives as DER from `km_alias_material`. That is why it was the
+/// call site the EC repair originally missed — it does not share a line with the
+/// six `parse_private_key_pem` builders. It exists as a named function, rather
+/// than three lines inlined into `resolve_via_java`, so a test can exercise the
+/// path the resolver actually takes: delete the repair here and
+/// `a_key_manager_supplied_jdk_ec_identity_is_repaired_too` goes red.
+pub(crate) fn certified_key_from_der_repairing_ec(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key_der: Vec<u8>,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<CertifiedKey, rustls::Error> {
+    let key = repair_ec_key_for_ring(
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+        &cert_chain,
+    );
+    CertifiedKey::from_der(cert_chain, key, provider)
+}
+
 /// Parse a PEM-encoded PKCS#8 private key. Returns an error if no key block
 /// is present. Accepts both `PRIVATE KEY` (PKCS#8) and `RSA PRIVATE KEY`
 /// (PKCS#1) / `EC PRIVATE KEY` (SEC1) forms.
@@ -2843,8 +2864,12 @@ impl JavaKeyManagerResolver {
                 if cert_chain.is_empty() {
                     continue;
                 }
-                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-                match CertifiedKey::from_der(cert_chain, key, &self.provider) {
+                // Repairs the JDK-shaped EC key on the way — without it a
+                // JDK-generated EC *client* identity resolves to `Err` here,
+                // the client sends an empty Certificate, and the far end
+                // answers `CertificateRequired`, a failure that names neither
+                // the key nor this decision.
+                match certified_key_from_der_repairing_ec(cert_chain, key_der, &self.provider) {
                     Ok(ck) => return Some(Arc::new(ck)),
                     Err(e) => {
                         if dbg {
@@ -6383,6 +6408,42 @@ mod ec_pkcs8_v1_identity_tests {
     #[test]
     fn jdk_shaped_p384_identity_is_repaired_from_its_certificate() {
         round_trip(P384_KEY, P384_CRT, "P-384");
+    }
+
+    /// The mTLS `KeyManager` resolver is the one identity path that never
+    /// parses PEM: `JavaKeyManagerResolver::resolve_via_java` takes DER
+    /// straight from `km_alias_material` and hands it to
+    /// `CertifiedKey::from_der`. It was missed when the repair first landed, so
+    /// a JDK-generated EC *client* certificate delivered through a Java
+    /// `KeyManager` still resolved to nothing.
+    ///
+    /// Pinned through `CertifiedKey::from_der` rather than
+    /// `any_supported_type`, because that is the call the resolver makes — a
+    /// test against the lower-level entry point would not have caught the
+    /// missing call site either.
+    #[test]
+    fn a_key_manager_supplied_jdk_ec_identity_is_repaired_too() {
+        let cert = CertificateDer::from(unhex(P256_CRT));
+        let jdk = strip_to_jdk_shape(&unhex(P256_KEY));
+        let provider = rustls::crypto::ring::default_provider();
+
+        // Control: the shape `resolve_via_java` used to build is genuinely
+        // rejected, so the positive half below cannot pass vacuously.
+        assert!(
+            CertifiedKey::from_der(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(jdk.clone())),
+                &provider,
+            )
+            .is_err(),
+            "control — CertifiedKey::from_der must reject the stripped JDK shape"
+        );
+
+        // The function `resolve_via_java` calls, not a re-creation of it.
+        assert!(
+            certified_key_from_der_repairing_ec(vec![cert], jdk, &provider).is_ok(),
+            "the KeyManager identity path must repair the JDK EC key it is handed"
+        );
     }
 
     #[test]

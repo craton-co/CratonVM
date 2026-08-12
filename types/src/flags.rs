@@ -2014,8 +2014,29 @@ impl VmFlags {
     /// instead of mutating `environ` after argument parsing: once any
     /// CratonVM flag is read, the process configuration is immutable.
     pub fn from_env_with_overrides(overrides: MapSource) -> Self {
+        Self::from_env_with_overrides_and_unsets(overrides, &[])
+    }
+
+    /// [`from_env_with_overrides`](Self::from_env_with_overrides), plus names to
+    /// resolve as if they had **never been exported**.
+    ///
+    /// An overlay can only add or replace, and the majority parser
+    /// ([`parse::present`]) reads *any* value — including `0` and the empty
+    /// string — as **on**. So a launcher translating an explicit off-switch
+    /// (`java -da` against an inherited `CRATONVM_ENABLE_ASSERTIONS`) cannot say
+    /// what it means with an override alone; `.with(name, "0")` would turn the
+    /// flag *on*. The unset list is applied after the overrides, so a name in
+    /// both ends up absent.
+    ///
+    /// Same shape as [`from_env_with_edits`](Self::from_env_with_edits), which
+    /// exists for tests; this one keeps the builder-style `MapSource` the
+    /// launcher already assembles.
+    pub fn from_env_with_overrides_and_unsets(overrides: MapSource, unset: &[&str]) -> Self {
         let mut raw = MapSource::from_process_env();
         raw.0.extend(overrides.0);
+        for name in unset {
+            raw.0.remove(*name);
+        }
         Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 

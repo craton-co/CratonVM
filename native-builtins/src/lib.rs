@@ -16993,6 +16993,39 @@ pub fn register_essential_natives_with_shims(
     // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register_with_kind(mhn, "registerNatives", "()V", native_noop, NativeKind::Bridge);
 
+    // `MethodHandleNatives.<clinit>` ends with `assert(verifyConstants())`, and
+    // `verifyConstants` is the sole caller of `getNamedCon`. With assertions
+    // off that whole path is dead, which is why an unimplemented native here
+    // went unnoticed for as long as `-ea` was being discarded by the launcher.
+    // The moment the flag started reaching the switch, every `-ea` run died
+    // during `java.lang.invoke` boot:
+    //
+    //     UnsatisfiedLinkError: MethodHandleNatives.getNamedCon(I[Ljava/lang/Object;)I
+    //         at MethodHandleNatives.verifyConstants(MethodHandleNatives.java:197)
+    //         at MethodHandleNatives.<clinit>(MethodHandleNatives.java:221)
+    //
+    // The JDK-side protocol (see the loop in `verifyConstants`) is: return the
+    // `which`th constant the VM names and store its name into `name[0]`; a null
+    // `name[0]` means "no such constant" and terminates the scan. The check
+    // exists so HotSpot's internal `MN_*` / `REF_*` table can be diffed against
+    // `MethodHandleNatives.Constants`. CratonVM keeps no counterpart of that
+    // table — `MemberName` flags are computed where they are used, not held in
+    // a VM-side constant list — so there is nothing here to cross-check and the
+    // truthful answer is "I name none": leave `name[0]` untouched and return 0,
+    // and the loop exits on its first iteration with `verifyConstants` true.
+    //
+    // Deliberately NOT fabricating values. Echoing the JDK's own numbers back
+    // would make the assertion certify an agreement that was never checked,
+    // which is worse than declining it. If CratonVM ever grows a real constant
+    // table, exporting it here turns this into a genuine boot-time drift check.
+    registry.register_with_kind(
+        mhn,
+        "getNamedCon",
+        "(I[Ljava/lang/Object;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+        NativeKind::Bridge,
+    );
+
     // C33: InvokerBytecodeGenerator bypass — register the three entry points
     // that drive JEP 466 code-gen as natives that return a minimal resolved
     // MemberName. Prevents `java.lang.classfile.constantpool.ConstantPoolException:
