@@ -1379,11 +1379,18 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 -1
             };
 
-            // Return a completed FutureTask with the bytes-read count
-            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)?;
-            ctx.set_field(future, 0, Value::Int(bytes_read));
-            ctx.set_field(future, 1, Value::Int(1)); // done = true
-            Ok(Some(Value::Object(Some(future))))
+            // A completed real Future carrying the byte count. This used to be
+            // a two-slot `java/util/concurrent/FutureTask` written by field
+            // index -- on the real `java.base` class that puts the count in
+            // `state:int`, and `FutureTask`'s constant block reads 2..=6 as
+            // NORMAL/EXCEPTIONAL/CANCELLED/INTERRUPTING/INTERRUPTED, so a
+            // 3-byte read would have reported itself as completed
+            // EXCEPTIONALLY. This registration is overwritten by `native-io`'s
+            // `native_afc_read` in every arm, so that never fired -- it was one
+            // registration-order change away from firing, which is why it is
+            // corrected rather than left. See `aio_completed_future`.
+            let boxed = aio_box_int(ctx, bytes_read);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(
@@ -1461,10 +1468,10 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                 0i32
             };
 
-            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)?;
-            ctx.set_field(future, 0, Value::Int(bytes_written));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
+            // Same correction as the sibling `read` above: a completed real
+            // Future, not a field-index-written `java.util.concurrent.FutureTask`.
+            let boxed = aio_box_int(ctx, bytes_written);
+            aio_completed_future(ctx, boxed)
         },
     );
     r.register(afc, "size", "()J", |ctx, args| {
@@ -1484,36 +1491,65 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(J)Ljava/nio/channels/AsynchronousFileChannel;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    // force(boolean metaData)V -- the ONLY registrant of this triple in the
+    // tree, live in both shipping modes. `native-io` does not declare it, so
+    // nothing overwrites this body the way it overwrites the ten AFC triples
+    // around it.
+    //
+    // WHAT THIS USED TO DO: nothing at all, on every channel this VM produces.
+    // It read slot 0 as a path `String` under THIS file's stale
+    // `path_str=0, open=1` belief. Every `AsynchronousFileChannel` in the VM is
+    // allocated by `native-io`'s `alloc_afc_channel`, whose layout is
+    // `AFC_FIELD_FD = 0` (an `Int`), `AFC_FIELD_PATH = 1`, `AFC_FIELD_OPEN = 2`
+    // -- so the `match` took its `_ =>` arm and returned `Ok(None)` BEFORE it
+    // ever looked at its `metaData` argument. `force(true)`, a durability
+    // barrier (H2's `FileAsync` is a caller -- see the sibling `write` body's
+    // comment), returned normally having flushed nothing. Nothing errored; the
+    // corruption only appears after a crash.
+    //
+    // Three further defects were stacked behind the slot error and are fixed
+    // with it: the sync_all/sync_data polarity was inverted relative to
+    // `AsynchronousFileChannel.force(boolean metaData)` ("true ... content AND
+    // metadata"), the fsync was issued on a SECOND descriptor opened by path
+    // (which carries none of this channel's buffered writes, and whose
+    // `.write(true)` open fails outright on a read-only channel), and there was
+    // no closed-channel refusal where the javadoc says
+    // `@throws ClosedChannelException`.
+    //
+    // The layout constants are spelled literally here because they belong to
+    // the other crate; `cratonvm_native_io::afc_sync_at` is the half that has
+    // to know the handle table. The rule this body got wrong is that the
+    // registration which decides the layout is the one that ALLOCATES.
     r.register(afc, "force", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let metadata_only = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        // Get the file path from field 0
-        let path = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        // slot 2 = AFC_FIELD_OPEN
+        if !matches!(ctx.get_field(this, 2), Value::Int(1)) {
+            return Err(cratonvm_native_io::afc_closed_channel_error(ctx));
+        }
+        // `metaData == true` is "content AND metadata" -> sync_all.
+        let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        // slot 0 = AFC_FIELD_FD, this channel's own handle id
+        let handle_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v > 0 => v as u32,
             _ => return Ok(None),
         };
-        if !path.is_empty() {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                if metadata_only {
-                    let _ = file.sync_data();
-                } else {
-                    let _ = file.sync_all();
-                }
+        cratonvm_native_io::afc_sync_at(handle_id, metadata).map_err(|e| {
+            RuntimeError::IOException {
+                message: format!("AsynchronousFileChannel.force: {e}"),
             }
-        }
+        })?;
         Ok(None)
     });
-    r.register(
-        afc,
-        "lock",
-        "()Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)?;
-            ctx.set_field(future, 0, Value::Object(None));
-            ctx.set_field(future, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(future))))
-        },
-    );
+    // `lock()Ljava/util/concurrent/Future;` was registered here and is now
+    // registered by `native-io`'s `register_async_file_channel`
+    // (`native_afc_lock`), beside the `tryLock(JJZ)` whose real
+    // `sun/nio/ch/FileLockImpl` plumbing it reuses. The body deleted here minted
+    // `try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)`
+    // and wrote two slots by index -- `FutureTask` is a real `java.base` class
+    // whose slot 0 is `state:int` and slot 1 is `callable`, so the future came
+    // out at state NEW and its real `get()` parked forever. Deleted rather than
+    // corrected in place, because the correction needs the channel's handle
+    // table, which lives in the crate that allocates the channel.
     r.register(afc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 1, Value::Int(0));
@@ -1808,17 +1844,28 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/AsynchronousServerSocketChannel;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
-    r.register(
-        assc,
-        "accept",
-        "()Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)?;
-            ctx.set_field(future, 0, Value::Object(None));
-            ctx.set_field(future, 1, Value::Int(0)); // pending
-            Ok(Some(Value::Object(Some(future))))
-        },
-    );
+    // `accept()Ljava/util/concurrent/Future;` was registered here and is
+    // DELETED, not corrected. It was the sole registrant -- `native-io`'s
+    // `async_socket.rs` registers only the
+    // `accept(Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V` form --
+    // and the body accepted NOTHING: it minted a two-slot
+    // `java/util/concurrent/FutureTask` and set slot 0 (`state:int` on the real
+    // `java.base` class) to `Object(None)`, i.e. `Int(0)` = NEW, and slot 1
+    // (`callable`) to `Int(0)`. Real `FutureTask.get()` then parks forever and
+    // `isDone()` is permanently false, so every caller either hangs or reads a
+    // future that never becomes ready.
+    //
+    // Neither remedy available inside this file is a fix. Completing it with
+    // `aio_completed_future(ctx, Value::Object(None))` hands back a
+    // `Future<AsynchronousSocketChannel>` that completes with `null`, which the
+    // caller dereferences -- a quiet failure traded for a loud one. Doing the
+    // accept for real needs the listener that `aio_assc_open`/`aio_assc_bind`
+    // registered in `native-io/src/async_socket.rs`, in that crate's own slot
+    // map, which is where the working `accept(Object,CompletionHandler)` half
+    // already lives. So the registration is removed and the real JDK's abstract
+    // `accept()` becomes an `AbstractMethodError` at the call site: a loud
+    // failure naming the missing method, instead of a thread that never wakes.
+    // The real implementation belongs beside its CompletionHandler twin.
     r.register(assc, "close", "()V", |ctx, args| {
         // AsynchronousServerSocketChannel = 1-field (open=0). Mark as closed.
         let this = obj_arg(args, 0)?;

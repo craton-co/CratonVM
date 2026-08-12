@@ -872,3 +872,93 @@ HotSpot oracle, the two CratonVM baselines, the strict census and the
 names are gone, that the deletion is behaviourally inert, and where the real
 defect lives. They do not establish that the edited source compiles, that the
 added synthetic triples behave, or that the out-of-file patch works.
+
+---
+
+## B and C adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+This record says, five times, that B and C "can still only move `--synthetic-jdk`
+mode, which has never been executed", and that it is "the record in the directory
+most dependent on a run". The run was done: `--features synthetic-jdk` binary
+built from clean HEAD, `probes/StructuredTaskScopeProbe` compiled
+`--release 25 --enable-preview`, launched
+`cratonvm --synthetic-jdk --enable-preview -cp … StructuredTaskScopeProbe`.
+
+**Verdict: B and C are UNREACHABLE even in `--synthetic-jdk`. Not "wrong" — not
+runnable.** Every probe row is a setup failure, and they are all the same two:
+
+```
+--synthetic-jdk:
+  openDefault.threw            = java.lang.NullPointerException: Cannot invoke
+      "java.lang.reflect.Method.invoke(Object, Object[])" because
+      "StructuredTaskScopeProbe.M_OPEN0" is null
+  joinWaits.threw              = (same)
+  forkRunnable.threw           = (same)
+  ownerThread.threw            = (same)
+  subtaskCarrier.threw         = (same)
+  state.*.setup                = (same, ×5)
+  joinerAwaitAll.threw         = java.lang.NoSuchMethodException: awaitAll
+  awaitAllSuccessful.happyPath.threw = java.lang.NoSuchMethodException: awaitAllSuccessfulOrThrow
+  awaitAllSuccessful.failPath.threw  = java.lang.NoSuchMethodException: awaitAllSuccessfulOrThrow
+  allSuccessful.threw          = java.lang.NoSuchMethodException: allSuccessfulOrThrow
+  anySuccessful.threw          = java.lang.NoSuchMethodException: anySuccessfulResultOrThrow
+  anySuccessful.allFail.threw  = java.lang.NoSuchMethodException: anySuccessfulResultOrThrow
+  allUntil.threw               = java.lang.NoSuchMethodException: allUntil
+  configuration.threw          = java.lang.NoSuchMethodException: awaitAll
+  timeout.threw                = java.lang.NoSuchMethodException: awaitAll
+```
+
+`M_OPEN0` is `StructuredTaskScope.class.getMethod("open")`
+(`StructuredTaskScopeProbe.java:253`). It resolves to null, so **no scope object
+can be constructed at all**, so:
+
+* **C is moot in practice.** C is about widening the fabricated
+  `StructuredTaskScope` from `instance_fields(8)` to 9 so two `Joiner`s can be
+  served. No instance is ever allocated, so no slot is ever read or written. C's
+  DECLINED verdict stands, and can now be stated more strongly: it is declined
+  *and* unobservable.
+* **B's kept JDK-21-shaped registrations in `jdk25_concurrency.rs` are
+  unreachable from bytecode in all three configurations.** The record's reason
+  for keeping them — "~20 `#[test]`s in a blocking gate pin them and the only
+  mode they can be observed in has never been run" — now reads differently: that
+  mode has been run, and it does not reach them either. The tests pin code no
+  Java caller can enter. That is not an argument to delete them blind, but it
+  removes the "it might be load-bearing in synthetic mode" half of the argument
+  for keeping them.
+
+HotSpot 25 (`--enable-preview`) is the negative control and answers all 26 rows,
+e.g. `state.joinTwice=java.lang.IllegalStateException:Already joined or scope is
+closed`, `subtask.state.declaringClass=java.util.concurrent.StructuredTaskScope$Subtask$State`,
+`ownerThread.forkFromOther=java.lang.WrongThreadException:Current thread not owner`.
+
+### One thing the run found that this record predicted structurally and never measured
+
+`Class.forName` **succeeds for every name the probe asks for** in
+`--synthetic-jdk`, including names JDK 25 does not ship:
+
+```
+--synthetic-jdk:                                    HotSpot 25:
+  forName.jdk.incubator.concurrent.StructuredTaskScope
+      = jdk.incubator.concurrent.StructuredTaskScope     ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$Subtask
+      = …$Subtask                                        ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$ShutdownOnSuccess
+      = …$ShutdownOnSuccess                              ClassNotFoundException
+  forName.jdk.incubator.concurrent.StructuredTaskScope$ShutdownOnFailure
+      = …$ShutdownOnFailure                              ClassNotFoundException
+  forName.java.util.concurrent.StructuredTaskScope$Config
+      = …$Config                                         (a name no JDK ships)
+```
+
+C's complaint — *"`class_manager.rs` still has a `$Config` row, a name no JDK
+ships"* — is confirmed from the outside: the name resolves. And the JDK-21
+*incubator* package, deleted in JDK 25, resolves too, along with its three
+nested types. This is the `Ok≠use` shape at full strength: **every metadata query
+answers yes and every use fails.** A census or a `forName`-based feature probe
+run in this mode will report the JEP 505 surface as present and complete.
+
+**Nothing here is a work item for this record.** It is the run the record asked
+for, with the answer that the run cannot discriminate B or C. What it does
+settle is that this record should stop describing itself as blocked on a
+`--synthetic-jdk` run — it is blocked on `StructuredTaskScope.open()` being
+registered, which is a prior and much larger question.

@@ -18157,6 +18157,65 @@ fn afc_unsupported_option(message: impl Into<String>) -> MethodCallFailed {
     .into()
 }
 
+/// The refusal every `AsynchronousFileChannel` operation owes a CLOSED channel.
+///
+/// `java.nio.channels.ClosedChannelException`, not a bare `java.io.IOException`.
+/// The JDK reaches it through `AsynchronousFileChannelImpl.begin()`
+/// (`sun/nio/ch/AsynchronousFileChannelImpl.java`: `if (closed) throw new
+/// ClosedChannelException();`), which `size()`, `truncate()` and `force()` all
+/// run first, and the javadoc of each says `@throws ClosedChannelException`.
+/// A bare `IOException` reports the failure with a type
+/// `catch (ClosedChannelException)` does not match — the failure IS visible, it
+/// is just wearing the supertype, which is why no fixture ever caught it.
+///
+/// `ClosedChannelException extends IOException`, so tightening this can never
+/// break a handler that already compiled.
+///
+/// `pub` because `native-builtins`' `force(Z)V` registration — the sole
+/// registrant of that triple, in the other crate — needs the same refusal.
+pub fn afc_closed_channel_error(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/channels/ClosedChannelException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/channels/ClosedChannelException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        // Only reached when the class cannot be built at all (a mock context,
+        // or a JDK image without it). Falling back to the supertype keeps the
+        // failure loud rather than turning it into a success.
+        _ => RuntimeError::IOException {
+            message: "AsynchronousFileChannel is closed".into(),
+        }
+        .into(),
+    }
+}
+
+/// `java.nio.channels.NonWritableChannelException` for an operation that needs
+/// write access on a channel that was not opened for writing. Same construction
+/// as `afc_closed_channel_error`; extracted so the `truncate` and `lock` paths
+/// cannot drift apart in what they raise.
+fn afc_non_writable_error(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/channels/NonWritableChannelException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/channels/NonWritableChannelException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: "channel was not opened for writing".into(),
+        }
+        .into(),
+    }
+}
+
 fn afc_position_arg(args: &[Value], index: usize) -> Result<u64, MethodCallFailed> {
     match args.get(index) {
         Some(Value::Long(n)) if *n < 0 => Err(RuntimeError::IllegalArgumentException {
@@ -18376,6 +18435,44 @@ fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
         handle.file.set_len(new_len)?;
     }
     Ok(())
+}
+
+/// `AsynchronousFileChannel.force(boolean metaData)`: fsync **this channel's
+/// own handle**, out of `afc_files()`, exactly the way `afc_truncate_at` finds
+/// the handle for `truncate`.
+///
+/// Why the handle and not the path. The only caller of this before 2026-08-12
+/// (`native-builtins/src/phases_late/net_channels.rs`, the sole registrant of
+/// `force(Z)V`) opened the path a SECOND time with `OpenOptions::new().write(true)`
+/// and fsynced that descriptor. A second descriptor carries none of this
+/// channel's buffered writes, so the barrier flushed nothing that the caller
+/// had written — and on a channel opened READ-only the second open fails
+/// outright, so the barrier silently did not happen at all. A durability
+/// barrier that does nothing and reports nothing is the worst shape available:
+/// the corruption only shows up after a crash.
+///
+/// Polarity, from `AsynchronousFileChannel.force(boolean metaData)`'s javadoc:
+/// `true` means force **content AND metadata**, i.e. `sync_all`; `false` means
+/// content only, i.e. `sync_data`. The previous caller had this backwards.
+///
+/// A non-writable channel is a deliberate `Ok(())`. It has no content changes
+/// of its own to force, and this matches the JDK's observable behaviour on both
+/// platforms this VM ships on: on Windows `FileDispatcherImpl.force0` swallows
+/// `ERROR_ACCESS_DENIED` from `FlushFileBuffers` (which is what a read-only
+/// handle produces) rather than throwing, and on Linux `fsync` on an `O_RDONLY`
+/// descriptor succeeds as a no-op. Returning an `Err` here would invent an
+/// `IOException` that neither platform's JDK raises.
+pub fn afc_sync_at(id: u32, metadata: bool) -> io::Result<()> {
+    let entry = afc_file_entry(id)?;
+    let handle = entry.lock();
+    if !handle.writable {
+        return Ok(());
+    }
+    if metadata {
+        handle.file.sync_all()
+    } else {
+        handle.file.sync_data()
+    }
 }
 
 /// WatchService layout: 3 fields
@@ -18890,6 +18987,29 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         "(JJZ)Ljava/nio/channels/FileLock;",
         native_afc_try_lock,
     );
+    // lock() / lock(long, long, boolean) -> Future<FileLock>.
+    //
+    // Registered HERE, in the crate that ALLOCATES the channel, and the
+    // `net_channels.rs` registration of `lock()` was deleted in the same
+    // change. That body minted a real `java.util.concurrent.FutureTask` at a
+    // two-slot synthetic width and wrote `state`/`callable` by index, so its
+    // future's `get()` parked forever -- see `native_afc_lock`'s doc comment.
+    // The abstract `(JJZ)` form had no registrant anywhere, which is an
+    // AbstractMethodError for any caller that does not go through the `final`
+    // no-arg `lock()`; both forms are registered so neither shipping mode
+    // depends on which of the two the application spells.
+    r.register(
+        afc,
+        "lock",
+        "()Ljava/util/concurrent/Future;",
+        native_afc_lock,
+    );
+    r.register(
+        afc,
+        "lock",
+        "(JJZ)Ljava/util/concurrent/Future;",
+        native_afc_lock,
+    );
     // truncate(long) -> AsynchronousFileChannel. Previously unregistered
     // here, so native-builtins' no-op passthrough (`|_, args| Ok(args[0])`)
     // was the only registrant -- it never checked writability, letting
@@ -18955,11 +19075,11 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
 fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
 
+    // `@throws ClosedChannelException If this channel is closed` --
+    // AsynchronousFileChannel.tryLock(long,long,boolean). Was a bare
+    // IOException here; see `afc_closed_channel_error`.
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "AsynchronousFileChannel is closed".into(),
-        }
-        .into());
+        return Err(afc_closed_channel_error(ctx));
     }
 
     let position = afc_position_arg(args, 1)? as i64;
@@ -19002,14 +19122,129 @@ fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(lock))))
 }
 
+/// `AsynchronousFileChannel.lock()` and `lock(long, long, boolean)`.
+///
+/// **What was here before, and why it hung.** The only registrant of
+/// `lock()Ljava/util/concurrent/Future;` was
+/// `native-builtins/src/phases_late/net_channels.rs`, and its body minted
+/// `try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)`
+/// and wrote two slots by index. `java.util.concurrent.FutureTask` is a REAL
+/// `java.base` class: slot 0 is `state:int` and slot 1 is `callable`. The
+/// `Object(None)` written into the int slot coerces to `Int(0)` — which is
+/// `FutureTask.NEW` — and the `Int(1)` meant as "done" lands on `callable` and
+/// degrades to null. Real `FutureTask.get()` then sees `state <= COMPLETING`,
+/// enters the UNTIMED `awaitDone`, and parks forever; `isDone()` is false for
+/// the life of the process. The abstract `lock(JJZ)` triple was registered by
+/// nobody at all, so a caller reaching it directly got `AbstractMethodError`.
+///
+/// **Why this is not the one-line `CompletableFuture.completedFuture(null)`
+/// swap.** That swap is correct for a `Future<Integer>` carrying a byte count;
+/// for `Future<FileLock>` it hands the caller a future that completes with
+/// `null`, and the very next thing a caller does with a `FileLock` is
+/// dereference it. That trades a hang for an NPE at a site with no connection
+/// to the cause. The channel's own `tryLock(JJZ)` already builds a real
+/// `sun/nio/ch/FileLockImpl` against this same receiver, so `lock` delegates to
+/// it and wraps the RESULT — one implementation, no second lock model to drift.
+///
+/// Defaults for the no-arg form are the JDK's own: `lock()` is
+/// `lock(0L, Long.MAX_VALUE, false)` (`AsynchronousFileChannel.java`), i.e. the
+/// whole file, exclusive.
+fn native_afc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+
+    // WHICH RECEIVER IS THIS. `lock()` is `final` on the abstract class, so
+    // unlike the abstract triples registered beside it this registration is
+    // also the resolved method for a receiver this crate did NOT allocate.
+    // Today there is no route to one -- both `AsynchronousFileChannel.open`
+    // overloads and `FileSystemProvider.newAsynchronousFileChannel` are
+    // registered above and all three answer `alloc_afc_channel` -- but that is
+    // a premise about the registrations, not a property of the class, so it is
+    // checked rather than assumed. The predicate is `t16_afc_uses_real_handle`'s:
+    // our channels are >= 3 slots with an Int handle id in slot 0.
+    if ctx.object_num_fields(this) < AFC_NUM_FIELDS
+        || !matches!(ctx.get_field(this, AFC_FIELD_FD), Value::Int(_))
+    {
+        return Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel.lock: receiver was not opened by this VM's \
+                      asynchronous file channel implementation"
+                .into(),
+        }
+        .into());
+    }
+
+    // args are [this] for `lock()` and [this, position, size, shared] for
+    // `lock(long,long,boolean)`. Read the arity rather than trusting
+    // `afc_position_arg`'s "missing means 0" default for `size`, because a
+    // `size` of 0 is not the same request as Long.MAX_VALUE.
+    let (position, size, shared) = if args.len() >= 4 {
+        (
+            afc_position_arg(args, 1)? as i64,
+            match args.get(2) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
+                _ => i64::MAX,
+            },
+            args.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0,
+        )
+    } else {
+        (0i64, i64::MAX, false)
+    };
+
+    // An exclusive lock on a channel that was not opened for writing is
+    // NonWritableChannelException, thrown by the call itself and not delivered
+    // through the future -- `SimpleAsynchronousFileChannelImpl.implLock` checks
+    // `if (!shared && !writing) throw new NonWritableChannelException();` before
+    // it builds any future at all. Without this, `lock()` on a read-only
+    // channel would report an exclusive lock it does not hold.
+    if !shared {
+        let writable = match ctx.get_field(this, AFC_FIELD_FD) {
+            Value::Int(v) if v > 0 => afc_file_writable(v as u32),
+            _ => false,
+        };
+        if !writable {
+            // A closed channel must answer ClosedChannelException, not
+            // NonWritableChannelException: `native_afc_close` removes the
+            // handle from `afc_files()`, so `afc_file_writable` answers false
+            // for a closed channel too and the order of these two refusals
+            // decides which type the caller sees.
+            if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+                return Err(afc_closed_channel_error(ctx));
+            }
+            return Err(afc_non_writable_error(ctx));
+        }
+    }
+
+    let lock = native_afc_try_lock(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Long(position),
+            Value::Long(size),
+            Value::Int(if shared { 1 } else { 0 }),
+        ],
+    )?;
+
+    match lock {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(wrap_completed_future(ctx, v)?)),
+        // `native_afc_try_lock` answers Object(None) only when
+        // `sun/nio/ch/FileLockImpl` could not be constructed at all. Completing
+        // the future with that null is the quiet failure this whole function
+        // exists to avoid, so it is raised instead.
+        _ => Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel.lock: could not construct a FileLock".into(),
+        }
+        .into()),
+    }
+}
+
 fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
 
+    // `@throws ClosedChannelException If this channel is closed` --
+    // AsynchronousFileChannel.truncate(long). The JDK reaches it through
+    // AsynchronousFileChannelImpl.begin(); see `afc_closed_channel_error`.
     if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "AsynchronousFileChannel is closed".into(),
-        }
-        .into());
+        return Err(afc_closed_channel_error(ctx));
     }
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
@@ -19018,21 +19253,7 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
 
     if !afc_file_writable(handle_id) {
-        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
-            Ok(Some(Value::Object(Some(exc)))) => {
-                let _ = ctx.invoke(
-                    "java/nio/channels/NonWritableChannelException",
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(exc))],
-                );
-                Err(MethodCallFailed::ExceptionThrown(exc))
-            }
-            _ => Err(RuntimeError::IOException {
-                message: "channel was not opened for writing".into(),
-            }
-            .into()),
-        };
+        return Err(afc_non_writable_error(ctx));
     }
 
     // `AsynchronousFileChannel.truncate(long)` carries the same clause as its
@@ -19321,21 +19542,7 @@ fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value,
     // the same contract already enforced for the plain (non-async)
     // FileChannel path.
     if !afc_file_writable(handle_id) {
-        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
-            Ok(Some(Value::Object(Some(exc)))) => {
-                let _ = ctx.invoke(
-                    "java/nio/channels/NonWritableChannelException",
-                    "<init>",
-                    "()V",
-                    &[Value::Object(Some(exc))],
-                );
-                Err(MethodCallFailed::ExceptionThrown(exc))
-            }
-            _ => Err(RuntimeError::IOException {
-                message: "channel was not opened for writing".into(),
-            }
-            .into()),
-        };
+        return Err(afc_non_writable_error(ctx));
     }
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19466,6 +19673,22 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 pub(crate) fn native_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
+
+    // The refusal has to be HERE, ahead of the handle lookup, and it has to be
+    // typed. `native_afc_close` clears AFC_FIELD_OPEN but deliberately leaves
+    // AFC_FIELD_FD holding the id it just removed from `afc_files()` (that is
+    // what keeps `t16_afc_size`'s `t16_afc_uses_real_handle` routing a CLOSED
+    // channel here rather than into its path-string arm). So without this
+    // check the flow was: positive fd -> `afc_file_size` fails to look it up ->
+    // the NotFound is mapped to `IOException("size: bad asynchronous file
+    // handle N")`. The failure was reported, wearing a type
+    // `catch (ClosedChannelException)` does not match, with a message about an
+    // internal handle id. HotSpot raises ClosedChannelException from
+    // AsynchronousFileChannelImpl.begin(), which `size()` runs first.
+    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+        return Err(afc_closed_channel_error(ctx));
+    }
+
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),

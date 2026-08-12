@@ -1403,7 +1403,7 @@ pub(crate) fn native_math_max_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Float(a.max(b))))
+    Ok(Some(Value::Float(java_math_max_f32(a, b))))
 }
 
 #[inline(always)]
@@ -1419,7 +1419,86 @@ pub(crate) fn native_math_max_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Double(a.max(b))))
+    Ok(Some(Value::Double(java_math_max_f64(a, b))))
+}
+
+// --- Java min/max semantics for the floating widths ---
+//
+// Rust's `f64::min`/`f32::min` are IEEE `minNum`: they RETURN THE NON-NaN
+// OPERAND, and `<`/`==` cannot see the sign of a zero. Java specifies the
+// opposite on both counts — NaN propagates, and `-0.0` sorts strictly below
+// `+0.0`.
+//
+// Measured 2026-08-12 against HotSpot 25.0.3+9, same host, same class file:
+//
+//                             HotSpot   CratonVM (before)
+//     Math.min(1.0, NaN)      NaN       1.0
+//     Math.max(1.0, NaN)      NaN       1.0
+//     Math.min(-0.0, 0.0)     -0.0      0.0
+//     Math.min(1.0f, NaNf)    NaN       1.0
+//     StrictMath.min(1.0,NaN) NaN       1.0
+//
+// while `min(II)I` and `min(JJ)J` were correct — the pass/fail boundary is per
+// DESCRIPTOR, below the granularity any census reports.
+//
+// `register_math_natives` is called for BOTH `java/lang/Math` and
+// `java/lang/StrictMath`, so four bodies were eight wrong triples, and
+// `Float.min`/`max` inherit these with no registration of their own.
+//
+// Why nothing caught it: the enclosing registrar opens with
+// `set_category(NativeKind::Intrinsic)`, and `Intrinsic` is exempt from shadow
+// retirement AND is not the census's `native-shadows-bytecode` kind — so a
+// `--jdk-only-report` run of a program calling `Math.min` four times yields
+// ZERO `java/lang/Math` rows. The correct tree already existed in-tree as
+// `phases_late::streams::p56_java_math_min`, whose doc comment describes this
+// exact trap, with one caller: the positive half fixed, the twin left.
+
+/// `java.lang.Math.min(double,double)` — NOT Rust's `f64::min`.
+#[inline(always)]
+pub(crate) fn java_math_min_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a <= b { a } else { b }
+}
+
+/// `java.lang.Math.max(double,double)` — the mirror of [`java_math_min_f64`].
+#[inline(always)]
+pub(crate) fn java_math_max_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { b } else { a };
+    }
+    if a >= b { a } else { b }
+}
+
+/// `java.lang.Math.min(float,float)` — same contract, `f32` width.
+#[inline(always)]
+pub(crate) fn java_math_min_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a <= b { a } else { b }
+}
+
+/// `java.lang.Math.max(float,float)` — the mirror of [`java_math_min_f32`].
+#[inline(always)]
+pub(crate) fn java_math_max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { b } else { a };
+    }
+    if a >= b { a } else { b }
 }
 
 // --- min ---
@@ -1462,7 +1541,7 @@ pub(crate) fn native_math_min_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Float(a.min(b))))
+    Ok(Some(Value::Float(java_math_min_f32(a, b))))
 }
 
 #[inline(always)]
@@ -1478,7 +1557,7 @@ pub(crate) fn native_math_min_double(
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    Ok(Some(Value::Double(a.min(b))))
+    Ok(Some(Value::Double(java_math_min_f64(a, b))))
 }
 
 // ---------------------------------------------------------------------------

@@ -2698,15 +2698,22 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
         Ok(Some(Value::Double(a + b)))
     });
+    // `Double.min`/`max` have their OWN bodies here, so the `java/lang/Math`
+    // repair does not reach them — a third copy of one rule. JDK 25's
+    // `Double.min` is literally `return Math.min(a, b);`, so sharing one tree
+    // is a theorem, not a convenience. Measured wrong before this:
+    // `Double.min(1.0, NaN)` answered `1.0` and `Double.min(-0.0, 0.0)`
+    // answered `+0.0`; Java requires `NaN` and `-0.0`. See the helpers' doc in
+    // `lang_math.rs` for why Rust's `f64::min` is the wrong primitive.
     r.register("java/lang/Double", "max", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(a.max(b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_max_f64(a, b))))
     });
     r.register("java/lang/Double", "min", "(DD)D", |_ctx, args| {
         let a = args.first().and_then(|v| v.as_double()).unwrap_or(0.0);
         let b = args.get(1).and_then(|v| v.as_double()).unwrap_or(0.0);
-        Ok(Some(Value::Double(a.min(b))))
+        Ok(Some(Value::Double(crate::lang_math::java_math_min_f64(a, b))))
     });
 
     // --- Charset ---

@@ -831,3 +831,57 @@ bytecode on the image, so strict drops the shadow and the JDK's own `exec` runs
 down to the real `ProcessBuilder.start()`. **Unbuilt, unmeasured**, and its
 comment states the general rule this cluster keeps paying for: *a retag that
 pins one caller of a shared mint must enumerate the callers*.
+
+---
+
+## 9. `p60_unmeasurable_process_tree` adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+This record is SOURCE-ONLY and says so. The one row in its fabricated-answer
+table scoped "synthetic-JDK only" has now been run: a `--features synthetic-jdk`
+binary, launched with `--synthetic-jdk`.
+
+**The naming is the problem.** `p60_unmeasurable_process_tree` answers an empty
+stream, and the row above justifies it as an honest "unmeasurable". The name
+asserts that the process tree could not be determined. Measured, it is asserted
+even when the tree is trivially determinable — the probe **holds a live child**
+and asks in the same breath:
+
+```
+                                  HotSpot 25            --jdk-only            --synthetic-jdk
+R processHandle.childrenWithChild children=1            children=1            children=0
+                                  descendants=2         descendants=1         descendants=0
+                                  childAlive=true       childAlive=true       childAlive=true
+```
+
+`childAlive=true` on the same line is the discriminator: the child exists, the
+VM spawned it, `Process.isAlive()` confirms it, and `children()` says there are
+none. There is no error, no violation, no `UnsupportedOperationException` — the
+JDK contract for a platform that cannot enumerate is to throw
+`UnsupportedOperationException`, not to answer `Stream.empty()`. A caller that
+iterates (`children().forEach(kill)`) reads a clean pass and kills nothing.
+
+That belongs in the `W7-20` species (a refusal laundered into a wrong answer),
+not in this record's "correct, and load-bearing" column beside
+`p60_empty_optional`. The distinction the table draws for `p60_empty_optional` —
+*"the specified answer … the JDK's own accessors derive exactly this from an
+unwritten field"* — genuinely applies there and does **not** apply here.
+
+Two neighbouring rows are honest absences by comparison, and are recorded so
+nobody re-derives them:
+
+```
+--synthetic-jdk:
+  R processHandle.allProcesses ! java.lang.NoSuchMethodError:
+      java.lang.ProcessHandle.allProcesses()Ljava/util/stream/Stream;
+  R processHandle.ofPid.self   ! java.lang.NoSuchMethodError:
+      java.lang.ProcessHandle.of(J)Ljava/util/Optional;
+--jdk-only: allProcesses=316 / present=true
+```
+
+Green in `--synthetic-jdk` and needing no further work: `ProcessHandle.current().pid()`
+(> 0), `.info().command()` (present), `.parent()` (present),
+`ProcessBuilder.start()` itself.
+
+**Verdict: CONFIRMED LIVE, synthetic-mode only, and mis-classified in the table
+above.** See lane A31's NOMINATION A31-6. Nothing was changed in
+`native-io/src/process.rs` by that lane — it writes no Rust.
