@@ -1312,6 +1312,25 @@ jobs:
       # run.sh defaults CV to target/release/cratonvm[.exe]; this job builds
       # debug, so point CV at it explicitly rather than paying for a release
       # build.
+      # THE INSTRUMENT, BEFORE THE MEASUREMENT. run.sh reduces every vector's
+      # output to its PASS/CK lines before diffing the two VMs, and for a long
+      # time nothing checked that anything meaningful survived the filter:
+      # three scheduled vectors printed their entire evidence on other prefixes
+      # and reduced to the constant `PASS <Class>`, which always matches itself.
+      # RDataInputFastPull with a one-line defect injected exited rc=0 with
+      # output byte-identical to a clean run. See
+      # W7-60-harness-extract-blindness.md and W7-51-vacuous-sweep-round-2.md.
+      #
+      # run.sh runs the same four guards inline, so this step is not the only
+      # place they fire. It is here because it needs NO CratonVM binary: if the
+      # build above breaks, or a contributor's lane cannot build the VM at all,
+      # the harness's own soundness is still measured. It was green over all 70
+      # scheduled vectors on Temurin 25.0.3+9 when it was added, so a red here
+      # means a vector landed that the suite cannot see fail.
+      - name: Regression-suite harness self-check (HotSpot only)
+        shell: bash
+        run: bash regression-suite/harness-selfcheck.sh
+
       # STRICT_COVERAGE=1 is the second half of a gate that had only ever had
       # one. `run.sh`'s own documentation says "CI should set it"; no workflow
       # did, so a `regression-suite/src/*.java` vector that appeared in NO class

@@ -54,6 +54,13 @@ applogs/
 __pycache__/
 
 # regression-suite.sh generated artifacts (per-run, machine-specific)
+# .selfcheck is harness-selfcheck.sh's scratch tree (kept only under KEEP=1);
+# .guard-tmp holds one vector's captured oracle output while run.sh's harness
+# guards inspect it. Both are deleted on a normal exit and are listed here so an
+# interrupted run cannot leave a staged directory behind.
+regression-suite/.selfcheck/
+regression-suite/.guard-tmp/
+regression-suite/.mut/
 test-infra/_regression-cratonvm-shim.bat
 test-infra/suite-results/_cm-*.log
 /target-gpu/
