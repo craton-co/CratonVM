@@ -1070,13 +1070,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             if let Some(Value::Object(Some(loc))) = args.get(1) {
                 let loc = *loc;
-                match decode_category(ctx, args.first()) {
-                    // An undecodable category is the JDK's NullPointerException
-                    // case; degrade to the pre-W7-67 behaviour (write the base)
-                    // rather than silently dropping the call.
-                    LocaleCategory::Base => *cached_locale(LocaleCategory::Base).lock() = Some(loc),
-                    category => *cached_locale(category).lock() = Some(loc),
-                }
+                // An undecodable category is the JDK's NullPointerException
+                // case; `decode_category` degrades it to `Base`, i.e. the
+                // pre-W7-67 behaviour, rather than dropping the call.
+                let category = decode_category(ctx, args.first());
+                *cached_locale(category).lock() = Some(loc);
             }
             Ok(None)
         },

@@ -178,7 +178,9 @@ nobody has fixed yet.
 `DecimalFormatSymbols.initialize` carries a **curated language list** — `de es it nl pt da pl
 ro el tr id` get `,`/`.`, `fr` gets `,`/U+202F, everything else gets en's `.`/`,` — while the
 currency symbol is hardcoded `$`/`USD` and the date symbols are en-only. On a host in that
-list, reporting the true locale produces the chimera W7-44 warned about:
+list, reporting the true locale produces the chimera
+`W7-44-numberformat-enum-and-double-tostring.md` warned about when it declined to make
+`getNumberPatterns` locale-aware ahead of `getDecimalFormatSymbolsData`:
 
 | observable | HOTSPOT tr_TR | CVM today (en_US) | CVM `-Dtr` (post-fix on a tr host) |
 |---|---|---|---|

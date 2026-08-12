@@ -430,11 +430,8 @@ pub(crate) fn parse_locale_name(raw: &str) -> LocaleSubtags {
 /// do not otherwise touch. Note `LC_ALL` must beat `LANG`, not the other way
 /// round.
 fn derive_host_locale() -> HostLocale {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(h) = windows_host_locale() {
-            return h;
-        }
+    if let Some(host) = platform_host_locale() {
+        return host;
     }
 
     let env = |name: &str| cratonvm_types::flags::runtime_var(name).unwrap_or_default();
@@ -453,6 +450,23 @@ fn derive_host_locale() -> HostLocale {
         display: parse_locale_name(&pick(env("LC_MESSAGES"))),
         format: parse_locale_name(&pick(env("LC_CTYPE"))),
     }
+}
+
+/// The host's locales from a platform API, or `None` where there is no such
+/// API and the environment is the only source.
+///
+/// Unix/macOS deliberately return `None` rather than calling `setlocale`:
+/// `setlocale` mutates process-global state we do not otherwise touch, and the
+/// `LC_ALL` ▸ category ▸ `LANG` precedence it would apply is the one the caller
+/// reads directly.
+#[cfg(target_os = "windows")]
+fn platform_host_locale() -> Option<HostLocale> {
+    windows_host_locale()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_host_locale() -> Option<HostLocale> {
+    None
 }
 
 /// Ask Windows for the UI language and the regional format, as BCP-47 names.
@@ -560,14 +574,6 @@ fn fill_i18n_props(
     }
 }
 
-/// Derive `user.language` and `user.country` from the host locale.
-///
-/// Retained as the two-subtag view of [`derive_host_locale`]'s DISPLAY locale,
-/// which is what seeds the base `user.language`/`user.country` properties.
-fn derive_locale() -> (String, String) {
-    let d = derive_host_locale().display;
-    (d.language, d.country)
-}
 
 // ---------------------------------------------------------------------------
 // SharedVm — thread-safe shared state
