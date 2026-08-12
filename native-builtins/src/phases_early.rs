@@ -20370,7 +20370,9 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // with the `inferCaller()` call deleted: JDK 25's body is
     // `if (needToInferCaller) inferCaller(); return sourceClassName;`, this one
     // is a bare field read, and the field is null because nothing ever inferred
-    // it. Measured: HotSpot renders the caller class, CratonVM renders null.
+    // it. Symmetrically `setSourceClassName` is the real setter with its
+    // `needToInferCaller = false` deleted. Measured: HotSpot renders the caller
+    // class, CratonVM renders null.
     //
     // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
     // under `--jdk-only` these survived after the retirement refused every
@@ -20378,6 +20380,17 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // not a removal. W7-25 lifted the two `LogManager` rows out of the ambient
     // block for exactly this reason; these are the same defect at sites that
     // pass did not cover. W7-35-jul-supplier-and-payload-residuals.md
+    //
+    // The `Bridge` tag alone did NOT retire them: it made the `--jdk-only`
+    // census REPORT them (`bridge-ran-over-bytecode`) and left them dispatching,
+    // which is why the source pair was still null in strict mode a day later.
+    // All four triples are entries in `RETIRED_SHADOW_TRIPLES`
+    // (native-api/src/retired_shadow.rs) as of 2026-08-12, so `--jdk-only`
+    // refuses them and the real lazy-inference bytecode runs, while
+    // `Compatible` still dispatches them over records the JUL bridge stamped at
+    // construction. They retire as a SET of four: see that module's docs for
+    // why a getter-only retirement is worse than none.
+    // W7-56-infercaller-strict.md
     r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
         r.register(
             lr,

@@ -36,7 +36,7 @@
 //! left them failing for a NEW reason would be a regression this comparison
 //! catches.
 //!
-//! The 84 triples below are every LIVE (`owns_slot`) `Bridge` registration on a
+//! The first 84 triples below are every LIVE (`owns_slot`) `Bridge` registration on a
 //! `java/util/logging/` receiver whose image target carries a `Code` attribute,
 //! declared or inherited — i.e. exactly the rows the dial would yield. They are
 //! re-tagged [`NativeKind::SyntheticStub`](crate::registry::NativeKind::SyntheticStub)
@@ -54,6 +54,57 @@
 //! there is no bytecode for it to yield to. Refusing it would replace a shadow
 //! with an `UnsatisfiedLinkError`, which is the shape the 2026-08-10 wave hit
 //! when four of 43 re-tagged receivers had to be held back.
+//!
+//! # `LogRecord`'s source pair — four more, retired 2026-08-12
+//!
+//! The wave above left `getSourceClassName`, `getSourceMethodName` and their
+//! two setters live, because they were tagged `Intrinsic` and the census scores
+//! `Bridge`. Re-tagging them `Bridge` on 2026-08-11 made the census REPORT them
+//! (`bridge-ran-over-bytecode`) but retired nothing — retirement is this table,
+//! and a category change alone is not an entry in it.
+//!
+//! What they were is the reason they have to go rather than improve. JDK 25:
+//!
+//! ```text
+//!   getSourceClassName() { if (needToInferCaller) inferCaller(); return sourceClassName; }
+//!   setSourceClassName(s) { this.sourceClassName = s; needToInferCaller = false; }
+//! ```
+//!
+//! The shadow getters are that getter with the `inferCaller()` call deleted —
+//! a bare field read — and the shadow setters are that setter with the
+//! `needToInferCaller` clear deleted. So under `--jdk-only` the real ctor set
+//! `needToInferCaller = true`, the real `inferCaller()` was never reached by
+//! anybody, and every `logger.warning(...)` record reached `SimpleFormatter`
+//! with a null pair, which that formatter renders as the LOGGER NAME.
+//!
+//! Measured, one binary, three arms (probes/SrcProbe3.java):
+//!
+//! ```text
+//!                  explicit set/get   pair during publish   StackWalker frames
+//!   HotSpot        A_CLASS/a_method   SrcProbe3/main        Logger.log, doLog, log, warning
+//!   --real-jdk     A_CLASS/a_method   SrcProbe3/main        (chain is native: none)
+//!   --jdk-only     A_CLASS/a_method   null/null             IDENTICAL to HotSpot
+//! ```
+//!
+//! That rules out both of the causes the handoff proposed: the setters stick,
+//! and our `StackWalker` hands `LogRecord$CallerFinder` exactly the frame list
+//! HotSpot's walks. Nothing was broken except that the code which would have
+//! CALLED them never ran.
+//!
+//! **All four or none.** Retiring only the getters would be a NEW defect:
+//! the real getter would then honour `needToInferCaller`, which the surviving
+//! shadow setter never clears, so an explicit `setSourceClassName("X")` would
+//! be silently overwritten by the inferred caller on the next read. The two
+//! halves are one state machine and only move together.
+//!
+//! `Compatible` is untouched, and not by argument: a `SyntheticStub` registers
+//! and dispatches normally in `Compatible`, so all four natives still answer
+//! there exactly as they did, over records the JUL bridge already stamped.
+//! Retiring them in BOTH modes would have been a regression, and that is
+//! measured too: probes/SrcProbe4.java runs `CallerFinder` at `inferCaller`'s
+//! real depth and gets `EMPTY` under `--real-jdk`, because the native chain
+//! leaves no `java.util.logging.Logger` frame to trip its latch. Compatible is
+//! correct only via the eager stamp. W7-56-infercaller-strict.md
 //!
 //! # Why this is applied centrally
 //!
@@ -118,6 +169,15 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/logging/LogRecord", "getLevel", "()Ljava/util/logging/Level;"),
     ("java/util/logging/LogRecord", "getMessage", "()Ljava/lang/String;"),
     ("java/util/logging/LogRecord", "getSequenceNumber", "()J"),
+    // The source pair, retired 2026-08-12 as a SET. See the "the source pair"
+    // section of this module's docs: the getters are the real getters with
+    // `inferCaller()` deleted, and the setters are the real setters with
+    // `needToInferCaller = false` deleted. Retiring either half alone is worse
+    // than retiring neither.
+    ("java/util/logging/LogRecord", "getSourceClassName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "getSourceMethodName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "setSourceClassName", "(Ljava/lang/String;)V"),
+    ("java/util/logging/LogRecord", "setSourceMethodName", "(Ljava/lang/String;)V"),
     ("java/util/logging/Logger", "addHandler", "(Ljava/util/logging/Handler;)V"),
     ("java/util/logging/Logger", "config", "(Ljava/lang/String;)V"),
     ("java/util/logging/Logger", "config", "(Ljava/util/function/Supplier;)V"),
@@ -242,13 +302,37 @@ mod tests {
     }
 
     /// A vacuity floor. An empty table would make every test above pass and
-    /// retire nothing — the measurement recorded 84 triples.
+    /// retire nothing — the 2026-08-11 measurement recorded 84 triples, and the
+    /// 2026-08-12 source-pair retirement added four.
     #[test]
     fn the_table_is_not_empty() {
         assert!(
             RETIRED_SHADOW_TRIPLES.len() >= 80,
-            "expected the measured java.util.logging population (84), got {}",
+            "expected the measured java.util.logging population (88), got {}",
             RETIRED_SHADOW_TRIPLES.len()
         );
+    }
+
+    /// `LogRecord`'s source pair is retired as a SET of four.
+    ///
+    /// Not a restatement of the table: it is the property that keeps a later
+    /// edit from retiring the getters and leaving the setters, which is
+    /// strictly worse than retiring neither. The real getter honours
+    /// `needToInferCaller`; the shadow setter never clears it; so a getter-only
+    /// retirement makes an explicit `setSourceClassName("X")` get silently
+    /// overwritten by the inferred caller on the next read.
+    #[test]
+    fn the_log_record_source_pair_is_retired_as_a_set() {
+        for (m, d) in [
+            ("getSourceClassName", "()Ljava/lang/String;"),
+            ("getSourceMethodName", "()Ljava/lang/String;"),
+            ("setSourceClassName", "(Ljava/lang/String;)V"),
+            ("setSourceMethodName", "(Ljava/lang/String;)V"),
+        ] {
+            assert!(
+                triple_is_retired_shadow("java/util/logging/LogRecord", m, d),
+                "the source pair retires as a set; {m}{d} is missing"
+            );
+        }
     }
 }

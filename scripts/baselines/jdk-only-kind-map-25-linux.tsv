@@ -10,6 +10,22 @@
 # rows: 11636
 # unchosen: 0
 # note: Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.
+# amended: 2026-08-12, W7-56-infercaller-strict.md. FOUR rows edited by hand,
+#   not re-measured: java/util/logging/LogRecord {get,set}Source{Class,Method}Name
+#   ordinal 0, intrinsic -> synthetic-stub, kind_stated 0 -> 1. Those are the
+#   four triples that branch adds to RETIRED_SHADOW_TRIPLES, and the retag in
+#   NativeMethodRegistry::register is deterministic (effective category Bridge +
+#   retired => SyntheticStub, kind_stated true), so the value is derived rather
+#   than guessed -- it is byte-identical in shape to the sibling retired rows
+#   already here (LogRecord.getSequenceNumber ordinal 1, and every
+#   java/util/logging row the 2026-08-11 wave retired).
+#
+#   PRE-EXISTING DRIFT this does NOT fix, and a linux re-freeze should: commit
+#   3b20b83b5 (2026-08-11 22:34) retagged SIX rows Bridge, and this file was
+#   frozen at 12:20 the same day, so it still calls all six `intrinsic`. Four
+#   of them are the rows above. The other two -- Formatter.formatMessage and
+#   its neighbour -- are untouched here and still read `intrinsic 0 1` where
+#   the tree now produces `bridge`.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -8249,8 +8265,8 @@ java/util/logging/LogRecord	getResourceBundle	()Ljava/util/ResourceBundle;	0	int
 java/util/logging/LogRecord	getResourceBundleName	()Ljava/lang/String;	0	intrinsic	0	1
 java/util/logging/LogRecord	getSequenceNumber	()J	0	intrinsic	0	1
 java/util/logging/LogRecord	getSequenceNumber	()J	1	synthetic-stub	1	1
-java/util/logging/LogRecord	getSourceClassName	()Ljava/lang/String;	0	intrinsic	0	1
-java/util/logging/LogRecord	getSourceMethodName	()Ljava/lang/String;	0	intrinsic	0	1
+java/util/logging/LogRecord	getSourceClassName	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/util/logging/LogRecord	getSourceMethodName	()Ljava/lang/String;	0	synthetic-stub	1	1
 java/util/logging/LogRecord	getThreadID	()I	0	intrinsic	0	1
 java/util/logging/LogRecord	getThrown	()Ljava/lang/Throwable;	0	intrinsic	0	1
 java/util/logging/LogRecord	setLoggerName	(Ljava/lang/String;)V	0	intrinsic	0	1
@@ -8260,8 +8276,8 @@ java/util/logging/LogRecord	setParameters	([Ljava/lang/Object;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setResourceBundle	(Ljava/util/ResourceBundle;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setResourceBundleName	(Ljava/lang/String;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setSequenceNumber	(J)V	0	intrinsic	0	1
-java/util/logging/LogRecord	setSourceClassName	(Ljava/lang/String;)V	0	intrinsic	0	1
-java/util/logging/LogRecord	setSourceMethodName	(Ljava/lang/String;)V	0	intrinsic	0	1
+java/util/logging/LogRecord	setSourceClassName	(Ljava/lang/String;)V	0	synthetic-stub	1	1
+java/util/logging/LogRecord	setSourceMethodName	(Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/util/logging/LogRecord	setThreadID	(I)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setThrown	(Ljava/lang/Throwable;)V	0	intrinsic	0	1
 java/util/logging/Logger	addHandler	(Ljava/util/logging/Handler;)V	0	synthetic-stub	1	1

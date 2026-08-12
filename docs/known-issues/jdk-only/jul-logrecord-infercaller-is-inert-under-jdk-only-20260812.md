@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN, strict-mode only. `Compatible`/`--real-jdk` is fixed and byte-identical to HotSpot. |
+| **Status** | SUPERSEDED 2026-08-12 by W7-56-infercaller-strict.md, which measured it and fixed it. **Both candidate causes in "where to look first" below are REFUTED**: the setters stick, and our `StackWalker` presents `CallerFinder` exactly the frames HotSpot's walks. The cause was a third thing — the shadow `getSourceClassName` is the real getter with the `inferCaller()` call deleted, so the working mechanism was never CALLED. Read that record instead of the section below. |
 | **Discovered** | 2026-08-12, closing the `RJdkLogging` `useParentHandlers` failure — this is the last of four defects that vector stacks up. |
 | **Reproducer** | `CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh` → `69 passed, 1 failed ( failed: RJdkLogging )`, on `formattedOutputIsRealBytes`. |
 | **Oracle** | HotSpot renders `RJdkLogging formattedOutputIsRealBytes`. |
