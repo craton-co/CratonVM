@@ -126,7 +126,7 @@ not re-derive them.
 | `os_parent_pid` (Linux), unreadable `/proc/<pid>/status` | `Ok(-1)` | **correct, and the asymmetry is the point.** One unreadable status means that process is gone; a failed `opendir("/proc")` means the scan did not run and is an `Err`. W6-10 finding 4 established this split |
 | `direct_child_pids`, unreadable `task/` | `Ok(vec![])` | same: a descendant that dies mid-walk must not abort the walk |
 | `start_time_matches`, unknown start time | counts as a MATCH | documented at the site — "unknown is not disagreement" |
-| `p60_unmeasurable_process_tree` | empty stream | **synthetic-JDK only, and refused under strict**, where the `SyntheticStub` tag drops the registration that reaches it |
+| `p60_unmeasurable_process_tree` | empty stream | **synthetic-JDK only, and refused under strict**, where the `SyntheticStub` tag drops the registration that reaches it. **MEASURED 2026-08-12 (lane A31): CONFIRMED LIVE — and it is a fabricated success, not an "unmeasurable" answer.** See §9 |
 | `p60_empty_optional` on the five `$Info` accessors | `Optional.empty()` | **the specified answer**, not a concession — the JDK's own accessors derive exactly this from an unwritten field |
 
 ### Two-gate `#[cfg]` with a default-off inner gate: **none**

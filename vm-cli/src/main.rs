@@ -3686,7 +3686,16 @@ fn run() -> Result<()> {
     // whatever failure they caused. See `ViolationWatermark` for what this
     // drain still covers now that class-origin violations arrive live.
     let mut jdk_only_watermark = ViolationWatermark::default();
-    if args.trace_jdk_only {
+    // `--explain-jdk-only` is admitted here as well as `--trace-jdk-only`.
+    // `finish_jdk_only` already accepts either (see its gate), so gating the
+    // vm-init drain and the live sink on `trace_jdk_only` ALONE meant
+    // `--jdk-only --explain-jdk-only` on its own got only a shutdown batch:
+    // every mid-run fabrication reported detached from the code that caused it,
+    // which is precisely what `ViolationWatermark`'s own doc says the live sink
+    // exists to prevent. Measured 2026-08-12: none of the nine runtime
+    // fabrication families appears in `--explain-jdk-only` output, while all
+    // thirteen boot-time refusals do.
+    if args.trace_jdk_only || args.explain_jdk_only {
         trace_jdk_only_violations(
             &vm.shared,
             &mut jdk_only_watermark,

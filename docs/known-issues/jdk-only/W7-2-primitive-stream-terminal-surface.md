@@ -573,3 +573,79 @@ lines; every one of them fails on the old behaviour (an `AbstractMethodError`
 that kills the run, or the `-0.0` rows above). `RJdkViews` is deliberately not
 also in `JDKONLY_CLASSES` — under `CRATONVM_ARGS=--jdk-only` the CORE list runs
 with those args too, so the one file covers both modes.
+
+---
+
+## Adjudicated in `--synthetic-jdk` — 2026-08-12 (lane A31)
+
+The reconciliation block at the head of this record says the §7.2 residual is
+"Source only — nothing built, nothing run", and that adjudicating it needs a
+build. A `--features synthetic-jdk` binary was built from clean HEAD and
+launched with `--synthetic-jdk` — the mode `register_phase56_stream_extras` and
+`register_phase56_primitive_stream_terminals` are actually reachable in.
+
+**Headline: the wiring works, and §7.2's named holes are RETIRED.** The bug this
+record came from — `IntStream.summaryStatistics()` killing whole probe runs with
+`AbstractMethodError: … has no Code attribute` — does not reproduce:
+
+```
+--synthetic-jdk (HotSpot 25 identical on every row):
+  R intStream.summaryStatistics = count=5 sum=15 min=1 max=5 avg=3.0
+  R intStream.range.distinct    = [0, 1]
+  R intStream.range.anyMatch    = true
+  R intStream.range.findFirst   = 2
+  R intStream.range.reduce      = 6
+  R intStream.range.sorted      = [0, 1, 2]
+  R intStream.range.iterator    = 0,1
+  R intStream.concat            = [0, 1, 5]
+  R intStream.asDouble.stats    = 6.0
+  R longStream.range.reduce     = 6
+```
+
+That is every §7.2 member the reconciliation block lists as WRITTEN —
+`anyMatch`, both `reduce` overloads, `findFirst`/`findAny`, `sorted`,
+`distinct`, and the `iterator()` boxing bridge — answering correctly in the only
+mode they are compiled into. **Retired.** (`summaryStatistics` was already green
+in `--real-jdk`; this closes the other half.)
+
+### Two residuals survive, and one of them is exactly what §9 refused
+
+1. **`spliterator()` — CONFIRMED ABSENT, with the missing triple named.** §9
+   refuses it as "REFUSED, not deferred". The refusal is still in force and now
+   has a transcript:
+
+   ```
+   --synthetic-jdk: R intStream.range.spliterator ! java.lang.NoSuchMethodError:
+       java.util.Spliterators.spliterator([IIII)Ljava/util/Spliterator$OfInt;
+   HotSpot / --jdk-only: est=3
+   ```
+
+   The gap is not in `IntStream` at all — `IntStream.spliterator()` runs and
+   reaches `java.util.Spliterators.spliterator([IIII)Ljava/util/Spliterator$OfInt;`,
+   which the synthetic image does not declare. Anyone reopening §9 should target
+   that one `Spliterators` triple, not the six `spliterator()` overloads §3
+   assumed.
+
+2. **The static `of(...)` factories are ABSENT — not previously recorded here.**
+
+   ```
+   --synthetic-jdk:
+     R intStream.distinct    ! NoSuchMethodError: java.util.stream.IntStream.of([I)Ljava/util/stream/IntStream;
+     R longStream.reduce     ! NoSuchMethodError: java.util.stream.LongStream.of([J)Ljava/util/stream/LongStream;
+     R doubleStream.sorted.distinct ! NoSuchMethodError: java.util.stream.DoubleStream.of([D)Ljava/util/stream/DoubleStream;
+   HotSpot / --jdk-only: [1, 3] / 6 / [1.0, 2.0, 3.0]
+   ```
+
+   §9's "static `concat`" exception is half right: `IntStream.concat` **works**
+   (`[0, 1, 5]`), and it is `of(...)` — all three primitive flavours, varargs
+   form — that is missing. This matters for the falsifier design: **a probe
+   written with `IntStream.of(...)` measures the absence of `of`, not the
+   terminal it was aimed at.** Every green row above uses `IntStream.range` /
+   `LongStream.range` for exactly that reason. Redo any earlier
+   `of`-based measurement before trusting it.
+
+Method note: none of this is visible from `--real-jdk` or `--jdk-only`, where
+real JDK bytecode serves all of it and the whole file is out of the picture. The
+falsifier the head of this record asks for (`cratonvm --real-jdk …
+ShadowDifferentialProbe`) tests a different question from the one §7.2's
+registrations answer.

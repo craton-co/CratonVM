@@ -326,6 +326,51 @@ exists and `nio_file.rs:1043` documents the same trap for
 `reflect_invoke.rs:2443` (`ModuleLayer.modules()`) and to the `HashSet`
 3-slot allocations in `collections.rs:86,1178` and `text_intl.rs:1525`.
 
+> ### "INERT" IS WRONG — measured 2026-08-12 (lane A31)
+>
+> The `build_string_set` row in the table above and this section both read
+> **"inert"**, on the reasoning that the sole caller (`register_p59_module`'s
+> `Module.getPackages`) is "reachable only from `register_synthetic_overrides`".
+> The reachability half is right. The *inert* half is a scope claim being read
+> as a harmlessness claim, and it is false: a `--features synthetic-jdk` binary
+> was launched with `--synthetic-jdk` and the caller runs, every time, and
+> **answers empty**.
+>
+> ```
+>                                  HotSpot 25                       --jdk-only                --synthetic-jdk
+> R module.getPackages =           cls=…ImmutableCollections$SetN   cls=java.util.HashSet     cls=java.util.HashSet
+>                                  size=196 hasJavaLang=true        size=63 hasJavaLang=true  size=0 hasJavaLang=false
+> R module.getPackages.iterate =   6                                6                         0
+> R module.unnamed.getPackages =   cls=java.util.HashSet size=1     size=63                   size=0
+> R module.getName =               java.base                        java.base                 null
+> R module.isNamed =               true                             true                       false
+> R moduleDescriptor.name =        name=java.base                   name=java.base            name=null
+> R module.layer =                 <62 modules>                     java.base                 null
+> ```
+>
+> `getPackages()` on `java.base` returns an **empty** `HashSet`, with no error
+> and no violation. That is the `W7-1`/`W7-20` failure mode — an empty
+> collection reads as a pass anywhere the caller only iterates — and it is
+> reached, not latent. `getDescriptor()` is non-null but its `name()` is `null`,
+> and `isNamed()` is `false` for `java.base`, so the module identity surface is
+> answering three mutually inconsistent things at once.
+>
+> The 3-slot `HashSet` shape hazard this section is *about* is **not** what the
+> run exposed — nothing crashed and no `contains()` misfired, because the set is
+> empty and nothing was looked up in it. The shape stays a real latent hazard for
+> any future promotion to the real-JDK path, exactly as written. What changes is
+> the priority framing: this is not a dormant landmine, it is a live wrong answer
+> in the mode it ships in.
+>
+> **Restate the row as:** *reachable only from `register_synthetic_overrides`;
+> LIVE and answering empty in `--synthetic-jdk`; shape is also wrong for a real
+> HashSet, which matters only if it is ever promoted.*
+>
+> Not adjudicated by this lane: the three sibling allocations
+> (`reflect_invoke.rs:2443` `ModuleLayer.modules()`, `collections.rs:86,1178`,
+> `text_intl.rs:1525`). `ModuleLayer.modules()` is implicated by
+> `module.layer = null` above but was not isolated.
+
 ## A different species, found in passing (GC stale local)
 
 Two sites held a freshly-allocated, unrooted `ObjectRef` in a bare Rust local

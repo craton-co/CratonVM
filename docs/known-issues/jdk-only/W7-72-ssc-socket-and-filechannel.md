@@ -588,3 +588,49 @@ reading, unverifiable by the suite* — not *verified*.
 * `CRATONVM_DBG_LAYOUT_ALIAS=1` on any run that opens a file: a new `over` row for
   `java/nio/channels/FileChannel` at 6 vs 4 is **expected** (§5.4). No new row for
   `java/nio/channels/SocketChannel` or `ServerSocketChannel`.
+
+### 7.2 Re-verified 2026-08-12 (second pass) — every symbol still present, and residual 7 has a sequel
+
+Source read only; **no build, no binary, no `cargo`**. §7.1's landed-state check
+reproduces symbol for symbol, with the line numbers drifted again (anchor on the
+identifiers, as §7.1 already says):
+
+| §7.1 claim | status |
+|---|---|
+| `ssc_socket_cache_table` / `gc_scan_ssc_socket_cache_roots` / `ssc_socket_cache_update_after_gc` in `native-io/src/socket_channel.rs` | present (`:5063`, `:5111`, `:5125`); the table is `RwLock<FxHashMap<i32, Vec<SscSocketRow>>>`, i.e. still identity-hash-keyed with the per-bucket `Vec` §1.3 item 2 requires |
+| eviction on close | present — `ssc_socket_cache_clear(ctx, this)` at `:1622` |
+| `native-api/src/synthetic_file_channel.rs` exists and owns the private map | present |
+| both `isOpen` registrations name one body | present — `nio_file.rs:5999` and `:15552` both name `p57_fc_is_open` (`:15037`) |
+| the winner still registers unconditionally | present — `socket_channel.rs:4778` |
+| the ratchet | present — `ssc_p58_socket_stays_deleted_and_the_registrar_stays_gated`, `native-api/tests/guarded_slot_maps.rs:539` |
+
+**Residual 7 — "the losing `socket()` registration in `net_channels.rs` still
+writes three real JDK fields" — is discharged twice over and has a sequel.** It
+was discharged as written by W7-88, which deleted the registration and measured
+that it never registered at all (and corrected the count from three writes to
+seven, across two classes rather than one). The sequel is that the residual's
+framing — *"a losing registration in `net_channels.rs`, inert today, dangerous
+if a future reorder makes it win"* — turned out to be the wrong worry for that
+file. **The dangerous registrations in `net_channels.rs` are not the losing ones
+waiting for a reorder; they are the ones that already win because nobody else
+registers the triple.** `register_p67_async_channels`, the next function down
+from the one W7-88 audited, is reached from
+`register_essential_natives_with_shims` and is live in both shipping modes;
+four of its triples survive `native-io`'s later pass, and two of those are
+fabricated success — `AsynchronousFileChannel.force(Z)V` returns without doing
+anything, and `lock()` hands back a real `java/util/concurrent/FutureTask` at a
+two-slot width so `get()` parks in `awaitDone` forever. W7-88 §10 and
+W7-8-fabricated-success-io-sweep.md §9 carry it.
+
+The reading lesson, since this record's §6 is where the campaign states them:
+§6 says a liveness claim must be traced to `vm_init` in every configuration, and
+it is right. What §6 does not say, and residual 7 is the reason to add it, is
+that **the trace has to be done per registrar, not per file** — two functions
+fifty lines apart in `net_channels.rs` have entirely different call chains, one
+gated behind `#[cfg(feature = "synthetic-jdk")]` and one not. A file-level
+verdict is the same error as a registration-site-level one, one altitude up.
+
+Nothing in §1–§7.1 changes. The `FileChannel` half of this record is
+unaffected — `p57_fc_*` and `synthetic_file_channel` are a different class, a
+different crate and a different registrar — and its "source landed, verified by
+reading, unverifiable by the suite" status stands.
