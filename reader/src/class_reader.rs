@@ -115,15 +115,20 @@ pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderEr
     // way: a whole-process property fixed before the first class is parsed.
     //
     // Blast radius, stated because this runs on every class the VM loads: the
-    // *only* byte pattern whose verdict moves is `minor == 0xFFFF` with
-    // `major == 69`, which used to load unconditionally and now needs preview
-    // enabled. Every other pattern keeps its previous answer bit-for-bit —
-    // `is_supported` is now `verify(true)` and that is the same function it was.
-    // The JDK's own class files cannot reach the new arm: they are `69.0`
-    // (measured on Adoptium 25.0.3.9, including `StructuredTaskScope.class`
-    // itself — a preview *API* does not imply a preview class file, the
-    // `@PreviewFeature` annotation is javac's business), and `minor == 0`
-    // returns Ok two lines earlier.
+    // *only* byte pattern whose verdict moves is `minor == 0xFFFF` together with
+    // `major == MAX_SUPPORTED.major` (69 today) — bytes 4..7 of the file reading
+    // `FF FF 00 45`. That pattern used to load unconditionally and now needs
+    // preview enabled. Every other pattern keeps its previous answer
+    // bit-for-bit, structurally rather than by inspection: `is_supported` is now
+    // `verify(true)`, and the only substitution here is `true` ->
+    // `preview_enabled()`, which those two differ on in exactly that one arm.
+    //
+    // The JDK's own class files cannot reach the new arm. They are `69.0` —
+    // measured on Adoptium 25.0.3.9, including `StructuredTaskScope.class`
+    // itself, because a preview *API* does not imply a preview class file: the
+    // `@PreviewFeature` annotation is javac's business and leaves no mark in the
+    // file. `verify` returns `Ok` for `minor == 0` two branches before the
+    // preview arm exists.
     if let Err(rejection) = version.verify(preview_enabled()) {
         return Err(ClassReaderError::UnsupportedVersion {
             major,
