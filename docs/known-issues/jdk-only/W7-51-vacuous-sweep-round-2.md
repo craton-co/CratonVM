@@ -1,7 +1,7 @@
 # W7-51 — the vacuous-test population, measured instead of sampled
 
 Status: **W6-5's two open residuals are closed structurally**, and a systematic
-sweep of the whole test surface found **55 further findings** plus one
+sweep of the whole test surface found **67 further findings** plus one
 population of 23. Round 1 (`W6-5-vacuous-tests.md`) found six by accident, while
 reading source for something else. This round asked the question on purpose.
 
@@ -19,9 +19,9 @@ gates), `vm/tests/probe_compile_guard.rs`, `vm/tests/common/mod.rs`.
 | how found | by accident, reading for another reason | swept on purpose |
 | Rust `#[test]` fns examined | — | **16,376** across 13 crates |
 | Java vectors examined | 55, for two shapes | **72 / 72**, executed, 7 mutated |
-| findings | 6 | **55**, plus a population of 23 fixtures / ~286 call sites |
+| findings | 6 | **67**, plus a population of 23 fixtures / ~286 call sites |
 | proved by MUTATION | 4 | **14** |
-| fixed here | 4 | 7 fixtures + 21 tests + 3 gates armed |
+| fixed here | 4 | 7 fixtures + 33 tests + 3 gates armed |
 
 **Round 1's estimate of its own §3.2 was low by half.** It reported eleven
 missing fixtures out of twelve referenced. The real numbers are **23 missing out
@@ -424,7 +424,8 @@ The first sweep pass reported the tolerance surface as "essentially clean",
 because every `abs() <` in scope was `1e-6` or tighter and nothing looked
 egregious. That reading was wrong, and it was wrong in an instructive way: **a
 tolerance is not judged by its magnitude, it is judged against the error term it
-absorbs.** Ten sites here have no error term at all.
+absorbs.** Twenty-two sites here have no error term at all — and the widest of
+them, at `0.001`, was nowhere near the `1e-12` the first pass went looking for.
 
 The gaussian test is the case that made it legible. Its comment names the gap it
 is sized for — *"the JDK's multiplier goes through `StrictMath.log` (fdlibm)
@@ -466,7 +467,32 @@ second case:
 | `types/src/compact_value.rs:2260`, `:2232`, `:3043` | the NaN-box round trip | **a box that silently truncated 40 bits of mantissa.** `CompactValue::double` stores `v.to_bits()` verbatim, so the test that proves the box is lossless permitted it to be lossy |
 | `gc/src/zgc/page.rs:2241`, `:2303` | `live_ratio()` of 512/512 and 512/8192, both exact in binary | the first test's own comment says *"no threshold short of 1.0 admits it"*, which the tolerance quietly contradicted |
 
-All ten are fixed, compared via `to_bits()` so the assertion is integral and does
+A widened grep (`abs() <`, `EPSILON`, `epsilon` across all first-party crates,
+not just the `1e-12` sites the first pass looked at) found **twelve more of the
+same round-trip shape**, and the worst of them is in
+`vm/src/runtime/jvmti.rs:4352-4378`:
+
+```rust
+assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 42);          // exact
+assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 123456789);  // exact
+assert!((env.get_local_float(1, 0, 2).unwrap() - 3.14).abs() < 0.001);       // 0.03%
+assert!((env.get_local_double(1, 0, 3).unwrap() - 2.718281828).abs() < 0.0001);
+assert_eq!(env.get_local_object(1, 0, 4).unwrap(), Some(0xDEAD)); // exact
+```
+
+Five slots, one round trip, one `insert`-then-read. The int, long and object
+slots are asserted exactly; the float and double slots — the same operation on
+the same map — get a window three to four orders of magnitude wide, enough to
+pass a slot that stored the float as fixed point. Nobody chose that; it is what
+happens when a float comparison is written by reflex.
+
+The rest: `vm/src/runtime/value_stack.rs:1879-1880`/`:2408-2409`
+(`push_*`/`pop_*`), `vm/src/runtime/frame.rs:2802-2803` (`get_local`, again with
+`assert_eq!` neighbours), and `vm/src/native/jni.rs:10522`/`:10537`, which assert
+a **varargs ABI round trip** — where any difference at all is a marshalling
+defect — with an `f64::EPSILON` window.
+
+All 22 are fixed, compared via `to_bits()` so the assertion is integral and does
 not depend on `clippy::float_cmp` policy.
 
 **Checked and left alone**, because a sweep that only reports hits is not a
@@ -497,7 +523,7 @@ green today and red the moment it should be.
 
 **Fixed:** the 7 fixtures and the census ratchet (§1.1); the
 `CRATONVM_REQUIRE_E2E` producer, the consumer test and the workflow guard
-(§1.2); the gaussian test (§2.2) and all ten over-wide tolerances (§2.6);
+(§1.2); the gaussian test (§2.2) and all 22 over-wide tolerances (§2.6);
 `STRICT_COVERAGE` (§2.7); the
 `synthetic-jdk` × experimental CI step (§2.4); the stale-`.class` trap in seven
 harnesses; and the Rust and Java repairs listed in the commit log for this
