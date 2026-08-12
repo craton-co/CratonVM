@@ -60916,8 +60916,8 @@ mod tests {
         let mut ctx = MockCtx::new(1);
         ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
 
-        fn new_stream(ctx: &mut MockCtx) -> ObjectRef {
-            let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+        let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+        let new_stream = |ctx: &mut MockCtx| {
             let arr = ctx.new_ref_array(ClassId::new(0), elements.len());
             for (i, v) in elements.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
@@ -60925,7 +60925,7 @@ mod tests {
             let s = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
             ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
             s
-        }
+        };
 
         // -- the under-set half: one stream, two terminals -------------------
         let s = new_stream(&mut ctx);
@@ -60937,7 +60937,8 @@ mod tests {
             Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 cratonvm_types::error::RuntimeError::IllegalStateException { ref message },
             ))) => assert_eq!(
-                message, STREAM_LINKED_MSG,
+                message.as_str(),
+                STREAM_LINKED_MSG,
                 "the class is only half the contract; HotSpot's wording is the other half"
             ),
             other => panic!("second terminal must raise IllegalStateException, got {other:?}"),
