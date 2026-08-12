@@ -20541,34 +20541,36 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `formatMessage` is NOT an `Intrinsic`, unlike this function's ambient
     // category: JDK 25's body resolves the resource bundle and then runs
     // `java.text.MessageFormat.format` whenever the message contains `{n}` and
-    // the record carries parameters, where this body returns `getMessage()`
-    // verbatim. Measured: HotSpot `one=A two=B`, CratonVM `one={0} two={1}`,
-    // in BOTH modes. `Intrinsic` is exempt from the `java/util/logging/` shadow
-    // retirement, so under `--jdk-only` this survived every honest row being
-    // refused — a refusal is not a removal.
+    // the record carries parameters, where this body USED TO return
+    // `getMessage()` verbatim. Measured then: HotSpot `one=A two=B`, CratonVM
+    // `one={0} two={1}`, in BOTH modes. `Intrinsic` is exempt from the
+    // `java/util/logging/` shadow retirement, so under `--jdk-only` this
+    // survived every honest row being refused — a refusal is not a removal,
+    // and re-tagging it `Bridge` did not remove it either: the retirement is
+    // driven by the explicit triple table in `native-api/src/retired_shadow.rs`
+    // and this triple is not in it, so the row still dispatched in both modes
+    // and still answered with the raw pattern.
     // W7-35-jul-supplier-and-payload-residuals.md
+    // W7-43-formatmessage-substitution.md
     let fmt = "java/util/logging/Formatter";
     r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
-    r.register(
-        fmt,
-        "formatMessage",
-        "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                // LogRecord slot 1 is its sequence number on the real JDK
-                // layout, not the message. Resolve through the public method
-                // so concrete JULI formatters receive the string populated by
-                // the logging bridge.
-                match ctx.invoke_virtual(*rec, "getMessage", "()Ljava/lang/String;", &[])? {
-                    Some(Value::Object(Some(message))) => Ok(Some(Value::Object(Some(message)))),
-                    _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        r.register(
+            fmt,
+            "formatMessage",
+            "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
+            |ctx, args| match args.get(1) {
+                Some(Value::Object(Some(rec))) => jul_formatter_format_message(ctx, *rec),
+                // A null record is an NPE on HotSpot (`record.getMessage()` is
+                // the method's first act). This row has answered with an empty
+                // string since it was written and nothing measured exercises
+                // the null, so the historical answer is kept rather than
+                // introducing a throw that no test can adjudicate.
+                _ => {
+                    let s = ctx.create_string("");
+                    Ok(Some(Value::Object(Some(s))))
                 }
-            } else {
-                let s = ctx.create_string("");
-                Ok(Some(Value::Object(Some(s))))
-            }
-        },
-    );
+            },
+        );
     });
 
     // --- SimpleFormatter ---
@@ -20639,6 +20641,196 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         );
     });
     r.set_category(__prev_cat);
+}
+
+/// Does the message look like a `java.text` format string?
+///
+/// This is JDK 25 `Formatter.formatMessage`'s own guard, and its own comment
+/// says why it is written this way rather than as `Pattern.compile("\\{\\d")`:
+/// the regex costs 14% more, so the JDK walks `indexOf('{')` and looks at the
+/// next `char`. Reproduced exactly, including the `index >= fence` break that
+/// makes a `{` in the LAST position not a pattern.
+///
+/// Byte-wise is equivalent to the JDK's `char`-wise scan here and not an
+/// approximation of it: `{` and `0`-`9` are ASCII, and UTF-8 never encodes an
+/// ASCII byte inside a multi-byte sequence, so a `{` byte is a `{` char and the
+/// byte after it is the next char's first byte.
+fn jul_message_is_java_text_format(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    let mut index = 0usize;
+    // `fence = length - 1`; the JDK breaks when a `{` is found AT the fence,
+    // which is the same as never looking past the last byte.
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'{' && bytes[index + 1].is_ascii_digit() {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// A `String` result, or the null the JDK returns when the record's message is
+/// null. `formatMessage` is declared to return `String`, and HotSpot really
+/// does hand back `null` for `new LogRecord(level, null)` — the empty string
+/// this row used to answer with is not the same value and prints differently
+/// through `SimpleFormatter.format`.
+fn jul_message_result(ctx: &mut dyn NativeContext, message: Option<String>) -> Value {
+    match message {
+        Some(text) => {
+            let s = ctx.create_string(&text);
+            Value::Object(Some(s))
+        }
+        None => Value::Object(None),
+    }
+}
+
+/// `java.util.logging.Formatter.formatMessage(LogRecord)`.
+///
+/// The registration this serves used to be `record.getMessage()` and nothing
+/// else, which is why the strict corpus' `RJdkLogging.recordPayloads` read back
+/// `one={0} two={1}` where HotSpot reads `one=A two=B`. The record side was
+/// never at fault — the same fixture asserts, and passes, that the record keeps
+/// the RAW pattern and both parameters. HotSpot substitutes in the FORMATTER.
+///
+/// The five steps below are JDK 25's `Formatter.formatMessage` in order, read
+/// off `java.logging/java/util/logging/Formatter.java` in the image's
+/// `src.zip`, not from memory:
+///
+/// 1. `String format = record.getMessage();`
+/// 2. localize it through `record.getResourceBundle()` when there is one,
+///    keeping the original if the lookup misses.
+/// 3. `record.getParameters()`; a null or empty array returns the message with
+///    NO formatting at all — this is why a bare `{0}` in an unparameterized
+///    message survives to the output.
+/// 4. the cheap `{<digit>` probe ([`jul_message_is_java_text_format`]); a
+///    message that does not look like a pattern is returned unchanged.
+/// 5. `java.text.MessageFormat.format(format, parameters)` — **and if that
+///    throws, the original message is returned**. The JDK swallows it on
+///    purpose ("Formatting failed: use localized format string"), which is what
+///    makes a bad pattern such as `set={x} v={0}` come back verbatim instead of
+///    propagating an `IllegalArgumentException` into a logging call.
+///
+/// Step 5 is the trap this fix had to rule out before touching step 4: a
+/// missing or stubbed `MessageFormat` would throw, the swallow would turn that
+/// into "return the raw pattern", and the symptom would be identical with the
+/// guard entirely innocent. It is not that here — measured on the pre-fix dev
+/// binary, `MessageFormat.format("one={0} two={1}", {"A","B"})` answers
+/// `one=A two=B` in BOTH `--real-jdk` and `--jdk-only`, and matches HotSpot on
+/// the quoting, out-of-range-index and bad-argument-name cases too (it throws
+/// `IllegalArgumentException` on `{x}` exactly as HotSpot does). So the
+/// dependency was healthy and the shadow was simply not calling it.
+/// W7-43-formatmessage-substitution.md
+fn jul_formatter_format_message(
+    ctx: &mut dyn NativeContext,
+    record: ObjectRef,
+) -> MethodCallResult {
+    // Every step below re-enters Java and can move the heap, so the record is
+    // rooted once and re-read through its pin after each re-entry (the native
+    // stale-local family). One base pin, one unpin on every exit path.
+    let base_pin = ctx.pin_native_root(record);
+    let out = jul_formatter_format_message_body(ctx, base_pin, record);
+    ctx.unpin_native_roots(base_pin);
+    out
+}
+
+fn jul_formatter_format_message_body(
+    ctx: &mut dyn NativeContext,
+    rec_pin: usize,
+    record: ObjectRef,
+) -> MethodCallResult {
+    // 1. `String format = record.getMessage();`
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let message_obj = ctx.invoke_virtual(rec, "getMessage", "()Ljava/lang/String;", &[])?;
+    let mut message = match message_obj {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    };
+
+    // 2. Localize through the record's own bundle. `getString` raising
+    //    `MissingResourceException` is the DOCUMENTED miss path ("Drop
+    //    through. Use record message as format"), so a failed lookup keeps the
+    //    raw message rather than propagating.
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let catalog_val =
+        ctx.invoke_virtual(rec, "getResourceBundle", "()Ljava/util/ResourceBundle;", &[])?;
+    let catalog = match catalog_val {
+        Some(Value::Object(o)) => o,
+        _ => None,
+    };
+    if let (Some(catalog), Some(key_text)) = (catalog, message.clone()) {
+        let catalog_pin = ctx.pin_native_root(catalog);
+        let key = ctx.create_string(&key_text);
+        let key_pin = ctx.pin_native_root(key);
+        let catalog = ctx.read_native_pin(catalog_pin, catalog);
+        let key = ctx.read_native_pin(key_pin, key);
+        let localized_call = ctx.invoke_virtual(
+            catalog,
+            "getString",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(key))],
+        );
+        if let Ok(Some(Value::Object(Some(localized)))) = localized_call {
+            if let Some(text) = ctx.read_string(localized) {
+                message = Some(text);
+            }
+        }
+    }
+
+    // 3. `Object[] parameters = record.getParameters();` — null or empty means
+    //    NO formatting is performed at all.
+    //    `getParameters()` is INSIDE the JDK's `try`, unlike the two calls
+    //    above it, so a throw here is swallowed into "return the message" too.
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let params_call = ctx.invoke_virtual(rec, "getParameters", "()[Ljava/lang/Object;", &[]);
+    let parameters = match params_call {
+        Ok(Some(Value::Object(o))) => o,
+        Ok(_) => None,
+        Err(_) => return Ok(Some(jul_message_result(ctx, message))),
+    };
+    let Some(parameters) = parameters else {
+        return Ok(Some(jul_message_result(ctx, message)));
+    };
+    let params_pin = ctx.pin_native_root(parameters);
+    let params_probe = ctx.read_native_pin(params_pin, parameters);
+    if ctx.array_length(params_probe) == 0 {
+        return Ok(Some(jul_message_result(ctx, message)));
+    }
+
+    // 4. The `{<digit>` probe. A message that is not a pattern is returned
+    //    unchanged even though parameters are present.
+    let Some(pattern) = message else {
+        // A null message WITH parameters: the JDK reaches `format.length()`
+        // inside its own `try`, the NPE lands in the catch, and the catch
+        // returns `format` — which is null. Not the empty string.
+        return Ok(Some(Value::Object(None)));
+    };
+    if !jul_message_is_java_text_format(&pattern) {
+        let s = ctx.create_string(&pattern);
+        return Ok(Some(Value::Object(Some(s))));
+    }
+
+    // 5. `java.text.MessageFormat.format(format, parameters)`, with the JDK's
+    //    deliberate swallow: any failure returns the (localized) message.
+    let pattern_obj = ctx.create_string(&pattern);
+    let pattern_pin = ctx.pin_native_root(pattern_obj);
+    let parameters = ctx.read_native_pin(params_pin, parameters);
+    let pattern_obj = ctx.read_native_pin(pattern_pin, pattern_obj);
+    let rendered_call = ctx.invoke(
+        "java/text/MessageFormat",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+        &[
+            Value::Object(Some(pattern_obj)),
+            Value::Object(Some(parameters)),
+        ],
+    );
+    match rendered_call {
+        Ok(Some(Value::Object(Some(rendered)))) => Ok(Some(Value::Object(Some(rendered)))),
+        _ => {
+            let s = ctx.create_string(&pattern);
+            Ok(Some(Value::Object(Some(s))))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -24492,5 +24684,40 @@ mod t2_tests {
         // The HMAC family takes any positive multiple of 8 — HotSpot really
         // does hand back an 8-byte key for `HmacSHA256` `init(64)`.
         assert!(keygen_allowed_bits("HmacSHA256").is_none());
+    }
+
+    /// `Formatter.formatMessage`'s step-4 guard, against the HotSpot answers
+    /// measured on JDK 25.0.3+9 for the same strings.
+    ///
+    /// Every case here can fail: the guard is the place this defect was most
+    /// likely to live, and three of these rows (`{x}` before a real `{0}`, a
+    /// lone trailing `{`, and `{` before a non-digit) are exactly the ones a
+    /// "does it contain a brace" shortcut gets wrong in one direction or the
+    /// other.
+    #[test]
+    fn jul_format_guard_matches_the_jdk_indexof_scan() {
+        // A `{<digit>` anywhere makes it a pattern.
+        assert!(jul_message_is_java_text_format("one={0} two={1}"));
+        assert!(jul_message_is_java_text_format("{0}"));
+        assert!(jul_message_is_java_text_format("trailing {9}"));
+        // `{10}` is `{` followed by `1` — a pattern by this rule, even though
+        // MessageFormat may then leave it alone for want of an 11th argument.
+        assert!(jul_message_is_java_text_format("ten={10}"));
+        // A `{` whose next char is not a digit is not enough on its own...
+        assert!(!jul_message_is_java_text_format("set={x}"));
+        assert!(!jul_message_is_java_text_format("no placeholder here"));
+        assert!(!jul_message_is_java_text_format(""));
+        // ...but the scan must keep going and find the later one. HotSpot
+        // formats this string (and MessageFormat then throws on `{x}`, which
+        // the swallow turns back into the raw message).
+        assert!(jul_message_is_java_text_format("set={x} v={0}"));
+        // The JDK's `index >= fence` break: a `{` in the LAST position has no
+        // next char and is never a pattern.
+        assert!(!jul_message_is_java_text_format("trail{"));
+        assert!(!jul_message_is_java_text_format("{"));
+        // The byte scan must not mistake a multi-byte char's continuation byte
+        // for a digit, and must not miss a pattern that follows one.
+        assert!(!jul_message_is_java_text_format("héllo {x}"));
+        assert!(jul_message_is_java_text_format("héllo {0}"));
     }
 }
