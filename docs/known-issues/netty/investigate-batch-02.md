@@ -15,7 +15,10 @@ run on Windows (binary built from an isolated worktree at commit `70c8b8cd6`).
 "status seen" is what that run recorded; "explained by" is the 2026-08-12
 triage on the Azure Linux host (`20.80.105.49`), binary built from `origin/dev`
 `6d1bfd531` — i.e. carrying the batch-01 `ByteArrayInputStream`/zero-length-copy
-fixes and the batch-07 `StackWalker$Option` fix.
+fixes and the batch-07 `StackWalker$Option` fix. Re-measured on `e042d699f` after
+the 34-lane jdk-only campaign landed (it touches `native-io` and
+`util_concurrent_ext` heavily): **every count below is unchanged**, and both JFR
+probes still reproduce.
 
 ## Outcome
 
