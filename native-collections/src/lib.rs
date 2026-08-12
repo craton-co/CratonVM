@@ -37734,6 +37734,96 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     )
 }
 
+/// The JDK's `compare(key, key)` — "type (and possibly null) check" in its own
+/// comment — for the sorted containers, hoisted to the natives that can reach an
+/// EMPTY one.
+///
+/// Three measured divergences, one cause:
+///
+/// ```text
+/// TreeMap.nullKeyPut              HotSpot NullPointerException  CratonVM no-throw
+/// TreeMap.nullKeyGet              HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.nullAddNaturalOrdering  HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.incomparableFirstAdd    HotSpot ClassCastException    CratonVM no-throw
+/// ```
+///
+/// None of them is an extra rule. Under natural ordering every insert and every
+/// lookup runs `((Comparable) key).compareTo(other)`, which raises both: the
+/// `checkcast` in front of the call raises `ClassCastException` for a
+/// non-`Comparable` receiver, and the invoke itself raises
+/// `NullPointerException` for a null one. `TreeMap.getEntry` opens with an
+/// explicit `if (key == null) throw new NullPointerException()` for exactly
+/// that reason, and `addEntryToEmptyMap` writes the self-compare out by hand
+/// because on an empty container no comparison would otherwise happen at all.
+///
+/// So the gap here is *two* gaps that look like one. [`compare_via_compare_to`]
+/// already raises the ClassCastException half — but only once there is
+/// something to compare against, which is why only the FIRST add diverged. It
+/// never raises the null half at all, and deliberately: it orders `null` first,
+/// because its other caller is `Arrays.sort(Object[])`, whose contract that is.
+/// A sorted map has the opposite contract, so the check has to live here rather
+/// than be added there.
+///
+/// Scoped to natural ordering — `comparator == null` — because that is where
+/// the JDK scopes it. `TreeMap.put`: "@throws NullPointerException if the
+/// specified key is null and this map uses natural ordering, **or its
+/// comparator does not permit null keys**"; with a comparator supplied the JDK
+/// asks the comparator and nothing else. `new TreeSet<>(Comparator.nullsFirst(..))`
+/// legitimately holds a null, and a comparator over a non-`Comparable` element
+/// type is the ordinary reason to supply one — this file already documents a
+/// `Set<Class<?>>` ordered by a name-comparator above `tree_key_from_value`, and
+/// `compare_via_compare_to` documents Spring catching the CCE from the other
+/// shape. Refusing under a comparator would be the over-throw.
+///
+/// The CCE message is `compare_via_compare_to`'s, verbatim, so the two sites
+/// that model the same `checkcast` cannot drift into two different reports. The
+/// NPE carries no message, like [`ad_refuse_null`]: HotSpot's has none here and
+/// `thrownDetail` prints a message when there is one.
+///
+/// `container_is_empty` gates the `Comparable` half only, and gates it exactly
+/// where the JDK gates it: the self-compare is written out by hand in
+/// `addEntryToEmptyMap` and nowhere else, because a non-empty container reaches
+/// the same `checkcast` through the real comparison a moment later — here, via
+/// `compare_via_compare_to` inside `tm_binary_search`/`ts_binary_search`.
+/// Running the hierarchy walk on every populated `get`/`put`/`add` would buy
+/// nothing and would put a class-hierarchy walk on the fast-mode `TreeMap`
+/// path, which today performs no comparison at all. The null half is
+/// unconditional because it is a `matches!` and because
+/// `compare_via_compare_to` will never supply it.
+fn tree_natural_order_key_check(
+    ctx: &dyn NativeContext,
+    comparator: &Value,
+    key: Value,
+    container_is_empty: bool,
+) -> Result<(), MethodCallFailed> {
+    if !matches!(comparator, Value::Object(None)) {
+        return Ok(());
+    }
+    match key {
+        Value::Object(None) => Err(RuntimeError::NullPointerException { message: None }.into()),
+        Value::Object(Some(k)) if container_is_empty && !implements_comparable(ctx, k) => {
+            let cname = object_class_name(ctx, k).replace('/', ".");
+            Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
+            }
+            .into())
+        }
+        // A primitive `Value` never reaches a `(Ljava/lang/Object;)` key
+        // parameter; treat anything else as already checked rather than
+        // inventing a refusal for a shape the registrations cannot produce.
+        _ => Ok(()),
+    }
+}
+
+/// `true` when a natively-managed TreeMap holds no entries, in either storage
+/// mode — `TM_FIELD_SIZE` is maintained by the fast-mode BTreeMap path as well
+/// as the array path (`native_tm_put`'s own fast-mode eligibility test reads
+/// it). Only ever used to decide whether the JDK's empty-map self-compare
+/// applies, so a wrong answer under-throws rather than over-throws.
+fn tm_is_empty_now(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
+}
+
 /// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
 /// if missing. Caller must ensure they only invoke this when fast mode
 /// is applicable (no comparator, etc.).
@@ -39460,6 +39550,21 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // Before the view branch, not after: a DESCENDING view carries a
+    // `Collections.reverseOrder` comparator, so this is a no-op on it and the
+    // redirect below lets the backing map raise the refusal itself. An
+    // ASCENDING range view carries the source's own (null) comparator, and the
+    // JDK refuses there too — `NavigableSubMap.put` calls `inRange(key)` first,
+    // which is a `compare(key, bound)` and raises the NPE before the
+    // `IllegalArgumentException` this function raises for a real out-of-range
+    // key can be reached.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
+
     // W7-1 family 1: a write through a navigable view is a write to the BACKING
     // MAP. Redirect it, and refuse an out-of-range key the way
     // `NavigableSubMap.put` does — `IllegalArgumentException`, not a silent
@@ -39624,6 +39729,16 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `TreeMap.getEntry` refuses a null key on a natural-ordering map BEFORE it
+    // looks at `root`, so an EMPTY map throws too — which is the shape the probe
+    // measures (`new TreeMap<>().get(null)`). The fast-mode branch below would
+    // otherwise answer `null` for it, i.e. "absent", the quiet wrong answer.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let v = tm_fast_with(ctx, this, |bt| {
@@ -40128,16 +40243,39 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 }
 
+/// Build the `Map.Entry` that `TreeMap`'s *relative-navigation* accessors hand
+/// back — `firstEntry`, `lastEntry`, `pollFirstEntry`, `pollLastEntry`,
+/// `floorEntry`, `ceilingEntry`, `higherEntry`, `lowerEntry`, and nothing else.
+///
+/// Every one of those is `exportEntry(e)` in the JDK, which is
+/// `new AbstractMap.SimpleImmutableEntry<>(e)` — a SNAPSHOT, whose `setValue`
+/// throws. `TreeMap.firstEntryIsImmutable` measured
+/// `tm.firstEntry().setValue(99)` returning normally here against HotSpot's
+/// `java.lang.UnsupportedOperationException`, because this allocated the
+/// MUTABLE twin. `AbstractMap.SimpleImmutableEntry.setValue`: "@throws
+/// UnsupportedOperationException always".
+///
+/// The two classes have the same two instance fields in the same order (`key`,
+/// `value`; `javap -p` on both), so nothing about the direct field stores below
+/// changes — only which `setValue` the receiver resolves to.
+///
+/// This is deliberately NOT the entry-set path. `TreeMap.entrySet()`'s iterator
+/// yields the LIVE `TreeMap.Entry`, whose `setValue` writes through, and
+/// `TreeMap.entrySetEntryIsLive` already matches HotSpot; that path allocates
+/// its own `AbstractMap$SimpleEntry` through `alloc_live_entry` and is
+/// untouched. Getting these two backwards in either direction is a divergence,
+/// which is why the split is stated here rather than left to the call sites.
 fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Result<ObjectRef, MethodCallFailed> {
-    // AbstractMap$SimpleEntry is a real Map.Entry implementation, so reflection
-    // (Class.getMethods) and reflective property access see getKey/getValue.
-    // The old fabricated "HashMap$Entry" does not implement Map.Entry — see
-    // native_tm_entry_set for the SpEL EL1008E that motivated this.
+    // Both `Simple*Entry` classes are real `Map.Entry` implementations, so
+    // reflection (Class.getMethods) and reflective property access see
+    // getKey/getValue. The old fabricated "HashMap$Entry" does not implement
+    // Map.Entry — see native_tm_entry_set for the SpEL EL1008E that motivated
+    // that change.
     // GC-safety: same hazard as `native_map_entry` — pin `key`/`value` across
     // the allocation so the entry is populated with post-move addresses.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2)?;
+    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2)?;
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -41083,6 +41221,62 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 // subMap: entries with keys >= fromKey and < toKey
+/// `NavigableSubMap`'s constructor, first three lines:
+///
+/// ```text
+/// if (!fromStart && !toEnd) {
+///     if (m.compare(lo, hi) > 0)
+///         throw new IllegalArgumentException("fromKey > toKey");
+/// }
+/// ```
+///
+/// `TreeMap.subMapReversedBounds` measured `tm.subMap("d", "a")` returning an
+/// empty view here against HotSpot's `IllegalArgumentException`. An empty view
+/// is the failure mode that reads as a pass everywhere a caller only iterates —
+/// W7-1-treemap-views-and-iterator-remove-contract is a whole record about that
+/// shape — and a caller that transposed two bounds gets no signal at all.
+///
+/// Only the two-bound entry points reach this. `headMap`/`tailMap` take the
+/// `else` arm of that `if`, which is a type check on the single bound and not
+/// an ordering check, so they are deliberately not routed here.
+///
+/// The ordering asked is the RECEIVER's, not the source map's: for
+/// `descendingMap().subMap(a, b)` the receiver is the descending view, whose
+/// comparator slot holds the `Collections.reverseOrder` wrapper, and the JDK's
+/// `m.compare` on a `DescendingSubMap` is that same reversed ordering. Reading
+/// the slot rather than the backing map's is what makes composition agree.
+///
+/// GC-SAFETY: `tree_compare` dispatches a user `Comparator` (or a
+/// `Comparable.compareTo` override), a full interpreted call that can move
+/// `this` and both bound keys — all three are used afterwards, and the two keys
+/// end up STORED in the view's side-table entry, where a from-space address
+/// would outlive the collection that produced it. Pin, compare, re-read.
+fn tm_refuse_reversed_bounds(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    from_key: Value,
+    to_key: Value,
+) -> Result<(ObjectRef, Value, Value), MethodCallFailed> {
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let this_pin = ctx.pin_native_root(this);
+    let from_pin = pin_value(ctx, from_key);
+    let to_pin = pin_value(ctx, to_key);
+    let verdict = tree_compare(ctx, &comparator, from_key, to_key);
+    let this = ctx.read_native_pin(this_pin, this);
+    let from_key = read_pinned_elem(ctx, from_pin, from_key);
+    let to_key = read_pinned_elem(ctx, to_pin, to_key);
+    ctx.unpin_native_roots(this_pin);
+    if verdict? > 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "fromKey > toKey".to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok((this, from_key, to_key))
+}
+
 fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -41090,6 +41284,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -41139,6 +41334,10 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_key = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
+    // The JDK's check is on the bounds alone and ignores the inclusive flags —
+    // `subMap(k, false, k, false)` is a legal empty range, `subMap(hi, .., lo, ..)`
+    // is not. See `tm_refuse_reversed_bounds`.
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -41418,6 +41617,12 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // Before the search, because on an EMPTY set the search performs no
+    // comparison and so raises nothing — the `TreeSet.incomparableFirstAdd`
+    // half. On a non-empty set this fires first and `compare_via_compare_to`
+    // (which would raise the same CCE) is never reached, so the two agree by
+    // construction rather than by coincidence.
+    tree_natural_order_key_check(ctx, &comparator, elem, size == 0)?;
     let data = match data_opt {
         Some(d) => d,
         None => {
