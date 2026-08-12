@@ -8529,43 +8529,59 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // pin() — increment pin count on the continuation AND on the live
-    // JvmThread so that any subsequent sleep/park emits `VirtualThreadPinned`.
-    r.register_with_kind(cls, "pin", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // The real class declares NO pin counter — `Continuation.pin()` is
-        // `static native` there and the count is VM state — so `s.pin` is
-        // `None` on a real receiver and the on-object bookkeeping is skipped.
-        // It used to stamp an `Int` over slot 3, which is `child`, a
-        // `Continuation` reference. Nothing outside this pair ever read the
-        // count; `vt_pin`/`vt_unpin` below are what any observer sees, and they
-        // are unchanged.
-        if let Some(slot) = cont_slots(&*ctx, this).pin {
-            let cur = match ctx.get_field(this, slot) {
-                Value::Int(i) => i,
-                _ => 0,
-            };
-            ctx.set_field(this, slot, Value::Int(cur.saturating_add(1)));
-        }
-        ctx.vt_pin("Continuation.pin");
-        Ok(None)
-    }, cratonvm_native_api::NativeKind::Bridge);
+    // W7-86. `pin()` and `unpin()` are **`public static native void`** on the
+    // real class — `javap -p --module java.base jdk.internal.vm.Continuation`
+    // against Adoptium 25.0.3.9 — and their descriptor is `()V`, so a call site
+    // is an `invokestatic` with zero operands and the native is handed an
+    // EMPTY `args`. Both bodies opened `obj_arg(args, 0)?`, which on an empty
+    // slice returns `NullPointerException("null object argument")`.
+    //
+    // That is not a source-level inference. Measured, on this Windows host,
+    // `probes/StaticNativeArityProbe.java`:
+    //
+    //   HotSpot 25.0.3.9   B1 Continuation.pin()  = returned
+    //   CratonVM (default) B1 Continuation.pin()  = THREW:java.lang.NullPointerException:null object argument
+    //
+    // and `--dump-native-registry` on that same run shows the registration
+    // below with `owns_slot: true`, `invocations: 1`, and the real class's
+    // method `acc_native: true, has_code: false` — this native is the only
+    // implementation there is, so nothing else could have answered.
+    //
+    // The on-object pin counter that used to live here is gone rather than made
+    // conditional: a static has no receiver under EITHER compatibility mode
+    // (the interpreter pops exactly the descriptor's parameters), so the
+    // counter was unreachable in both, in this shape and in every shape this
+    // pair has had. Nothing outside the pair ever read it; `vt_pin`/`vt_unpin`
+    // are the whole observable and they are unchanged. `ContSlots::pin` stays —
+    // it is the fallback map's honest description of the synthetic layout, and
+    // `cont_slots` is still what every OTHER native on this class uses.
+    //
+    // Mode: this repairs Compatible (`--real-jdk`, the default) and is a
+    // HotSpot-parity fix — HotSpot returns normally, CratonVM threw. Synthetic
+    // mode is unchanged in observable behaviour: the counter it wrote could
+    // never be written there either.
+    r.register_with_kind(
+        cls,
+        "pin",
+        "()V",
+        |ctx, _args| {
+            ctx.vt_pin("Continuation.pin");
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
-    // unpin()
-    r.register_with_kind(cls, "unpin", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // See `pin` above for why this is conditional on a real pin field.
-        if let Some(slot) = cont_slots(&*ctx, this).pin {
-            let cur = match ctx.get_field(this, slot) {
-                Value::Int(i) => i,
-                _ => 0,
-            };
-            let next = if cur > 0 { cur - 1 } else { 0 };
-            ctx.set_field(this, slot, Value::Int(next));
-        }
-        ctx.vt_unpin();
-        Ok(None)
-    }, cratonvm_native_api::NativeKind::Bridge);
+    // unpin() — see `pin` above; same arity, same repair.
+    r.register_with_kind(
+        cls,
+        "unpin",
+        "()V",
+        |ctx, _args| {
+            ctx.vt_unpin();
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
 
     // isPinned()Z — static in the real JDK; both forms register.
 

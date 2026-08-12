@@ -14443,7 +14443,25 @@ pub fn register_essential_natives_with_shims(
         ctx.force_gc();
         Ok(None)
     }, NativeKind::Bridge);
-    registry.register("java/lang/Runtime", "exit", "(I)V", native_system_exit);
+    // W7-86. `Runtime.exit(int)` is an INSTANCE method (`javap -p` on Adoptium
+    // 25.0.3.9: `public void exit(int)`), so `args[0]` is the `Runtime`
+    // receiver and `args[1]` is the status. `native_system_exit` serves the
+    // STATIC `System.exit(int)`, where `args[0]` IS the status — pointing this
+    // triple at it made every `Runtime.getRuntime().exit(n)` read the receiver
+    // where an `Int` was expected, take the `_ => 0` arm and **exit 0**.
+    //
+    // Measured on this Windows host: `Runtime.getRuntime().exit(7)` returned
+    // exit code 7 on HotSpot 25.0.3.9 and 0 on CratonVM, while `System.exit(7)`
+    // returned 7 on both.
+    //
+    // `native_runtime_exit` is the sibling that already handles the instance
+    // shape (`args.get(1)`, falling back to `args.first()`), and
+    // `lang_system.rs:1423` already registers it for this exact triple — but
+    // this line ran LATER and last-write-wins made the correct one dead. The
+    // `--dump-native-registry` census shows both rows, this one with
+    // `owns_slot: true`. Compatible mode (`--real-jdk`, default);
+    // HotSpot-parity fix.
+    registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
     registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
@@ -28711,8 +28729,22 @@ fn native_classloader_find_bootstrap_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // args[0]=this ClassLoader, args[1]=name String
-    let name = match args.get(1) {
+    // W7-86. `findBootstrapClass` is **`private static native`** on JDK 25's
+    // `ClassLoader` (`javap -p --module java.base java.lang.ClassLoader`,
+    // Adoptium 25.0.3.9), so `args[0]` IS the name and there is no receiver
+    // slot. The comment this replaces described its neighbour
+    // `findLoadedClass0`, which really is `private final native` — an INSTANCE
+    // method — and whose `args[1]` indexing below is correct. Copying it here
+    // made this native read one past the end of a one-element `args`, take the
+    // `_` arm and answer **null for every name**, on every call, since it was
+    // written. The registration owns its slot and the real method is
+    // `acc_native: true, has_code: false` (`--dump-native-registry`), so no
+    // bytecode was answering behind it.
+    //
+    // Mode: Compatible (`--real-jdk`, the default). This is a HotSpot-parity
+    // fix — HotSpot resolves the bootstrap class — but note it wakes a code
+    // path that has been inert, so it is committed on its own.
+    let name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
