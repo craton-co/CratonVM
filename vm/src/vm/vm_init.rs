@@ -2119,9 +2119,35 @@ impl SharedVm {
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
                 cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
-                cratonvm_native_builtins::jmx::register_management_factory_platform_server_stub(
-                    &mut native_methods,
-                );
+                // W7-50 (2026-08-12): `register_management_factory_platform_server_stub`
+                // used to be called here. This is the REAL-JDK arm — the
+                // `else` of `if config.use_synthetic_jdk` above — and the
+                // default build's real-JDK arm below refuses this exact call
+                // under JMX-CLUSTER-20260720, with a measured rationale
+                // (`queryNames(null, null)` returning 0 entries because every
+                // platform MXBean was being zeroed out). The feature build
+                // never got that revert, so the two builds' real-JDK arms
+                // disagreed on the one registration that decides whether
+                // `ManagementFactory.getPlatformMBeanServer()` returns a real
+                // `com.sun.jmx.mbeanserver.JmxMBeanServer` or an empty
+                // synthetic `javax/management/MBeanServer`.
+                //
+                // With the synthetic server as the receiver, `MBeanServer`'s
+                // interface natives in `native-builtins/src/jmx.rs` answer
+                // instead of real bytecode, and they bind BY NAME: getAttribute
+                // (jmx.rs:6677) probes `getAttribute(String)Object`, then
+                // `get<Cap>()Ljava/lang/Object;` and `is<Cap>()Z` with
+                // HARD-CODED return descriptors. `RJdkJmx$Counter.getValue()`
+                // returns `int`, so every probe missed and the three misses
+                // surfaced as three `NoSuchMethodError`s naming methods the
+                // fixture's own nested class never declared. Removing the call
+                // puts the real introspection back on the path and makes this
+                // arm identical to the default build's.
+                //
+                // The bind-by-name dispatch itself is NOT fixed here: it is
+                // still the only implementation synthetic mode has, and this
+                // vector cannot measure it. Recorded in
+                // W7-50-synthetic-jdk-strict-six.md as a live latent defect.
                 // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
                 // friends. The real-JDK bytecode delegates to
                 // `getPlatformMXBean(Class)` which throws "X is not a platform
@@ -2133,16 +2159,21 @@ impl SharedVm {
                 // forked test JVM continue past constructor.
                 #[cfg(feature = "management")]
                 cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
-                // Synthetic-JDK-only: `MBeanServerFactory.createMBeanServer`/
-                // `newMBeanServer` overrides. Safe here because there is no
-                // real `java.management` module to shadow. Must NOT be
-                // called from the real-JDK branch below — see the function
-                // doc for why (it broke `getPlatformMBeanServer()` interface
-                // dispatch when it leaked into real mode).
-                #[cfg(feature = "management")]
-                cratonvm_native_builtins::jmx::register_mbean_server_factory_synthetic(
-                    &mut native_methods,
-                );
+                // W7-50 (2026-08-12): `register_mbean_server_factory_synthetic`
+                // used to be called here, under a comment reading
+                // "Synthetic-JDK-only ... Must NOT be called from the real-JDK
+                // branch below — ... it broke `getPlatformMBeanServer()`
+                // interface dispatch when it leaked into real mode." The
+                // comment was right and its own call site was the leak: this
+                // is the real-JDK arm. "The branch below" was read as the
+                // `#[cfg(not(feature = "synthetic-jdk"))]` block, but the
+                // relevant fork is `if config.use_synthetic_jdk`, and these
+                // lines are in its `else`.
+                //
+                // Removing it costs synthetic mode nothing: vm_init's two
+                // call sites for this function were BOTH in this arm, so the
+                // synthetic arm never received it. Its only other caller is a
+                // unit test (jmx.rs:7172).
                 // RKC16N.11: pre-register the rest of the sun.management.*
                 // native surface so future Keycloak-boot iterations don't
                 // trip on missing-native errors as JMM init walks deeper.
