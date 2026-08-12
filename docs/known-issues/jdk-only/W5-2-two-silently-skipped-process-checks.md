@@ -1,14 +1,43 @@
 # `ProcessHandle.current().info()` was empty, so two `RJdkProcess` checks never ran
 
-**Status:** FIXED (2026-08-07). Lane W5-2 of the jdk-wave2 pool.
-**Files changed:** `native-io/src/process.rs`, `native-builtins/src/phases_late.rs`.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
-**AMENDED 2026-08-11**, jdk-only process-natives residual lane, ALSO UNBUILT.
-The two residuals this record left open — `Info.user` null on both platforms,
-`Info.totalTime` `-1` on Linux — are now sourced from the OS. The third
-(`getProcessPids0`'s per-process `OpenProcess` cost on Windows) is untouched and
-still stands; it is a cost, not a defect, and W6-10 owns it. Full per-accessor
-table below. **Nothing here has been built or run.**
+* **Headline: CLOSED in source (2026-08-07).** `p60_process_handle_current`
+  passes `current_process_start_time()` rather than `0`; the construction is
+  documented at `native-builtins/src/phases_late.rs:2400-2409`, with
+  `p60_real_handle_for` at `:2416`.
+  **Files changed:** `native-io/src/process.rs`,
+  `native-builtins/src/phases_late.rs`.
+* **Residual 1: CLOSED.** `Info.user` null on both platforms — `os_process_user`
+  is in `native-io/src/process.rs` (Windows token-SID → `LookupAccountSidW`;
+  Linux `Uid:` → `getpwuid_r`).
+* **Residual 2: CLOSED.** `Info.totalTime` `-1` on Linux — `linux_proc_stat_times`
+  is in `native-io/src/process.rs`. See the caveat below about the Linux arm.
+* **Residual 3: STILL OPEN, and it is a cost not a defect.**
+  `getProcessPids0`'s per-row `OpenProcess` on Windows is untouched. W6-10
+  Finding 3 rules it **inherent**: `PROCESSENTRY32` carries no creation time, so
+  there is nothing cheaper to read. Owned by
+  W6-10-process-enumeration-syscall-cost.md; do not re-derive it here.
+* **The 2026-08-11 amendment is now itself stale on one point.** It says the
+  absence of `ProcessHandle$Info.commandLine()` is a live `AbstractMethodError`
+  and uses that absence as evidence. It was registered on 2026-08-11 by commit
+  `0ab1067ec` — `native-builtins/src/phases_late.rs:2826`. The *evidence* the
+  amendment drew from the absence still stands as a historical measurement; the
+  *state* does not.
+* **Deliberate, not pending:** `commandLine`/`arguments` are left empty on
+  Windows — `native-io/src/process.rs:4677` writes `commandLine` only on the
+  Linux-sourced path.
+* **Cannot adjudicate without a run — two, and one needs a different host.**
+  1. Whether `RJdkProcess` is back to `checks=53`:
+     `target/release/cratonvm --jdk-only -cp regression-suite/build RJdkProcess`
+     and `--real-jdk`, against `java -cp regression-suite/build RJdkProcess`.
+     The check counter is the only signal — nothing throws. Note a
+     Compatible-mode measurement on 2026-08-12 found `RJdkProcess` failing on a
+     **control** binary pre-dating today's merges with identical errors, so its
+     current failure is pre-existing, not a regression.
+  2. The Linux and `not(any(linux, windows))` arms of `process.rs` are not
+     compilable on this dev host and were never type-checked here. That is the
+     record's own *"What this lane could NOT check"*, and it is still true.
 
 ## The failure has no error in it
 

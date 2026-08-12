@@ -1,7 +1,54 @@
 # `java.lang.ProcessImpl` — nine unregistered Windows natives, and a tenth under a descriptor the image never declared
 
-**Status:** FIX LANDED, UNVALIDATED (no build run in this lane). Filed 2026-08-07
-by wave-3 lane W3-6. Source of truth for the census below is
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **Headline: CLOSED in source.** The ten `ProcessImpl` Windows natives and the
+  corrected `create` descriptor are in `native-io/src/process.rs`. `signal_pid`
+  is no longer POSIX-only: three `cfg` arms at `native-io/src/process.rs:1029`
+  (unix), `:1061` (windows, `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`),
+  `:1097` (other).
+* **Residual: MOSTLY CLOSED, but by a DIFFERENT MECHANISM — the
+  `## Out-of-file patch (not applied)` below is superseded, not applied.** Do
+  not apply it. It prescribes making `os_parent_pid`, `os_list_processes`,
+  `collect_descendant_pids`, `process_scan_exception` and `ProcessScanError`
+  `pub`, adding `p60_handle_stream`, and rewriting four bodies. **None of those
+  identifiers exist anywhere in the tree** (grepped 2026-08-12). What actually
+  landed is commit `0ab1067ec` *fix(jdk-only): route the ProcessHandle interface
+  stubs at a real measurement*, which introduced `p60_real_handle_for`
+  (`native-builtins/src/phases_late.rs:2416`) and `p60_delegate_to_real_handle`
+  (`:2444`) — these invoke the real `ProcessHandleImpl` and pass its exceptions
+  through untouched. On that mechanism: `children()` (`phases_late.rs:2644-2650`)
+  and `descendants()` (`:2652-2664`) no longer fabricate empty streams;
+  `parent()` (`p60_process_parent`, `:2522-2553`) no longer claims this VM as
+  every process's parent, with a synthetic-only `Optional.empty()` fallback at
+  `:2534`; and `ProcessHandle.current()`'s interception risk is addressed by
+  retagging the block `SyntheticStub` (`:2621`, restated `:1639`) so `--jdk-only`
+  drops it. Exactly **one line** of the recorded patch landed verbatim: the
+  `commandLine` registration at `phases_late.rs:2826`, which closed a live
+  `AbstractMethodError`.
+* **Residual: CLOSED beyond what this record asked for.**
+  `ProcessHandle$Info.command()`, which this record deliberately did *not*
+  patch, is now pid-gated at `phases_late.rs:2760-2778`, and `info()`
+  (`:2723-2738`) delegates to the real `ProcessHandleImpl$Info` first.
+* **Residual: STILL OPEN — one.** Off POSIX, `ProcessHandle.destroy()` and
+  `destroyForcibly()` still return `0` ("did not take effect"):
+  `p60_handle_destroy` in `native-builtins/src/phases_late.rs` has
+  `#[cfg(not(unix))] { let _ = force; Ok(Some(Value::Int(0))) }`. This record
+  correctly identified `signal_pid` as the missing primitive and it now exists
+  on Windows — but it is still a private `fn` in `native-io/src/process.rs`
+  (`:1061`), not exported, so nothing consumes it. **This is the one live item
+  in the record, and it is a two-line export plus a call.**
+* **The 2026-08-11 amendment's point 1 is confirmed** — the *"Deliberately not
+  fixed"* section is stale and superseded by W5-2; read it only as history.
+* **Cannot adjudicate without a run:** whether `RJdkProcess` reaches
+  `PASS RJdkProcess (53 checks)` under strict. Command:
+  `target/release/cratonvm --jdk-only -cp regression-suite/build RJdkProcess`
+  against `java -cp regression-suite/build RJdkProcess`. Note that a
+  Compatible-mode measurement on 2026-08-12 found `RJdkProcess` failing on a
+  **control** binary that pre-dates today's merges, with identical errors — so
+  whatever it fails on is pre-existing, not a regression from recent work.
+
+Filed 2026-08-07 by wave-3 lane W3-6. Source of truth for the census below is
 `javap -p -s` against `C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot`.
 
 **AMENDED 2026-08-11** (jdk-only process-natives residual lane, also unbuilt).
@@ -327,7 +374,23 @@ three-row duplicate of it in `register_phase57_process` (`current`, `pid`,
 | `ProcessHandle$Info.arguments()` / `user()` / `startInstant()` / … | abstract | **Correct as far as they go.** `Optional.empty()` is the specified answer for a value the implementation does not have (javadoc: *"The attributes of a process vary by operating system and are not available in all implementations"*), so these are honest absences, not fabrications. They should be *upgraded* to real values, not merely defended. |
 | `ProcessHandle$Info.commandLine()` | **absent** | **A live `AbstractMethodError`.** Abstract on the interface, registered nowhere, and the receiver `info()` mints is an instance of the interface. W5-2 relied on this: it is why the interface stub is known not to be intercepting. Any fix to `info()` must add it. |
 
-## Out-of-file patch (not applied)
+## Out-of-file patch — SUPERSEDED, DO NOT APPLY
+
+> **Reconciled 2026-08-12.** This patch was never applied and must not be. Its
+> *diagnosis* was right and was acted on; its *prescription* was overtaken. None
+> of the identifiers it introduces — `pub fn os_parent_pid`,
+> `pub fn os_list_processes`, `pub fn collect_descendant_pids`,
+> `pub fn process_scan_exception`, `pub struct ProcessScanError`,
+> `p60_handle_stream` — exists anywhere in the tree. The four fabricated bodies
+> it targets were instead fixed by commit `0ab1067ec` via delegation to the real
+> `ProcessHandleImpl` (`p60_real_handle_for`,
+> `native-builtins/src/phases_late.rs:2416`; `p60_delegate_to_real_handle`,
+> `:2444`), which is the better answer because it passes the real
+> implementation's exceptions through untouched. The one line of this patch that
+> DID land verbatim is the `commandLine` registration, now at
+> `phases_late.rs:2826`. The one thing it prescribes that is still LIVE is the
+> Windows `destroy()`/`destroyForcibly()` route through `signal_pid` — see the
+> status block at the top of this record. Kept below as the record of the census.
 
 Owned by another lane this wave; recorded here with the exact code rather than
 described. The four fabricated bodies in
