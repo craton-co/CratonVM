@@ -810,6 +810,10 @@ pub const INVENTORY: &[E] = &[
     // CORRECTNESS; off is a measurement configuration only, for pricing the
     // seal's ceiling. Never ship with it off.
     E { group: Group::JIT, token: "native-shadow-caller-seal", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL"), off_key: None, off_word: Some("0") },
+    // The POSITIVE half of `execute()`'s static-eligibility short-circuit.
+    // Default ON; `-gate-pass-memo` restores the pre-fix re-run-every-entry
+    // behaviour so the fix can be A/B'd in one binary. Correct either way.
+    E { group: Group::JIT, token: "gate-pass-memo", on_key: Some("CRATONVM_JIT_GATE_PASS_MEMO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "full-self-call-spill", on_key: Some("CRATONVM_JIT_FULL_SELF_CALL_SPILL"), off_key: None, off_word: None },
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },

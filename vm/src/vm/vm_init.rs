@@ -3830,6 +3830,7 @@ impl SharedVm {
                 jit_cache: JitCache::new(),
                 profile_store: ProfileStore::new(),
                 jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                jit_gate_pass: parking_lot::RwLock::new(FxHashMap::default()),
                 // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
