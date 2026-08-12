@@ -1,5 +1,22 @@
 # The preview gate had no switch, and HotSpot's nameless-class placeholder is `<Unknown>`
 
+> # NOT RETIRED 2026-08-12 (second pass). The build arrived, the falsifiers were
+> # run, and the third one found a LIVE row. See §7.
+>
+> The headline is discharged by measurement: `--enable-preview` parses, the gate
+> refuses without it and admits with it, and `PreviewFeatures.isEnabled` agrees
+> with HotSpot on **both** arms — which is the falsifier this record itself says
+> one arm cannot satisfy. §6's WILL NOT FIX on the `<Unknown>` vs `""`
+> distinction stands and was not re-opened.
+>
+> **What is live is part C on the road part C was written for.** A nameless
+> define of a 69.65535 class file renders `<Unknown>` correctly and then throws
+> the WRONG TYPE: `java.lang.ClassFormatError` wrapping a Rust `Debug` string,
+> where HotSpot throws `UnsupportedClassVersionError`. Measured identically on
+> `--jdk-only`, `--real-jdk` and the pristine-dev control, so it is pre-existing
+> rather than this wave's. Full measurement and the site in §7;
+> RETIREMENT-20260812B.md §3.1 records why this held the record back.
+
 **Status: CLOSED 2026-08-12. All four parts of W7-28's handback are APPLIED, and
 the one residual — the `<Unknown>` vs `""` nameless-define distinction — is
 ADJUDICATED WILL NOT FIX in §6, which is this record's own §3.1 argument
@@ -337,6 +354,72 @@ Unchanged from W7-28's, plus:
   `java` on **both** arms. One arm agreeing proves nothing: a hardcoded `0` also
   passes the no-flag arm, which is exactly the state this record replaces.
 * A nameless define of a 69.65535 class file must say `<Unknown>`, not blank.
+
+## 7. 2026-08-12, second pass: the three falsifiers were RUN. Two pass; the third is a live row.
+
+The build this record said it needed exists (`scratchpad/bin/cratonvm-f8.exe`,
+with `cratonvm-control-44044c7e2.exe` as the pristine-dev control). Every
+falsifier above was run against both, with HotSpot Adoptium 25.0.3.9 beside
+them, on a `69.0` class file with bytes 4..5 overwritten to `FF FF`.
+
+**Falsifier 1 — the flag and the gate. PASSES.**
+
+```
+HotSpot                    -> UnsupportedClassVersionError: Preview features are not enabled for Q (class file version 69.65535). Try running with '--enable-preview'
+HotSpot --enable-preview   -> ran-Q
+f8                         -> linkage error: Preview features are not enabled for Q (class file version 69.65535). Try running with '--enable-preview'
+f8 --enable-preview        -> ran-Q
+```
+
+`--enable-preview` parses where §2 measured `error: unexpected argument`, the
+gate refuses, and the sentence is HotSpot's word for word. The control binary
+behaves the same, so parts A/B/C were already on `dev` at `44044c7e2`.
+
+**Falsifier 2 — the two bits must agree, and one arm proves nothing. PASSES.**
+`jdk.internal.misc.PreviewFeatures.isEnabled`, reflected through
+`--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED`: `false` without the
+flag and `true` with it — on HotSpot, on `--real-jdk` and on `--jdk-only`.
+
+**Falsifier 3 — `<Unknown>`. The TEXT passes. The TYPE does not, and that is a
+live defect.** `ClassLoader.defineClass(null, b, 0, b.length)` over the same
+bytes, which §3 established is the reachable analogue of JNI `DefineClass` with
+a NULL name:
+
+```
+HotSpot : java.lang.UnsupportedClassVersionError: Preview features are not enabled for <Unknown> (class file version 69.65535). Try running with '--enable-preview'
+f8      : java.lang.ClassFormatError: : defineClass1: Linkage(UnsupportedClassVersionError { class_name: "", message: "Preview features are not enabled for <Unknown> (class file version 69.65535). Try running with '--enable-preview'" })
+```
+
+Identical on `--jdk-only`, on `--real-jdk` and on the control — **pre-existing,
+not this wave's**, and not the `<Unknown>` vs `""` question §6 declined.
+
+**The site.** §4(C) fixed the mapping at `class_manager.rs`, which is the
+main-class road. The `ClassLoader.defineClass` road re-wraps below it:
+`native_classloader_define_class1` (`native-builtins/src/lang_system.rs:5011`)
+ends every failure arm with
+
+```rust
+Err(define_class_format_error(&name, "defineClass1", msg))
+```
+
+so a typed `LinkageError::UnsupportedClassVersionError` is flattened back into
+`ClassFormatError` — the very collapse this record's §1 table lists as verified
+("`class_manager.rs:5252` maps every reader error to `ClassFormatError`") — and
+a Rust `Debug` rendering is carried into a Java exception message, `class_name`
+field and all. `defineClass2` (`:5016`) takes the same tail.
+
+**Why it matters more than a spelling.** A caller catching
+`UnsupportedClassVersionError` — which is what every container does when it
+probes whether it can load a bundle, and exactly the `catch` HotSpot's message
+invites — does not catch this. §4(C)'s exhaustiveness census over `match`es on
+`LinkageError` was correct and is not the gap; the gap is a road that does not
+propagate the enum at all.
+
+**Not fixed here** (this pass adjudicates records and does not build), and
+deliberately **not given a new record number**: two other lanes were running and
+`W7-94` would collide. The fix is to give `define_class_format_error` a
+pass-through for an already-typed `VmError::Linkage`, and it needs the same
+exhaustiveness care §4(C) applied — plus a falsifier, which this section now is.
 
 ## What is not claimed
 

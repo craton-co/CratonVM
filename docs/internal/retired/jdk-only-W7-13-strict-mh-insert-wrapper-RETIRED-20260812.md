@@ -1,5 +1,25 @@
 # `__mh_insert_wrapper__` — ten combinator carriers went through the wrong door
 
+> # RETIRED-FIXED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence: this record's own falsifier, run on the rebuilt binary.**
+> RETIREMENT-20260812B.md §1.2. `MhFamilyProbe` re-created from the table below
+> and run three ways — HotSpot 25, `cratonvm-f8 --jdk-only`, pristine-dev
+> control — gives **12 of 12 identical to HotSpot** where this record measured
+> ten `NoClassDefFoundError`s, and `--jdk-only-report` over that run holds
+> **zero** rows whose `class` begins `__mh_`. A green `RJdkHandles` was
+> deliberately NOT accepted as the evidence, for the reason *How to falsify
+> this* gives.
+>
+> **Both "observed on the way" rows are closed too, measured not assumed:**
+> `asCollector` under `--real-jdk` answers HotSpot's `6`, and `bindTo` on a
+> leading `int` refuses with HotSpot's exact `IllegalArgumentException: no
+> leading reference parameter` on both arms.
+>
+> **The one open row was transplanted, not dropped.** The second, disagreeing
+> `java/lang/invoke/MethodHandle` slot map in `classloader.rs` is now stated
+> inline in W7-19-methodhandles-compatible-residuals.md §5.2.1, which is live.
+
 **Status: DIAGNOSED and FIXED IN SOURCE 2026-08-11. NOT REBUILT.** Every
 measurement below was taken by running the already-built `dev` binary at
 `C:/craton/CratonVM/target/release/cratonvm.exe`; nothing in this record claims

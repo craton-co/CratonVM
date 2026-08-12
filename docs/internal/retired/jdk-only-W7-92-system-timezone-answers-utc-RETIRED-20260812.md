@@ -1,5 +1,26 @@
 # W7-92 — the system time zone answered `UTC` on every host, and it is the other two bytes of `RJdkLogging`
 
+> # RETIRED-FIXED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.8, measured — not the `PASS`, which
+> §6 of this record correctly warns is not the judge. `defaultZoneRawOffsetMs`
+> moves **0 → -10800000**, matching HotSpot, and `TimeZone.getDefault().getID()`
+> is `America/Buenos_Aires` on `f8` in **both** modes against `UTC` on the
+> pristine-dev control.
+>
+> **§6's prediction of `179` is superseded, and the reasoning it gives is why.**
+> Measured at 14:xx local, HotSpot and `f8` both read `streamBytes=177` /
+> `handlerLevelGate bytes=88`: the 12-hour field is one digit on every VM at
+> this hour, so `H=1` for the broken and the fixed alike and the whole
+> `175 → 177` movement is W7-91's month name. A lane that had pinned 179 would
+> have read a correct run as a failure. **Do not pin the number.**
+>
+> **§7's open question is SETTLED: the named IANA id resolves**, so it is the
+> `getTimeZone(zoneID, false)` route and not the `getSystemGMTOffsetID`
+> fallback — which means the Round-13-era `lib.rs` comment claiming
+> `ZoneInfoFile`'s `<clinit>` cannot load `tzdb.dat` under `--jdk-only` is
+> **stale** and should be retired by that file's owner.
+
 **Status: SOURCE LANDED, NOT BUILT and NOT RE-RUN.** This lane could not build,
 could not run the suite, and could not run a VM or a `java`. Everything below is
 either source-verified (a quoted line at a named function) or a host fact read
