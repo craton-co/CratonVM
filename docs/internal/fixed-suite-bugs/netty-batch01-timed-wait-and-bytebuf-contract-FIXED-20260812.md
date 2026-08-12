@@ -251,8 +251,10 @@ Not defects introduced or missed here — filed separately:
   `known-issues/netty/unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md`,
   and the reason that pin cannot just be dropped,
   `known-issues/netty/memorysegment-asbytebuffer-unimplemented-20260812.md`.
-* `CyclicBarrier`'s barrier-action `Runnable` is silently dropped →
-  `known-issues/netty/cyclicbarrier-native-drops-barrier-action-20260812.md`.
+* `CyclicBarrier`'s barrier-action `Runnable` is silently dropped → FIXED the
+  same day, with two further defects in the same native (no generation, and a
+  registration gate on the flag rather than the mode) →
+  `netty-cyclicbarrier-synthetic-action-generation-and-mode-gate-FIXED-20260812.md`.
 * `ManagementFactory.getThreadMXBean()` is not a `com.sun.management.ThreadMXBean` →
   `known-issues/netty/threadmxbean-not-com-sun-extension-20260812.md`.
 
