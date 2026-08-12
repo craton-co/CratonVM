@@ -1829,13 +1829,58 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let len = match args.get(1) {
+            // The BYTES, not just their count. `allocateFrom(String)` is
+            // specified to return a segment CONTAINING the NUL-terminated UTF-8
+            // encoding, and a downcall dereferences it.
+            let mut bytes = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
-                    ctx.read_string(*s).map(|t| t.len() as i64 + 1).unwrap_or(1)
+                    ctx.read_string(*s).unwrap_or_default().into_bytes()
                 }
-                _ => 1,
+                _ => Vec::new(),
             };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)?))))
+            bytes.push(0);
+            let len = bytes.len() as i64;
+            // Allocate through the SAME path as `Arena.allocate(long, long)`, so
+            // the segment carries a real off-heap base in the `[0]=ptr, [1]=size`
+            // layout every reader expects.
+            //
+            // `p67_arena_segment` did neither: it allocated NO memory
+            // (`set_field(segment, 1, Long(0)) // address`) and wrote the SIZE
+            // into slot 0 — the inverse of the convention
+            // `panama_libffi::segment_address` and `pe_arena_allocate_impl` use.
+            // So `segment_address` fell through to `get_field(seg, 0)`, read
+            // `Long(5)` — the byte length of "abcd\0" — and libffi passed 5 as
+            // the `char *`. `strlen` then dereferenced address 0x5.
+            //
+            // Measured 2026-08-12: the same object reported `byteSize() == 0`
+            // and `address() == 5`, inverted on both. The downcall carrier,
+            // `invoke` dispatch, CIF build and return unmarshal were all correct
+            // — a positive control building the argument with `allocate(5)` plus
+            // explicit stores returns `strlen(abcd) == 4`, matching HotSpot.
+            let seg = match crate::panama::pe_arena_allocate(
+                ctx,
+                &[Value::Object(Some(this)), Value::Long(len), Value::Long(1)],
+            )? {
+                Some(Value::Object(Some(seg))) => seg,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "Arena.allocateFrom could not allocate a segment".into(),
+                    }
+                    .into())
+                }
+            };
+            match p67_segment_parts(ctx, seg, 0, len) {
+                Some((ptr, _)) => unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                },
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "Arena.allocateFrom segment is not writable".into(),
+                    }
+                    .into())
+                }
+            }
+            Ok(Some(Value::Object(Some(seg))))
         },
     );
     r.register(arena, "close", "()V", |ctx, args| {

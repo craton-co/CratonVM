@@ -272,6 +272,14 @@ where
         }
         .into());
     }
+    // Null and alignment are NOT sufficient. A tagged arena handle
+    // (`Unsafe.allocateMemory`, hence every direct `ByteBuffer` address) is
+    // both non-null and 8-aligned, so it walked through the two checks above
+    // and was then CALLED — a jump to an address that is a Rust-side arena key
+    // rather than code. Same for a callee address in the unmappable low
+    // window. `checked_foreign_addr` is the one screen both this and the
+    // argument path in `panama_libffi::marshal_arg` share.
+    crate::panama_libffi::checked_foreign_addr(fn_addr, "downcall target")?;
     // SAFETY: We have verified the address is non-null and properly aligned.
     // The caller is responsible for ensuring the address points to a valid
     // extern "C" function with the expected signature.

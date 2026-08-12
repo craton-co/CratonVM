@@ -54,6 +54,73 @@ use cratonvm_types::{
 /// registers plus some headroom for stack-passed aggregates.
 pub const MAX_STRUCT_BYTES: usize = 4096;
 
+/// Bit 62 — the tag `unsafe_natives_ext.rs`'s `unsafe_arena::ARENA_TAG` ORs
+/// into every handle its arena store hands out.
+///
+/// **Duplicated deliberately.** The authoritative constant is `pub(super)`
+/// inside a private module of `unsafe_natives_ext.rs` and is not importable
+/// from here; see the residual filed against this lane for exporting it. Its
+/// contract is what matters and it is documented as permanent: the tag "is part
+/// of the address value end-to-end — it is NEVER stripped", so a tagged handle
+/// is a Rust-side arena key, not a machine address, and dereferencing one
+/// always faults.
+const ARENA_HANDLE_TAG: i64 = 1 << 62;
+
+/// Lowest address any platform CratonVM targets will map.
+///
+/// Windows reserves the low 64 KiB of every process's address space, and Linux
+/// enforces `vm.mmap_min_addr` (64 KiB on the distributions we test). Nothing
+/// below this can be a real mapping — but it IS exactly what a segment carrier
+/// that stored its byte SIZE where its base pointer belongs yields, which is
+/// the shape that made `Arena.allocateFrom(String)` hand `strlen` the pointer
+/// `0x5`.
+const MIN_MAPPED_ADDR: i64 = 0x1_0000;
+
+/// Screen an address that is about to be dereferenced by native code — either
+/// by us (struct-by-value copy) or by the callee (pointer argument).
+///
+/// **Why this exists.** Everything downstream of here is a raw machine access
+/// with no recovery: a bad pointer is a SIGSEGV inside libffi or inside the
+/// foreign function, with no Java exception and no stack. Two classes of bad
+/// pointer are *statically* known to be bad, and both were reachable:
+///
+///  * a **tagged arena handle** ([`ARENA_HANDLE_TAG`]). `Unsafe.allocateMemory`
+///    returns one of these, so every direct `ByteBuffer`'s `address` is one —
+///    measured: `MemorySegment.ofBuffer(ByteBuffer.allocateDirect(32))` reports
+///    `0x4000001000000000`. Handing that to a callee is a guaranteed fault.
+///  * an address in the **unmappable low window** ([`MIN_MAPPED_ADDR`]), which
+///    is what a size-for-base carrier mix-up produces.
+///
+/// `0` is NOT screened here: a null pointer is a legitimate C argument and the
+/// callers that cannot accept one reject it themselves.
+///
+/// Refusing is strictly better than the crash it replaces — the caller gets a
+/// Java exception naming the step instead of losing the VM.
+pub(crate) fn checked_foreign_addr(addr: i64, what: &str) -> Result<i64, MethodCallFailed> {
+    if addr & ARENA_HANDLE_TAG != 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "Panama {what}: address {addr:#x} is a CratonVM arena handle, not a machine \
+                 address (tag bit 62 set). It cannot be dereferenced by native code. This \
+                 segment is backed by Unsafe.allocateMemory (e.g. a direct ByteBuffer), which \
+                 CratonVM does not yet expose to foreign calls."
+            ),
+        }
+        .into());
+    }
+    if addr > 0 && addr < MIN_MAPPED_ADDR {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "Panama {what}: address {addr:#x} lies in the reserved low {MIN_MAPPED_ADDR:#x} \
+                 bytes of the address space and can never be a valid mapping. The MemorySegment \
+                 carrier is reporting a byte size or an offset where its base pointer belongs."
+            ),
+        }
+        .into());
+    }
+    Ok(addr)
+}
+
 /// Maximum number of fields we will recurse through when translating
 /// nested aggregate layouts. Bounds runaway recursion from a malformed
 /// or hostile descriptor.
@@ -447,6 +514,11 @@ pub fn marshal_arg(
                 Value::Int(n) => *n as i64,
                 _ => 0,
             };
+            // The CALLEE dereferences this one, so a bad value faults inside
+            // foreign code where we can neither catch nor report it. Screen it
+            // here, where a refusal is still a Java exception. Null passes: it
+            // is a legitimate C argument.
+            let v = checked_foreign_addr(v, "downcall pointer argument")?;
             // Address is sizeof(usize); use ptr layout.
             mk((v as usize).to_ne_bytes().to_vec())
         }
@@ -478,6 +550,10 @@ pub fn marshal_arg(
                 }
                 .into());
             }
+            // WE dereference this one, in the `copy_nonoverlapping` below. Same
+            // screen, same reason — an unmappable or tagged base takes the VM
+            // down inside our own code rather than the callee's.
+            let addr = checked_foreign_addr(addr, "struct-by-value MemorySegment base")?;
             let mut bytes = vec![0u8; total];
             // SAFETY: `addr` was sourced from a live MemorySegment field.
             // The segment's owning Arena keeps the backing memory valid
@@ -903,6 +979,68 @@ mod tests {
         };
         // The pointer should be usable.
         assert!(!slot.as_ptr().is_null());
+    }
+
+    /// A tagged arena handle must never reach native code.
+    ///
+    /// `0x4000_0010_0000_0000` is not a hypothetical: it is the address
+    /// `MemorySegment.ofBuffer(ByteBuffer.allocateDirect(32))` reports on this
+    /// VM, measured. It is non-null and 16-aligned, so every pre-existing
+    /// screen passed it through to be dereferenced.
+    #[test]
+    fn tagged_arena_handle_is_refused() {
+        let tagged = ARENA_HANDLE_TAG | 0x10_0000_0000;
+        let err = checked_foreign_addr(tagged, "downcall pointer argument")
+            .expect_err("a tagged arena handle must be refused, not dereferenced");
+        match err {
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::IllegalStateException { message },
+            )) => {
+                assert!(
+                    message.contains("arena handle"),
+                    "message must name the cause: {message}"
+                );
+            }
+            other => panic!("expected IllegalStateException, got {other:?}"),
+        }
+    }
+
+    /// The exact shape that segfaulted: `Arena.allocateFrom("abcd")` handed
+    /// `strlen` the pointer `0x5` — the segment's byte SIZE read out of the
+    /// slot its base pointer belongs in.
+    #[test]
+    fn unmappable_low_address_is_refused() {
+        assert!(
+            checked_foreign_addr(5, "downcall pointer argument").is_err(),
+            "an address in the reserved low window must be refused"
+        );
+        assert!(
+            checked_foreign_addr(MIN_MAPPED_ADDR - 1, "downcall pointer argument").is_err(),
+            "the top of the reserved low window must still be refused"
+        );
+    }
+
+    /// The screen must not fire on the values a working downcall uses: a null
+    /// pointer is a legitimate C argument, and a real mapping passes.
+    #[test]
+    fn null_and_real_addresses_pass() {
+        assert_eq!(
+            checked_foreign_addr(0, "downcall pointer argument").ok(),
+            Some(0),
+            "NULL is a legitimate C pointer argument"
+        );
+        let buf = [0u8; 8];
+        let real = buf.as_ptr() as i64;
+        assert_eq!(
+            checked_foreign_addr(real, "downcall pointer argument").ok(),
+            Some(real),
+            "a genuine mapping must pass the screen"
+        );
+        assert_eq!(
+            checked_foreign_addr(MIN_MAPPED_ADDR, "downcall pointer argument").ok(),
+            Some(MIN_MAPPED_ADDR),
+            "the screen is exclusive at its lower bound"
+        );
     }
 
     #[test]
