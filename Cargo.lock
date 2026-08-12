@@ -610,6 +610,7 @@ dependencies = [
  "parking_lot",
  "rustc-hash",
  "socket2",
+ "tracing",
 ]
 
 [[package]]

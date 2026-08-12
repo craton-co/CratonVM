@@ -1,0 +1,14 @@
+# hibernate-reactive — FAIL/HANG classes needing investigation (index)
+
+**71 unique classes** (union of FAIL/HANG across all 3 GC-variant runs, 2026-08-12), split into 6 pages of up to 12 classes each so multiple people can pick up a page without duplicating work. **No investigation done here** — this is a raw class list plus a repro command template; each page's classes are its own to investigate, not shared with any other page.
+
+Found during a **partial** 3-GC-variant (default/G1/ZGC) PostgreSQL run on Azure host `azureuser@20.80.105.49` (stopped early after ~15-28min once a dominant blocker was identified — see `docs/known-issues/hibernate-reactive/vertx-pg-sasl-scram-handshake-fails-20260812.md`). **Most of these classes are LIKELY hitting that same SASL/SCRAM handshake bug** (it blocks session-open for virtually every DB-required test), but that has NOT been confirmed per-class — each class here still needs its own check to rule out a distinct, unrelated defect hiding behind the dominant one. "status seen" reflects what each GC variant's partial run actually recorded before it was stopped; the 3 variants did not all reach the same point in the class list (G1 got further, ~77 classes attempted vs ~28-29 for default/zgc), so absence from a variant's column means "not reached," not "passed." A class showing both FAIL and HANG across variants (`FAIL/HANG`) is raw observed flakiness near the run's stop point, not yet explained. Also set `DOCKER_HOST=unix:///var/run/docker.sock` before reproducing (works around a separate, already-documented JNA NPE in Testcontainers' Docker-strategy probe — `docs/known-issues/hibernate-reactive/jna-native-clinit-nativeversion-npe-20260812.md` — without it you'll hit that bug instead of reaching these classes at all).
+
+## Pages
+
+- [batch 01](investigate-batch-01.md) — 12 classes (org.hibernate.reactive.BatchFetchTest .. org.hibernate.reactive.CascadeTest)
+- [batch 02](investigate-batch-02.md) — 12 classes (org.hibernate.reactive.CollectionStatelessSessionListenerTest .. org.hibernate.reactive.EagerElementCollectionForBasicTypeSetTest)
+- [batch 03](investigate-batch-03.md) — 12 classes (org.hibernate.reactive.EagerElementCollectionForEmbeddableEntityTypeMapTest .. org.hibernate.reactive.EmbeddedIdWithManyEagerTest)
+- [batch 04](investigate-batch-04.md) — 12 classes (org.hibernate.reactive.EmbeddedIdWithManyTest .. org.hibernate.reactive.GeneratedPropertySingleTableTest)
+- [batch 05](investigate-batch-05.md) — 12 classes (org.hibernate.reactive.GeneratedPropertyUnionSubclassesTest .. org.hibernate.reactive.IdentityGeneratorTypeTest)
+- [batch 06](investigate-batch-06.md) — 11 classes (org.hibernate.reactive.IdentityGeneratorWithColumnTransformerTest .. org.hibernate.reactive.LazyOrderedElementCollectionForEmbeddableTypeListTest)

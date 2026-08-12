@@ -2,11 +2,13 @@
 
 **Status:** OPEN (2026-08-12). Found on Windows (`C:\craton\CratonVM`) during a
 3-GC-variant (default/G1/ZGC) full-suite (657-class) run of the netty test
-suite, built from an isolated worktree at commit `70c8b8cd6`.
+suite, built from an isolated worktree at commit `70c8b8cd6`. All 3
+variants completed (~87min each); results below are from the completed
+runs, not partial data.
 
 ## Symptom
 
-Four classes crash the CratonVM process outright (no stdout/stderr, no
+Five classes crash the CratonVM process outright (no stdout/stderr, no
 Java exception — the process dies with SIGSEGV, `rc=139`, before any
 `@@RESULT` line is emitted):
 
@@ -14,16 +16,23 @@ Java exception — the process dies with SIGSEGV, `rc=139`, before any
 - `io.netty.handler.codec.compression.Lz4FrameDecoderTest`
 - `io.netty.handler.codec.compression.ByteBufChecksumTest`
 - `io.netty.handler.codec.http.HttpContentDecoderTest`
+- `io.netty.test.udt.nio.NioUdtByteRendezvousChannelTest`
 
 ```
 run-netty-suite.sh: line 247: <pid> Segmentation fault  CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout 60 <cv> ... CratonRunner <class>
 status: CRASH=1  sum_class_ms=0
 ```
 
-All 4 reproduced identically in every one of the 3 GC-variant shard runs
-(default/G1/ZGC — GC-independent), and each was individually re-run in
+All 5 reproduced **identically in all 3 completed GC-variant full runs**
+(default/G1/ZGC — same 5 classes, byte-for-byte, in every variant, so this
+is GC-independent), and the first 4 were also individually re-run in
 isolation (`--shards 1`, single class) to rule out shard-contention
-artifacts: **deterministic crash every time**, all 4 classes.
+artifacts: **deterministic crash every time**. The 5th
+(`NioUdtByteRendezvousChannelTest`, netty's UDT — UDP-based Data Transfer —
+native transport, backed by the `barchart-udt` JNI library) surfaced in the
+full run after the doc was first drafted from partial data; it fits the
+same JNI-native-library hypothesis below even more directly than the
+first four, since UDT has no pure-Java fallback at all.
 
 ## HotSpot-clean confirmation
 
@@ -62,11 +71,46 @@ scaffolding) would help isolate loader-time vs. call-time failure.
 
 ## Impact
 
-Only 4/657 classes crash outright, but a process-level SIGSEGV is more
+Only 5/657 classes crash outright, but a process-level SIGSEGV is more
 severe than a normal test failure — it kills the entire fork (no partial
 results for that class) and, if this pattern extends to any JNI-native-
 library-dependent code in a real application (not just these test
 classes), would be a hard crash rather than a graceful failure.
+
+Full-suite results, all 3 GC variants (657 classes each, ~87min wall each):
+
+| variant | PASS | FAIL | HANG | CRASH | ABORTED | NOTESTS |
+|---|---|---|---|---|---|---|
+| default (`-XX:+UseGenerationalGC`) | 425 | 131 | 50 | 5 | 8 | 38 |
+| g1 (`-XX:+UseG1GC`) | 425 | 126 | 55 | 5 | 8 | 38 |
+| zgc (`-XX:+UseZGC`) | 427 | 130 | 49 | 5 | 8 | 38 |
+
+The near-identical distribution across all 3 GC variants (CRASH, ABORTED,
+NOTESTS counts are *exactly* identical; PASS/FAIL/HANG vary by only a few
+classes) indicates the FAIL/HANG buckets are largely GC-independent —
+i.e. algorithmic/harness-classpath issues rather than GC-triggered
+correctness bugs. Not yet individually triaged (~130 FAIL and ~50 HANG
+classes per variant); this doc covers only the fully-verified CRASH
+bucket. The FAIL bucket needs its own pass (dedupe by exception
+signature — the harness's own auto-extracted `sig` column was empty for
+119/131 default-variant FAILs, so this needs a raw-log read, not just a
+tsv scan) with a HotSpot cross-check per distinct signature before any of
+it can be called a confirmed CratonVM bug.
+
+**HANG bucket, partial characterization**: 25 of the ~50 HANG classes per
+variant cluster in `io.netty.buffer` (allocator/pooled-ByteBuf test
+classes with large parameterized/combinatorial method counts). Sampled one
+(`PooledByteBufAllocatorTest`) at a 600s timeout instead of the suite's
+180s default: it completed in **202s** (`ABORTED=1`, matching HotSpot's
+result type), vs HotSpot's **17s** for the same class — so this is **not**
+a true hang/deadlock, it's a ~12x throughput gap that happens to cross the
+180s cutoff. Only 1 of 25 `io.netty.buffer` HANGs has been checked this
+way; treat the rest as *likely* the same throughput-gap pattern, not
+confirmed individually. The 16 `io.netty.handler.codec` HANGs and the
+remaining smaller clusters (`util.concurrent`, `resolver.dns`,
+`handler.ssl`, `handler.pcap`) haven't been sampled at all and could be
+genuine hangs rather than slowness — don't assume the same explanation
+without checking.
 
 ## Repro
 
