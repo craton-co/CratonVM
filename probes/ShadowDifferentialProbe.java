@@ -47,8 +47,156 @@ import java.util.regex.Pattern;
  */
 public class ShadowDifferentialProbe {
 
+    // =======================================================================
+    // THE OBSERVABLE LEDGER
+    // =======================================================================
+    //
+    // W7-42. Two of the fourteen residual "divergences" on this probe were
+    // holes in the probe, not in the VM. Five observables
+    // (`ArrayDeque.addNull`, `addFirstNull`, `offerNull`,
+    // `sizeAfterRefusedNulls`, `COW.addAllAbsent`) were present on the HotSpot
+    // side and simply ABSENT on the CratonVM side — not a different value, no
+    // line at all — while the enclosing sections ran to completion and the
+    // fence never fired. The cause is recorded in
+    // W7-42-differential-instrument-holes.md: the two sides were not running
+    // the same class file. W7-33 excised those five statements into a
+    // scratchpad copy so the dead sections could be measured on an unfixed
+    // binary, and the next run compiled HotSpot from the tree and CratonVM
+    // from the copy. Nothing threw, so nothing could be reported.
+    //
+    // A missing line is the worst possible failure for a differential: an
+    // absent row reads as agreement everywhere a reader scans for `<`/`>`
+    // PAIRS, and the fence — which exists to turn truncation into one marker
+    // — is blind to it by construction, because the fence can only see
+    // throws.
+    //
+    // So the probe no longer relies on control flow reaching a `line(..)`
+    // call. Every section DECLARES the observables it owes (`manifest()`
+    // below), `line(..)` ticks them off, and the end of the section prints
+    // `MISSING-OBSERVABLE=<name>` for every one still owed. The declaration
+    // and the statement are separate text, which is the whole point: deleting
+    // the statement — or running a side whose source never had it — leaves
+    // the declaration behind to accuse it.
+    //
+    // The ledger is deliberately built out of `String[]`, `boolean[]` and
+    // `String.equals` only. This probe exists to test `java.util`; an
+    // instrument that stores its own bookkeeping in a `LinkedHashSet` is a
+    // variable of the comparison it is running, and would report a clean run
+    // whenever the collection it depends on is the thing that is broken.
+
+    /** Section names, in registration order. */
+    static final String[] SEC_NAME = new String[64];
+    /** Observables each section owes, parallel to {@link #SEC_NAME}. */
+    static final String[][] SEC_KEYS = new String[64][];
+    /** Whether each section was actually entered. */
+    static final boolean[] SEC_RAN = new boolean[64];
+    static int secCount = 0;
+
+    /** Index into {@link #SEC_NAME} of the section currently running, or -1. */
+    static int curSec = -1;
+    /** Per-key tick marks for the running section, parallel to its key array. */
+    static boolean[] curSeen = null;
+
+    /** Every key emitted so far, for cross-section duplicate detection. */
+    static final String[] EMITTED = new String[4096];
+    static int emittedCount = 0;
+
+    static int missingCount = 0;
+    static int undeclaredCount = 0;
+    static int duplicateCount = 0;
+    static int multilineCount = 0;
+    static int unrenderableCount = 0;
+
+    /** Declare the observables one section owes. Called only from {@link #manifest()}. */
+    static void declare(String section, String... names) {
+        if (secCount >= SEC_NAME.length) {
+            System.out.println("MANIFEST-OVERFLOW=" + section);
+            return;
+        }
+        SEC_NAME[secCount] = section;
+        SEC_KEYS[secCount] = names;
+        secCount++;
+    }
+
+    static int sectionIndex(String name) {
+        for (int i = 0; i < secCount; i++) {
+            if (SEC_NAME[i].equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * One observable is ONE transcript line, always, and every emitted key is
+     * reconciled against the manifest.
+     *
+     * Three things happen here that did not before, each closing a way a row
+     * could go missing or a foreign row could be mistaken for one:
+     *
+     *   1. A `toString` that throws no longer takes the rest of the section
+     *      with it. It prints `<toString-threw:Type>` — a value, which diffs —
+     *      instead of unwinding to the fence and turning ~40 later observables
+     *      into absence.
+     *   2. A value containing a newline is ESCAPED. An un-escaped one splits a
+     *      single observable across several transcript rows and shifts the
+     *      alignment of every row after it, which is precisely the corruption
+     *      the leaked `[SUREFIRE-NPE]` frames caused on the CratonVM side.
+     *   3. The key is ticked off the running section's manifest, and reported
+     *      if it was never declared or has already been emitted.
+     */
     static void line(String k, Object v) {
-        System.out.println(k + "=" + v);
+        String s;
+        try {
+            s = String.valueOf(v);
+        } catch (Throwable t) {
+            s = "<toString-threw:" + t.getClass().getName() + ">";
+            unrenderableCount++;
+        }
+        if (s == null) {
+            s = "null";
+        }
+        if (s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0) {
+            multilineCount++;
+            s = s.replace("\r", "\\r").replace("\n", "\\n");
+        }
+        record(k);
+        System.out.println(k + "=" + s);
+    }
+
+    /** Reconcile one emitted key against the manifest. Prints only when wrong. */
+    static void record(String k) {
+        for (int i = 0; i < emittedCount; i++) {
+            if (EMITTED[i].equals(k)) {
+                duplicateCount++;
+                // A key emitted twice cannot be checked off by a set, so a LOST
+                // second occurrence would be invisible to this ledger. Zero
+                // today (measured against the 859-line HotSpot transcript);
+                // this is the ratchet that keeps it zero.
+                System.out.println("DUPLICATE-OBSERVABLE=" + k);
+                break;
+            }
+        }
+        if (emittedCount < EMITTED.length) {
+            EMITTED[emittedCount++] = k;
+        }
+        if (curSec < 0) {
+            undeclaredCount++;
+            System.out.println("UNDECLARED-OBSERVABLE=" + k + " outside-any-section");
+            return;
+        }
+        String[] names = SEC_KEYS[curSec];
+        for (int i = 0; i < names.length; i++) {
+            if (names[i].equals(k)) {
+                curSeen[i] = true;
+                return;
+            }
+        }
+        // An added `line(..)` with no matching `declare(..)` entry would
+        // re-open the hole for that row: nothing would notice it going away
+        // again. Reported so the manifest cannot silently fall behind.
+        undeclaredCount++;
+        System.out.println("UNDECLARED-OBSERVABLE=" + k + " section:" + SEC_NAME[curSec]);
     }
 
     /** Same shape as the JDK's own contract tests: value, type, and identity. */
@@ -63,6 +211,81 @@ public class ShadowDifferentialProbe {
     }
 
     public static void main(String[] args) {
+        manifest();
+        // The 63 observables below used to run INLINE in `main`, outside any
+        // section — so they were both unfenced (a throw there truncated the
+        // whole transcript with no `SECTION-DIED` marker) and unledgered.
+        // They are a section like every other now.
+        section("factoriesAndViews", ShadowDifferentialProbe::factoriesAndViews);
+        // --- Map.entry --------------------------------------------------
+        // (moved into `factoriesAndViews` below)
+        section("orderedMaps", ShadowDifferentialProbe::orderedMaps);
+        section("deques", ShadowDifferentialProbe::deques);
+        section("iteratorContracts", ShadowDifferentialProbe::iteratorContracts);
+        section("arraysFamily", ShadowDifferentialProbe::arraysFamily);
+        section("collectionsAlgorithms", ShadowDifferentialProbe::collectionsAlgorithms);
+        section("optionalAndObjects", ShadowDifferentialProbe::optionalAndObjects);
+        section("stringSurface", ShadowDifferentialProbe::stringSurface);
+        section("boxesAndParsing", ShadowDifferentialProbe::boxesAndParsing);
+        section("joinersAndBuilders", ShadowDifferentialProbe::joinersAndBuilders);
+        section("streamsSurface", ShadowDifferentialProbe::streamsSurface);
+        section("comparators", ShadowDifferentialProbe::comparators);
+        section("bitSetAndUuidAndBase64", ShadowDifferentialProbe::bitSetAndUuidAndBase64);
+
+        // ROUND 2, added 2026-08-11. The sections above found four defect
+        // families on their first run. A hit rate like that is not a verdict
+        // on those twelve families, it is a verdict on the SAMPLE: the
+        // shadowed surface is under-observed, so the highest-yield thing
+        // available is another widening. The fifteen below go at families
+        // round 1 did not reach at all, picked for one property — a native
+        // stands in front of real JDK bytecode, and a wrong answer there is
+        // QUIET. An empty view, a stored null where the spec says remove, a
+        // `false` from a bounded queue that grew anyway, a no-throw where the
+        // spec mandates a throw: none of those announce themselves, and all
+        // of them read as a pass to a caller that only iterates.
+        //
+        // FOUR disciplines hold for every one of them:
+        //   1. FENCED — `section(..)` turns a throw into one `SECTION-DIED.x`
+        //      line rather than deleting the rest of the transcript.
+        //   2. DECLARED — every observable is named in `manifest()`, and one
+        //      that does not get emitted prints `MISSING-OBSERVABLE=<name>`.
+        //      The fence only sees throws; a line lost any other way (a
+        //      skipped branch, a side compiled from different source) is
+        //      invisible to it, and that is what actually happened — see
+        //      W7-42-differential-instrument-holes.md.
+        //   3. BOUNDED — nothing here relies on an exception, or on a
+        //      collection shrinking, to terminate. Every drain, every
+        //      `Matcher.find` loop, every iterate-and-mutate carries a guard
+        //      and reports `...-after-100` rather than hanging.
+        //   4. VALUES, NOT VERDICTS — every observable prints its actual
+        //      content. `probes/JdkOnlyCollectionViewProbe` exists because an
+        //      empty view reads as a pass everywhere a caller only iterates;
+        //      a line that prints `ok` cannot diff, a line that prints
+        //      `{d=4, c=3}` can. Where a message is the observable (checked
+        //      collections, helpful NPEs, `valueOf` on a bad enum constant)
+        //      the message is printed too, via `thrownDetail`.
+        section("mapDefaults", ShadowDifferentialProbe::mapDefaults);
+        section("mapViewWriteThrough", ShadowDifferentialProbe::mapViewWriteThrough);
+        section("subListContracts", ShadowDifferentialProbe::subListContracts);
+        section("wrapperViews", ShadowDifferentialProbe::wrapperViews);
+        section("navigableEdges", ShadowDifferentialProbe::navigableEdges);
+        section("dequeEdges", ShadowDifferentialProbe::dequeEdges);
+        section("enumCollections", ShadowDifferentialProbe::enumCollections);
+        section("concurrentAndAtomic", ShadowDifferentialProbe::concurrentAndAtomic);
+        section("bigNumbers", ShadowDifferentialProbe::bigNumbers);
+        section("regexSurface", ShadowDifferentialProbe::regexSurface);
+        section("formatConversions", ShadowDifferentialProbe::formatConversions);
+        section("timeSurface", ShadowDifferentialProbe::timeSurface);
+        section("textFormatting", ShadowDifferentialProbe::textFormatting);
+        section("seededRandom", ShadowDifferentialProbe::seededRandom);
+        section("throwableSurface", ShadowDifferentialProbe::throwableSurface);
+
+        finish();
+    }
+
+    // The `java.util` factories and views. Fenced and declared like every
+    // other section since W7-42; this was `main`'s inline preamble before.
+    static void factoriesAndViews() {
         // --- Map.entry --------------------------------------------------
         Map.Entry<String, Integer> me = Map.entry("k", 7);
         entryLike("Map.entry", me);
@@ -176,75 +399,387 @@ public class ShadowDifferentialProbe {
         sub.set(0, "CHANGED");
         line("subList.writeThrough", base);
 
-        // The sections below were added 2026-08-10. Everything above is
-        // `java.util`'s factories and views, and the honest reading of "they
-        // match" was "the ones anybody looked at match" — the census counts
-        // ~1,600 inherited shadows and this probe reached a few dozen of them.
-        // Each section below is a family the census names and nothing had
-        // exercised against the bytecode it shadows.
-        // Each section is FENCED. A section that throws must not take the rest
-        // of the transcript with it: a differential that stops early cannot
-        // report a difference on any line after the one that killed it, and a
-        // truncated transcript reads exactly like a short clean run — the
-        // specific way the first two strict census runs lied. The fence prints
-        // a marker instead, so the divergence is one line rather than a
-        // hundred missing ones.
-        section("orderedMaps", ShadowDifferentialProbe::orderedMaps);
-        section("deques", ShadowDifferentialProbe::deques);
-        section("iteratorContracts", ShadowDifferentialProbe::iteratorContracts);
-        section("arraysFamily", ShadowDifferentialProbe::arraysFamily);
-        section("collectionsAlgorithms", ShadowDifferentialProbe::collectionsAlgorithms);
-        section("optionalAndObjects", ShadowDifferentialProbe::optionalAndObjects);
-        section("stringSurface", ShadowDifferentialProbe::stringSurface);
-        section("boxesAndParsing", ShadowDifferentialProbe::boxesAndParsing);
-        section("joinersAndBuilders", ShadowDifferentialProbe::joinersAndBuilders);
-        section("streamsSurface", ShadowDifferentialProbe::streamsSurface);
-        section("comparators", ShadowDifferentialProbe::comparators);
-        section("bitSetAndUuidAndBase64", ShadowDifferentialProbe::bitSetAndUuidAndBase64);
+        // Everything above is `java.util`'s factories and views, and the
+        // honest reading of "they match" was "the ones anybody looked at
+        // match" — the census counts ~1,600 inherited shadows and this probe
+        // reached a few dozen of them. The sections registered in `main` are
+        // the families the census names and nothing had exercised against the
+        // bytecode they shadow.
+    }
 
-        // ROUND 2, added 2026-08-11. The sections above found four defect
-        // families on their first run. A hit rate like that is not a verdict
-        // on those twelve families, it is a verdict on the SAMPLE: the
-        // shadowed surface is under-observed, so the highest-yield thing
-        // available is another widening. The fifteen below go at families
-        // round 1 did not reach at all, picked for one property — a native
-        // stands in front of real JDK bytecode, and a wrong answer there is
-        // QUIET. An empty view, a stored null where the spec says remove, a
-        // `false` from a bounded queue that grew anyway, a no-throw where the
-        // spec mandates a throw: none of those announce themselves, and all
-        // of them read as a pass to a caller that only iterates.
-        //
-        // Three disciplines hold for every one of them:
-        //   1. FENCED — `section(..)` turns a throw into one `SECTION-DIED.x`
-        //      line rather than deleting the rest of the transcript.
-        //   2. BOUNDED — nothing here relies on an exception, or on a
-        //      collection shrinking, to terminate. Every drain, every
-        //      `Matcher.find` loop, every iterate-and-mutate carries a guard
-        //      and reports `...-after-100` rather than hanging.
-        //   3. VALUES, NOT VERDICTS — every observable prints its actual
-        //      content. `probes/JdkOnlyCollectionViewProbe` exists because an
-        //      empty view reads as a pass everywhere a caller only iterates;
-        //      a line that prints `ok` cannot diff, a line that prints
-        //      `{d=4, c=3}` can. Where a message is the observable (checked
-        //      collections, helpful NPEs, `valueOf` on a bad enum constant)
-        //      the message is printed too, via `thrownDetail`.
-        section("mapDefaults", ShadowDifferentialProbe::mapDefaults);
-        section("mapViewWriteThrough", ShadowDifferentialProbe::mapViewWriteThrough);
-        section("subListContracts", ShadowDifferentialProbe::subListContracts);
-        section("wrapperViews", ShadowDifferentialProbe::wrapperViews);
-        section("navigableEdges", ShadowDifferentialProbe::navigableEdges);
-        section("dequeEdges", ShadowDifferentialProbe::dequeEdges);
-        section("enumCollections", ShadowDifferentialProbe::enumCollections);
-        section("concurrentAndAtomic", ShadowDifferentialProbe::concurrentAndAtomic);
-        section("bigNumbers", ShadowDifferentialProbe::bigNumbers);
-        section("regexSurface", ShadowDifferentialProbe::regexSurface);
-        section("formatConversions", ShadowDifferentialProbe::formatConversions);
-        section("timeSurface", ShadowDifferentialProbe::timeSurface);
-        section("textFormatting", ShadowDifferentialProbe::textFormatting);
-        section("seededRandom", ShadowDifferentialProbe::seededRandom);
-        section("throwableSurface", ShadowDifferentialProbe::throwableSurface);
-
-        System.out.println("PROBE-DONE");
+    // =======================================================================
+    // THE MANIFEST
+    // =======================================================================
+    //
+    // Every observable this probe owes, by section, in emission order. This is
+    // NOT documentation: it is the half of the instrument that a lost line
+    // cannot delete along with itself, because the declaration lives here and
+    // the `line(..)` call lives in the section body. The two must be edited
+    // together, and both directions are checked at runtime —
+    // `MISSING-OBSERVABLE` if a declared name never got emitted,
+    // `UNDECLARED-OBSERVABLE` if an emitted name was never declared — so the
+    // manifest cannot rot quietly in either direction.
+    //
+    // Generated from the source and reconciled against the 859-line HotSpot
+    // transcript of 2026-08-12: 858 declared names, 0 declared-not-emitted,
+    // 0 emitted-not-declared (`PROBE-DONE` aside). A manifest that were merely
+    // asserted rather than reconciled would be exactly the kind of probe that
+    // cannot fail, which is what this record is about.
+    static void manifest() {
+        declare("factoriesAndViews",
+                "Map.entry.key", "Map.entry.value", "Map.entry.toString",
+                "Map.entry.hashCode.matchesSpec", "Map.entry.equalsSelf", "Map.entry.equalsCopy",
+                "Map.entry.setValue", "new SimpleEntry.key", "new SimpleEntry.value",
+                "new SimpleEntry.toString", "new SimpleEntry.hashCode.matchesSpec",
+                "new SimpleEntry.equalsSelf", "new SimpleEntry.equalsCopy",
+                "new SimpleImmutableEntry.key", "new SimpleImmutableEntry.value",
+                "new SimpleImmutableEntry.toString",
+                "new SimpleImmutableEntry.hashCode.matchesSpec",
+                "new SimpleImmutableEntry.equalsSelf", "new SimpleImmutableEntry.equalsCopy",
+                "new SimpleEntry.equalsEqualPeer", "new SimpleEntry.equalsSymmetric",
+                "new SimpleEntry.afterSetValue", "new SimpleImmutableEntry.setValue",
+                "List.of.toString", "List.of.size", "List.of.contains", "List.of.indexOf",
+                "List.of.equalsArrayList", "List.of.hashCodeMatchesArrayList", "List.of.add",
+                "Set.of.size", "Set.of.contains", "Set.of.equalsHashSet", "Set.of.add",
+                "Map.of.size", "Map.of.get", "Map.of.containsKey", "Map.of.equalsHashMap",
+                "Map.of.put", "Map.of.sortedKeys", "Set.of.sortedElems",
+                "LinkedHashMap.entrySet.toString", "LinkedHashMap.firstEntry.key",
+                "LinkedHashMap.firstEntry.value", "LinkedHashMap.firstEntry.toString",
+                "LinkedHashMap.firstEntry.hashCode.matchesSpec",
+                "LinkedHashMap.firstEntry.equalsSelf", "LinkedHashMap.firstEntry.equalsCopy",
+                "LinkedHashMap.afterSetValue", "unmodifiableList.toString", "unmodifiableList.add",
+                "List.copyOf.toString", "Set.copyOf.size", "Map.copyOf.size", "subList.toString",
+                "subList.size", "subList.writeThrough");
+        declare("orderedMaps",
+                "TreeMap.toString", "TreeMap.firstKey", "TreeMap.lastKey", "TreeMap.firstEntry",
+                "TreeMap.floorKey", "TreeMap.ceilingKey", "TreeMap.higherKey", "TreeMap.lowerKey",
+                "TreeMap.headMap", "TreeMap.tailMap", "TreeMap.subMap", "TreeMap.descendingMap",
+                "TreeMap.descendingKeySet", "TreeMap.headMapRemoveWritesThrough",
+                "TreeMap.pollFirstEntry", "TreeMap.afterPollFirst", "TreeSet.toString",
+                "TreeSet.first", "TreeSet.last", "TreeSet.headSet", "TreeSet.tailSet",
+                "TreeSet.subSet", "TreeSet.descendingSet", "TreeSet.floor", "TreeSet.ceiling",
+                "TreeSet.pollFirst", "TreeSet.afterPollFirst", "LinkedHashMap.accessOrder",
+                "LinkedHashMap.reversedIsSupported");
+        declare("deques",
+                "ArrayDeque.toString", "ArrayDeque.peekFirst", "ArrayDeque.peekLast",
+                "ArrayDeque.pollFirst", "ArrayDeque.pollLast", "ArrayDeque.afterPolls",
+                "ArrayDeque.contains", "LinkedList.getFirst", "LinkedList.getLast",
+                "LinkedList.toString", "LinkedList.removeFirst", "LinkedList.removeLast",
+                "LinkedList.indexOf", "LinkedList.descendingIterator", "ArrayDeque.pollEmpty",
+                "ArrayDeque.peekEmpty", "ArrayDeque.removeEmpty", "ArrayDeque.elementEmpty",
+                "PriorityQueue.drainOrder");
+        declare("iteratorContracts",
+                "Iterator.removeBeforeNext", "Iterator.afterRemove", "Iterator.removeTwice",
+                "ListIterator.afterSetAdd", "ListIterator.nextIndex", "ListIterator.previousIndex",
+                "ListIterator.hasPrevious", "ListIterator.previous", "ArrayList.CME", "HashMap.CME",
+                "Iterator.exhaustedNext");
+        declare("arraysFamily",
+                "Arrays.sort", "Arrays.binarySearch", "Arrays.binarySearchMissing", "Arrays.copyOf",
+                "Arrays.copyOfRange", "Arrays.equals", "Arrays.hashCodeMatches", "Arrays.fill",
+                "Arrays.compare", "Arrays.mismatch", "Arrays.deepToString", "Arrays.deepEquals",
+                "Arrays.asListWriteThrough", "Arrays.asListAddThrows", "Arrays.stream.sum",
+                "Arrays.sortComparator", "Arrays.copyOfRangeBad", "Arrays.fillRangeBad");
+        declare("collectionsAlgorithms",
+                "Collections.sort", "Collections.max", "Collections.min", "Collections.frequency",
+                "Collections.binarySearch", "Collections.reverse", "Collections.swap",
+                "Collections.nCopies", "Collections.emptyList", "Collections.singletonList",
+                "Collections.singletonMap", "Collections.disjoint", "Collections.rotate",
+                "Collections.fill", "Collections.addAll", "Collections.unmodifiableMap.put",
+                "Collections.unmodifiableSet.add", "Collections.singletonList.set",
+                "Collections.emptyList.add", "Collections.synchronizedList",
+                "Collections.enumerationRoundTrip");
+        declare("optionalAndObjects",
+                "Optional.toStringSome", "Optional.toStringNone", "Optional.map",
+                "Optional.filterOut", "Optional.orElse", "Optional.orElseGet",
+                "Optional.orElseThrow", "Optional.getOnEmpty", "Optional.ofNullableNull",
+                "Optional.equalsSameValue", "Optional.hashCodeMatchesValue", "Optional.flatMap",
+                "Optional.ofNull", "Objects.equalsNulls", "Objects.hashCodeNull",
+                "Objects.toStringNull", "Objects.requireNonNullMsg", "Objects.hash",
+                "Objects.isNull", "Objects.requireNonNullElse", "Objects.checkIndex",
+                "Objects.compare");
+        declare("stringSurface",
+                "String.substring", "String.substringRange", "String.indexOf", "String.lastIndexOf",
+                "String.indexOfFrom", "String.replace", "String.replaceAll", "String.replaceFirst",
+                "String.splitJoin", "String.splitLimit", "String.splitNegLimit", "String.trim",
+                "String.strip", "String.isBlank", "String.repeat", "String.chars.sum",
+                "String.compareTo", "String.compareToIgnoreCase", "String.equalsIgnoreCase",
+                "String.startsWithOffset", "String.contentEquals", "String.toCharArray",
+                "String.valueOfCharArray", "String.formatted", "String.lines",
+                "String.stripLeading", "String.stripTrailing", "String.indent", "String.hashCode",
+                "String.internIdentity", "String.concatNull", "String.charAtBad",
+                "String.substringBad", "String.regionMatches", "String.codePointAt",
+                "String.length.surrogate", "String.toUpperCaseRoot", "String.matches",
+                "String.CASE_INSENSITIVE_ORDER");
+        declare("boxesAndParsing",
+                "Integer.parseInt", "Integer.parseIntRadix", "Integer.parseIntBad",
+                "Integer.toBinaryString", "Integer.toHexString", "Integer.toOctalString",
+                "Integer.MAX_VALUE", "Integer.compare", "Integer.bitCount", "Integer.reverse",
+                "Integer.highestOneBit", "Integer.numberOfLeadingZeros",
+                "Integer.valueOfCacheIdentity", "Integer.hashCode", "Long.parseLong",
+                "Long.toHexString", "Long.hashCode", "Double.parseDouble", "Double.toString",
+                "Double.compareNaN", "Double.isNaN", "Double.doubleToLongBits", "Float.toString",
+                "Boolean.parseBoolean", "Character.isLetter", "Character.toUpperCase",
+                "Character.digit", "Character.getNumericValue", "Byte.parseByte",
+                "Short.reverseBytes", "Math.floorDiv", "Math.floorMod", "Math.abs", "Math.round",
+                "Math.addExact", "Math.sqrt", "Math.pow", "String.formatIntegers",
+                "String.formatFloats", "String.formatWidth");
+        declare("joinersAndBuilders",
+                "StringBuilder.appendChain", "StringBuilder.insert", "StringBuilder.replace",
+                "StringBuilder.deleteCharAt", "StringBuilder.indexOf", "StringBuilder.reverse",
+                "StringBuilder.setLength", "StringBuilder.capacityIndependentEquals",
+                "StringBuilder.deleteBad", "StringBuilder.appendNull", "StringBuilder.appendSub",
+                "StringJoiner.empty", "StringJoiner.filled", "StringJoiner.emptyValue",
+                "StringJoiner.length");
+        declare("streamsSurface",
+                "stream.filterMapSorted", "stream.count", "stream.reduce", "stream.anyMatch",
+                "stream.allMatch", "stream.noneMatch", "stream.findFirst", "stream.limitSkip",
+                "stream.flatMap", "stream.distinct", "stream.collectJoining",
+                "stream.collectToMapSorted", "stream.groupingBySorted", "stream.summaryStats",
+                "stream.iterateLimit", "stream.generateLimit", "stream.mapToIntBoxed",
+                "stream.reuseThrows", "stream.emptyReduce", "stream.sortedComparator",
+                "stream.peekOrder");
+        declare("comparators",
+                "Comparator.compare", "Comparator.reversed", "Comparator.thenComparing",
+                "Comparator.nullsFirst", "Comparator.nullsLast", "Comparator.naturalOrderReverse",
+                "List.sortComparator", "Comparator.comparingIdentity");
+        declare("bitSetAndUuidAndBase64",
+                "BitSet.toString", "BitSet.cardinality", "BitSet.nextSetBit", "BitSet.nextClearBit",
+                "BitSet.length", "BitSet.and", "UUID.toString", "UUID.version", "UUID.variant",
+                "UUID.mostSigBits", "UUID.equalsRoundTrip", "UUID.hashCodeStable",
+                "UUID.nameUUIDFromBytes", "UUID.badString", "Base64.encode", "Base64.roundTrip",
+                "Base64.urlEncode", "Base64.decodeBad");
+        declare("mapDefaults",
+                "Map.getOrDefaultPresent", "Map.getOrDefaultAbsent", "Map.putIfAbsentPresent",
+                "Map.putIfAbsentAbsent", "Map.afterPutIfAbsent", "Map.computeIfAbsentNew",
+                "Map.computeIfAbsentExisting", "Map.computeIfAbsentNull",
+                "Map.computeIfAbsentNullCreatesNoEntry", "Map.computeIfPresentAbsent",
+                "Map.computeIfPresentNullRemoves", "Map.afterComputeIfPresentNull",
+                "Map.computeOnAbsent", "Map.computeNullRemoves", "Map.afterComputeNull",
+                "Map.mergeAbsentUsesValue", "Map.mergePresentCombines",
+                "Map.mergeNullResultRemoves", "Map.afterMergeNull", "Map.mergeNullValueThrows",
+                "Map.replacePresent", "Map.replaceAbsent", "Map.replaceThreeArgMismatch",
+                "Map.replaceThreeArgMatch", "Map.removeKeyValueMismatch", "Map.removeKeyValueMatch",
+                "Map.replaceAll", "Map.forEachOrder", "Map.finalContent", "HashMap.nullKeyGet",
+                "HashMap.nullKeyContains", "HashMap.nullValueGet", "HashMap.nullValueContainsKey",
+                "HashMap.getOrDefaultOverNullValue", "HashMap.containsValueNull", "HashMap.size",
+                "HashMap.removeNullKey", "HashMap.sizeAfterNullKeyRemove");
+        declare("mapViewWriteThrough",
+                "keySet.content", "values.content", "entrySet.content",
+                "keySet.removeWritesThrough", "values.removeWritesThrough", "keySet.removeIf",
+                "entrySet.removeIf", "keySet.seesLaterPut", "values.seesLaterPut",
+                "keySet.sizeAfterLaterPut", "entrySet.sizeAfterLaterPut", "keySet.addUnsupported",
+                "values.addUnsupported", "entrySet.setValueWritesThrough",
+                "keySet.retainAllWritesThrough", "values.clearWritesThrough",
+                "values.removeRemovesOneMapping", "entrySet.iteratorRemoveWritesThrough",
+                "keySet.equalsPlainSet", "TreeMap.keySetIsSorted");
+        declare("subListContracts",
+                "subList.content", "subList.setWritesThrough", "subList.addWritesThrough",
+                "subList.sizeAfterAdd", "subList.baseSizeAfterAdd", "subList.removeWritesThrough",
+                "subList.nestedContent", "subList.nestedClearWritesThroughToBase",
+                "subList.afterNestedClear", "subList.emptyRange", "subList.emptyRangeIsEmpty",
+                "subList.reversedRange", "subList.pastEnd", "subList.negativeStart",
+                "subList.staleSize", "subList.staleGet", "subList.staleToString",
+                "subList.staleIterator", "List.of.subList", "List.of.subList.addThrows",
+                "Arrays.asList.subList.setWritesThrough", "subList.sortWritesThrough",
+                "subList.equalsPlainList");
+        declare("wrapperViews",
+                "unmodifiableList.seesBackingWrite", "unmodifiableList.sizeAfterBackingWrite",
+                "unmodifiableList.set", "unmodifiableList.removeIf", "unmodifiableList.sort",
+                "unmodifiableList.replaceAll", "unmodifiableList.iteratorRemove",
+                "unmodifiableList.subListAdd", "unmodifiableList.equalsBacking",
+                "unmodifiableList.contentAfterAll", "unmodifiableMap.seesBackingWrite",
+                "unmodifiableMap.getAfterBackingWrite", "unmodifiableMap.entrySetSetValue",
+                "unmodifiableMap.keySetRemove", "unmodifiableMap.valuesClear",
+                "unmodifiableMap.merge", "unmodifiableMap.computeIfAbsent",
+                "unmodifiableMap.contentAfterAll", "unmodifiableSet.content",
+                "unmodifiableSet.removeAll", "unmodifiableCollection.content",
+                "unmodifiableSortedMap.content", "unmodifiableList.rewrapIsNewObject",
+                "checkedList.goodAdd", "checkedList.badAdd", "checkedList.contentAfterBadAdd",
+                "checkedList.badSet", "checkedMap.badValuePut", "checkedMap.badKeyPut",
+                "checkedMap.contentAfterBadPuts", "checkedCollection.badAdd",
+                "synchronizedCollection.content", "synchronizedMap.content",
+                "synchronizedMap.sortedKeys", "synchronizedMap.getOrDefault",
+                "Collections.emptyMap.get", "Collections.emptyIterator.hasNext",
+                "Collections.emptyIterator.next", "Collections.emptySet.equalsEmpty");
+        declare("navigableEdges",
+                "TreeMap.emptyFirstEntry", "TreeMap.emptyLastEntry", "TreeMap.emptyFloorKey",
+                "TreeMap.emptyCeilingEntry", "TreeMap.emptyPollFirstEntry",
+                "TreeMap.emptyFirstKeyThrows", "TreeMap.emptyLastKeyThrows", "TreeMap.nullKeyPut",
+                "TreeMap.nullKeyGet", "TreeSet.emptyFirstThrows", "TreeSet.emptyPollFirst",
+                "TreeMap.headMapInclusive", "TreeMap.headMapExclusive", "TreeMap.tailMapExclusive",
+                "TreeMap.subMapBothInclusive", "TreeMap.subMapBothExclusive",
+                "TreeMap.subMapReversedBounds", "TreeMap.floorEntry", "TreeMap.ceilingEntry",
+                "TreeMap.higherEntryAtLast", "TreeMap.lowerEntryAtFirst", "TreeMap.navigableKeySet",
+                "TreeMap.descendingKeySetSize", "TreeMap.firstEntryIsImmutable",
+                "TreeMap.entrySetEntryIsLive", "TreeMap.descendingWriteThrough",
+                "TreeMap.headMapPutOutOfRange", "TreeMap.contentAfterAll",
+                "TreeSet.headSetInclusive", "TreeSet.tailSetExclusive",
+                "TreeSet.subSetInclusiveExclusive", "TreeSet.higherAtLast", "TreeSet.lowerAtFirst",
+                "TreeSet.pollLast", "TreeSet.descendingWriteThrough",
+                "TreeSet.customComparatorOrder", "TreeSet.comparatorIsReported",
+                "TreeSet.customFirst", "TreeSet.headSetUnderCustomComparator",
+                "TreeSet.nullAddNaturalOrdering", "TreeSet.incomparableFirstAdd",
+                "TreeMap.comparatorNullForNaturalOrder");
+        declare("dequeEdges",
+                "ArrayDeque.addNull", "ArrayDeque.addFirstNull", "ArrayDeque.offerNull",
+                "ArrayDeque.sizeAfterRefusedNulls", "ArrayDeque.pushIsAddFirst", "ArrayDeque.pop",
+                "ArrayDeque.content", "ArrayDeque.removeFirstOccurrence",
+                "ArrayDeque.removeLastOccurrence", "ArrayDeque.descendingIterator",
+                "ArrayDeque.toArray", "ArrayDeque.clearThenIsEmpty",
+                "ArrayDeque.growsPastInitialCapacity", "ArrayDeque.getFirstOnEmpty",
+                "ArrayDeque.popOnEmpty", "LinkedList.acceptsNull", "LinkedList.peekOnEmpty",
+                "LinkedList.removeFirstOnEmpty", "LinkedList.addAtIndex",
+                "ArrayDequeAsStack.toString", "Stack.toString", "Stack.peekIsTop", "Stack.search",
+                "Stack.popOnEmpty", "PriorityQueue.peekIsHead",
+                "PriorityQueue.customComparatorDrain", "PriorityQueue.nullAdd",
+                "ConcurrentLinkedQueue.poll", "ConcurrentLinkedQueue.nullOffer",
+                "ConcurrentLinkedQueue.pollEmpty");
+        declare("enumCollections",
+                "EnumMap.ordinalOrderRegardlessOfInsertion", "EnumMap.keySet", "EnumMap.values",
+                "EnumMap.get", "EnumMap.getAbsent", "EnumMap.nullKeyPut", "EnumMap.size",
+                "EnumMap.containsValue", "EnumMap.equalsPlainHashMap", "EnumMap.removeThenSize",
+                "EnumSet.ofOrdinalOrder", "EnumSet.allOf", "EnumSet.noneOf", "EnumSet.range",
+                "EnumSet.complementOf", "EnumSet.copyOfCollection", "EnumSet.iterationIsOrdinal",
+                "EnumSet.removeReturns", "EnumSet.containsNonEnum", "EnumSet.equalsPlainSet",
+                "EnumSet.retainAll", "Enum.valueOf", "Enum.valueOfBadName", "Enum.valueOfNull",
+                "Enum.ordinal", "Enum.name", "Enum.compareTo", "Enum.valuesLength",
+                "Enum.valuesIsAFreshArray", "Enum.getDeclaringClass", "Enum.equalsIsIdentity",
+                "Enum.switchDispatch", "Enum.constantBodyApply",
+                "Enum.constantBodyClassIsEnumClass", "Enum.constantBodyDeclaringClass",
+                "EnumSet.overConstantBodies", "EnumMap.overConstantBodies", "Enum.constantBodyName");
+        declare("concurrentAndAtomic",
+                "CHM.get", "CHM.nullKeyPut", "CHM.nullValuePut", "CHM.nullKeyGet",
+                "CHM.nullValueMerge", "CHM.sizeAfterRefusedNulls", "CHM.putIfAbsentPresent",
+                "CHM.computeIfAbsent", "CHM.computeNullRemoves", "CHM.merge", "CHM.getOrDefault",
+                "CHM.sortedContent", "CHM.reduceValues", "CHM.keySetViewAdd", "CHM.newKeySet",
+                "CHM.searchKeys", "COW.content", "COW.snapshotIteratorDoesNotSeeAdds",
+                "COW.iteratorRemoveUnsupported", "COW.addIfAbsentDuplicate", "COW.addIfAbsentNew",
+                "COW.addAllAbsent", "ABQ.offerFits", "ABQ.offerWhenFullIsFalse",
+                "ABQ.sizeAfterRefusedOffer", "ABQ.remainingCapacity", "ABQ.addWhenFullThrows",
+                "ABQ.content", "ABQ.pollThenOffer", "ABQ.drainTo", "ABQ.nullOffer",
+                "ABQ.zeroCapacity", "AtomicInteger.getAndIncrement",
+                "AtomicInteger.incrementAndGet", "AtomicInteger.compareAndSetMismatch",
+                "AtomicInteger.compareAndSetMatch", "AtomicInteger.getAndUpdate",
+                "AtomicInteger.accumulateAndGet", "AtomicInteger.getAndSet",
+                "AtomicInteger.toString", "AtomicInteger.intValueOverflow", "AtomicLong.addAndGet",
+                "AtomicBoolean.compareAndSet", "AtomicReference.updateAndGet",
+                "AtomicReference.compareAndSetIsIdentity", "LongAdder.sum");
+        declare("bigNumbers",
+                "BigDecimal.toString", "BigDecimal.scale", "BigDecimal.precision",
+                "BigDecimal.unscaledValue", "BigDecimal.equalsComparesScale",
+                "BigDecimal.compareToIgnoresScale", "BigDecimal.hashCodeTracksScale",
+                "BigDecimal.setDedupes", "BigDecimal.add", "BigDecimal.subtract",
+                "BigDecimal.multiplyScaleAdds", "BigDecimal.divideExact",
+                "BigDecimal.divideNonTerminating", "BigDecimal.divideByZero",
+                "BigDecimal.divideRounded", "BigDecimal.setScaleHalfEven",
+                "BigDecimal.setScaleHalfEvenOdd", "BigDecimal.setScaleHalfUp",
+                "BigDecimal.setScaleFloorNegative", "BigDecimal.setScaleUnnecessary",
+                "BigDecimal.stripTrailingZeros", "BigDecimal.stripThenPlainString",
+                "BigDecimal.negativeZeroStrip", "BigDecimal.fromDoubleIsExact",
+                "BigDecimal.valueOfDoubleUsesToString", "BigDecimal.movePointLeft",
+                "BigDecimal.pow", "BigDecimal.intValueExactOnFraction",
+                "BigDecimal.intValueTruncates", "BigDecimal.toEngineeringString",
+                "BigDecimal.badString", "BigInteger.pow", "BigInteger.modPow", "BigInteger.gcd",
+                "BigInteger.toStringRadix", "BigInteger.fromRadixString", "BigInteger.divideByZero",
+                "BigInteger.modNegative", "BigInteger.remainderNegative", "BigInteger.shiftLeft",
+                "BigInteger.bitLengthAndCount", "BigInteger.testBit", "BigInteger.signumNegate",
+                "BigInteger.longValueExactOverflow", "BigInteger.longValueTruncates",
+                "BigInteger.badString", "BigInteger.compareTo",
+                "BigInteger.equalsAcrossConstruction");
+        declare("regexSurface",
+                "Matcher.groupBeforeFindThrows", "Matcher.startBeforeFindThrows", "Matcher.find1",
+                "Matcher.find2", "Matcher.findExhausted", "Matcher.groupCount",
+                "Matcher.groupAfterFailedFind", "Matcher.resetRestartsFind",
+                "Matcher.groupIndexPastGroupCount", "Matcher.findAllBounded", "Matcher.namedGroups",
+                "Matcher.unmatchedOptionalGroupIsNull", "Matcher.matchesVsFind",
+                "Matcher.lookingAt", "Matcher.hitEnd", "Matcher.replaceAllBackref",
+                "Matcher.replaceFirst", "Matcher.appendReplacement", "Matcher.quoteReplacement",
+                "Matcher.badReplacementRef", "Matcher.results", "Pattern.quoteDefeatsMetachars",
+                "Pattern.splitLimit2", "Pattern.splitDropsTrailingEmpties",
+                "Pattern.splitKeepsTrailingEmpties", "Pattern.splitZeroWidth",
+                "Pattern.splitLeadingEmpty", "Pattern.badSyntax", "Pattern.caseInsensitiveFlag",
+                "Pattern.dotallFlag", "Pattern.multilineFlag", "Pattern.matchesStatic",
+                "Pattern.asPredicate", "Pattern.asMatchPredicate", "Pattern.toStringIsThePattern",
+                "Pattern.backreference", "Pattern.lookahead", "Pattern.lookbehind",
+                "Pattern.unicodeClass", "Pattern.greedyVsReluctant");
+        declare("formatConversions",
+                "format.sNull", "format.sUpper", "format.sPrecisionTruncates",
+                "format.booleanOfNullAndObject", "format.charFromCharAndInt",
+                "format.charFromSupplementary", "format.grouping", "format.parenthesisedNegative",
+                "format.zeroPadNegativeFloat", "format.zeroPadInt", "format.argumentIndex",
+                "format.previousArgument", "format.literalPercent", "format.hexAndOctal",
+                "format.hexOfNegative", "format.scientific", "format.general", "format.hexFloat",
+                "format.floatSpecials", "format.floatRoundingHalfUp", "format.bigDecimalPrecision",
+                "format.bigInteger", "format.widthOnNull", "format.plusFlag",
+                "format.unknownConversion", "format.missingArgument", "format.wrongArgumentType",
+                "format.illegalFlagCombination", "format.precisionOnInteger", "format.localeUS",
+                "format.localeGermany", "format.localeFrance", "format.formatterAppendable");
+        declare("timeSurface",
+                "LocalDate.toString", "LocalDate.plusMonthsClampsToShorterMonth",
+                "LocalDate.plusMonthsNonLeapYear", "LocalDate.plusMonthsIsNotThirtyDays",
+                "LocalDate.roundTripIsNotIdentity", "LocalDate.plusDaysAcrossYear",
+                "LocalDate.minusYearsFromLeapDay", "LocalDate.isLeapYear",
+                "LocalDate.lengthOfMonth", "LocalDate.dayOfWeek", "LocalDate.dayOfYearAfterLeapDay",
+                "LocalDate.month", "LocalDate.withDayOfMonthOutOfRange", "LocalDate.ofBadMonth",
+                "LocalDate.ofFeb30", "LocalDate.parseBadDay", "LocalDate.parseUnpadded",
+                "LocalDate.compareAndEquals", "LocalDate.until", "ChronoUnit.daysBetween",
+                "ChronoUnit.monthsBetweenIsWhole", "YearMonth.atEndOfMonth", "Period.parse",
+                "Period.normalized", "Period.toTotalMonths", "Period.parseBad", "Duration.parse",
+                "Duration.toStringOfSeconds", "Duration.toStringNegative", "Duration.toStringZero",
+                "Duration.plusAndToMillis", "Duration.dividedBy", "Duration.parseBad",
+                "Duration.between", "LocalDateTime.toStringDropsZeroSeconds",
+                "LocalDateTime.withSeconds", "LocalTime.toStringDropsZeroSeconds",
+                "LocalTime.ofNanoOfDay", "Instant.epoch", "Instant.plusNanos",
+                "Instant.toEpochMilli", "ZonedDateTime.atFixedOffset", "ZonedDateTime.offsetShift",
+                "OffsetDateTime.toInstant", "DateTimeFormatter.ISO_DATE",
+                "DateTimeFormatter.ISO_LOCAL_DATE_TIME", "DateTimeFormatter.numericPattern",
+                "DateTimeFormatter.textPattern", "DateTimeFormatter.shortTextPattern",
+                "DateTimeFormatter.twelveHourClock", "DateTimeFormatter.parseRoundTrip",
+                "DateTimeFormatter.parseWrongPattern", "DateTimeFormatter.badPattern",
+                "DateTimeFormatter.formatWrongTemporal");
+        declare("textFormatting",
+                "DecimalFormat.basic", "DecimalFormat.negative", "DecimalFormat.doubleTieRounding",
+                "DecimalFormat.exactTieDefaultIsHalfEven", "DecimalFormat.exactTieHalfUp",
+                "DecimalFormat.roundingModeIsReported", "DecimalFormat.optionalDigits",
+                "DecimalFormat.percentPattern", "DecimalFormat.scientificPattern",
+                "DecimalFormat.negativeSubpattern", "DecimalFormat.groupingSize",
+                "DecimalFormat.toPattern", "DecimalFormat.parse",
+                "DecimalFormat.parseTrailingGarbage", "DecimalFormat.parseNotANumber",
+                "DecimalFormat.parseIntegerOnly", "DecimalFormat.formatBigDecimalExactly",
+                "DecimalFormat.formatLong", "NumberFormat.integerInstanceRounds",
+                "NumberFormat.percentInstance", "NumberFormat.currencyUS",
+                "NumberFormat.currencyNegativeUS", "NumberFormat.maxFractionDigits",
+                "NumberFormat.defaultMaxFraction", "MessageFormat.simple",
+                "MessageFormat.numberSubformat", "MessageFormat.quotedBrace",
+                "MessageFormat.choiceSubformat", "MessageFormat.missingArgument",
+                "MessageFormat.reorderedIndices", "SimpleDateFormat.utc",
+                "SimpleDateFormat.parseRoundTrip", "SimpleDateFormat.lenientAcceptsOverflow",
+                "SimpleDateFormat.strictRejectsOverflow");
+        declare("seededRandom",
+                "Random.nextIntSequence", "Random.nextIntBoundSequence",
+                "Random.nextIntPowerOfTwoBound", "Random.nextIntOriginBound", "Random.nextLong",
+                "Random.nextDouble", "Random.nextFloat", "Random.nextBooleanSequence",
+                "Random.nextGaussian", "Random.nextBytes", "Random.intsStream",
+                "Random.doublesStreamFirst", "Random.setSeedRestartsSequence",
+                "Random.sameSeedSameSequence", "Random.differentSeedsCollide",
+                "Random.nextIntZeroBound", "Random.nextIntNegativeBound",
+                "Collections.shuffleSeeded", "Collections.shuffleSeededTwiceIsStable");
+        declare("throwableSurface",
+                "Throwable.getMessage", "Throwable.getCauseMessage", "Throwable.toString",
+                "Throwable.causeToString", "Throwable.getLocalizedMessage",
+                "Throwable.noArgMessageIsNull", "Throwable.noArgToString",
+                "Throwable.causeOfNoCauseIsNull", "Throwable.initCauseAfterCtorThrows",
+                "Throwable.initCauseOnce", "Throwable.initCauseTwiceThrows",
+                "Throwable.selfCauseThrows", "Throwable.addSuppressedSelfThrows",
+                "Throwable.suppressedFromTryWithResources", "Throwable.suppressedDefaultIsEmpty",
+                "Throwable.suppressionDisabled", "Throwable.stackTraceTopFrame",
+                "Throwable.stackTraceNonEmpty", "Throwable.setStackTraceIsHonoured",
+                "Throwable.customSubclassMessage", "VM.nullPointerHelpfulMessage",
+                "VM.nullFieldAccessMessage", "VM.nullArrayStoreMessage", "VM.divideByZero",
+                "VM.modByZero", "VM.longDivideByZero", "VM.doubleDivideByZeroIsInfinity",
+                "VM.classCast", "VM.arrayStore", "VM.arrayIndexOutOfBounds", "VM.negativeArraySize",
+                "VM.arrayLengthOfNull", "VM.checkcastToArray", "VM.integerOverflowWraps",
+                "VM.intMinValueNegated", "VM.intDivideMinByMinusOne");
     }
 
     // -- TreeMap/TreeSet navigation, LinkedHashMap access order -------------
@@ -2130,13 +2665,131 @@ public class ShadowDifferentialProbe {
 
     // -- helpers -------------------------------------------------------------
 
-    /** Run one section; a throw is one reported line, not a truncated run. */
+    /**
+     * Run one section. A throw is one reported line, not a truncated run —
+     * and, since W7-42, a section that ends without emitting everything it
+     * declared says so by name.
+     *
+     * The two guarantees are independent and both are needed. The fence
+     * catches a section that DIED; the ledger catches a section that
+     * FINISHED while quietly emitting fewer lines than it owes, which is the
+     * failure that actually happened and which the fence cannot see.
+     */
     static void section(String name, Runnable body) {
+        curSec = sectionIndex(name);
+        if (curSec < 0) {
+            // A section run without a manifest entry: every one of its
+            // observables would be unaccounted for. Loud, and every emitted
+            // key will also report itself undeclared.
+            System.out.println("SECTION-UNDECLARED=" + name);
+            curSeen = null;
+        } else {
+            SEC_RAN[curSec] = true;
+            curSeen = new boolean[SEC_KEYS[curSec].length];
+        }
         try {
             body.run();
         } catch (Throwable t) {
-            line("SECTION-DIED." + name, t.getClass().getName());
+            // Deliberately NOT through `line(..)`: this is a marker, not one
+            // of the declared observables, and routing it through the ledger
+            // would report it as undeclared on exactly the runs that need
+            // reading most.
+            System.out.println("SECTION-DIED." + name + "=" + t.getClass().getName());
+        } finally {
+            endSection();
         }
+    }
+
+    /** Name every observable the section owed and did not emit. */
+    static void endSection() {
+        if (curSec >= 0) {
+            String[] names = SEC_KEYS[curSec];
+            for (int i = 0; i < names.length; i++) {
+                if (!curSeen[i]) {
+                    missingCount++;
+                    System.out.println("MISSING-OBSERVABLE=" + names[i]);
+                }
+            }
+        }
+        curSec = -1;
+        curSeen = null;
+    }
+
+    /**
+     * The run's own accounting, printed last and ALWAYS — a healthy run's
+     * totals diff clean, so they cost one identical line each and turn four
+     * classes of instrument failure into a visible difference.
+     *
+     * `PROBE-MANIFEST-DIGEST` is the one that closes the hole this was
+     * written for. `MISSING-OBSERVABLE` catches a statement deleted on one
+     * side; the digest catches a statement AND its declaration deleted on one
+     * side, which is otherwise invisible because nothing is left to notice.
+     * Two sides that print different digests were not built from the same
+     * probe, and no comparison between them means anything.
+     */
+    static void finish() {
+        int declared = 0;
+        for (int i = 0; i < secCount; i++) {
+            declared += SEC_KEYS[i].length;
+            if (!SEC_RAN[i]) {
+                // A `section(..)` call deleted from `main` takes every one of
+                // its observables with it and throws nothing. Before the
+                // ledger, that was indistinguishable from a clean run.
+                System.out.println("SECTION-NEVER-RAN=" + SEC_NAME[i]);
+                String[] names = SEC_KEYS[i];
+                for (int j = 0; j < names.length; j++) {
+                    missingCount++;
+                    System.out.println("MISSING-OBSERVABLE=" + names[j]);
+                }
+            }
+        }
+        System.out.println("PROBE-SECTIONS=" + secCount);
+        System.out.println("PROBE-OBSERVABLES-DECLARED=" + declared);
+        System.out.println("PROBE-OBSERVABLES-EMITTED=" + emittedCount);
+        System.out.println("PROBE-MANIFEST-DIGEST=" + manifestDigest());
+        System.out.println("PROBE-LEDGER=missing:" + missingCount
+                + ",undeclared:" + undeclaredCount
+                + ",duplicate:" + duplicateCount
+                + ",multiline:" + multilineCount
+                + ",unrenderable:" + unrenderableCount);
+        System.out.println("PROBE-DONE");
+        // A transcript whose tail was still sitting in a buffer at exit is
+        // absence of exactly the kind this record is about.
+        System.out.flush();
+    }
+
+    /**
+     * A digest of the manifest — section names and observable names, in
+     * declaration order.
+     *
+     * Plain `long` arithmetic over `charAt`, rendered to hex by hand. It
+     * deliberately calls neither `MessageDigest`, `String.hashCode`,
+     * `Long.toHexString` nor `String.format`: an instrument that leans on the
+     * surface under test can manufacture its own agreement.
+     */
+    static String manifestDigest() {
+        long h = 1125899906842597L;
+        for (int i = 0; i < secCount; i++) {
+            h = fold(h, SEC_NAME[i]);
+            String[] names = SEC_KEYS[i];
+            for (int j = 0; j < names.length; j++) {
+                h = fold(h, names[j]);
+            }
+        }
+        char[] hex = new char[16];
+        for (int i = 15; i >= 0; i--) {
+            int nib = (int) (h & 0xFL);
+            hex[i] = (char) (nib < 10 ? '0' + nib : 'a' + (nib - 10));
+            h >>>= 4;
+        }
+        return new String(hex);
+    }
+
+    static long fold(long h, String s) {
+        for (int i = 0; i < s.length(); i++) {
+            h = h * 31L + s.charAt(i);
+        }
+        return h * 31L + 0x1FL;
     }
 
     /** The thrown type's name, or `no-throw` — never a stack trace or a message. */
