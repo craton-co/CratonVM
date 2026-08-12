@@ -14443,7 +14443,25 @@ pub fn register_essential_natives_with_shims(
         ctx.force_gc();
         Ok(None)
     }, NativeKind::Bridge);
-    registry.register("java/lang/Runtime", "exit", "(I)V", native_system_exit);
+    // W7-86. `Runtime.exit(int)` is an INSTANCE method (`javap -p` on Adoptium
+    // 25.0.3.9: `public void exit(int)`), so `args[0]` is the `Runtime`
+    // receiver and `args[1]` is the status. `native_system_exit` serves the
+    // STATIC `System.exit(int)`, where `args[0]` IS the status — pointing this
+    // triple at it made every `Runtime.getRuntime().exit(n)` read the receiver
+    // where an `Int` was expected, take the `_ => 0` arm and **exit 0**.
+    //
+    // Measured on this Windows host: `Runtime.getRuntime().exit(7)` returned
+    // exit code 7 on HotSpot 25.0.3.9 and 0 on CratonVM, while `System.exit(7)`
+    // returned 7 on both.
+    //
+    // `native_runtime_exit` is the sibling that already handles the instance
+    // shape (`args.get(1)`, falling back to `args.first()`), and
+    // `lang_system.rs:1423` already registers it for this exact triple — but
+    // this line ran LATER and last-write-wins made the correct one dead. The
+    // `--dump-native-registry` census shows both rows, this one with
+    // `owns_slot: true`. Compatible mode (`--real-jdk`, default);
+    // HotSpot-parity fix.
+    registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
     registry.register_with_kind(
         "java/lang/Runtime",
         "freeMemory",
