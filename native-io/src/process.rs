@@ -1388,6 +1388,29 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// opposite answers — the first is a stub Process the VM owns, the second is
 /// someone else's.
 ///
+/// # The census, taken rather than asserted (2026-08-12, W7-46)
+///
+/// The paragraph above said "every concrete `java.lang.Process` native now
+/// asks" and then named five. That was a list, not a census, and it was one
+/// short — the guard's own comment outlived the sweep that wrote it. Re-taken
+/// against the image with `javap -p java.lang.Process` and
+/// `javap -p java.lang.ProcessImpl` (JDK 25.0.3, Windows), because what matters
+/// is not "is this method concrete" but "is it concrete AND unoverridden by the
+/// class strict mode actually instantiates":
+///
+/// | registered on `java/lang/Process` | on the image | `ProcessImpl` overrides it? | needs the guard |
+/// | --- | --- | --- | --- |
+/// | `waitFor()I`, `exitValue`, `destroy`, `getInputStream`, `getErrorStream`, `getOutputStream` | abstract | yes (must) | no — dispatch never walks up |
+/// | `isAlive`, `pid`, `toHandle`, `destroyForcibly`, `waitFor(JLjava/util/concurrent/TimeUnit;)Z` | concrete | yes | **yes**, and all five have it |
+/// | `onExit` | concrete | **yes** | no — same reason as the abstract rows |
+/// | `descendants` | concrete | **NO** | **yes**, and it did not have one until W7-46 |
+///
+/// `descendants()` is the whole point of the table: it is the only triple this
+/// VM registers on `java/lang/Process` that is both reachable from a real
+/// `java.lang.ProcessImpl` receiver and unguarded, and what it answered there
+/// was an empty stream. `info()` and `children()` are equally unoverridden but
+/// this VM does not register them, so they reach the JDK's own bytecode.
+///
 /// See `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
@@ -3922,6 +3945,48 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .into())
         }
     };
+    // `descendants()` is CONCRETE on `java.lang.Process` and — unlike
+    // `isAlive`, `pid`, `toHandle`, `destroyForcibly` and
+    // `waitFor(long, TimeUnit)` — it was never given the [`is_vm_process`]
+    // guard those five carry, even though `is_vm_process`' own doc comment
+    // says "every concrete `java.lang.Process` native now asks". It did not,
+    // and the omission is measurable rather than theoretical:
+    //
+    // `javap -p java.lang.ProcessImpl` (JDK 25.0.3, Windows image) lists the
+    // methods the real subclass overrides — `exitValue`, `waitFor()`,
+    // `waitFor(long, TimeUnit)`, `destroy`, `onExit`, `toHandle`,
+    // `supportsNormalTermination`, `destroyForcibly`, `pid`, `isAlive`, the
+    // three stream getters, `toString` — and `descendants()` is NOT among
+    // them. So under `--jdk-only`, where `ProcessBuilder.start()` really does
+    // return a `java.lang.ProcessImpl`, dispatch walks up to
+    // `java/lang/Process` and lands HERE with a receiver whose layout is the
+    // JDK's, not `PROC_FIELD_COUNT` slots of subprocess bookkeeping.
+    // `PROC_FIELD_PID` is slot 10; on a `ProcessImpl` that slot holds one of
+    // the stream references, so the read below did not even yield a `Long` —
+    // it fell to `-1`, `collect_descendant_pids(-1)` returned `Ok(vec![])`,
+    // and `Process.descendants()` answered an EMPTY STREAM. That is the
+    // fabricated success this file's `ProcessScanError` machinery was built to
+    // remove, arriving by the one route the machinery cannot see: a correct
+    // scan of the wrong process.
+    //
+    // The foreign answer is the JDK's own concrete body, verbatim —
+    // `return toHandle().descendants();` — which reaches the real
+    // `ProcessHandleImpl.descendants()` and therefore `getProcessPids0`, the
+    // same probe this native would have used, for the right pid.
+    if !is_vm_process(ctx, this) {
+        let handle = ctx.invoke_virtual(this, "toHandle", "()Ljava/lang/ProcessHandle;", &[])?;
+        let Some(Value::Object(Some(handle))) = handle else {
+            // `Process.toHandle()`'s own default body throws this, and
+            // `descendants()` is specified to propagate it: "the process is not
+            // supported by this operating system" is a refusal, and an empty
+            // stream is not how it is spelled.
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Process.descendants()".to_string(),
+            }
+            .into());
+        };
+        return ctx.invoke_virtual(handle, "descendants", "()Ljava/util/stream/Stream;", &[]);
+    }
     let pid = match ctx.get_field(this, PROC_FIELD_PID) {
         Value::Long(p) => p,
         _ => -1,

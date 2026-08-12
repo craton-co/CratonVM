@@ -86,7 +86,7 @@ public class RJdkProcess {
      * throw runs it, the count becomes {@code EXPECTED_CHECKS + 1}, and this
      * constant catches that too.
      */
-    static final int EXPECTED_CHECKS = 54;
+    static final int EXPECTED_CHECKS = 55;
 
     static void check(boolean c, String m) {
         checks++;
@@ -246,6 +246,30 @@ public class RJdkProcess {
                 "the child's parent must be us");
         check(awaitInTree(lh.pid(), false), "the child must appear in our children()");
         check(awaitInTree(lh.pid(), true), "the child must appear in our descendants()");
+        // `Process.descendants()` and `ProcessHandle.descendants()` are the
+        // SAME query -- the JDK's concrete `Process.descendants()` body is
+        // literally `return toHandle().descendants();` -- so they must report
+        // the same pids. Asserted as an identity rather than against a fixed
+        // expectation because the shape of the subtree is a host fact: on
+        // Windows `cmd.exe /c ping ...` forks a real grandchild, while a Unix
+        // `/bin/sh -c "sleep 30"` usually execs and has none.
+        //
+        // What it catches is a `descendants()` answered for the WRONG process,
+        // which is what CratonVM did under `--jdk-only` until 2026-08-12: the
+        // native registered on `java/lang/Process` read the VM's own pid slot
+        // off a real `java.lang.ProcessImpl` receiver (which does not override
+        // `descendants()`, so dispatch reaches it), got no pid, and returned an
+        // empty stream -- indistinguishable from a childless process, and on
+        // this host provably wrong. NOTE the asymmetry: an empty answer on both
+        // sides satisfies this check, so on a host whose launcher execs rather
+        // than forks it is satisfied without being exercised. It is live on
+        // Windows, which is where the defect was.
+        List<Long> viaProcess = live.descendants().map(ProcessHandle::pid).sorted().toList();
+        List<Long> viaHandle = lh.descendants().map(ProcessHandle::pid).sorted().toList();
+        check(viaProcess.equals(viaHandle),
+                "Process.descendants() must agree with ProcessHandle.descendants(): "
+                        + viaProcess.size() + " vs " + viaHandle.size());
+
         // The whole tree section is only meaningful if the subject never left
         // the table underneath us; prove that rather than assume it.
         check(live.isAlive(), "the sleeper must still be alive after the tree checks");
