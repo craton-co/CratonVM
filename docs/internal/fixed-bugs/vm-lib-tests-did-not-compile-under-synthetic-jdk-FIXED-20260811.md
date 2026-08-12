@@ -92,6 +92,24 @@ under them any more.
   `jdk-only-dead-sweep.py`, and `registry_contracts.rs` for the registrations
   that must survive.
 
+## An eighth, found by the next dev merge, and it asserted the insecure shape
+
+`secret_key_spec_basics` required `getEncoded()` to return **the caller's own
+array**, by identity. `SecretKeySpec` copies both ways — `<init>` is
+`this.key = key.clone()` and `getEncoded()` is `return this.key.clone()` (JDK
+25 `src.zip`) — and the aliasing that assertion demanded was a live **all-zero
+AES key**: SunJCE's generators scrub their working buffer the instant the key
+object exists (`AESKeyGenerator.engineGenerateKey` is `new
+SecretKeySpec(keyBytes, "AES"); Arrays.fill(keyBytes, (byte) 0);`), so with the
+array shared the scrub landed on the key itself, and every downstream caller
+encrypted and signed under sixteen zero bytes. Dev fixed that in `911ddb84b`;
+the test was still pinning the defect.
+
+Rewritten to assert the contract instead: the key material is a distinguishable
+pattern, the caller's buffer is scrubbed exactly the way SunJCE scrubs it, and
+`getEncoded()` must still return that pattern in a **different** array. **Red
+proved** by perturbing the expected byte.
+
 ## A seventh, found by merging dev again
 
 Merging current dev before landing turned up one more of the same kind:
@@ -136,7 +154,16 @@ two tests could be saved while these four could not.
 | all of the above again after merging dev | unchanged |
 | mutation: `jdk_only` test's second arm flipped to `false` | FAILS, as intended |
 | mutation: `command()` test's second handle given our own pid | FAILS, as intended |
+| mutation: `SecretKeySpec` expected key byte perturbed | FAILS, as intended |
 
-Both mutations matter more than the greens: this module's whole failure mode is
+The mutations matter more than the greens: this module's whole failure mode is
 assertions nobody has run, and a green that cannot go red is the same thing
 again.
+
+**Expect more of these.** Eight stale fixtures surfaced across three dev merges
+during this one branch, two of them in the last two merges — the rate is a
+direct function of how much has landed on natives this module covers while it
+was unrunnable. That is the fix working, not a problem with it: each one is a
+change that landed unmeasured and is now visible. The one thing that must not
+happen is the module going dark again, so a compile failure here should be
+treated as a broken build, not a broken test.

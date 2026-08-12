@@ -39010,6 +39010,15 @@ use std::sync::Arc;
             crate::memory::heap::ArrayElementType::Byte,
             16,
         );
+        // Distinguishable key material. A freshly allocated array is all
+        // zeroes, and all-zeroes cannot tell a copy from an alias — nor from
+        // the scrubbed buffer this test now checks for.
+        for i in 0..16 {
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(key_bytes, i, Value::Int(i as i32 + 1));
+        }
         let sks = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
@@ -39039,6 +39048,23 @@ use std::sync::Arc;
             read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
         );
+        // `SecretKeySpec` copies on the way IN and on the way OUT — `<init>` is
+        // `this.key = key.clone()` and `getEncoded()` is `return
+        // this.key.clone()` (JDK 25 `src.zip`). This assertion used to be
+        // `assert_eq!(enc, Value::Object(Some(key_bytes)))`, i.e. it required
+        // the exact ALIASING those clones exist to prevent — and that aliasing
+        // was a live all-zero-key defect, because SunJCE's generators scrub
+        // their working buffer the instant the key object exists
+        // (`AESKeyGenerator.engineGenerateKey` = `new SecretKeySpec(keyBytes,
+        // "AES"); Arrays.fill(keyBytes, (byte) 0);`), so the scrub landed on
+        // the key itself. Scrub the caller's array here the same way and check
+        // the key survives it, which is the property that was actually broken.
+        for i in 0..16 {
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(key_bytes, i, Value::Int(0));
+        }
         let enc = call_native(
             &shared,
             &mut thread,
@@ -39049,7 +39075,19 @@ use std::sync::Arc;
         )
         .unwrap()
         .unwrap();
-        assert_eq!(enc, Value::Object(Some(key_bytes)));
+        let enc_ref = enc.as_object().expect("getEncoded() must return a byte[]");
+        assert_ne!(
+            enc_ref, key_bytes,
+            "getEncoded() must not hand back the caller's own array"
+        );
+        assert_eq!(shared.mem.heap.array_length(enc_ref), 16);
+        for i in 0..16 {
+            assert_eq!(
+                shared.mem.heap.get_array_element(enc_ref, i).unwrap(),
+                Value::Int(i as i32 + 1),
+                "key byte {i} did not survive the caller scrubbing its buffer"
+            );
+        }
         let fmt = call_native(
             &shared,
             &mut thread,
