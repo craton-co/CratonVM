@@ -1,5 +1,55 @@
 # W5-1 — the `System.loadLibrary` allowlist was too wide
 
+**Status (re-reconciled 2026-08-12 — W7-79-loadlibrary-compatible-arm.md, on a
+running binary):**
+
+* **Residual 2, `Runtime.load0`/`loadLibrary0` on the `Compatible` arm: CLOSED.**
+  The in-file patch below was applied on 2026-08-12. The diagnosis was verified
+  before it was believed rather than after: on one binary at dev `87809196b`,
+  `--jdk-only` answered `no cratonvm_probe_zzz in java.library.path` and loaded
+  `net`, `--real-jdk` answered `no  in java.library.path` for both. Full table,
+  the `Runtime.load` case, the blast radius and the vector are in
+  W7-79-loadlibrary-compatible-arm.md. `LoaderScoping::Off` is unchanged on that
+  arm, so nothing in the residual below moved with it.
+* **The loader-scoped residual is no longer unverified.** It builds, it runs,
+  and it fires. Two `URLClassLoader`s over one directory, each loading its own
+  `LibProbe` which loads `sunmscapi`: HotSpot and `--jdk-only` both answer
+  LOADED / LOADED / `Native Library … already loaded in another classloader`,
+  `--real-jdk` answers LOADED three times. The only strict-vs-HotSpot difference
+  is the key — bare `sunmscapi` here, `<java.home>\bin\sunmscapi.dll` there —
+  which is exactly the named residual this record already carries. The strict
+  run through `Runtime.loadLibrary` exercises `requesting_loader_id`'s
+  `fromClass` path end to end.
+* **Whether `Compatible` needs the loader scoping too: STILL OPEN, and now a
+  decision rather than an omission.** Not taken on 2026-08-12, for four reasons
+  that are about direction rather than caution. (a) It converts successes into
+  errors, where the argument-index fix converted a manufactured error into a
+  real answer. (b) Its trigger is two loaders in one VM — the servlet-container
+  shape — so its blast radius lands squarely on the Tomcat and Spring Boot
+  suites, which this lane cannot run; the argument-index fix's trigger is a
+  `Runtime.load*` call that no suite makes at all. (c) The key is the spelling,
+  not the file, so closing the first divergence in `Compatible` introduces a
+  second one for `loadLibrary("zip")` versus `load("…/zip.dll")`; strict mode's
+  contract accepts that trade and a frozen mode does not. (d) Nothing is waiting
+  on it: `RJdkJni` is single-loader by construction and cannot assert it, since
+  the two modes legitimately differ here.
+* **Residual 1, `BootLoader.loadLibrary`: STILL OPEN, unchanged.**
+  `native-builtins/src/lib.rs:14050` is still `|_ctx, _args| Ok(None)` and
+  `record_boot_loader_library` (`lang_system.rs:3198`) still has no caller.
+  Re-grepped 2026-08-12: `BootLoader.loadLibrary` is registered in exactly one
+  place — `boot_loader.rs` registers three *other* `BootLoader` triples and
+  `lib.rs:14249`/`:18696` two more, none of them `loadLibrary` — so there is no
+  last-write-wins ambiguity, only an unarmed body. The A/B this record calls for
+  still needs an armed build. The risk it names is live and now re-measured: the
+  extended `RJdkJni` still prints `CK RJdkJni loadedLibrary=net` in both modes,
+  byte-identical to HotSpot, so arming the recording would still be aimed
+  directly at that line. Note the ambient `NativeKind` at that registration is
+  whatever `lib.rs`'s last `set_category` left in force, not `Bridge` by
+  default — check it when arming.
+* **Residual 3, the key is the spelling not the file: STILL OPEN, unchanged**,
+  and now visible in a transcript rather than only in source — see the
+  cross-loader table above.
+
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
 * **Headline: CLOSED, and now verified.** The allowlist narrowing is in
@@ -8,7 +58,8 @@
   `["sunmscapi"]` on Windows and `["jsig"]` elsewhere, and `zip` moved to
   `DYNAMIC_ALREADY_LOADED` (`:1987`). The binary verification this record said
   it lacked was taken 2026-08-12 against the dev binary at `ba65f1a19`:
-  `RJdkJni` runs to `PASS RJdkJni (35 checks)` in **both** `--jdk-only` and
+  `RJdkJni` runs to `PASS RJdkJni (35 checks)` — 40 since the 2026-08-12
+  vector extension — in **both** `--jdk-only` and
   `--real-jdk`, so the one-character `CK RJdkJni loadedLibrary=` divergence
   this record opened for is gone.
 * **Residual: CLOSED — loader-scoped `loadedLibraryNames`.** Commit `adbe284ab`,
@@ -19,17 +70,18 @@
   triples with `LoaderScoping::On` and the `else` arm with `LoaderScoping::Off`,
   and `load_library_or_throw` early-returns on `Off` (`:1859`). Compatible mode
   is byte-identical to before by construction.
-* **Residual: STILL OPEN — three, re-grepped 2026-08-12.**
+* **Residual: three, re-grepped 2026-08-12. Item 2 has since been CLOSED —
+  see the 2026-08-12 re-reconciliation at the top of this file; items 1 and 3
+  are still open and this text still describes them.**
   1. **`BootLoader.loadLibrary` is still unarmed.** `record_boot_loader_library`
      exists at `lang_system.rs:3183` and its own doc comment at `:3150` says
      *"THIS HAS NO CALLER IN THE TREE."* The registration it would feed is still
      `|_ctx, _args| Ok(None)` at `native-builtins/src/lib.rs:13813-13818`. The
      "Not applied here" closure body in this record is genuinely unapplied. This
      is also the reason W6-6's boot-loader case still cannot fire.
-  2. **Compatible-mode `Runtime.load0`/`loadLibrary0` still read the wrong
-     argument index.** `runtime_load_args` (`lang_system.rs:1658`) is used only
-     on the strict arm (`:1479`, `:1497`); the `else` arm still does
-     `match args.get(1)` at `:1547` and `:1569`.
+  2. **CLOSED 2026-08-12.** *(Was: "Compatible-mode `Runtime.load0`/
+     `loadLibrary0` still read the wrong argument index." True when written;
+     `runtime_load_args` is now called from both arms of the fork.)*
   3. **`load_native_library` still returns a table index, not the resolved
      path** (`native-builtins/src/lib.rs:13913`), so "the key is the spelling,
      not the file" stands.
@@ -359,12 +411,15 @@ survived: the regression suite reaches library loading only through
 `System.load`/`System.loadLibrary` (`RJdkJni.java:189-217`,
 `RJdkFailure.java:257`), never through `Runtime`, so nothing guards it.
 
-Corrected on the strict arm (`runtime_load_args`). **Not** on the `Compatible`
-arm: it is mode-independent — nothing about it is a compatibility-layer
-substitution — so repairing it under `Compatible` is a behaviour change that
-belongs to whoever owns `Compatible`, not to a jdk-only lane.
+Corrected on the strict arm (`runtime_load_args`) 2026-08-11, and on the
+`Compatible` arm 2026-08-12: it is mode-independent — nothing about it is a
+compatibility-layer substitution — and a `loadLibrary` that fails for every
+argument is the one thing the `Compatible` freeze admits, a HotSpot-parity bug
+fix. Adjudicated in W7-79-loadlibrary-compatible-arm.md, which carries the
+measurement, the blast radius, and the five `RJdkJni` checks that assert the
+name now reaches the native.
 
-In-file patch when that is adjudicated — in the `else` arm only, and keeping
+The in-file patch, as applied — in the `else` arm only, and keeping
 `LoaderScoping::Off` so the loader rule stays strict-only, replace each of the
 two `Runtime` bodies' first three lines with the one call the strict arm makes:
 
@@ -416,5 +471,11 @@ behaviour change for each of them.
 its two `System.loadLibrary("zip")` calls both still throw for the reason this
 record already documents (`zip` is on `DYNAMIC_ALREADY_LOADED` and off the
 allowlist), so nothing is recorded for them, and the `net` probe that follows is
-a single load from a single loader with an empty table under it. Unverified —
-nothing has been built or run.
+a single load from a single loader with an empty table under it.
+
+*Verified 2026-08-12* against the dev binary at `87809196b`: `RJdkJni` prints
+`CK RJdkJni loadedLibrary=net mapped=foo.dll` in both modes, byte-identical to
+HotSpot, and reaches `PASS RJdkJni (40 checks)` on the strict arm after the
+vector extension in W7-79-loadlibrary-compatible-arm.md. Unmoved, as predicted.
+The scoping itself was verified separately, with two loaders — see the top of
+this file.

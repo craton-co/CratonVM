@@ -220,6 +220,58 @@ public class RJdkJni {
         }
         check(threw, "System.load of a missing file must raise UnsatisfiedLinkError");
 
+        // ------------------------------------------------------------------
+        // The Runtime road, and the assertion that the NAME reaches the native.
+        //
+        // Runtime.load0/loadLibrary0 are INSTANCE methods, so a native body
+        // sees args[0] = the Runtime receiver, args[1] = the fromClass mirror
+        // and args[2] = the library name. A native that reads args[1] gets the
+        // Class, whose string form is empty, and then EVERY load fails with an
+        // empty name. Asserting only "it threw" cannot see that -- the wrong
+        // index throws too -- so what is asserted here is that the error NAMES
+        // the library the caller asked for. The message text still is not
+        // printed (it embeds java.library.path); only these predicates are.
+        String rtMissing = "cratonvm_no_such_library_20260812_runtime";
+        String rtMsg = null;
+        try {
+            Runtime.getRuntime().loadLibrary(rtMissing);
+        } catch (UnsatisfiedLinkError expected) {
+            rtMsg = String.valueOf(expected.getMessage());
+        }
+        check(rtMsg != null,
+                "Runtime.loadLibrary of a missing library must raise UnsatisfiedLinkError");
+        check(rtMsg.contains(rtMissing),
+                "Runtime.loadLibrary's UnsatisfiedLinkError must name the library asked for");
+
+        // Same, one road down: Runtime.load(String) of an absolute path. Both
+        // HotSpot's "Can't load library: <path>" and this VM's "no <path> in
+        // java.library.path" contain the path, which is what is asserted; the
+        // two SHAPES differ and that divergence is recorded separately.
+        String rtPath = new java.io.File("cratonvm-no-such-runtime.so").getAbsolutePath();
+        String rtLoadMsg = null;
+        try {
+            Runtime.getRuntime().load(rtPath);
+        } catch (UnsatisfiedLinkError expected) {
+            rtLoadMsg = String.valueOf(expected.getMessage());
+        }
+        check(rtLoadMsg != null,
+                "Runtime.load of a missing file must raise UnsatisfiedLinkError");
+        check(rtLoadMsg.contains(rtPath),
+                "Runtime.load's UnsatisfiedLinkError must name the file asked for");
+
+        // And the positive direction, which no "it threw" assertion can reach:
+        // whatever System.loadLibrary just loaded must also load through
+        // Runtime. Same VM, same class loader, same file, so the JDK answers
+        // out of this loader's own cache -- the cross-loader
+        // UnsatisfiedLinkError is not in range here.
+        boolean rtLoaded = true;
+        try {
+            Runtime.getRuntime().loadLibrary(loaded);
+        } catch (UnsatisfiedLinkError e) {
+            rtLoaded = false;
+        }
+        check(rtLoaded, "Runtime.loadLibrary must load what System.loadLibrary loaded: " + loaded);
+
         // mapLibraryName is pure and platform-shaped.
         String mapped = System.mapLibraryName("foo");
         check(mapped.equals("foo.dll") || mapped.equals("libfoo.so")

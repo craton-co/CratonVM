@@ -1,5 +1,52 @@
 # `NativeLibraries.load` returned `true` for every library in the universe
 
+**Status (re-reconciled 2026-08-12 — W7-79-loadlibrary-compatible-arm.md):**
+
+* **Headline: CLOSED, present, single-registrar, and INERT on every vector this
+  host can run.** The three ordered branches are in the tree
+  (`native-builtins/src/lib.rs:14131-14209`), `throw_if_fail` is read from
+  `args[3]`, the triple is registered exactly **once** — the only other
+  `jdk/internal/loader/NativeLibraries` registrations are `findBuiltinLib`
+  (`:14060`) and `unload` (`:14228`), and `native-api/src/capability.rs` merely
+  classifies the class — and the kind is stated explicitly with
+  `register_with_kind(…, NativeKind::Bridge)`, so no ambient `set_category`
+  block can decide it. There is no mode fork, so it is live in both modes.
+* **This record's own falsifying observation, now measured.** §"How to verify"
+  named it: *if `NativeLibraries.load` is never actually reached in either arm,
+  the change is correct but inert*, and the cheapest check is
+  `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK=1` producing no behavioural difference.
+  Taken 2026-08-12 on the dev binary at `87809196b`: the knob changes **nothing**
+  in `RJdkJni`'s extracted `PASS`/`CK` output in `--real-jdk` **or** `--jdk-only`.
+* **So: `RJdkJni` does NOT cover this headline, and cannot.** This record already
+  said so in §"The `RJdkJni` trap" — "`RJdkJni` reaches loading through
+  `System.loadLibrary`, which is intercepted, so this change cannot move that
+  test either way" — and the knob A/B confirms it rather than merely repeating
+  it. The structural reason is one clause in `vm/src/vm/vm_exec.rs` (RKC16N.12),
+  which forces the native override for `java/lang/System.{load,loadLibrary}` and
+  `java/lang/Runtime.{load0,load,loadLibrary0,loadLibrary}`, so real
+  `ClassLoader.loadLibrary` -> `NativeLibraries.loadLibrary` bytecode never runs
+  for any of them; and `BootLoader.loadLibrary` is a registered no-op, which
+  closes the last road on this platform. What still covers the body is the unit
+  test `bare_native_library_name` in `native-builtins/src/lib.rs`. The
+  Linux real-JDK boot-`<clinit>` road this record was written for is off this
+  host and was not exercised.
+* **Residual, the boot-loader case: STILL OPEN and STILL W5-1's.**
+  `BootLoader.loadLibrary` remains `|_ctx, _args| Ok(None)` at
+  `native-builtins/src/lib.rs:14050`, registered in exactly one place.
+* **The two roads did not get conflated, and here is the check that proves it.**
+  §4 below says the "already loaded in another classloader" error belongs to
+  bytecode *above* this native and must not be duplicated here. On W5-1's road,
+  where CratonVM replaces that bytecode, the rule now fires: two `URLClassLoader`s
+  loading `sunmscapi` give LOADED / LOADED / `already loaded in another
+  classloader` under `--jdk-only`, matching HotSpot. Nothing on **this** road
+  changed, which is still the correct outcome. Table in
+  W5-1-loadlibrary-allowlist-too-wide.md.
+* **Unrelated to the headline, corrected here for the next reader:** the sibling
+  `System.load`/`Runtime.load` road in `lang_system::load_library_or_throw`
+  formats `no <path> in java.library.path` where **this** native correctly
+  formats HotSpot's `Can't load library: <path>`. The two roads disagree with
+  each other. Named residual in W7-79-loadlibrary-compatible-arm.md.
+
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
 * **Headline: CLOSED, and now verified.** The unconditional
