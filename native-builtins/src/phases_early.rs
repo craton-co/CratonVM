@@ -20624,18 +20624,75 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "formatMessage",
         "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
         |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                // LogRecord slot 1 is its sequence number on the real JDK
-                // layout, not the message. Resolve through the public method
-                // so concrete JULI formatters receive the string populated by
-                // the logging bridge.
-                match ctx.invoke_virtual(*rec, "getMessage", "()Ljava/lang/String;", &[])? {
-                    Some(Value::Object(Some(message))) => Ok(Some(Value::Object(Some(message)))),
-                    _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
-                }
-            } else {
+            let Some(Value::Object(Some(rec))) = args.get(1) else {
                 let s = ctx.create_string("");
-                Ok(Some(Value::Object(Some(s))))
+                return Ok(Some(Value::Object(Some(s))));
+            };
+            let rec = *rec;
+            // LogRecord slot 1 is its sequence number on the real JDK
+            // layout, not the message. Resolve through the public method
+            // so concrete JULI formatters receive the string populated by
+            // the logging bridge.
+            let Some(Value::Object(Some(message))) =
+                ctx.invoke_virtual(rec, "getMessage", "()Ljava/lang/String;", &[])?
+            else {
+                let s = ctx.create_string("");
+                return Ok(Some(Value::Object(Some(s))));
+            };
+            // `formatMessage` SUBSTITUTES; it does not just fetch. Returning
+            // `getMessage()` verbatim made
+            // `new SimpleFormatter().formatMessage(record)` answer
+            // `one={0} two={1}` where HotSpot answers `one=A two=B` — the
+            // whole point of the method, and the reason a `LogRecord` keeps
+            // its RAW pattern plus a separate parameter array rather than a
+            // pre-rendered string (regression-suite RJdkLogging
+            // `recordPayloads`). Every `Formatter` in the JDK routes its
+            // `{n}` handling through here, so the omission reached
+            // `SimpleFormatter`, `XMLFormatter` and every JULI formatter
+            // alike.
+            //
+            // Mirror `java.util.logging.Formatter.formatMessage` exactly:
+            // substitute only when there are parameters AND the pattern
+            // actually names one of `{0`..`{3`, and fall back to the raw
+            // pattern on any failure. The `{0`..`{3` sniff is the JDK's own
+            // (deliberately cheap, deliberately not a full parse) — matching
+            // it matters because a message containing a lone `{` must come
+            // back untouched rather than through `MessageFormat`, which would
+            // throw on it.
+            let params = match ctx.invoke_virtual(rec, "getParameters", "()[Ljava/lang/Object;", &[])
+            {
+                Ok(Some(Value::Object(Some(array)))) if ctx.array_length(array) > 0 => Some(array),
+                _ => None,
+            };
+            let Some(params) = params else {
+                return Ok(Some(Value::Object(Some(message))));
+            };
+            let pattern = ctx.read_string(message).unwrap_or_default();
+            if !["{0", "{1", "{2", "{3"].iter().any(|m| pattern.contains(m)) {
+                return Ok(Some(Value::Object(Some(message))));
+            }
+            let message_pin = ctx.pin_native_root(message);
+            let params_pin = ctx.pin_native_root(params);
+            let message_cur = ctx.read_native_pin(message_pin, message);
+            let params_cur = ctx.read_native_pin(params_pin, params);
+            let formatted = ctx.invoke(
+                "java/text/MessageFormat",
+                "format",
+                "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+                &[
+                    Value::Object(Some(message_cur)),
+                    Value::Object(Some(params_cur)),
+                ],
+            );
+            let message_cur = ctx.read_native_pin(message_pin, message);
+            ctx.unpin_native_roots(message_pin);
+            match formatted {
+                // `MessageFormat.format` throws on a malformed pattern; the
+                // JDK catches everything here and hands back the raw format,
+                // so a bad pattern degrades to unsubstituted text instead of
+                // taking down the logging call.
+                Ok(Some(Value::Object(Some(s)))) => Ok(Some(Value::Object(Some(s)))),
+                _ => Ok(Some(Value::Object(Some(message_cur)))),
             }
         },
     );
