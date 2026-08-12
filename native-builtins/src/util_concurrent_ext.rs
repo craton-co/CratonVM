@@ -888,7 +888,7 @@ fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
     // `observe_from_rust` is `#[track_caller]` and so is this function, so the
     // location that reaches the census is the NATIVE that asked for the shape,
     // not this forwarding line and not `alloc_concurrent_synthetic` in between.
-    cratonvm_native_api::layout_alias::observe_from_rust(class_name, num_fields, real);
+    let _ = cratonvm_native_api::layout_alias::observe_from_rust(class_name, num_fields, real);
 }
 
 // The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,

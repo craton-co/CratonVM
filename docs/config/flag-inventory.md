@@ -799,7 +799,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_LAMBDA_GENERIC` | DBG | `CRATONVM_DBG=lambda-generic` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DBG_LAMBDA_PROF` | DBG | `CRATONVM_DBG=lambda-prof` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LAYOUT` | DBG | `CRATONVM_DBG=layout` | opt-in | off | diag | snapshot | types |
-| `CRATONVM_DBG_LAYOUT_ALIAS` | DBG | `CRATONVM_DBG=layout-alias` | opt-in | off | diag | snapshot | native-builtins |
+| `CRATONVM_DBG_LAYOUT_ALIAS` | DBG | `CRATONVM_DBG=layout-alias` | opt-in | off | diag | snapshot | native-api |
 | `CRATONVM_DBG_LETSGO` | DBG | `CRATONVM_DBG=letsgo` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_LHM_EVICT` | DBG | `CRATONVM_DBG=lhm-evict` | opt-in | off | diag | snapshot | native-collections |
 | `CRATONVM_DBG_LICM` | DBG | `CRATONVM_DBG=licm` | opt-in | off | diag | snapshot | jit |
@@ -850,7 +850,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_NPE_MATCH` | DBG | `CRATONVM_DBG=npe-match` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NPE_NONE` | DBG | `CRATONVM_DBG=npe-none` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NPE_STACK` | DBG | `CRATONVM_DBG=npe-stack` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_DBG_NPE_TRACE` | DBG | `CRATONVM_DBG=npe-trace` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_NPE_TRACE` | DBG | `CRATONVM_DBG=npe-trace` | opt-in | off | diag | snapshot | native-builtins, vm |
 | `CRATONVM_DBG_NSME` | DBG | `CRATONVM_DBG=nsme` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NULLTHIS` | DBG | `CRATONVM_DBG=nullthis` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_NULL_NATIVE` | DBG | `CRATONVM_DBG=null-native` | opt-in | off | diag | snapshot | types |

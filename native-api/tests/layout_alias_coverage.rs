@@ -114,7 +114,7 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
         let path = entry.path();
         if path.is_dir() {
             out.extend(rust_sources(&path));
-        } else if path.extension().is_some_and(|e| e == "rs") {
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             out.push(path);
         }
     }
@@ -357,7 +357,11 @@ fn try_alloc_object_gc_safe_has_no_override_that_could_route_around_alloc_object
 #[test]
 fn the_base_allocator_observes() {
     let src = read("vm/src/vm/vm_exec.rs");
-    let body = fn_body(&strip_comments(&src), "alloc_object")
+    // Bound to a `let`, not inlined into the call: `fn_body` hands back a slice
+    // of the stripped source, which would be dropped at the end of the
+    // statement if the temporary were never named.
+    let stripped = strip_comments(&src);
+    let body = fn_body(&stripped, "alloc_object")
         .expect("vm_exec.rs no longer defines `fn alloc_object` — the base allocator moved");
     for needle in ["layout_alias::enabled()", "layout_alias::observe("] {
         assert!(

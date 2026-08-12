@@ -11993,11 +11993,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             } else {
                 frames.join(" <- ")
             };
-            cratonvm_native_api::layout_alias::observe(
-                &class_name,
+            let _ = cratonvm_native_api::layout_alias::observe(
+                class_name.as_str(),
                 num_fields,
                 real_fields,
-                cratonvm_native_api::layout_alias::AllocSite::Java(&site),
+                cratonvm_native_api::layout_alias::AllocSite::Java(site.as_str()),
             );
         }
         let slots = num_fields.max(real_fields);
