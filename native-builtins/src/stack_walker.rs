@@ -803,14 +803,26 @@ mod tests {
                 Value::Object(Some(o)) => o,
                 other => panic!("{name} static is {other:?}, expected an object"),
             };
-            assert!(
-                matches!(
-                    ctx.get_field_by_name(constant, "name"),
-                    Value::Object(Some(_))
+            // Non-null is NOT the contract; the name must be the RIGHT string.
+            // Merged 2026-08-12 from the jdk-only campaign, which found the
+            // weaker shape twice in one day: a doc froze "values() returns
+            // length 3" as verified-good while all three constants were wrong,
+            // and a sibling enum passed a non-null-and-named check while
+            // `values()[0] == State.NEW` was false. A null-check and an
+            // identity/equality check are different assertions, and only the
+            // latter can see a fabricated constant.
+            match ctx.get_field_by_name(constant, "name") {
+                Value::Object(Some(s)) => assert_eq!(
+                    ctx.read_string(s).as_deref(),
+                    Some(name.as_str()),
+                    "{name} carries the wrong Enum.name — a wrong or null name makes \
+                     Enum.valueOf's constant directory match nothing"
                 ),
-                "{name} must carry an Enum.name string — a null name makes \
-                 Enum.valueOf's constant directory match nothing"
-            );
+                other => panic!(
+                    "{name} must carry an Enum.name string, got {other:?} — a null name \
+                     makes Enum.valueOf's constant directory match nothing"
+                ),
+            }
             assert_eq!(
                 ctx.get_field_by_name(constant, "ordinal"),
                 Value::Int(idx as i32),

@@ -21,6 +21,18 @@ unchanged. Windows only; the non-Windows arm is the old two-step verbatim,
 because there the two probes read two different `/proc` files and merging them is
 a change on an arm this host cannot compile.
 
+**Linux followed on 2026-08-12** (`linux_liveness_and_start_time`, one
+`/proc/<pid>/stat` read, sharing its parser with `linux_proc_stat_times`), from a
+Windows host and therefore **still uncompiled**. Only the
+`not(any(target_os = "linux", windows))` arm keeps the two-step now, correctly:
+there `os_process_start_time` has no probe and answers `None`, so there is no
+second read to straddle a recycle with. Full reasoning, including the arm that
+must NOT collapse "the line will not parse" into "dead", in
+W7-46-process-cluster.md §8.1.
+
+**Three of this record's own claims are re-checked below and one is stale**;
+read the 2026-08-12 block before quoting a cost.
+
 Finding 3's conclusion stands unchanged — `PROCESSENTRY32` carries no creation
 time, so the per-row `OpenProcess` in `getProcessPids0` is inherent. Its *free*
 half was taken: the three `array_length` probes were loop-invariant and are now
@@ -91,6 +103,28 @@ counts and asymptotics**, provable by reading the code, not in time.
   children of one pid).
 * `D` — descendants of a pid, i.e. the size of the subtree below it.
 
+## Re-check, 2026-08-12 (W7-46 follow-up) — which findings still describe code that runs
+
+Asked because a record that prices a change is worthless if the code no longer
+runs. Source-only, like the rest of this record.
+
+| finding | premise today |
+|---|---|
+| 1 | **STALE under `--jdk-only`.** See the block appended to Finding 1 below. |
+| 2 | **LIVE and unaffected.** `ProcessHandle.info()` reaches `native_proc_handle_info0` in both shipping modes. |
+| 3 | **LIVE, and reached MORE than when this was written** — the delegation in finding 1's note routes strict-mode `descendants()` through `getProcessPids0`. |
+| 4 | **LIVE** for `parent0` and `getProcessPids0`. For `native_process_descendants` it now guards only the VM-receiver (Compatible-mode) path. |
+
+Finding 4's **five widened signatures were audited on every arm** — the thing
+this record flagged as unverifiable from this host. All five are consistent:
+identical parameter types, arity and return type on every `cfg` arm, with every
+caller matching, and `direct_child_pids`' missing `windows` arm exactly matched
+by its sole caller being `not(windows)`. The table is in
+W7-46-process-cluster.md §8.4. **That is a source read, not a compile**: it rules
+out a `Result` widened on one arm only, a drifted arity, and a caller left
+unwrapping a bare value; it cannot rule out a borrow or inference error inside a
+body. The Linux build is still owed.
+
 ## Finding 1 — `Process.descendants()` took one machine-wide snapshot per node
 
 `collect_descendant_pids` is a breadth-first walk that expanded each node with
@@ -123,6 +157,24 @@ Scope: this is `java.lang.Process.descendants()`, registered on
 is the known consumer). `ProcessHandle.descendants()` is real JDK bytecode that
 makes a single `getProcessPids0(0, ...)` call and builds the tree in Java, so it
 never had this shape.
+
+> **STALE under `--jdk-only` since 2026-08-12, and stale because of a fix in
+> W7-46-process-cluster.md §3.** `Process.descendants()` on a real
+> `java.lang.ProcessImpl` receiver now returns `toHandle().descendants()` — the
+> JDK's own concrete body — so it reaches `getProcessPids0` and never touches
+> `collect_descendant_pids`. This optimised Windows walk is now entered **only**
+> for a `cratonvm/synthetic/Process` receiver, i.e. Compatible mode.
+>
+> The direction is worth stating, because it is a cost this campaign ADDED and
+> nobody had priced. `collect_descendant_pids` reads the whole topology out of
+> one Toolhelp snapshot and `build_process_handle` stamps `startTime` 0 without
+> probing, so the old path was **1 snapshot, 0 `OpenProcess`**. The JDK route is
+> `getProcessPids0(0, …)` plus `ProcessHandleImpl`'s mandatory 100-element
+> retry: **2 snapshots, `100 + N` `OpenProcess`**. Strictly more expensive, and
+> strictly more correct — the old path answered for the WRONG PROCESS. Do not
+> revisit the fix; do stop quoting `1 + D` → `1` as a live saving in strict
+> mode, and note that finding 3's per-row `OpenProcess` is now the dominant cost
+> of this whole surface.
 
 ## Finding 2 — `info0` opened the same process twice for one `GetProcessTimes`
 
@@ -331,7 +383,15 @@ arms the driving host never compiles"):
 * **Windows** — the host's own target. Compilable here in principle.
 * **`target_os = "linux"`** — NOT compilable on this host. `os_parent_pid`,
   `os_list_processes`, `direct_child_pids` and the `not(windows)`
-  `collect_descendant_pids`.
+  `collect_descendant_pids`. **Three more joined them on 2026-08-12**, from a
+  lane also on Windows: `linux_liveness_and_start_time` (new),
+  `linux_stat_line_times` (the parse half of `linux_proc_stat_times`, split out)
+  and the new `target_os = "linux"` arm of `foreign_start_time_or_dead`. Same
+  mitigation, applied again: no borrowed state, no new control flow beyond one
+  three-arm `match` on `std::fs::read_to_string`'s `Result`, and the split
+  parser is the OLD body moved unchanged. Also a Linux-only `#[test]`,
+  `one_stat_read_reports_the_same_start_time_as_the_separate_probe`, which is
+  the mirror of the Windows one this record's confirmation list already names.
 * **`not(any(target_os = "linux", windows))`** — NOT compilable on this host, and
   not on the Linux fixture host either. `os_parent_pid`, `os_list_processes`,
   `direct_child_pids`.
@@ -346,13 +406,26 @@ constructed on all three platforms, so no arm leaves it `dead_code`.
 
 ## Out-of-file addition (not applied — and the target has MOVED)
 
-> **Reconciled 2026-08-12.** Still unapplied, and no longer appliable as
-> written. The target record was retired out of this directory on 2026-08-11
-> into the internal fixed-bugs tree as
-> `jdk-only-W2-7-fabricated-success-where-the-spec-mandates-failure-FIXED-20260811.md`,
-> whose table stops at row 4 and contains no row naming
-> `CreateToolhelp32Snapshot` / `Process32First` / `opendir("/proc")`. Decide
-> where the row belongs before writing it; do not go looking for the path
+> **CLOSED — NO TARGET, 2026-08-12 (W7-46 §8.3). Do not carry this forward.**
+>
+> Two corrections to the reconciliation note that stood here. It said the
+> retired target's *"table stops at row 4"*: it does not — that file's table has
+> a **row 5**, `ProcessHandleImpl.isAlive0` in `native-io/src/process.rs`,
+> marked FIXED, which is this very family filed from the other end. And the row
+> this section asks for would be a sixth entry in the species inventory of a
+> record that is **retired and internal**, describing a defect that is **fixed**
+> and already recorded in two live records (finding 4 above, and
+> W7-46-process-cluster.md §2). It documents nothing a reader of this directory
+> can act on.
+>
+> Kept below as drafted text, for the day the species inventory is re-founded as
+> a live record. It is not work.
+>
+> **Reconciled 2026-08-12 (superseded, kept for provenance).** Still unapplied,
+> and no longer appliable as written. The target record was retired out of this
+> directory on 2026-08-11 into the internal fixed-bugs tree as
+> `jdk-only-W2-7-fabricated-success-where-the-spec-mandates-failure-FIXED-20260811.md`.
+> Decide where the row belongs before writing it; do not go looking for the path
 > quoted below.
 
 The inventory for this defect species was `W2-7-fabricated-success-where-the-spec-mandates-failure.md`,

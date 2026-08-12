@@ -1,8 +1,22 @@
-# W7-40 — the differential at 14, and two instrument holes
+# W7-40 — SUPERSEDED. The differential is 9, not 14
 
-> **SUPERSEDED 2026-08-12 by W7-42-differential-instrument-holes.md. The
-> number below is 14 only because five of the rows are the instrument.**
+> # SUPERSEDED 2026-08-12 by W7-42-differential-instrument-holes.md
 >
+> **DO NOT WORK FROM THE NUMBER 14. IT IS WRONG AND THIS RECORD IS THE REASON
+> IT CIRCULATES.** The live figure is **9**, in W7-42. Five of the fourteen
+> rows below are the instrument, not the VM — this record measured a harness
+> defect and published it as VM divergence, which is the species the campaign
+> keeps re-buying. The title, the `96 → 43 → 14` line and the fourteen-row diff
+> are all kept **only** so a reader holding an old transcript can find their way
+> here; none of them is a current measurement.
+>
+> Anything re-derived from this file must be re-derived from W7-42's transcript
+> and its `PROBE-MANIFEST-DIGEST` instead. Do not diff a fresh run against
+> W7-4's retired oracle either (RETIREMENT-20260812.md): it predates the probe's
+> manifest ledger, so diffing against it manufactures divergence out of rows the
+> probe has since gained.
+>
+
 > The "same class files" claim in the next paragraph is false. The CratonVM
 > side was compiled from the scratchpad copy W7-33 Part 3 made with five
 > `line(..)` statements excised; HotSpot was compiled from the tree. The five
@@ -16,12 +30,16 @@
 > divergences" below still stands; nothing else here should be read as a
 > property of the VM.
 
-**Status: MEASURED 2026-08-12** on the 50-branch binary. HotSpot 25.0.3.9 vs CratonVM
-`--real-jdk`, same class files, both sides pinned to UTF-8 / en-US.
+**Status: SUPERSEDED. Measured 2026-08-12** on the 50-branch binary. HotSpot
+25.0.3.9 vs CratonVM `--real-jdk`, ~~same class files~~ (**false — the two sides
+were compiled from different source; that is hole 1**), both sides pinned to
+UTF-8 / en-US.
 
-**96 → 43 → 14 divergent observables. 0 sections died** (was 2).
+**96 → 43 → ~~14~~ divergent observables. The live number is 9 (W7-42).**
+0 sections died (was 2) — and W7-42's whole point is that "0 sections died" was
+true and still hid five lost rows, because absence is not a throw.
 
-## The 14
+## The ~~14~~ — five of these are the instrument, not the VM
 
 ```diff
 < stream.reuseThrows=java.lang.IllegalStateException

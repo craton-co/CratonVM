@@ -20,17 +20,32 @@ previously had no status line at all):**
   for an unregistered target module is unreachable; the record's three-writer
   argument stands, writer 3 confirmed live at
   `classloading/src/class_manager.rs:9568`. No source change, and none wanted.
-* **Residual: STILL OPEN — one, the "found on the way, NOT fixed" row.** Array
-  classes report the wrong module. `synthesize_array_class_for_loader`
-  (`classloading/src/class_manager.rs:9328`) writes
-  `module_name: Some("java.base".to_string())` unconditionally at `:9568`,
-  regardless of component type, so `MyApp[].class.getModule()` still answers
-  `java.base`. Re-grepped 2026-08-12. **This is the only live item in the
-  record**, and RETIREMENT-20260811.md does not mention it — that audit kept
-  W4-2 for two reasons that are both wrong (the `ServiceLoader` interaction
-  landed in `b3aca74c8`; `is_package_exported_to` is unreachable).
+* **Residual: FIXED IN SOURCE 2026-08-12, NOT YET RUN — the "found on the way,
+  NOT fixed" row, which was the record's last live item.** It really was live:
+  re-grepped before touching anything, `synthesize_array_class_for_loader`
+  (`classloading/src/class_manager.rs`, the single array-synthesis site
+  tree-wide) wrote `module_name: Some("java.base".to_string())` unconditionally
+  in its `Class` literal. It now computes `array_module_name` from the
+  **component class's** `module_name`, falling back to `java.base` only for a
+  primitive component (`component_id == None`), which is the one case the
+  hardcode got right. A multi-dimensional array inherits through the inner
+  array class, the same recursion that already carries the defining loader.
+  Marker: `// JDK-ONLY-NOTE (W4-2)` immediately above the computation.
+* **The vector exists now, and it would have failed against the hardcode.**
+  `regression-suite/src/RJdkModule.java::arrayModules` — eight checks, in
+  `JDKONLY_CLASSES`, run in both modes. `Exported[]`, `Greeter[]` and
+  `Exported[][]` must answer the module `cratonvm.jdkonly.svc`;
+  `RJdkModule[]`/`RJdkModule[][]` must answer the **unnamed** module (both
+  `!isNamed()` and identity against `RJdkModule.class.getModule()`); and
+  `int[]`, `long[][]`, `String[]` must still answer `java.base`. Those last
+  three are the control — they passed against the hardcode too, so a "fix" that
+  answered the unnamed module for everything would not survive them. The whole
+  vector is **155 checks** as of 2026-08-12 (was 104); `arrayModules` accounts
+  for 10 of them, its 9 own checks plus the one inside `svc()`.
+  **Unverified against a binary: this lane could not build or run.**
 * The record's own `### Out-of-file patch (not applied)` section reads "None."
-  and is accurate.
+  and is still accurate — the fix landed inside `classloading/`, which is this
+  lane's file this wave.
 
 `regression-suite/src/RJdkModule.java:172`, failing in **both** `--real-jdk`
 and `--jdk-only` on the wave-3 build; HotSpot 25 passes all 44 checks.
@@ -241,7 +256,7 @@ All three rows were adjudicated on 2026-08-11. None is open.
   would destroy an agreement that currently holds rather than create one.
   **Left as-is — now with a reason instead of a hunch.**
 
-## Found on the way, NOT fixed: array classes report the wrong module
+## Found on the way, FIXED 2026-08-12: array classes reported the wrong module
 
 Row 3 above is unreachable through the reflection gate, but it is still wrong,
 and `Class.getModule()` and bytecode-resolution `check_module_access` both do
@@ -255,16 +270,40 @@ int[].class.getPackageName()   "java.lang"                 <-- not ""
 ```
 
 A reference array's module is its **component type's** module, not java.base.
-`synthesize_array_class_for_loader` hardcodes `Some("java.base")` for every
-array class regardless of component type, so `MyAppClass[].class.getModule()`
-answers java.base where HotSpot answers the unnamed module; `package_of("[I")`
-likewise yields `""` where HotSpot reports `"java.lang"`. `classloading/` is not
-this lane's file and neither divergence has a measured consumer yet. Filed so
-the next lane does not have to rediscover it.
+`Class.getModule()`'s javadoc states it as a rule rather than as a consequence:
+*"If this class represents an array type then this method returns the Module
+for the element type."* `synthesize_array_class_for_loader` hardcoded
+`Some("java.base")` for every array class regardless of component type, so
+`MyAppClass[].class.getModule()` answered java.base where HotSpot answers the
+unnamed module.
+
+**Fixed 2026-08-12.** The `Class` literal now takes `module_name:
+array_module_name`, computed just above it:
+
+* reference component (including the inner array of a multi-dimensional type) —
+  the component class's own `module_name`, cloned out of the `ClassStore`. The
+  component is already resolved at that point; it is what the map key and
+  `array_info` are derived from, so there is nothing new to look up and nothing
+  that can fail;
+* primitive component (`component_id == None`) — `java.base`, which is HotSpot's
+  answer for `int[]` and the one case the hardcode was right about;
+* `None` (the unnamed module) is a legal outcome and the point of the change:
+  `Class::module_name`'s own doc comment says *"None for unnamed module"*.
+
+Reachability, so the change is not overstated: `Class.getModule()` is served by
+a native in both modes and reads `NativeContext::module_name_of_class`, i.e.
+this exact field — which is why `RJdkModule`'s existing
+`Greeter.class.getModule() == svc` already passes in both modes. The value flows
+straight through.
+
+**`package_of("[I")` is NOT fixed and is a separate row.** It still yields `""`
+where HotSpot reports `"java.lang"` for `int[].class.getPackageName()`. It has
+no measured consumer, it is a different function in a different file, and
+bundling it into a module-attribution change would have made the blast radius
+of both unreadable. Left recorded rather than half-done.
 
 ### Out-of-file patch (not applied)
 
-None. Both remaining rows resolved without a source change: one was already in
-the tree, one is proven unreachable. The array-module divergence above is a
-new finding, not a residual of this record, and wants its own measurement
-before anyone edits `classloading/src/class_manager.rs`.
+None, still. The array-module fix landed inside `classloading/`, and the two
+older rows resolved without a source change: one was already in the tree, one is
+proven unreachable.

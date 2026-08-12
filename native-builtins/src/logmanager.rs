@@ -4612,7 +4612,34 @@ fn publish_to_jul_handlers_full(
         // stack capture at all. That bound matters: HotSpot's cost is deferred
         // to whoever calls `getSourceClassName()`, and this is the nearest
         // equivalent placement we can reach from a native.
-        if src_cls_pin.is_none() && src_mth_pin.is_none() {
+        //
+        // A FALLBACK, not the primary inference. `stamp_inferred_caller` above
+        // already stamped the pair (and cleared `needToInferCaller`), and this
+        // block used to run unconditionally afterwards — so it took a SECOND
+        // `capture_stack_trace` on every published record and then overwrote the
+        // first answer with its own, which is the weaker of the two predicates.
+        // Adjudicated against the JDK 25 source rather than by preference:
+        // `LogRecord$CallerFinder.test` has TWO stages, a latch that skips until
+        // it sees `java.util.logging.Logger` / `sun.util.logging.PlatformLogger*`
+        // (`isLoggerImplFrame`) and then a FILTER,
+        // `jdk.internal.logger.SurrogateLogger.isFilteredFrame` → `Formatting.
+        // isFilteredFrame`, which skips all of `java.util.logging.`,
+        // `sun.util.logging.`, `jdk.internal.logger.`,
+        // `java.lang.invoke.MethodHandle*`, `java.security.AccessController` and
+        // anything implementing `System.Logger`. `infer_jul_caller_source` skips
+        // only the two LATCH names, so it can name `java.util.logging.Handler`
+        // or a reflection frame as the caller; `stamp_inferred_caller`'s wider
+        // skip set is the analogue of the filter stage and is the faithful one.
+        // Kept as the last resort for the case the wider set rejects every
+        // frame, where a narrow answer beats a null pair.
+        // W7-35-jul-supplier-and-payload-residuals.md
+        if src_cls_pin.is_none()
+            && src_mth_pin.is_none()
+            && !matches!(
+                ctx.get_field_by_name(record, "sourceClassName"),
+                Value::Object(Some(_))
+            )
+        {
             if let Some((cls, mth)) = infer_jul_caller_source(ctx) {
                 let cls_obj = ctx.create_string(&cls);
                 let cls_pin = ctx.pin_native_root(cls_obj);
@@ -5084,6 +5111,21 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// chain, so the record — and any THROWABLE it carries — was silently
 /// dropped, hiding errors callers log-and-swallow. Read `level`/`message`/
 /// `thrown` off the record by field name and emit.
+///
+/// **The level gate is the first statement of the real body and was missing
+/// here.** JDK 25's `Logger.log(LogRecord record)` opens with
+/// `if (!isLoggable(record.getLevel())) return;` — so a `FINEST` record handed
+/// to a logger at `INFO` is dropped, not published. Without the gate this
+/// overload was the one member of the eight-overload `log` family that
+/// published unconditionally: the same "right in the members with one
+/// implementation, wrong in the members with the other" split
+/// [`native_jul_logger_log_supplier`] documents, one overload along. It shares
+/// [`native_jul_logger_is_loggable`] rather than restating the threshold walk,
+/// for the reason stated there — that walk is 60 lines of `Level`-shape
+/// fallbacks and a second copy would drift the first time one shape changed.
+/// It reads no field the body below does not already read, and allocates
+/// nothing, so it sits above the pin/publish block.
+/// docs/known-issues/jdk-only/W7-25-jul-getlogger-regression.md §7.
 fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -5093,6 +5135,27 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // The record's own level is the one to gate on — `log(LogRecord)` takes no
+    // `Level` argument, so `args` cannot be forwarded to `is_loggable` the way
+    // the `(Level, …)` overloads forward theirs. A record with no readable
+    // `level` is left alone: `is_loggable` would score it as the INFO default
+    // and could suppress a record whose level we simply failed to read.
+    // Read out of the `if let` scrutinee on purpose: a method call there keeps
+    // its receiver reborrow alive for the whole block, and the gate below needs
+    // `ctx` mutably.
+    let record_level = match ctx.get_field_by_name(rec, "level") {
+        Value::Object(Some(level)) => Some(level),
+        _ => None,
+    };
+    if let (Some(logger), Some(level)) = (this, record_level) {
+        let gate_args = [Value::Object(Some(logger)), Value::Object(Some(level))];
+        if matches!(
+            native_jul_logger_is_loggable(ctx, &gate_args)?,
+            Some(Value::Int(0))
+        ) {
+            return Ok(None);
+        }
+    }
     // Real `Logger.log(LogRecord)` fans the record out to the logger's own
     // handlers and then its ancestors'. Do that first — this is also the tail
     // of the real-JDK `throwing`/`entering` bytecode (via `doLog`), so a

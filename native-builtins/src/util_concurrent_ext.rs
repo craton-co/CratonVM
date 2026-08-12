@@ -8278,239 +8278,58 @@ pub(crate) fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry)
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
-    let scope = "java/util/concurrent/StructuredTaskScope";
-
-    r.register(scope, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        scope,
-        "<init>",
-        "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_init_scope(ctx, this)?;
-            Ok(None)
-        },
-    );
-
-    r.register(
-        scope,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let callable = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, callable)
-        },
-    );
-
-    r.register(
-        scope,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Do not downgrade an already shut-down / closed scope (state 2):
-            // `shutdown(); join();` must leave isShutdown() == true.
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(
-        scope,
-        "joinUntil",
-        "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(scope, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    // shutdown() must be observable by isShutdown() below (which tests
-    // field 1 == 2). The former no-op meant `scope.shutdown();
-    // scope.isShutdown()` answered false, so ShutdownOn*-style loops that
-    // poll for the shutdown flag never saw it and kept forking subtasks.
-    r.register(scope, "shutdown", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(scope, "isShutdown", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(
-            if matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                1
-            } else {
-                0
-            },
-        )))
-    });
-
-    let subtask = "java/util/concurrent/StructuredTaskScope$Subtask";
-    r.register(subtask, "get", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        match ctx.get_field(this, 3) {
-            Value::Int(1) => Ok(Some(ctx.get_field(this, 1))),
-            Value::Int(2) => Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into()),
-            _ => Err(RuntimeError::IllegalStateException {
-                message: "Subtask result is unavailable".into(),
-            }
-            .into()),
-        }
-    });
-    r.register(
-        subtask,
-        "state",
-        "()Ljava/util/concurrent/StructuredTaskScope$Subtask$State;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        },
-    );
-    r.register(
-        subtask,
-        "exception",
-        "()Ljava/lang/Throwable;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
-
-    // --- ShutdownOnFailure ---
-    let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
-    r.register(sof, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sof,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnFailure;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sof, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sof, "throwIfFailed", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if pd_has_failure(ctx, this) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into());
-        }
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "throwIfFailed",
-        "(Ljava/util/function/Function;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if pd_has_failure(ctx, this) {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "Subtask failed".into(),
-                }
-                .into());
-            }
-            Ok(None)
-        },
-    );
-
-    // --- ShutdownOnSuccess ---
-    let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
-    r.register(sos, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        sos,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sos,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnSuccess;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sos, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sos, "result", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_first_success(ctx, this)
-            .map(|v| Ok(Some(v)))
-            .unwrap_or_else(|| {
-                Err(RuntimeError::IllegalStateException {
-                    message: "No successful subtask".into(),
-                }
-                .into())
-            })
-    });
-    r.register(
-        sos,
-        "result",
-        "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_first_success(ctx, this)
-                .map(|v| Ok(Some(v)))
-                .unwrap_or_else(|| {
-                    Err(RuntimeError::IllegalStateException {
-                        message: "No successful subtask".into(),
-                    }
-                    .into())
-                })
-        },
-    );
-}
+/// RETIRED 2026-08-12 (W7-18 patch B). Registers nothing, on purpose, and the
+/// function is kept only because its call site is in another lane's file
+/// (`lib.rs`'s `register_phase_d_natives`).
+///
+/// This was the *third* registrar of `java/util/concurrent/StructuredTaskScope`,
+/// and every triple it held was either dead or a landmine:
+///
+/// * **Provably inert.** All three registrars sit inside
+///   `register_synthetic_overrides`, and the call order there is
+///   `register_phase67_natives` (`phases_late/concurrent.rs`), then
+///   `register_phase_d_natives` (this one), then
+///   `register_jdk25_concurrency_natives`. `register()` is
+///   last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+///   §3), and `jdk25_concurrency.rs` registers a superset of this function's
+///   `StructuredTaskScope` and `$Subtask` triples — so every one of them was
+///   overwritten before boot finished. The only registrations here that ever
+///   *won* were the two covariant-return `join()`s,
+///   `$ShutdownOnFailure.join()L…$ShutdownOnFailure;` and
+///   `$ShutdownOnSuccess.join()L…$ShutdownOnSuccess;`, which `jdk25_concurrency`
+///   spelled with the base `L…StructuredTaskScope;` return and therefore did not
+///   collide with. Both are on classes **JEP 505 deleted**: `javap` and
+///   `Class.forName` answer "not found" on Adoptium 25.0.3.9, `--real-jdk` and
+///   `--jdk-only` alike (docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §3).
+///
+/// * **A landmine, which is why it is retired rather than left alone.** These
+///   bodies used a DIFFERENT `$Subtask` slot convention from the registrar that
+///   owns the readers. Here, `state` was read and written at **slot 3** (`1` =
+///   success, `2` = failed) and the result at slot 1. In
+///   `jdk25_concurrency.rs`, which wins `Subtask.get/state/exception`, the
+///   layout is `SUBTASK_FIELD_STATE = 0`, `RESULT = 1`, `EXCEPTION = 2`,
+///   **`CALLABLE = 3`** — so this file's `state` write landed on the callable
+///   REFERENCE slot: an `Int` in a slot the collector scans as an oop, which is
+///   heap corruption rather than a wrong answer
+///   (docs/architecture/natives-over-real-jdk-classes.md §5). It never fired
+///   only because every one of those triples was overwritten. The day anyone
+///   deletes a JDK-21-shaped triple from the winning registrar, this becomes
+///   live. `t3_impl.rs::register_t31_structured_concurrency` is already a
+///   tombstone for exactly this defect ("registering them here caused the
+///   canonical 8-field layout to be overridden with the earlier 2-field stubs,
+///   silently breaking `close()`, `result()`, and `throwIfFailed()`"); this is
+///   the copy that pass missed.
+///
+/// Scope of the change: **synthetic-JDK mode only**, and structurally so. All
+/// three registrars are reachable only from `register_synthetic_overrides`,
+/// which is `#[cfg(feature = "synthetic-jdk")]` and called only on the
+/// `use_synthetic_jdk` arm of `vm_init`. In `--real-jdk` and `--jdk-only` real
+/// JDK bytecode serves this API end to end, measured at
+/// `compatibility_classes: 0` / `synthetic_stub_invocations: 0` with zero
+/// StructuredTaskScope violations (W7-18 §5), so nothing here can move either
+/// shipping mode by any amount, and nothing here can move a ratchet taken in
+/// Compatible mode.
+pub(crate) fn register_pd_structured_concurrency(_r: &mut NativeMethodRegistry) {}
 
 // ===========================================================================
 // Concurrency primitive tests & Unsafe.setMemory test

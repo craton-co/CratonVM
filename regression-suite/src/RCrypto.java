@@ -529,6 +529,61 @@ public class RCrypto {
                 "Mac before init is HotSpot's own IllegalStateException: " + macUninit);
         System.out.println("CK RCrypto macExc=" + macUninit);
 
+        // W7-21 Patch A/C. Each fails on the pre-fix behaviour: the 2-arg
+        // overload minted a KeyGenerator nothing could drive (NPE on this.spi),
+        // and SecretKeySpec accepted a zero-length key.
+        //
+        // 32 is not a guess: SunJCE's AES default is 256-bit on JDK 25,
+        // measured on the oracle (probes/JcaAdvertisedVsServedProbe.expected.txt,
+        // "A.KeyGenerator[AES] = OK alg=AES keylen=32 prov=SunJCE"), not the 128
+        // the deleted shim hardcoded. The all-zeros arm is the standing guard
+        // for the SecretKeySpec aliasing defect: SunJCE's own generators scrub
+        // their working buffer the instant the key object exists, so a
+        // store-by-reference put the scrub through onto the key itself and
+        // handed back 32 zero bytes with the right length and the right
+        // algorithm name.
+        KeyGenerator kg2 = KeyGenerator.getInstance("AES", "SunJCE");
+        byte[] kg2Key = kg2.generateKey().getEncoded();
+        check(kg2Key.length == 32,
+                "getInstance(\"AES\",\"SunJCE\") default is 256-bit, got " + kg2Key.length * 8);
+        check(!Arrays.equals(kg2Key, new byte[32]), "a generated AES key must not be all zeros");
+        String emptyKey = refused(() -> new SecretKeySpec(new byte[0], "AES"));
+        check(emptyKey.equals("IllegalArgumentException"),
+                "an empty SecretKeySpec key must be refused: " + emptyKey);
+        System.out.println("CK RCrypto keygen2arg=" + kg2Key.length + "," + emptyKey);
+
+        // The wall the block above walked into, pinned directly. AESKeyGenerator's
+        // constructor calls SecurityProviderConstants.getDefAESKeySize, which calls
+        // Cipher.getMaxAllowedKeyLength("AES") — so the KeyGenerator checks above
+        // depend on this and would not say so if it broke.
+        //
+        // Integer.MAX_VALUE is the unlimited-policy answer, which is what a stock
+        // JDK 9+ install gives (crypto.policy=unlimited ships by default). These
+        // methods do NOT check that the algorithm exists — "Bogus" answers
+        // unlimited too — only that the transformation is well FORMED: one token,
+        // or three separated by "/". "AES/GCM" is two, and is the refusal that
+        // exercises the format check rather than the policy answer.
+        int maxAes = Cipher.getMaxAllowedKeyLength("AES");
+        check(maxAes == Integer.MAX_VALUE,
+                "getMaxAllowedKeyLength(\"AES\") must be unlimited, got " + maxAes);
+        check(Cipher.getMaxAllowedKeyLength("AES/GCM/NoPadding") == Integer.MAX_VALUE,
+                "a three-part transformation is well formed and unlimited");
+        check(Cipher.getMaxAllowedKeyLength("Bogus") == Integer.MAX_VALUE,
+                "getMaxAllowedKeyLength does not validate the algorithm");
+        check(Cipher.getMaxAllowedParameterSpec("AES") == null,
+                "getMaxAllowedParameterSpec is null under the unlimited policy");
+        String twoPart = refused(() -> Cipher.getMaxAllowedKeyLength("AES/GCM"));
+        check(twoPart.equals("NoSuchAlgorithmException"),
+                "a two-part transformation must be refused: " + twoPart);
+        String noAlgo = refused(() -> Cipher.getMaxAllowedKeyLength("/ECB/PKCS5Padding"));
+        check(noAlgo.equals("NoSuchAlgorithmException"),
+                "an empty algorithm must be refused: " + noAlgo);
+        String nullTr = refused(() -> Cipher.getMaxAllowedKeyLength(null));
+        check(nullTr.equals("NullPointerException"),
+                "a null transformation is NPE, not NoSuchAlgorithmException: " + nullTr);
+        System.out.println("CK RCrypto maxKeyLen=" + maxAes + "," + twoPart + ","
+                + noAlgo + "," + nullTr);
+
         System.out.println("CK RCrypto checks=" + checks);
         System.out.println("PASS RCrypto (" + checks + " checks)");
     }

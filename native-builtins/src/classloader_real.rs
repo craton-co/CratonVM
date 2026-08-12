@@ -1095,6 +1095,79 @@ fn stub_may_answer_load_class() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
 }
 
+/// W7-26 R1 — narrow a loader-ladder swallow to the shape the JDK's own
+/// `catch` clause names.
+///
+/// JDK 25 `java.lang.ClassLoader.loadClass(String,boolean)` wraps its parent
+/// delegation in exactly one `catch`:
+///
+/// ```java
+/// try {
+///     if (parent != null) { c = parent.loadClass(name, false); }
+///     else { c = findBootstrapClassOrNull(name); }
+/// } catch (ClassNotFoundException e) {
+///     // ClassNotFoundException thrown if class not found
+///     // from the non-null parent class loader
+/// }
+/// ```
+///
+/// So the JDK absorbs a `ClassNotFoundException` and **nothing else**. A
+/// `LinkageError` out of a parent's `loadClass`, an
+/// `ExceptionInInitializerError` from a loader's `<clinit>`, an
+/// `OutOfMemoryError`, or any `RuntimeException` the loader raised all leave
+/// `loadClass` on HotSpot. Every loader ladder in this tree was spelled
+/// `_ => {}` or `if let Ok(...)`, which absorbs all of them and reports the
+/// class as merely absent — a diagnosable failure turned into a wrong answer,
+/// which is the species `W7-26-getannotation-swallowed-exception.md` is about.
+/// The type test is by `ClassId` hierarchy — the question `instanceof` asks —
+/// never by class name, matching `native-api/src/delegated_close.rs`.
+///
+/// `NoClassDefFoundError` is absorbed alongside `ClassNotFoundException`
+/// because CratonVM's own resolution reports the same "this name is not
+/// reachable from here" condition with it: `no_class_def_found_error` and the
+/// `ClassLookup::DependencyMissing` arm in this file both mint one, so
+/// re-raising it would refuse the fall-through the ladders exist to reach.
+/// This is exactly the pair `W7-26` residual R1 prescribes.
+///
+/// `Ok(())` means **absorbed** — treat it as "the class is absent" and keep
+/// going down the ladder. `Err(failed)` hands the original failure straight
+/// back so the caller can `?` it.
+///
+/// **Residual, stated rather than hidden:**
+/// `MethodCallFailed::InternalError` is absorbed too, which the rule in
+/// `delegated_close.rs` argues against (it is not a Java throwable, so no JDK
+/// `catch` can name it). It is kept absorbed because it is also the shape
+/// `resolve_class_loader_aware` returns for an ordinary "not on any classpath
+/// entry" miss — its terminal arm is `Err(MethodCallFailed::from(e))` over a
+/// `VmError` — which is the single most common way a rung legitimately falls
+/// through. Separating the two needs the resolver to stop reporting plain
+/// absence as an internal error; narrowing it here first would refuse every
+/// ordinary miss.
+pub(crate) fn absorb_class_absent(
+    ctx: &dyn NativeContext,
+    failed: MethodCallFailed,
+) -> Result<(), MethodCallFailed> {
+    let thrown = match failed {
+        // See the residual above.
+        MethodCallFailed::InternalError(_) => return Ok(()),
+        MethodCallFailed::ExceptionThrown(obj) => obj,
+    };
+    let thrown_class = ctx.class_id_of_object(thrown);
+    for absent in [
+        "java/lang/ClassNotFoundException",
+        "java/lang/NoClassDefFoundError",
+    ] {
+        // A name that was never loaded cannot be this throwable's supertype,
+        // so a missing root simply does not absorb.
+        if let Some(root) = ctx.class_id_by_name(absent) {
+            if ctx.is_subclass(thrown_class, root) {
+                return Ok(());
+            }
+        }
+    }
+    Err(MethodCallFailed::ExceptionThrown(thrown))
+}
+
 /// GC-SAFETY wrapper — the real-JDK sibling of
 /// `classloader::cl_load_class_base_delegation_inner`, and the one this
 /// workload actually takes (the repro runs with `--java-home`). The body
@@ -1322,9 +1395,15 @@ fn cl_real_load_class_base_rooted(
     //    the (parent-blind) global store and then a bare `ClassNotFoundException`.
     //    Scoped to a genuinely user-defined parent so builtin (app/platform/
     //    bootstrap) parents are unaffected and keep using the faster global
-    //    path below; a miss or exception here is swallowed (`_ => {}`) so
-    //    every existing fallback (global store, `findClass` override,
-    //    deferred resolution) still runs exactly as before.
+    //    path below. A miss, or a `ClassNotFoundException`/
+    //    `NoClassDefFoundError` from the parent, still lets the remaining
+    //    fallbacks run (`findClass` override, deferred resolution) — but it is
+    //    recorded as AUTHORITATIVE rather than swallowed, which is what
+    //    `parent_user_defined_authoritative_miss` below is for. Any OTHER
+    //    failure from the parent's `loadClass` propagates (W7-26 R1); this
+    //    comment previously read "a miss or exception here is swallowed
+    //    (`_ => {}`)", which had already stopped being true of the miss and is
+    //    now untrue of the exception as well.
     // Set when the user-defined parent's own `loadClass` was actually
     // invoked (real bytecode) and did NOT hand back a class. That refusal
     // is authoritative — the parent already ran its own full delegation/
@@ -1360,7 +1439,26 @@ fn cl_real_load_class_base_rooted(
                 Ok(Some(Value::Object(Some(mirror)))) => {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
-                _ => {
+                // The parent ran and answered null (or void). That is the
+                // authoritative miss this flag was added for — unchanged.
+                Ok(_) => {
+                    parent_user_defined_authoritative_miss = true;
+                }
+                // W7-26 R1 — the arm above used to be a bare `_ =>` that
+                // covered this one too, so ANY failure from the parent's own
+                // `loadClass` read as "the parent does not have it". JDK 25
+                // `ClassLoader.loadClass` catches `ClassNotFoundException`
+                // here and nothing else, so a `LinkageError`, an
+                // `ExceptionInInitializerError` from the parent loader's own
+                // `<clinit>`, or an `OutOfMemoryError` was being reported to
+                // the caller as a plain `ClassNotFoundException` naming this
+                // class (step 3 below) — the exception's identity gone and
+                // the real cause unnameable. `absorb_class_absent` keeps the
+                // `ClassNotFoundException`/`NoClassDefFoundError` half, which
+                // is every case the exclusion-aware loaders this branch
+                // exists for actually produce.
+                Err(failed) => {
+                    absorb_class_absent(&*ctx, failed)?;
                     parent_user_defined_authoritative_miss = true;
                 }
             }
@@ -1621,8 +1719,24 @@ pub fn ucl_real_find_class(
             exc?,
         ));
     }
-    if let Ok(Some(mirror)) = ctx.load_class(&internal) {
-        return Ok(Some(mirror));
+    // W7-26 R2 — this was `if let Ok(Some(mirror)) = ctx.load_class(...)`, so
+    // EVERY failure fell through to the `ClassNotFoundException` below. That
+    // is a re-raise with the wrong type, which is worse than a propagate:
+    // `URLClassLoader.findClass` raises `ClassNotFoundException` only when the
+    // class file cannot be FOUND. When it is found and cannot be used, HotSpot
+    // lets `defineClass`'s failure out — a `ClassFormatError`, a
+    // `VerifyError`, an `UnsupportedClassVersionError`, an
+    // `IncompatibleClassChangeError` — and a caller's
+    // `catch (ClassNotFoundException)` deliberately does not match any of
+    // them. Reporting "not found" for a class that is present but malformed
+    // sends every loader in the corpus down its "try the next source" path,
+    // and the real cause is unnameable from the Java side.
+    match ctx.load_class(&internal) {
+        Ok(Some(mirror)) => return Ok(Some(mirror)),
+        // No mirror and no failure — genuinely absent; fall through to the
+        // `ClassNotFoundException` below, exactly as before.
+        Ok(None) => {}
+        Err(failed) => absorb_class_absent(&*ctx, failed)?,
     }
     let exc = crate::jboss_module_loader::alloc_single_message_exception(
         ctx,

@@ -1,5 +1,74 @@
 # W7-34 — the twelve `java.util.Formatter` divergences that survived W7-3
 
+> ## 2026-08-12 — the locale patch is APPLIED, and the registrar order this record said had to be settled first IS settled
+>
+> **Which registrar wins, read from the boot path rather than from a census.**
+> Both live in `native-builtins/src/lib.rs`, and they are not peers:
+>
+> | registrar | enclosing fn | reached from | ambient kind | registers under `--jdk-only` / `--real-jdk`? |
+> |---|---|---|---|---|
+> | 1 — `let f = "java/util/Formatter";` (~`lib.rs:21308`) | `register_string_format_real_jdk_natives` (`lib.rs:21270`) | `register_essential_natives_with_shims` at `lib.rs:19292` | `Intrinsic` (set at `lib.rs:21274`, restored at `lib.rs:21434`) | **yes — and it is the only one** |
+> | 2 — `let c = "java/util/Formatter";` (~`lib.rs:41407`) | `register_formatter_natives` (`lib.rs:41402`) | `register_enterprise_final_natives` (`lib.rs:41149`) ← `register_synthetic_overrides` (`lib.rs:23897`), which is `#[cfg(feature = "synthetic-jdk")]` and called only from `register_builtins` on the `use_synthetic_jdk` arm | `Intrinsic` (set at `lib.rs:41406`) | **no** |
+>
+> So this record's own closing note — *"two registrars for one class means the
+> last one registered wins; patching only one is indistinguishable from patching
+> none"* — is **true only in `--synthetic-jdk`**. On the two shipping modes
+> registrar 2 never registers at all, so registrar 1 wins by default rather than
+> by ordering, and patching it is necessary AND sufficient. This is
+> docs/architecture/natives-over-real-jdk-classes.md §3's second shape ("a
+> shadowing verdict that ignores this is backwards"), and it is why the patch
+> could land without the `--dump-native-registry` diff the note demanded.
+> Registrar 2 is patched too, so synthetic mode agrees.
+>
+> **What landed.**
+>
+> * Registrar 1's `format` now reads the receiver's `Locale` out of field 1 and
+>   calls `lang_string::native_string_format_locale`. A null field 1 means "root
+>   defaults", which is exactly what `native_string_format` did unconditionally,
+>   so the no-locale path is byte-for-byte unchanged.
+> * Registrar 2's `native_formatter_format` does the same, and its
+>   `native_formatter_init` — which served `()V` **and** `(Locale)V` and wrote
+>   null into field 1 either way — is split, with `native_formatter_init_locale`
+>   and a new `native_formatter_init_appendable_locale`.
+>
+> **What was deliberately NOT taken from §"Out-of-file patch": the
+> `(Ljava/lang/Appendable;Ljava/util/Locale;)V` constructor on REGISTRAR 1.**
+> The patch proposed adding it there. On registrar 1's boot path the class is
+> the real `java.util.Formatter`, whose own constructor already writes `a` at
+> slot 0 and `l` at slot 1 — the two slots this layout uses — **plus `zero`**,
+> the digit-base field no native writes and real `Formatter` bytecode reads (the
+> `format(Locale, String, Object[])` overload has no native). Shadowing that
+> constructor would have traded a locale bug for an unwritten `zero`. Once
+> `format` reads slot 1, the real constructor is all registrar 1 needs. Registrar
+> 2 *does* need the overload — there is no real constructor in synthetic mode —
+> and has it. This is the "a fix that only pins the positive half" rule run
+> forwards: the constructor and the reader are one state machine, and on one arm
+> the constructor half is already correct.
+>
+> **Coverage.** `regression-suite/src/RStrings.java` (`CORE_CLASSES`, so it runs
+> in a plain `bash run.sh` and again under `CRATONVM_ARGS=--jdk-only`) asserts
+> that `new Formatter(sb, Locale.GERMANY).format("%,.2f", 1234.5)` equals
+> `String.format(Locale.GERMANY, "%,.2f", 1234.5)` — an equality between the two
+> spellings of one request rather than a pinned `1.234,50`, so a platform whose
+> German locale data is unavailable cannot turn it into a false red — and, as an
+> implication guarded on `DecimalFormatSymbols.getInstance(Locale.GERMANY)`
+> actually reporting `,`/`.`, that the rendering then uses them. The implication
+> is the locale-SENSITIVE half: a VM that resolves the symbols and discards the
+> locale fails it, which a `contains`-over-English check cannot see.
+>
+> **Also from "What is left", now measured against the source rather than
+> assumed:** `%t`/`%T` is not merely missing its `checkDateTime` — its month,
+> weekday and AM/PM renderings are **hard-coded English tables**
+> (`MONTHS_ABBR`, `MONTHS_FULL`, `DAYS_ABBR`, `DAYS_FULL` and the `'r'`/`'R'`
+> AM-PM arm in `native-builtins/src/lang_string.rs`'s date-time conversion),
+> consulted for every locale. `java.util.logging.SimpleFormatter`'s default
+> pattern opens with `%1$tb %1$td, %1$tY … %1$Tp`, so every JUL console line
+> renders its date in English whatever `Locale.getDefault(Locale.Category.FORMAT)`
+> says. Not fixed here (it needs `DateFormatSymbols`, and the re-entrancy latch
+> this record documents for `DecimalFormatSymbols`), and **not asserted** in
+> `RJdkLogging` — an assertion there would be red for a defect that row does not
+> gate, and would be date-dependent besides. A comment at that check says so.
+
 **Status: source landed, UNVERIFIED against a VM.** Nothing here has been built
 as part of the crate and `probes/ShadowDifferentialProbe.java` has **not** been
 re-run. What *is* measured is stated as measured; what is computed is stated as
@@ -301,7 +370,16 @@ refusal becoming the specified one — but `%q`, `%-d` and `%.2d` now throw wher
 they used to pass, and any caller that was relying on a typo being echoed back
 will see it.
 
-## Out-of-file patch (not applied)
+## Out-of-file patch (APPLIED 2026-08-12, with one deliberate departure)
+
+> Applied as written for the two `format` bodies and for registrar 2's
+> constructor split. **Registrar 1's `(Ljava/lang/Appendable;Ljava/util/Locale;)V`
+> constructor was NOT added** — see the head of this record for why (the real
+> constructor already writes slots 0 and 1, and also `zero`, which a native
+> would not). The registrar-order question the closing note raises is settled
+> at the head of this record: registrar 2 is synthetic-only, so on the shipping
+> modes registrar 1 wins by default and a `--dump-native-registry` diff is not
+> the instrument that settles it — the call graph is.
 
 ### `native-builtins/src/lib.rs` — `new Formatter(…, Locale)` still drops its locale
 

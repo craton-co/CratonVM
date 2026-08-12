@@ -18,6 +18,39 @@ W7-59-layout-detector-coverage.md, W7-68-live-under-allocations.md and W7-73.
 Every Java value quoted as "HotSpot says" is a transcript of
 `probes/ShortThreadMirrorProbe.java` run on that image.
 
+> **CORRECTIONS BANNER — 2026-08-12, later pass.**
+>
+> 1. **§5's "14 of 28" is an arithmetic slip. The answer is 12 of 28.** §1's
+>    corrections took W7-73's 16 to **14 out of a population of 30**. The two
+>    `java/lang/Thread` mirrors this record then repaired were **members of that
+>    14**, so subtracting them from the population must subtract them from the
+>    short count too: 30 → 28 and 14 → **12**, in the same edit. The ratchet's doc
+>    comment and failure message inherited the 14 and are corrected with it.
+> 2. **§2 row 12 (`FileChannel`) is DEAD, and its stated blocker was never the
+>    real one.** The row reads *"latent — and the live map is shared with
+>    `nio_file.rs`, so a one-sided renumber would break `isOpen()` (W7-68 §3.2)"*.
+>    W7-72-ssc-socket-and-filechannel.md §2.1 shows that premise **inverted**: the
+>    `isOpen` copy that reads the private slot lives in
+>    `register_phase57_file_channel`, whose whole transitive caller chain is
+>    `#[cfg(feature = "synthetic-jdk")]`, and which is overwritten by the
+>    constant-returning copy even inside that build. It never runs in any shipping
+>    configuration. W7-72 then paid the *actual* blocker — a cross-crate owner —
+>    and moved the map in one step to `native-api/src/synthetic_file_channel.rs`.
+>    The site's width is now `alloc_slots` = `base_for_class(…) + 2`, which makes
+>    the row **structurally unable to be short**, by §1.3's own argument. It
+>    leaves the short column.
+> 3. **One row JOINS it, so the twelve is not eleven.**
+>    `native-io/src/socket_channel.rs:637`'s `alloc_obj` is filed in W7-73 §3.2 as
+>    `over` at 12 against 10. W7-66-live-over-allocations.md §4.3 narrowed all
+>    four of its callers to `SC_OBJECT_SLOTS` = **6**, and
+>    `SocketChannel`/`ServerSocketChannel` declare 10 — short by 4. It is on an
+>    `Err(_)` arm, so §2's spine and §2.1's refusal both apply to it unchanged.
+> 4. **Every line number in §1.4 and §2 has moved again.** The re-derived table is
+>    W7-73-short-object-blind-spot.md §3.4. §1.4's *method* is the durable part:
+>    these tables are a work queue and the next reader will `sed -n` them.
+>
+> §1.1, §1.2, §1.3, §2, §2.1, §3, §4 and §6 are otherwise re-read and hold.
+
 ---
 
 ## 1. The width re-verification, and three disagreements with the 16
@@ -171,7 +204,7 @@ the reason they are the two this lane repaired.
 | 9 | `native-io/src/lib.rs:7548` | `ByteBuffer` | 5 | 11 | `Err(_)` | latent — the live path double-writes by index *and* by name in an order that ends correct on both layouts (W7-68 §3.3) |
 | 10 | `native-io/src/lib.rs:15087` (`alloc_typed_buffer`) | `CharBuffer` &c. | 5 | 9 | `Err(_)`; live arm is `BB_NUM_FIELDS.max(real)` | latent |
 | 11 | `native-io/src/lib.rs:12853` | `java/io/File` | 1 | 4 | `Err(_)` | latent — slot 0 *is* `path`, and `java/io/File` is fully overlaid, so nothing reads `prefixLength` (W7-68 §3.6, where a repair was written and reverted) |
-| 12 | `native-io/src/lib.rs:9570` | `FileChannel` | 2 | 4 | `Err(_)` | latent — and the live map is shared with `nio_file.rs`, so a one-sided renumber would break `isOpen()` (W7-68 §3.2) |
+| 12 | ~~`native-io/src/lib.rs:9570`~~ (now `:9811`) | `FileChannel` | `base+2` | 4 | `Err(_)` | **DEAD ROW — not short.** W7-72 §2 moved the map onto the appended-slot idiom across both crates; the width is `synthetic_file_channel::alloc_slots`, so §1.3's argument applies verbatim. The stated blocker was also inverted — see the banner |
 | 13 | `native-builtins/src/apps_h2.rs:62` | `Thread$State` | 2 | 3 | `Err(_)` | **dead** — `register_apps_h2_overrides` has no call site; the only reference in the tree is `let _ = apps_h2::register_apps_h2_overrides;` in `lib.rs`, and the module's own header records why it was switched off |
 | 14 | `native-io/src/lib.rs:13113` | `ArrayList` | 2 | 3 | `Err(_)` | latent — and the collections overlay is an architecture, not a defect (W7-68 §3.5) |
 | 15 | `native-builtins/src/util_time.rs:140` (`alloc_time_synthetic`) | `ZoneRules` (worst) | 1 | 7 | `Err(_)` | **dead in Compatible** — synthetic-only registrar (§1.2) |
@@ -450,10 +483,20 @@ new finding.
 **30 → 28**. Both removed sites are the two `Thread` mirrors; the scanner's own
 output confirms it (replicated line-for-line rather than eyeballed, and
 returning 30 before the edit and 28 after). The doc comment and the failure
-message were updated to match — 14 of 28 short, with §1.1's correction folded in
-— and the failure message now cites the repair as an instance of the remedy it
-prescribes. **Nothing else in that file was touched, no bound was raised, and no
-gate was relaxed.**
+message were updated to match — ~~14~~ **12** of 28 short (the banner has the
+arithmetic; 14 was this record's own slip, corrected in the same file on the
+later pass of 2026-08-12), with §1.1's correction folded in — and the failure
+message now cites the repair as an instance of the remedy it prescribes.
+**Nothing else in that file was touched, no bound was raised, and no gate was
+relaxed.**
+
+A twelfth link was added to that file on the later pass:
+`the_appended_slot_allocators_do_not_regress_to_a_literal_width`. It holds the
+property that takes the `FileChannel` and `MappedByteBuffer` rows out of the
+short column — that their requested widths are DERIVED from
+`appended_slots::base_for_class`, never literal. Neither the ratchet nor the
+census can see that regression: the site count does not move, and the width the
+detector reports is correct for the object it actually allocated.
 
 ---
 

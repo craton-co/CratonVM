@@ -9531,6 +9531,37 @@ impl ClassManager {
             cratonvm_types::intern_arc(leaf_descriptor)
         };
 
+        // JDK-ONLY-NOTE (W4-2): an array class's module is its COMPONENT
+        // type's module. This was a hardcoded `Some("java.base")` for every
+        // array class regardless of component type, so
+        // `MyAppClass[].class.getModule()` answered `java.base` where HotSpot
+        // answers the unnamed module. Measured on Temurin 25.0.3:
+        //
+        //   int[].class.getModule()        module java.base
+        //   String[].class.getModule()     module java.base
+        //   ArrProbe[].class.getModule()   unnamed module @691a7f8f
+        //
+        // `Class.getModule()`'s javadoc says it directly: "If this class
+        // represents an array type then this method returns the Module for
+        // the element type." A primitive component has no `ClassId` in the
+        // store (`component_id == None`) and its element type's module is
+        // java.base, which is the one case the old hardcode got right. A
+        // multi-dimensional array reaches here with `component_id` naming the
+        // inner ARRAY class, whose own module was computed by this same rule
+        // one recursion down, so `[[Lp/X;` inherits `p/X`'s module through
+        // `[Lp/X;` exactly as it already inherits its defining loader.
+        //
+        // `None` is the unnamed module (see `Class::module_name`), so a
+        // classpath component type produces an array class in the unnamed
+        // module rather than one falsely claiming java.base.
+        let array_module_name: Option<String> = match component_id {
+            Some(component) => self
+                .class_store
+                .get(component)
+                .and_then(|component_class| component_class.module_name.clone()),
+            None => Some("java.base".to_string()),
+        };
+
         let class = Class {
             id,
             loader_id: array_loader,
@@ -9565,7 +9596,7 @@ impl ClassManager {
             inner_classes: Vec::new(),
             enclosing_method: None,
             hidden: false,
-            module_name: Some("java.base".to_string()),
+            module_name: array_module_name,
             // Crucially: an array class is NOT a synthetic stub — it is a
             // fully-formed array class produced by the VM itself.
             // Marking it stub would (a) emit a misleading log line and
@@ -9697,18 +9728,57 @@ impl ClassManager {
 
         // Load superclass (may already be loaded). `super_class` is now
         // `Option<Arc<str>>`; deref for the `&str` parameter.
+        //
+        // W7-26 — these two were `.ok()` and `filter_map(… .ok())`, and both
+        // laundered a supertype resolution failure into a WRONG LAYOUT rather
+        // than into a failed upgrade:
+        //
+        //   * `superclass_id = None` says "this class has no superclass" when
+        //     its own class file says it has one, and `compute_field_layout`
+        //     below reads exactly that bit — so every inherited field slot
+        //     collapses and `first_field_index` becomes 0. That is the
+        //     slot-index species (`docs/architecture/natives-over-real-jdk-classes.md`
+        //     §5: a slot index against a real layout is heap corruption), not a
+        //     missing diagnostic.
+        //   * `filter_map` silently SHORTENS the interface list, so
+        //     `instanceof` answers false for a type the class file declares and
+        //     the itable is built one entry short.
+        //
+        // Neither has a fallback to fall through to, and
+        // `define_class_with_options` — the sibling that defines the same
+        // class from the same bytes — propagates both (`return Err(e)` on its
+        // `resolve_supertype` and on `resolved_interfaces`). This function was
+        // the outlier. All three callers already handle the `Err`: two log it
+        // at `debug` and keep the un-upgraded stub, which is strictly better
+        // than installing a stub whose layout claims a hierarchy it does not
+        // have, and the third (`define_class_with_options`) propagates.
+        //
+        // The `loading_guard` entry MUST be removed on every exit or the name
+        // is permanently seen as circular by `load_class`; that is why these
+        // are written as explicit `match`es rather than `?`.
         self.loading_guard.insert(name.to_string());
         let superclass_id = match class_file.super_class {
-            Some(ref super_name) => self.load_class(&**super_name).ok(),
+            Some(ref super_name) => match self.load_class(&**super_name) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    self.loading_guard.remove(name);
+                    return Err(e);
+                }
+            },
             None => None,
         };
 
         // Load interfaces. `iface_name: &Arc<str>` derefs to `&str`.
-        let interface_ids: Vec<ClassId> = class_file
-            .interfaces
-            .iter()
-            .filter_map(|iface_name| self.load_class(iface_name).ok())
-            .collect();
+        let mut interface_ids: Vec<ClassId> = Vec::with_capacity(class_file.interfaces.len());
+        for iface_name in class_file.interfaces.iter() {
+            match self.load_class(iface_name) {
+                Ok(id) => interface_ids.push(id),
+                Err(e) => {
+                    self.loading_guard.remove(name);
+                    return Err(e);
+                }
+            }
+        }
         self.loading_guard.remove(name);
 
         // Compute field layout from real class file
@@ -10376,6 +10446,12 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.util exceptions
         "java/util/NoSuchElementException"
         | "java/util/ConcurrentModificationException"
+        // `EmptyStackException` extends `RuntimeException` DIRECTLY, not
+        // `NoSuchElementException` — see types/src/error.rs's
+        // `RuntimeError::EmptyStackException`, whose doc says the same thing for
+        // the same reason: a `catch (NoSuchElementException)` must NOT catch it.
+        // docs/known-issues/jdk-only/W7-33-differential-dead-sections.md
+        | "java/util/EmptyStackException"
         | "java/util/InputMismatchException" => "java/lang/RuntimeException",
 
         // Linkage errors
@@ -11342,6 +11418,75 @@ pub(crate) fn is_vm_annotation_carrier_name(name: &str) -> bool {
     name == "java/lang/annotation/AnnotationProxy"
 }
 
+/// This VM's reserved `CratonVM$…` namespace for the small carriers it invents
+/// to hold state between two of its own natives.
+///
+/// Two names live here today, both 1–2 slot `Runnable`s with a native `run()V`
+/// and nothing else:
+///
+/// * `CratonVM$HttpServerLoop` — `native-builtins/src/net_phase_e.rs`, minted
+///   once per `HS_DISPATCHER_POOL` dispatcher to carry a `server_id` from
+///   `re10_spawn_dispatcher` to `re10_serve_loop_run`. This is the class
+///   `W7-17-vm-internal-door-sweep.md` §6A measured taking
+///   `HttpServer.start()` down under `--jdk-only` with
+///   `NoClassDefFoundError: CratonVM$HttpServerLoop`.
+/// * `CratonVM$StsForkRunner` — `native-builtins/src/jdk25_concurrency.rs`,
+///   the JEP 505 `StructuredTaskScope.fork()` worker body carrying the
+///   `Callable` and the `Subtask`. It is minted with a bare
+///   `try_alloc_concurrent_synthetic` and has **no** `ensure_vm_internal_class`
+///   pre-mint of its own, so before this arm it was the same door defect one
+///   file over, unrecorded.
+///
+/// # Why the prefix is admissible where a name usually is not
+///
+/// `is_vm_annotation_carrier_name` above carries this campaign's *never bind
+/// by name* argument in full; the same three statements hold here and the
+/// second is the one that changes shape, so it is restated rather than
+/// referenced:
+///
+/// * **There is no other copy to confuse this with.**
+///   [`fabricated_origin_for_name`] is reached only from
+///   [`ClassManager::try_ensure_synthetic_class`] →
+///   [`ClassManager::fabricate_class`], by which point `get_loaded_class_id`
+///   has answered `None` **and** `find_class_bytes_delegated` has failed. If an
+///   application really did put a `CratonVM$…` class on its classpath, the
+///   bytes would have been found and this function would never run.
+/// * **No other party is minting into it.** `java/lang/annotation/` is closed
+///   by the JVM's package rules; `CratonVM$` is closed by convention instead —
+///   it is this VM's own prefix, every use of it in the workspace is one of the
+///   two names above, and neither is a JDK name (`javap CratonVM$HttpServerLoop`
+///   against the JDK 25 image answers "class not found"; the string is in no
+///   JDK namespace at all). That is a weaker guarantee than the package rule
+///   and it is why the statement is written down: **anything added under this
+///   prefix must be a carrier the VM invents, never a stand-in for bytes some
+///   image declares.**
+/// * **It classifies, it does not dispatch.** Same as above — the only input is
+///   the invented name, and the answer is a provenance label.
+///
+/// # Gate 2 is already open for both, which is what makes this sufficient
+///
+/// `W7-17` §3's rule is that the door is only half the refusal: a class whose
+/// natives strict mode also drops buys an `UnsatisfiedLinkError` at the first
+/// call instead of a `NoClassDefFoundError` at the mint. Checked per name, not
+/// by analogy — neither appears in any table in
+/// `native-api/src/no_image_receiver.rs`, and
+/// `receiver_declared_by_no_supported_image` returns `false` for a name on
+/// none of them, so nothing re-tags either class's `run()V` `SyntheticStub`.
+///
+/// # Cost, stated as `is_vm_annotation_carrier_name` requires
+///
+/// A name routed to [`ClassOrigin::VmInternal`] skips
+/// [`ClassManager::fabricate_class`]'s ambiguity gate, which runs only for
+/// compatibility-stub origins. Inert here for the first bullet's reason: the
+/// gate exists to refuse a stand-in for a name several live classes already
+/// hold, and this path is reached only when no supplier answered at all.
+/// [`ClassManager::classify_defined_origin`]'s asymmetry does not arise either
+/// — no class file can ever back these names, so they never arrive with real
+/// bytes for the two paths to disagree about.
+pub(crate) fn is_vm_reserved_namespace_name(name: &str) -> bool {
+    name.starts_with("CratonVM$")
+}
+
 /// The origin a **fabricated** class deserves on the strength of its name
 /// alone.
 ///
@@ -11369,6 +11514,12 @@ pub(crate) fn is_vm_annotation_carrier_name(name: &str) -> bool {
 ///   `ensure_vm_internal_class`); this arm exists so a second minting route
 ///   cannot silently re-acquire the wrong label, which is precisely the
 ///   pairing `Proxy$Instance` already has.
+/// * `CratonVM$…` → [`ClassOrigin::VmInternal`] — see
+///   [`is_vm_reserved_namespace_name`], which carries the prefix argument and
+///   the per-name gate-2 check. This is the pairing `W7-17` §6A left optional;
+///   it is taken because a SECOND minting route exists and has no pre-mint of
+///   its own (`CratonVM$StsForkRunner`, `jdk25_concurrency.rs`), so here the
+///   arm is not belt-and-braces — it is the only thing covering that name.
 /// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
 ///   `Generated*Accessor*` is what generated it, exactly as
 ///   [`ClassManager::classify_defined_origin`] already reports for the same
@@ -11389,6 +11540,9 @@ fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
         return ClassOrigin::VmInternal;
     }
     if is_vm_annotation_carrier_name(name) {
+        return ClassOrigin::VmInternal;
+    }
+    if is_vm_reserved_namespace_name(name) {
         return ClassOrigin::VmInternal;
     }
     if is_generated_lambda_name(name) {
@@ -11670,6 +11824,11 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/lang/OutOfMemoryError"
         | "java/lang/VerifyError"
         | "java/util/NoSuchElementException"
+        // W7-33's synthetic-mode residual: without a field arm the fabricated
+        // carrier gets no slots, and the two `Throwable` slots every other
+        // exception here relies on (message, cause) are what a `getMessage()` on
+        // a caught `EmptyStackException` reads.
+        | "java/util/EmptyStackException"
         | "java/util/InputMismatchException"
         | "java/io/IOException"
         | "java/io/FileNotFoundException"
@@ -15290,8 +15449,19 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
+        // All SIX abstracts `javap 'java.lang.ProcessHandle$Info'` declares on
+        // JDK 25 — `commandLine` included. It was the one this list omitted, and
+        // the omission was load-bearing rather than cosmetic: a name absent here
+        // fails at RESOLUTION, before native dispatch is reached, so
+        // `phases_late.rs`'s `commandLine` registration (W7-10 §4) could only
+        // ever be reached on a real JDK. `regression-suite/src/RJdkStrict.java`
+        // asserts this surface as an exact six-name list, which is the assertion
+        // that goes red when a seventh abstract appears on a future image or a
+        // row is dropped from here again.
+        // docs/known-issues/jdk-only/W7-10-processhandle-interface-stub-bodies.md
         out.extend([
             mk("command", "()Ljava/util/Optional;"),
+            mk("commandLine", "()Ljava/util/Optional;"),
             mk("arguments", "()Ljava/util/Optional;"),
             mk("user", "()Ljava/util/Optional;"),
             mk("startInstant", "()Ljava/util/Optional;"),
@@ -19103,6 +19273,31 @@ mod tests {
                 "ProcessHandle fallback must declare {name}{descriptor}",
             );
         }
+
+        // The `$Info` carrier must declare ALL SIX of the image's abstracts. A
+        // name missing here fails at resolution, before native dispatch, so the
+        // matching `phases_late.rs` registration is unreachable — which is
+        // exactly what happened to `commandLine` until 2026-08-12 (W7-10 §7.3).
+        // Asserted as an exact set, not a `contains` sweep, because the failure
+        // mode is an omission and a `contains` loop over five names cannot see a
+        // sixth going missing. Mirrors `RJdkStrict.processHandleInfo`.
+        let mut info_methods: Vec<String> = synthetic_stub_ctor_methods("java/lang/ProcessHandle$Info")
+            .iter()
+            .map(|m| m.name.to_string())
+            .collect();
+        info_methods.sort();
+        assert_eq!(
+            info_methods,
+            vec![
+                "arguments".to_string(),
+                "command".to_string(),
+                "commandLine".to_string(),
+                "startInstant".to_string(),
+                "totalCpuDuration".to_string(),
+                "user".to_string(),
+            ],
+            "the fabricated ProcessHandle$Info must declare the image's six abstracts",
+        );
 
         let mut manager = ClassManager::new(&[], &[], &[]);
         let handle_id = manager

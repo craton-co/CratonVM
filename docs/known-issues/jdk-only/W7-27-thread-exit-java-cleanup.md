@@ -14,11 +14,26 @@
 >
 > * **Also open:** `TerminatingThreadLocal.threadTerminated()` and
 >   `StackableScope.popAll()` are now reachable **for the first time** and have
->   never been exercised; and the container half is still interlocked off at
->   `shared_secrets_bridge.rs:745`
->   (`VM_REMOVES_THREADS_FROM_CONTAINERS: bool = false`). With this half landed,
->   the ordering hazard W7-23 documented is now resolvable — flip the interlock
->   and measure the pair.
+>   never been exercised.
+> * **The container half is no longer interlocked off. Flipped 2026-08-12,
+>   unrun:** `VM_REMOVES_THREADS_FROM_CONTAINERS` is `true` in
+>   `native-builtins/src/shared_secrets_bridge.rs`, so the pair §8 prescribes is
+>   now the default arm rather than an A/B. Read
+>   docs/known-issues/jdk-only/W7-23-thread-container-registration.md §10 before
+>   the suite run: the wrong-flip signature is a hang with no `FAIL` line, and
+>   `CRATONVM_THREAD_CONTAINERS=0` un-flips it in the same binary.
+> * **§10C is still the live item, and it is now fully diagnosed rather than
+>   deferred** — see §10C, rewritten 2026-08-12 with the call chain. The short
+>   version: the main thread's death is expressed in `vm-cli/src/main.rs`, in a
+>   DIFFERENT CRATE, and `run_thread_exit_shared` is module-private to
+>   `vm/src/vm/vm_exec.rs`, so the third call site is a two-file change and
+>   neither file could be touched by the lane that diagnosed it. The exact patch
+>   is written out.
+> * **New residual found 2026-08-12, filed at §12:** the per-thread
+>   uncaught-handler SIDE TABLE is not cleared on a clean death, so
+>   `getUncaughtExceptionHandler()` on a normally-terminated thread answers
+>   differently per mode. §9's "the VM's own dispatch … consults a side table, so
+>   it is unaffected" is true of the *dispatch* and false of the *getter*.
 
 **Status: landed in `vm/src/vm/vm_exec.rs`, unconditional, in every mode.**
 This is the second half of the pair whose first half —
@@ -414,18 +429,118 @@ recipe, then at the top of `run_thread_exit_shared`
     }
 ```
 
-### C. The main thread does not get `exit()` either
+### C. The main thread does not get `exit()` either — and here is the exact call chain
+
+> **REWRITTEN 2026-08-12 with the call chain, which was the whole ask.** The
+> earlier text said "CratonVM's main-thread teardown is in a different file (the
+> one that owns the other `clear_tlab_addr` call site)". That pointer is
+> **wrong**: the other `clear_tlab_addr` call sites are `vm/src/native/jni.rs`'s
+> `detach_foreign_thread` (a JNI foreign thread, not the primordial one), and the
+> main thread **never reaches `clear_tlab_addr` at all**.
 
 `Thread.exit()` is wired into the two worker death paths in
 `vm/src/vm/vm_exec.rs`. HotSpot's `JavaThread::exit` runs on the primordial
-thread too, at VM shutdown. CratonVM's main-thread teardown is in a different
-file (the one that owns the other `clear_tlab_addr` call site) and is out of
-this lane's ownership, so it is recorded rather than changed. It matters much
-less — the process is ending, so no observer survives to see a container that
-was not emptied — and running arbitrary Java during VM shutdown is a materially
-riskier proposition than running it on a worker. Whoever takes it should measure
-`ExitBodyProbe`-on-main first, which already passes (§3 invokes `exit()` on the
-main thread and the VM stays usable).
+thread too, at VM shutdown. CratonVM's does not, and the reason it cannot be
+fixed from either of this record's two files is structural, not a matter of
+ownership convention.
+
+**Where the main thread's death is expressed.** `vm-cli/src/main.rs`, in
+`fn run()`. `main(String[])` is invoked through `vm.invoke(&class_name, "main",
+"([Ljava/lang/String;)V", …)` inside a `catch_unwind`, and immediately after it
+`run()` enters `phase::Category::VmShutdown` — everything from there to the end
+of `run()` is teardown. What that teardown does **not** contain, verified by
+grep: no `mark_dead(ThreadId(0))`, no `release_monitors_held_by` for the main
+thread, no termination-monitor notify, no `clear_tlab_addr`, and no
+`Thread.exit()`. `Vm::begin_main_thread_blocking_region` (`vm/src/vm/vm_init.rs`)
+is the only main-thread teardown step there is, and all it does is
+`set_vm_state` + `tlab.retire()` before the non-daemon wait. `Drop for Vm` runs
+AOT flush, CDS dump, `run_pending_finalizers`, JVMTI `VMDeath` and
+`release_vm_native_state` — no thread teardown either.
+
+**Why it is a two-file change.** `run_thread_exit_shared` is declared
+`fn`, with no `pub` and no `pub(crate)`, so it is private to the module
+`crate::vm::vm_exec`. `vm/src/vm.rs` has `pub(crate) mod vm_exec;` +
+`pub use vm_exec::*;`, so raising it to `pub` makes it reachable from `vm-cli` as
+`cratonvm_vm::vm::run_thread_exit_shared`; leaving it private makes the call
+impossible from anywhere outside that one file, and the main-thread death is not
+in that file. Hence: one visibility change in `vm/src/vm/vm_exec.rs`, one call in
+`vm-cli/src/main.rs`. Both are out of the ownership of the lane that has this
+record.
+
+**The insertion window, derived the same way §5 derives the worker one.** In
+`vm-cli/src/main.rs::run()`, after the `let result = match result { Ok(r) => r,
+Err(panic) => { … bail!("main() panicked: {msg}"); } };` block — so a Rust panic
+in `main()` is already out of the way and `result` is a `MethodCallResult` — and
+**before** `vm.begin_main_thread_blocking_region("vm-main:wait-non-daemon")`,
+which is the first thing to retire main's TLAB. Placing it there and not later
+covers **both** termination paths: the Java-exception path never reaches the
+non-daemon wait at all (`if matches!(result, Ok(_))` guards it) and goes straight
+to the renderer and `bail!`, so anything placed at or after that guard misses
+abnormal termination — the same trap §6 describes for the worker paths.
+
+**The receiver.** Read the main thread's `java.lang.Thread` mirror from the
+**registry**, not from `vm.main_thread.java_thread_obj`: the registry copy is
+remapped after every GC (`update_thread_objs_after_gc`) and the `JvmThread`
+field copy is not, and `main()` is an arbitrarily long window for a moving
+collection. `JvmThread::thread_id` is `pub`, so the tid comes from the thread
+itself and no `ThreadId` needs constructing:
+
+```rust
+    // vm/src/vm/vm_exec.rs — visibility only
+-fn run_thread_exit_shared(shared: &SharedVm, thread: &mut JvmThread, thread_obj: ObjectRef) {
++pub fn run_thread_exit_shared(shared: &SharedVm, thread: &mut JvmThread, thread_obj: ObjectRef) {
+```
+
+```rust
+    // vm-cli/src/main.rs, immediately after the `let result = match result {…};`
+    // block and before `begin_main_thread_blocking_region`.
+    //
+    // W7-27 §10C: HotSpot's `JavaThread::exit` runs `Thread.exit()` on the
+    // primordial thread too. Placed here, not after the non-daemon wait,
+    // because the Java-exception path never reaches that wait — the abnormal
+    // path is the one that gets forgotten. Errors are already reported at WARN
+    // inside the helper and never propagated.
+    {
+        let main_tid = vm.main_thread.thread_id;
+        if let Some(main_thread_obj) = vm.shared.threads.thread_registry.java_thread_obj(main_tid) {
+            cratonvm_vm::vm::run_thread_exit_shared(
+                &vm.shared,
+                &mut vm.main_thread,
+                main_thread_obj,
+            );
+        }
+    }
+```
+
+`(&vm.shared, &mut vm.main_thread)` is a disjoint-field borrow of
+`Vm { pub shared: Arc<SharedVm>, pub main_thread: Box<JvmThread> }` and is
+already the house pattern two hundred lines above — `ensure_singleton_oom(&vm.shared,
+&mut vm.main_thread)` and `invoke_premains(&vm.shared, &mut vm.main_thread, …)`
+in the same function. `java_thread_obj(ThreadId) -> Option<ObjectRef>` is `pub`
+on `ThreadRegistry`; `SharedVm::threads` and `ThreadRealm::thread_registry` are
+both `pub`.
+
+**Whether to land it at all — the honest position.** It matters much less than
+the worker halves: the process is ending, so no observer survives to see a
+container that was not emptied, and the only observable `clearReferences()` write
+(`uncaughtExceptionHandler`) has no reader left either. Against that, this runs
+arbitrary Java on the primordial thread during VM shutdown for the first time
+ever, and it runs it on **every** program the VM has ever executed rather than
+only on ones that start threads. `ExitBodyProbe` (§3) already invokes `exit()`
+in-thread on the main thread on all four arms and the VM stays usable, which is
+the cheapest available pre-flight and it passes — but that was with
+`container == null`, and the container half is no longer interlocked off, so the
+pre-flight no longer covers the interesting branch. **Recommended order: land the
+container flip first, measure it, and only then take §10C.** Two first-time-ever
+Java-teardown changes in one unmeasured wave is a bisect nobody can do.
+
+**Adjacent, and worth knowing before anyone widens this into "run shutdown
+teardown properly":** `Runtime.addShutdownHook` registers into
+`native-builtins/src/lang_system.rs`'s `SHUTDOWN_HOOKS` and **nothing ever runs
+them** — the file says so in place. `java/lang/Shutdown.runHooks` is registered
+nowhere and invoked nowhere, and `System.exit`/`Runtime.exit` go straight to
+`std::process::exit`. That is a separate, larger gap than this one; do not let it
+ride along on §10C.
 
 ## 11. Probe sources
 
@@ -464,6 +579,279 @@ throwaway `StringBuilder` round-trip to show the VM survived.
 so a functioning `ThreadLocal` whose storage is not the JDK's field is
 distinguishable from a broken one.
 
+## 12. Filed 2026-08-12: the fix is now covered by a scheduled vector, and covering it found a residual
+
+### 12.1 The coverage, and why it needed no `--add-opens`
+
+§8's A/B is a hand-run against probes that are not checked in, and `probes/` is
+never executed by `regression-suite/run.sh` in any suite. So this half now has a
+scheduled assertion instead:
+`regression-suite/src/RJdkExecutors.java::threadExitCleanup()`, in
+`JDKONLY_CLASSES`.
+
+The device is that `clearReferences()`'s one observable write is reachable from
+**public API** — `Thread.getUncaughtExceptionHandler()` reads the same
+`uncaughtExceptionHandler` field and falls back to the `ThreadGroup` when it is
+null — so nothing here needs reflection, `--add-opens`, `StructuredTaskScope` or
+a `ThreadFlock`. Three assertions, in this order because each is meaningless
+without the one before it:
+
+1. a live thread reports the handler installed on it (the field is populated and
+   readable at all — the check §2's first draft was missing, which is how that
+   draft reported the opposite answer);
+2. the handler **fires** on an uncaught exception (so the dispatch consulted it
+   while it was still installed, which is §5's forced ordering, observed);
+3. after `join()` returns, the terminated thread no longer reports it.
+
+(3) is the discriminator and it fails on the pre-fix behaviour: without
+`Thread.exit()` the field is never nulled and the terminated thread hands the
+handler straight back. It is asserted on the **abnormal** path — a thread whose
+`run()` throws — for §6's reason, and because that is the path a cleanup wired
+only into the happy path would miss.
+
+Two things the vector deliberately does **not** assert, each because the answer
+is not mode-independent:
+
+* **The clean-death thread's handler.** See §12.2 — the answer differs between
+  `--real-jdk` and `--jdk-only`, so pinning it would freeze one mode's
+  divergence into a gate. The clean thread is still started, joined, and checked
+  for "ran once", "did not dispatch a handler" and "cannot be restarted", which
+  is everything about that path that IS mode-independent.
+* **The exact handler-fire count.** CratonVM dispatches through the side table
+  *and* lets real `Thread.dispatchUncaughtException` bytecode run on some paths,
+  so the count is a per-mode fact. The vector asserts `>= 1` for the abnormal
+  thread and then asserts the count is **unchanged** across the clean thread,
+  which is the same question asked as a delta and is mode-independent.
+
+### 12.2 Residual: the handler side table outlives `Thread.exit()`
+
+**Found while writing §12.1, and it corrects §9's point 4.** §9 said "The VM's
+own dispatch runs strictly before this point and consults a side table, so it is
+unaffected". That is true of the **dispatch** and false of the **getter**.
+
+`native-builtins/src/uncaught_handlers.rs` keeps per-thread handlers in an
+identity-hash-keyed side table *and* mirrors them into the real
+`Thread.uncaughtExceptionHandler` field, and its
+`getUncaughtExceptionHandler()Ljava/lang/Thread$UncaughtExceptionHandler;` native
+reads **the side table first**, falling back to the real field only when the
+table misses. The table is emptied in exactly two places: `take_uncaught_handler`
+(the abnormal dispatch path) and `clear_handler` (a setter called with null).
+**Neither runs on a clean death.** `Thread.exit()` nulls the real field, so the
+two stores now disagree for every normally-terminated thread that had a handler,
+and the getter prefers the stale one.
+
+Which answer you get depends on the mode, and the mechanism is the ambient
+`NativeKind`:
+
+| mode | who serves `getUncaughtExceptionHandler()` | terminated thread, clean death |
+|---|---|---|
+| `Compatible` / `--real-jdk` | the `Bridge` native wins | the **stale handler** (HotSpot: the ThreadGroup, or null) |
+| `--jdk-only` | the native **yields** — `policy.is_jdk_only() && bytecode_available && kind != Intrinsic` — and real bytecode runs | the nulled field, i.e. HotSpot's answer |
+
+Registrar and ambient kind, established from the call sequence rather than from
+brace-scanning: `uncaught_handlers::register_uncaught_handler_natives` sets
+ambient `NativeKind::Bridge` for all four `java/lang/Thread` triples and is
+called three times — from `register_essential_natives` (`lib.rs`, the real-JDK
+boot path), from `phases_late.rs`, and from `phases_late/concurrent.rs` — always
+with the *same* callbacks, so last-write-wins is a no-op between them and this
+registrar is the unambiguous winner on every path.
+
+**Not fixed here, and the reason is not effort.** The obvious repair — make the
+getter consult the real field first whenever the receiver's class *declares*
+`uncaughtExceptionHandler` (asked of the class, not of the value:
+`resolve_field_index_by_class_id` / `field_read::declares_field`, per
+docs/architecture/natives-over-real-jdk-classes.md §4) — inverts a priority the
+file documents as deliberate ("the side-table lookups intentionally keep priority
+over the real field: they are the only storage that survives a synthetic Thread
+layout"), and it is a **`Compatible`-mode behaviour change** on the
+uncaught-exception path. That is exactly the population this directory's standing
+constraints say to be most careful with, it is a HotSpot-parity fix rather than a
+strict-mode one, and it cannot be validated without a run. The cheaper and
+strictly safer alternative is to clear the table on a clean death too — one
+`clear_handler` call from the normal branch of the worker-death paths in
+`vm/src/vm/vm_exec.rs` — which converges both modes with no priority inversion,
+but that is a third file again.
+
+## 13. Filed 2026-08-12: the vector's restart assertion FAILED, and the state it must read is not the one `Thread.start()` reads
+
+§12.1's vector ended with a fourth assertion — *"restarting a terminated thread
+must throw `IllegalThreadStateException`"* — added because running Java teardown
+on a dying thread is the change that could plausibly resurrect one. Its first
+ever run failed. The defect it found is **older than this record's patch** and
+independent of it: CratonVM has never enforced JVMS's start-at-most-once rule.
+
+    cratonvm --java-home <jdk25> --jdk-only -cp regression-suite/build RJdkExecutors
+    => AssertionError: restarting a terminated thread must throw IllegalThreadStateException
+    HotSpot 25.0.3.9: PASS RJdkExecutors
+
+### 13.1 Measured: the exception is the symptom, the resurrection is the damage
+
+A standalone probe (`Thread` started, joined, started again) answers on the two
+VMs:
+
+| | HotSpot 25 | CratonVM `--jdk-only` |
+|---|---|---|
+| second `start()` throws | **yes** | no |
+| body ran (`ran`) after the second `start()` | 1 | **2** |
+| `start()` on a still-RUNNING thread throws | **yes** | no |
+
+So a `Runnable` the application had already retired executes a second time on a
+second OS thread. Both halves of the rule are missing, not just the terminated
+one — which is why §12.1's vector now asserts the live half too, and asserts
+`ran == 1` after the refused restart rather than only the exception.
+
+### 13.2 Which lifecycle state is authoritative, and the one that is inert
+
+Three stores model thread lifecycle in this VM. Only one of them is written on
+the death path, and it is **not** the one the JDK's own `Thread.start()` reads.
+
+Read with `--add-opens java.base/java.lang=ALL-UNNAMED` so `holder.threadStatus`
+is reachable from Java, across one thread's whole life:
+
+| store | NEW | after it has terminated | verdict |
+|---|---|---|---|
+| `Thread.holder.threadStatus` (what real `start()` branches on) | 0 / 0 | HotSpot **2**, CratonVM **0** | **INERT on this VM** |
+| VM `ThreadRegistry` (`thread_run_state`) | NEW | **TERMINATED** | **authoritative** |
+| `Thread.getState()` | NEW / NEW | TERMINATED / **TERMINATED** | correct *because* it bypasses the field |
+
+`native_thread_get_state` says so in its own doc comment — *"the VM never
+advances that field past 0 (NEW)"* — and computes the state from the registry
+instead. `vm/src/vm/vm_exec.rs::thread_run_state` is explicit about why the
+registry can answer for a dead thread: *"the registry RETAINS dead threads'
+entries (`mark_dead` only flips `alive`), so a present-but-not-alive entry is
+TERMINATED, while a missing entry is a thread that was never started (NEW)."*
+
+**A guard placed on `holder.threadStatus` would therefore never fire.** That is
+the whole trap in this defect: the field is the one the JVMS text and the JDK
+source both point at, and it is the one thing here that nothing writes.
+
+### 13.3 Why the real `start()`'s own check never runs
+
+The JDK's `Thread.start()` bytecode *does* carry `if (holder.threadStatus != 0)
+throw new IllegalThreadStateException()`. It is shadowed. `java/lang/Thread` /
+`start` / `()V` is registered **twice** in `native-builtins/src/lib.rs` — once in
+the real-JDK set and once in the synthetic set — and both land on
+`native_thread_start0`. The real-JDK registration's own comment states the
+intent and then contradicts itself in the next five lines:
+
+> `Thread.start`: in real-JDK mode the JDK's Java implementation must run (it
+> sets thread state, checks already-started, and calls start0). Only intercept
+> for synthetic-JDK Thread …
+
+— after which **both** branches call `native_thread_start0`. So the check is
+bypassed *and* the field it reads is dead. Two independent reasons, either one
+sufficient; fixing only the registration would still not throw, because
+`threadStatus` stays 0.
+
+Note the container route reaches the same place:
+`shared_secrets_bridge.rs::jla_start_in_container` invokes
+`Thread.start(Ljdk/internal/vm/ThreadContainer;)V`, whose real bytecode does
+**not** re-check `threadStatus` (the public no-arg `start()` does that before
+calling it) and ends in `start0()`. `start0()V` is natively registered on both
+sets too. One guard in `native_thread_start0` therefore covers all four
+registrations and both routes — and, because that bytecode's `finally` calls
+`container.onExit(this)` when `start0` throws, a refused start does not leak a
+container registration.
+
+### 13.4 The fix, and why it reads two different things per layout
+
+Out-of-file (`native-builtins/src/lang_system.rs`, in
+`native_thread_start0`, before any of the `InheritableThreadLocal` / CCL
+bookkeeping — HotSpot throws before any side effect). Exact text is in
+§13.6.
+
+The predicate is HotSpot's (`threadStatus != 0`, i.e. *anything but NEW*),
+sourced from the registry. But the registry lookup
+(`resolve_thread_id_from_thread_obj`) has **two** routes and only one is
+aliasing-proof:
+
+* **Real-JDK mirror** (`tid` reads back as a `Long`): resolved through the
+  process-unique Java `Thread.tid` index, or the `tid`-checked pointer walk.
+  A dead thread's recycled mirror address cannot alias — this is precisely the
+  repair made for the *DoHead engine-start `IllegalThreadStateException` flake*,
+  named in `read_java_thread_tid`'s and
+  `find_thread_id_by_thread_obj_tid_checked`'s doc comments.
+* **Fabricated mirror** (no `tid` field at all — the synthetic
+  `java/lang/Thread` declares `contextClassLoader`, `_f5`, `threadLocals`,
+  `inheritableThreadLocals` and four anonymous slots, and no `tid`): falls back
+  to the **unguarded** pointer walk `find_thread_id_by_thread_obj` *before* it
+  reads the synthetic marker. Asking `thread_run_state` there would reintroduce
+  the DoHead flake as a spurious `IllegalThreadStateException` on a *fresh*
+  thread.
+
+So the guard asks the layout question first with the existing
+`has_real_jdk_thread_layout` helper, and for the fabricated layout reads the
+marker that lives **on the mirror itself**: `vm_exec.rs::thread_start` writes
+`Value::Long(registry tid)` into slot 2 of a compatibility-stub `Thread`, and
+nothing else puts a `Long` there — the same convention
+`resolve_thread_id_from_thread_obj`'s own last fallback uses. A value on the
+object cannot alias a side table keyed by address.
+
+### 13.5 Blast radius of the narrowing — and why it is not a new one
+
+`start()` now throws where it used to silently spawn. What in the corpus could
+start a thread twice?
+
+* **`ThreadPoolExecutor` — the dangerous case, and it is already gated.**
+  `javap -c java.util.concurrent.ThreadPoolExecutor` on Adoptium 25.0.3.9 shows
+  `addWorker` calling `Thread.getState()` and throwing
+  `IllegalThreadStateException` when the answer is not `NEW`. That bytecode runs
+  in `--jdk-only`, and `getState()` is the registry-backed native. **Every
+  pooled worker in the corpus is therefore already gated on the exact predicate
+  this guard adds**, off the exact same read. The guard adds no new
+  false-positive surface in real-JDK mode; if the registry misresolved, the
+  corpus would already be throwing from `addWorker`.
+* **Misresolution of a fresh mirror** (the only way to get a *false* throw).
+  Probe: 60 waves × 40 freshly constructed `Thread`s, each asked `getState()` /
+  `isAlive()` before `start()`, with 2000-object heap churn per wave to force
+  mirror-address recycling. **0 / 2400 misresolved**, in `--jdk-only` and in the
+  default real-JDK mode. The synthetic mode could not be measured — the frozen
+  wave binary is built without the `synthetic-jdk` feature and refuses
+  `--synthetic-jdk` — which is the second reason the fabricated layout gets the
+  on-mirror marker rather than the registry.
+* **The eight natives that call `ctx.thread_start(...)` directly** —
+  `jdk25_concurrency.rs:934`, `net_phase_e.rs:16503`, `lib.rs:22621/22659/22676`,
+  `phases_late/concurrent.rs:4168/4231` — bypass `native_thread_start0` entirely
+  and are **unaffected**. Each spawns a freshly allocated worker mirror. This is
+  the argument for putting the guard in the native rather than in
+  `vm_exec.rs::thread_start`: the Java-visible `Thread.start()` surface gets the
+  JVMS rule, VM-internal spawns keep their current behaviour.
+* **Not closed by this**: two threads calling `start()` on the same `Thread`
+  concurrently. HotSpot's `start()` is `synchronized (this)`; this native is not,
+  so a genuine double-start race narrows but does not vanish. Pre-existing, and
+  out of scope here.
+
+### 13.6 The patch
+
+`native-builtins/src/lang_system.rs`, inserted immediately after
+`native_thread_start0`'s `let this = match args.first() { … };` (before the
+`Round-7 CRIT fix #3` comment):
+
+```rust
+    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
+        ctx.thread_run_state(this) != 0
+    } else {
+        ctx.object_num_fields(this) > 2
+            && matches!(ctx.get_field(this, 2), Value::Long(_))
+    };
+    if already_started {
+        return Err(RuntimeError::IllegalThreadStateException {
+            message: "Thread.start: this thread has already been started".to_string(),
+        }
+        .into());
+    }
+```
+
+Everything it names already exists: `has_real_jdk_thread_layout` is a
+crate-root-private `fn` in `lib.rs` (called the same way, with a
+`&mut dyn NativeContext`, at eight sites there); `thread_run_state`,
+`object_num_fields` and `get_field` are `NativeContext` trait methods;
+`RuntimeError` is already imported at the top of `lang_system.rs` and
+`RuntimeError::IllegalThreadStateException { message }` already maps to
+`java/lang/IllegalThreadStateException` in `types/src/error.rs`. A real-JDK
+mirror whose `tid` does not read back as a `Long` takes the else-arm, reads the
+real slot 2 (`name`, a reference), and fails **open** — never a spurious throw.
+
 ## What is not claimed
 
 Nothing was rebuilt. §2's baseline, §3's pre-flight and §7's `ThreadLocal`
@@ -473,3 +861,13 @@ VM when it is reached, and that the `TerminatingThreadLocal` gate is closed for
 a second reason. They do **not** establish that the edited source compiles, that
 the two new call sites are reached, or that the pair works together — §8 is the
 run that decides that, and it has not been done.
+
+The same applies to §13, with one difference in its favour: §13.1's two-VM
+divergence, §13.2's `threadStatus` time series and §13.5's 0/2400 misresolution
+count are measurements of the **frozen wave binary**, so the defect and the
+inertness of `holder.threadStatus` are facts, not hypotheses. §13.6's patch is
+**not applied and not compiled** — it is written against read signatures, and
+the `--synthetic-jdk` arm of §13.4 could not be exercised at all because the
+frozen binary is built without that feature. `RJdkExecutors.threadExitCleanup()`
+gained four checks for this (69 on HotSpot, was 65); with the patch unapplied,
+CratonVM still stops at the same first one.

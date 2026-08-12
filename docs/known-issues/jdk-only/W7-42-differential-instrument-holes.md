@@ -14,6 +14,37 @@ W7-32-round-2-differential-run.md.
 **The differential is at 9, not 14.** Five of the fourteen were the
 instrument.
 
+> **RE-VERIFIED IN TREE 2026-08-12, and the pipeline's remaining holes are now
+> closed too (§"The pipeline, audited a second time" below).**
+>
+> Everything this record claims to have fixed is present in the working tree:
+> `probes/ShadowDifferentialProbe.java` carries all nine ledger markers
+> (`MISSING-OBSERVABLE`, `UNDECLARED-OBSERVABLE`, `SECTION-NEVER-RAN`,
+> `SECTION-UNDECLARED`, `DUPLICATE-OBSERVABLE`, `MANIFEST-OVERFLOW`,
+> `PROBE-MANIFEST-DIGEST`, `PROBE-LEDGER`, plus `<toString-threw:…>` and the
+> explicit `System.out.flush()`), and `native-builtins/src/lib.rs:38238` gates
+> the `[SUREFIRE-NPE]` forensic behind `surefire_npe_trace_enabled()`. Neither
+> hole is open.
+>
+> **Two standing rules for anyone re-measuring this**, both of which cost this
+> area a lane already:
+>
+> * **Diff against this record's transcript and its `PROBE-MANIFEST-DIGEST`,
+>   never against W7-4's retired oracle.** That oracle predates the manifest
+>   ledger, so diffing a current run against it MANUFACTURES divergence out of
+>   rows the probe has since gained — RETIREMENT-20260812.md retires it on
+>   exactly that ground. No baseline transcript is stored beside the probe, and
+>   that is deliberate: a frozen expected-output file beside a probe that keeps
+>   growing is the same trap with a filename.
+> * **One compile, both sides.** Two builds are two objects and are not
+>   comparable. That *is* hole 1, and it is now a property of the script rather
+>   than of the operator's discipline.
+>
+> One correction to the framing, not to the finding: the campaign brief cites
+> W7-4's oracle as 858 lines. **858 is this probe's declared-observable count**;
+> RETIREMENT-20260812.md records W7-4's oracle as **540** lines. Both numbers are
+> in play in this area and they are not the same number.
+
 ---
 
 ## Hole 1 — five observables vanished while the fence stayed silent
@@ -281,6 +312,59 @@ the tree, so this is a dispatch-path question rather than a native to patch,
 and it is not this branch's surface. Repro above is six lines and deterministic.
 
 ---
+
+## The pipeline, audited a second time (2026-08-12)
+
+The probe's Java was the half this record fixed. The **runner** was audited
+afterwards and had six more ways to lose or misread a row, all in
+`probes/shadow-differential.ps1`, all now closed. Nothing was run: this section
+is a source claim, and the command that turns it into a measurement is below.
+
+| # | the hole | why it is the same species | now |
+|---|---|---|---|
+| 1 | a digest mismatch printed the diff anyway, under a warning | a warning above a plausible-looking diff is a warning that gets scrolled past, and scrolling past *this* condition is what produced hole 1 | **no diff is printed at all**; exit 2, transcripts and provenance left on disk |
+| 2 | `PROBE-LEDGER` was matched against a frozen five-field string | the ledger already grew twice (`multiline`, `unrenderable`); a frozen pattern goes red on a **healthy** run the day it grows again, and a check that fires on a healthy tree gets muted rather than read | parsed as `key:value` pairs, every field must be `0`, unparsable and non-numeric fields reported by name |
+| 3 | the stderr sidecar was kept and **never read** | this record's one genuinely new finding came from that file and had never appeared in any transcript. Separating the streams and then not reading the sidecar is the same blindness one step further back | scanned for nine linkage/lookup errors (`NoSuchMethodError`, `NoSuchFieldError`, `AbstractMethodError`, `IncompatibleClassChangeError`, `NoClassDefFoundError`, `ClassNotFoundException`, `UnsatisfiedLinkError`, `IllegalAccessError`, `VerifyError`), one regex alternation so a line naming two is reported once, printed **above** the diff |
+| 4 | no cross-side check on the emitted count | both sides can report `missing:0` — each is only self-consistent — while having emitted different numbers of rows. That combination is hole 1's exact shape | `PROBE-OBSERVABLES-EMITTED` compared across sides |
+| 5 | nothing recorded what produced a transcript | the digest proves the two sides of **one** run agree; hole 1's mechanism was a scratchpad copy **outliving** the run, which no within-run check can see | `provenance.txt` beside the transcripts: probe path + SHA-256, classes dir, `javac -version`, each side's resolved exe path + SHA-256 + mtime + argv + exit code, both digests |
+| 6 | `Get-Content` decoded both transcripts in the host ANSI codepage | the sides are pinned to `-Dstdout.encoding=UTF-8`; the currency and text rows this probe exists to adjudicate are exactly the ones that mangle | `-Encoding UTF8` on every read, `@()` so `.Count` is a line count on an empty or one-line file |
+
+Sidecar findings deliberately do **not** suppress the diff and do not change
+the exit code: they are findings about the VM, not instrument errors. The
+banner says so, and says that a run with sidecar lines and a clean diff is not
+a clean run.
+
+### Re-measuring: one command, and the numbers are blank because nothing was run
+
+```powershell
+.\probes\shadow-differential.ps1 `
+    -Cratonvm .\target\release\cratonvm.exe `
+    -Java "C:\jdk-25.0.3.9-hotspot\bin\java.exe" `
+    -VmArgs "--real-jdk"
+```
+
+It compiles once, runs both sides against that one class directory, and exits
+0 / 1 (divergence) / 2 (instrument error). Fill in from its output:
+
+```text
+hotspot   stdout ____ lines   stderr ____ lines
+cratonvm  stdout ____ lines   stderr ____ lines
+PROBE-MANIFEST-DIGEST   hotspot ________________  cratonvm ________________
+PROBE-LEDGER            hotspot ________________  cratonvm ________________
+divergent observables   ____        (this record's figure: 9)
+stderr sidecar lines    ____ hotspot / ____ cratonvm
+```
+
+**Do not copy the 9, the 864 or `22732607802c59c2` into that block.** They are
+this record's measurement on the release binary of 2026-08-12 00:21, and a
+remembered figure written where a fresh one belongs is how a stale oracle gets
+its second life. If a fresh digest differs from `22732607802c59c2`, the probe
+gained or lost declarations since — which is expected and is not by itself a
+defect; it means the row counts are not comparable to the ones above.
+
+Run `-VmArgs "--jdk-only"` as a second arm. This record's 9 is `--real-jdk`
+only, and nothing has ever taken this probe through the `--jdk-only` arm the
+campaign is named for.
 
 ## What was NOT changed
 

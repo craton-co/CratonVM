@@ -26,6 +26,81 @@
 > Everything under *"What is deliberately still missing"* remains open and is
 > deliberate.
 
+> **RE-GREPPED 2026-08-12 (crypto lane, second pass). Patch 2's live half is
+> still live and is now anchored; Patch 3 is complete end to end; Patch 4 is
+> re-confirmed as needing nothing.**
+>
+> * **Patch 2 — LIVE, unchanged, and the anchors moved.** Both 2-arg
+>   `KeyGenerator.getInstance` overloads in
+>   `native-builtins/src/jca/cipher.rs::register_keygen_dispatch` still do
+>   `ctx.set_field(obj, 1, Value::Int(128));` with no algorithm check —
+>   `:3346` and `:3358` today, not `:3300`/`:3312`. `keygen_default_bits` still
+>   appears nowhere in `cipher.rs`, and it is a private `fn` in
+>   `phases_early.rs` (`:14489`), so reaching it needs `pub(crate)` first.
+>   **The preferred fix has shifted to "delete both registrations", and the
+>   reason is new evidence, not taste:** W7-39 seeded twelve real
+>   `KeyGenerator` services on 2026-08-12
+>   (`native-builtins/src/jca/provider_chain.rs:1418-1440`), and that file's own
+>   comment at `:1401` now asserts *"`KeyGenerator` is **NOT** natively
+>   intercepted in `--real-jdk` mode"* — a statement these two registrations
+>   falsify. The doc comment's stated reason for the shims (the real path NPEs
+>   at `service.getProvider()`) was written before the registry was seeded.
+>   `cipher.rs` is outside this lane; see W7-21's Patch A for the exact text.
+> **CLOSED 2026-08-12 (third pass, JCA lane). Patch 2's live half is gone.**
+> Both 2-arg `KeyGenerator.getInstance` overloads, the enclosing
+> `register_keygen_dispatch`, and its call site were **deleted** from
+> `native-builtins/src/jca/cipher.rs` — the "delete both registrations" option
+> the pass above shifted to, taken for its reason. `keygen_default_bits` stays
+> private in `phases_early.rs`; nothing needed it, because nothing replaces the
+> shims. Two corrections to the block above, both from re-reading the source
+> rather than the record:
+>
+> * the seed is **thirteen** `SunJCE` `KeyGenerator` services, not twelve —
+>   `AES, ARCFOUR, Blowfish, ChaCha20, DES, DESede, HmacMD5, HmacSHA1,
+>   HmacSHA224, HmacSHA256, HmacSHA384, HmacSHA512, RC2`;
+> * the deletion is safe because of a fact neither pass states: the
+>   `sun/security/jca/GetInstance` bridges that answer the real path are gated
+>   on `ec_real`, which is `real_jca_mode() || route_ec_to_real() ||
+>   route_dsa_to_real()` — and `route_ec_to_real()` is **default ON**
+>   (`CRATONVM_SYNTHETIC_EC=1` is its kill switch). Both the named-provider
+>   `getService(String,String,String)` and the search overload are registered
+>   there. Had that gate been off in shipping builds, deleting the shims would
+>   have restored the `service.getProvider()` NPE the doc comment described.
+>
+> The Java-side cover is `RCrypto`'s `keygen2arg` line: `KeyGenerator
+> .getInstance("AES","SunJCE").generateKey().getEncoded()` must be **32 bytes**
+> (SunJCE's JDK 25 AES default is 256-bit, measured — the deleted shim
+> hardcoded 128) and must not be all zeros.
+>
+> * **Patch 3 — COMPLETE, and wider than this record asked for.** It did not
+>   land as a generalisation of `crypto_impl::chacha20_keystream_fill`; a
+>   concurrent lane landed a whole `native-builtins/src/chacha20.rs` carrying
+>   ChaCha20, **Poly1305**, and the RFC 8439 §2.8 AEAD, with the RFC's own
+>   vectors including **§2.5.2**, both §A.3 reduction edges, five tampering arms
+>   and a differential against the `chacha20poly1305` crate. So this record's
+>   *"`ChaCha20-Poly1305` is refused, not approximated, and will stay refused
+>   until a real Poly1305 exists in this tree"* is **discharged**: the Poly1305
+>   exists, the AEAD is wired at `jca/cipher.rs:2282`/`:2296`, and both names are
+>   advertised again at `provider_chain.rs:1226-1227`. The "Removed —
+>   advertised, computed by nothing" table below is therefore **historical**: all
+>   four names went back in on 2026-08-11 once they were computed, which is the
+>   order this record insisted on and got.
+> * **Patch 4 — re-confirmed, still nothing to do.** `native-builtins/src/
+>   keystore.rs`'s two `ChaCha20` references are about the PKCS#12 secret-key
+>   OID table (`SECRET_KEY_ALG_OIDS`), and real JDK 25's
+>   `AlgorithmId.get("ChaCha20")` raises `NoSuchAlgorithmException` regardless of
+>   whether `Cipher` serves the name. Implementing the cipher does **not** make
+>   the OID encodable, so the test asserting `setEntry` fails and names the
+>   algorithm stays correct. Recorded again because Patch 3 landing is exactly
+>   the event that makes the next reader want to "fix" it.
+>
+> **The coverage gap this record left, now closed in the tree and still
+> unrun:** `regression-suite/src/RChaCha20Cipher.java` is named in `run.sh`'s
+> `CORE_CLASSES` and cited by `provider_chain.rs:1187` as matching HotSpot
+> byte-for-byte, but the file was **untracked**, so `prune_missing` dropped it
+> from every scheduled run. It is now in the tree. See
+> W7-38-crypto-trio-verified.md.
+
 **Status:** FIXED in source 2026-08-11 (lane W7-15). **Nothing was rebuilt** —
 this lane could not run `cargo build`, so every claim below is either a
 measurement taken against the *pre-fix* release binary at

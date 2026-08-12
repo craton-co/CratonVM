@@ -5,6 +5,14 @@ sweep of the whole test surface found **67 further findings** plus one
 population of 23. Round 1 (`W6-5-vacuous-tests.md`) found six by accident, while
 reading source for something else. This round asked the question on purpose.
 
+> **2026-08-12 — read §3's box before working from any list in this file.**
+> Three of §3's "recorded and not fixed" entries (`RNioNoFollow`, `RCrypto`,
+> `RJdkX509Intercept`) are **repaired**; two entries of §2.5's read-only tail are
+> **wrong** in a way worth understanding (a locally-weak assertion whose
+> observable reaches the cross-VM diff is not vacuous); and §2.5's "verified
+> clean, for the record" list is **not a clearance** — a round-3 sweep found the
+> species in nine of the fifteen fixtures it covers.
+
 Predecessors: `W6-5-vacuous-tests.md` (the two shapes, and the six),
 `L10-rjdkprocess-vector-overassertion.md` (the opposite failure),
 `W7-1-treemap-views-and-iterator-remove-contract.md` (the defects `RJdkViews`
@@ -552,14 +560,69 @@ actively working on this exact defect class. The reflex is strong enough that
 noticing it requires deliberately asking "what would make this line red?" of
 every line, including the ones being added to fix the problem.
 
-**Recorded and not fixed**, with the reason in each case: `RNioNoFollow`,
+**Recorded and not fixed**, with the reason in each case: ~~`RNioNoFollow`,
 `RCrypto` and `RJdkX509Intercept` from §2.5 (all three specified in full there,
 with their mutation evidence, but the repairs are larger than the mechanical
-`CK`-prefix ones and were not reached); the 16 remaining fixtures (§1.1); F27's `gpu-offload` tests (a placement decision for that
+`CK`-prefix ones and were not reached);~~ the 16 remaining fixtures (§1.1); F27's `gpu-offload` tests (a placement decision for that
 surface's owner); the `jdk-only-strict-probes.sh` absent-arm agreement; and the
 `RForNameGcStress` / `ROverlaySystemGcStress` constant booleans, which are low
 severity because the rest of each `CK` line does discriminate; and the two
 arithmetic tolerances named at the end of §2.6.
+
+> **2026-08-12 — THIS LIST WAS STALE ON ITS FIRST THREE ENTRIES, and the
+> staleness was live long enough to be handed out as pending work.**
+> `RNioNoFollow`, `RCrypto` and `RJdkX509Intercept` were all repaired in
+> `2969f44be` / `173f38606` and are specified with fresh side-by-side mutation
+> evidence in `W7-60-harness-extract-blindness.md` §3 and §4. Verified against
+> the tree rather than taken on the commit message: `RNioNoFollow` carries
+> `symlinkArms()` / `plainFileArms()` and 39 `check()` sites where the
+> `symlinks=unavailable` bail-out used to skip all 27; `RCrypto` carries the
+> AES-256-GCM known answer, GCM specification test case 16, nine refusals and
+> three signature negatives at 51 `check()` sites; `RJdkX509Intercept` carries
+> both negatives — a wrong key derived from the certificate's own SPKI and a
+> signature-tampered certificate — at 27. **Do not re-fix them.** This record was
+> edited *after* the repairs landed and the sentence was not updated, which is
+> the same bookkeeping failure `W6-9`'s §8 heading caused twice; the cost is
+> identical, an agent-run spent re-deriving finished work.
+>
+> **Two entries of §2.5's read-only tail are also wrong, in the instructive
+> direction — an assertion that is weak LOCALLY is not vacuous if its observable
+> reaches the cross-VM diff.**
+>
+> * **`RJdkServices:197.** The `kind.equals("ClassNotFoundException") ||
+>   kind.equals("none")` disjunction really does accept the defect locally. But
+>   `kind` is printed at `RJdkServices:204` as `CK RJdkServices
+>   badProviderCause=<kind>`, a `CK` line, so a CratonVM that drops the cause
+>   answers `none` where the oracle answers something else and the diff goes red.
+>   The residual is real but narrower than recorded: it is vacuous only on a host
+>   with no HotSpot, where `run.sh` skips the diff. Tightening it further would
+>   need the JDK's own behaviour measured first — modern `ServiceLoader.fail`
+>   does not obviously attach a cause — so pinning `ClassNotFoundException`
+>   without that measurement risks a red on the ORACLE, which is worse than the
+>   loose disjunction.
+> * **`RJdkLambdas`'s `bridgeCount >= 1`** is the same shape and is left for the
+>   same reason plus one more: the exact bridge count on `StringMapper` is a
+>   javac artefact, so pinning it pins the compiler, not the VM. It is on the
+>   `CK RJdkLambdas bridges=` line and the diff judges it.
+>
+> **Still open from this record, unchanged:** the 16 fixtures, F27's placement,
+> `jdk-only-strict-probes.sh`, the two `churn=(n > 0)` booleans, and the two
+> arithmetic tolerances.
+>
+> **Round 3 (2026-08-12)** re-asked this record's question of fifteen fixtures it
+> had marked sound — including `RJdkModule`, `RJdkProxy` and `RJdkSecurity`,
+> which §2.5's "verified clean, for the record" paragraph names explicitly. Nine
+> carried the species. The paragraph's method was `!= null`-majority plus
+> empty-`catch` plus helper-delegation, and it cannot see the shape that actually
+> dominates here: **a single load-bearing assertion that is satisfied by the
+> wrong answer, sitting among many that are not.** `RJdkModule` at 155 checks had
+> `check(!d.isAutomatic())` against a hardcoded `false` (W2-3, unfixable from the
+> fixture); `RJdkFieldModule` asserted `Field.get(null) != null` for `System.out`
+> where a fabricated stream passes and identity does not; `RJdkRecords` asserted
+> a record accessor's result `!= null` where this VM's recorded failure mode is a
+> boxed `0`; `RJdkProxy` asserted `s.getClass() != null`, which cannot fail on
+> any VM, to stand for "getClass is not routed to the handler". The count is not
+> the instrument; **majority is not the instrument either.**
 
 **Nothing was deleted or weakened to resolve a finding.** Where a test could not
 be made meaningful, it is named here with why.

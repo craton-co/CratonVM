@@ -4067,7 +4067,12 @@ fn re1_read_retry_eintr(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<u
 /// socket's own `SO_RCVTIMEO` (applied at connect) stays set and remains the
 /// first line; this deadline is what still ends the park on a platform or a
 /// socket state where `SO_RCVTIMEO` does not fire.
-fn re1_read_close_aware(
+/// `pub(crate)` for `phases_early.rs`'s `java/net/SocketInputStream`, which is
+/// the FOURTH surface of this defect (W2-2). It keys the same `s2_registry()`
+/// `streams` map with the same `sid`, so the mechanism transfers with no
+/// adaptation — which is the reason that surface was converged onto this
+/// function rather than growing a fifth copy of the loop or being deleted.
+pub(crate) fn re1_read_close_aware(
     sid: i32,
     stream: &TcpStream,
     buf: &mut [u8],
@@ -4126,7 +4131,13 @@ fn re1_read_close_aware(
 /// `SocketTimeoutException` subclasses — so the object has to be constructed,
 /// exactly as [`re1_socket_write_stream`] below already does for a peer reset.
 /// Falls back to a plain IOException if the class cannot be built.
-fn re1_socket_exception(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
+/// `pub(crate)` for the same reason as [`re1_read_close_aware`]: the close
+/// carrier is worthless without the concrete `java.net.SocketException` at the
+/// end of it, and `RuntimeError` has no variant for that type.
+pub(crate) fn re1_socket_exception(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+) -> MethodCallFailed {
     let jmsg = ctx.create_string(message);
     match ctx.new_object_initialized(
         "java/net/SocketException",
@@ -4566,148 +4577,61 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
     None
 }
 
-/// Wait up to `timeout_ms` for `stream` to become readable.
+/// Wait up to `timeout_ms` for `stream` to become **readable**.
 ///
 /// `Some(Ok(true))` — readable, or errored/hung up (which the read that
 /// follows then surfaces as the concrete socket error); `Some(Ok(false))` —
 /// the timeout expired; `Some(Err(_))` — the poll itself failed. `None` means
 /// this build has NO poll primitive at all, and is the caller's signal to fall
 /// back to a plain blocking read rather than spin on a stub that answers "not
-/// ready" forever.
+/// ready" forever. **That `None` arm is the one a "simplification" deletes and
+/// the one that prevents a livelock**; it is preserved verbatim by
+/// `cratonvm_native_io::net::poll_stream_readable`, which is where the three
+/// `#[cfg]` arms that used to live here now are.
 ///
-/// This is deliberately the same signature and the same three-state contract as
-/// `cratonvm_native_io::net::poll_stream_readable`, which is the primitive both
-/// halves of the 2026-08-07 asynchronous-close wakeup park in
-/// (`net.rs::net_read_close_aware` for `java.net.Socket`,
-/// `socket_channel.rs::read_close_aware` for `SocketChannel`). That function is
-/// `pub(crate)` to `cratonvm-native-io` and this crate cannot call it, so the
-/// contract is restated here rather than the mechanism reinvented — see
-/// [`re1_read_close_aware`], which is that same loop.
+/// COLLAPSED 2026-08-12, W2-2's out-of-file patch. This file used to carry its
+/// own `poll(2)`/`WSAPoll` binding — inherited from the zero-timeout readiness
+/// probe `SocketInputStream.available()` needs — because the `native-io`
+/// primitive both halves of the asynchronous-close wakeup park in
+/// (`net.rs::net_read_close_aware`, `socket_channel.rs::read_close_aware`) was
+/// `pub(crate)` to that crate and unreachable from here. It is now `pub`, along
+/// with its write twin, so the duplicate is gone rather than kept in agreement
+/// by hand. `native-builtins` already depends on the crate and already calls
+/// `cratonvm_native_io::net::take_stream_for_tls`, so no dependency edge is new.
 ///
-/// The `poll(2)`/`WSAPoll` binding below is not new either: it has serviced
-/// `SocketInputStream.available()` here since the readiness rewrite, with the
-/// timeout hard-coded to 0. Only the timeout became a parameter. Adding a
-/// fourth binding of the same syscall to this crate (`servlet.rs` and
-/// `xnio_conduits.rs` have the other two) would have been the third
-/// implementation of one primitive, which is the shape this file is trying not
-/// to grow.
-#[cfg(unix)]
-fn re1_socket_poll(
-    stream: &TcpStream,
-    want_write: bool,
-    timeout_ms: i32,
-) -> Option<std::io::Result<bool>> {
-    use std::os::unix::io::AsRawFd;
-
-    let mut pfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: if want_write { libc::POLLOUT } else { libc::POLLIN },
-        revents: 0,
-    };
-    // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
-    // matches the one-element buffer.
-    let rc =
-        unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, timeout_ms) };
-    if rc < 0 {
-        let error = std::io::Error::last_os_error();
-        // EINTR is "not ready" — never an error, and never an in-place
-        // re-poll. Same call as OpenJDK's `Net.poll` (which returns 0 revents
-        // on EINTR rather than throwing) and as `net.rs::net_poll_raw`'s
-        // AUDIT 2026-08-02 arm. `poll(2)` is NEVER auto-restarted by
-        // `SA_RESTART`, so a signal delivered to a thread parked here always
-        // comes straight back as EINTR — and this VM sends one on purpose,
-        // `jit::xt_root_scan` SIGUSR2s every thread to take it over for a
-        // cross-thread root scan. Reporting "not ready" is what keeps the
-        // caller's deadline honest: [`re1_read_close_aware`] recomputes its
-        // remaining `SO_TIMEOUT` on every pass, whereas re-polling here with
-        // the same `timeout_ms` would restart the whole wait on every GC.
-        if is_eintr(&error) {
-            return Some(Ok(false));
-        }
-        return Some(Err(error));
-    }
-    // `rc > 0` rather than `revents & POLLIN`: POLLERR/POLLHUP/POLLNVAL are
-    // reported whether or not they were requested, and have to count as
-    // "ready" so the read that follows surfaces the concrete socket error.
-    // Treating them as not-ready would park a reader forever on a socket that
-    // can never become readable — the failure mode this whole path exists to
-    // remove. `available()` is unaffected: its `peek` answers `Ok(0)` at EOF
-    // and `Err(_)` on a socket error, and it maps both to 0 already.
-    Some(Ok(rc > 0))
-}
-
-#[cfg(windows)]
-fn re1_socket_poll(
-    stream: &TcpStream,
-    want_write: bool,
-    timeout_ms: i32,
-) -> Option<std::io::Result<bool>> {
-    use std::os::windows::io::AsRawSocket;
-
-    // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
-    // and signature below are byte-identical to the other `WSAPoll` bindings
-    // in this crate (`servlet.rs`, `xnio_conduits.rs`) —
-    // `clashing_extern_declarations` is a deny-lint here, so any divergence
-    // would fail the build.
-    #[repr(C)]
-    struct Wsapollfd {
-        fd: usize,
-        events: i16,
-        revents: i16,
-    }
-    const WSAPOLLRDNORM: i16 = 0x0100;
-    const WSAPOLLWRNORM: i16 = 0x0010;
-
-    #[link(name = "Ws2_32")]
-    extern "system" {
-        fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
-    }
-
-    let mut pfd = Wsapollfd {
-        fd: stream.as_raw_socket() as usize,
-        events: if want_write { WSAPOLLWRNORM } else { WSAPOLLRDNORM },
-        revents: 0,
-    };
-    // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
-    // buffer length.
-    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, timeout_ms) };
-    if rc < 0 {
-        return Some(Err(std::io::Error::last_os_error()));
-    }
-    // See the Unix arm for why this is `rc > 0` and not a `revents` mask test.
-    // Winsock has no EINTR, so there is no signal arm to mirror here — and no
-    // `SA_RESTART` hazard either, because there are no signals to restart.
-    Some(Ok(rc > 0))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn re1_socket_poll(
-    _stream: &TcpStream,
-    _want_write: bool,
-    _timeout_ms: i32,
-) -> Option<std::io::Result<bool>> {
-    // No readiness primitive on this target. `None` (rather than a stubbed
-    // "not ready") is load-bearing: it tells [`re1_read_close_aware`] to fall
-    // back to one plain blocking read instead of spinning a poll loop that
-    // could never report readiness.
-    None
-}
-
-/// Wait up to `timeout_ms` for `stream` to become **readable**.
+/// Three properties survive the collapse unchanged, each of which is a real
+/// difference and not noise:
 ///
-/// The original name and contract; [`re1_socket_poll`] above grew a direction
-/// parameter on 2026-08-12 so the write twin could reuse the one binding of
-/// `poll(2)`/`WSAPoll` this file owns instead of adding another. Converting the
-/// idiom rather than copying the site is deliberate: this crate already carries
-/// more bindings of that one syscall than anyone can keep in agreement.
+/// * the three-state contract above, `None` arm included;
+/// * readiness is `rc > 0`, **not** a `revents & POLLIN` mask test —
+///   POLLERR/POLLHUP/POLLNVAL are delivered whether or not they were requested
+///   and must count as ready, or a reader parks forever on a socket that can
+///   never become readable. `net_poll_raw` answers `Ok(count > 0)` for exactly
+///   that reason. Do not "restore" a mask test on either side;
+/// * EINTR is reported as "not ready", never as an error and never as an
+///   in-place re-poll. `poll(2)` is never auto-restarted by `SA_RESTART` and
+///   this VM signals parked threads on purpose (`jit::xt_root_scan` SIGUSR2s
+///   every thread for a cross-thread root scan), so re-polling in place with the
+///   same `timeout_ms` would restart the whole wait on every GC and silently
+///   defeat [`re1_read_close_aware`]'s `SO_TIMEOUT` deadline.
+///
+/// Still outstanding, and deliberately not attempted here: `servlet.rs` and
+/// `xnio_conduits.rs` hold the crate's other two bindings. `servlet.rs`'s is
+/// `selector_poll` over a `PollReq` **slice**, which the selector needs and this
+/// two-argument primitive cannot express — a genuine third shape rather than a
+/// fourth copy.
 fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
-    re1_socket_poll(stream, false, timeout_ms)
+    cratonvm_native_io::net::poll_stream_readable(stream, timeout_ms)
 }
 
 /// Wait up to `timeout_ms` for `stream` to become **writable**. Same
-/// three-state contract as [`re1_socket_poll_readable`].
+/// three-state contract as [`re1_socket_poll_readable`], and the reason the
+/// collapse needed the pair exported: this file's own binding had grown a
+/// direction parameter, so exporting only the readable half would have forced it
+/// to keep a private copy for the write direction — one site of a two-direction
+/// idiom converted, which is how a duplicate grows back.
 fn re1_socket_poll_writable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
-    re1_socket_poll(stream, true, timeout_ms)
+    cratonvm_native_io::net::poll_stream_writable(stream, timeout_ms)
 }
 
 /// Zero-timeout OS readability query for a TCP stream.

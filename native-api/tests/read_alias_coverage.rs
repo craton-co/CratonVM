@@ -66,7 +66,17 @@
 //!    ([`the_exit_paths_sweep_before_they_terminate`]). `System.exit` /
 //!    `Runtime.exit` / `Runtime.halt` never reach the launcher's post-`main`
 //!    line, and they are how every suite fixture this instrument is aimed at
-//!    ends.
+//!    ends. **That link names its own three natives, so it cannot report that
+//!    the population was wrong — and it was: `System.exit` is not the whole
+//!    self-terminating population.** Link 10 covers the rest.
+//! 10. The **Surefire fork's** exit paths sweep too
+//!    ([`the_surefire_exit_paths_sweep_before_they_terminate`]). Four triples on
+//!    `ForkedBooter` are registered in **both** shipping modes onto three bodies
+//!    that terminate on their own and never reach `native_system_exit`, so a
+//!    Surefire fork skipped the launcher trigger AND link 9's three natives —
+//!    the exact fixture population W7-90 §2.2 named as its whole reason for
+//!    existing. Closing three of four doors has looked identical to closing none
+//!    in this repo before.
 //!
 //! Plus [`census`], which **prints** the read-side population and asserts only
 //! that it is non-zero. Deliberately not a ratchet, for the same reason
@@ -765,6 +775,56 @@ fn the_exit_paths_sweep_before_they_terminate() {
          differently depending on a debug flag, which is a behaviour change in \
          Compatible mode — contractually frozen."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Link 10 — the Surefire fork's own exit paths
+// ---------------------------------------------------------------------------
+
+/// LINK 10. `System.exit` is not the only way a fixture leaves. Four triples on
+/// `ForkedBooter` are registered from `register_essential_natives_with_shims`
+/// — LIVE in both modes — onto three bodies that each end in their own
+/// `std::process::exit` and never reach `native_system_exit`. A Surefire fork
+/// therefore skips the launcher's post-`main` line AND link 9's three natives,
+/// which is the population W7-90 §2.2 named as its whole reason for existing.
+///
+/// Each call is matched WITH its own trigger label, not by the helper's name:
+/// three bodies share one helper, so a name-only predicate stays green when two
+/// of the three are deleted (§5.1).
+#[test]
+fn the_surefire_exit_paths_sweep_before_they_terminate() {
+    let src = strip_comments(&read("native-builtins/src/test_frameworks.rs"));
+    // The label is matched WITH its quotes, exactly as link 9 does: an
+    // unquoted "ForkedBooter.exit" is a prefix of "ForkedBooter.exit1".
+    for (body, label) in [
+        (
+            "native_surefire_forkedbooter_acknowledged_exit",
+            "\"ForkedBooter.acknowledgedExit\"",
+        ),
+        ("native_surefire_forkedbooter_exit1", "\"ForkedBooter.exit1\""),
+        ("native_surefire_forkedbooter_exit_code", "\"ForkedBooter.exit\""),
+    ] {
+        let b = fn_body(&src, body)
+            .unwrap_or_else(|| panic!("{body} not found in test_frameworks.rs"));
+        let sweep = b.find("sweep_declared_slot_maps_before_exit(").unwrap_or_else(|| {
+            panic!(
+                "{body} terminates the process with std::process::exit and never \
+                 sweeps. A Surefire fork skips the launcher trigger AND the three \
+                 lang_system natives, so the declared slot-map sweep prints nothing \
+                 on exactly the fixtures W7-90 section 2.2 was written for."
+            )
+        });
+        assert!(
+            b[sweep..].contains(label),
+            "{body}'s sweep call must carry its own trigger label {label:?}; three \
+             bodies share one helper and a name-only match stays green when two of \
+             the three calls are deleted"
+        );
+        let exit = b.find("std::process::exit").unwrap_or_else(|| {
+            panic!("{body} no longer exits — re-derive this gate before deleting it")
+        });
+        assert!(sweep < exit, "{body} sweeps AFTER it has already exited");
+    }
 }
 
 // ---------------------------------------------------------------------------

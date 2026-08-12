@@ -503,6 +503,78 @@ lines must hold.
 * A transcript that is `true` everywhere, or `false` everywhere, is a **failure**
   even though half of each would look correct.
 
+### 7.1 ADJUDICATED 2026-08-12 — the landed fix has NO VECTOR on the defect path
+
+The source claims above were re-verified from the tree, and all of them hold:
+`ssc_socket_cache_table` / `gc_scan_ssc_socket_cache_roots` /
+`ssc_socket_cache_update_after_gc` are in `native-io/src/socket_channel.rs`
+(`:5063`, `:5111`, `:5125`) and wired at `vm/src/memory/native_roots.rs:417`
+and `:423`; `native-api/src/synthetic_file_channel.rs` exists; **both**
+`isOpen` registrations (`nio_file.rs:5999` and `:15552`) now name the single
+body `p57_fc_is_open` (`:15037`), which reads `closed` by name — so the
+disagreement §2.4 says was load-bearing is gone from the source, not merely
+resolved on paper. §2.1's ordering reproduces exactly:
+`register_phase57_file_channel` has one caller (`nio_file.rs:36`), that has one
+(`native-builtins/src/lib.rs:24015`, inside `register_synthetic_overrides`,
+which is `#[cfg(feature = "synthetic-jdk")]` at `:21525`–`:21526`), and
+`register_phase57_nio_file` is called directly at `vm_init.rs:2217` and
+`:2763`. B is not merely inert — **it is not compiled into the default binary
+at all**, which is a stronger statement than §2.1 makes.
+
+**What does not hold is the assumption that a suite run could show any of it.**
+
+* **Item 1 has no vector, and no near miss.** No fixture calls
+  `ServerSocketChannel.socket()`. The six `.socket()` hits in
+  `regression-suite/src/*.java` are all `DatagramChannel.socket()` in
+  `RJdkNet.java` (`:511` and its messages), a different class and a different
+  native. `RJdkNio` and `RSocketChannelInterrupt` open `ServerSocketChannel`s
+  and register them with a `Selector`, so they touch `keys` — but neither ever
+  calls `socket()`, which is the only thing that used to clobber it. The
+  probe `probes/SscSocketKeysProbe.java` is the whole instrument, and
+  `regression-suite/run.sh` names no path under `probes/` at any `SUITE=`
+  value, so **no suite run, however green, discharges item 1.**
+* **Item 2 has a vector on the class, and none on the defect path.**
+  `RChannelInterrupt.java` DOES call `FileChannel.isOpen()`, in **both**
+  polarities — `:125` asserts `true` on a freshly opened channel and `:147`/
+  `:157` assert `false` after an interrupted operation closed it — which is
+  precisely the asymmetry §4.2 says is the assertion. But
+  `FileChannel.open(...)` yields a real `sun.nio.ch.FileChannelImpl`, and the
+  private map lives only on a **literal** `java/nio/channels/FileChannel`, the
+  one `private_base` screens for. The producer that is live in Compatible mode
+  is the legacy synthetic fallback inside the `FileSystemProvider.newFileChannel`
+  shim, reached only when the RECONCILE-WITH-REAL construction fails — which is
+  exactly why §2.2 could say "no suite had turned it red". A green
+  `RChannelInterrupt` is evidence that the unified `!closed` body did not break
+  the real path. It is **not** evidence about the map that was moved.
+
+**What a real vector would have to do.** Stated so the next lane does not write
+another probe by accident:
+
+1. **Item 1** — a fixture (an `R*.java` in `regression-suite/src`, registered in
+   `run.sh`; a probe cannot be scheduled) that, on ONE
+   `ServerSocketChannel`, exercises **both orders**: `socket()` then
+   `register(sel, OP_ACCEPT)`, and `register(...)` then `socket()`. Every read
+   must go through `AbstractSelectableChannel` bytecode — `isRegistered()`,
+   `keyFor(sel)`, `key.isValid()`, `close()` — never through the native that
+   wrote the slot. One order alone reports green on half a corrupt VM. It must
+   also pin `socket()`'s stability (same instance twice) and that two channels
+   get **distinct** sockets, which is the identity-hash bucket's receiver
+   disambiguation and the one thing an over-correction would break.
+2. **Item 2** — a fixture that gets hold of a literal
+   `java/nio/channels/FileChannel`, i.e. one built by the `newFileChannel`
+   legacy fallback rather than by the real provider. `FileChannel.open` on a
+   default-filesystem path will not do it. The reachable shape is a
+   non-default `FileSystemProvider` (the `TestFileSystem` per-prefix fixture
+   family is the existing precedent) whose `newFileChannel` drives the shim.
+   Then: `position(1)` — the value a `boolean true` reads as, and the sharpest
+   single case — then `isOpen()`; then `position(7)`, read, write, force, each
+   followed by `isOpen()`; then `close()` and `isOpen()` twice. A transcript
+   that is uniformly `true` or uniformly `false` is a **failure** even though
+   half of each looks correct.
+
+Until one of those exists, this record's status is *source landed, verified by
+reading, unverifiable by the suite* — not *verified*.
+
 **Both items — the build itself.**
 
 * `cargo test -p cratonvm-types` must stay green (no flag surface moved, so this

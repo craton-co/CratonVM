@@ -6397,6 +6397,15 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
                 }
                 _ => "RUNNABLE".into(),
             };
+            // Enum identity is the contract: hand back the object the class's
+            // own static field holds, never a fresh one. Falls through to the
+            // minting body below only for a fabricated synthetic-JDK stand-in,
+            // which has no static field to read. W7-93 §8.
+            if let Some(v) =
+                crate::lang_system::canonical_enum_constant(ctx, "java/lang/Thread$State", &name)
+            {
+                return Ok(Some(v));
+            }
             let ord = match name.as_str() {
                 "NEW" => 0,
                 "RUNNABLE" => 1,
@@ -6410,6 +6419,13 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(ts, "values", "()[Ljava/lang/Thread$State;", |ctx, _args| {
+        // Real `values()` is `$VALUES.clone()`: a fresh array of the CANONICAL
+        // constants. Minting six new ones broke `values()[0] == State.NEW`.
+        // W7-93 §8.
+        if let Some(arr) = crate::lang_system::canonical_enum_values(ctx, "java/lang/Thread$State")
+        {
+            return Ok(Some(Value::Object(Some(arr))));
+        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
         // Pin across the per-state allocs below — a moving young GC there
         // would relocate the fresh array/states (native stale-local family).

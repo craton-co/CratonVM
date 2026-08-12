@@ -14092,7 +14092,21 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     if cursor >= total {
-        return Ok(Some(Value::Object(None)));
+        // W7-1 residual: this answered `null` past the end where
+        // `HashMap$KeyItr.next()` throws. `null` is the worst answer available —
+        // it is also a legitimate element of a `HashMap` key set, so a caller
+        // that over-ran its own `hasNext()` got an element it could not
+        // distinguish from a real one and NPE'd somewhere else entirely. The
+        // message is `native_snapshot_itr_next`'s verbatim: that function is the
+        // other half of this iterator family (it delegates HERE for a
+        // `HashMap$KeyItr` receiver) and already throws it on all three of its
+        // own exhausted paths, so the two cannot drift into different reports.
+        return Err(
+            cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into(),
+        );
     }
     let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(arr)) => arr,
@@ -19039,6 +19053,90 @@ fn native_stream_chain_collector_accept(
 /// array-based `stream_process_chain` loops already do (via their own
 /// `emit`/`downstream_emit` wrapper's captured flag), so this is a drop-in
 /// replacement for "get `base` then loop `stream_process_chain` over it".
+/// The `--jdk-only` road for [`drain_spliterator_inline`]: same per-element
+/// interleaving, no fabricated `Consumer`.
+///
+/// `cratonvm/internal/StreamChainCollector` is a name no JDK image declares, so
+/// strict mode refuses to fabricate it and the `?` in
+/// [`drain_spliterator_inline`] used to be the last unguarded mint of the family
+/// W2-1-strict-refuses-the-synthetic-stream-stack.md was opened for. The
+/// substitution is the one `drain_spliterator_via_real_iterator` already proved:
+/// `java.util.Spliterators.iterator(Spliterator)` hands back a real
+/// `java.util.Spliterators$1Adapter` that is itself both the `Iterator` and the
+/// `Consumer`, so the `tryAdvance` drive runs from real bytecode and no
+/// `Consumer` of ours is needed.
+///
+/// What is preserved, and it is the whole point of the inline drain: ONE element
+/// is pulled, run through `chain` (and `emit`) to completion, and only then is
+/// the next one asked for. A `limit` or an `emit` returning
+/// [`PullStep::Stop`] therefore still short-circuits before the source is
+/// exhausted — `stream_limit_saturated` is consulted at the top of every
+/// iteration exactly as the collector-driven loop consults `guard.poll()`.
+///
+/// What differs, stated rather than hidden: `Spliterators$1Adapter` buffers one
+/// element between `hasNext()` and `next()`, so a source whose `tryAdvance`
+/// observes downstream side effects sees them one element later than the
+/// collector path does. That is the "cursor" idiom the module comment above
+/// describes, and it is why this is the FALLBACK and not the default.
+fn drain_spliterator_inline_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    chain: &[LazyOp],
+    chain_pins: &[usize],
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed> {
+    let spl_pin = ctx.pin_native_root(spl);
+    let spl_cur = ctx.read_native_pin(spl_pin, spl);
+    let adapter = ctx.invoke(
+        "java/util/Spliterators",
+        "iterator",
+        "(Ljava/util/Spliterator;)Ljava/util/Iterator;",
+        &[Value::Object(Some(spl_cur))],
+    );
+    ctx.unpin_native_roots(spl_pin);
+    let it = match adapter? {
+        Some(Value::Object(Some(it))) => it,
+        _ => return Ok(PullStep::Continue),
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let mut state = stream_new_pull_state(chain.len());
+    const SAFETY_CAP: usize = 1_000_000;
+    let mut n = 0usize;
+    let outcome: Result<PullStep, MethodCallFailed> = loop {
+        if n >= SAFETY_CAP {
+            break Ok(PullStep::Continue);
+        }
+        if stream_limit_saturated(chain, &state, 0) {
+            break Ok(PullStep::Stop);
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let has_next = match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            Ok(_) => false,
+            Err(e) => break Err(e),
+        };
+        if !has_next {
+            break Ok(PullStep::Continue);
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let elem = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Object(None),
+            Err(e) => break Err(e),
+        };
+        // `elem` goes straight into the chain, whose own `pin_value` roots it —
+        // nothing allocates between the `next()` return and that pin.
+        match stream_process_chain(ctx, elem, chain, chain_pins, 0, &mut state, emit) {
+            Ok(PullStep::Stop) => break Ok(PullStep::Stop),
+            Ok(PullStep::Continue) => {}
+            Err(e) => break Err(e),
+        }
+        n += 1;
+    };
+    ctx.unpin_native_roots(it_pin);
+    outcome
+}
+
 fn drain_spliterator_inline(
     ctx: &mut dyn NativeContext,
     spl: ObjectRef,
@@ -19046,7 +19144,26 @@ fn drain_spliterator_inline(
     chain_pins: &[usize],
     emit: &mut StreamEmit<'_>,
 ) -> Result<PullStep, MethodCallFailed> {
-    let collector = try_alloc_synthetic(ctx, STREAM_CHAIN_COLLECTOR_CLASS, 0)?;
+    // W2-1 residual 4. Same idiom, same reason, as
+    // `drain_spliterator_to_array_capped`'s `Err(_refused) =>` arm two thousand
+    // lines above: a fabrication that happens to run first makes every other
+    // site's refusal order-dependent rather than a policy.
+    //
+    // REACHABILITY, stated so the next reader does not mistake this for a fixed
+    // bug: under `--jdk-only` `stream_make_lazy_derived` already returns
+    // `Ok(None)` (the `cratonvm/stream/LazyOp` guard), so slot 3 is never
+    // written, `stream_has_chain` is false, and every `stream_pull` entry point
+    // is gated on it — so strict mode does not reach this function today. The
+    // guard is here because "unreachable" is a property of five call sites in
+    // two other functions, not of this one, and the previous shape failed by
+    // FABRICATING under Compatible and by raising `NoClassDefFoundError` under
+    // strict at whichever site got there first.
+    let collector = match try_alloc_synthetic(ctx, STREAM_CHAIN_COLLECTOR_CLASS, 0) {
+        Ok(c) => c,
+        Err(_refused) => {
+            return drain_spliterator_inline_via_real_iterator(ctx, spl, chain, chain_pins, emit)
+        }
+    };
     let spl_pin = ctx.pin_native_root(spl);
     let col_pin = ctx.pin_native_root(collector);
 
@@ -19241,6 +19358,32 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if !is_synthetic_stream(&cn) {
         return Ok(Some(Value::Object(Some(this))));
     }
+    // W7-65 residual 4, closed 2026-08-12. `AbstractPipeline.onClose(Runnable)`
+    // (line 362 of the JDK 25 source) is the JDK's one CHECK-ONLY site: it
+    // throws `IllegalStateException(MSG_STREAM_LINKED)` when the stage is
+    // already linked or consumed, and then registers the handler WITHOUT
+    // marking. Measured on HotSpot 25 as `reuse.onCloseAfterConsume` = throws,
+    // which a reading of the source alone would not have predicted, so the
+    // measurement is the authority.
+    //
+    // Why this cannot fire spuriously, which is the only question that mattered:
+    // the read is `stream_is_linked`, whose two guards do the work. It is placed
+    // AFTER the `is_synthetic_stream` gate above — deliberately, because slot 4
+    // on a REAL pipeline is one of its own fields and could hold `Int(1)` for
+    // reasons of its own — and `stream_is_linked` additionally requires the
+    // 5-slot layout, so every short-layout stream (the whole
+    // `StreamSupport.stream(realSpliterator, false)` family) is exempt. Nothing
+    // else in the file writes slot 4, so the flag can only be here because
+    // `stream_link_or_consume` put it there.
+    //
+    // No mark: the JDK does not set here, and adding one would make this the
+    // second set site on a path that runs in every try-with-resources.
+    if stream_is_linked(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: STREAM_LINKED_MSG.to_string(),
+        }
+        .into());
+    }
     // W1 fix: a 1-field synthetic stream (e.g. Files.lines's eager array-backed
     // stream) has no close-handler slot to attach to. Reading/writing slot 1
     // would index past the receiver; behave as a no-op (return `this`) instead.
@@ -19278,13 +19421,42 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// `BaseStream.close()` for synthetic streams: run the registered close handlers.
+/// `BaseStream.close()` for synthetic streams: mark the stage linked-or-consumed,
+/// then run the registered close handlers.
+///
+/// W7-65 residual 3, closed 2026-08-12. `AbstractPipeline.close()` is the JDK's
+/// site 7 and the only one that sets **unconditionally, with no preceding
+/// check** — which is why `close(); close()` and `count(); close()` both return
+/// normally on HotSpot 25 (`reuse.closeTwice`, `reuse.consumeThenClose`) while
+/// `close(); count()` throws (`reuse.closeThenCount`). `stream_mark_linked` is
+/// the unconditional setter, so all three fall out of one line; using
+/// `stream_link_or_consume` here would have made `close()` itself throw and
+/// broken every try-with-resources.
+///
+/// The reason this was left open in W7-65 was "a VM-internal path that closes a
+/// synthetic stream earlier than HotSpot would". Censused since, from source:
+/// the only `invoke_virtual(_, "close", "()V", _)` calls in this file are the
+/// two `flatMap` inner-stream closes — the lazy chain's
+/// (`stream_process_chain`) and the eager body's (`native_stream_flat_map`) —
+/// and both run AFTER that inner stream's elements have been pulled, which is
+/// exactly what the JDK's own `try (Stream<R> result = mapper.apply(u))` does.
+/// Neither inner stream is touched again, so the mark ends nothing. No native
+/// anywhere else in the workspace closes a `java.util.stream.Stream` it did not
+/// just mint and drain.
 fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         let cn = ctx
             .class_name_of_id(ctx.class_id_of_object(*this))
             .unwrap_or_default();
         if is_synthetic_stream(&cn) {
+            // BEFORE the handlers, matching `AbstractPipeline.close()`, whose
+            // first statement is `linkedOrConsumed = true` and whose
+            // `closeAction.run()` is last. The order is observable in two ways:
+            // a handler that operates on the stream must see it spent (HotSpot
+            // throws there too), and a handler that THROWS must still leave the
+            // stage marked. Running the handlers first would have got both
+            // backwards.
+            stream_mark_linked(ctx, *this);
             stream_run_close_handlers(ctx, *this)?;
         }
     }
@@ -19557,6 +19729,41 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(
         c,
         "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_stream_for_each,
+    );
+    // W7-9 §8.1 precondition 1. `forEachOrdered(Consumer)` is ABSTRACT on the
+    // real `java.util.stream.Stream`, so — per the interface rule in
+    // docs/architecture/natives-over-real-jdk-classes.md §1 and W7-9 §2 — this
+    // registration is reachable only for a receiver whose runtime class IS the
+    // interface (a CratonVM mint); a real `ReferencePipeline` has its own
+    // `Code` and is not shadowed.
+    //
+    // Until 2026-08-12 the ONLY registration of this triple was in
+    // `native-builtins/src/phases_late/streams.rs::register_phase56_stream_extras`,
+    // which `register_synthetic_overrides` alone reaches — a no-op shim in both
+    // shipping builds. That dead registrar is why
+    // `vm/src/runtime/interpreter.rs`'s `!has_code` arm carries a hardcoded
+    // `method_name == "forEachOrdered"` re-dispatch to `forEach`, which tests
+    // the NAME and descriptor and not the `class_id`.
+    //
+    // Registering it here is deliberately behaviour-NEUTRAL today: that
+    // interpreter special case runs ~20 lines ABOVE `resolve_native_for_dispatch`
+    // and still wins, so this callback is not yet reached. It exists so the
+    // special case can be deleted — W7-9 §8.1's order is "land the registration,
+    // prove it live, then delete", and deleting first converts a wrong answer
+    // into an `AbstractMethodError`.
+    //
+    // `forEach` is the correct body for the same reason the deleted comment
+    // gave: every synthetic stream here is sequential, and `stream_elements`
+    // yields the encounter-order snapshot. The three PRIMITIVE widths take a
+    // different descriptor and are registered by
+    // `phases_late::register_phase56_primitive_stream_terminals`, wired into the
+    // essentials path — see `native-builtins/tests/essential_wiring_ratchet.rs`,
+    // whose comment naming this row as "the next row to add" is now stale.
+    r.register(
+        c,
+        "forEachOrdered",
         "(Ljava/util/function/Consumer;)V",
         native_stream_for_each,
     );
@@ -21195,6 +21402,27 @@ fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// are registered in streams.rs). Replaces the field-0-raw iterator that bypassed
 /// the chain. Non-synthetic / real pipelines flow through `stream_elements`'s
 /// `toArray` path, so this is correct for those too.
+///
+/// W7-2 §3: this registration also serves the THREE PRIMITIVE streams, because
+/// `iterator()Ljava/util/Iterator;` is declared on `BaseStream` — the supertype
+/// of `IntStream`/`LongStream`/`DoubleStream` — and that is the descriptor a
+/// call site records whenever the static type is `BaseStream` or `Stream`. A
+/// synthetic `IntStream` keeps its elements in a PRIMITIVE `int[]`, so
+/// `stream_elements` hands back bare `Value::Int`s; storing those into the
+/// `Object[]` below put an untyped word where the JDK's `Arrays$ArrayItr.next()`
+/// — declared `()Ljava/lang/Object;` — hands a reference to the caller. It is
+/// silent at the store and only misbehaves one frame away: measured, `o != null`
+/// was TRUE and `o.getClass()` raised NPE on the very same word, and
+/// `o instanceof Integer` was false for every element. That is the
+/// primitive-in-a-reference-store species (W7-84), not a wrong answer.
+/// [`box_primitive_stream_elements`] fixes it for every element and allocates
+/// nothing on a reference stream, which is the common case this function exists
+/// for (Hibernate's `JoinedList.iterator()`).
+///
+/// NOTE the registration order: `streams.rs`'s `native_stream_empty_iterator`
+/// does its own boxing, but native-collections registers AFTER native-builtins
+/// (last-writer-wins), so for `Stream`/`BaseStream` THIS function is the one
+/// that runs. The two must both box or the surface is only half covered.
 fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -21207,6 +21435,10 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let elements = stream_elements(ctx, this)?;
+    // Box BEFORE pinning: the returned wrappers are already re-read past any
+    // collection `valueOf` caused, and nothing allocates between here and the
+    // `pin_value_slice` on the next line.
+    let elements = box_primitive_stream_elements(ctx, &elements)?;
     let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
@@ -23834,6 +24066,11 @@ fn box_primitive_result(ctx: &mut dyn NativeContext, v: Value) -> Result<Value, 
         Value::Int(_) => ("java/lang/Integer", "(I)Ljava/lang/Integer;"),
         Value::Long(_) => ("java/lang/Long", "(J)Ljava/lang/Long;"),
         Value::Double(_) => ("java/lang/Double", "(D)Ljava/lang/Double;"),
+        // `Float` belongs with the other three: there is no `FloatStream`, but a
+        // `Value::Float` reaches reference-typed surfaces through `Array.get` /
+        // reflective field reads that feed a stream, and left unboxed it is the
+        // same untyped word in a reference slot the Int arm exists to prevent.
+        Value::Float(_) => ("java/lang/Float", "(F)Ljava/lang/Float;"),
         other => return Ok(other),
     };
     if let Ok(Some(boxed @ Value::Object(Some(_)))) =
@@ -25128,10 +25365,43 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// Infallible wrapper over [`stream_elements`] for the three primitive stream
+/// interfaces. **25 call sites, and the `.unwrap_or_default()` is the mechanism
+/// that turns any throw raised anywhere below it into a silently EMPTY stream.**
+///
+/// The claim this comment used to make — "the chain branch is unreachable here,
+/// so this can never actually error" — is TRUE but named only one of
+/// `stream_elements`' three error paths. Re-derived 2026-08-12, all three, so
+/// the next reader can check whether it still holds rather than trusting it:
+///
+/// 1. **`stream_link_or_consume`** — gated on `class_name ==
+///    "java/util/stream/Stream"`, so no primitive receiver reaches it.
+/// 2. **`materialize_lazy_stream`** — needs a spliterator in slot 2. Only
+///    `StreamSupport.stream(Spliterator,Z)` writes that slot, and it mints
+///    `java/util/stream/Stream`; `StreamSupport.intStream`/`longStream`/
+///    `doubleStream` live in `native-builtins/src/phases_late/streams.rs`,
+///    reachable only from `register_synthetic_overrides`. Unreachable on both
+///    shipping modes.
+/// 3. **The real-pipeline `toArray()[Ljava/lang/Object;` branch** — needs a
+///    receiver whose class is not one of the four interface names. Every
+///    `native_{int,long,double}_stream_*` native is registered on an INTERFACE
+///    name, and every native-shadow hierarchy walk in the tree is a *superclass*
+///    walk (W7-9 §2), so a real `IntPipeline$Head` resolves its own concrete
+///    `Code` and never reaches these bodies. `prim_stream_values` is the
+///    function that exists for real primitive pipelines, and it uses the correct
+///    `()[I`/`()[J`/`()[D` descriptor.
+///
+/// So the swallow eats nothing today. It is still the reason W7-65's residual 1
+/// (extending `linkedOrConsumed` to the primitive streams) is open, and the cost
+/// of closing it is NOT "add `?` at 25 sites": at least
+/// `native_int_stream_peek`'s call has a live `pin_native_root` handle in scope,
+/// so a bare `?` there leaks a pin — the LIFO pin-stack corruption family this
+/// file has paid for repeatedly (see `stream_apply_chain_full`'s cceres3 note).
+/// Each of the 25 needs its live pins checked and the `match`-and-unpin form
+/// where any is held, which is why the conversion is its own change with its own
+/// review surface. Recorded in
+/// docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md §5.1.
 fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    // Primitive streams never carry a reference-Stream deferred op-chain (the
-    // lazy ops register only on `java/util/stream/Stream`), so the chain branch
-    // of `stream_elements` is unreachable here and this can never actually error.
     stream_elements(ctx, stream).unwrap_or_default()
 }
 
@@ -25278,7 +25548,7 @@ fn native_primitive_iterator_next_boxed(
 ) -> MethodCallResult {
     let val = primitive_iterator_next_value(ctx, args)?;
     Ok(Some(
-        box_primitive_stream_elements(ctx, &[val])
+        box_primitive_stream_elements(ctx, &[val])?
             .into_iter()
             .next()
             .unwrap_or(Value::Object(None)),
@@ -25715,6 +25985,14 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         "sorted",
         "()Ljava/util/stream/IntStream;",
         native_int_stream_sorted,
+    );
+    // W7-2 §7.2 — `distinct` was declared-and-unregistered on all three
+    // primitive streams (AbstractMethodError on the interface declaration).
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/IntStream;",
+        native_int_stream_distinct,
     );
     r.register(
         c,
@@ -26334,6 +26612,43 @@ fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     make_int_stream(ctx, &elements)
 }
 
+/// `IntStream.distinct()` — the first occurrence of each value, in encounter
+/// order.
+///
+/// W7-2 §7.2: `distinct` was missing on ALL THREE primitive streams, which on a
+/// synthetic stream (whose runtime class is the interface itself) means the
+/// `invokeinterface` resolved to the abstract declaration and the call died with
+/// `AbstractMethodError: … has no Code attribute` — the same death
+/// `summaryStatistics` died, and the family this record is about.
+///
+/// The JDK's `IntPipeline.distinct()` is `boxed().distinct().mapToInt(i -> i)`,
+/// i.e. `Integer.equals`, which for `Integer` is plain value equality — so a set
+/// of the raw `i32`s is exactly it. Encounter order is preserved by keeping the
+/// FIRST occurrence, which is what `ReduceOps`' `LinkedHashSet` accumulator does.
+/// A non-`Int` element cannot occur on a primitive stream; it is passed through
+/// rather than silently dropped, so a layout defect elsewhere shows up as a
+/// wrong count instead of as an empty stream.
+fn native_int_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match e {
+            Value::Int(i) => {
+                if seen.insert(*i) {
+                    out.push(*e);
+                }
+            }
+            _ => out.push(*e),
+        }
+    }
+    make_int_stream(ctx, &out)
+}
+
 fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -26449,7 +26764,22 @@ fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Box each primitive stream element to its wrapper object so `boxed()` yields a
 /// real `Stream<Integer/Long/Double>` — collect/iteration then observe wrapper
 /// objects, not raw primitive `Value`s in reference slots.
-fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]) -> Vec<Value> {
+///
+/// Reference elements are returned verbatim and allocate nothing, so this is
+/// safe to run over any element list whose destination is reference-typed
+/// (`Object[]`, `Iterator.next()Ljava/lang/Object;`) without asking first
+/// whether the source stream is primitive.
+///
+/// Fallible: the per-element boxing is [`box_primitive_result`], whose
+/// `valueOf`-then-fabricate path can refuse (a fabricated `java/lang/Integer`
+/// is refused under `--jdk-only`). Returning the refusal is the point — the
+/// previous `.ok().flatten().unwrap_or(Value::Object(None))` turned it into a
+/// silent `null` element, which is a wrong answer wearing the shape of a
+/// correct one.
+fn box_primitive_stream_elements(
+    ctx: &mut dyn NativeContext,
+    elements: &[Value],
+) -> Result<Vec<Value>, MethodCallFailed> {
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // `valueOf` allocates, so the wrapper refs accumulated in `out` (and any
     // object elements passed through) must be pinned as produced and re-read
@@ -26458,30 +26788,18 @@ fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]
     let mut first_pin = elem_base;
     let mut out = Vec::with_capacity(elements.len());
     let mut out_handles: Vec<usize> = Vec::with_capacity(elements.len());
+    // Single-exit: an early `return Err` would leak every pin taken above, so
+    // the failure is parked and raised after the unpin below.
+    let mut failure: Option<MethodCallFailed> = None;
     for (idx, v) in elements.iter().enumerate() {
         let v = read_pinned_elem(ctx, elem_handles[idx], *v);
-        let boxed = match v {
-            Value::Int(i) => ctx.invoke(
-                "java/lang/Integer",
-                "valueOf",
-                "(I)Ljava/lang/Integer;",
-                &[Value::Int(i)],
-            ),
-            Value::Long(l) => ctx.invoke(
-                "java/lang/Long",
-                "valueOf",
-                "(J)Ljava/lang/Long;",
-                &[Value::Long(l)],
-            ),
-            Value::Double(d) => ctx.invoke(
-                "java/lang/Double",
-                "valueOf",
-                "(D)Ljava/lang/Double;",
-                &[Value::Double(d)],
-            ),
-            other => Ok(Some(other)),
+        let bv = match box_primitive_result(ctx, v) {
+            Ok(bv) => bv,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
         };
-        let bv = boxed.ok().flatten().unwrap_or(Value::Object(None));
         let h = pin_value(ctx, bv);
         if first_pin == usize::MAX {
             first_pin = h;
@@ -26493,7 +26811,10 @@ fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]
     if first_pin != usize::MAX {
         ctx.unpin_native_roots(first_pin);
     }
-    out
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -26502,7 +26823,7 @@ fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return make_stream(ctx, &[]),
     };
     let elements = int_stream_elements(ctx, this);
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -26752,6 +27073,82 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ctx.unpin_native_roots(f_pin);
     make_long_stream(ctx, &out)
 }
+/// `LongStream.sorted()` — natural ascending order.
+///
+/// W7-2 §7.2. `sorted` existed for `IntStream` only (added for Groovy's shaded
+/// ANTLR lexer); the `LongStream` and `DoubleStream` declarations were abstract
+/// and unregistered, so the call died with `AbstractMethodError: … has no Code
+/// attribute` on the interface exactly as `summaryStatistics` did.
+fn native_long_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let mut elements = stream_elements(ctx, this)?;
+    elements.sort_by_key(|v| match v {
+        Value::Long(l) => *l,
+        Value::Int(i) => *i as i64,
+        _ => 0,
+    });
+    make_long_stream(ctx, &elements)
+}
+
+/// `LongStream.distinct()` — see [`native_int_stream_distinct`]. `Long.equals`
+/// is value equality, so a set of the raw `i64`s is the JDK's dedupe.
+fn native_long_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match e {
+            Value::Long(l) => {
+                if seen.insert(*l) {
+                    out.push(*e);
+                }
+            }
+            Value::Int(i) => {
+                if seen.insert(*i as i64) {
+                    out.push(Value::Long(*i as i64));
+                }
+            }
+            _ => out.push(*e),
+        }
+    }
+    make_long_stream(ctx, &out)
+}
+
+/// `LongStream.findFirst()` / `findAny()` — `OptionalLong` of the first element.
+///
+/// W7-2 §7.2: `IntStream` got this in spring-bug-03 and the other two were left,
+/// which is the "each was fixed for the one member a workload happened to reach"
+/// shape §1 of that record names. The synthetic stream is eager and
+/// `stream_elements` preserves encounter order, so the first element satisfies
+/// `findFirst`; `findAny` may return any element and the first is a valid choice.
+fn native_long_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this)?;
+    let first = match elements.first() {
+        Some(Value::Long(l)) => Some(Value::Long(*l)),
+        Some(Value::Int(i)) => Some(Value::Long(*i as i64)),
+        _ => None,
+    };
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
+    if let Some(v) = first {
+        set_opt_prim_value(ctx, opt, v);
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
 fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -26914,6 +27311,32 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         "asDoubleStream",
         "()Ljava/util/stream/DoubleStream;",
         native_long_stream_as_double,
+    );
+    // W7-2 §7.2 — the LongStream half of the hole: `findFirst`/`findAny`
+    // (present on IntStream since spring-bug-03), `sorted` and `distinct`.
+    r.register(
+        c,
+        "findFirst",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_find_first,
+    );
+    r.register(
+        c,
+        "findAny",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_find_first,
+    );
+    r.register(
+        c,
+        "sorted",
+        "()Ljava/util/stream/LongStream;",
+        native_long_stream_sorted,
+    );
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/LongStream;",
+        native_long_stream_distinct,
     );
     r.set_category(__prev_cat);
 }
@@ -27264,7 +27687,7 @@ fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -27440,6 +27863,245 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
     make_double_stream(ctx, &out)
 }
 
+/// `Double.doubleToLongBits(d)` — the canonicalising form, which is what
+/// `Double.equals` and `Double.compare` are both specified in terms of.
+///
+/// Rust's `f64::to_bits` is `doubleToRawLongBits`: it preserves the payload of a
+/// signalling or negatively-signed NaN, so two NaNs that Java calls equal would
+/// key differently. Collapsing every NaN onto the canonical quiet pattern is the
+/// difference between `DoubleStream.of(0.0/0.0, 0.0/0.0).distinct().count()`
+/// answering `1` (HotSpot) and `2`.
+fn java_double_to_long_bits(d: f64) -> i64 {
+    if d.is_nan() {
+        0x7ff8_0000_0000_0000u64 as i64
+    } else {
+        d.to_bits() as i64
+    }
+}
+
+/// `Double.compare(d1, d2)` as an `Ordering`, and a total order — which is what
+/// `Arrays.sort(double[])` (and therefore `DoubleStream.sorted()`) uses.
+///
+/// It is NOT `f64`'s `PartialOrd`, and the two disagree on the two cases a
+/// `sorted()` test looks at first: Java orders `-0.0` strictly BELOW `+0.0`, and
+/// puts every NaN at the top. `f64::total_cmp` is a third order again (it sorts
+/// negatively-signed NaN below `-inf`), so neither stock comparator will do.
+fn java_double_compare(a: f64, b: f64) -> std::cmp::Ordering {
+    if a < b {
+        return std::cmp::Ordering::Less;
+    }
+    if a > b {
+        return std::cmp::Ordering::Greater;
+    }
+    java_double_to_long_bits(a).cmp(&java_double_to_long_bits(b))
+}
+
+/// Read a stream element as an `f64`, widening the integral shapes the way the
+/// primitive-stream natives around here already do.
+fn stream_elem_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Double(d) => Some(*d),
+        Value::Float(f) => Some(*f as f64),
+        Value::Int(i) => Some(*i as f64),
+        Value::Long(l) => Some(*l as f64),
+        _ => None,
+    }
+}
+
+/// `DoubleStream.anyMatch(DoublePredicate)`.
+///
+/// W7-2 §7.2 calls this one conspicuous, and it is: `allMatch` and `noneMatch`
+/// sit beside it in `register_double_stream_natives` and `anyMatch` did not,
+/// so `DoubleStream.anyMatch` alone died with `AbstractMethodError: … has no
+/// Code attribute` on the interface declaration.
+fn native_double_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let p = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    stream_match(ctx, this, p, "(D)Z", 0)
+}
+
+/// `double DoubleStream.reduce(double identity, DoubleBinaryOperator op)`.
+/// Mirrors `native_long_stream_reduce_seeded`; see it for the pin contract.
+fn native_double_stream_reduce_seeded(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let identity = args.get(1).and_then(stream_elem_as_f64).unwrap_or(0.0);
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(identity))),
+    };
+    let op = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(identity))),
+    };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let op_pin = ctx.pin_native_root(op);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(op_pin);
+            return Err(e);
+        }
+    };
+    let mut acc = identity;
+    for elem in &elements {
+        let e = match stream_elem_as_f64(elem) {
+            Some(d) => d,
+            None => continue,
+        };
+        let op = ctx.read_native_pin(op_pin, op);
+        let r = match ctx.invoke_virtual(
+            op,
+            "applyAsDouble",
+            "(DD)D",
+            &[Value::Double(acc), Value::Double(e)],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(op_pin);
+                return Err(e);
+            }
+        };
+        acc = r.as_ref().and_then(stream_elem_as_f64).unwrap_or(acc);
+    }
+    ctx.unpin_native_roots(op_pin);
+    Ok(Some(Value::Double(acc)))
+}
+
+/// `OptionalDouble DoubleStream.reduce(DoubleBinaryOperator op)` — the
+/// no-identity overload. Empty stream → empty `OptionalDouble`.
+fn native_double_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let op = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let op_pin = ctx.pin_native_root(op);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(op_pin);
+            return Err(e);
+        }
+    };
+    let mut acc: Option<f64> = None;
+    for elem in &elements {
+        let e = match stream_elem_as_f64(elem) {
+            Some(d) => d,
+            None => continue,
+        };
+        acc = Some(match acc {
+            None => e,
+            Some(a) => {
+                let op = ctx.read_native_pin(op_pin, op);
+                let r = match ctx.invoke_virtual(
+                    op,
+                    "applyAsDouble",
+                    "(DD)D",
+                    &[Value::Double(a), Value::Double(e)],
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(op_pin);
+                        return Err(e);
+                    }
+                };
+                r.as_ref().and_then(stream_elem_as_f64).unwrap_or(a)
+            }
+        });
+    }
+    ctx.unpin_native_roots(op_pin);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+    if let Some(a) = acc {
+        set_opt_prim_value(ctx, opt, Value::Double(a));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// `DoubleStream.findFirst()` / `findAny()` — see
+/// [`native_long_stream_find_first`].
+fn native_double_stream_find_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this)?;
+    let first = elements.first().and_then(stream_elem_as_f64);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+    if let Some(d) = first {
+        set_opt_prim_value(ctx, opt, Value::Double(d));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// `DoubleStream.sorted()` — `Arrays.sort(double[])` order, i.e.
+/// [`java_double_compare`], not `f64`'s `PartialOrd`.
+fn native_double_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    // Normalised to `Value::Double` on the way out, not just sorted: the result
+    // goes to `make_double_stream`, which allocates a `double[]`, so an integral
+    // `Value` that slipped in from an upstream widening op would be stored into
+    // a slot of the wrong width.
+    let mut doubles: Vec<f64> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        doubles.push(stream_elem_as_f64(e).unwrap_or(0.0));
+    }
+    doubles.sort_by(|a, b| java_double_compare(*a, *b));
+    let out: Vec<Value> = doubles.into_iter().map(Value::Double).collect();
+    make_double_stream(ctx, &out)
+}
+
+/// `DoubleStream.distinct()` — `Double.equals` semantics, see
+/// [`java_double_to_long_bits`]: all NaNs are one value and `-0.0` is distinct
+/// from `+0.0`, which is the opposite of what `==` on `f64` says for both.
+fn native_double_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match stream_elem_as_f64(e) {
+            Some(d) => {
+                if seen.insert(java_double_to_long_bits(d)) {
+                    out.push(Value::Double(d));
+                }
+            }
+            None => out.push(*e),
+        }
+    }
+    make_double_stream(ctx, &out)
+}
+
 fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -27561,6 +28223,53 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
         "mapToInt",
         "(Ljava/util/function/DoubleToIntFunction;)Ljava/util/stream/IntStream;",
         native_double_stream_map_to_int,
+    );
+    // W7-2 §7.2 — the DoubleStream half, and the largest of the three holes:
+    // `anyMatch` (conspicuous, because `allMatch`/`noneMatch` above it are both
+    // registered), both `reduce` overloads, `findFirst`/`findAny`, `sorted` and
+    // `distinct`. Every one of them was an abstract interface declaration with
+    // no live registration, i.e. an `AbstractMethodError` waiting for a caller.
+    r.register(
+        c,
+        "anyMatch",
+        "(Ljava/util/function/DoublePredicate;)Z",
+        native_double_stream_any_match,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(DLjava/util/function/DoubleBinaryOperator;)D",
+        native_double_stream_reduce_seeded,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/util/function/DoubleBinaryOperator;)Ljava/util/OptionalDouble;",
+        native_double_stream_reduce,
+    );
+    r.register(
+        c,
+        "findFirst",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_find_first,
+    );
+    r.register(
+        c,
+        "findAny",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_find_first,
+    );
+    r.register(
+        c,
+        "sorted",
+        "()Ljava/util/stream/DoubleStream;",
+        native_double_stream_sorted,
+    );
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/DoubleStream;",
+        native_double_stream_distinct,
     );
     r.set_category(__prev_cat);
 }
@@ -27842,7 +28551,7 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -38017,6 +38726,39 @@ fn tm_new_range_view(
     hi: Option<(Value, bool)>,
     descending: bool,
 ) -> MethodCallResult {
+    // W7-36 residual — the OTHER arm of `NavigableSubMap`'s constructor, the one
+    // `tm_refuse_reversed_bounds` documents as deliberately not routed to it:
+    //
+    // ```text
+    // } else {
+    //     if (!fromStart) m.compare(lo, lo);   // type (and possibly null) check
+    //     if (!toEnd)     m.compare(hi, hi);   // type check
+    // }
+    // ```
+    //
+    // So a SINGLE-bound `headMap`/`tailMap` refuses a null bound with
+    // `NullPointerException` and a non-`Comparable` bound with
+    // `ClassCastException`. Both compares are unconditional — they do not
+    // consult `root` — which is why `container_is_empty` is passed `true` rather
+    // than asked of the map: on an empty map the JDK still refuses, and asking
+    // would under-throw exactly there.
+    //
+    // Fires only when exactly one bound is present. Two bounds take the `if`
+    // arm, already covered by `tm_refuse_reversed_bounds` at the two `subMap`
+    // entry points; `descendingMap` supplies neither and is untouched. Reads the
+    // RECEIVER's comparator slot, as `tm_refuse_reversed_bounds` does, so a view
+    // of a view is judged by its own ordering. Runs before any pin because it
+    // allocates nothing: `implements_comparable` and `object_class_name` are
+    // both pure `ClassId` lookups.
+    if lo.is_some() != hi.is_some() {
+        let bound = lo.or(hi).map(|(k, _)| k).unwrap_or(Value::Object(None));
+        tree_natural_order_key_check(
+            ctx,
+            &tm_get_slot(ctx, source, TM_FIELD_COMPARATOR),
+            bound,
+            true,
+        )?;
+    }
     // GC-SAFETY: the allocation, `Collections.reverseOrder` and the resync all
     // collect, and `source` and the two bound keys are bare Rust locals that end
     // up STORED in the side table — a from-space address recorded there would
@@ -40412,6 +41154,20 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // W7-36 residual, and BEFORE the view branch for the reason `native_tm_put`
+    // states: a DESCENDING view carries a `Collections.reverseOrder` comparator,
+    // so this is a no-op on it and the redirect lets the backing map raise;
+    // an ASCENDING view carries the source's own (null) comparator and
+    // `NavigableSubMap.remove`'s `inRange(key)` is a `compare(key, bound)` that
+    // raises there too. `TreeMap.remove` itself is `getEntry(key)`, which
+    // null-checks and casts to `Comparable` ahead of `root` — an empty map
+    // refuses as well.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     // W7-1 family 1. This is the row the record measured directly:
     // `tm.headMap("c").remove("a")` used to delete from a detached snapshot and
     // leave `tm` reading `{a=1, b=2, c=3, d=4}`. The JDK's
@@ -40475,6 +41231,17 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // W7-36 residual: `TreeMap.containsKey` is `getEntry(key) != null`, and
+    // `getEntry` performs the `if (key == null) throw new NullPointerException();`
+    // + `(Comparable) key` checkcast BEFORE it looks at `root` — so an EMPTY map
+    // refuses too. Both branches below would otherwise answer "absent", which is
+    // the quiet wrong answer `native_tm_get` was given this same call for.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let found = tm_fast_with(ctx, this, |bt| bt.contains_key(&tk));
@@ -41589,6 +42356,28 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     } else {
         key_pin
     };
+    // W7-36 named this native as a suspected `getOrDefault`-over-a-null-VALUE
+    // defect. It is not one — see the record's correction: both storage paths
+    // read the mapping itself (`bt.get(&tk).copied()` / the array slot), so a
+    // key present with a null value already answers `null` rather than the
+    // default, which is what `Map.getOrDefault` specifies. What IS missing is
+    // the refusal: `TreeMap.getOrDefault` is `getEntry(key)`, the same
+    // null-check + `Comparable` checkcast `native_tm_get` runs, and without it
+    // `new TreeMap<>().getOrDefault(null, d)` answered `d` where HotSpot throws.
+    //
+    // Computed into a local BEFORE the `if let`: an `if let` scrutinee's
+    // temporaries — including the `&*ctx` reborrow the call takes — live to the
+    // end of the `if let` in this edition, and the arm needs `ctx` mutably to
+    // release the pins.
+    let key_check = {
+        let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+        let empty_now = tm_is_empty_now(ctx, this);
+        tree_natural_order_key_check(ctx, &comparator, key, empty_now)
+    };
+    if let Err(e) = key_check {
+        ctx.unpin_native_roots(first_pin);
+        return Err(e);
+    }
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied());
@@ -42355,6 +43144,12 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // W7-36 residual: `TreeSet.contains` is `m.containsKey(o)`, i.e. the same
+    // `getEntry` null-check + `Comparable` checkcast `native_ts_add` already
+    // runs. It has to be ahead of the `data_opt` early return as well as the
+    // search: an empty set has no backing array here, and answering `false` for
+    // `contains(null)` is precisely the "returns where the JDK refuses" row.
+    tree_natural_order_key_check(ctx, &comparator, elem, size == 0)?;
     let data = match data_opt {
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
@@ -43054,6 +43849,47 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// The `TreeSet` twin of [`tm_refuse_reversed_bounds`].
+///
+/// W7-36 left this one explicitly: *"`TreeSet.subSet(hi, lo)`. The `TreeMap`
+/// twin of it is fixed; the `TreeSet` one is not measured and was not widened
+/// into."* `TreeSet.subSet` is `new TreeSet<>(m.subMap(...))`, so it reaches the
+/// **same** `NavigableSubMap` constructor and the same
+/// `throw new IllegalArgumentException("fromKey > toKey")` — the message is that
+/// constructor's verbatim, in both places, for the reason
+/// `tree_natural_order_key_check` gives for sharing the CCE text: two sites
+/// modelling one refusal must not drift into two different reports.
+///
+/// Returns the possibly-moved receiver and bounds, exactly as the `TreeMap`
+/// twin does: `tree_compare` dispatches a user `Comparator` (or a
+/// `Comparable.compareTo` override), a full interpreted call that can move all
+/// three, and all three are used afterwards.
+fn ts_refuse_reversed_bounds(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    from_elem: Value,
+    to_elem: Value,
+) -> Result<(ObjectRef, Value, Value), MethodCallFailed> {
+    let comparator = ts_get_slot(ctx, this, TS_FIELD_COMPARATOR);
+    let this_pin = ctx.pin_native_root(this);
+    let from_pin = pin_value(ctx, from_elem);
+    let to_pin = pin_value(ctx, to_elem);
+    let verdict = tree_compare(ctx, &comparator, from_elem, to_elem);
+    let this = ctx.read_native_pin(this_pin, this);
+    let from_elem = read_pinned_elem(ctx, from_pin, from_elem);
+    let to_elem = read_pinned_elem(ctx, to_pin, to_elem);
+    ctx.unpin_native_roots(this_pin);
+    if verdict? > 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "fromKey > toKey".to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok((this, from_elem, to_elem))
+}
+
 fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -43061,6 +43897,7 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
@@ -43235,6 +44072,10 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_elem = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
+    // The JDK's check is on the bounds alone and ignores the inclusive flags —
+    // `subSet(e, false, e, false)` is a legal empty range, `subSet(hi, .., lo, ..)`
+    // is not. Same split as `native_tm_sub_map_inclusive`.
+    let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);

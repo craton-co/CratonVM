@@ -87,7 +87,26 @@ public class RTreeRangeGc {
         }
     }
 
+    /**
+     * Count of assertions executed, published on a CK line so the cross-VM diff
+     * can see a run that silently asserted fewer things than the oracle (harness
+     * guard G3; see regression-suite/harness-guard.sh and
+     * docs/known-issues/jdk-only/W7-60-harness-extract-blindness.md).
+     *
+     * The UNIT is one check() call, the same unit every other vector in the
+     * suite publishes — deliberately not "one view" or "one phase". checkMap and
+     * checkSet assert per ELEMENT inside a walk, which is what makes the number
+     * load-bearing here rather than decorative: a range view that hands back
+     * FEWER entries than it should — the empty-view failure this vector exists
+     * to catch — runs fewer per-element checks and reports a smaller number, so
+     * it diverges from the oracle's count as well as tripping the local
+     * `seen == hi - lo` assertion. Every loop below is over a fixed-size
+     * collection, so on a healthy VM the number is a constant.
+     */
+    static int checks = 0;
+
     static void check(boolean cond, String what) {
+        checks++;
         if (!cond) {
             throw new AssertionError("RTreeRangeGc: " + what);
         }
@@ -193,6 +212,7 @@ public class RTreeRangeGc {
         setSum += checkSet("subSet(k,true,k,false)", ns, lo, hi);
         System.out.println("CK ts-range " + setSum);
 
-        System.out.println("PASS RTreeRangeGc");
+        System.out.println("CK RTreeRangeGc checks=" + checks);
+        System.out.println("PASS RTreeRangeGc (" + checks + " checks)");
     }
 }

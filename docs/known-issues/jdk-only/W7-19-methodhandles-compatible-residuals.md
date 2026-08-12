@@ -10,6 +10,15 @@ Branch: `fix/methodhandles-compatible-residuals-20260811`.
 Files changed: `native-builtins/src/lang_invoke.rs`,
 `regression-suite/src/RJdkHandles.java`, and this record. Nothing else.
 
+> **SECOND PASS 2026-08-12, also NOT REBUILT.** Two of the three residuals this
+> record filed in §5 are now fixed in source — `isVarargsCollector()` (§5.2) and
+> the getter / array-getter `type()` narrowing (§5.3) — and §5.1 is declined with
+> a mechanism instead of a budget (§5.1.1). Same two files, plus **one** new
+> out-of-file line reported at the bottom. `RJdkHandles` goes from 37 steps / 116
+> checks to **40 steps / 128 checks**; §5's preamble reconciles that against the
+> "316" this record printed and the "54" the index prints, both of which are
+> wrong.
+
 Both defects are **`Compatible`-mode** defects — a wrong value and a missing
 refusal, in the mode that is supposed to be the faithful one. Neither is a
 strict-mode policy question. Both were named, and could not be taken, by the
@@ -331,6 +340,13 @@ was written down.
 
 ### 4.2 One check written, measured, and deleted
 
+> **REINSTATED 2026-08-12, because the deviation it was red for is now fixed —
+> §5.2. Both halves are back: the marking on `asVarargsCollector`'s result, with
+> a FRESH-handle negative control, and the `asFixedArity` twin, which is a real
+> control now that the flag can be `true`. The reasoning below is why they were
+> right to be absent while the flag was hardcoded, and it is the reasoning a
+> future lane should apply to §5.1's missing row.**
+
 `check(sumAll.isVarargsCollector(), …)` was written, run, and **removed**, with
 its `asFixedArity` twin.
 
@@ -387,6 +403,30 @@ Named because someone should be able to argue with them:
 
 ## 5. Observed and measured, NOT fixed here
 
+> **REVISITED 2026-08-12. Two of the three are now FIXED IN SOURCE; §5.1 is
+> declined with a named mechanism instead of a budget.** Nothing below was
+> rebuilt or run — the verdicts are source verdicts and the fixture assertions
+> are unverified against a binary.
+>
+> | residual | 2026-08-12 |
+> |---|---|
+> | §5.1 `bindTo` does not raise `ClassCastException` | **NOT TAKEN, and the reason is now a mechanism rather than a budget — see §5.1.1.** A same-lane fix would raise FALSE `ClassCastException`s. |
+> | §5.2 `isVarargsCollector()` answers `false` | **FIXED IN SOURCE.** `MH_VARARGS` = `MH_BASE + 5`, both allocators widened to `MH_VARARGS + 1`, an `isVarargsCollector` native reads it width-guarded. §5.2.1. |
+> | §5.3 `type()` is not narrowed after a getter / array-getter bind | **FIXED IN SOURCE.** The leading-parameter drop now covers `MH_KIND_GETTER`/`SETTER`/`ARRAY_GET`/`ARRAY_SET`. §5.3.1. |
+>
+> Vector: **`RJdkHandles` moves from 37 steps / 116 checks to 40 steps / 128
+> checks.** Three counts for this file are in circulation and two of them are
+> wrong, so here is the arithmetic rather than a number to trust.
+>
+> §4 above says "37 independent steps carrying 316 checks". The 37 is
+> right and is still verifiable by counting `step(` call sites. **The 316 is
+> not**: the file has 132 `check(` call sites, four of which are
+> `check(false, …)` inside a `try` that a correct VM never reaches, so a green
+> run counted 116 before this pass. README §2.6's *"expecting `PASS RJdkHandles
+> (54 checks)`"* is a third number and is older still — it predates the
+> step-based rewrite. Whoever rebuilds should trust the binary's own
+> `CK RJdkHandles checks=` line over all three, and correct whichever is wrong.
+
 ### 5.1 `bindTo` does not raise `ClassCastException` for a wrong reference type
 
 HotSpot: `findStatic(…(String,int)int).bindTo(Integer.valueOf(1))` →
@@ -408,28 +448,193 @@ It is a real defect and it wants a lane that can rebuild.
 There is no vector row for it, for the same reason: a red that no fix in this
 lane clears.
 
+#### 5.1.1 STILL NOT TAKEN 2026-08-12 — and the reason is now a mechanism
+
+The 2026-08-11 reason was *"an unverifiable change to a hot path"*, which is a
+budget argument and reads as *"do it when there is time"*. There is a stronger
+one, and it names the predicate.
+
+`NativeContext` offers exactly one assignability primitive:
+`is_subclass(child: ClassId, parent: ClassId) -> bool`. It does walk interfaces
+(`classloading/src/class.rs::is_subclass_of` recurses through the superclass
+chain **and** the interface list, with a visited set for the JDK's diamond
+shapes), and it routes synthetic lambda-proxy `ClassId`s ≥ `0x8000_0000` through
+`lambda_proxy_satisfies`. So on the face of it, it is the right predicate.
+
+It is not, and the counter-example is a species this directory already has a
+record for: **a fabricated stand-in declares no interfaces, so every type test
+against an interface fails on it.** A `cast` check built on `is_subclass` would
+therefore answer "not assignable" — i.e. raise `ClassCastException` — for a
+receiver HotSpot casts without complaint, and `bindTo` is on the Groovy-indy /
+SpEL-`FunctionReference` / log4j-provider-factory path in this tree, all of which
+bind interfaces. The same shape reaches it from the other side:
+`class_id_by_name` has no initiating loader, so a leading-parameter class name
+that resolves to a different-loader twin gives the same false negative.
+
+That inverts the cost. The residual today is a **wrong answer** on a case nothing
+in the corpus exercises; the fix as available would be a **refusal of working
+code** on three paths that are exercised constantly — which is the direction this
+whole directory is about not going. `aastore_element_assignable` is the shape a
+correct fix would need: a predicate whose contract is *"must never produce a
+false refusal"*, with the hedges (interface component, `$Proxy`/`AnnotationProxy`
+value, synthetic class id, same-named-other-loader component) written into it and
+paid for by regressions. There is no `bindTo`-shaped equivalent on
+`NativeContext`, and adding one is a `native-api` change, not a `lang_invoke` one.
+
+**So: still no vector row, and the blocker is now stated as a capability gap.**
+What would unblock it: either a `cast`-shaped `NativeContext` predicate with
+`aastore_element_assignable`'s never-false-refuse contract, or a lane that can
+run the Groovy, SpEL and log4j slices against a build.
+
+An in-file pointer to this section now sits beside the guard in
+`native-builtins/src/lang_invoke.rs`, so the next reader of the two-line
+syntactic test learns why it is only two lines.
+
 ### 5.2 `isVarargsCollector()` answers `false`
 
-Measured (§4.2), and already declared in place in `lang_invoke.rs`. The fix, if
-a later lane wants it, is confined to that file: a sixth synthetic slot
+> **FIXED IN SOURCE 2026-08-12. NOT REBUILT.** Measured red (§4.2) on the
+> shipped binary; the fix below is a source change with no run behind it.
+
+Measured (§4.2), and formerly declared in place in `lang_invoke.rs`. The
+prescription this record left was: *a sixth synthetic slot
 `MH_VARARGS = MH_BASE + 5` with `alloc_method_handle`'s width going to
 `MH_BOUND + 2`, set by the `asVarargsCollector` shim and cleared by
 `asFixedArity`, plus a registration for `MethodHandle.isVarargsCollector()`
-reading it — the base-class bytecode returns `false` and is what runs today. Not
-done here because it is a third defect on a two-defect brief, and because
-widening the `MethodHandle` allocation touches every handle in the VM.
+reading it.* That is what landed, with one correction the prescription needed.
+
+#### 5.2.1 The correction: the read had to be width-guarded, and the record did not say so
+
+*"Widening the `MethodHandle` allocation touches every handle in the VM"* is
+**false, and falsely reassuring in the dangerous direction.** Widening
+`alloc_method_handle` touches only the handles `alloc_method_handle` mints. Three
+other populations exist, and a bare `get_field(mh, MH_VARARGS)` is an
+out-of-bounds read on all three:
+
+* `MethodHandles.empty` and `MethodHandles.zero` allocate **17** slots
+  (`lang_invoke.rs`, two literal `17`s);
+* `native-builtins/src/panama.rs` uses a compact layout whose field 0 is the
+  native function address, which `asType`'s own comment names;
+* `classloader.rs`'s `alloc_method_handle` allocates 21 with a **different field
+  order** (see W7-13's note on the second slot map).
+
+That is precisely the defect `MH_KIND_ARRAY_GET`'s doc comment records — `invokeExact`
+read `MH_DESC`(18) and `MH_KIND`(19) off the end of a 17-slot object, and the GC
+guard logged exactly those two indices with `num_slots=17`. So the marking is
+read and written through
+
+```rust
+fn mh_is_varargs_collector(ctx: &dyn NativeContext, mh: ObjectRef) -> bool {
+    ctx.object_num_fields(mh) > MH_VARARGS && matches!(ctx.get_field(mh, MH_VARARGS), Value::Int(1))
+}
+```
+
+and a `mh_set_varargs_collector` with the same guard — the idiom
+`lang_stackwalker.rs:1158` already uses (`object_num_fields(this) > P59_SF_DECL_MIRROR`).
+A handle too narrow to carry the marking is not one, which is the pre-fix answer
+for every handle: **the fallback is the old behaviour exactly.**
+`alloc_method_handle` and `alloc_string_concat_method_handle` also write
+`Int(0)` explicitly, so the read never has to interpret an unwritten slot.
+
+#### 5.2.2 The declared deviation that survives, and why it is the identity shim's, not the marking's
+
+HotSpot's `asVarargsCollector` returns a **new** handle and leaves the receiver
+fixed-arity. CratonVM's is the identity — deliberately, and
+`register_method_handle_combinator_extras_bridge` explains why at length: the
+real bytecode wraps the receiver in a `DelegatingMethodHandle` whose constructor
+demands a `LambdaForm` reinvoker that would have to re-enter a `MH_KIND_*` shim
+through `invokeBasic`. So there is only ONE handle here, and consequently:
+
+* `h.asVarargsCollector(t).isVarargsCollector()` → `true` (HotSpot: `true`);
+* `h.isVarargsCollector()` afterwards → `true` (HotSpot: `false`);
+* `h.asFixedArity()` clears the bit on that same object (HotSpot: leaves `h`
+  marked and returns an unmarked copy).
+
+Minting a copy instead would have to reproduce all six synthetic slots plus the
+`type` field of an arbitrary handle kind, in a shim two other subsystems reach.
+Dispatch is unaffected either way — `collect_trailing_varargs` derives varargs
+behaviour from arity and never reads this bit — so the copy buys only the
+aliasing, at the price of a new allocation on a shimmed path. **The vector
+asserts the marking on the RESULT of `asVarargsCollector` and takes its negative
+control from a FRESH handle, precisely so it does not assert the deviation.**
+
+#### 5.2.3 One reachability caveat, stated rather than assumed
+
+`MethodHandle.isVarargsCollector()` is **concrete** in the real JDK: the base
+class returns `false` and `MethodHandleImpl$AsVarargsCollector` overrides it. Per
+`docs/architecture/natives-over-real-jdk-classes.md` §1 a registered native beats
+real bytecode on the cold interpreter paths with no list consulted, and this
+block's ambient `NativeKind` is `Bridge`, which `--jdk-only` keeps — the sibling
+`asVarargsCollector`/`asFixedArity` shims in the same block are green under
+`--jdk-only` today, which is the empirical form of that argument. The warm,
+cached, reflective and JIT paths reinstate the preference from `vm_exec.rs`'s
+`check_override` mirror, and that mirror lists `asCollector`, `asSpreader`,
+`asVarargsCollector` and `asFixedArity` but **not** `isVarargsCollector`. Adding
+it is a one-line out-of-file edit and is reported as such; until it lands, a
+JIT-warm caller may read the base class's `false`. That is the answer the entire
+VM gave before this change, so the worst case is the old behaviour on one path,
+not a new wrong answer — but it is a cold/warm split of the cached-twin species
+and should not be left indefinitely.
 
 ### 5.3 `type()` is not narrowed after a getter bind or an array-getter bind
+
+> **FIXED IN SOURCE 2026-08-12. NOT REBUILT.**
 
 Measured in §3.3's census: `findGetter(…)` bound to a receiver still reports
 `(H)int` where HotSpot reports `()int`, and `arrayElementGetter(int[])` bound to
 an array still reports `([I,int)int` where HotSpot reports `(int)int`. The
-`bindTo` native narrows `type` for `MH_KIND_VIRTUAL`/`SPECIAL`/`STATIC` and for
+`bindTo` native narrowed `type` for `MH_KIND_VIRTUAL`/`SPECIAL`/`STATIC` and for
 the second-bind INSERT path, but not for `MH_KIND_GETTER`/`SETTER`/`ARRAY_GET`/
-`ARRAY_SET`. Both are in this lane's file and were left alone: they are the
-reason the new `bindTo` guard under-refuses on two shapes (§3.3), so fixing them
-would TIGHTEN a refusal that has not been rebuilt or run once. Fix the arity
-bookkeeping and the guard in the same rebuilt lane, not in a source-only one.
+`ARRAY_SET`.
+
+#### 5.3.1 The change, and why the tightening it causes is the point
+
+The `MH_KIND_STATIC` arm's body is already generic — read `type`, drop
+parameter 0, rebuild — so the four accessor kinds were added to its condition and
+the body is untouched. They take the same drop for the same reason: a getter's
+`type` is its raw descriptor `(LH;)I`, because `alloc_method_handle` prepends a
+receiver only for VIRTUAL/SPECIAL, so parameter 0 IS the value `bindTo` just
+captured, exactly as for STATIC. Static getters and setters (`()I`, `(I)V`) never
+reach the arm: the guard at the top of the native already refuses a zero-arity or
+primitive-leading target, which is what HotSpot does too.
+
+This record's 2026-08-11 reason for leaving it — *"fixing them would TIGHTEN a
+refusal that has not been rebuilt or run once"* — was the right caution and is
+answered rather than ignored. §3.3's census found exactly two rows out of
+thirteen where CratonVM's `type()` lagged, and **both lagged in the permissive
+direction**: CratonVM reported a REFERENCE leading parameter where HotSpot
+reported a primitive or none, so the guard under-refused on two shapes and
+over-refused on none. Narrowing them makes the guard refuse those two — which is
+what HotSpot does. And the behaviour it replaces is worse than a wrong `type()`:
+a second `bindTo` on a bound getter fell through to the allocation below, minted
+a fresh handle and **overwrote `MH_BOUND`**, silently dropping the first
+capture — the same defect the INSERT second-bind path exists to prevent for
+static/virtual/special handles. So the tightening converts a silent wrong answer
+into HotSpot's `IllegalArgumentException`.
+
+The `type()` narrowing changes no dispatch: `mh_dispatch` keys the accessor arms
+off `MH_DESC`, which is untouched, and takes the receiver/array from `MH_BOUND`
+(`MH_KIND_GETTER`'s `let receiver = match bound { … }`).
+
+#### 5.3.2 Three new steps, and what each can fail on
+
+`RJdkHandles.binding()` gains three steps / twelve of the new checks:
+
+* **`bindTo narrows type() after a getter bind`** — the unbound arity is 1, the
+  bound arity is 0, the return type survives, and the bound handle reads the
+  bound receiver's field. Asserted through `parameterCount`/`returnType`, not
+  `MethodType.toString()`, because the arity is the claim and §4.3 item 4 already
+  names string rendering as the weak form.
+* **`bindTo narrows type() after an array-element getter bind`** — the same
+  three plus `parameterType(0) == int.class`, which is what distinguishes
+  "dropped a parameter" from "dropped the wrong one".
+* **`bindTo refuses a second bind on a bound getter`** — the tightening, asserted
+  directly rather than left as a consequence.
+
+The two `invoke` assertions are the ones a rebuild should look at first: they are
+the only claims here that exercise a bound-accessor **dispatch** rather than its
+bookkeeping, and this lane could not run them. If either goes red, the step names
+itself and the bookkeeping claims beside it still report independently — which is
+what §1 is for.
 
 ---
 
@@ -449,22 +654,43 @@ javac -d regression-suite/build regression-suite/src/RJdkHandles.java
 
 # 1. Compatible. Was: 13 of 37 steps failed, named in the AssertionError.
 cratonvm --real-jdk --java-home "<jdk-25-home>" -cp regression-suite/build RJdkHandles
-#    Expect: PASS RJdkHandles (316 checks, 37 steps).
+#    Expect: PASS RJdkHandles (128 checks, 40 steps) after the 2026-08-12 pass.
+#    If the oracle disagrees, the oracle is right and this number is stale — the
+#    "316" this line used to print is not reproducible from the file (§5 preamble).
 
 # 2. Strict, which additionally exercises W7-13's carrier door.
 #    Was: 24 of 37.
 cratonvm --jdk-only --java-home "<jdk-25-home>" -cp regression-suite/build RJdkHandles
 
 # 3. The oracle must still agree line for line.
-java -cp regression-suite/build RJdkHandles          # 0 of 37, 316 checks
+java -cp regression-suite/build RJdkHandles          # 0 of 40, 128 checks
 
 # 4. The whole vector through the harness, which diffs 1 against 3.
 ONLY=RJdkHandles bash regression-suite/run.sh
 ```
 
 **A green `RJdkHandles` is now sufficient evidence for the combinator surface,
-which is the point of §1** — it was not before. It is NOT evidence for anything
-this record lists in §5, none of which has a row.
+which is the point of §1** — it was not before. **After the 2026-08-12 pass it is
+also evidence for §5.2 and §5.3, which now have rows: three new checks for the
+varargs marking and its two controls, and nine for the accessor-bind narrowing —
+twelve in all, taking a green run from 116 checks to 128 and 37 steps to 40.** It
+is still NOT evidence for §5.1, which deliberately has none — §5.1.1 says why,
+and the reason is now that the fix as available would raise a FALSE refusal, not
+that nobody had time.
+
+**Five of the twelve fail on the old behaviour; the rest are controls, and that
+split is deliberate.** Falsified by the old behaviour:
+`sumAll.isVarargsCollector()` (answered `false`), the bound getter's
+`parameterCount() == 0` and the bound array getter's `parameterCount() == 1` and
+`parameterType(0) == int.class` (all three read the un-narrowed type), and the
+second-bind refusal (was accepted). The other seven are controls or corroboration:
+the FRESH-handle and `asFixedArity` negatives — without which a VM answering
+`true` unconditionally satisfies the marking check — the two unbound arities and
+the return type, and the two `invoke` reads. **The two `invoke` reads may or may
+not have passed before this change** (the un-narrowed `type` carried an extra
+parameter that some `invoke` arity paths consult) and were not measured either
+way; they are here to catch a narrowing that breaks the dispatch, not to
+demonstrate the defect.
 
 What would falsify the `bindTo` half specifically: any real-world `bindTo` in
 the Groovy / SpEL / log4j paths newly raising `IllegalArgumentException: no
@@ -482,9 +708,47 @@ instrument.
 
 ## Out-of-file patch (not applied)
 
-None. Both defects, both fixes and the vector are contained in
+The original two defects, both fixes and the vector are contained in
 `native-builtins/src/lang_invoke.rs` and
-`regression-suite/src/RJdkHandles.java`.
+`regression-suite/src/RJdkHandles.java`. **The 2026-08-12 §5.2 fix adds ONE
+out-of-file line**, and it is a completeness edit rather than a correctness one:
+the warm/cached/reflective/JIT preference mirror in
+`vm/src/vm/vm_exec.rs::invoke_on_class_shared_inner` lists the sibling shims and
+not the new reader. Present:
+
+```rust
+                        || (class_name == "java/lang/invoke/MethodHandle"
+                            && matches!(
+                                method_name,
+                                "asCollector"
+                                    | "asSpreader"
+                                    | "asVarargsCollector"
+                                    | "asFixedArity"
+                            ))
+```
+
+Wanted — one added arm, nothing else in the block touched:
+
+```rust
+                        || (class_name == "java/lang/invoke/MethodHandle"
+                            && matches!(
+                                method_name,
+                                "asCollector"
+                                    | "asSpreader"
+                                    | "asVarargsCollector"
+                                    | "asFixedArity"
+                                    | "isVarargsCollector"
+                            ))
+```
+
+Without it the `isVarargsCollector` native still wins on the cold interpreter
+paths — which is where the vector runs — and a JIT-warm caller falls back to the
+base class's `return false`, i.e. to the behaviour that preceded this fix. So the
+line is not load-bearing for the vector; leaving it out leaves a cold/warm split
+that a later reader will read as a flake. `interpreter/native_override.rs`'s
+`force_native_over_real_jdk_bytecode` does **not** list `asVarargsCollector`
+either, so no matching edit is wanted there; the two are not kept in sync for
+this family today.
 
 `regression-suite/run.sh` needs **no** change: `RJdkHandles` is already in
 `JDKONLY_CLASSES`, it takes no per-class arguments from `class_args` or

@@ -531,6 +531,13 @@ over-correction arms from §5.2 (a live arena still reads and writes; a global o
 heap segment still does). Both assertions in one fixture, because the arm that
 catches an over-correction is the arm a "fix" is most likely to have broken.
 
+**DONE 2026-08-12 — see §11.2.** It is
+`RForeignLayoutJdkInterfaces.foreignArenaLifetime()`, 22 checks, in
+`CORE_CLASSES` already so no `run.sh` change was needed. The "reads and writes"
+half of the over-correction arm had to be replaced by `allocate`/`byteSize`,
+because `get`/`set` are gated on `--enable-native-access` and this suite passes
+no such flag (§7.2); §11.2 lists what that costs.
+
 ## 10. The single next step
 
 **Run the two behavioural probes on a binary built from this branch.** Every
@@ -539,3 +546,79 @@ produced, for this lane or for W7-83, W7-76, W7-69 or W7-58. `C` and `D` must
 flip to HotSpot's answers, `F.confined.offThread.*` must flip, and **`B` and `E`
 must not move** — that last clause is the whole guard, and a run that reports
 only the first two has not tested the fix.
+
+---
+
+## 11. The fix is on the live path, and §9's fixture now exists (2026-08-12)
+
+Two things this section settles, neither of which needed a build.
+
+### 11.1 The witness was re-tested before the fix was trusted
+
+W7-89's own §2 is the cautionary tale — the arity bug was real and fixing it
+alone would have moved nothing, because the predicate behind it was false. So
+the repair's *own* predicate was re-read end to end rather than assumed, in the
+merged tree:
+
+| link | verified | where |
+|---|---|---|
+| the model no longer holds an absolute index | `p67_session_slots` resolves `state`/`acquireCount`/`owner`/`resourceList` by name and falls back to `P67SessionSlots::SYNTHETIC` only when **all four** miss | `native-builtins/src/phases_late/foreign_ffm.rs`, `p67_session_slots` |
+| our own session is still MODELLED | `p67_session_is_real` requires the class name to differ from `jdk/internal/foreign/MemorySessionImpl`, and `p67_memory_session` allocates with exactly that name — so the new real-session exclusion cannot swallow the model's own carrier | `p67_session_is_real`, `p67_memory_session` |
+| the width half of the predicate holds | `required_width()` is `1 + max(index)`; on the real four-field carrier that is 4, and `object_num_fields` is 4 | `P67SessionSlots::required_width` |
+| a REAL session is still left alone | `p67_session_modelled` returns false for it *first*, before any slot read, so the JDK's inverse `OPEN = 0` encoding is never interpreted with this model's `1 = open` | `p67_session_modelled` |
+| the second copy of the index is gone | `panama.rs` has no `PE_SESSION_STATE_FIELD` / `PE_SESSION_SLOTS` and both `pe_session_modelled` and `pe_session_check_open` call the shared resolver | `native-builtins/src/panama.rs` |
+| the arena width gate landed | `let four_slot_layout = ctx.object_num_fields(arena_obj) > 3;` gates both the slot-2 read and the slot-3 read, and the id write additionally carries `ctx.object_is_array` | `pe_arena_allocate_impl` |
+| W7-83's two screens are still there | `native-io/src/lib.rs` and `native-builtins/src/servlet.rs` both still read `ctx.heap_kind_of(a) == ObjectKind::Array` | grep, both files |
+
+**Verdict: the landed fix is on the live path.** Nothing here is a measurement
+of behaviour; it is the confirmation that the four repairs are the code that
+runs, which is what §2 shows cannot be taken for granted.
+
+### 11.2 The scheduled fixture — `RForeignLayoutJdkInterfaces.foreignArenaLifetime()`
+
+§9 asked for it in as many words ("close an arena and assert the throw, plus the
+two over-correction arms from §5.2 … Both assertions in one fixture") and named
+`regression-suite/src/RForeignLayoutJdkInterfaces.java` as the only scheduled
+class that so much as mentions `java.lang.foreign`. That is where it went, so it
+is scheduled by the existing `CORE_CLASSES` word list with **no `run.sh` edit**
+— a new `src/*.java` in no list is the `RJdkPhaser` failure mode and would have
+looked like coverage while being none.
+
+22 checks. Each RED row's expected value is copied from §1's measured
+transcript, not reasoned about:
+
+| rows | discharges | before (measured, §1/§3) |
+|---|---|---|
+| `a closed arena's scope is NOT alive`, ×2 factories | `C.closed.scope.isAlive`, `D.shared.closed.*` | `true` |
+| `allocate() on a closed arena` → `IllegalStateException`, ×2 | `C.closed.allocate` | `NO-THROW:8` |
+| `close() on an already-closed arena` → `IllegalStateException`, ×2 | `C.closed.reclose` | `NO-THROW:void` |
+| `arena.scope() is stable across calls`, `a segment's scope is its arena's scope`, `a second segment shares the same scope` | `confined.arena.scope.stable`, `confined.seg.scope==arena.scope`, `confined.segA.scope==segB.scope` (§3.1) | `false` on all three |
+| the LIVE arm — a live arena's `scope().isAlive()`, `allocate`, `byteSize` | §5.2's `B.live.*` / `D.shared.live.*` | green, and must stay green |
+| `Arena.global()`, `Arena.ofAuto()`, `MemorySegment.ofArray` — alive, allocating, and (heap only) a stable scope | §5.2's `E.global.*` / `E.auto.*` / `E.heap.*` and `heap.scope.stable` | green, and must stay green |
+
+**What it deliberately cannot cover, and why that is not a choice.** The suite
+passes no `--enable-native-access`, and `MemorySegment.get`/`set`/`getAtIndex`/
+`setAtIndex`/`copy`/`fill` are all gated on it (`require_native_access`,
+`native-builtins/src/panama.rs`) — they would raise `IllegalCallerException`
+here for a reason that has nothing to do with liveness (§7.2). So:
+
+* **`C.closed.get` / `C.closed.set` / `C.closed.slice.get` are not in the
+  fixture.** The use-after-close *read* — the row that returned `0x55667788`
+  after `close()` — stays probe-only.
+* **Thread confinement is not in the fixture either**, and it is the widest of
+  §5.1's four widenings. `p67_session_check_valid` is where the owner check
+  lives, and in Compatible mode the only ungated paths into it are `close()` and
+  the arena allocator; `pe_session_check_open`, which is what
+  `pe_arena_allocate_impl` calls, checks the state word **only** and has no
+  owner test at all (read, not inferred). So an off-thread `allocate` on a
+  confined arena does *not* raise, and asserting that it does would have pinned
+  a behaviour this repair does not implement.
+* Making either coverable needs one line in `run.sh`'s `class_cv_args` giving
+  this class `--enable-native-access=ALL-UNNAMED`. That is a runner change, it
+  is outside the lane that wrote this section, and it is the honest next step for
+  §6.3 as well.
+
+`Arena.global().scope() == Arena.global().scope()` is also absent, deliberately:
+§6.6 records that `Arena.global()` mints a fresh arena per call, so that row is
+red for a reason this record does not fix, and putting it in a scheduled fixture
+would freeze a known divergence into the green baseline.

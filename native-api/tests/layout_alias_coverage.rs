@@ -99,6 +99,13 @@
 //!   [`the_unresolved_class_fallback_population_only_shrinks`] fails. The one
 //!   ratchet in this file, and see its doc for why this population earns one
 //!   when [`census`] does not.
+//! * Inline the appended-slot base back into a literal width at
+//!   `alloc_mapped_byte_buffer` or `native_fc_open` →
+//!   [`the_appended_slot_allocators_do_not_regress_to_a_literal_width`] fails.
+//!   Neither the ratchet nor the census can see that one: the site COUNT does
+//!   not move, and the width the detector reports is correct for the object it
+//!   allocated. What moves is where the private map lands — back inside the real
+//!   class's declared fields — and whether the row can be short at all.
 //!
 //! # What this gate deliberately does NOT assert
 //!
@@ -770,6 +777,94 @@ fn the_fabrication_funnel_uses_the_shared_classify() {
     );
 }
 
+/// Link 12 — the two allocators whose width is DERIVED must keep deriving it.
+///
+/// `native-io/src/lib.rs`'s `alloc_mapped_byte_buffer` and `native_fc_open` are
+/// the only two sites in the workspace whose requested slot count comes from
+/// `appended_slots::base_for_class` (directly, or through
+/// `synthetic_file_channel::alloc_slots`, which is `base_for_class(…) + 2`).
+/// That is not a stylistic choice and it is not only about the alias: it is what
+/// takes both rows OUT of the short population this file ratchets.
+///
+/// The argument, which is W7-74-short-object-repairs.md §1.3 generalised from
+/// `MappedByteBuffer` to both sites. `base_for_class` resolves the class through
+/// the same `ensure_class_initialized` the surrounding `match` scrutinises, and
+/// answers 0 when it fails or when the class is a fabricated stub. So the two
+/// halves of a "short by N" claim can never both hold in one execution:
+///
+/// * on an image where the class really declares `base`, the request is
+///   `base + private_width` — an `over` row, the appended-slot idiom's
+///   signature, and the object carries every declared field;
+/// * on an image where the request collapses to `private_width`, the base is 0,
+///   which means the class did not resolve — and there is then no declared width
+///   for the object to be short against.
+///
+/// Replace either derivation with the literal it replaced (`12`/`2` for
+/// `MappedByteBuffer`, `2` for `FileChannel`) and both properties go at once:
+/// the private map lands back inside the real class's declared fields — the
+/// `MMAP_REGISTRY` id in `nativeByteOrder` and the writable flag in `fd`
+/// (W7-68 §3.1), the fd in `closeLock` and the file position in `closed`, which
+/// real `AbstractInterruptibleChannel.isOpen()` reads (W7-72 §2.2) — and the two
+/// rows silently re-enter the short column without the ratchet's total moving,
+/// because the site count is unchanged. **A literal here is invisible to every
+/// other gate in this file.**
+///
+/// *Red when*: a "simplification" pass inlines the base, or a new `alloc_object`
+/// call with a bare numeric width is added to either body. Deliberately scans
+/// the whole body rather than one line, because a fixed line band in a
+/// source-witness test goes stale within a wave.
+#[test]
+fn the_appended_slot_allocators_do_not_regress_to_a_literal_width() {
+    let stripped = strip_comments(&read("native-io/src/lib.rs"));
+    for (func, derivation) in [
+        ("alloc_mapped_byte_buffer", "appended_slots::base_for_class("),
+        ("native_fc_open", "synthetic_file_channel::alloc_slots("),
+    ] {
+        let body = fn_body(&stripped, func).unwrap_or_else(|| {
+            panic!(
+                "`{func}` is gone from native-io/src/lib.rs. It is one of the two \
+                 appended-slot allocators; if it moved, move this gate with it — \
+                 see W7-74-short-object-repairs.md §1.3."
+            )
+        });
+        assert!(
+            body.contains(derivation),
+            "`{func}` no longer derives its allocation width through \
+             `{derivation}`. The derivation is what keeps the private slots ABOVE \
+             every field the class declares, and what makes the site's census row \
+             structurally unable to be `short`. See W7-72-ssc-socket-and-filechannel.md \
+             and W7-68-live-under-allocations.md §3.1."
+        );
+        let needle = "alloc_object(";
+        for (idx, _) in body.match_indices(needle) {
+            let prev = body[..idx].chars().next_back().unwrap_or(' ');
+            if prev.is_alphanumeric() || prev == '_' {
+                continue;
+            }
+            let open = idx + needle.len() - 1;
+            let Some(args) = paren_args(body, open) else {
+                continue;
+            };
+            let parts = split_top_level(args);
+            let Some(width) = parts.get(1) else {
+                continue;
+            };
+            let width = width.trim();
+            assert!(
+                width.is_empty() || !width.chars().all(|c| c.is_ascii_digit()),
+                "`{func}` asks `alloc_object` for the LITERAL width `{width}`. \
+                 Both allocation arms of this function must pass the width \
+                 derived from `{derivation}` — the `Err(_)` arm included, because \
+                 that is the arm whose row the ratchet counts. A literal restores \
+                 the in-bounds write of the wrong field that \
+                 W7-68-live-under-allocations.md §3.1 and \
+                 W7-72-ssc-socket-and-filechannel.md §2.2 repaired, and no other \
+                 gate in this file can see it."
+            );
+        }
+    }
+}
+
 /// A RATCHET, and the only one in this file: the `ClassId::new(0)` fallback
 /// population may shrink and may not grow.
 ///
@@ -779,9 +874,39 @@ fn the_fabrication_funnel_uses_the_shared_classify() {
 /// defect-shaped thing**, so growth is never routine. A native writing
 /// `alloc_object(ClassId::new(0), N)` has resolved a class, failed, and gone
 /// ahead — handing back an object of class `cratonvm/synthetic/AnonymousObject$N`
-/// to a caller that will use it as the class it asked for. 14 of today's 28 ask
-/// for fewer slots than the class they name really declares (`javap -p`, JDK
+/// to a caller that will use it as the class it asked for. **12** of today's 28
+/// ask for fewer slots than the class they name really declares (`javap -p`, JDK
 /// 25.0.3.9), so those objects are short.
+///
+/// **The 12 is a re-derivation, and the 14 it replaces was an arithmetic slip
+/// worth naming** — the population number and the short number are not the same
+/// number and have to be decremented together. W7-74-short-object-repairs.md
+/// corrected W7-73's 16 down to 14, then repaired the two `java/lang/Thread`
+/// carrier mirrors and took the POPULATION from 30 to 28 — but both repaired
+/// sites were members of the 14, so the short count went to 12 at the same
+/// moment and was left at 14 here and in that record's §5. Two later, offsetting
+/// movements landed on the same day and net to zero, which is exactly how a
+/// stale figure gets "confirmed":
+///
+/// * `native-io/src/lib.rs`'s `native_fc_open` LEAVES the short column.
+///   W7-72-ssc-socket-and-filechannel.md moved the `FileChannel` private map
+///   onto the appended-slot idiom, so the requested width is now
+///   `synthetic_file_channel::alloc_slots` = `base_for_class(…) + 2`. That makes
+///   the row structurally unreachable in the same way W7-74 §1.3 established for
+///   `MappedByteBuffer`: on an image where `FileChannel` really declares 4 the
+///   base is 4 and the request is 6 (an `over` row), and on an image where the
+///   request is 2 the base is 0 — meaning the class did not resolve, so there is
+///   no declared 4 to be short against.
+/// * `native-io/src/socket_channel.rs`'s `alloc_obj` JOINS it. W7-66-live-over-allocations.md
+///   §4.3 narrowed its four callers from 12 to `SC_OBJECT_SLOTS` = 6 against
+///   `SocketChannel`/`ServerSocketChannel`, which really declare 10 — so the row
+///   W7-73 §3.2 filed as "12 against 10 — over" is now 6 against 10, short by 4.
+///   A narrowing repair aimed at the `over` census moved a site into the `under`
+///   one, and no record noticed on the day.
+///
+/// The count is prose, not a computation: the declared widths come from `javap`
+/// and no Rust test can derive them. Treat it as a work queue, re-derive it
+/// after any repair, and decrement BOTH numbers when a short site leaves.
 ///
 /// The number is a source-level count of a shape, not a runtime measurement, and
 /// it does not claim any of these arms is ever taken. That is the point: nothing
@@ -789,9 +914,14 @@ fn the_fabrication_funnel_uses_the_shared_classify() {
 ///
 /// **How it fails.** Add one more `alloc_object(ClassId::new(0), 3)` to any
 /// native crate and this goes red with the new total. (Verified red against a
-/// mutated copy with one added site: reported 31 against the bound of 30.)
+/// mutated copy with one added site: reported 31 against the then-bound of 30.)
 /// Lowering the bound after a repair is the intended edit and needs no
 /// discussion; raising it needs a reason in the commit message.
+///
+/// The scanner was independently replicated a third time on 2026-08-12 — a
+/// line-for-line reimplementation of `strip_comments`, `match_brace`,
+/// `cfg_test_spans`, `paren_args` and `split_top_level` — and returns the same
+/// 28 sites against this tree.
 #[test]
 fn the_unresolved_class_fallback_population_only_shrinks() {
     /// 2026-08-12, W7-73-short-object-blind-spot.md. Sites whose class argument
@@ -808,6 +938,12 @@ fn the_unresolved_class_fallback_population_only_shrinks() {
     /// `try_alloc_concurrent_synthetic`, which resolves the class and widens to
     /// its declared 19. This is the ratchet doing what its own failure message
     /// prescribes — *"allocate against a class you actually resolved"*.
+    ///
+    /// **28 re-derived by an independent scanner on 2026-08-12 (later pass) and
+    /// unchanged.** The SHORT subset of it is not 14 but **12** — see this
+    /// test's doc comment for the arithmetic and for the two offsetting
+    /// reclassifications (`native_fc_open` out, `socket_channel::alloc_obj` in)
+    /// that make a stale 14 look like it still reconciles.
     const BOUND: usize = 28;
 
     let root = workspace_root();
@@ -867,7 +1003,7 @@ fn the_unresolved_class_fallback_population_only_shrinks() {
          substitutes `cratonvm/synthetic/AnonymousObject$N` — which declares \
          exactly N, so the slot-count clamp is a no-op and the width census sees \
          agreement — and the object is then handed back as an instance of the class \
-         the caller named. Where that class's real layout is wider (14 of the 28 \
+         the caller named. Where that class's real layout is wider (12 of the 28 \
          sites after 2026-08-12: `ZipEntry` 6 against 14, `Pattern` 2 against 20, \
          `ServiceLoader` 2 against 10, `Iocp` 1 against 14), the object is SHORT \
          and every real-bytecode read past slot N is out of bounds.\n\

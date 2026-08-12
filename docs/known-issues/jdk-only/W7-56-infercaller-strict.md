@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | FIXED in two parts on `fix/infercaller-strict-source-pair-20260812`. Part 1 (accessors) is merged and MEASURED to have taken effect; part 2 (the constructor) is the one that closes the vector and is unbuilt. |
+| **Status** | **ALL THREE PARTS ARE IN THE TREE, verified against the source on 2026-08-12 (§Landed state) — still unbuilt.** Part 1 (accessors) was merged and MEASURED to have taken effect; parts 2 (the constructor retag) and 3 (`stamp_inferred_caller`) are present and unmeasured. |
 | **Vector** | `regression-suite/src/RJdkLogging.java`, `formattedOutputIsRealBytes` — the last red in the `--jdk-only` strict corpus (69 passed / 1 failed). |
-| **Predecessor** | `jul-logrecord-infercaller-is-inert-under-jdk-only-20260812.md` (the handoff; both of its candidate causes are refuted below). |
+| **Predecessor** | retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md (the handoff; both of its candidate causes are refuted below). It is no longer in this directory — it was retired to the internal tree on 2026-08-12 and carries a SUPERSEDED marker pointing here. |
 | **Oracle** | HotSpot 25.0.3.9 renders `RJdkLogging formattedOutputIsRealBytes`. |
 
 ## The symptom
@@ -159,6 +159,59 @@ constructor.
 3. **`native-builtins/src/logmanager.rs`** — `stamp_inferred_caller` clears
    `needToInferCaller` alongside its two field writes, so a stamped record
    cannot be re-inferred over by the now-live real getter.
+
+## Landed state, and the registrar census that decides it
+
+Re-verified in the tree on 2026-08-12 by grepping every registration of every
+triple in the fix, because that is the check this record's own history says
+cannot be skipped. Nothing was built.
+
+| part | site | present |
+|---|---|---|
+| 1, the four accessors | `native-api/src/retired_shadow.rs`, table entries + `the_log_record_source_pair_is_retired_as_a_set` | yes; table is 88 entries, floor `>= 80` |
+| 2, the `<init>` retag | `native-builtins/src/phases_early.rs`, `let __ctor_cat = r.current_category(); r.set_category(…Bridge); … r.set_category(__ctor_cat);` | yes |
+| 3, the flag clear | `native-builtins/src/logmanager.rs`, `stamp_inferred_caller` | yes, guarded on `log_record_real_layout` |
+
+**The four accessors have exactly ONE registrar**, tree-wide:
+`register_phase54_logging_extras`, inside an explicit
+`r.with_category(NativeKind::Bridge, …)`. So the retirement retag fires and
+nothing can hand them back — the failure mode this record's own §"Why the table
+entry for the constructor was inert" describes cannot recur for them.
+
+**`LogRecord.<init>(Level,String)V` has THREE**, and only two of them ship:
+
+| registrar | file | ambient kind | ships? |
+|---|---|---|---|
+| `register_phase54_logging_extras` | `phases_early.rs` | explicit `Bridge` (the part-2 retag) | yes — called from `register_essential_natives_with_shims` AND from `register_phase54_natives` |
+| `register_essential_natives_with_shims`, inline | `native-builtins/src/lib.rs` | `Bridge` (ambient, set once near the head and restored to itself around the regex block) | yes |
+| `register_p71_logging_extras` | `native-builtins/src/phases_late.rs` | ambient of `register_phase71_natives` | **no** — reached only from `register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]` and runs only on the `use_synthetic_jdk` arm |
+
+Both shipping registrations are `Bridge`, the triple is in
+`RETIRED_SHADOW_TRIPLES`, so both are retagged `SyntheticStub` and **both are
+refused under `--jdk-only`** — `register_inner`'s refusal arm returns before the
+push, so the slot is never created and the real constructor bytecode runs. That
+is what makes `needToInferCaller` true on a fresh record, and it is the whole
+closure. This does not depend on registrar ORDER, which is the reason to prefer
+it to any ordering argument.
+
+### Correction to fix item 2's Compatible sentence
+
+Item 2 says the shadow "also now mirrors `needToInferCaller = true` for its
+remaining Compatible-mode life". **In `Compatible` that write never executes.**
+The `phases_early.rs` registration is made at `register_essential_natives_with_shims`'
+call to `register_phase54_logging_extras`, and the `lib.rs` inline registration
+of the same triple is made LATER IN THE SAME FUNCTION BODY — `register()` is
+last-write-wins on the callback, so the surviving Compatible body is `lib.rs`'s,
+and that one writes `needToInferCaller` to **`Int(0)`**.
+
+Nothing is broken by it: in `Compatible` all four source accessors are still
+natives and none of them reads the flag, so `0` and `1` are indistinguishable
+there, and `stamp_inferred_caller` has already filled the pair in. The mirror is
+worth keeping as documentation of what the real constructor does. But the
+sentence as written asserts a live effect the tree does not have, and the same
+misreading — "my registration is the one that runs" — is what made the `<init>`
+table entry inert for a day. **Two registrations in one registrar function are
+ordered by line, and the later line wins.**
 
 ## Why Compatible cannot regress
 

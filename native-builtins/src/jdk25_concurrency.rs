@@ -2217,6 +2217,50 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ShutdownOnFailure ---
+    //
+    // JDK-ONLY-NOTE (W7-18): every registration between here and the `Joiner`
+    // block below is on a class or a method that **no JDK 25 declares**, and
+    // that is measured rather than inferred. `javap` on Adoptium 25.0.3.9
+    // answers "class not found" for `StructuredTaskScope$ShutdownOnSuccess` and
+    // `$ShutdownOnFailure` — JEP 505 deleted both — and `Class.forName` answers
+    // `ClassNotFoundException` for each on HotSpot 25, `cratonvm --real-jdk` and
+    // `cratonvm --jdk-only` alike. `StructuredTaskScope$Config` is a name no JDK
+    // ever shipped (`$Configuration` is the real one, registered by
+    // `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`), and
+    // `Joiner.policy()I` is not on the JDK's `Joiner` either. Transcript:
+    // docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §1/§3.
+    //
+    // WHY THEY ARE STILL HERE, named as a decision rather than left as an
+    // oversight. Two things have to be true at once for the deletion to be
+    // worth taking, and only one is:
+    //
+    //   * It cannot move either shipping mode. TRUE — this registrar is reached
+    //     only from `register_synthetic_overrides`, so in `--real-jdk` and
+    //     `--jdk-only` real JDK bytecode serves the whole API with zero
+    //     fabrication (W7-18 §5: `compatibility_classes: 0`,
+    //     `synthetic_stub_invocations: 0`, no StructuredTaskScope violation in
+    //     1,454). So the deletion is also worth exactly nothing there.
+    //   * The deletion is checkable. FALSE without a run. Roughly twenty
+    //     `#[test]`s in this file's own test module PIN these registrations by
+    //     triple — `test_register_sof_*` and `test_register_sos_*` (nine),
+    //     `test_all_shutdown_on_failure_methods_registered` and its
+    //     `_success_` twin, `s52_joiner_policy_registered`,
+    //     `s52_total_registration_count`, and the fork/join/close/shutdown
+    //     lists — and the only mode the change could be observed in —
+    //     `--synthetic-jdk` — has never been executed once. Deleting the
+    //     registrations therefore means rewriting a blocking gate's assertions
+    //     to match an unmeasured expectation, which is how a divergence gets
+    //     frozen in rather than removed.
+    //
+    // What DID land instead, because it was both checkable and load-bearing:
+    // `util_concurrent_ext.rs::register_pd_structured_concurrency` — the third
+    // registrar of these same classes, with an INCOMPATIBLE `$Subtask` slot
+    // convention — is retired to a tombstone. Read its doc comment: it explains
+    // why every triple it held was already overwritten by this registrar, and
+    // why leaving it in place was a landmine for whoever finally deletes the
+    // block below. See also `w7_18_jep505_surface_is_not_shadowed_here`, the
+    // ratchet that keeps this registrar from growing a second body for the JEP
+    // 505 triples that live in `phases_late/concurrent.rs`.
     r.register(CLS_SHUTDOWN_ON_FAILURE, "<init>", "()V", native_sof_init);
     r.register(
         CLS_SHUTDOWN_ON_FAILURE,
@@ -4423,7 +4467,85 @@ mod jdk25_concurrency_tests {
     fn s52_joiner_policy_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jdk25_concurrency_natives(&mut r);
+        // NOTE (W7-18): `policy()I` is not on JDK 25's `Joiner`. This test pins
+        // a triple no JDK declares; see the JDK-ONLY-NOTE at the
+        // `ShutdownOnFailure` registration block for why it is still here.
         assert!(r.find(CLS_JOINER, "policy", "()I").is_some());
+    }
+
+    /// RATCHET (W7-18 patch B), not a coverage claim: this registrar must not
+    /// grow a second body for the JEP 505 triples that
+    /// `phases_late/concurrent.rs::register_p67_structured_task_scope_j25` owns.
+    ///
+    /// The hazard is an ordering one and it is silent. All three
+    /// `StructuredTaskScope` registrars sit inside `register_synthetic_overrides`,
+    /// and the call order there is `register_phase67_natives` (which reaches the
+    /// JEP 505 registrar), then `register_phase_d_natives`, then
+    /// `register_jdk25_concurrency_natives` — this one, LAST. `register()` is
+    /// last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+    /// §3), so any triple added here silently replaces the JEP 505 body with the
+    /// JDK-21-shaped one, with no warning, no duplicate-registration row, and no
+    /// visible diff at the call site. That is the exact mechanism this record's
+    /// residual names as the dangerous one.
+    ///
+    /// Checked as of 2026-08-12 by comparing the two triple sets: the JEP 505
+    /// surface is NOT shadowed today. This test is what keeps that true.
+    #[test]
+    fn w7_18_jep505_surface_is_not_shadowed_here() {
+        let mut r = NativeMethodRegistry::new();
+        register_jdk25_concurrency_natives(&mut r);
+        let owned_by_the_jep505_registrar: &[(&str, &str, &str)] = &[
+            (CLS_TASK_SCOPE, "join", "()Ljava/lang/Object;"),
+            (CLS_TASK_SCOPE, "isCancelled", "()Z"),
+            (
+                CLS_TASK_SCOPE,
+                "fork",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
+            ),
+            (
+                CLS_TASK_SCOPE,
+                "open",
+                "(Ljava/util/concurrent/StructuredTaskScope$Joiner;Ljava/util/function/Function;)Ljava/util/concurrent/StructuredTaskScope;",
+            ),
+            (
+                CLS_JOINER,
+                "allUntil",
+                "(Ljava/util/function/Predicate;)Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+            ),
+            (
+                CLS_JOINER,
+                "onFork",
+                "(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withName",
+                "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withThreadFactory",
+                "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withTimeout",
+                "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+        ];
+        for (cls, name, desc) in owned_by_the_jep505_registrar {
+            assert!(
+                r.find(cls, name, desc).is_none(),
+                "W7-18: `{}.{}{}` is registered HERE as well. This registrar runs \
+                 LAST inside `register_synthetic_overrides`, so it silently \
+                 replaces the JEP 505 body in \
+                 `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`. \
+                 Either delete this registration or move the implementation.",
+                cls,
+                name,
+                desc
+            );
+        }
     }
 
     // -- 52.3: Joiner.onComplete behavior --

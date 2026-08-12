@@ -2418,7 +2418,20 @@ fn net_poll_raw(_raw: NetRawHandle, _events: i32, timeout: i32) -> std::io::Resu
 ///
 /// Shared with `socket_channel.rs`, whose `SocketChannel` registry is separate
 /// from this file's but whose blocking read needs the same park-in-poll shape.
-pub(crate) fn poll_stream_readable(
+///
+/// # Why this is `pub` and not `pub(crate)`
+///
+/// W2-2-blocked-reader-async-close-wakeup.md's out-of-file patch. The synthetic
+/// `java.net.Socket` reader in `native-builtins/src/net_phase_e.rs` needs
+/// exactly this three-state contract and, unable to reach a `pub(crate)` item
+/// across the crate boundary, restated the whole `WSAPoll`/`poll(2)` binding a
+/// second time as `re1_socket_poll_readable`. `native-builtins` already depends
+/// on this crate and already calls `cratonvm_native_io::net::take_stream_for_tls`,
+/// so exporting costs no new dependency edge. **Exporting is only half the
+/// collapse** — deleting the duplicate arms is an edit to `net_phase_e.rs`, and
+/// is recorded, not applied, in that record. Until it is applied this crate has
+/// one exported primitive and that file still has its own copy.
+pub fn poll_stream_readable(
     stream: &TcpStream,
     timeout_ms: i32,
 ) -> Option<std::io::Result<bool>> {
@@ -2473,7 +2486,14 @@ const NET_POLLCONN: i32 = NET_POLLOUT;
 /// Deliberately NOT a fourth binding of `WSAPoll`/`poll(2)`: it goes through
 /// the same [`net_poll_stream`] the readable side uses, with `NET_POLLOUT`
 /// instead of `NET_POLLIN`.
-pub(crate) fn poll_stream_writable(
+///
+/// `pub` for the same reason as [`poll_stream_readable`], and exported with it
+/// rather than after it: `net_phase_e.rs`'s duplicate binding grew a *direction*
+/// parameter, so collapsing it needs both halves of the pair available at once.
+/// Exporting only the readable one would have left that file no choice but to
+/// keep its own copy for the write direction, which is how a four-site idiom
+/// grows back.
+pub fn poll_stream_writable(
     stream: &TcpStream,
     timeout_ms: i32,
 ) -> Option<std::io::Result<bool>> {

@@ -456,6 +456,9 @@ and renaming it would lose the trail.
 Two pre-existing hazards seen while migrating, neither introduced nor fixed
 here, both recorded so the next reader does not have to re-find them:
 
+* **§6's probe now has a partial scheduled home — and asking which of its rows a
+  fixture could reach found a fifth defect in the same family.** See §12.
+
 * **The typed `slice`/`slice(int,int)`/`duplicate` macro holds a resolved
   `ObjectRef` across an allocation.** `bb_state` is called on `this`, then
   `alloc_typed_buffer` runs — a collection point — and the earlier view's
@@ -470,3 +473,44 @@ here, both recorded so the next reader does not have to re-find them:
   view's window. Also unchanged — the old `bb_state` returned the array with no
   offset at all — but it means the two families disagree about where a view
   starts, and native-io's is the registration that wins (§7).
+
+---
+
+## 12. §6's probe, scheduled — the reachable half (2026-08-12)
+
+§7 is right that "the probe must be run `--features synthetic-jdk` +
+`--synthetic-jdk`" **for this record's own changes**, and that is exactly why
+this record's 78 sites are the part a scheduled fixture cannot reach: the suite
+runs Compatible mode, where `register_nio_natives` is not even compiled in a
+default build.
+
+But §6's probe is not only about `bb_state`. It is a HotSpot oracle for the
+`java.nio.ByteBuffer` **contract**, and in Compatible mode that contract is
+answered by the s2 family, which W7-76 §2 shows wins there. So the probe's rows
+split three ways, and the split is the useful output of asking the question:
+
+| probe rows | who answers in Compatible mode | schedulable? |
+|---|---|---|
+| the two `arm()` batteries — position/limit/remaining/bounds/slice/duplicate/read-only/compact | s2 | **already covered** — `RDirectBufferElem` groups 1–5 assert the same contract on the same two receivers and are green today |
+| `*.ord.*` (order propagation) and `*.win.*` (`array`/`arrayOffset` on a window) | s2 | **yes** — now groups 6 and 7 of `RDirectBufferElem`. W7-76 §10 and W7-83 §8.1 are the two records those groups discharge |
+| `seg.*` | nothing — `MemorySegment.asByteBuffer()` has no registration in either crate | **no**, and W7-83 §8 has the grep |
+| this record's own 78 `bb_state` sites | `native-io`, synthetic mode only | **no**, and §7 already says so |
+
+**The fifth defect.** §6's prediction table names four things it does not fix
+(`slice.aliasesParent`, `readOnly.isReadOnly`, the hard-coded `to_be_bytes`
+family, and the direct arm it does fix). Writing the `*.ord.*` assertions found a
+fifth, in `native-builtins` rather than `native-io` and therefore live in the
+shipping mode: **all four s2 derivations propagate the parent's byte order, and
+HotSpot resets it.** It is recorded in full at W7-76 §10, because that is the
+record whose §4.3 measured the oracle, and it is the clearest instance yet of
+this campaign's own rule — §4.3 measured HotSpot, drew the right conclusion about
+the *task's* premise, and never turned the same question on the code.
+
+**What the s2 family gets right, checked while doing this**, so the next reader
+does not re-derive it: `array()`'s three-arm match already produces HotSpot's
+measured heap/direct read-only split exactly (`Some(arr)` + read-only →
+`ReadOnlyBufferException`; `None` + a plausible direct address →
+`UnsupportedOperationException`), and `hasArray()` is already
+`s2_bb_arr(..).is_some() && !s2_bb_is_read_only(..)`, i.e. the JDK's
+`hb != null && !isReadOnly`. Both are asserted by group 7 as the over-correction
+arm rather than as findings.

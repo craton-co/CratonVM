@@ -35,7 +35,51 @@
   4. And `build_module_descriptor` cannot consume them; `build_requires_set`'s
      modifier loop still carries only two bits.
   The visible consequence stands: `isAutomatic()` is a hardcoded `false`, so
-  `RJdkModule:61` passes **vacuously**. A green 44/44 does not close this.
+  `RJdkModule`'s `check(!d.isAutomatic(), ...)` passes **vacuously**. A green
+  vector does not close this, at 44 checks or at any larger number.
+
+* **Re-verified independently 2026-08-12 (second pass), and part 1 was
+  deliberately NOT landed.** All four parts are still absent — a tree-wide
+  `*.rs` grep for `module_is_automatic|module_version|module_main_class|
+  module_requires_full|module_exports_full|module_opens_full` returns only
+  `reader/`'s unrelated `ModuleMainClass` *attribute* tests, and
+  `jboss_jdkspecific.rs` still carries `ctx.set_field_by_name(desc,
+  "automatic", Value::Int(0))` with `version`/`rawVersionString`/`mainClass`
+  left null on purpose.
+
+  **Why part 1 was not landed by a lane that owned `classloading/src/module.rs`.**
+  Adding `main_class` to `pub struct ModuleDescriptor` breaks three struct
+  literals outside that file — `classloading/src/access_control.rs`,
+  `vm/src/vm/vm_init.rs`, `vm/tests/new19_module_access.rs` — each needing one
+  added `main_class: None,` line. The struct has no `Default` impl and the
+  literals name every field, so there is no non-breaking spelling. Landing part
+  1 alone therefore buys **no observable change at all** (parts 2–4 are the only
+  consumers, and all three live in files this lane does not own) while making
+  the tree's ability to compile depend on three edits landing elsewhere in the
+  same commit. The four parts are one change; splitting them at the struct
+  boundary is the worst place to split them. The exact text for all four is
+  unchanged below and was re-checked against the tree, including that
+  `parse_module_info` still has both `desc` and `packages` bindings the part-1
+  snippet inserts between.
+
+  **`version()` and `Requires.compiledVersion()` need no parse-side work at
+  all** — `ModuleDescriptor::version` (`module.rs`, from `version_index`) and
+  `ModuleRequiresEntry::compiled_version` (from `requires_version_index`) are
+  both parsed and carried today. Only `main_class` has no data source anywhere.
+  So of the five accessors this record names as sourceless, four are blocked
+  purely on the **bridge** (parts 2–4), and one is blocked on the bridge *and*
+  the struct field.
+
+  **No fixture assertion was added, and that is not an oversight.** Every
+  accessor here is answered by a hardcoded constant or a null field, and the
+  hardcoded answers happen to be *correct* for `cratonvm.jdkonly.svc` — it is
+  not automatic, it carries no version, it declares no main class. A check that
+  distinguishes the fix from the hardcode needs a module that disagrees with it:
+  an **automatic** module (a plain jar with no `module-info` on the module path)
+  for `isAutomatic()`, and a `jar --module-version` / `--main-class` build for
+  the other three. Both are new harness work, and both would go RED until parts
+  2–4 land. Writing them now would hand the next lane a red suite instead of a
+  closed record.
 
 Lane W2-3 of the jdk-wave2 pool; the defect directly behind lane L9's
 `--module-path` resolution fix.
@@ -317,6 +361,11 @@ Per accessor, with the javadoc sentence that decides it:
 touches, vacuously.
 
 ## Out-of-file patch (not applied)
+
+**Apply all four parts together or none of them.** Re-verified absent
+2026-08-12; the prescription below is NOT in §2.4's dead list. Part 1 is a
+`classloading/` change with three one-line consequences outside it, and it is
+inert without parts 2–4 — see the second-pass status block.
 
 Everything remaining needs `native-api/src/registry.rs` and
 `vm/src/vm/vm_exec.rs`, which this lane does not own. The parse-side data all

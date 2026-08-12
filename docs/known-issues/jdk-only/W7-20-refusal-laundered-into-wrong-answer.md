@@ -321,6 +321,11 @@ inventory scoped to `cratonvm/*` under-reports these gaps.**
 >   this record says was "written for this record", is NOT IN THE TREE.** Not
 >   in `probes/`, not in `regression-suite/src/`. The measurement cannot be
 >   re-run.
+>
+> **2026-08-12, second pass: the red now has THREE causes and only one of them
+> is this record's.** Do not settle it with a single re-freeze — a conflated
+> number is what made this ratchet unreadable in the first place. See
+> *The census that settles this, and where it must be taken* below.
 
 ### (a) Two baselines under `scripts/baselines/` must be re-frozen
 
@@ -357,6 +362,65 @@ declares the carrier). Exact values are deliberately not written here — they
 must come from the census, not from this record's arithmetic. The `note` field
 should say that the movement is the `LinkedListSnapshotListItr` retag and cite
 this record.
+
+### The census that settles this, and where it must be taken — 2026-08-12
+
+**One command, and it must run on LINUX against JDK 25.**
+
+```sh
+JAVA_HOME=<jdk25> bash regression-suite/bridge-ratchet.sh
+```
+
+It boots `--real-jdk` against a real image, takes one schema-4 census, and
+scores BOTH gates from it — `scripts/jdk-only-bridge-ratchet.py` and
+`scripts/jdk-only-kind-map.py`. Two boots would be two objects; that is why the
+script refuses to take a second census.
+
+**The platform half is not a detail.** Both artefacts are keyed
+`<jdk-feature>/<os>`: the JSON's only entry is `"25/linux"` and the kind map is
+`jdk-only-kind-map-25-linux.tsv`. `jdk-only-bridge-ratchet.py`'s `host_os()`
+derives the key from the running interpreter, and `bridge-ratchet.sh` derives
+`--os` from `uname`. **On the Windows session host both gates therefore look up
+`25/windows`, find nothing, and exit 2 — "REFUSING: no committed baseline"**,
+which is not a pass, not a fail, and cannot re-freeze anything. Run it on the
+Linux build host. Anyone who runs it here and reports "the gate did not fire"
+has measured the absence of a baseline.
+
+**Three contributions to the current red. Attribute them apart before
+re-freezing; a single conflated number is what made this artefact unreadable.**
+
+| # | cause | effect on `jdk-only-bridge-ratchet.json` | effect on `stub_ratchet.rs` |
+|---|---|---|---|
+| (a) | the retag this record is about, plus `Formatter.formatMessage` and `LogManager.{getLogManager,getLogger}` | `bridge.without_acc_native` +10, `bridge.shadows_bytecode_anywhere` +1, `superseded.kind_disagreements` −2 | +6, via `RETIRED_SHADOW_TRIPLES` |
+| (b) | the four new scalar `StringBuilder.insert` overloads (`IZ`/`IJ`/`IF`/`ID`) registered on `StringBuilder` / `StringBuffer` / `AbstractStringBuilder` — ambient kind `Bridge` | up to **+12** Bridge-over-bytecode rows, and the kind map gains twelve rows | **ZERO.** `Bridge` is not in that census's population |
+| (c) | anything else in the 182 commits between the freeze and HEAD | unknown | unknown |
+
+(a) and (b) are *arithmetic*, stated so the diff can be read, and neither is a
+value anyone may paste. Every figure is a LOWER BOUND. If the run moves a
+counter by anything else, that is (c) — a finding to attribute, not slack to
+absorb.
+
+**One retirement is deliberately NOT landed, and its consequence must not be
+frozen for it.** The 7-row `java/io/Print*` shadow retirement in
+`native-api/src/retired_shadow.rs` was verified to come back clean and was held
+back, because landing it moves three `25/linux`-frozen artefacts —
+`bridge_shadows_bytecode`, `stub_ratchet.rs`'s `SLACK = 0` baseline, and the
+kind map — which must be re-frozen in the SAME commit from ONE census. Predicted
+if it lands: `stub_ratchet` rises by up to seven in the (a) direction, and
+`bridge.shadows_bytecode_anywhere` falls by the rows that leave the `Bridge`
+population. Confirm with the same one command; do not pre-freeze for a change
+that does not exist.
+
+**And one census this script structurally cannot take.** `bridge-ratchet.sh`
+runs `--real-jdk`, and the frozen artefact records `"mode": "compatible"`. A
+registration reachable only from `register_synthetic_overrides` therefore
+**cannot move it by any amount** — see
+docs/architecture/natives-over-real-jdk-classes.md §7. Verifying a
+synthetic-mode-only change (for instance, that the `ProcessBuilder` cluster's
+three slots return to `SyntheticStub` with an empty `overwrote=`) needs a
+`--dump-native-registry` diff from a `--features synthetic-jdk` binary run in
+`--synthetic-jdk` MODE. Running this script for that question answers a
+different one and answers it "nothing changed".
 
 ### (b) `cratonvm/internal/LinkedListSnapshotListItr` implements nothing
 

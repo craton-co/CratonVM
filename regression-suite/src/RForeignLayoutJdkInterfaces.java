@@ -1,3 +1,5 @@
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -51,6 +53,11 @@ import javax.net.ssl.SSLSession;
  * their packages (package-private constructors, sealed types) and so cannot
  * receive a foreign implementor at all; that is a fact about the type, not an
  * untested gap.
+ *
+ * {@code foreignArenaLifetime()} is the one section that is NOT a dispatch
+ * question. It is here because the sentence above was, until it was written, the
+ * only mention of {@code java.lang.foreign} in any scheduled class — so the FFM
+ * lifetime model had no vector anywhere in the suite. See its own javadoc.
  *
  * Determinism: no I/O, no clock, no identity hashes — the proxy's own
  * {@code hashCode} is routed through the handler and answers a constant.
@@ -370,11 +377,60 @@ public class RForeignLayoutJdkInterfaces {
         System.out.println("CK RForeignLayoutJdkInterfaces thr=" + t.seen.size()
                 + " rt=" + rt.seen.size() + " mbs=" + ms.seen.size());
 
-        // The REAL beans are unaffected.
-        check(java.lang.management.ManagementFactory.getThreadMXBean().getThreadCount() > 0,
-                "the real ThreadMXBean reports at least one thread");
-        check(java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime() >= 0,
-                "the real RuntimeMXBean reports a non-negative uptime");
+        // The REAL beans are unaffected. `> 0` and `>= 0` are satisfied by any
+        // plausible constant, which is what the proxies above hand back by
+        // design -- so each weak bound is paired with a cross-accessor
+        // invariant, the same shape RJdkJmx's platform-bean block uses. Nothing
+        // below is a host constant: every right-hand side is read at run time
+        // from the same VM, in an order that can only widen the comparison.
+        java.lang.management.ThreadMXBean realTh =
+                java.lang.management.ManagementFactory.getThreadMXBean();
+        check(realTh.getThreadCount() > 0, "the real ThreadMXBean reports at least one thread");
+        // The thread executing this line is live by construction, so it MUST be
+        // in the list. A fabricated array of plausible-looking ids is not.
+        long selfId = Thread.currentThread().getId();
+        boolean sawSelfId = false;
+        for (long id : realTh.getAllThreadIds()) {
+            if (id == selfId) {
+                sawSelfId = true;
+            }
+        }
+        check(sawSelfId, "getAllThreadIds() must contain the current thread " + selfId);
+
+        java.lang.management.RuntimeMXBean realRt =
+                java.lang.management.ManagementFactory.getRuntimeMXBean();
+        long realStart = realRt.getStartTime();
+        long realUptime = realRt.getUptime();
+        long nowMs = System.currentTimeMillis();
+        check(realUptime >= 0, "the real RuntimeMXBean reports a non-negative uptime");
+        // The VM cannot have started in the future.
+        check(realStart > 0 && realStart <= nowMs,
+                "RuntimeMXBean.getStartTime " + realStart + " is not in the past");
+        // NOT `start + uptime <= now`. That reads as sound and is not: MEASURED
+        // on HotSpot 25.0.3.9 it fails by ~48ms, because getStartTime() is a
+        // wall-clock instant captured at VM start while getUptime() is measured
+        // from a monotonic source with a different base. The two are only
+        // approximately commensurable, so any strict inequality between them is
+        // a latent flake -- on the ORACLE as well as on CratonVM.
+        //
+        // What the row is actually for is catching an uptime that is a constant
+        // unrelated to this VM. Two properties express that without pitting the
+        // clocks against each other:
+        //   * uptime must ADVANCE across a real sleep -- a constant cannot;
+        //   * uptime must agree with (now - start) to within a generous slack,
+        //     which a fabricated value unrelated to the start instant fails.
+        long uptimeBefore = realRt.getUptime();
+        try {
+            Thread.sleep(50L);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        check(realRt.getUptime() > uptimeBefore,
+                "getUptime() must advance across a sleep; stayed at " + uptimeBefore);
+        long drift = Math.abs((nowMs - realStart) - realUptime);
+        check(drift <= 5000L,
+                "uptime " + realUptime + " must agree with now-start " + (nowMs - realStart)
+                        + " to within 5s; drift was " + drift);
         System.out.println("CK RForeignLayoutJdkInterfaces realBeans=ok");
     }
 
@@ -422,6 +478,129 @@ public class RForeignLayoutJdkInterfaces {
                 + " dos=" + a.seen.size());
     }
 
+    /** Run {@code body}, and check it threw exactly {@code expected}. */
+    static void checkThrows(Class<?> expected, Runnable body, String what) {
+        checks++;
+        try {
+            body.run();
+        } catch (Throwable t) {
+            if (t.getClass() == expected) {
+                return;
+            }
+            throw new AssertionError("RForeignLayoutJdkInterfaces: " + what + " threw "
+                    + t.getClass().getName() + ": " + t.getMessage()
+                    + ", expected exactly " + expected.getName());
+        }
+        throw new AssertionError("RForeignLayoutJdkInterfaces: " + what
+                + " did not throw " + expected.getName());
+    }
+
+    /**
+     * java.lang.foreign arena LIFETIME — the one thing in this package that is
+     * not a dispatch question.
+     *
+     * WHY IT IS HERE. This file's header explains that {@code
+     * java.lang.foreign.MemorySegment} is sealed and so cannot receive a foreign
+     * implementor; that sentence was, until this method, the ONLY mention of
+     * {@code java.lang.foreign} anywhere in the 70 classes {@code run.sh}
+     * schedules. So no scheduled fixture opened an {@code Arena}, and the FFM
+     * lifetime model — {@code close()}, {@code isAlive()}, {@code scope()}
+     * identity — had no vector at all.
+     *
+     * WHAT WAS WRONG. The model keeps four words on a {@code
+     * jdk.internal.foreign.MemorySessionImpl} carrier, and in Compatible mode
+     * that carrier is the REAL loaded class, whose slot 0 is a declared
+     * REFERENCE. The model wrote its {@code int} state word there, the
+     * "is this a session we built?" predicate was "does slot 0 read back as an
+     * int", and it therefore answered false for every session this VM mints.
+     * With it the whole model went inert: {@code close()} recorded nothing,
+     * {@code isAlive()} answered true forever, a closed arena still allocated,
+     * and a second {@code close()} was silently accepted. Every row below marked
+     * RED was measured in that state on a current-dev binary
+     * (probes/MemorySessionValidStateProbe.java sections C/D,
+     * probes/MemorySessionIdentityProbe.java, probes/MemorySessionPreAllocProbe.java);
+     * the HotSpot column is Eclipse Adoptium jdk-25.0.3.9.
+     *
+     * WHAT IT DELIBERATELY DOES NOT TOUCH. {@code MemorySegment.get}/{@code set}
+     * and the whole raw-address family are gated on {@code
+     * --enable-native-access}, which this suite does not pass, so they would
+     * raise {@code IllegalCallerException} here for a reason that has nothing to
+     * do with liveness. That is also why thread confinement — the widest of the
+     * four behaviour changes — is absent: it fires on the segment ACCESS path
+     * only. {@code allocate}, {@code close}, {@code scope} and {@code byteSize}
+     * are ungated, which is the whole surface used below.
+     *
+     * The over-correction arm is not optional and is interleaved on purpose: a
+     * gate that refuses everything satisfies every RED row and fails every LIVE
+     * one, and the arm a fix is most likely to have broken is the one that must
+     * still pass.
+     */
+    static void foreignArenaLifetime() {
+        // --- LIVE (green before AND after): none of this may start throwing ---
+        Arena confined = Arena.ofConfined();
+        check(confined.scope().isAlive(), "a live confined arena's scope is alive");
+        MemorySegment live = confined.allocate(16L);
+        check(live != null, "a live confined arena allocates");
+        check(live.byteSize() == 16L, "the segment is 16 bytes, got " + live.byteSize());
+
+        // scope() must return the SAME session object every time it is asked.
+        // RED: `false` — `Arena.scope()` minted a fresh, always-open session on
+        // every call, because the predicate that recognises the one it is holding
+        // was answering false. A fresh session is alive forever, so this row and
+        // the closed-arena rows below are two faces of one defect.
+        check(confined.scope() == confined.scope(),
+                "arena.scope() is stable across calls");
+        check(live.scope() == confined.scope(),
+                "a segment's scope is its arena's scope");
+        check(confined.allocate(8L).scope() == confined.scope(),
+                "a second segment shares the same scope");
+
+        // --- the RED rows: a CLOSED confined arena ---
+        confined.close();
+        // RED: `true`. HotSpot: false.
+        check(!confined.scope().isAlive(),
+                "a closed arena's scope is NOT alive");
+        // RED: NO-THROW, returning a fresh 8-byte segment from a dead arena.
+        checkThrows(IllegalStateException.class,
+                () -> confined.allocate(8L), "allocate() on a closed arena");
+        // RED: NO-THROW. A second close is an IllegalStateException on HotSpot.
+        checkThrows(IllegalStateException.class,
+                () -> confined.close(), "close() on an already-closed arena");
+        System.out.println("CK RForeignLayoutJdkInterfaces confinedArena=closed");
+
+        // --- the same three on a SHARED arena, which is a different factory ---
+        Arena shared = Arena.ofShared();
+        check(shared.scope().isAlive(), "a live shared arena's scope is alive");
+        check(shared.allocate(16L).byteSize() == 16L, "a live shared arena allocates 16");
+        check(shared.scope() == shared.scope(), "shared arena.scope() is stable");
+        shared.close();
+        check(!shared.scope().isAlive(), "a closed shared arena's scope is NOT alive");
+        checkThrows(IllegalStateException.class,
+                () -> shared.allocate(8L), "allocate() on a closed shared arena");
+        checkThrows(IllegalStateException.class,
+                () -> shared.close(), "close() on an already-closed shared arena");
+        System.out.println("CK RForeignLayoutJdkInterfaces sharedArena=closed");
+
+        // --- the arenas that can NEVER close: the over-correction guard ---
+        // Nothing here changed and nothing here may change. A liveness gate that
+        // reads the wrong state encoding reports these as closed, which is the
+        // exact over-correction the repair had to avoid: the real JDK's own
+        // sessions encode OPEN as 0 and CLOSED as -1, the inverse of the model's.
+        check(Arena.global().scope().isAlive(), "the global arena is alive");
+        check(Arena.global().allocate(16L).byteSize() == 16L, "the global arena allocates");
+        check(Arena.ofAuto().scope().isAlive(), "an automatic arena is alive");
+        check(Arena.ofAuto().allocate(16L).byteSize() == 16L, "an automatic arena allocates");
+
+        // A HEAP segment's scope is a session that can never close, and it is the
+        // one scope-stability row that was ALREADY green before the repair — so it
+        // is the row that catches a change to the slot map rather than to the gate.
+        MemorySegment heap = MemorySegment.ofArray(new byte[16]);
+        check(heap.byteSize() == 16L, "a heap segment is 16 bytes");
+        check(heap.scope().isAlive(), "a heap segment's scope is alive");
+        check(heap.scope() == heap.scope(), "a heap segment's scope is stable");
+        System.out.println("CK RForeignLayoutJdkInterfaces neverCloses=ok");
+    }
+
     public static void main(String[] args) throws Exception {
         sqlConnection();
         sqlResultSet();
@@ -430,6 +609,7 @@ public class RForeignLayoutJdkInterfaces {
         processAndSession();
         managementBeans();
         xmlAndAttributes();
+        foreignArenaLifetime();
         System.out.println("CK RForeignLayoutJdkInterfaces checks=" + checks);
         System.out.println("PASS RForeignLayoutJdkInterfaces (" + checks + " checks)");
     }

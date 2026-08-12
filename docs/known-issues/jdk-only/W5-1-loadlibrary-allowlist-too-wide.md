@@ -1,5 +1,86 @@
 # W5-1 — the `System.loadLibrary` allowlist was too wide
 
+**Status (re-read 2026-08-12, second pass — source and committed baselines only;
+nothing here was built or run):**
+
+* **Item 2, the `Runtime` argument index: CLOSED, and now re-verified in the
+  tree rather than taken from the record below.** Both arms of the fork in
+  `native-builtins/src/lang_system.rs` call `runtime_load_args`: strict at
+  `:1522` (`loadLibrary0`) and `:1540` (`load0`), `Compatible` at `:1596` and
+  `:1615`. The helper is at `:1717` and reads `args.get(2)` for the name
+  (`:1722`) and `args.get(1)` for the `fromClass` mirror (`:1718`). No
+  `args.get(1)`-as-name read survives on either arm. There is nothing left to
+  apply for this item and no reason to re-open it.
+* **Item 1, the `BootLoader.loadLibrary` arming: STILL OPEN. Line cites
+  corrected — every one in the older text below had rotted.** The registration
+  is `native-builtins/src/lib.rs:14068-14073`, still
+  `|_ctx, _args| Ok(None)`; `record_boot_loader_library` is
+  `native-builtins/src/lang_system.rs:3244` and still has **zero** callers
+  (grepped tree-wide: the only other hits are its own doc comment and this
+  directory's records). Exact patch: §"The arming patch, as it must be applied".
+* **The ambient `NativeKind` at that registration is no longer an inference from
+  reading `set_category` windows — it is MEASURED, in a committed artefact.**
+  `scripts/baselines/jdk-only-kind-map-25-linux.tsv:9400`:
+
+  ```
+  jdk/internal/loader/BootLoader	loadLibrary	(Ljava/lang/String;)V	0	bridge	0	1
+  ```
+
+  One row, so registered exactly **once** (the unit of that file is one
+  registration, and a triple registered twice appears twice — `BootLoader
+  .setBootLoaderUnnamedModule0` does, at `:9401-9402`). Kind `bridge`;
+  `kind_stated` **0**, i.e. ambient, taken from the enclosing
+  `set_category(Bridge)` at `lib.rs:7159` in
+  `register_essential_natives_with_shims` (`:7103`), which the one temporary
+  `Intrinsic` window for regex restores at `:7686-7699`. It must stay `Bridge`:
+  `NativeKind::allowed_in` (`native-api/src/registry.rs:4624-4629`) drops
+  `SyntheticStub` and only `SyntheticStub` under `JdkOnly`, so a drift of this
+  registration into a `SyntheticStub` window deletes the no-op in strict mode,
+  runs real `NativeLibraries` bytecode in its place, and restores the JDK
+  native-library lock on the Linux boot-class `<clinit>` path that the
+  short-circuit exists to avoid.
+* **Do NOT "fix" the ambient kind by converting it to
+  `register_with_kind(.., NativeKind::Bridge)`.** It is behaviour-identical and
+  looks like free hardening, but it flips that row's `kind_stated` from 0 to 1,
+  which is a diff in a baseline whose own header says the unit is one
+  registration and whose README forbids hand-editing — it can only be re-frozen
+  by `regression-suite/bridge-ratchet.sh` **on Linux**. The durable guard is a
+  comment at the registration site, and that is written as an out-of-file patch
+  below.
+* **The measurement §2.6 asks for is WEAK ON WINDOWS, and a green Windows A/B
+  must not be read as a licence to arm.** The only in-tree statement of who
+  calls this native is `lib.rs:14062-14067`: *Linux* real-JDK boot classes such
+  as `java.net.NetworkInterface` reach `BootLoader.loadLibrary("net")` during
+  `<clinit>`, which is the road the short-circuit was added for. On Windows the
+  plausible caller is `Inflater.<clinit>` → `ZipUtils.loadLibrary()` →
+  `BootLoader.loadLibrary("zip")`, and a boot claim on `zip` changes nothing
+  observable — `zip` already throws (`DYNAMIC_ALREADY_LOADED`,
+  `lang_system.rs:2046`, screened out of `jdk_image_ships_library` at `:2078`).
+  So the expected Windows outcome is *no difference*, which is the "correct but
+  inert" answer W6-6 already had to disambiguate on its own road, not evidence
+  that arming is safe. **Take the A/B on Linux, or state that it did not
+  measure the road at risk.**
+* **A second thing the A/B must decide, which nothing had written down.** The
+  arming faithfully models the JDK rule, but its INPUT is CratonVM's own boot
+  sequence, not HotSpot's. HotSpot answers `loadedLibrary=net` for `RJdkJni`
+  precisely because nothing in `java.base` boot-loaded `net` before that line.
+  If CratonVM's boot does claim `net`, arming does not remove a divergence — it
+  manufactures one, and the defect to chase is then the boot sequence, not the
+  bookkeeping. That is why the run is `with and without the arming` **on both
+  arms with the HotSpot oracle beside them**, not just "does the suite stay
+  green".
+* **The vector now fails hard instead of merely diverging.**
+  `regression-suite/src/RJdkJni.java`, `libraryLoading()`, gained one check
+  (40 → **41**): `loaded` must be `"net"`, not merely `"zip" or "net"`. The old
+  line accepted `zip`, which is exactly the answer this record's headline
+  defect produced, so the headline was carried entirely by `run.sh`'s cross-VM
+  `CK` diff — and that diff is **skipped for every class when no HotSpot is on
+  the host**, which `run.sh` prints as a NOTE. It is also the trip-wire for the
+  arming: a boot claim on `net` turns `loaded` into `"none"` and the fixture
+  raises `AssertionError` instead of quietly printing a different `CK` line.
+* **Item 3, the key is the spelling not the file: STILL OPEN, and the
+  prescription below is INCOMPLETE.** See §"Item 3 re-costed" at the end.
+
 **Status (re-reconciled 2026-08-12 — W7-79-loadlibrary-compatible-arm.md, on a
 running binary):**
 
@@ -326,7 +407,12 @@ boot-loads `net`, then the application asks for it — still reports success.
 `lang_system::record_boot_loader_library` is written and **deliberately
 unarmed**; its doc comment says so. Out-of-file patch, the closure body of that
 registration (`BootLoader.loadLibrary(String)` is static, so `args[0]` is the
-name):
+name).
+
+**The sketch below is SUPERSEDED by §"The arming patch, as it must be applied"
+at the end of this file** — same body, but with the ambient-`NativeKind` guard
+comment the patch has to land with, and against line numbers that have not
+rotted:
 
 ```rust
     registry.register(
@@ -478,4 +564,133 @@ a single load from a single loader with an empty table under it.
 HotSpot, and reaches `PASS RJdkJni (40 checks)` on the strict arm after the
 vector extension in W7-79-loadlibrary-compatible-arm.md. Unmoved, as predicted.
 The scoping itself was verified separately, with two loaders — see the top of
-this file.
+this file. **41 checks since 2026-08-12's second pass** — the `loaded` value is
+now asserted, not merely the `CK` line; see the top of this file.
+
+## The arming patch, as it must be applied
+
+Two independent out-of-file patches, both in `native-builtins/src/lib.rs`, which
+is not this lane's file. **A is landable now and changes no behaviour; B is the
+arming and must not land before the measurement.** A does not depend on B.
+
+### Patch A — the ambient-kind guard, at the registration site
+
+The constraint has lived only in records (W6-6's 2026-08-12 amendment, and the
+top of this file). Anyone retagging the `set_category` window that spans
+`lib.rs:14068` reads `lib.rs`, not this directory. Insert immediately **above**
+`registry.register(` at `lib.rs:14068`, after the existing `KEEP (the
+BootLoader.loadLibrary no-op)` comment block that ends at `:14067`:
+
+```rust
+    // AMBIENT `NativeKind`, AND IT MUST STAY `Bridge`. This is a bare
+    // `register`, so the kind comes from the enclosing `set_category(Bridge)`
+    // at the top of this function, restored after the regex `Intrinsic` window.
+    // `NativeKind::allowed_in` drops `SyntheticStub` and ONLY `SyntheticStub`
+    // under `JdkOnly`: if this registration ever drifts inside a
+    // `SyntheticStub` window it is DROPPED in strict mode, real
+    // `NativeLibraries` bytecode runs in its place, and the JDK native-library
+    // lock this short-circuit exists to avoid is back on the Linux boot-class
+    // `<clinit>` path. Re-check the enclosing category, not just this call.
+    // Measured, one row: `scripts/baselines/jdk-only-kind-map-25-linux.tsv`
+    // has `... loadLibrary (Ljava/lang/String;)V 0 bridge 0 1` — `bridge`,
+    // `kind_stated=0`. Do NOT "harden" this by switching to
+    // `register_with_kind(.., Bridge)`: identical behaviour, but it flips that
+    // row's `kind_stated` 0 -> 1, and that baseline can only be re-frozen by
+    // `regression-suite/bridge-ratchet.sh` on Linux.
+```
+
+### Patch B — the arming itself
+
+Replace `lib.rs:14068-14073` in full:
+
+```rust
+    registry.register(
+        "jdk/internal/loader/BootLoader",
+        "loadLibrary",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            // The LOAD stays a no-op — that is what avoids the JDK's
+            // native-library lock. Only the bookkeeping is added:
+            // `BootLoader.loadLibrary(String)` is static, so `args[0]` is the
+            // name, and `record_boot_loader_library` claims it for loader id 0.
+            if let Some(Value::Object(Some(name_obj))) = args.first() {
+                let name = ctx.read_string(*name_obj).unwrap_or_default();
+                crate::lang_system::record_boot_loader_library(ctx, &name);
+            }
+            Ok(None)
+        },
+    );
+```
+
+Nothing else moves: `record_boot_loader_library` is already `pub`
+(`lang_system.rs:3244`), already ignores an empty name, and is already inert
+under `Compatible` because `loaded_by` early-returns on `LoaderScoping::Off`
+(`lang_system.rs:1918`) — so the whole blast radius is the strict arm. Delete
+the "THIS HAS NO CALLER IN THE TREE" paragraph from that function's doc comment
+in the same change, or the next reader is entitled to believe it.
+
+### The measurement, and what a bad outcome looks like
+
+```
+cratonvm --java-home "<jdk-25>" --jdk-only -cp regression-suite/build RJdkJni
+cratonvm --java-home "<jdk-25>" --real-jdk -cp regression-suite/build RJdkJni
+java -cp regression-suite/build RJdkJni          # HotSpot 25 oracle
+```
+
+taken **with and without patch B**, on **Linux**, diffing the
+`CK RJdkJni loadedLibrary=` line and the `PASS RJdkJni (41 checks)` line.
+`--java-home` is not optional; a hand-run without it has already inverted a
+per-mode verdict in this campaign.
+
+* **Bad outcome, and the one to expect if the road is live:**
+  `AssertionError: System.loadLibrary must FAIL for zip once java.util.zip has
+  boot-loaded it and fall through to net, got: none`, i.e. CratonVM's own boot
+  claimed `net` for the boot loader where HotSpot's did not. Do not land B, and
+  do not "fix" it by re-adding `net` somewhere — the finding is then a boot
+  sequence that touches `java.net` when HotSpot's does not, which is a
+  different record.
+* **Inert outcome:** byte-identical `CK` lines and 41 checks with and without B,
+  on Linux. That licenses B only in the sense that it costs nothing; it does not
+  demonstrate the residual is closed, because the claim is that a boot load is
+  now *recorded*, and no Java-visible surface reports the table. Say so rather
+  than writing "verified".
+* **On Windows either outcome is uninformative** — see the top of this file.
+
+## Item 3 re-costed: the prescription is incomplete, and cheaper than it looks
+
+*"Closing this means returning the resolved path from `load_native_library`,
+which is a `native-api` change"* is right about the direction and wrong twice
+about the size.
+
+* **It is not one signature.** `load_native_library` is a required
+  `NativeContext` trait method (`native-api/src/registry.rs:4320`, returning
+  `Result<i64, MethodCallFailed>`) with **nine** implementations: the real one
+  at `vm/src/vm/vm_exec.rs:15758` and eight mocks/test doubles
+  (`native-io/src/test_support.rs:983`,
+  `native-collections/tests/common/mod.rs:1089`,
+  `native-collections/src/lib.rs:60473`,
+  `native-builtins/src/test_utils.rs:2752`, `native-builtins/src/cds.rs:1932`,
+  `native-builtins/src/atomic_updater.rs:1792`,
+  `native-api/tests/atomic_fetch_add_err_path.rs:481`,
+  `native-api/src/test_mock.rs:827`). Widening the return type churns all nine.
+  An **additive** accessor with a default body — "resolve this spelling to the
+  file it names, or `None`" — is two sites: the trait, and `vm_exec.rs`, where
+  `resolve_library_path` (`:15761`) already computes exactly that value and
+  currently throws it away.
+* **And returning the path from the successful open would still not close it.**
+  `load_library_or_throw` (`lang_system.rs:2123`) has three success arms, and
+  the open succeeds on only one of them (`:2134`). The other two —
+  `is_vm_provided_jdk_library` (`:2141`) and `jdk_image_ships_library` (`:2149`)
+  — report success with **nothing opened**, and those are precisely the
+  libraries whose spelling HotSpot canonicalises to `<java.home>/bin/zip.dll`.
+  For those two arms the path needs no `native-api` change at all:
+  `jdk_image_ships_library` (`:2077-2092`) already builds
+  `<java.home>/{bin|lib}/platform_lib_name(name)` and tests it with `is_file()`.
+
+  So the shape is: canonicalise the key in `lang_system.rs` for the two
+  no-open arms, and use one additive resolver for the real-open arm.
+* **It stays a DECISION, not a prescription.** Changing the key changes which
+  loads collide under `LoaderScoping::On`, so it is a strict-mode behaviour
+  change with no vector demanding it — `RJdkJni` is single-loader by
+  construction and cannot assert it, for the same reason the cross-loader table
+  is not in it.

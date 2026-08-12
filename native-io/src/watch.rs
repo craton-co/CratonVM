@@ -427,15 +427,69 @@ fn try_pop_signalled(state: &mut WatcherState) -> i32 {
     0
 }
 
-/// Block up to `timeout_ns` for an event. `i64::MIN` means "indefinite";
-/// `0` means non-blocking (selectNow-style). Returns 0 on timeout/closed.
-pub fn poll_with_timeout(ws_id: i32, timeout_ns: i64) -> Result<i32, MethodCallFailed> {
-    let select_now = timeout_ns == 0;
-    let blocking_indefinite = timeout_ns == i64::MIN || timeout_ns < 0;
-    let deadline = if select_now || blocking_indefinite {
-        None
+/// How `poll_with_timeout` should interpret a `timeout_ns` argument.
+///
+/// Split out of the loop below as a pure function so the classification can be
+/// asserted without a wall clock: the difference between the two negative
+/// answers is "returns at once" versus "never returns", and a test that told
+/// them apart by waiting would either hang on the wrong one or be a fixed
+/// wall-clock bound, which this tree forbids for the reasons in
+/// `docs/known-issues/jdk-only/README.md` §3.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum WatchWait {
+    /// Do not wait at all — one probe, then answer.
+    Now,
+    /// Wait until an event arrives or the service closes.
+    Forever,
+    /// Wait at most this many nanoseconds.
+    Until(u64),
+}
+
+/// Classify a `poll0(long)` timeout.
+///
+/// `i64::MIN` is this file's own sentinel for `take()`, written by
+/// [`take_blocking`], and is the ONLY value that means "block indefinitely".
+///
+/// # Why every other negative is [`WatchWait::Now`]
+///
+/// The condition here used to read `timeout_ns == i64::MIN || timeout_ns < 0`,
+/// so **every** negative blocked forever. That is the wrong direction on a
+/// timeout, and the JDK settles it rather than leaving it open:
+/// `java.nio.file.WatchService.poll(long, TimeUnit)` names no exception for a
+/// negative timeout, and `sun.nio.fs.AbstractWatchService.poll` hands the value
+/// to `LinkedBlockingDeque.poll(timeout, unit)`, whose loop is
+/// `if (nanos <= 0L) return null;` — a negative wait is a wait that has already
+/// expired, and it answers `null` immediately. So the two readings are not both
+/// defensible: "do not wait" is the JDK's, and "wait forever" converts a caller's
+/// miscomputed deadline (`deadline - now` gone negative, the usual way a negative
+/// timeout is produced at all) into a hang. `watch_timeout_millis` in
+/// `native-io/src/lib.rs` — the other WatchService surface in this crate —
+/// already reads `if timeout <= 0 { return 0; }`, so the two surfaces disagreed.
+///
+/// W7-8-fabricated-success-io-sweep.md recorded this family's `.max(0)` as
+/// UNMEASURED with "no sentence either way". There is a sentence; it is in
+/// `LinkedBlockingDeque`, not in the `WatchService` javadoc.
+#[must_use]
+pub fn watch_wait_for(timeout_ns: i64) -> WatchWait {
+    if timeout_ns == i64::MIN {
+        WatchWait::Forever
+    } else if timeout_ns <= 0 {
+        WatchWait::Now
     } else {
-        Some(Instant::now() + Duration::from_nanos(timeout_ns as u64))
+        WatchWait::Until(timeout_ns as u64)
+    }
+}
+
+/// Block up to `timeout_ns` for an event. `i64::MIN` means "indefinite";
+/// zero or negative means non-blocking (selectNow-style), for the reason
+/// [`watch_wait_for`] sets out. Returns 0 on timeout/closed.
+pub fn poll_with_timeout(ws_id: i32, timeout_ns: i64) -> Result<i32, MethodCallFailed> {
+    let wait = watch_wait_for(timeout_ns);
+    let select_now = wait == WatchWait::Now;
+    let deadline = if let WatchWait::Until(ns) = wait {
+        Some(Instant::now() + Duration::from_nanos(ns))
+    } else {
+        None
     };
     loop {
         // First, fast-path: drain + try to pop without sleeping.
@@ -924,6 +978,45 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(100), "elapsed {elapsed:?}");
         assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
         close_watch_service(id);
+    }
+
+    /// A NEGATIVE timeout is "already expired", not "wait forever".
+    ///
+    /// RED against the tree as it stood before `watch_wait_for` existed: the
+    /// condition there was `timeout_ns == i64::MIN || timeout_ns < 0`, so every
+    /// negative classified as indefinite. The oracle is
+    /// `sun.nio.fs.AbstractWatchService.poll(long, TimeUnit)` handing the value
+    /// to `LinkedBlockingDeque.poll`, whose loop opens `if (nanos <= 0L) return
+    /// null;`.
+    ///
+    /// Asserted on the classifier rather than by timing `poll_with_timeout`,
+    /// deliberately: the pre-fix behaviour of the negative case is *never
+    /// returns*, so a test that told the two apart by waiting would hang on a
+    /// red tree instead of failing it, and any bound that avoided the hang would
+    /// be a fixed wall-clock bound.
+    #[test]
+    fn wp3_8_a_negative_watch_timeout_does_not_wait() {
+        assert_eq!(watch_wait_for(-1), WatchWait::Now, "poll(-1) must not wait");
+        assert_eq!(watch_wait_for(-1_000_000_000), WatchWait::Now);
+        assert_eq!(watch_wait_for(i64::MIN + 1), WatchWait::Now);
+        // The one sentinel that does mean "block", written by `take_blocking`.
+        assert_eq!(watch_wait_for(i64::MIN), WatchWait::Forever);
+        // Unchanged either side of the fix.
+        assert_eq!(watch_wait_for(0), WatchWait::Now);
+        assert_eq!(watch_wait_for(1), WatchWait::Until(1));
+    }
+
+    /// `take()` must still block. The guard against fixing the row above
+    /// backwards by collapsing `i64::MIN` into the other negatives — which would
+    /// turn every `WatchService.take()` in the process into a busy `poll()`
+    /// returning `null`, and no assertion in this file would have said so.
+    #[test]
+    fn wp3_8_take_still_blocks_after_the_negative_timeout_fix() {
+        assert_eq!(
+            watch_wait_for(i64::MIN),
+            WatchWait::Forever,
+            "take_blocking's sentinel must remain the indefinite one"
+        );
     }
 
     #[test]

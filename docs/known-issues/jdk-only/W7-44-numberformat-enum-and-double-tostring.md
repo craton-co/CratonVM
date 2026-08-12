@@ -82,7 +82,16 @@ differ only in symbol **placement**: `#,##0.00 ¤` (333 locales — de, fr, es, 
 and `¤ #,##0.00` (215). Every one of those 797 now gets the correct *negative* rendering,
 which is the defect this row named.
 
-### What was deliberately not done
+### What was deliberately not done — and was DONE four records later
+
+> **STALE 2026-08-12.** Everything in this subsection describes the tree before
+> `W7-80-locale-data-stage-two.md`, which took exactly the staged step it asks
+> for: `getNumberPatterns`, `getDecimalFormatSymbolsData`, `DecimalFormatSymbols
+> .initialize` and the currency tables all read the JDK image's own CLDR data
+> per locale now, **together**, in one commit, for the reason this subsection
+> gives. The hardcoded arrays survive only as the fallback for an image with no
+> `jdk.localedata`. The argument below is why it was correct to decline the
+> half-step; it is no longer a description of `locale_resources.rs`.
 
 Making the pattern locale-aware. `getDecimalFormatSymbolsData` in the same file is
 **also** hardcoded en (`.` decimal separator, `,` grouping) for every locale. Making the
@@ -285,6 +294,27 @@ Wired into:
 * Both polar sites in `native-builtins/src/securerandom.rs` — the SHA1PRNG one is seeded and
   therefore observable; the OS-CSPRNG one is not, and is changed anyway so the three sites
   cannot drift.
+
+> **CORRECTION 2026-08-12 — this list named the registrar that LOSES, and the
+> row did not move.** `java/util/Random.nextGaussian` is registered twice, and
+> registration is last-write-wins: `native-collections`' `register_random_natives`
+> — the bullet above — is overwritten by `native-builtins/src/securerandom.rs`'s
+> `register`, which `vm/src/vm/vm_init.rs` calls afterwards inside a block
+> labelled *"LAST-WRITE-WINS BOUNDARY — do not reorder"*, deliberately, because
+> the collections body reads the LCG seed from a synthetic two-field layout and
+> answers zero on a real-JDK `Random`. So the fdlibm `log` landed in a body the
+> VM does not run, and the body it does run was still on `f64::ln`. There was
+> also a **third** copy in `native-builtins/src/lib.rs`, unregistered but
+> compiled and tested, that this record never mentions. Nothing caught it
+> because the bit-exact seeded-stream test lives in `native-collections` and
+> calls that crate's helper directly, never the registry — a test on the wrong
+> side of a last-write-wins boundary is not weak evidence, it is *no* evidence.
+> Found and fixed by `W7-54-strictmath-fdlibm-family.md` §7; verified in the
+> tree 2026-08-12, all three `securerandom.rs` polar sites now read
+> `cratonvm_types::fdlibm::log`. **Read §7 of W7-54, not this list, for where
+> the fix is.** The rest of §3 — the ULP determination, the 7.3% census, the
+> port and its 90 vectors, the tolerance that hid it — was re-checked and
+> stands.
 
 Verified bit-exact against **90 golden vectors** captured from HotSpot with
 `probes/StrictMathLogVectorProbe.java`: the `s` this defect turns on, the exact powers of

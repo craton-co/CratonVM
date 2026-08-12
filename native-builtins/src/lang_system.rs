@@ -124,6 +124,19 @@ fn invoke_pre_exit_hook(code: i32) {
 /// soft-returned exit does not consume the census the launcher would print
 /// later.
 ///
+/// `pub(crate)` since 2026-08-12, and the reason is the third exit door.
+/// `std::process::exit` has **seven** call sites in this crate, not three: four
+/// triples on `org/apache/maven/surefire/booter/ForkedBooter` are registered
+/// from `register_essential_natives_with_shims` — LIVE in **both** modes — onto
+/// three bodies in `test_frameworks.rs` that each terminate on their own and
+/// never reach `native_system_exit`. Registration is the gate, so real
+/// `ForkedBooter` bytecode never runs: on a Surefire fork the launcher's
+/// post-`main` line is skipped **and** these three natives are skipped, and the
+/// sweep printed nothing at all on precisely the corpus this trigger was
+/// written for. Those three bodies call this helper rather than open-coding a
+/// fourth gate — one gated block with no `else`, one place to read. See
+/// W7-90-slot-map-sweep-caller.md §2.2.1.
+///
 /// Gated with **no `else`** and observation-only: the report is printed by the
 /// sweep and dropped here. With the flag off it is one `OnceLock` load and a
 /// branch, on a path that runs once per process.
@@ -134,7 +147,7 @@ fn invoke_pre_exit_hook(code: i32) {
 /// The fix is not a second emitter — two detectors on one primitive drift and
 /// then disagree — it is to prefer the launcher's post-`main` trigger when a
 /// workload can be made to return.
-fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
+pub(crate) fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
     if cratonvm_native_api::layout_alias::enabled() {
         let _ = cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(ctx, trigger);
     }
@@ -910,6 +923,85 @@ pub(crate) fn native_thread_get_state(
     Ok(Some(Value::Object(None)))
 }
 
+/// The canonical constant that `class_name`'s own static field `name` holds,
+/// or `None` when the loaded class does not declare it / has not published it.
+///
+/// A native that answers an enum constant must hand back **the object the
+/// class's own `<clinit>` stored**, never a fresh allocation. Enum identity is
+/// the whole contract: `==` comparison, the `tableswitch` an enum `switch`
+/// compiles to, `EnumSet`/`EnumMap`'s ordinal indexing and `Enum.compareTo` all
+/// assume exactly one instance per constant. A minting native satisfies every
+/// null-check and every `name()`/`ordinal()` check while breaking all of them —
+/// see W7-93 §"Second cause".
+///
+/// `None` is the honest answer for a fabricated synthetic-JDK stand-in, which
+/// has no static field to read; callers fall back to their own construction
+/// there. `ensure_class_initialized` can itself fabricate rather than fail (it
+/// returns `Ok` for a class it invented), so the static-field lookup — not the
+/// `Result` — is what decides whether a real class answered.
+pub(crate) fn canonical_enum_constant(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    name: &str,
+) -> Option<Value> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let idx = ctx.static_field_index_by_name(cid, name)?;
+    match ctx.get_static_field(cid, idx) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// A fresh array holding `class_name`'s canonical enum constants in ordinal
+/// order — what the real `values()` bytecode (`$VALUES.clone()`) returns.
+///
+/// **Ask the class, never a hard-coded list.** A javac-generated enum declares
+/// one static field of its OWN type per constant in source order, which is
+/// ordinal order; the synthetic `$VALUES` has the ARRAY descriptor and so
+/// filters itself out. That is the same derivation
+/// `stack_walker::option_constant_names` uses, and it is what keeps this
+/// version-proof when a JDK adds a constant.
+///
+/// Returns `None` — so the caller keeps its existing behaviour — unless the
+/// class declares at least one constant AND every one of them reads back
+/// non-null, because a partially initialised class must not be turned into an
+/// array with null holes (`ImmutableCollections$Set12.<init>` NPEs on one).
+///
+/// GC-SAFETY: `new_ref_array` is the only allocation, and it happens before the
+/// array reference is live; `get_static_field` and `set_array_element` do not
+/// allocate, so nothing can move underneath the fill loop. Each element is read
+/// out of its static — a GC root — rather than cached from the scan above.
+pub(crate) fn canonical_enum_values(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let self_descriptor = format!("L{class_name};");
+    let names: Vec<String> = ctx
+        .declared_fields(cid)
+        .into_iter()
+        .filter(|f| f.is_static && f.descriptor == self_descriptor)
+        .map(|f| f.name)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(names.len());
+    for name in &names {
+        let idx = ctx.static_field_index_by_name(cid, name)?;
+        if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
+            return None;
+        }
+        slots.push(idx);
+    }
+    let arr = ctx.new_ref_array(cid, slots.len());
+    for (i, idx) in slots.into_iter().enumerate() {
+        let published = ctx.get_static_field(cid, idx);
+        ctx.set_array_element(arr, i, published);
+    }
+    Some(arr)
+}
+
 pub(crate) fn native_thread_is_alive(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -930,6 +1022,40 @@ pub(crate) fn native_thread_start0(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // JVMS / `java.lang.Thread`: `start()` on a thread that has already been
+    // started must throw `IllegalThreadStateException`. We did not, and the
+    // consequence was worse than a missing exception — MEASURED 2026-08-12, a
+    // second `start()` RE-RAN the body and spawned a second OS thread for a
+    // retired `Runnable`.
+    //
+    // The real `Thread.start()` branches on `holder.threadStatus`, and that
+    // field is INERT on this VM: measured NEW=0 / terminated=0 here against
+    // HotSpot's NEW=0 / terminated=2. A guard reading it would never fire.
+    // `native_thread_get_state` says the same in its own doc comment and
+    // computes from the registry instead, which retains dead entries
+    // (`mark_dead` only flips `alive`), so present-but-not-alive is
+    // TERMINATED and missing is NEW.
+    //
+    // Two readers because only one lookup route is aliasing-proof: a real-JDK
+    // mirror resolves through the process-unique `Thread.tid` index, while a
+    // fabricated mirror has no `tid` field and would fall back to an unguarded
+    // pointer walk, so it reads the on-mirror marker `vm_exec::thread_start`
+    // writes instead. This native is the convergence point of all four
+    // registrations and of the container route, including the `--jdk-only`
+    // case where the real `start()` bytecode runs; a refusal here does not
+    // leak a container registration, because that bytecode's `finally` calls
+    // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
+    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
+        ctx.thread_run_state(this) != 0
+    } else {
+        ctx.object_num_fields(this) > 2 && matches!(ctx.get_field(this, 2), Value::Long(_))
+    };
+    if already_started {
+        return Err(RuntimeError::IllegalThreadStateException {
+            message: "Thread.start: this thread has already been started".to_string(),
+        }
+        .into());
+    }
     // Round-7 CRIT fix #3: snapshot the parent's `InheritableThreadLocal`
     // entries and queue them against the child's Java Thread identity
     // hash. The child's first `ThreadLocal.get/set/remove` will drain

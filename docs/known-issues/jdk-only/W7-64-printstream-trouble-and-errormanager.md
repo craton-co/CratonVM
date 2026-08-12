@@ -9,6 +9,19 @@ as read-from-source was read from source. The two are kept apart on purpose.
 Closes the two residuals W7-57-close-flush-swallow-sweep.md named by name:
 `trouble` / `checkError()`, and `ErrorManager`.
 
+> **ADJUDICATED 2026-08-12 — this record OVERSTATED what is open, and it did not
+> say which of its rows a shipping binary contains.** Two of the five items
+> under **What is left** are CLOSED IN SOURCE and are struck there; the
+> remainder is restated. Separately, a new **Which arm compiles this** section
+> below establishes what no earlier pass in this record did: three of its five
+> findings are behind `#[cfg(feature = "synthetic-jdk")]`, and that feature is
+> **not** in the default feature set (`vm/Cargo.toml`: "intentionally NOT in
+> the default feature set"), so **the default `cratonvm-cli` binary — the only
+> build that serves `--real-jdk` and `--jdk-only` — never compiled them.** A
+> green run of either shipping mode is therefore evidence about two rows out of
+> five, not about this record. Everything verified by reading the tree; nothing
+> here was built or run either.
+
 ## The species
 
 `java.io.PrintStream` and `java.io.PrintWriter` never throw from
@@ -378,9 +391,58 @@ a field write and an `ErrorManager` call on paths that were already absorbing.
 * `checkError`/`setError`/`clearError` in Compatible mode (untouched).
 * Every `delegated_close` decision from W7-57 (untouched).
 
+## Which arm COMPILES this (added 2026-08-12)
+
+The "Run it in BOTH modes" table above says which *mode* each finding lives in.
+It does not say which *build* contains the code, and for three of the five that
+is the load-bearing fact. Read from the tree:
+
+* `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`
+  (`native-builtins/src/lib.rs:21525`–`:21526`), and so is its only caller
+  `register_builtins` (`:21514`–`:21515`). `synthetic-jdk` is **not** a default
+  feature (`vm/Cargo.toml`, and `vm-cli`'s is a pass-through). So everything
+  reachable only from that registrar is **absent from the default binary's
+  object code**, not merely unreached at run time.
+
+| finding | registrar | in the DEFAULT build? |
+|---|---|---|
+| `trouble` not set on flush / the shared write funnel (sites 4–11 that are Compatible-reachable) | `register_printstream_fallback_natives`, called from `register_essential_natives_with_shims` (`lib.rs:7103` → `:17300`) | **yes** — live in `--real-jdk` and `--jdk-only` |
+| `Handler.errorManager` left null by the native `<init>` | `reflect_annotations::register_annotation_overrides` ← `register_essential_natives` | **yes** |
+| `checkError` / `setError` / `clearError` | `lib.rs:22979`–`:22981`, inside `register_synthetic_overrides` | **no — not compiled** |
+| `StreamHandler` `flush`/`close`/`publish` → `ErrorManager`, and the `Handler.reportError` / `get`/`setErrorManager` / `ErrorManager.error` surface | `register_p61_handler_error_manager` (`phases_late.rs:3276`) ← `register_p61_logging` (`:2858`) ← `register_phase61_natives` (`:2836`) ← `lib.rs:24027`, inside `register_synthetic_overrides` | **no — not compiled** |
+| `PrintWriter.flush` / `close` recording | `register_synthetic_overrides` alone | **no — not compiled** |
+
+The synthetic `trouble` slot is the one row that does not split this way:
+`synthetic_stub_fields` (`classloading/src/class_manager.rs:11615`) carries no
+`cfg`, so it compiles into the default build — but it only shapes *fabricated*
+classes, which that build never mints for `java/io/PrintStream`, so it is inert
+there rather than absent. **Its quoted arm above is now STALE**: W7-70 split
+the shared `"java/io/PrintStream" | "java/io/PrintWriter"` arm in two and gave
+`PrintStream` a second named field, `closing` (`:12266`–`:12277`).
+`PrintWriter` still gets only `trouble`, deliberately — it has no `closing` in
+the real image and uses `out == null` as its closed marker, which is the same
+fact the last open item below rests on.
+
+**Consequence for the run list.** Two of the five findings can be exercised by
+the shipping binary; the other three need a `--features synthetic-jdk` build run
+in `--synthetic-jdk` **mode**, which is the configuration README §2.6 records as
+never having been run at all. Feature is not mode, and here it is also not
+*presence*.
+
 ## What is left
 
-* **`native_printstream_close` is a no-op, for every `PrintStream`.** Not just
+* ~~**`native_printstream_close` is a no-op, for every `PrintStream`.**~~
+  **CLOSED IN SOURCE 2026-08-12 by W7-70-printstream-close-noop.md**, and
+  re-verified from the tree rather than from that record: `native_printstream_close`
+  (`native-builtins/src/logging_shims.rs:1245`) now performs the receiver test
+  its old comment was a reason for — a `closing` latch read through
+  `print_error_state::is_closing`, then the sink resolved **by the JDK's own
+  field name** `out`, with the no-op kept only for the console case where `out`
+  is not an object. The paragraph below is kept as written and struck by this
+  note; the reason it gave for there being no
+  `printStreamCheckErrorAfterAbsorbedClose` row in the probe no longer holds
+  either.
+  *Original text, struck:* ~~Not just
   the console ones — the triple is registered unconditionally in both
   registrars, so `new PrintStream(fileOutputStream).close()` does not close
   the file and does not run HotSpot's `textOut.close(); out.close();`. Its
@@ -390,20 +452,34 @@ a field write and an `ErrorManager` call on paths that were already absorbing.
   `System.out`/`System.err` really must survive a `close()`), so it is
   recorded rather than half-fixed. It is also why there is no
   `printStreamCheckErrorAfterAbsorbedClose` row in the probe: the call this
-  VM makes there is not the call HotSpot makes.
+  VM makes there is not the call HotSpot makes.~~
 * **An `Error` on the write paths is still absorbed** where HotSpot lets it
   out. `route_write_through_out` returns `bool` into `stream_write` /
   `stream_writeln`, which return `()` across ten call sites; propagating is a
   signature change, not a one-line fix. `record_write_failure`'s doc comment
   carries the same statement at the code. Unchanged from W7-57, which recorded
-  it first.
-* **`route_write_through_out` still reports a FAILED write as "not routed"**,
+  it first. **STILL OPEN, verified 2026-08-12, and its SHAPE changed**: the
+  helper still returns `bool` (`native-builtins/src/lib.rs:26525`) and
+  `stream_write` still returns `()`, so nothing propagates — but the text no
+  longer vanishes. W7-81 made an `Error` the `Refused` outcome, which is
+  reported as NOT routed, so the caller's fd fast path prints it. Wrong stream,
+  not lost data.
+* ~~**`route_write_through_out` still reports a FAILED write as "not routed"**,
   which sends the caller to the fd fast path and prints the text to the
   console. HotSpot writes nowhere in that case. Left alone because the console
   fallback is what keeps output flowing when `out` is a `Writer` shape the
   helper cannot address (the picocli / JUnit-console `NoSuchMethodError`
   case), and separating those two reasons needs a measurement this lane did
-  not take.
+  not take.~~
+  **CLOSED IN SOURCE 2026-08-12 by W7-81-write-route-three-way.md**, and
+  re-verified from the tree: `print_error_state::DelegatedWrite`
+  (`native-api/src/print_error_state.rs:221`) splits `Delivered` / `Absorbed` /
+  `Refused`, and **both** branches of `route_write_through_out` now end in
+  `classify_write_failure(ctx, this, written).routed()` — the char branch
+  through `write_string_to_writer`, the byte branch inline. An absorbed
+  `IOException` is ROUTED, so the console echo HotSpot never makes is gone;
+  only a `Refused` call falls back. This item is exactly the "separating those
+  two reasons needs a measurement this lane did not take" that W7-81 took.
 * **`ErrorManager`'s six `public static final int` codes do not resolve under
   `--synthetic-jdk`.** A synthetic class has no static field table to put them
   in. The codes this VM *passes* are correct; the probe compares literals for
@@ -418,7 +494,14 @@ a field write and an `ErrorManager` call on paths that were already absorbing.
   HotSpot answers `false`. The probe's clean-close row uses a `StringWriter`,
   whose `flush()` after `close()` is a no-op, so it is stable in both arms and
   does not paper over this. Closing it needs a closed-marker that is not
-  `out == null`.
+  `out == null`. **STILL OPEN, verified 2026-08-12, and the marker now exists
+  on the other class only**: W7-70 added a named `closing` field to the
+  synthetic `java/io/PrintStream` model and split the arm it used to share with
+  `java/io/PrintWriter` (`classloading/src/class_manager.rs:12266`–`:12277`),
+  deliberately leaving `PrintWriter` with `trouble` alone because the real
+  image declares no `closing` on it. So the closed-marker this item asks for is
+  a `PrintWriter`-shaped decision that W7-70 declined to make, not an absent
+  mechanism.
 * **`InterruptedIOException` is handled in `print_error_state`
   (`absorb_write_exception_recording` / `record_write_failure`) but not
   asserted in the probe.** Producing one from a `Runnable`-shaped check needs
@@ -428,4 +511,12 @@ a field write and an `ErrorManager` call on paths that were already absorbing.
 * Nothing in this record has run on a VM. The next lane with a build should
   run `probes/CloseFlushSwallowProbe.java` under `--real-jdk` **and**
   `--synthetic-jdk` and expect `RESULT ok` in both, then run the suites named
-  under Blast radius.
+  under Blast radius. **Two corrections to that instruction, 2026-08-12.**
+  (1) `--synthetic-jdk` is not a mode the default binary has; it needs a
+  `cargo build --release -p cratonvm-cli --features synthetic-jdk` binary, and
+  per the table above that binary is the *only* one containing three of the
+  five findings. (2) `probes/` is never run by `regression-suite/run.sh` at any
+  `SUITE=` value — grepped, `run.sh` names no path under `probes/` — so **no
+  suite run, however green, discharges this record.** The probe has to be run
+  by hand, in both arms, and the two Compatible-reachable rows are the only
+  ones a `--real-jdk` transcript can speak to.

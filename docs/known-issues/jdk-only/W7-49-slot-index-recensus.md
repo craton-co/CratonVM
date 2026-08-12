@@ -54,6 +54,38 @@ that `NativeContext` does not have.
 through a constant, a variable or an expression and cannot be read from source.
 W4-4 put this at ~350; the two agree.
 
+> **(c) IS CLOSED, 2026-08-12 — do not quote it as an open hole.** This
+> record's sharpest finding was acted on: the detector was moved out of
+> `native-builtins/src/util_concurrent_ext.rs` into
+> `native-api/src/layout_alias.rs` and given a second observation point on
+> `NativeContextImpl::alloc_object` (`vm/src/vm/vm_exec.rs:12058`), the terminal
+> every native object allocation in every native crate reaches. The funnel's own
+> call is **kept** and is load-bearing for the `under` direction — the funnel
+> clamps `n = requested.max(real)` before it allocates, so by the time an
+> under-request reaches the base allocator it has become `n == real` and there is
+> nothing left to see. One implementation, two callers; the funnel's copy was
+> deleted rather than left beside it. `native-api/tests/layout_alias_coverage.rs`
+> is the gate that every production direct-allocation site now reaches it.
+>
+> Two consequences for this record. **§2(c)'s "511 direct call sites" is a
+> historical figure**, not a current one — the population is now printed by that
+> file's `census` test rather than counted from source here. And **§9.3 is
+> discharged**: it asked for exactly this change ("a census over them needs the
+> same requested-vs-declared comparison moved down to
+> `NativeContext::alloc_object`, in `vm/`"), including its warning about the
+> dedup key, which the landed form answers by keying on the **Java frame** rather
+> than a `#[track_caller]` Rust location — a site says a path exists, a frame says
+> it ran.
+>
+> One thing the closure did **not** do, stated because it is the natural
+> misreading: the base allocator clamps `slots = num_fields.max(real_fields)` two
+> lines after it observes, so `direction=under` still cannot describe a short
+> object. The genuinely short population arrives with `real_fields == 0` and is
+> reported as `undeclared` — a third direction added by
+> `W7-73-short-object-blind-spot.md`, whose source-level bound is the ratchet
+> `the_unresolved_class_fallback_population_only_shrinks` (`BOUND = 28`, 14 of
+> them short; MAY ONLY GO DOWN).
+
 **(c) NEW — the census covers ONE funnel, and it is not the only allocator.**
 `native-builtins`, `native-io` and `native-collections` contain **511**
 `alloc_object(` / `try_alloc_object_gc_safe(` call sites that never pass through
@@ -329,7 +361,42 @@ which is not a judgement call.
 
 ## 7. Live, over-allocating, and NOT repaired — with the reason
 
-* **`javax/net/ssl/SSLEngine` 7 vs 2, 27 receiver-slot accesses at indices 2–6**
+> **CORRECTED 2026-08-12 — the `SSLEngine` bullet below is a FALSE POSITIVE in
+> both shipping modes, and the correction is not this lane's to re-derive.**
+> `W7-61-sslengine-layout-and-tls-blocking.md` measured the registration order:
+> `register_p68_ssl` registers both `SSLContext.createSSLEngine` descriptors onto
+> `ssleng_alloc` (which requests 7), and **23 lines later**
+> `net_phase_e::register_re6_ssl_context` re-registers both of them onto bodies
+> that allocate `sun/security/ssl/SSLEngineImpl` instead. Registration is
+> last-write-wins, so `ssleng_alloc`'s only two callers are overwritten and it
+> allocates nothing on either shipping boot path. The 7-vs-2 over-allocation is
+> **live only under `--synthetic-jdk`**, where `register_phase68_natives` calls
+> `register_p68_ssl` again and it wins back.
+>
+> This is not taken on trust: `native-builtins/src/tls.rs:4948`–`:5021` is a
+> source gate asserting `register_re6_ssl_context` is the LAST writer of both
+> descriptors on both the solo and boot orders, whose own failure message says
+> *"If p68 wins here, `ssleng_alloc` is live again"*. Read W7-61 before touching
+> the SSL slot map; do not re-derive the order.
+>
+> Two other places in this record carry the same error and are corrected by this
+> note rather than edited in place, so what they contribute stays traceable:
+> §4's write-side table (`javax/net/ssl/SSLEngine` | 2 | 6 | **LIVE**) and the
+> `javax/net/ssl/SSLEngine 7 vs 2` entry in the "20 LIVE" allocation-site list
+> under it. **Both should read `synthetic-jdk only`.** The 23-class figure for
+> that table is unchanged — the class stays in the census, its reachability label
+> is what was wrong — and the "20 LIVE `over` call sites" figure drops by the one
+> site inside `ssleng_alloc`. It is **not** restated as 19 here: that list is
+> enumerated by class while the 20 counts call sites, this lane did not re-run
+> the call-graph walk that produced either, and re-deriving one number from the
+> other by hand is how the `ConcurrentHashMap` 16-vs-10 row in W4-4 got written.
+> The correction is the label; the recount belongs to whoever next runs the flag.
+>
+> The error leaned in the direction that overstates open work — the direction
+> HANDOFF-20260812.md found every stale row in this directory leaning.
+
+* ~~**`javax/net/ssl/SSLEngine` 7 vs 2, 27 receiver-slot accesses at indices 2–6**~~
+  — **DEAD on both shipping boot paths; see the correction above.**
   (`phases_late/ssl_security.rs`, `ssleng_alloc` + `register_p68_ssl`). Real
   `SSLEngine` declares `peerHost` (a reference) and `peerPort`, and the model
   writes `Int` into both. Not repaired because the fix is a base offset threaded
@@ -409,11 +476,14 @@ young collection — and which is out of scope here.
    question no instrument answers, and §5 now supplies a concrete candidate:
    `AsynchronousSocketChannel` at 4 from two crates with incompatible meanings,
    plus whatever real bytecode allocates at 1.
-3. **The 511 direct `alloc_object` sites.** A census over them needs the same
-   requested-vs-declared comparison moved down to `NativeContext::alloc_object`,
-   in `vm/`. That is a one-place change with workspace-wide reach and it belongs
-   to a lane that can build and run it — the reporting is cheap, but a wrong
-   dedup key on a path that hot is not.
+3. ~~**The 511 direct `alloc_object` sites.**~~ **DONE 2026-08-12 — see the
+   §2(c) closure note.** The comparison was moved to
+   `NativeContextImpl::alloc_object` exactly as prescribed, the funnel's call was
+   kept for the `under` direction, and the dedup-key worry was answered by keying
+   on the Java frame. What remains is not the wiring but the **run**: the census
+   is a source-level upper bound until somebody executes
+   `CRATONVM_DBG_LAYOUT_ALIAS=1` over a workload, which nobody has done for this
+   record, W7-66, W7-68, W7-73 or W7-90.
 4. **Runtime confirmation of anything here.** This lane cannot build or run the
    VM. Every claim is source-level and argued from `javap` against JDK 25.0.3.9,
    exactly as W4-4's own closing sentence says of itself.

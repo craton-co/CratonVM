@@ -1436,6 +1436,34 @@ fn runtime_package_of(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<
 /// The host is resolved with `class_id_by_name_near(.., class_id)` rather than
 /// the ambient `class_id_by_name` so a duplicate binary name defined by another
 /// loader cannot be substituted for the real host.
+///
+/// # The hidden-class arm
+///
+/// It mirrors `classloading::access_control::confirmed_nest_host`'s arm, and
+/// for that function's stated reason: a JEP 371 hidden class's `nest_host` is
+/// **not** read from its class file at all — `define_class_with_options`
+/// overwrites whatever the bytes claimed with the defining `Lookup`'s own
+/// class, and no `NestMembers` round-trip is possible because the host cannot
+/// name a class whose name no class file can spell. The claim is authoritative
+/// because only the defining call could have made it.
+///
+/// L15 recorded this arm as missing and unfixable, on the grounds that
+/// `NativeContext` had no hidden-class question to ask. **That was a grep for
+/// the wrong name.** There is no `is_hidden_class`, but there is
+/// `NativeContext::is_class_hidden` (`native-api/src/registry.rs`), backed by a
+/// real `ClassManager` read in `vm/src/vm/vm_exec.rs` and by the mock's
+/// `hidden_classes` set — not a defaulted `false`, so this arm is exercised
+/// rather than inert. Without it a hidden class always resolved to itself as
+/// host and never matched a nestmate, so `defineHiddenClass(.., NESTMATE)` and
+/// lambda-proxy classes were denied reflective access their bytecode already
+/// has. That failed CLOSED, which is why it was a divergence and not a hole;
+/// closing it only ever admits, and it cannot admit anything
+/// `access_control.rs` does not already admit at the bytecode level.
+///
+/// The W3-2 complement holds here unchanged: a hidden class defined WITHOUT
+/// `ClassOption::NESTMATE` has its class-file `NestHost` discarded at
+/// definition time, so it reaches the self-host arm above and this one never
+/// sees it.
 fn confirmed_nest_host_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<String> {
     let own = ctx.class_name_of_id(class_id)?;
     let claimed = match ctx.nest_host_name(class_id) {
@@ -1445,6 +1473,11 @@ fn confirmed_nest_host_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> O
         Some(h) if h != own => h,
         _ => return Some(own),
     };
+    // Arm order matches `confirmed_nest_host`: self-host, then hidden, then the
+    // confirmation round-trip.
+    if ctx.is_class_hidden(class_id) {
+        return Some(claimed);
+    }
     let host_id = match ctx.class_id_by_name_near(&claimed, class_id) {
         Some(id) => id,
         // Host not loadable/loaded → claim unconfirmed → own host.

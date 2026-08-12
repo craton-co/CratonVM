@@ -695,8 +695,16 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 /// Whether this VM takes a terminating thread back out of its `ThreadContainer`.
 ///
-/// This is the other half of container registration and it is not optional.
-/// `jdk.internal.misc.ThreadFlock.awaitAll()` is
+/// **This is now `true`, because the de-registration half landed.** The
+/// constant is not a policy dial; it is a factual statement about the VM, and
+/// the fact changed. `vm/src/vm/vm_exec.rs::run_thread_exit_shared` invokes
+/// `java/lang/Thread.exit()V` on the terminating thread from both worker-death
+/// paths (normal return and after the uncaught-exception dispatch), which is
+/// what reaches `container.remove(this)` —
+/// docs/known-issues/jdk-only/W7-27-thread-exit-java-cleanup.md.
+///
+/// Why the pairing is not optional. `jdk.internal.misc.ThreadFlock.awaitAll()`
+/// is
 ///
 /// ```java
 ///     if (threadCount == 0) return true;
@@ -705,8 +713,7 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 ///
 /// so a container that is only ever added to does not leak quietly — it hangs
 /// every `join()`/`close()` built on it. HotSpot gets the decrement from
-/// `Thread.exit()`, which the VM calls on the terminating thread (JDK 25
-/// `Thread.java`, `private void exit()`):
+/// `Thread.exit()` (JDK 25 `Thread.java`, `private void exit()`):
 ///
 /// ```java
 ///     ThreadContainer container = threadContainer();
@@ -715,15 +722,10 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 ///     }
 /// ```
 ///
-/// CratonVM never invokes `Thread.exit()V`. Its thread-termination path runs
-/// `run()`, dispatches the uncaught-exception handler, retires the TLAB and
-/// notifies the VM-level termination monitor; no Java-level cleanup runs at
-/// all, on either the normal or the abnormal path.
-///
-/// MEASURED against `target/release/cratonvm.exe` (2026-08-11) under
-/// `--real-jdk`, by invoking the JDK's own package-private
-/// `Thread.start(ThreadContainer)` reflectively — the exact body the enabled
-/// branch below reaches — on a live `StructuredTaskScope`'s flock:
+/// MEASURED against `target/release/cratonvm.exe` (2026-08-11), i.e. the binary
+/// that had NEITHER half, under `--real-jdk`, by invoking the JDK's own
+/// package-private `Thread.start(ThreadContainer)` reflectively — the exact body
+/// the enabled branch below reaches — on a live `StructuredTaskScope`'s flock:
 ///
 /// ```text
 ///                                       HotSpot 25    cratonvm --real-jdk
@@ -732,17 +734,35 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 ///   join() called after the worker died   0-1 ms        never returned (3/3)
 /// ```
 ///
-/// Registering without the pair therefore turns today's "join() waits for
-/// nothing" into "join() waits forever", which is strictly worse: this tree
-/// already carries eight recorded hangs from three causes. So the registration
-/// stays off until the decrement exists. Flip this constant in the same change
-/// that makes the VM invoke `Thread.exit()V` on both termination paths; the
-/// patch is written out in
-/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
+/// That table is why this constant existed: the add half alone turns today's
+/// "join() waits for nothing" into "join() waits forever", which is strictly
+/// worse. With `Thread.exit()` wired up, the right-hand column is the thing
+/// this flip is expected to move to `0` / a number.
 ///
-/// `CRATONVM_THREAD_CONTAINERS=1` overrides it at runtime, so the two arms can
-/// be A/B'd in one binary once that patch lands.
-const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = false;
+/// **WHAT A WRONG FLIP LOOKS LIKE, so a suite run can be read.** The failure
+/// mode is a HANG, not a wrong answer, and it has one signature per consumer:
+///
+/// * A vector that opens a `StructuredTaskScope` (or anything reaching
+///   `ThreadFlock`) never finishes: no `FAIL` line, no `PASS` line, the run
+///   stops mid-transcript and the harness times out. `join()`/`close()` are
+///   parked in `LockSupport.park()` on a `threadCount` that never fell. Note
+///   that a suite timeout in this tree is more often a crash with no result
+///   line than a real wait, so check the process is still alive before reading
+///   a timeout as this: here it IS a live park, not a fault.
+/// * With `-ea`, `ThreadFlock.onExit`'s `assert removed` fires instead: that is
+///   the OPPOSITE regression — a thread removed twice, or removed from a
+///   container it was never added to.
+/// * `WARN … Thread.exit() failed on terminating thread …` on every thread
+///   death means `exit()` is being reached and throwing inside real JDK
+///   bytecode; the container is then still held and the first bullet follows.
+/// * Jetty/Tomcat thread pools use `SharedThreadContainer`, which never waits
+///   on a count, so they cannot show this. Do not read a green Jetty arm as
+///   evidence the flip is sound.
+///
+/// The escape hatch is `CRATONVM_THREAD_CONTAINERS=0`, which restores the
+/// pre-flip behaviour in the same binary; `=1` forces it on. Bisect with that
+/// rather than by rebuilding.
+const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = true;
 
 /// Read once per process: the constant above, overridable by
 /// `CRATONVM_THREAD_CONTAINERS` (`1` on, `0` off).
@@ -786,10 +806,13 @@ fn thread_container_registration_enabled() -> bool {
 /// dumps, JFR), and they are enumerated in
 /// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
 ///
-/// It is still dropped by default, and that is a deliberate interlock rather
-/// than an oversight: see `VM_REMOVES_THREADS_FROM_CONTAINERS` for the measured
-/// hang that landing the add half on its own produces. The drop is announced
-/// once per process so the wrong answer is at least not silent.
+/// It is no longer dropped by default: `VM_REMOVES_THREADS_FROM_CONTAINERS` is
+/// `true` now that `Thread.exit()` runs on both worker-death paths. Read that
+/// constant's doc comment before changing anything here — it carries the
+/// measured hang the interlock existed for, and the runtime signature of a
+/// wrong flip. `CRATONVM_THREAD_CONTAINERS=0` restores the drop in the same
+/// binary, and the drop is still announced once per process so the wrong answer
+/// is not silent when it is selected.
 ///
 /// INSTANCE method: args[0] = receiver (System$1), args[1] = Thread,
 /// args[2] = ThreadContainer.

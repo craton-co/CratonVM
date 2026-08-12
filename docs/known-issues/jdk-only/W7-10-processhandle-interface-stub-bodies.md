@@ -7,6 +7,11 @@ already takes, one unregistered abstract method registered, and the ambient
 registration sites. Three residuals are named in §7 and two of them are
 out-of-file.
 
+> **§7.3 APPLIED 2026-08-12, unbuilt.** The one-line row is in
+> `classloading/src/class_manager.rs`, so §4's `commandLine` registration is no
+> longer real-JDK-only. §7.1 (`onExit` on a minted handle) and §7.2 (the
+> synthetic-JDK empty stream) are untouched and remain the record's open work.
+
 **Nothing here has been built or run.** Every claim is either `javap` output
 from the JDK 25 image on this host (Eclipse Adoptium jdk-25.0.3.9-hotspot,
 `javap -version` = `25.0.3`), the JDK's own `lib/src.zip`, or a read of the
@@ -344,23 +349,40 @@ Removing the last of it needs a process enumerator `native-builtins` can call
 without a real JDK — i.e. the four `pub`s W3-6 asked for, or an equivalent in a
 crate below `native-builtins`.
 
-### 7.3 Out-of-file: the synthetic `$Info` carrier does not declare `commandLine`
+### 7.3 APPLIED 2026-08-12 — the synthetic `$Info` carrier now declares `commandLine`
 
-`classloading/src/class_manager.rs` fabricates the `java/lang/ProcessHandle$Info`
-carrier with five methods — `command`, `arguments`, `user`, `startInstant`,
-`totalCpuDuration` — and no `commandLine`. In synthetic-JDK mode an
-`invokeinterface ProcessHandle$Info.commandLine()` therefore fails at
-resolution, before native dispatch is reached, so §4's registration is
-real-JDK-only until that list gains a row:
+**Was:** `classloading/src/class_manager.rs` fabricated the
+`java/lang/ProcessHandle$Info` carrier with five methods — `command`,
+`arguments`, `user`, `startInstant`, `totalCpuDuration` — and no `commandLine`.
+In synthetic-JDK mode an `invokeinterface ProcessHandle$Info.commandLine()`
+therefore fails at **resolution**, before native dispatch is reached, so §4's
+registration was real-JDK-only.
 
-```rust
-            mk("commandLine", "()Ljava/util/Optional;"),
-```
+**Now:** `synthetic_stub_ctor_methods`' `if name == "java/lang/ProcessHandle$Info"`
+arm carries `mk("commandLine", "()Ljava/util/Optional;")` beside the other five,
+so the arm declares all six of the image's abstracts. Both halves re-verified
+before editing rather than taken from this record: the registration §4 describes
+is live (`r.register(phi, "commandLine", "()Ljava/util/Optional;", p60_empty_optional)`
+in `native-builtins/src/phases_late.rs`) and the carrier's list really was five
+names. The `java/lang/ProcessHandle` arm above it is complete against the 13
+abstracts that file registers, so nothing else there needed a row.
 
-beside the other five in the `if name == "java/lang/ProcessHandle$Info"` arm.
-The `java/lang/ProcessHandle` arm above it is complete against the 13 abstracts
-this file registers, so nothing else there needs a row. Not applied: that file
-is outside this lane.
+**It already had a scheduled witness, and that is why no new fixture is
+proposed.** `regression-suite/src/RJdkStrict.java`'s `processHandleInfo` reflects
+over `ProcessHandle.Info.class.getDeclaredMethods()` and asserts the sorted names
+equal exactly `[arguments, command, commandLine, startInstant, totalCpuDuration,
+user]` — an **exact set**, not a `contains` sweep, which is the only shape that
+can see an omission. `RJdkStrict` is scheduled in `JDKONLY_CLASSES`, so on a real
+JDK it reads the image and passes either way; the arm this change repairs is the
+`--synthetic-jdk` **mode**, which no suite runs (README §2.6). A mirror
+assertion of the same exact set was added to
+`process_handle_native_fallback_has_verifier_visible_callable_shape` in
+`classloading/src/class_manager.rs`, which does exercise the fabrication path
+directly and is the only instrument that can go red for this today.
+
+**No ratchet moves.** §6's two censuses count native REGISTRATIONS; this adds a
+fabricated *method declaration* and no registration. The `commandLine`
+registration itself was already counted when §4 landed.
 
 ## 8. What was rejected from the handed-over patch
 

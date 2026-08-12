@@ -3,6 +3,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.invoke.VarHandle;
 import java.lang.invoke.WrongMethodTypeException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -458,20 +459,31 @@ public class RJdkHandles {
             // makes it VARIABLE arity rather than a collector.
             check((int) sumAll.invoke(new int[] { 5, 6 }) == 11,
                     "asVarargsCollector array call");
-            // NOT asserted: `isVarargsCollector()`. It answers false on
-            // CratonVM, which was measured here and is a DECLARED deviation --
-            // `lang_invoke.rs` says so in place ("Known deviation, deliberately
-            // not papered over"), because the marking would need a sixth
-            // synthetic MethodHandle slot and dispatch derives varargs
-            // behaviour from arity instead. A check for it would make this
-            // vector permanently red for something no fix in this lane can
-            // reach, and a permanently-red vector teaches operators to ignore
-            // the red. Recorded in W7-19 rather than asserted here.
+            // The MARKING. This answered `false` on CratonVM until W7-19 5.2:
+            // `asVarargsCollector` was the identity and stored the marking
+            // nowhere, so `isVarargsCollector()` fell through to the base
+            // class's `return false`. It is now the sixth synthetic slot.
+            check(sumAll.isVarargsCollector(),
+                    "asVarargsCollector's result must report isVarargsCollector()");
+            // The control that keeps the line above from being satisfied by a
+            // VM that answers `true` unconditionally. It must be a FRESH handle:
+            // CratonVM's `asVarargsCollector` is still the identity, so marking
+            // is visible through the receiver too (a declared deviation -- see
+            // W7-19 5.2), and re-reading the receiver of the call above would
+            // assert that deviation rather than the marking.
+            check(!st("sumInts", int.class, int[].class).isVarargsCollector(),
+                    "a plain findStatic handle is not a varargs collector");
         });
         step("asFixedArity", () -> {
             MethodHandle fixed = st("sumInts", int.class, int[].class)
                     .asVarargsCollector(int[].class).asFixedArity();
             check((int) fixed.invoke(new int[] { 5, 6 }) == 11, "asFixedArity array call");
+            // Now a real control rather than half of one. While the flag was
+            // hardcoded `false` this passed because it was ALWAYS false, which
+            // is why W7-19 4.2 deleted it; with the marking stored, it
+            // distinguishes "asFixedArity cleared it" from "always true".
+            check(!fixed.isVarargsCollector(),
+                    "asFixedArity's result must not report isVarargsCollector()");
         });
     }
 
@@ -543,6 +555,54 @@ public class RJdkHandles {
                 threw = true;
             }
             check(threw, "bindTo on a zero-arity target must raise IllegalArgumentException");
+        });
+        // W7-19 5.3. The `type()` bookkeeping after a bind was correct for
+        // static/virtual/special handles and MISSING for the four accessor
+        // kinds. Measured on the shipped binary against HotSpot 25, same class
+        // file: a bound `findGetter` reported `(Holder)int` where HotSpot
+        // reports `()int`, and a bound `arrayElementGetter` reported
+        // `([I,int)int` where HotSpot reports `(int)int`.
+        //
+        // Asserted through `parameterCount`/`parameterType` rather than
+        // `MethodType.toString()`: the arity is the claim, and a rendering
+        // difference in some unrelated change must not fail this.
+        step("bindTo narrows type() after a getter bind", () -> {
+            MethodHandle g = MethodHandles.lookup().findGetter(Holder.class, "i", int.class);
+            check(g.type().parameterCount() == 1,
+                    "an unbound instance getter takes the receiver");
+            MethodHandle bg = g.bindTo(new Holder(11));
+            check(bg.type().parameterCount() == 0,
+                    "a bound getter must drop the receiver from type()");
+            check(bg.type().returnType() == int.class, "a bound getter still returns int");
+            check((int) bg.invoke() == 11, "a bound getter reads the bound receiver's field");
+        });
+        step("bindTo narrows type() after an array-element getter bind", () -> {
+            MethodHandle ag = MethodHandles.arrayElementGetter(int[].class);
+            check(ag.type().parameterCount() == 2,
+                    "an unbound array-element getter takes (array, index)");
+            MethodHandle bag = ag.bindTo(new int[] { 7, 8, 9 });
+            check(bag.type().parameterCount() == 1,
+                    "a bound array-element getter must drop the array from type()");
+            check(bag.type().parameterType(0) == int.class,
+                    "a bound array-element getter takes the index");
+            check((int) bag.invoke(1) == 8, "a bound array-element getter reads the element");
+        });
+        step("bindTo refuses a second bind on a bound getter", () -> {
+            // The consequence of the narrowing above, and the reason it is a
+            // parity fix rather than cosmetics: while `type()` still carried the
+            // receiver, this second bind was ACCEPTED and silently OVERWROTE the
+            // first capture. HotSpot refuses it -- the narrowed type has arity 0.
+            MethodHandle bg = MethodHandles.lookup()
+                    .findGetter(Holder.class, "i", int.class)
+                    .bindTo(new Holder(11));
+            boolean threw = false;
+            try {
+                MethodHandle again = bg.bindTo(new Holder(12));
+                check(false, "the second bindTo was ACCEPTED and produced " + again.type());
+            } catch (IllegalArgumentException expected) {
+                threw = true;
+            }
+            check(threw, "a second bindTo on a bound getter must raise IllegalArgumentException");
         });
     }
 
@@ -714,6 +774,55 @@ public class RJdkHandles {
             threw = true;
         }
         check(threw, "dropLookupMode(PRIVATE) must remove private access");
+
+        // W6-8 / W4-1: the `unreflect*` family reaches exactly the members
+        // `find*` reaches, so it has to ask the same mode question. Until
+        // `3644142d5` it asked nothing at all, which made the two refusals
+        // above reachable around in one line -- same Lookup, same member,
+        // opposite answers. Nothing in the corpus asserted either polarity;
+        // this is that vector.
+        //
+        // HotSpot 25 rule, from `MethodHandles.Lookup`: for `unreflect`, "If
+        // the method's accessible flag is not set, access checking is performed
+        // immediately on behalf of the lookup class", and the body is
+        // `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;` -- so a set
+        // flag is an unconditional ALLOW performed by the TRUSTED lookup, not a
+        // discount. All three polarities are asserted because each one alone is
+        // passable by a broken gate: a gate that asks nothing passes the second
+        // and third, a gate that refuses every non-PRIVATE lookup passes the
+        // first and second, and a gate that ignores the accessible flag passes
+        // the first and second.
+        //
+        // ORDER IS LOAD-BEARING: `setAccessible(true)` is called only AFTER the
+        // full-power positive, so the flag cannot be what makes that check
+        // pass. That is the exact vacuity L15's field block was written to
+        // avoid.
+        Method secretM = Holder.class.getDeclaredMethod("secret", int.class);
+        threw = false;
+        try {
+            pub.unreflect(secretM);
+        } catch (IllegalAccessException expected) {
+            threw = true;
+        }
+        check(threw, "publicLookup must not unreflect a private method");
+
+        // BOTH positives INVOKE the handle and pin its result. `!= null` alone
+        // is satisfied by a fabricated carrier with no invocable body -- the
+        // fabricated-success species -- and the only other assertions in this
+        // block are refusals, so a VM that returned a stand-in for every
+        // `unreflect` passed the whole block. `Holder.secret(add)` is
+        // `return i + add;` and `new Holder(n)` sets `i = n`, so the sum is a
+        // value only that body can produce; a handle bound to the wrong member,
+        // to the wrong receiver, or to nothing at all cannot answer it.
+        MethodHandle fullPower = MethodHandles.lookup().unreflect(secretM);
+        check(fullPower != null && (int) fullPower.invoke(new Holder(7), 35) == 42,
+                "a full-power lookup must unreflect a private nestmate method into a"
+                        + " handle that invokes to i+add");
+
+        secretM.setAccessible(true);
+        MethodHandle honoured = pub.unreflect(secretM);
+        check(honoured != null && (int) honoured.invoke(new Holder(2), 40) == 42,
+                "unreflect must honour a set accessible flag and yield a working handle");
 
         // A missing member is NoSuchMethodException, not a fabricated handle.
         threw = false;

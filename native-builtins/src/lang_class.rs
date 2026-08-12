@@ -2538,6 +2538,80 @@ fn validate_for_name_dotted(dotted_name: &str) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
+/// The name HotSpot's `Class.forName` puts in a `ClassNotFoundException`.
+///
+/// JVMS 5.3.3: an array class is created *by the VM from its element type* --
+/// no class file for the array itself is ever consulted -- so `Class.forName`
+/// strips the `[`s itself and the only name a loader, and therefore a
+/// `ClassNotFoundException`, ever sees is the ELEMENT's. Measured on JDK 25
+/// (jdk-25.0.3.9-hotspot):
+///
+/// ```text
+/// Class.forName("[Lp.X;")  -> ClassNotFoundException msg="p.X"  cause=null
+/// Class.forName("[[Lp.X;") -> ClassNotFoundException msg="p.X"  cause=null
+/// ```
+///
+/// `ClassLoader.loadClass("[Lp.X;")` by contrast keeps the descriptor -- it
+/// never resolves an array form at all, not even one whose element exists.
+/// That asymmetry is exactly why the correction belongs here, at
+/// `Class.forName`, and not in the loader: the loader's own wording is right
+/// for the loader.
+///
+/// `array_descriptor_element_class` answers `None` for everything that is not
+/// a reference-array descriptor (`[I`, a plain class name, a malformed `[Lp/X`
+/// or `[L;`), so every non-array case keeps today's name character for
+/// character.
+///
+/// See docs/known-issues/jdk-only/L16-classnotfound-vs-noclassdeffound-shapes.md
+fn for_name_cnfe_name(dotted_name: &str) -> String {
+    cratonvm_classloading::array_descriptor_element_class(dotted_name)
+        .unwrap_or(dotted_name)
+        .to_string()
+}
+
+/// Re-mint a `ClassNotFoundException` that a loader raised for an array
+/// descriptor so it names the ELEMENT, per `for_name_cnfe_name`.
+///
+/// Deliberately narrow on both axes:
+///
+/// * Only `java/lang/ClassNotFoundException` is rewritten, by exact class
+///   name. A `NoClassDefFoundError` is left alone on purpose -- when
+///   `[Lp/X;`'s element `p/X` EXISTS but `p/X`'s own supertype is missing,
+///   `load_class_visible_to`'s `DependencyMissing` arm mints an NCDFE naming
+///   that supertype, which is what `Class.forName` should report and what the
+///   L16 guard in `classloader_real.rs` was deliberately not widened past.
+/// * Only a reference-array descriptor is rewritten; anything else is handed
+///   straight back.
+///
+/// The replacement is a fresh `RuntimeError::ClassNotFoundException`, which
+/// carries no cause -- matching HotSpot, whose `Class.forName` array miss
+/// reports `cause=null`.
+fn for_name_rename_array_cnfe(
+    ctx: &mut dyn NativeContext,
+    dotted_name: &str,
+    failed: MethodCallFailed,
+) -> MethodCallFailed {
+    let element = match cratonvm_classloading::array_descriptor_element_class(dotted_name) {
+        Some(element) => element.to_string(),
+        None => return failed,
+    };
+    let exc_ref = match failed {
+        MethodCallFailed::ExceptionThrown(exc_ref) => exc_ref,
+        other => return other,
+    };
+    let exc_cid = ctx.class_id_of_object(exc_ref);
+    if !ctx
+        .class_name_of_id(exc_cid)
+        .is_some_and(|n| n == "java/lang/ClassNotFoundException")
+    {
+        return MethodCallFailed::ExceptionThrown(exc_ref);
+    }
+    cratonvm_types::error::RuntimeError::ClassNotFoundException {
+        class_name: element,
+    }
+    .into()
+}
+
 /// DBG: report whether `cid` is a bytecode-enhanced entity (declares a
 /// `$$_hibernate_*` member). Trace-only.
 fn dbg_class_enhanced(ctx: &mut dyn NativeContext, cid: ClassId) -> bool {
@@ -2946,9 +3020,12 @@ pub(crate) fn native_class_for_name(
                     );
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
+                // L16 -- for an array descriptor HotSpot's `Class.forName`
+                // names the ELEMENT, never the descriptor. See
+                // `for_name_cnfe_name`.
                 return Err(
                     cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                        class_name: dotted_name,
+                        class_name: for_name_cnfe_name(&dotted_name),
                     }
                     .into(),
                 );
@@ -3027,8 +3104,17 @@ pub(crate) fn native_class_for_name(
                     // raw exception is more informative than a synthesized
                     // CNFE(dotted_name). Matches HotSpot's behaviour.
                     s111_dbg!("[S111-DBG] loadClass({}) threw, propagating", dotted_name);
-                    return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                        exc_ref,
+                    // L16 -- one correction before propagating. We handed the
+                    // loader an array DESCRIPTOR, so a `ClassNotFoundException`
+                    // it raises names the descriptor; HotSpot's `Class.forName`
+                    // never shows a loader an array form at all and reports the
+                    // element. Everything else, including the
+                    // `NoClassDefFoundError` a genuinely-missing dependency
+                    // produces, is handed back untouched.
+                    return Err(for_name_rename_array_cnfe(
+                        ctx,
+                        &dotted_name,
+                        cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref),
                     ));
                 }
             }
@@ -3147,13 +3233,18 @@ pub(crate) fn native_class_for_name(
                 e,
                 cratonvm_types::error::MethodCallFailed::ExceptionThrown(_)
             ) {
-                return Err(e);
+                // L16 -- same array-descriptor correction as the loader arm
+                // above; a no-op for every non-array name and for every
+                // throwable that is not a `ClassNotFoundException`.
+                return Err(for_name_rename_array_cnfe(ctx, &dotted_name, e));
             }
             // No Java exception was raised вЂ” the class file simply could not
             // be located on any source on the classpath. Throw `CNFE(dotted)`.
             Err(
                 cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                    class_name: dotted_name,
+                    // L16 -- the element, not the descriptor, for an array
+                    // form. See `for_name_cnfe_name`.
+                    class_name: for_name_cnfe_name(&dotted_name),
                 }
                 .into(),
             )
@@ -10029,7 +10120,28 @@ fn link_isolated_method_signatures(
         ctx.unpin_native_roots(loader_pin);
         let mirror = match loaded {
             Ok(Some(Value::Object(Some(mirror)))) => mirror,
-            _ => return Err(isolated_loader_class_not_found(ctx, name)?),
+            Ok(_) => return Err(isolated_loader_class_not_found(ctx, name)?),
+            Err(failed) => {
+                // W7-26 R2 -- a failure is not a miss. `isolated_loader_class_not_found`
+                // synthesises a `NoClassDefFoundError` naming this type, which is the
+                // right answer only when the isolated loader could not FIND the class.
+                // JDK 25 `URLClassLoader.findClass` raises `ClassNotFoundException`
+                // for that case alone; a found-but-unusable class leaves `defineClass`
+                // as its own `LinkageError` -- `ClassFormatError`, `VerifyError`,
+                // `UnsupportedClassVersionError`, `IncompatibleClassChangeError` --
+                // and each of those is a different `catch` in application code.
+                // `absorb_class_absent` returns `Ok(())` only for the two
+                // class-absent shapes (tested by `ClassId` hierarchy, never by
+                // name); everything else it hands straight back through `?`.
+                //
+                // NOTE for the record: W7-26's patch text for this site says the
+                // re-mint is a `ClassNotFoundException`. It is a
+                // `NoClassDefFoundError` -- see `isolated_loader_class_not_found`
+                // just below. The argument is unaffected, the class name in the
+                // prose is not.
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Err(isolated_loader_class_not_found(ctx, name)?);
+            }
         };
         let mirror_pin = ctx.pin_native_root(mirror);
         // Netty CompositeByteBuf clinit bug (20260731): forcing full
@@ -11231,10 +11343,17 @@ pub(crate) fn native_constructor_new_instance(
     // "Could not construct a list instance of java.util.ArrayList".
     // Only a non-public constructor requires the opens/deep check.
     let accessible = read_constructor_accessible(ctx, this);
-    let ctor_modifiers = match ctx.get_field_by_name(this, "modifiers") {
-        Value::Int(v) => v,
-        _ => 0,
+    // L15: kept as an `Option` rather than collapsed straight to 0. An
+    // unreadable `modifiers` word decodes as 0, and 0 IS a real access-flag
+    // word — package-private — so the member gate added below would otherwise
+    // manufacture a refusal out of a field it could not read. The two JPMS arms
+    // are unaffected: they only ask `is_public`, for which 0 has always meant
+    // "not public".
+    let ctor_modifiers_opt = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => Some(v),
+        _ => None,
     };
+    let ctor_modifiers = ctor_modifiers_opt.unwrap_or(0);
     let ctor_is_public = (ctor_modifiers & 0x0001) != 0;
     if !ctor_is_public {
         if let Err(msg) = check_reflection_module_access_with_target_id(
@@ -11265,6 +11384,80 @@ pub(crate) fn native_constructor_new_instance(
             }
             .into(),
         );
+    }
+
+    // L15: the MEMBER-MODIFIER gate. Everything above this point is JPMS; until
+    // now there was nothing else, so a `private` constructor was reflectively
+    // reachable from anywhere without `setAccessible(true)` — CratonVM was MORE
+    // permissive than HotSpot on this path, not less.
+    //
+    // HotSpot's `Constructor.newInstanceWithCaller` calls
+    //
+    //     checkAccess(caller, clazz, clazz, modifiers)
+    //
+    // -> `AccessibleObject.verifyAccess` -> `Reflection.verifyMemberAccess`,
+    // the SAME funnel `native_method_invoke` is routed through above. Only the
+    // `targetClass` argument differs: a constructor has no receiver, so HotSpot
+    // passes the declaring class itself, and `verifyMemberAccess`'s `protected`
+    // sub-rule then reduces to `isSubclassOf(clazz, caller)`. That is exactly
+    // what `caller_may_access_member` computes from a `receiver` of
+    // `Some(declaring)`, which is why the argument is spelled that way rather
+    // than as `None`.
+    //
+    // Ordering is HotSpot's too: `verifyMemberAccess` runs `verifyModuleAccess`
+    // FIRST, so the JPMS refusals above still outrank this one and a
+    // cross-module non-public constructor keeps the module message it has today.
+    //
+    // The `ReflectionFactory.newConstructorForSerialization` path returns far
+    // above this point and is deliberately left untouched — HotSpot's
+    // serialization constructor bypasses the access check as well.
+    //
+    // NARROWING. Two fail-OPEN valves, and the second is a DELIBERATE
+    // divergence from `native_method_invoke`'s `_ => false`: there the
+    // fail-closed leg was the behaviour that already shipped, whereas here
+    // every refusal this block can emit is new, so an input it cannot read must
+    // not become the first one it ever emits.
+    //
+    //   * `modifiers` unreadable — see `ctor_modifiers_opt` above;
+    //   * no resolvable caller frame, or a declaring mirror that did not
+    //     resolve to a `ClassId`. `resolve_caller_class_id` answers `None`
+    //     during VM bootstrap and on an all-reflection frame stack, and
+    //     reflective construction runs on both.
+    //
+    // Deliberately NOT implemented: `verifyMemberAccess`'s class-accessibility
+    // half (a member of a non-public class is reachable only from that class's
+    // own runtime package, however public the member). `enforce_module_check_
+    // on_field`'s `public_member_class_is_reachable` is that rule for fields;
+    // adding it here would refuse the reflective instantiation of every
+    // package-private implementation type from a foreign package, which is a
+    // much larger blast radius than this record was filed with and wants its
+    // own measurement.
+    //
+    // `docs/known-issues/jdk-only/L15-nestmate-access-field-and-constructor.md`
+    if !accessible && !ctor_is_public && ctor_modifiers_opt.is_some() {
+        // Metadata-only, exactly as on the field path: nothing reached from
+        // here allocates or re-enters Java, so `this` cannot go stale across it
+        // and no additional pin is required.
+        let caller_cid = resolve_caller_class_id(ctx);
+        let caller_entitled = match (caller_cid, declaring_cid) {
+            (Some(caller), Some(declaring)) => crate::lang_reflect::caller_may_access_member(
+                ctx,
+                caller,
+                declaring,
+                ctor_modifiers,
+                Some(declaring),
+            ),
+            _ => true,
+        };
+        if !caller_entitled {
+            // Same helper, same `IllegalAccessException`, same message shape as
+            // the `Method.invoke` refusal — the two paths must not drift.
+            check_access(
+                ctor_modifiers,
+                false,
+                &format!("Constructor.newInstance: {class_name}"),
+            )?;
+        }
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`
@@ -23582,6 +23775,68 @@ mod tests {
         let caller = ctx
             .ensure_class_initialized("cratonvm/test/NestlessPeer")
             .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002, // private
+            false,
+            declaring,
+            None,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    /// L15's hidden-class residual, closed: a JEP 371 hidden class defined with
+    /// `ClassOption::NESTMATE` IS a nestmate of the `Lookup`'s class, so a
+    /// `private` member of it is reflectively reachable from that class.
+    ///
+    /// The host is deliberately given **no** `NestMembers` entry naming the
+    /// hidden class, because no class file could spell that name. That is what
+    /// makes this test non-vacuous: the confirmation round-trip in
+    /// `confirmed_nest_host_name` CANNOT succeed here, so the only thing that
+    /// can admit the access is the hidden-class arm. The paired test below is
+    /// the same fixture with the hidden flag off, and it must stay red.
+    #[test]
+    fn field_access_allows_private_field_of_a_hidden_nestmate() {
+        let mut ctx = mock_ctx();
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/HiddenNestOwner")
+            .expect("caller class");
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/HiddenNestOwner$$Lambda/0x1")
+            .expect("hidden class");
+        ctx.set_nest_host_override(declaring, "cratonvm/test/HiddenNestOwner");
+        ctx.set_class_hidden(declaring);
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002, // private
+            false,
+            declaring,
+            None,
+            "Field.get(privateValue)"
+        )
+        .is_ok());
+    }
+
+    /// The falsifier for the test above. Identical fixture, hidden flag NOT
+    /// set: the `NestHost` claim is then just a claim, the host lists no such
+    /// member, and the access must stay refused. Without this row the widening
+    /// above could not be distinguished from "any `NestHost` claim is honoured",
+    /// which is the spoof `confirmed_nest_host_name` exists to defeat.
+    #[test]
+    fn field_access_rejects_private_field_of_an_unconfirmed_non_hidden_claimant() {
+        let mut ctx = mock_ctx();
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/HiddenNestOwner")
+            .expect("caller class");
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/SpoofingClaimant")
+            .expect("declaring class");
+        ctx.set_nest_host_override(declaring, "cratonvm/test/HiddenNestOwner");
         ctx.set_frame_class_ids(vec![caller]);
 
         assert!(check_field_access(

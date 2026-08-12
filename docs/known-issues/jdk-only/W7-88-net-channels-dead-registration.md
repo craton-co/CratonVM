@@ -425,3 +425,36 @@ in §2 is the thing to re-measure first.
    class not mentioned. Worth carrying forward as a reading lesson: a
    registrar's slot map and a single body's writes are different sets, and the
    residual named the first while describing the second.
+
+---
+
+## 9. Landed-state check, 2026-08-12 — on the live path, and what a run must still add
+
+Source re-read on this tree by a later lane (still **no build, no binary**). All
+four facts the deletion rests on hold, and every line number in §2.1/§4 has
+drifted under concurrent edits, so **anchor on the identifiers, not the lines**:
+
+| fact | where it is now | was |
+|---|---|---|
+| the registration stays deleted, with the tombstone comment naming the triple | `net_channels.rs`, in `register_p58_nio_channels` | line 366 |
+| `SSC_P58_SLOT_MAP` declared and published | `net_channels.rs` (`declare_slot_map(&SSC_P58_SLOT_MAP)`) | — |
+| the winner still registers unconditionally | `socket_channel.rs`, `r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket)` in `register_socket_channel_real`, called from `native-io/src/lib.rs` with no `if` above it | `socket_channel.rs:4776` → **4778** |
+| the loser's registrar is still gated and still has exactly one call site each | `register_p58_nio_channels` ← `phases_late.rs` (one call) ← `register_phase58_natives` ← `lib.rs` (one call), inside `pub fn register_synthetic_overrides` under `#[cfg(feature = "synthetic-jdk")]`; the next top-level `fn` in `lib.rs` is far below that call | `lib.rs:23922` → **24018**; the `fn` at `21430` → **21526** |
+| the ratchet exists | `ssc_p58_socket_stays_deleted_and_the_registrar_stays_gated` in `native-api/tests/guarded_slot_maps.rs` | — |
+
+**This is a source verification and it does not upgrade §7.** Everything in §7
+still needs the run, and §7 item 3 is the one that matters: the census must be
+**byte-identical** in all four configurations. Two riders a build lane should not
+skip:
+
+* **the `--dump-native-registry` row must still read
+  `registered_by = native-io/src/socket_channel.rs:<line>` with `owns_slot = true`
+  and `overwrote = null`** — the line number in §6 is now stale by two, which is
+  exactly the drift §2.1 warns about, and a lane diffing the census text rather
+  than the fields will read that as a change;
+* **no fixture assertion is possible for this record and none was added.** §6
+  says why in full — the row was never in the registry, so there is nothing a
+  Java-visible predicate can move. `probes/SscSocketOwnerProbe.java` is
+  NO-CHANGE by construction and is still not scheduled (`run.sh` reads a word
+  list, not `probes/`). This is a record that closes on a census diff, not on a
+  vector.
