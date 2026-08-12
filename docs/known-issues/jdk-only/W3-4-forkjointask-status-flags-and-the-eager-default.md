@@ -1,11 +1,38 @@
 # W3-4 — `ForkJoinTask.isCompletedAbnormally()` was unregistered, and what still
 # gates the `CRATONVM_FJP_EAGER_FORK` default
 
-Status: **fix landed (unbuilt, unmeasured)** for the assertion. **The default
-flip LANDED 2026-08-07** — see §3, which is kept as the record of what was
-measured before it moved. §4 (`quietly*`) was closed by
-`W6-7-forkjointask-quietly-family.md`; it is kept as the record of what that
-lane was handed. Wave 3, lane W3-4.
+Status: **everything this record specifies is applied; nothing here is pending.**
+§2's four coordinated edits are in the tree; the default flip LANDED 2026-08-07;
+§4 (`quietly*`) was closed by `W6-7-forkjointask-quietly-family.md`. §3 and §4
+are kept as the record of what was measured and what W6-7 was handed. Wave 3,
+lane W3-4.
+
+> **2026-08-12 — re-audited by W7-48, and the eager-fork flag is genuinely
+> read.** `CRATONVM_FJP_EAGER_FORK` was traced flag-to-consumer, because this
+> codebase has shipped levers that moved a number nothing read:
+> `types/src/flag_groups.rs:1224` -> `runtime_var_os` -> `fjt_fork_mode()` ->
+> `register_forkjointask_eager_fork_gate`, which re-registers the `fork()` triple
+> on all three task classes with `fjt_fork_counted_completer_eager` (or
+> `fjt_fork_always_eager`), and that callback reaches
+> `phases_early::fjp_compute_for_submit` — it really runs `compute()` at fork
+> time. The gate is also the LAST writer for that triple on both boot paths
+> (`register_phase51_natives` :23581 before `register_new15_loom` :23677;
+> `register_real_jdk_forkjoin_essentials` :9959 before
+> `register_t19_k3_forkjoinpool_common` :9978, both `native-builtins/src/lib.rs`),
+> and no other registrar in the tree claims
+> `("fork", "()Ljava/util/concurrent/ForkJoinTask;")` — every other `"fork"`
+> registration is `StructuredTaskScope`-family, a different class and descriptor.
+> All four flag-surface obligations are met and unchanged.
+>
+> **What is still NOT closed is §3's condition (2): the Spring/H2 A/B has never
+> been run.** The lever is wired; its cost on the only workload that can observe
+> it is unmeasured. See `W7-48-fjp-unapplied-patches.md` §4.
+>
+> §2's `isCompletedAbnormally` now also has a neighbour that discriminates it:
+> `regression-suite/src/RJdkForkJoin.java::completionRecord()` asserts the
+> abnormal RECORD, not just the flags — `:294`'s
+> `isCancelled() && isCompletedAbnormally()` was green throughout the W6-9
+> defects, which is exactly why it could not catch them.
 
 Predecessors: `L12-forkjoinpool-no-workers-awaitdone-hang.md`,
 `L19-countedcompleter-lazy-fork-starvation.md`,

@@ -1,9 +1,29 @@
 # W6-9 — `ForkJoinTask.complete(v)` erased the abnormal record, and
 # `completeExceptionally` was never registered at all
 
-Status: **fix written (unbuilt, unmeasured)**. Wave 6, lane W6-9. Takes the
-defect W6-7 found and declined ("live long-standing registrations, blast radius
-unmeasured").
+Status: **ALL patches applied; falsifiers added 2026-08-12 (unbuilt,
+unmeasured)**. Wave 6, lane W6-9. Takes the defect W6-7 found and declined
+("live long-standing registrations, blast radius unmeasured").
+
+> **2026-08-12 — §8 IS APPLIED. Read this before acting on the section.**
+> Every patch in §8 landed on 2026-08-11 in commit `e643b5893` ("apply the four
+> cross-file patches wave-1 lanes could not reach"), hours after this file was
+> last edited, and the status line below was never updated — so this record was
+> handed out as pending work a day later and re-audited from scratch. §8 is
+> kept verbatim as the specification each patch was built from; it is **not a
+> to-do list**. Nothing in it needs applying.
+>
+> What was genuinely missing is the other half: none of these fixes had a test
+> that fails without them. Three falsifiers are now in
+> `regression-suite/src/RJdkForkJoin.java::completionRecord()` — §6's, and
+> §7.4's first and second — where the strict suite actually runs them.
+> `W7-48-fjp-unapplied-patches.md` records the census, the RED for each, and one
+> finding this record got wrong: **§8.1's cure is applied and cannot be reached
+> from Java**, because `fjt_has_own_raw_result_slot`'s side-table arm tests three
+> ABSTRACT class names and `method_exists` walks the superclass chain, so every
+> Java receiver takes the virtual-`setRawResult` arm. §7.5's divergence was
+> correctly reasoned and never observable. Do not write a corpus assertion for
+> it; it is green before and after.
 
 **2026-08-11 — §7's four divergences are now addressed** (landed in source,
 unbuilt). Three are landed in
@@ -11,9 +31,9 @@ unbuilt). Three are landed in
 (`register_forkjointask_w6_9_residual_bridge`): `getException()` on a cancelled
 task, `reinitialize()`, and the missing `RecursiveAction.complete(Object)`. The
 fourth — the `setRawResult` half of `complete(v)` on a cancelled task — and the
-three edits the first three imply outside that file are written out verbatim in
-§8, **not applied**. §7 now records the disposition of each rather than
-deferring it.
+three edits the first three imply outside that file were written out verbatim in
+§8; they were applied later the same day (see the box above). §7 records the
+disposition of each rather than deferring it.
 
 Predecessors: `W2-8-forkjointask-invoke-returns-computes-null.md`,
 `W3-4-forkjointask-status-flags-and-the-eager-default.md`,
@@ -256,6 +276,11 @@ check(!t.isCompletedNormally(),   "not normal after complete()");
 check(t.getException() instanceof IllegalStateException, "ISE survives complete()");
 ```
 
+**This falsifier is now IN THE TREE**, as part 1 of
+`regression-suite/src/RJdkForkJoin.java::completionRecord()`, with the two
+`isDone()`/`isCompletedAbnormally()` assertions moved BEFORE the `complete()`
+call so the test can tell the two independent reasons apart.
+
 Before: `isCompletedAbnormally()` false and `getException()` null — for two
 independent reasons (the erasure, and `completeExceptionally` never reaching the
 side table). After: true / false / ISE. `t.join()` must still throw the ISE.
@@ -388,13 +413,20 @@ a.complete(null);
 check(a.isCompletedAbnormally(), "7.3 — ra.complete is setDone, not an erase");
 ```
 
+**Parts 1 and 2 of this falsifier are now IN THE TREE** (the cancelled
+`getException()`, and the `reinitialize` pair with a run COUNTER added — the
+value alone does not discriminate a replay from a re-execution). The
+`RecursiveAction` third part is NOT: it is a synthetic-mode-only hole by §7.3's
+own argument, and the strict corpus runs `--jdk-only`, so an assertion there
+would be green before and after. See `W7-48-fjp-unapplied-patches.md` §2.4.
+
 Before: line 3 answered null; `reinitialize()` left `isDone()` true and the
 second `invoke()` replayed the memoised 7 without running `compute()`; under
 `--synthetic-jdk` the `a.complete(null)` call had no native at all. The
 `reinitialize` pair only discriminates once §8.3/§8.4 land — without them it is
 dropped in real-JDK mode, so a green there proves nothing about that mode.
 
-### 7.5 `complete(v)` on a cancelled task is still a full no-op — NOT LANDED
+### 7.5 `complete(v)` on a cancelled task is still a full no-op — LANDED 2026-08-11, AND INERT
 
 Recorded in §8 as an applied-by-someone-else patch, because the write belongs
 inside `fjp_complete_body` (`native-builtins/src/phases_early.rs`), outside this
@@ -420,15 +452,32 @@ shape as 7.1, one level up. Naming it here rather than fixing it: it changes wha
 every cancelled-task `pool.invoke` call site sees, from a value to a raised
 exception, and that needs the blast-radius survey §4 did for `complete`.
 
+**2026-08-12 — the narrow scope is NARROWER THAN THIS, and the divergence was
+never observable.** The paragraph below is right that it is visible only through
+a bare `getRawResult()` on a receiver whose raw-result slot IS the side table.
+What it missed is that no such receiver exists: `fjt_has_own_raw_result_slot`
+takes that arm only when the runtime class NAME is `ForkJoinTask` /
+`RecursiveTask` / `RecursiveAction`, all three of which are ABSTRACT, and a user
+subclass does not fall through either because `NativeContext::method_exists`
+walks the superclass chain and finds the inherited `final setRawResult`. So the
+cure landed in `e643b5893` is defence in depth and has no Java falsifier —
+`W7-48-fjp-unapplied-patches.md` §3. The original text follows.
+
 The narrow scope is worth stating: the divergence is only visible through a bare
 `getRawResult()` on a `ForkJoinTask`/`RecursiveTask` receiver whose raw-result
 slot IS the side table. A receiver with its own slot never had the bug —
 `fjp_complete_body` invokes the virtual `setRawResult` unconditionally, exactly
 like the real `complete`. `RecursiveAction` cannot have it (7.3).
 
-## 8. Out-of-file patch (not applied)
+## 8. Out-of-file patch — ALL FOUR APPLIED 2026-08-11 (`e643b5893`)
 
 Four edits, none inside this lane's files. Ordered by what they unblock.
+
+> **Kept verbatim as the specification, not as pending work.** All four landed
+> in `e643b5893`. Verified present on 2026-08-12 by `git log -S` on a
+> distinctive string from each, plus the `grep -c` counts §8.4 predicts. See
+> `W7-48-fjp-unapplied-patches.md` §1 for the census and §3 for the one
+> correction: 8.1 is applied and unreachable from Java.
 
 ### 8.1 `native-builtins/src/phases_early.rs` — the cancelled-task `setRawResult` (7.5)
 
@@ -493,6 +542,10 @@ loop is unreachable. Delete **only** the `getException` `r.register(...)` call
         // registration is last-write-wins, so a copy here would look live and
         // be dead.
 ```
+
+**APPLIED 2026-08-11.** The paragraph below describes the state before that.
+Its numbers are also STALE: `BASELINE_SHADOWED_NO_MANAGEMENT` now reads `1150`,
+not `1148`, re-seeded by `b6f0bca44`. The gate is still not wired into CI.
 
 **Until this is applied, `native-builtins/tests/duplicate_registration_gate.rs`
 measures more shadowed registrations than its frozen baseline and its
