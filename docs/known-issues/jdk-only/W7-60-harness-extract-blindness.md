@@ -431,3 +431,219 @@ output is exactly the vector's output, so subtracting the filter from it names
 every blind vector in one pass, with no VM build, in under a minute — and the
 subtraction had never been performed, in a suite that had been read carefully
 many times by people who wrote precise headers about what it measured.
+
+---
+
+## 9. Verified in the tree, and the harness this record did not reach — 2026-08-12 (doc-only lane)
+
+No cargo, no Rust, no run. This section is a **verification** of what this record
+claims about the tree, and a **finding** about the neighbouring harness.
+
+### 9.1 Everything this record claims about the tree is there
+
+Checked by symbol, not by line number:
+
+* `extract()` is defined **exactly once**, at `regression-suite/harness-guard.sh:53`.
+  `run.sh` does not redefine it; it sources the guard file at `run.sh:236` with a
+  hard `exit 3` if the source fails. The "two filters drifting apart would be the
+  same defect one level up" argument holds in the tree, not just on paper.
+* The guards are invoked on the real control flow — `harness_guard_oracle` at
+  `run.sh:496`, `harness_guard_extract` at `:507` — and they are **fatal, not
+  advisory**: `guarded=1` feeds `hbad`/`hfailed`, which is folded into
+  `total_failed` at `run.sh:613` and reported under its own `HARNESS:` heading at
+  `:609`. The separate-counter claim of §6.6 is real; so is the exit-status claim.
+* G2/G3 deliberately run even with no HotSpot present (`run.sh:502-507` and its
+  comment), which is the run where they matter most.
+* `harness-uncounted.txt` holds **exactly one** live entry, `RClassUnloadSweep`,
+  with the two cleared rows recorded as a comment block rather than as rows —
+  the reverse-ratchet direction, applied to itself.
+* CI wiring: `harness-selfcheck.sh` at `.github/workflows/ci.yml:1332`,
+  `STRICT_COVERAGE: 1` at `:1350`, `run.sh` at `:1354`, and W7-51's
+  `CRATONVM_REQUIRE_E2E: 1` producer at `:211`.
+
+### 9.2 The blind spot the same subtraction has not been pointed at
+
+This record closed the question *"what does the instrument delete"* for the 72
+vectors `run.sh` schedules. The adjacent corpus is untouched and much larger:
+
+| | files | scheduled |
+| --- | --- | --- |
+| `regression-suite/src/*.java` | 72 | 70, and four guards watch them |
+| `probes/*.java` | **449** | **3** |
+
+The string `probes` appears **zero** times in `run.sh` at any `SUITE=` value. The
+sole scheduled consumer is `scripts/jdk-only-strict-probes.sh`
+(`ci.yml:315`, `:1404`), whose `PROBE_LIST` default is
+`JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe` plus the agent.
+**This is the standing reason a finding whose only evidence is a probe cannot be
+discharged by a suite run, however green** — it is the live situation for
+`W7-33-differential-dead-sections.md` and `W7-36-differential-view-families.md`,
+whose entire evidence base is `probes/ShadowDifferentialProbe.java`, a file named
+by no `.sh` and no `.yml` in the tree.
+
+That is not a call to schedule 449 probes. It is the reason to say, per record,
+whether a claim has a scheduled witness — and this record's numbers, uniquely in
+the set, do.
+
+### 9.3 G4's defect, still live and still scheduled, in the harness next door
+
+**This is the finding of this section.** G4 exists because `run.sh` discarded the
+oracle's exit code, so a control that never produced evidence was scored as
+ground truth. `scripts/jdk-only-strict-probes.sh` — which CI runs on the whole
+OS × JDK matrix — has the same defect in a second form, and its own comments
+argue that the defect is correct behaviour:
+
+```
+scripts/jdk-only-strict-probes.sh:249-251
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm, so the arms still agree and the gate stays honest."
+```
+
+```
+scripts/jdk-only-strict-probes.sh:277, :280
+      echo "         The jni section will report lib=absent in EVERY arm."
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+```
+
+The gate is a cross-arm **agreement** ratchet. When a fixture fails to build,
+every arm reports `absent`, every arm agrees, no section diverges, and the script
+reaches `RESULT: PASS` with `exit 0`. The whole agent section and the whole JNI
+section — the two that cover the JNI boundary and instrumentation under
+`--jdk-only`, i.e. the surface least covered anywhere else — are silently
+switched off, and the only trace is a `WARNING:` inside a green build.
+
+**Three arms that all failed to build agree with each other**, and agreement
+between three broken instruments is this record's entire subject. It is exactly
+the shape §6.6 rejects — *"a warning inside a green build is how the previous
+version of this defect survived long enough to be measured"* — and exactly the
+shape G4 was written to make fatal. The script already has the right vocabulary
+for it: its self-test failure path prints `RESULT: REFUSED` and exits 2, on the
+principle that a gate which cannot adjudicate must say so rather than pass.
+
+W7-51 §3 has carried this as an open residual since it was found. It is harder to
+close now than when it was merely unnoticed, because the source comments assert
+that the behaviour is honest, so a fixer has to disagree with the file first.
+**NOMINATION below**, with exact text; a doc-only lane cannot make it.
+
+#### NOMINATION — `scripts/jdk-only-strict-probes.sh`: a fixture that did not build must REFUSE, not PASS
+
+Shape deliberately mirrors `harness-uncounted.txt`: degradation is allowed, but
+only when it is **declared**, so the default run cannot be quietly hollowed out.
+Three edits, anchored on literal text.
+
+**(1)** After the `SRCS=""` initialisation block, add the flag. Anchor —
+`scripts/jdk-only-strict-probes.sh`, immediately before the agent fixture
+comment:
+
+```sh
+# ------------------------------------------------------- fixture: the agent jar
+```
+
+becomes
+
+```sh
+# Set by any fixture that failed to build. A missing fixture makes its section
+# report `absent` in EVERY arm, so the arms AGREE and the agreement ratchet sees
+# no divergence — the section is switched off and the gate still says PASS. That
+# is the G4 defect of W7-60-harness-extract-blindness.md: a control that produced
+# no evidence being scored as ground truth. Declared degradation is fine;
+# silent degradation is not.
+DEGRADED_FIXTURES=""
+
+# ------------------------------------------------------- fixture: the agent jar
+```
+
+**(2)** Mark each degraded fixture. Three sites, each gaining one line.
+
+```sh
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm, so the arms still agree and the gate stays honest."
+```
+
+becomes
+
+```sh
+    echo "WARNING: the agent jar did not build; the agent section will report absent"
+    echo "         in EVERY arm. The arms then agree because NEITHER measured"
+    echo "         anything, which is not honesty — see the DEGRADED_FIXTURES note."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-jar"
+```
+
+```sh
+      echo "WARNING: the JNI fixture did not build (see $OUT/logs/jni-build.log)."
+      echo "         The jni section will report lib=absent in EVERY arm."
+```
+
+becomes
+
+```sh
+      echo "WARNING: the JNI fixture did not build (see $OUT/logs/jni-build.log)."
+      echo "         The jni section will report lib=absent in EVERY arm."
+      DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib"
+```
+
+```sh
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+```
+
+becomes
+
+```sh
+    echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
+    DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib-no-cc"
+```
+
+**(3)** Refuse at the verdict. Anchor — the final three lines of the file:
+
+```sh
+echo "RESULT: PASS -- every arm completed and no section diverged that the"
+echo "        baseline does not already carry."
+exit 0
+```
+
+becomes
+
+```sh
+if [ -n "$DEGRADED_FIXTURES" ] && [ "${ALLOW_DEGRADED_FIXTURES:-0}" != "1" ]; then
+  echo ""
+  echo "DEGRADED FIXTURES:$DEGRADED_FIXTURES"
+  echo "  Each of these switches a whole SECTION off in every arm at once. The"
+  echo "  arms then agree, no section diverges, and the ratchet cannot fire --"
+  echo "  so a PASS here would mean 'nothing was measured', not 'nothing broke'."
+  echo "  Fix the fixture, or declare the degradation with"
+  echo "  ALLOW_DEGRADED_FIXTURES=1 so the run says out loud what it did not cover."
+  echo "RESULT: REFUSED -- a fixture did not build, so its section is absent in"
+  echo "        every arm and the agreement between them is vacuous."
+  exit 2
+fi
+
+echo "RESULT: PASS -- every arm completed and no section diverged that the"
+echo "        baseline does not already carry."
+exit 0
+```
+
+Two notes for whoever lands it. **A permanently-red job is a job nobody reads** —
+W7-51 §1.2's rule — so if the CI matrix has a runner with no C compiler, that
+runner's step sets `ALLOW_DEGRADED_FIXTURES=1` and the WARNING then stands as a
+declared gap rather than a hidden one. And this changes an **exit code**, so it
+must be run once on each matrix OS before landing: the failure mode of this fix
+is a REFUSED on a platform where the fixture never built and nobody knew.
+
+### 9.4 The instrument this record's `--jdk-only` neighbours should be using
+
+Adjacent, and worth recording here because this record is the one about
+instruments: for `--jdk-only` questions there is now a complete per-run census —
+`cratonvm --jdk-only --explain-jdk-only --jdk-only-report r.json -cp <cp> <Main>`
+emits `compatibility-class-requested`, `native-shadows-bytecode` and
+`synthetic-native-registered` rows, each with class, method, descriptor and the
+requester's `file:line`. Three cautions, all of the same species this record is
+about:
+
+* **the flags are silently ignored if placed after the main class** — no file, no
+  warning, exit 0. A missing report is indistinguishable from a clean one, which
+  is a G4-shaped hazard in the census itself;
+* **`--explain-jdk-only` reports boot-time refusals and only those.** Every
+  runtime refusal is silent, so a clean startup banner licenses nothing;
+* **the census over-reports and a probe under-reports.** A requested-and-refused
+  row is not a failure — the caller recovers onto real bytecode. Only the
+  intersection of the two is the blocking set.

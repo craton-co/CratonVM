@@ -14,6 +14,68 @@ field count is `javap -p` against the JDK 25.0.3.9 image on the Windows host
 — the same oracle and the same convention as
 `W4-4-slot-index-species-sweep.md`.
 
+> **SOURCE-VERIFICATION BANNER — 2026-08-12, triage pass (A28). §9.3's "what
+> remains is the RUN" is now measured, and the answer is that it cannot be done
+> on this host without a build. Plus one wrong premise in §6.3/§6.4.**
+>
+> **1. The evidence for this whole family is unscheduled, and the one artifact
+> that looks like it could run it is a trap.** §9.3 ends *"the census is a
+> source-level upper bound until somebody executes
+> `CRATONVM_DBG_LAYOUT_ALIAS=1` over a workload, which nobody has done for this
+> record, W7-66, W7-68, W7-73 or W7-90."* Two things checked:
+>
+> * **The probes are not scheduled.** All four exist —
+>   `probes/SlotIndexRecensusProbe.java`, `probes/OverAllocationWidthProbe.java`,
+>   `probes/UnderAllocationProbe.java`, `probes/GuardedSlotMapProbe.java` — and
+>   `regression-suite/run.sh` contains **no reference to `probes/` at any
+>   `SUITE=` value**. Every "how it fails" section in this family therefore
+>   describes an observation nothing will ever make on its own. That is a
+>   property of the directory, not of the probes, and it is worth stating once
+>   per family rather than once per record.
+> * **The only shipping binary on this host predates the instrument.**
+>   `C:\craton\cratonvm\target\release\cratonvm.exe` is dated **26 July** —
+>   seventeen days before `native-api/src/layout_alias.rs` landed (2026-08-12
+>   05:20). Probed for its own strings: `CRATONVM_DBG_LAYOUT_ALIAS` **absent**,
+>   `undeclared` **absent**, `unresolved:ClassId` **absent**, `explain-jdk-only`
+>   **absent**. (`CRATONVM_DBG_LAYOUT` **is** present — that flag is older, and
+>   it is the one that resolves a numeric `ClassId` to a name, which is a
+>   different job.) So the census cannot be run here without a build, and — the
+>   reason this is written down — **a later lane that finds this binary and runs
+>   the flag against it will get an empty transcript that reads exactly like
+>   "the census is clean".** It would be measuring a VM older than every repair
+>   in W7-66, W7-68, W7-72, W7-73, W7-74 and W7-77. Rebuild first; check
+>   `--explain-jdk-only` is accepted before believing any run.
+>
+> The same argument disposes of the read-side half: `read_alias::observe_read`
+> cannot have been exercised either, by the same binary date.
+>
+> **2. §6.3/§6.4's synthetic arm rests on a width that is not the fabricated
+> width.** Both sections say of the `HashSet` repair: *"on a fabricated stub the
+> 3-slot shape IS the layout and that arm is unchanged"*. It is not.
+> `ClassManager::synthetic_stub_fields` fabricates `java/util/HashSet` — sharing
+> an arm with `HashMap`, `EnumMap`, `Hashtable` and `ConcurrentHashMap` — at
+> **16** (`classloading/src/class_manager.rs:12310`), under a comment two lines
+> above that says *"= 3 fields (buckets, size, capacity)"*. The **conclusion**
+> survives untouched: the count is written at slot 1, which is inside 16 as it is
+> inside 3, and `alloc_object` clamps a 3-slot request up to 16, so the arm
+> really is unchanged and really is safe. The **premise** does not, and it is the
+> premise the next reader will reuse. Same finding, same file, same function as
+> W7-68's triage banner (nomination N-4) and W7-66's (N-1): three width comments
+> in `synthetic_stub_fields` disagree with the arms beneath them, all
+> understating, and this family has been reading its fabricated widths out of
+> those comments.
+>
+> §7's last bullet is affected the same way and the same distance:
+> `util_time.rs::native_zone_id_get_available`'s third 3-slot `HashSet` is still
+> genuinely indeterminate for reachability, which was the reason for leaving it,
+> and that reason is untouched by the width.
+>
+> **Verified true and not to be re-derived:** §8's idiom moved crates as §5 of
+> W7-68 describes — `cratonvm_native_api::appended_slots::base_for_class` exists
+> with `appended_slot_base_for_class` kept as a forwarder. §2(c)'s closure note
+> holds; the ratchet it points at is `BOUND = 28`
+> (`native-api/tests/layout_alias_coverage.rs:947`).
+
 ## 1. The repair is real — verified, not taken on trust
 
 `native-builtins/src/util_concurrent_ext.rs`, the condition at the funnel:

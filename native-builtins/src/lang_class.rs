@@ -13380,12 +13380,27 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                 return Ok(sx == sy);
             }
             if xname == "java/lang/Class" && yname == "java/lang/Class" {
-                let xcid_field = ctx.get_field(x, 0);
-                let ycid_field = ctx.get_field(y, 0);
-                return Ok(matches!(
-                    (xcid_field, ycid_field),
-                    (Value::Int(a), Value::Int(b)) if a == b
-                ));
+                // Identity, not slot 0. `mirror_class_id` asks
+                // `class_id_from_mirror` FIRST and falls back to slot 0 only if
+                // that misses, so this works in synthetic mode and keeps working
+                // in real-JDK mode, where the slot-0 `ClassId` overlay is no
+                // longer written (`vm/src/vm/vm_object.rs`, 2026-08-12 — slot 0
+                // of a real `java.lang.Class` is `Constructor cachedConstructor`,
+                // a declared REFERENCE field, and writing an `Int` there made
+                // every collector box it).
+                //
+                // This site was the ONLY Class-mirror reader with no reverse-map
+                // path — the 2026-08-10 sweep that fixed the others grepped the
+                // token `mirror` and this function's variables are `x`/`y`. So
+                // it was already wrong wherever the overlay was absent, and
+                // would have become wrong everywhere.
+                //
+                // Two unresolvable mirrors must NOT compare equal merely by both
+                // answering `None`; fall back to reference identity.
+                return Ok(match (mirror_class_id(ctx, x), mirror_class_id(ctx, y)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => x.as_ptr() == y.as_ptr(),
+                });
             }
             if ctx_wrapper_class_to_primitive(&xname).is_some()
                 && ctx_wrapper_class_to_primitive(&yname).is_some()

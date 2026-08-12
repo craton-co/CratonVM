@@ -184,10 +184,35 @@ an un-boxing read, and HANDOFF-20260812.md records that
 `cargo test -p cratonvm-gc --test primitive_in_reference_slot` passes 10/10
 including `every_collector_agrees_on_a_primitive_in_a_reference_slot` — on a
 tree this binary was built from. So "the primitive is dropped" is *not* a
-sufficient account: either this object is not on the arm that test covers, or
-`NativeContext::get_field` does not reach the un-boxing read. Naming which is a
-question for a lane that can build and instrument the heap, and it is left open
-rather than guessed at (§6.7).
+sufficient account. **Corrected 2026-08-12: there are THREE candidates, not
+two, and the second one now looks false.**
+
+  (a) This object is not on the arm that test covers.
+  (b) `NativeContext::get_field` does not reach the un-boxing read. **This now
+      looks FALSE by reading**: all four collectors un-box inside their own
+      `get_field` — `gc/src/heap.rs:680`, `gc/src/gen_heap.rs:3639`,
+      `gc/src/g1.rs:9078`, `gc/src/zgc.rs:5211`, each calling
+      `crate::autobox::unbox_reference_slot(…)` — and `NativeContext::get_field`
+      routes to the collector. Anything going through `get_field` un-boxes.
+  (c) **The un-boxing is not uniform across execution tiers.** The JIT's
+      compact-reference field read does NOT un-box: neither the helper
+      (`vm/src/jit/helpers.rs:5642-5660`, `jit_getfield`, which returns
+      `jit_decode_ref_word` on the raw word — a heap-plausibility filter, not a
+      class-id test) nor the default inline path (`jit/src/ir_lower.rs:2419-2421`
+      and `jit/src/x64/bytecode_walk.rs:4034-4036`, a bare
+      `MOV RAX, [RAX + disp32]`). `AUTOBOX_CLASS_ID` appears nowhere in `jit/`,
+      `jit-api/`, or `vm/src/jit/`.
+
+The transcripts in §1 and §3 were taken through natives, i.e. through
+`NativeContext::get_field`, so (c) is **not** what produced these rows — (a)
+remains the live explanation for the measurement. What (c) does establish is
+that "the four GC tests pass" cannot be read as "every reader un-boxes": the
+gc ratchet (`gc/tests/primitive_in_reference_slot.rs`) only scans the four
+`gc/src` heaps, and the JIT is a fifth, independent field reader outside its
+reach. Any lane instrumenting this must say **which tier it measured**.
+
+Which of (a)/(c) applies here is still a question for a lane that can build and
+instrument the heap, and is left open rather than guessed at (§6.7).
 
 What is measured, and what the repair rests on, is narrower and enough: slot 0
 of this object does not read back as a `Value::Int`, and slot 0 is the one slot
@@ -648,8 +673,12 @@ Every link §11.1 claims is present in the tree today:
   it reads: §4.1 identifies that duplicate index as the reason
   `pe_segment_check_scope`, a function whose own comment calls itself "the single
   choke point", had never once fired.
-* Nineteen further `p67_session_slots` call sites across `foreign_ffm.rs`, i.e.
-  the resolver is the file's only route to those words rather than one of two.
+* Fourteen further `p67_session_slots` call sites across `foreign_ffm.rs`
+  (`:647, 721, 882, 888, 896, 933, 959, 973, 986, 1026, 1074, 1891, 2017,
+  2039`), i.e. the resolver is the file's only route to those words rather than
+  one of two. (Corrected 2026-08-12: this said "nineteen". The file has 15
+  occurrences of the symbol, one of which is the definition at `:623`, so 14
+  are call sites. The point is unaffected; the count was not checked.)
 
 **This is reading, not verification of behaviour.** §10 is still the whole
 question and is still untaken: no *after* column exists for

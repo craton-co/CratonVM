@@ -105,10 +105,13 @@ than the one that was recorded, and it still needs a vector that runs in
 synthetic mode.
 
 **One triple has no contest in either mode.** `java/nio/ByteBuffer.order()Ljava/nio/ByteOrder;`
-is registered by s2 (`native-builtins/src/servlet.rs:5814`, via
-`register_s2_byteorder`) and by **nobody else** — native-io registers `order`
-for the six typed classes (`native-io/src/lib.rs:8407`, `:8451`, `:8505`,
-`:8565`, `:8624`, `:8678`) and never for `ByteBuffer`. So `s2_bb_order` answers
+is registered by s2 (`native-builtins/src/servlet.rs:5877`, inside
+**`register_s2_bytebuffer`** — corrected 2026-08-12, this said
+`register_s2_byteorder`, which registers only `java/nio/ByteOrder`'s statics
+(`nativeOrder`, `BIG_ENDIAN`, `LITTLE_ENDIAN`) and never touches `ByteBuffer`)
+and by **nobody else** — native-io registers `order`
+for the six typed classes (`native-io/src/lib.rs:8715`, `:8759`, `:8813`,
+`:8873`, `:8932`, `:8986`) and never for `ByteBuffer`. So `s2_bb_order` answers
 `order()` in synthetic mode *and* in Compatible mode, and
 `vm/src/runtime/interpreter/native_override.rs:3194` forces the native to win
 over the real bytecode for that descriptor. That single fact is what makes §4
@@ -543,8 +546,21 @@ the `order(ByteOrder)` native **and by slice/view creation when propagating the
 source buffer's order**"* — so this is a deliberate choice made against an
 un-measured belief, which is exactly the shape §4.3 congratulated itself for
 avoiding one level up. `s2` is the registrar that **wins in Compatible mode**
-(§2) and all four descriptors are on the forced-native list for
-`java/nio/ByteBuffer`, so this is live in the shipping mode:
+(§2), **but only TWO of the four descriptors are on the forced-native list for
+`java/nio/ByteBuffer`** — corrected 2026-08-12, the original claim said all
+four. `("slice", "()Ljava/nio/ByteBuffer;")` and
+`("duplicate", "()Ljava/nio/ByteBuffer;")` are present
+(`vm/src/runtime/interpreter/native_override.rs:3196`, `:3197`), but
+`slice (II)` and `asReadOnlyBuffer` appear **nowhere in that file** — `grep -c
+asReadOnlyBuffer vm/src/runtime/interpreter/native_override.rs` is `0`. So on a
+real `ByteBuffer` receiver in Compatible mode the JDK's own bytecode runs for
+those two and the s2 body is never reached.
+
+The RED is therefore live in the shipping mode for `slice()` and `duplicate()`
+only. The two-line repro below is correct exactly as written — both its lines
+are forced descriptors — but the `sliceRange` and `readOnly` rows of §4.3's
+transcript do **not** describe a shipping-mode divergence, and §9/§11.6 should
+be read with that halving in mind:
 
 ```java
 ByteBuffer b = ByteBuffer.allocate(16);

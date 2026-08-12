@@ -4571,7 +4571,12 @@ pub(crate) fn native_unsafe_object_field_offset1(
     let resolved_cid: Option<cratonvm_types::ClassId> = ctx
         .class_id_from_mirror(class_mirror)
         .or_else(|| match ctx.get_field(class_mirror, 0) {
-            Value::Int(cid) => Some(cratonvm_types::ClassId::new(cid as u32)),
+            // `cid >= 0` matters: a PRIMITIVE mirror carries `Int(-1)` in slot 0
+            // as its marker, and without this guard that decodes to
+            // `ClassId(0xFFFF_FFFF)` — a plausible-looking id for a class that
+            // does not exist. `mirror_class_id` in lang_class.rs has always had
+            // the guard; this copy did not.
+            Value::Int(cid) if cid >= 0 => Some(cratonvm_types::ClassId::new(cid as u32)),
             _ => None,
         });
     if let Some(class_id) = resolved_cid {

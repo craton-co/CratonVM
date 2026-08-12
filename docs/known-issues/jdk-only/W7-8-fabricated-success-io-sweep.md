@@ -19,6 +19,17 @@ never about observed behaviour.
 > seven shared triples now point at one body each, registered by BOTH registrars,
 > so rows 1, 2 and 19 are live-fixed in all three configurations. Still not built
 > and still not run.
+>
+> **§9 (same day, later still) is the largest thing in this record and it is NOT
+> fixed.** The §2 tier table names `register_async_file_channel` as the owner of
+> the `AsynchronousFileChannel` surface. It owns eleven triples; the class has
+> two more, and a registrar in a **third** file this record never opened serves
+> both of them. `force(Z)V` is a **silent no-op on every channel this VM
+> produces** — a durability barrier that returns before it reads its own first
+> argument — and `lock()` mints a real `java/util/concurrent/FutureTask` at the
+> wrong width so `get()` **parks forever**. §7.1's lesson recurs with the
+> polarity reversed: it is not enough to fix the winning registrar; you have to
+> ask what the winner does not register. §9.6 carries the patches, out-of-file.
 
 Scope: `native-io/src/lib.rs` and
 `native-builtins/src/phases_late/nio_file.rs` only. Findings outside those two
@@ -962,3 +973,383 @@ exercise the real JDK's own bytecode and prove nothing about this change. Stated
 rather than papered over: **rows 1, 2 and 19 are fixed in source on the shipping
 path and are unasserted**, and the vector that would assert them has to run under
 `--synthetic-jdk`.
+
+---
+
+## 9. The `AsynchronousFileChannel` surface, 2026-08-12 — the live owner is a THIRD file, and both of its live triples are fabricated success
+
+Same standing as everything above: **nothing was built, checked, tested or run.**
+No `cargo` command of any kind was executed. Every CratonVM claim is a claim
+about *source*; every JDK claim is `javap -p` or `src.zip` against Eclipse
+Adoptium 25.0.3.9 on this host (`javap -version` = `25.0.3`).
+
+§2's tier table names `register_async_file_channel` (`native-io/src/lib.rs`) as
+the DEFAULT owner of the AFC surface, and §3.3 row 46 fixed
+`AsynchronousFileChannel.truncate(long)` there. That is true of the eleven
+triples that registrar names and **false of the class**. `javap -p
+java.nio.channels.AsynchronousFileChannel` declares thirteen instance methods;
+`register_async_file_channel` names eleven of the reachable ones, and the two it
+does not name — `force(Z)V` and `lock()Ljava/util/concurrent/Future;` — are
+served by a registrar in a **third** file that this record never opened. Both of
+them are this record's species, and one of them is a hang.
+
+This is the §7.1 lesson recurring with the polarity reversed. There, §3.1's
+fixes had landed on the losing registrar. Here the record fixed the *winning*
+registrar and never asked what the winner does **not** register — and
+last-write-wins answers "then somebody else's body runs", not "then real
+bytecode runs", because these methods are `abstract` on a class CratonVM itself
+instantiates.
+
+### 9.1 The three registrars and the per-triple winner
+
+Ordering re-measured from `vm/src/vm/vm_init.rs` on this tree — **the line
+numbers in §7.1 and §8.1 have drifted by ~70, so anchor on the identifiers**:
+
+| arm | first | last |
+|---|---|---|
+| `#[cfg(feature = "synthetic-jdk")]` (`:1903`) + `if config.use_synthetic_jdk` (`:1905`) | `register_builtins` `:1907` | `register_io_natives` **`:1908`** |
+| its `else` (feature build, real-JDK arm) | `register_essential_natives_with_shims` `:2028` | `register_io_natives` **`:2225`** |
+| `#[cfg(not(feature = "synthetic-jdk"))]` (`:2540`) — the shipping `cratonvm-cli` | `register_essential_natives_with_shims` `:2566` | `register_io_natives` **`:2761`** |
+
+`register_io_natives` is last in **all three**, so anything `native-io`
+registers wins everywhere. The three registrars on this class:
+
+* **A — `native-builtins/src/phases_late/net_channels.rs::register_p67_async_channels`.**
+  Reached from `register_essential_natives_with_shims`
+  (`native-builtins/src/lib.rs:7943`) — a SHIPPING registrar, unlike
+  `register_p58_nio_channels` in the same file, which
+  W7-88-net-channels-dead-registration.md measured as registering nothing at
+  all. Also reached a second time in the synthetic arm via
+  `register_synthetic_overrides` → `register_phase67_natives`
+  (`lib.rs:24073`). Ambient kind `Bridge` (`net_channels.rs:1309`), so strict
+  mode does not refuse it. Believes the layout
+  `path_str=0, open=1, _unused=2` (`:1310`).
+* **B — `native-io/src/lib.rs::register_async_file_channel`** (`:18816`), via
+  `register_phase92_io_completeness` (`:18796`), via `register_io_natives`
+  (`:6902`). Believes `AFC_FIELD_FD = 0`, `AFC_FIELD_PATH = 1`,
+  `AFC_FIELD_OPEN = 2` (`:18057-18059`).
+* **C — `native-io/src/nio_native.rs::register_t16_channel_overrides`**
+  (`:1765`), called by `register_io_natives` at `:6908` — i.e. **after** B, with
+  the comment *"Registered LAST so these overrides win"*. It re-registers
+  `open`, `isOpen`, `size`, `close`. Its file header still declares A's layout
+  (`nio_native.rs:1344`) but its bodies do not use it: `t16_afc_open` is
+  `crate::native_afc_open(ctx, args)` verbatim (`:1427-1429`), the legacy
+  3-slot body beside it is `#[cfg(any())]` — permanently dead — and the other
+  three discriminate with `t16_afc_uses_real_handle` (`:1421`: `≥3` fields and
+  slot 0 is an `Int`) before delegating to B. So **C wins those four triples and
+  agrees with B**, and the object every AFC in this VM is born with is B's:
+  slot 0 = `Int(fd)`, slot 1 = the path `String`, slot 2 = the open flag
+  (`alloc_afc_channel`, `native-io/src/lib.rs:19145-19164`).
+
+| triple | A | B | C | **winner** |
+|---|:-:|:-:|:-:|---|
+| `open(Path,[OpenOption])` | yes | yes | yes | C (= B's body) |
+| `read(ByteBuffer,J)Future` / `write(ByteBuffer,J)Future` | yes | yes | — | B |
+| `read/write(...,Object,CompletionHandler)V` | — | yes | — | B |
+| `size()J` · `close()V` · `isOpen()Z` | yes | yes | yes | C (delegates to B) |
+| `truncate(J)` | yes (no-op) | yes | — | B |
+| `tryLock(JJZ)` | — | yes | — | B |
+| **`force(Z)V`** | **yes** | — | — | **A** |
+| **`lock()Ljava/util/concurrent/Future;`** | **yes** | — | — | **A** |
+
+So of A's ten AFC registrations, eight are overwritten and **the only two that
+dispatch are the two nobody audited.**
+
+### 9.2 `force(boolean)` is a silent no-op on every channel this VM produces
+
+`net_channels.rs:1487-1505`, the sole registrant:
+
+```rust
+r.register(afc, "force", "(Z)V", |ctx, args| {
+    let this = obj_arg(args, 0)?;
+    let metadata_only = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+    // Get the file path from field 0
+    let path = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    if !path.is_empty() {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+            if metadata_only { let _ = file.sync_data(); } else { let _ = file.sync_all(); }
+        }
+    }
+    Ok(None)
+});
+```
+
+Slot 0 on the object `alloc_afc_channel` built holds `Value::Int(fd)`. The
+`match` therefore takes `_ =>` and **returns `Ok(None)` before reading its own
+first argument.** `force(true)` on every `AsynchronousFileChannel` this VM
+produces is a `void` method that returns having done nothing — the exact answer
+§1's Instrument B is built to catch, and the worst possible one for this method,
+because a durability barrier's caller records the data as committed on the next
+line.
+
+Four distinct defects are stacked in those nine lines, and they are worth
+separating because a fix that repairs only the first still lies:
+
+1. **Wrong slot.** Reads A's layout on B's object. This alone is the no-op.
+2. **Inverted polarity.** `force(true)` means *content **and** metadata*
+   (`src.zip`, `AsynchronousFileChannel.java:380-384`: *"If `true` then this
+   method is required to force changes to both the file's content and metadata
+   to be written to storage; otherwise, it need only force content changes"*).
+   The body calls `sync_data()` when the flag is true and `sync_all()` when it
+   is false. Its sibling on the synchronous class has it right —
+   `nio_file.rs:15525-15531` is `if metadata { file.sync_all() } else { file.sync_data() }`.
+   A one-line "read slot 1 instead of slot 0" fix would turn a no-op into a
+   *wrong* fsync, which is the W7-20 laundering shape.
+3. **Wrong handle.** It opens a **second** descriptor by path and fsyncs that
+   one. CratonVM's own writes for this channel live behind
+   `afc_files()` (`native-io/src/lib.rs:18104`), and on the synchronous side the
+   equivalent code says why this matters: *"`clone_file` flushes any buffered
+   writer for the fd"* (`nio_file.rs:15510`). Fsyncing an unrelated handle
+   flushes nothing of the caller's. It also fails outright — silently — on a
+   channel opened `READ`-only, because the second open asks for `.write(true)`.
+4. **Swallowed error, and no closed check.** `let _ = file.sync_all()` discards
+   the one failure the method exists to report
+   (*"@throws IOException If some other I/O error occurs"*), and there is no
+   open-flag test at all, so `force` on a **closed** channel also returns
+   normally where `src.zip:386-387` says *"@throws ClosedChannelException If
+   this channel is closed"*.
+
+**Blast radius: the largest row in this record.** `force` is how a database
+tells the OS its log is on disk. The mint site's own comment in the sibling
+`write` body (`net_channels.rs:1439`) names H2's `FileAsync`, and H2's async
+file store calls `channel.force(true)` on exactly this path. A silent no-op here
+is not a wrong answer a test can see; it is a durability guarantee that is not
+being made, and it surfaces as corruption after a crash, which no green suite
+can distinguish from a healthy run.
+
+**Scheduled, and unasserted.** `regression-suite/src/RJdkAsyncChannel.java` is in
+`JDKONLY_CLASSES` (`run.sh:119`) and its `writeReadRoundTrip` calls
+`ch.force(true); ch.force(false);` at `:143-144` — and then asserts only
+`check(ch.isOpen(), "force() must not close the channel")`. **The defect path is
+scheduled and the assertion beside it is satisfied by the no-op.** That is the
+§6.5-of-README shape: a fixture that reaches the defect and measures something
+else. The assertable half is the refusal — see the nomination.
+
+### 9.3 `lock()` mints a real `java.base` class at the wrong width, and `Future.get()` never returns
+
+`net_channels.rs:1506-1516`, again the sole registrant
+(`grep -rn '"lock",' --include=*.rs` returns exactly one AFC hit):
+
+```rust
+let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)?;
+ctx.set_field(future, 0, Value::Object(None));
+ctx.set_field(future, 1, Value::Int(1));
+```
+
+`java/util/concurrent/FutureTask` is a **real `java.base` class**, and
+`try_alloc_concurrent_synthetic` resolves it and clamps the width up, so this is
+a genuine `FutureTask` with the real layout. `javap -p
+java.util.concurrent.FutureTask` on 25.0.3, statics excluded, superclass
+`Object`:
+
+| slot | field | what the mint writes | after `coerce_field_value_by_descriptor` |
+|---:|---|---|---|
+| 0 | `state` (`int`, volatile) | `Object(None)` | `Int(0)` — `gc/src/heap.rs:1657`, the `I` arm maps `Object(None)` to `Int(0)` |
+| 1 | `callable` (`Callable`) | `Int(1)` | `Object(None)` — `heap.rs:1674`, the `L` arm degrades `Int` to null |
+| 2 | `outcome` | — | zero |
+| 3 | `runner` | — | zero |
+| 4 | `waiters` | — | zero |
+
+`FutureTask.NEW` is `0`. So the "done = true" the mint believes it is writing
+lands on `callable` and is thrown away, and `state` is left at exactly the value
+that means **not started**. Real `FutureTask.get()` is
+`int s = state; if (s <= COMPLETING) s = awaitDone(false, 0L); return report(s);`
+— `0 <= 1`, so it enters an untimed `awaitDone` and parks. Nothing can ever
+complete it: `callable` is null, `runner` is null, and no thread holds a
+reference to run it. **`ch.lock().get()` blocks forever**, and
+`while (!f.isDone())` spins forever, because `isDone()` is `state != NEW`.
+
+**Whether the native runs at all is the one thing source cannot settle, and both
+answers are defects.** `lock()` is `final` on `AsynchronousFileChannel` and its
+bytecode is `return lock(0L, Long.MAX_VALUE, false);`. If the registry wins —
+which is what the census category `native-shadows-bytecode` counts, 226 rows on
+an ordinary program — the hang above is what happens. If the bytecode wins, it
+calls `lock(JJZ)Future`, which is `abstract` and registered nowhere, so it is
+`AbstractMethodError`. There is no arm in which `lock()` works.
+
+**Why this row belongs to this record and not to a concurrency lane.** It is
+fabricated success *and* wrong-layout-on-a-real-class in one object: the native
+returns a plausible `Future` — right static type, non-null, implements the
+interface — that has never been connected to anything. §1's question answers
+itself: the caller cannot tell it from a real success **until it asks**, and
+then it does not come back.
+
+### 9.4 The same mint, three more times — and the fix already exists in the same file
+
+`try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/FutureTask", 2)`
+appears four times, all in `net_channels.rs`:
+
+| site | triple | live? | `state` ends as |
+|---|---|---|---|
+| `:1383` | `AsynchronousFileChannel.read(ByteBuffer,J)Future` | no — B wins | `Int(bytes_read)` |
+| `:1464` | `AsynchronousFileChannel.write(ByteBuffer,J)Future` | no — B wins | `Int(bytes_written)` |
+| **`:1511`** | **`AsynchronousFileChannel.lock()Future`** | **YES — sole registrant** | `NEW` → hangs |
+| **`:1816`** | **`AsynchronousServerSocketChannel.accept()Future`** | **YES** — `native-io/src/async_socket.rs:3516` registers only `accept(Object,CompletionHandler)V` | `NEW`, and slot 1 is `Int(0)` so even the mint's own belief says "pending" |
+
+The two dead ones are worth keeping in the table for what they would do if the
+order changed: `state := Int(n)` for an arbitrary byte count walks straight
+through `FutureTask`'s constant block — `NORMAL=2`, `EXCEPTIONAL=3`,
+`CANCELLED=4`, `INTERRUPTING=5`, `INTERRUPTED=6` — so a 3-byte read would report
+itself as having completed exceptionally and `get()` would throw
+`ExecutionException` wrapping whatever `outcome` held. That is a *worse* failure
+than the hang and it is one registration-order change away.
+
+**And the correct helper is already in this codebase, already used, and its own
+doc comment already contains the diagnosis.**
+`native-builtins/src/phases_late/concurrent.rs:1363-1369`:
+
+> *"A synthetic `FutureTask` does NOT work here: in real-JDK mode
+> `FutureTask.get()` runs the real bytecode (reads the real `state` field, stuck
+> NEW) → the websocket client's `fConnect.get(timeout)` TimeoutException."*
+
+`aio_completed_future(ctx, result)` is four lines over
+`CompletableFuture.completedFuture`. It was applied to
+`AsynchronousSocketChannel.connect(SocketAddress)Future`
+(`net_channels.rs:1621`) and to `asc.read`/`asc.write` (`:1690`, `:1762`) — and
+to **none** of the four `FutureTask` sites twenty lines away in the same file.
+`native-io`'s `wrap_completed_future` (`lib.rs:19543`) is the same fix arrived at
+independently for B's `read`/`write`. This is the
+"correct helper exists but only one callsite uses it" shape: the diagnosis was
+written down and then applied at the callsite that produced the failing test,
+not to the shape.
+
+### 9.5 Two lower-ranked rows on the same surface, for completeness
+
+Both in `native-io/src/lib.rs`, both this record's own file, both smaller than
+anything in §9.2–9.4 and neither fixed here:
+
+* **`native_afc_size` on a closed channel is a bare `IOException`, not
+  `ClosedChannelException`** (`:19467-19477`). `native_afc_close` (`:19479`)
+  clears `AFC_FIELD_OPEN` but leaves `AFC_FIELD_FD` holding the id it just
+  removed from `afc_files()`, so `size()` finds a positive fd, `afc_file_size`
+  fails to look it up, and the error is mapped to `IOException("size: …")`.
+  Exactly §3.1 row 19's species — the failure *is* reported, with a type
+  `catch (ClosedChannelException)` does not match.
+* **`native_afc_read_handler` / `native_afc_write_handler` discard the
+  application handler's exception** (`:19406`, `:19417`, `:19446`, `:19456` —
+  four `let _ = ctx.invoke_virtual(handler, "completed"/"failed", …)`). Scored
+  deliberately low rather than omitted: on HotSpot the handler runs on a group
+  thread and a throw there reaches only the thread's uncaught handler, so the
+  *observable* gap is narrow. What is not narrow is that the `let _ =` also eats
+  a `MethodCallFailed` raised by the VM itself on the way into the handler, and
+  those two are indistinguishable at the call site.
+
+### 9.6 Out-of-file patch items 7–9 (NOT applied)
+
+All three are in `native-builtins/src/phases_late/net_channels.rs`, which is
+W7-88's file, not this one. Anchor on the quoted text, not the line number.
+
+**7. `AsynchronousFileChannel.force(Z)V` — refuse when closed, sync the
+channel's own handle, and get the polarity right.** The refusal is the part with
+a scheduled witness, so it can land first and alone. Replace the whole body
+registered at `r.register(afc, "force", "(Z)V", …)`:
+
+```rust
+    r.register(afc, "force", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Layout note: the channel is minted by `native-io`'s
+        // `alloc_afc_channel` -- AFC_FIELD_FD=0, AFC_FIELD_PATH=1,
+        // AFC_FIELD_OPEN=2. This body used to read slot 0 as a path String
+        // under THIS file's `path_str=0` belief, take the `_ =>` arm on the
+        // Int it actually found, and return Ok(None): `force(true)` was a
+        // silent no-op on every channel the VM produces. The one registration
+        // that decides the layout is the one that ALLOCATES.
+        if !matches!(ctx.get_field(this, 2), Value::Int(1)) {
+            return Err(cratonvm_native_api::RuntimeError::IOException {
+                message: "AsynchronousFileChannel is closed".into(),
+            }
+            .into());
+        }
+        // `metaData == true` is "content AND metadata" (JDK 25
+        // AsynchronousFileChannel.java:380-384), i.e. sync_all. The previous
+        // body had this backwards.
+        let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let handle_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v > 0 => v as u32,
+            _ => return Ok(None),
+        };
+        cratonvm_native_io::afc_sync_at(handle_id, metadata).map_err(|e| {
+            cratonvm_native_api::RuntimeError::IOException {
+                message: format!("AsynchronousFileChannel.force: {e}"),
+            }
+        })?;
+        Ok(None)
+    });
+```
+
+with, in `native-io/src/lib.rs` beside `afc_truncate_at` (`:18371`) and exported
+the same way `native_afc_open` is:
+
+```rust
+/// `AsynchronousFileChannel.force(boolean)`: fsync THIS channel's handle.
+/// Opening the path a second time (what the previous caller did) syncs a
+/// descriptor that carries none of this channel's buffered writes.
+pub fn afc_sync_at(id: u32, metadata: bool) -> io::Result<()> {
+    let entry = afc_file_entry(id)?;
+    let handle = entry.lock();
+    if metadata {
+        handle.file.sync_all()
+    } else {
+        handle.file.sync_data()
+    }
+}
+```
+
+The `ClosedChannelException` type is the one deviation to argue about: this
+patch raises `IOException` to match `native_afc_truncate`'s existing refusal
+(`native-io/src/lib.rs:19008-19013`) rather than introducing a typed builder
+into a file that has none. If the two land together the typed one is better —
+`ClosedChannelException extends IOException`, so tightening later cannot break a
+handler, exactly as §3.1 row 19 argues.
+
+**8. The three remaining `FutureTask` mints → `aio_completed_future`.** Same
+edit at three sites; `use` is already in scope, the helper is `pub(crate)` in the
+same module tree, and `asc.connect` twenty lines away is the worked example. For
+`lock()` (`:1506-1516`) the whole closure body becomes
+
+```rust
+        |ctx, _args| aio_completed_future(ctx, Value::Object(None)),
+```
+
+**but this is a fabricated success even after the fix** — a `Future<FileLock>`
+completing with `null` is not what `lock()` promises, and the honest shapes are
+either (a) route it to `native_afc_try_lock`'s real OS-advisory-lock plumbing
+(`native-io/src/lib.rs:18955`) and complete the future with the resulting
+`sun/nio/ch/FileLockImpl`, or (b) delete the registration so the `final`
+bytecode runs and the missing `lock(JJZ)Future` becomes a loud
+`AbstractMethodError`. (a) is the right one and it is small, because the
+plumbing already exists for `tryLock()`. **Do not land the one-line version on
+its own**: it converts a hang into a `null` that a caller will dereference, and
+that is trading a loud failure for a quiet one — the mistake §1 records as
+W2-7 #1.
+
+For `assc.accept()` (`:1811-1821`) and the two dead `read`/`write` mints
+(`:1383`, `:1464`) the mechanical `aio_completed_future` swap is correct as-is —
+`accept()` has no channel to hand back, so it should complete with `null` only
+if the surrounding `open`/`bind` surface is also honest; otherwise the same
+argument as `lock()` applies and deletion is better. Either way, **no
+`java/util/concurrent/FutureTask` should be minted by field-index writes
+anywhere in this tree**, and a ratchet on that string in `net_channels.rs` is
+worth more than any of the individual fixes.
+
+**9. Correct `nio_native.rs:1344`'s layout comment.** It states
+`AsynchronousFileChannel = 3 fields (path_str=0, open=1, _unused=2)` in a file
+whose only surviving AFC body delegates to the crate that uses
+`fd=0, path=1, open=2`. The stale comment is what the `force` body was written
+against, and it is still there for the next reader. One line, and it should say
+which registrar allocates.
+
+### 9.7 What is scheduled, stated per row
+
+| finding | scheduled evidence today | after the nominations |
+|---|---|---|
+| `force` no-op | `RJdkAsyncChannel.writeReadRoundTrip` **calls it** (`:143-144`) and asserts only `isOpen()` — vacuous | the closed-channel refusal is assertable from Java; the fsync itself is not |
+| `lock()` hang | **none.** No fixture in `regression-suite/src` mentions `AsynchronousFileChannel.lock`; `probes/` holds only `AsyncCloseProbe`, and `run.sh` reads a word list, not `probes/` | a fixture that calls `ch.lock()` and `get(1, SECONDS)` distinguishes all three states — and must be *timed*, because the pre-fix behaviour is "never returns" and an untimed vector hangs the suite instead of failing it (the `WatchService` lesson, §7.4) |
+| `assc.accept()` hang | **none.** No fixture mentions `AsynchronousServerSocketChannel` at all | same shape |
+| `size()` after close | `RJdkAsyncChannel.sizeTruncateClose` exists; whether it asserts the exception *type* was not read | — |
+
+The `force` row is the one to take first, and the reason is that it is the only
+one of the three whose defect path a green suite is already walking.

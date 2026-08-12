@@ -42,6 +42,104 @@ Branch `fix/layout-over-allocation-live-defects-20260812`.
 > superclass-fields-take-the-low-slots rule, which W7-72 §1.1 re-derived
 > independently.
 
+> **SOURCE-VERIFICATION BANNER — 2026-08-12, triage pass (A28). Three rows of
+> this record are stale and one worry is closed. Everything else re-read holds.**
+>
+> Read against the tree, not against the record. What was *verified* is marked;
+> the rest of this record remains source-level argument as it always said.
+>
+> 1. **§4.3 and §10 are stale on `SC_OBJECT_SLOTS`.** This record says the
+>    constant is *"defined as `SSC_SOCKET_CACHE + 1`"*. **`SSC_SOCKET_CACHE` no
+>    longer exists anywhere in the tree** — W7-72 §1 moved the slot-5 cache to
+>    `ssc_socket_cache_table`, and took the constant with it. What is in
+>    `native-io/src/socket_channel.rs:796` today is a bare
+>    `const SC_OBJECT_SLOTS: usize = 6;` whose own doc states that **no native in
+>    that file addresses a channel object slot by index any more**, so the number
+>    encodes no slot map and is only a floor. Consequence: §10's *"largest single
+>    risk"* bullet — "if a later lane adds a second object slot there without
+>    raising the floor" — is **obsolete**, and the constant's doc already forbids
+>    the thing it warns about ("must go through the side table, not raise this").
+>    Also obsolete: the justification "6 is chosen precisely to keep
+>    `SSC_SOCKET_CACHE` in range". The value is now arbitrary-but-harmless, and
+>    the doc says to leave it alone for that reason.
+> 2. **§3's liveness table mis-files `servlet.rs`, in the direction that
+>    overstates open work.** The table lists `servlet.rs` under step 1,
+>    `register_essential_natives_with_shims`. Its **channel** registrars are not
+>    there: `register_s2_socket_channel` / `register_s2_server_socket_channel`
+>    have exactly one caller each (`register_s2_nio`,
+>    `native-builtins/src/servlet.rs:4666`–`:4667`), `register_s2_nio` has
+>    exactly one caller in the workspace (`native-builtins/src/lib.rs:24147`),
+>    and that line is inside `register_synthetic_overrides`, which spans
+>    `:21554`–`:24335` and is `#[cfg(feature = "synthetic-jdk")]`. **They are
+>    synthetic-only**, exactly like `net_channels.rs`'s `register_p58_nio_channels`
+>    (W7-88). This is the same trap W7-68 §3.2 fell into from the other side and
+>    W7-72 §2.1 named the rule for: *liveness of a registrar is a property of the
+>    call graph from `vm_init`, not of the file the registrations are in.*
+> 3. **§11 item 6 is therefore CLOSED in the real-JDK direction, and measured in
+>    the other.** The question was whether these classes are allocated at two
+>    widths in one run. They are allocated at **three**, and now all three are
+>    accounted for:
+>
+>    | producer | requests | its slot map | mode |
+>    |---|---:|---|---|
+>    | `native-io/src/socket_channel.rs` (`alloc_obj`, ×4) | `SC_OBJECT_SLOTS` = **6** | none — `chan_fields` side table | both (WINNER) |
+>    | `native-builtins/src/servlet.rs` `:7030 :7045 :7354 :7381` | **5** | `S2SC_*` 0..4 / `S2SSC_*` 0..4, written by INDEX | synthetic only |
+>    | `native-builtins/src/phases_late/net_channels.rs` `:85 :100 :512` | **4** | `SSC_P58_SLOT_MAP` 0..3 | synthetic only |
+>
+>    Against a fabricated width of **5** (`class_manager.rs:13479`–`:13480`,
+>    verified) and a declared width of **10**. In real-JDK mode the two narrow
+>    producers do not exist, so neither 4-slot nor 5-slot map can ever meet a real
+>    ten-field channel. In synthetic mode both maps land inside the fabricated
+>    five. **No aliasing is reachable from either, in any of the four
+>    configurations** — which is a stronger answer than "out of scope".
+>
+>    Worth stating because the write set is alarming and the reader should not
+>    have to re-derive that it is inert: `servlet.rs`'s `S2SC_OPEN = 1` would be
+>    `AbstractInterruptibleChannel.closed` on a real channel, and
+>    `set_field(ch, S2SC_OPEN, Int(1))` would make a real `isOpen()` answer
+>    **false** for a freshly opened channel. That is a worse shape than anything
+>    in §5 — and it is unreachable, for the call-graph reason in item 2 alone.
+> 4. **§6's second finding is still in the tree, unrepaired.**
+>    `classloading/src/class_manager.rs:13472`–`:13473` still reads
+>    `java/nio/channels/ServerSocketChannel = 1 (provider)` /
+>    `java/nio/channels/SocketChannel = 1 (provider)`, six and seven lines above
+>    the arms at `:13479`–`:13480` that fabricate both at **5**. Nomination N-1
+>    below.
+>
+> **Verified true and not to be re-derived:** `class_manager` fabricates
+> `TreeSet` 3 (`:12359`), `CompletableFuture` 4 (`:13095`), `InetSocketAddress` 3
+> (`:13328`), both channels 5 (`:13479`–`:13480`) — every fabricated width §4 and
+> §10 rest on. `CF_NUM_FIELDS = 2` (`native-collections/src/lib.rs:56126`), and
+> `CF_FIELD_SOURCE`/`CF_FIELD_HANDLER` survive only inside a doc comment, so
+> §4.2's deletion landed. `try_alloc_declared_width` exists (`:2703`) with nine
+> `TreeSet` callers, so §4.1 landed. **`register_selector` has no definition
+> anywhere in the workspace**, so §7's deletion landed.
+>
+> **Nomination N-1 — `classloading/src/class_manager.rs`, comment only.**
+> Exact old text (two consecutive lines, `:13472`–`:13473`):
+>
+> ```text
+>         // java/nio/channels/ServerSocketChannel = 1 (provider)
+>         // java/nio/channels/SocketChannel    = 1 (provider)
+> ```
+>
+> Exact new text:
+>
+> ```text
+>         // java/nio/channels/ServerSocketChannel = 5 — NOT 1. The comment read
+>         // "1 (provider)" until 2026-08-12, describing the REAL JDK class's own
+>         // declaration (`provider`) while the arm below fabricates five. The
+>         // real transitive width is 10, not 1 (four from
+>         // AbstractInterruptibleChannel, six from AbstractSelectableChannel);
+>         // see W7-72 §1.1 for the slot-by-slot derivation.
+>         // java/nio/channels/SocketChannel    = 5 — same, same reason.
+> ```
+>
+> This is the shape §6 calls the campaign's signature failure — a slot-map or
+> width comment describing a different layout from the code beneath it — sitting
+> five lines from the arm it misdescribes, in the file every fabricated width in
+> this record is read from.
+
 ## 1. The correction this record exists for
 
 **The `over` direction is not, on its own, a defect predicate — and W7-49's own
