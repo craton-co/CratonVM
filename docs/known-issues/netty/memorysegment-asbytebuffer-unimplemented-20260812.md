@@ -58,8 +58,12 @@ interleaved, same box, same binary):
 | default (`hasUnsafe=true`) | 535 s / 500 s | 126 | 0 |
 | `-Dio.netty.noUnsafe=true` | 77 s / 77 s | **17** | **109** |
 
-The 7× speed difference in that table is a second, independent finding — see
-[adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md).
+The wall-time difference in that table is **not** a speedup and must not be
+read as one: arm B exits 109 of 127 tests early on this very defect, so it does
+far less work. That misreading is retracted in
+[adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md),
+which re-measured the gap with a census and `perf`. What the table *is* good
+for is this page's own point — the failure is 100% reproducible and single-cause.
 
 ## Scope
 

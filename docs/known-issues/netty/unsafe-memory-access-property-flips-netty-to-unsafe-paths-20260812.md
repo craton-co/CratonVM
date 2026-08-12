@@ -91,9 +91,16 @@ Two consequences:
   Matching HotSpot's property set today would take netty from mostly-green to
   mostly-red. The property is not just a `StackWalker` workaround any more; it
   is what keeps netty off an unimplemented path.
-* Arm B being **7× faster** on identical Java work is its own finding about
-  CratonVM's Unsafe natives →
-  [adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md).
+* ~~Arm B being **7× faster** on identical Java work is its own finding about
+  CratonVM's Unsafe natives.~~ **RETRACTED 2026-08-12.** The two arms do not do
+  the same work: 109 of arm B's 127 tests fail early on
+  `MemorySegment.asByteBuffer()`, so it exits the work rather than doing it
+  faster — and a native-invocation census shows it issues *more* native calls
+  than arm A while taking a sixth of the time. The arm is a good
+  `MemorySegment` reproducer and worthless as a throughput instrument. See
+  [adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md),
+  which re-measured this properly and also refutes the Unsafe natives as the
+  cost (0.086% of native invocations).
 
 ## Impact
 

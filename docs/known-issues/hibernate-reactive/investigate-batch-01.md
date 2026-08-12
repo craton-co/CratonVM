@@ -1,35 +1,77 @@
-# hibernate-reactive — investigate batch 01 of 6
+# hibernate-reactive — investigate batch 01 of 6 — CLOSED
 
-> **STALE AS A DEFECT LIST (2026-08-12).** Both blockers this list was collected behind — the SASL/SCRAM handshake failure and the JNA `Native.<clinit>` NPE — were root-caused and fixed the same day, and a 40-class rerun of the head of `testlist.txt` on the Azure host afterwards recorded PASS=39 NOTESTS=1 with no `before()` timeout at all. Regenerate from a full run before working these classes one by one; see `docs/internal/fixed-suite-bugs/hibernate-reactive/testcontainers-jackson-jit-stall-blocks-eventloop-20260812-FIXED.md`.
+> **CLOSED 2026-08-12.** All 12 classes were re-run per class, per GC variant,
+> against the dev tip (`ad7b496ef`) with a HotSpot JDK 25 control on the same
+> classpath. **11 of the 12 were already green** — they were collected behind
+> the SASL/SCRAM and JNA blockers, exactly as the stale banner this page used to
+> carry predicted. The twelfth, `BatchingConnectionTest`, hid a real CratonVM
+> defect behind them: a young-GC livelock under `-XX:+UseGenerationalGC`, now
+> fixed. See "Result" below. Batches 02-06 are untouched and still owe the same
+> per-class check.
 
-**No investigation done — class names and repro only.** Part of a 71-class FAIL/HANG list split across 6 pages (see [investigate-INDEX.md](investigate-INDEX.md)) so work doesn't overlap. This page owns exactly the 12 classes below — do not touch classes listed in other batch pages.
+Part of a 71-class FAIL/HANG list split across 6 pages (see
+[investigate-INDEX.md](investigate-INDEX.md)). This page owns exactly the 12
+classes below — do not touch classes listed in other batch pages.
 
-Found during a **partial** 3-GC-variant (default/G1/ZGC) PostgreSQL run on Azure host `azureuser@20.80.105.49` (stopped early after ~15-28min once a dominant blocker was identified — see `docs/internal/fixed-suite-bugs/vertx-pg-sasl-scram-handshake-fails-20260812-FIXED.md`). **Most of these classes are LIKELY hitting that same SASL/SCRAM handshake bug** (it blocks session-open for virtually every DB-required test), but that has NOT been confirmed per-class — each class here still needs its own check to rule out a distinct, unrelated defect hiding behind the dominant one. "status seen" reflects what each GC variant's partial run actually recorded before it was stopped; the 3 variants did not all reach the same point in the class list (G1 got further, ~77 classes attempted vs ~28-29 for default/zgc), so absence from a variant's column means "not reached," not "passed." A class showing both FAIL and HANG across variants (`FAIL/HANG`) is raw observed flakiness near the run's stop point, not yet explained. Also set `DOCKER_HOST=unix:///var/run/docker.sock` before reproducing (works around a separate, already-documented JNA NPE in Testcontainers' Docker-strategy probe — `docs/internal/fixed-suite-bugs/jna-native-clinit-nativeversion-npe-20260812-FIXED.md` — without it you'll hit that bug instead of reaching these classes at all).
+The original list was collected during a **partial** 3-GC-variant
+(default/G1/ZGC) PostgreSQL run on Azure host `azureuser@20.80.105.49`, stopped
+early once a dominant blocker was identified. Every FAIL on it carried the
+runner's `NO-DB: connection-refused` signature, i.e. the session never opened —
+the SASL/SCRAM bug (retired
+`vertx-pg-sasl-scram-handshake-fails-20260812-FIXED` write-up), with the JNA
+`Native.<clinit>` NPE in front of it.
 
-## Classes
+## Result
 
-| class | status seen | GC variant(s) |
-|---|---|---|
-| `org.hibernate.reactive.BatchFetchTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.BatchQueryOnConnectionTest` | FAIL/HANG | default=HANG, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.BatchingConnectionTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.BeforeExecutionIdGeneratorTypeTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.BlockSequenceGeneratorTest` | FAIL/HANG | default=FAIL, g1=FAIL, zgc=HANG |
-| `org.hibernate.reactive.BlockTableGeneratorTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.CacheTest` | FAIL/HANG | default=FAIL, g1=HANG, zgc=FAIL |
-| `org.hibernate.reactive.CachedQueryResultsGenerateStatisticsTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.CachedQueryResultsTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.CascadeComplicatedTest` | FAIL/HANG | default=FAIL, g1=FAIL, zgc=HANG |
-| `org.hibernate.reactive.CascadeComplicatedToOnesEagerTest` | FAIL/HANG | default=HANG, g1=FAIL, zgc=FAIL |
-| `org.hibernate.reactive.CascadeTest` | FAIL | default=FAIL, g1=FAIL, zgc=FAIL |
+Each class run one-per-process, `--Xmx 1500m`, `-Dcraton.batch=1`,
+`DOCKER_HOST=unix:///var/run/docker.sock`, Testcontainers `postgres:18.4`.
+
+| class | HotSpot 25 | dev tip, default (ZGC) | G1 | Generational | after fix |
+|---|---|---|---|---|---|
+| `BatchFetchTest` | PASS | PASS | PASS | PASS | PASS |
+| `BatchQueryOnConnectionTest` | PASS | PASS | PASS | PASS | PASS |
+| `BatchingConnectionTest` | PASS | PASS | PASS | **HANG/FAIL 4 of 6** | PASS |
+| `BeforeExecutionIdGeneratorTypeTest` | PASS | PASS | PASS | PASS | PASS |
+| `BlockSequenceGeneratorTest` | PASS | PASS | PASS | PASS | PASS |
+| `BlockTableGeneratorTest` | PASS | PASS | PASS | PASS | PASS |
+| `CacheTest` | PASS | PASS | PASS | PASS | PASS |
+| `CachedQueryResultsGenerateStatisticsTest` | PASS | PASS | PASS | PASS | PASS |
+| `CachedQueryResultsTest` | PASS | PASS | PASS | PASS | PASS |
+| `CascadeComplicatedTest` | PASS | PASS | PASS | PASS | PASS |
+| `CascadeComplicatedToOnesEagerTest` | PASS | PASS | PASS | PASS | PASS |
+| `CascadeTest` | PASS | PASS | PASS | PASS | PASS |
+
+Test counts match HotSpot's exactly in every green cell (e.g.
+`BatchingConnectionTest` found=62 ok=61 skipped=1 on both), so these are real
+passes and not a discovery that quietly found nothing.
+
+**The defect:** `BatchingConnectionTest` timed out under
+`-XX:+UseGenerationalGC` because the young non-moving sweep discarded ~40 700
+reclaim decisions per cycle over 2 352 bytes of dead, all-zero-header
+`new Object()`s. Fixed in `gc/src/gen_heap.rs`
+(`zero_run_is_empty_object_run`); the write-up is the retired
+`young-sweep-empty-object-run-unwind-20260812-FIXED` record. It is a general GC
+defect — nothing about Hibernate Reactive, batching, or Postgres — that any
+allocation-heavy workload can hit when the generational collector is selected
+and the JIT has compiled anything.
+
+**Still open, from the same investigation:**
+[young-walk-zero-run-sibling-sites.md](young-walk-zero-run-sibling-sites.md) —
+seven more walk sites in `gc/src/gen_heap.rs` misread the same benign shape.
+Throughput and over-retention, not a hang.
 
 ## Repro
 
 ```bash
 cd apps/hibernate-reactive-suite-runner   # on azureuser@20.80.105.49, /data/cratonvm
 export DOCKER_HOST=unix:///var/run/docker.sock
-./cratonvm-hibreactive-default-wrapper.sh @common.args -Dcraton.batch=1 CratonRunner <ClassName>
-# swap the -default- wrapper for -g1- / -zgc- to match the variant(s) that showed the failure
-# HotSpot cross-check: run the same class/classpath under stock HotSpot (JDK 25) with the same DOCKER_HOST set
+export TESTCONTAINERS_RYUK_DISABLED=true
+<cratonvm> --java-home /data/toolchain/jdk-25 --Xmx 1500m -XX:+UseGenerationalGC \
+    @common.args -Dcraton.batch=1 CratonRunner <ClassName>
+# swap -XX:+UseGenerationalGC for -XX:+UseG1GC / -XX:+UseZGC / nothing (= ZGC)
+# HotSpot control: $JAVA_HOME/bin/java @common.args -Dcraton.batch=1 CratonRunner <ClassName>
 ```
 
+Note for the other batches: **the no-flag default is ZGC**, so a run with no GC
+flag does not exercise the generational collector at all. Batch 01's one real
+defect was invisible in three of the four configurations.

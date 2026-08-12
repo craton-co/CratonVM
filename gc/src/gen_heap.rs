@@ -414,6 +414,16 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Zero runs the young walk recognised as a run of EMPTY objects and stepped
+/// over on-grid, instead of treating as a desync — see
+/// [`zero_run_is_empty_object_run`]. Deliberately a SEPARATE counter from
+/// [`SWEEP_ZERO_SPAN_HITS`], which now counts only the runs that still take the
+/// unwind: this shape is normal and frequent (147 per young cycle on the
+/// hibernate-reactive repro), so folding the two together would turn its
+/// arrival into apparent corruption. Like its siblings above it has no printer
+/// — it is read from a debugger or an instrumented repro build.
+pub static SWEEP_ZERO_SPAN_EMPTY_RUNS: AtomicU64 = AtomicU64::new(0);
+
 /// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
 /// striding OVER the watched base, inside some earlier object's computed
 /// extent. Bounds the log: a desynced grid can straddle one watched address on
@@ -9860,6 +9870,23 @@ impl GenerationalHeap {
                 // header below, instead of unwinding every reclaim decision
                 // taken since the last anchor for an ordinary live object.
                 let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                // A run of EMPTY objects is not a desync — step over it on-grid
+                // and keep every reclaim decision behind it. See
+                // `zero_run_is_empty_object_run` for the measurement that
+                // separates this shape from the corruption the unwind below
+                // exists for. Still never parsed and never freed: over-retention
+                // is always safe here.
+                if run_end - cursor >= HEADER_SIZE
+                    && !vouched_live
+                    && zero_run_is_empty_object_run(from_base, cursor, run_end, used, &side_sorted)
+                {
+                    SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
+                    // `run_end <= limit` (the next free block's offset), so the
+                    // run never crosses a free block and `free_iter` is already
+                    // positioned correctly.
+                    cursor = run_end;
+                    continue;
+                }
                 if run_end - cursor >= HEADER_SIZE && !vouched_live {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
@@ -16411,6 +16438,78 @@ fn next_grid_anchor(anchors: &[usize], after: usize) -> Option<usize> {
     anchors.get(anchors.partition_point(|&a| a <= after)).copied()
 }
 
+/// Is the all-zero run `[cursor, run_end)` a run of EMPTY objects rather than
+/// evidence that the walk left the object grid?
+///
+/// An empty object — `ClassId(0)`, `kind = Object` (tag 0), `num_slots = 0`,
+/// identity hash not yet minted — is HEADER_SIZE all-zero bytes, and
+/// [`gen_object_total_size`] sizes it at exactly HEADER_SIZE. That has been an
+/// ordinary, common allocation ever since HEADER_SIZE shrank 24 -> 16 made the
+/// mark word the second header word and the JIT's `new Object()` fast path left
+/// it zero (`jit/src/x64/objects.rs`; the interpreter mints the hash eagerly,
+/// which is why `--nojit` never saw this). A DEAD one is unmarked, so the
+/// sweep's `side_sorted` cannot vouch for it, and it used to fall into the
+/// unlisted-zero-span anomaly path — which unwinds every reclaim decision taken
+/// since the last grid anchor.
+///
+/// Measured on `org.hibernate.reactive.BatchingConnectionTest` under
+/// `-XX:+UseGenerationalGC` (a live JIT frame forces the non-moving sweep, so
+/// every young cycle takes that walk): 147 such spans per cycle, EVERY one
+/// exactly 16 bytes, 2352 bytes in total — and they discarded 40 724 dead
+/// regions, leaving 22. The sweep reclaimed 789 KB of a 187 MB young
+/// generation, `live` never fell back under the collection trigger, and the
+/// collector ran continuously until the test's 120 s cap fired. No other
+/// desync guard fired on those cycles (phantom extents 0, implausible sizes 0,
+/// free-hole overlaps 0) — which is what says these runs were the benign shape
+/// and not evidence of anything.
+///
+/// The three conditions are exactly what makes resuming at `run_end` on-grid:
+///
+/// 1. the run is a whole number of HEADER_SIZE object slots;
+/// 2. no marked object BASE starts strictly inside it (one at `cursor` is the
+///    caller's `vouched_live` case, which parses normally instead);
+/// 3. the header at `run_end` itself sizes plausibly, or the run ends the
+///    arena.
+///
+/// Anything else — notably a long unlisted zeroed span, the shape that
+/// abandoned 233 MB of a 256 MB young generation in
+/// `jit-young-heap-exhaustion-after-header-16-FIXED-20260807` — still takes the
+/// unwind. This says nothing about whether the run is garbage: the caller
+/// STEPS OVER it and never frees it, because the span may equally be a live
+/// allocation whose header a stale register-held reference clobbered.
+///
+/// # Safety contract
+///
+/// `[base + cursor, base + used)` must be mapped from-space, and `run_end` must
+/// be the end of an all-zero run starting at `cursor` (so `run_end <= used`).
+fn zero_run_is_empty_object_run(
+    base: usize,
+    cursor: usize,
+    run_end: usize,
+    used: usize,
+    side_sorted: &[usize],
+) -> bool {
+    if (run_end - cursor) % HEADER_SIZE != 0 {
+        return false;
+    }
+    // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
+    // ascending, so the only candidate is the last entry below `run_end`.
+    let hi = base + run_end;
+    let i = side_sorted.partition_point(|&a| a < hi);
+    if i > 0 && side_sorted[i - 1] > base + cursor {
+        return false;
+    }
+    if run_end >= used {
+        return true;
+    }
+    // SAFETY: `run_end < used` and the run is HEADER_SIZE-aligned from an
+    // on-grid `cursor`, so `base + run_end` is a header-aligned address inside
+    // the mapped from-space region the caller guarantees.
+    let next = unsafe { &*((base + run_end) as *const ObjectHeader) };
+    let size = gen_object_total_size(next);
+    size >= HEADER_SIZE && run_end + size <= used
+}
+
 fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
     let mut r = start;
     // SAFETY: (caller contract) the scanned range is mapped arena memory.
@@ -16718,6 +16817,120 @@ impl GarbageCollector for GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `h` into `buf` at `off` bytes and return the buffer's base
+    /// address. `Vec<u64>` gives the 8-byte alignment `ObjectHeader` needs.
+    fn put_header(buf: &mut [u64], off: usize, h: ObjectHeader) -> usize {
+        let base = buf.as_mut_ptr() as usize;
+        // SAFETY: `off + HEADER_SIZE <= buf.len() * 8` is the caller's job in
+        // these tests; `base + off` is 8-aligned.
+        unsafe { std::ptr::write((base + off) as *mut ObjectHeader, h) };
+        base
+    }
+
+    /// A plausible legacy object header: `HEADER_SIZE + num_slots * SLOT_SIZE`.
+    fn plain_object(num_slots: u32) -> ObjectHeader {
+        ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            num_slots,
+        )
+    }
+
+    /// The whole point of the predicate: ONE empty object's worth of zeros,
+    /// followed by a real header, is the benign shape.
+    ///
+    /// This is the regression guard for the retired
+    /// `young-sweep-empty-object-run-unwind-20260812-FIXED` write-up:
+    /// answering `false` here is what made the young non-moving sweep unwind
+    /// 40 724 reclaim decisions per cycle and wedge the collector.
+    #[test]
+    fn one_empty_object_of_zeros_is_not_a_desync() {
+        let mut buf = vec![0u64; 8]; // 64 bytes
+        let base = put_header(&mut buf, HEADER_SIZE, plain_object(2));
+        assert!(zero_run_is_empty_object_run(base, 0, HEADER_SIZE, 64, &[]));
+    }
+
+    /// Several empty objects in a row are still empty objects.
+    #[test]
+    fn several_empty_objects_of_zeros_are_not_a_desync() {
+        let mut buf = vec![0u64; 16]; // 128 bytes
+        let base = put_header(&mut buf, 3 * HEADER_SIZE, plain_object(1));
+        assert!(zero_run_is_empty_object_run(
+            base,
+            0,
+            3 * HEADER_SIZE,
+            128,
+            &[]
+        ));
+    }
+
+    /// A zero run that is not a whole number of object slots cannot be a run of
+    /// objects, so resuming at its end would resume off-grid.
+    #[test]
+    fn a_misaligned_zero_run_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, HEADER_SIZE + 8, plain_object(1));
+        assert!(!zero_run_is_empty_object_run(
+            base,
+            0,
+            HEADER_SIZE + 8,
+            64,
+            &[]
+        ));
+    }
+
+    /// A marked object starting INSIDE the run means the run is not a sequence
+    /// of whole dead objects — the walk is somewhere it should not be.
+    #[test]
+    fn a_live_base_inside_the_run_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        let live = base + HEADER_SIZE;
+        assert!(!zero_run_is_empty_object_run(
+            base,
+            0,
+            2 * HEADER_SIZE,
+            64,
+            &[live]
+        ));
+    }
+
+    /// A live base AT the run start is the caller's `vouched_live` case and
+    /// never reaches here; a live base at or before `cursor` must not veto.
+    #[test]
+    fn a_live_base_before_the_run_does_not_veto() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        assert!(zero_run_is_empty_object_run(
+            base,
+            HEADER_SIZE,
+            2 * HEADER_SIZE,
+            64,
+            &[base]
+        ));
+    }
+
+    /// A run that reaches the end of the used region has no following header to
+    /// check, and nothing after it to resynchronise with.
+    #[test]
+    fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
+        let mut buf = vec![0u64; 4];
+        let base = buf.as_mut_ptr() as usize;
+        assert!(zero_run_is_empty_object_run(base, 0, 32, 32, &[]));
+    }
+
+    /// If the header the run lands on does not size plausibly, `run_end` is not
+    /// a believable object start and the unwind path must keep it.
+    #[test]
+    fn an_implausible_header_after_the_run_is_still_a_desync() {
+        let mut buf = vec![0u64; 8];
+        // 4096 slots = 32 KiB, far past the 64-byte `used` bound.
+        let base = put_header(&mut buf, HEADER_SIZE, plain_object(4096));
+        assert!(!zero_run_is_empty_object_run(base, 0, HEADER_SIZE, 64, &[]));
+    }
 
     /// H2-CID0 (2026-08-05) — "nobody looked" must not read as "nothing found".
     ///
