@@ -1,4 +1,24 @@
-# P4-B: why `--synthetic-jdk` MODE has never been run
+# P4-B: `--synthetic-jdk` MODE requires its own binary
+
+> **Correction, same day.** This document was first titled "why it has never
+> been run", following the roadmap's "it has never been executed, ever". A lane
+> auditing the corpora falsified that: `apps/h2database-suite-runner/RESULTS-20260721.md:91-95`
+> records a synthetic-mode boot failing on a *missing synthetic stub*, and four
+> runners pass the flag today. The defensible restatement is **the
+> `--features synthetic-jdk` binary has never been run in that mode by this
+> campaign, and no `RJdk*` vector ever has** — nothing gating
+> (`regression-suite/`, CI, `scripts/`) launches the mode; CI runs
+> `cargo check`/`test` and never the binary. The measurement below stands
+> unchanged and is the more useful fact: the mode cannot be reached from a
+> shipping binary at all.
+>
+> Also corrected by that lane: `--synthetic-jdk` **is** a runtime flag
+> (`vm-cli/src/main.rs:312`); there are three runtime selections, `--jdk-only`
+> implies `JdkMode::Real`, the launcher default is `Real` and the **embedded**
+> default is `Synthetic`. The original "feature ≠ mode" note was right about the
+> distinction and wrong to imply the mode had no flag.
+
+
 
 **Measured 2026-08-12 on `cratonvm-merged-dev` (dev tip `210703b7a`).**
 
