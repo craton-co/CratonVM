@@ -289,16 +289,86 @@ pub(crate) fn native_get_caller_class(
     Ok(Some(Value::Object(None)))
 }
 
+/// Canonical fallback constant list, used only when the loaded class reports
+/// no enum-typed static fields (a stripped synthetic stand-in). Declaration
+/// order IS ordinal order, so this mirrors the JDK source order.
+const OPTION_FALLBACK_CONSTANTS: [&str; 4] = [
+    "RETAIN_CLASS_REFERENCE",
+    "DROP_METHOD_INFO",
+    "SHOW_REFLECT_FRAMES",
+    "SHOW_HIDDEN_FRAMES",
+];
+
+/// Names of the enum constants `java.lang.StackWalker$Option` declares, in
+/// declaration (= ordinal) order.
+///
+/// Read from the loaded class rather than hard-coded: `DROP_METHOD_INFO` only
+/// exists from JDK 22, so a fixed list is wrong on one JDK or the other. Enum
+/// constants are exactly the static fields whose descriptor is the enum type
+/// itself, which excludes `$VALUES` (an array) and any other static.
+fn option_constant_names(ctx: &dyn NativeContext, class_name: &str) -> Vec<String> {
+    let self_descriptor = format!("L{class_name};");
+    let names: Vec<String> = match ctx.class_id_by_name(class_name) {
+        Some(cid) => ctx
+            .declared_fields(cid)
+            .into_iter()
+            .filter(|f| f.is_static && f.descriptor == self_descriptor)
+            .map(|f| f.name)
+            .collect(),
+        None => Vec::new(),
+    };
+    if names.is_empty() {
+        return OPTION_FALLBACK_CONSTANTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+    names
+}
+
+/// `java.lang.StackWalker$Option.<clinit>`.
+///
+/// Builds REAL enum constants — `name` and `ordinal` populated — not bare
+/// instances. A nameless constant is not merely cosmetic: `Enum.valueOf`
+/// resolves by comparing `name`, so nameless constants make
+/// `Option.valueOf("SHOW_REFLECT_FRAMES")` (and every other name) throw
+/// `IllegalArgumentException: No enum constant`. Mockito's
+/// `Java9PlusLocationImpl.<clinit>` does exactly that lookup, so it died with
+/// `ExceptionInInitializerError` and every Mockito-based test class failed
+/// wholesale — 7 of the 19 netty `io.netty.util` classes in
+/// `docs/known-issues/netty/investigate-batch-12.md` / `-13.md`.
+///
+/// The constant set is read from the loaded class (see
+/// `option_constant_names`) so the array matches whichever JDK is in use, and
+/// `$VALUES` is built in declaration order so `ordinal()` agrees with
+/// `values()[i]`.
 fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let class_name = "java/lang/StackWalker$Option";
-    let mut values = Vec::with_capacity(3);
+    let names = option_constant_names(ctx, class_name);
+    let mut values = Vec::with_capacity(names.len());
 
-    for name in [
-        "RETAIN_CLASS_REFERENCE",
-        "SHOW_HIDDEN_FRAMES",
-        "SHOW_REFLECT_FRAMES",
-    ] {
-        let option = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
+    for (ordinal, name) in names.iter().enumerate() {
+        // 2 slots = java.lang.Enum's (name, ordinal), the layout every other
+        // synthetic JDK enum in this crate uses (see `p57_alloc_enum`).
+        let option = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
+        // Pin across `create_string`: a moving young GC there would relocate
+        // the freshly allocated constant (native stale-local family).
+        let pin = ctx.pin_native_root(option);
+        let name_str = ctx.create_string(name);
+        let option = ctx.read_native_pin(pin, option);
+        ctx.set_field_by_name(option, "name", Value::Object(Some(name_str)));
+        ctx.set_field_by_name(option, "ordinal", Value::Int(ordinal as i32));
+        // `set_field_by_name` is a NO-OP when the field is absent, which is the
+        // case for a stripped synthetic stand-in that declares no `java.lang.Enum`
+        // superclass fields. Fall back to Enum's (name, ordinal) slot convention
+        // — the same one `p57_alloc_enum` writes positionally — but only when the
+        // by-name write demonstrably did not land, so a real-JDK layout is never
+        // written through blind slot indices.
+        if !matches!(ctx.get_field_by_name(option, "name"), Value::Object(Some(_))) {
+            ctx.set_field(option, 0, Value::Object(Some(name_str)));
+            ctx.set_field(option, 1, Value::Int(ordinal as i32));
+        }
+        ctx.unpin_native_roots(pin);
         ctx.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
         values.push(option);
     }

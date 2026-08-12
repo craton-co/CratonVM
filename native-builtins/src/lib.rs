@@ -10923,15 +10923,25 @@ pub fn register_essential_natives_with_shims(
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
     // `SyntheticStub` for the same reason as the latch above.
-    let surefire_cb = "java/util/concurrent/CyclicBarrier";
-    registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
-    registry.register_with_kind(
-        surefire_cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-        cratonvm_native_api::NativeKind::SyntheticStub,
-    );
+    //
+    // Gated on `synthetic_aqs` for the same reason as Semaphore above, and it
+    // matters MORE here: `native_cb_init` parks its int[3] state holder in the
+    // receiver's slot 0, which on the real JDK layout is the `lock`
+    // ReentrantLock field. Registering only the constructors while `await()`
+    // runs real bytecode would hand that bytecode a barrier whose `lock` is an
+    // int[] — so these two must live or die with the `await` natives in
+    // `util_concurrent_ext::register_concurrent_natives`.
+    if synthetic_aqs {
+        let surefire_cb = "java/util/concurrent/CyclicBarrier";
+        registry.register_with_kind(surefire_cb, "<init>", "(I)V", native_cb_init, cratonvm_native_api::NativeKind::SyntheticStub);
+        registry.register_with_kind(
+            surefire_cb,
+            "<init>",
+            "(ILjava/lang/Runnable;)V",
+            native_cb_init_action,
+            cratonvm_native_api::NativeKind::SyntheticStub,
+        );
+    }
     // If CommandReader.<clinit> still fails, surefire wraps the cause in
     // UnsatisfiedLinkError / ExceptionInInitializerError very early.
     registry.register(
