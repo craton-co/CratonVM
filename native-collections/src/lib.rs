@@ -5962,37 +5962,18 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
-    // toArray(T[]) / toArray(IntFunction) — delegate through a fresh snapshot
-    // ArrayList (which registers both overloads). Without these, a caller doing
-    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher, and
-    // ~every ESTestCase via ES-FAIL-04) hits a NoSuchMethodError on the
-    // synthetic ASL class and aborts.
-    r.register(
-        c,
-        "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-        |ctx, args| {
-            asl_delegate_snapshot(
-                ctx,
-                args,
-                "toArray",
-                "([Ljava/lang/Object;)[Ljava/lang/Object;",
-            )
-        },
-    );
-    r.register(
-        c,
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-        |ctx, args| {
-            asl_delegate_snapshot(
-                ctx,
-                args,
-                "toArray",
-                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-            )
-        },
-    );
+    // `toArray(T[])` and `toArray(IntFunction)` are registered ONCE, further
+    // down this same function under "REGRESSION FIX (hibernate-smoke)".
+    //
+    // A byte-identical second pair used to sit here: two independent regression
+    // fixes — the JUnit Platform launcher and ~every ESTestCase via ES-FAIL-04
+    // here, Hibernate's metadata collector there — each added the same two
+    // registrations without noticing the other. Registration is
+    // last-write-wins, so this pair could only ever LOSE the slot, and
+    // `duplicate_registration_gate` counted both rows as shadowed. The callers
+    // named by both fixes are served by the surviving pair, which has the same
+    // body (`asl_delegate_snapshot` with the same descriptors), so deleting
+    // this one changes no behaviour. Do not re-add a pair here.
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
     // these, an interface-level `Collection`/`List` native would be reached

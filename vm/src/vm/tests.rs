@@ -51070,7 +51070,7 @@ use std::sync::Arc;
             cf,
             "getInstance",
             "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-            &[x509],
+            &[Value::Object(Some(x509))],
         )
         .unwrap()
         .unwrap();
