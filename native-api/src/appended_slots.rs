@@ -55,7 +55,11 @@
 //! registration and about which subclasses declare the method with `Code`, and
 //! has to be made per call site, in place.
 
-use crate::registry::NativeContext;
+// `NativeClassAccess` is the trait that actually declares
+// `is_class_synthetic_stub` / `ensure_class_initialized` /
+// `class_num_total_fields`; `NativeContext` is the empty aggregate over the
+// access traits, so it alone does not bring those methods into scope.
+use crate::registry::{NativeClassAccess, NativeContext};
 
 /// The private-slot base for `class_name`, loading and initialising it first.
 ///

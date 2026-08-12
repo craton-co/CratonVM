@@ -16732,11 +16732,15 @@ fn native_file_lock_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// may have swapped pages out, but they are still "loaded" in the JLS
 /// sense — `java.nio.MappedByteBuffer.isLoaded` is explicitly a hint).
 fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // The base FIRST, before any ObjectRef is in a bare local: it goes
+    // through `ensure_class_initialized`, which is GC-capable in principle
+    // even though the class is loaded by construction on every path that
+    // can reach here (you cannot hold a MappedByteBuffer otherwise).
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
@@ -16760,11 +16764,11 @@ fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// both POSIX and Windows; the compiler-fence prevents the read from
 /// being elided.
 fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
@@ -16803,18 +16807,18 @@ fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `FlushViewOfFile` (memmap2 abstracts both). No-op for read-only
 /// mappings and for the array-backed fallback.
 fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
     if id != 0 {
         // 1. Sync Java byte[] → kernel mapping for writable maps.
-        mmap_sync_back_from_java(ctx, this).map_err(|e| RuntimeError::IOException {
+        mmap_sync_back_from_java(ctx, this, mbb_base).map_err(|e| RuntimeError::IOException {
             message: format!("MappedByteBuffer.force: sync back: {e}"),
         })?;
         // 2. Flush kernel mapping to disk.
@@ -16831,6 +16835,7 @@ fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// FileChannel.unmap0(MappedByteBuffer) — drops the kernel mapping.
 /// Safe to call more than once.
 fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     // Accept either (this, mbb) from instance form or (mbb) from static form.
     let target = match args.iter().rev().find_map(|v| match v {
         Value::Object(Some(o)) => Some(*o),
@@ -16839,7 +16844,6 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(None),
     };
-    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let id = match ctx.get_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(None),
@@ -17098,8 +17102,8 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     mmap_registry().lock().insert(id, entry);
 
     let writable = matches!(mode, FcMapMode::ReadWrite | FcMapMode::Private);
-    let mbb = alloc_mapped_byte_buffer(ctx, size);
     let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let mbb = alloc_mapped_byte_buffer(ctx, size);
     ctx.set_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(id));
     ctx.set_field(
         mbb,
@@ -17121,8 +17125,16 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 /// Synchronize the Java byte[] view into the kernel mapping for
 /// read-write / private mappings. Invoked by `force` prior to msync.
-fn mmap_sync_back_from_java(ctx: &mut dyn NativeContext, mbb: ObjectRef) -> std::io::Result<()> {
-    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+///
+/// `mbb_base` is passed in rather than resolved here: resolving it would put a
+/// GC-capable `ensure_class_initialized` between this function's entry and its
+/// first read of `mbb`, which arrives as a bare `ObjectRef` local from the
+/// caller. The caller already has the base.
+fn mmap_sync_back_from_java(
+    ctx: &mut dyn NativeContext,
+    mbb: ObjectRef,
+    mbb_base: usize,
+) -> std::io::Result<()> {
     let id = match ctx.get_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(()),
