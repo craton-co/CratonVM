@@ -20,7 +20,7 @@ gates), `vm/tests/probe_compile_guard.rs`, `vm/tests/common/mod.rs`.
 | Rust `#[test]` fns examined | — | **16,376** across 13 crates |
 | Java vectors examined | 55, for two shapes | **72 / 72**, executed, 7 mutated |
 | findings | 6 | **67**, plus a population of 23 fixtures / ~286 call sites |
-| proved by MUTATION | 4 | **14** |
+| proved by MUTATION | 4 | **17** |
 | fixed here | 4 | 7 fixtures + 33 tests + 3 gates armed |
 
 **Round 1's estimate of its own §3.2 was low by half.** It reported eleven
@@ -350,9 +350,18 @@ last statement".
 | `RDataInputFastPull` | 19 | **1** |
 | `RClassUnloadSweep` | 2 | **1** |
 
-All three are **proved by mutation**: a mutant reproducing the defect the vector
-was written for changes up to 29 of the observables and leaves the filtered
-output byte-identical. `RForeignLayoutCollections` is the sharpest case — it has
+All three are **proved by mutation**, and `RDataInputFastPull` was measured
+side by side against its own repair, which is the cleanest evidence in the lane.
+The same one-line defect — a typed read that drops the high byte of
+`readShort()`, i.e. exactly the partial fast pull the vector exists to catch —
+applied to both versions:
+
+| | exit | filtered output |
+| --- | --- | --- |
+| pre-repair (`HEAD`) | **rc=0** | `PASS RDataInputFastPull` — **byte-identical to the clean run** |
+| post-repair | rc=1 | 24 lines &rarr; 2, and `typed.buf1.acc = -8864145947552760507, want -2285467307761758651` |
+
+The broken implementation passed. That is the whole finding, in one run. `RForeignLayoutCollections` is the sharpest case — it has
 zero `check()` calls, and its `safe()` helper turns a thrown `Throwable` into an
 `"EXC:…"` string that also lands on a deleted line, so the success path and the
 total-failure path produce identical filtered stdout. Its header claims
@@ -521,7 +530,13 @@ green today and red the moment it should be.
 
 ## 3. What is fixed here, and what is only recorded
 
-**Fixed:** the 7 fixtures and the census ratchet (§1.1); the
+**Fixed:** the three filtered vectors of §2.5 —
+`RForeignLayoutCollections` (0 &rarr; 42 observables reaching the diff, plus
+local assertions against measured values, mutation-checked with two mutants),
+`RDataInputFastPull` (1 &rarr; 22, mutation-checked side by side against its own
+pre-repair version) and `RClassUnloadSweep` (kept deliberately diff-only, with
+the reason recorded in the file); the two `native-api/src/init_level.rs` tests;
+the 7 fixtures and the census ratchet (§1.1); the
 `CRATONVM_REQUIRE_E2E` producer, the consumer test and the workflow guard
 (§1.2); the gaussian test (§2.2) and all 22 over-wide tolerances (§2.6);
 `STRICT_COVERAGE` (§2.7); the
@@ -529,8 +544,18 @@ green today and red the moment it should be.
 harnesses; and the Rust and Java repairs listed in the commit log for this
 branch.
 
-**Recorded and not fixed**, with the reason in each case: the 16 remaining
-fixtures (§1.1); F27's `gpu-offload` tests (a placement decision for that
+A note on the repairs themselves: **a constant assertion was written and then
+deleted during the `RClassUnloadSweep` fix** — a `rounds.capped=(12 > 0)` line,
+which cannot fail. W6-5 §3.4 records the same thing happening while *that*
+record was open. Three occurrences now, in three separate lanes, all by authors
+actively working on this exact defect class. The reflex is strong enough that
+noticing it requires deliberately asking "what would make this line red?" of
+every line, including the ones being added to fix the problem.
+
+**Recorded and not fixed**, with the reason in each case: `RNioNoFollow`,
+`RCrypto` and `RJdkX509Intercept` from §2.5 (all three specified in full there,
+with their mutation evidence, but the repairs are larger than the mechanical
+`CK`-prefix ones and were not reached); the 16 remaining fixtures (§1.1); F27's `gpu-offload` tests (a placement decision for that
 surface's owner); the `jdk-only-strict-probes.sh` absent-arm agreement; and the
 `RForNameGcStress` / `ROverlaySystemGcStress` constant booleans, which are low
 severity because the rest of each `CK` line does discriminate; and the two
