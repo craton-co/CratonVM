@@ -1699,6 +1699,129 @@ fn service_accepts_type(
     }
 }
 
+/// `factoryMethod.toString()` — the exact text `ServiceLoader.fail(service,
+/// factoryMethod + " return type not a subtype")` interpolates, e.g.
+/// `public static java.lang.Object com.example.Bad.provider()`.
+///
+/// Measured against HotSpot 25.0.3.9 rather than inferred; the whole message is
+/// asserted verbatim by `regression-suite/src/RJdkModule.java`'s `Rejected`
+/// service, so a drift here is a red vector rather than a silent divergence.
+///
+/// Falls back to `<fqn>.provider()` when `Method.toString()` cannot be driven.
+/// That keeps the one part a reader has to have — which provider was refused —
+/// without inventing modifiers or a return type this VM did not actually read.
+fn factory_method_display(
+    ctx: &mut dyn NativeContext,
+    method: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> String {
+    let method_pin = ctx.pin_native_root(method);
+    let method_now = ctx.read_native_pin(method_pin, method);
+    let rendered = match ctx.invoke(
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(method_now))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(method_pin);
+    if rendered.is_empty() {
+        format!("{fqn}.provider()")
+    } else {
+        rendered
+    }
+}
+
+/// The verdict of `ServiceLoader.loadProvider`'s factory-form subtype gate.
+enum FactoryReturn {
+    /// A legal `provider()`. Carries the return-type mirror, which is what
+    /// `ProviderImpl` records as `type` and what `Provider.type()` answers.
+    /// The reference is UNPINNED — pin it before the next allocation, the same
+    /// contract `factory_return_type` and `load_provider_class` carry.
+    Accepted(cratonvm_types::ObjectRef),
+    /// `getReturnType()` could not be read at all. Historic behaviour is kept
+    /// (treat the provider as legal) for the same reason `service_accepts_type`
+    /// answers `true` on an unreadable `isAssignableFrom`: an interrogation
+    /// this VM cannot drive must never MANUFACTURE a refusal.
+    Unreadable,
+    /// Not a subtype of the service. Carries the `ServiceConfigurationError` to
+    /// raise, or `None` when the error object itself could not be built — the
+    /// contract `service_configuration_error` has always had, where the caller
+    /// drops the provider rather than pretending to have thrown.
+    Rejected(Option<MethodCallFailed>),
+}
+
+/// `ServiceLoader.loadProvider`'s factory-form gate, shared by BOTH provider
+/// paths:
+///
+/// ```text
+/// Class<?> returnType = factoryMethod.getReturnType();
+/// if (!service.isAssignableFrom(returnType))
+///     fail(service, factoryMethod + " return type not a subtype");
+/// ```
+///
+/// It is a function because it has to run in `native_sl_iterator` AND
+/// `native_sl_stream`. It was written inline on the iterator only, and the
+/// `stream()` path computed the return type without ever asking: an illegal
+/// module-declared factory raised from `iterator()` and was handed out by
+/// `stream()` as a `Provider` whose `get()` returns an object of the wrong type
+/// (measured: a `String` for a service interface). Nothing downstream catches
+/// that — `ProviderImpl.invokeFactoryMethod`'s `(S)` cast is erased — so this
+/// gate is the only gate there is. See W7-85-serviceloader-stream-validation.md.
+///
+/// PIN ORDER, which is the delicate part: every step allocates and re-enters
+/// Java, so no `ObjectRef` may be held raw across a call.
+///
+///  * `factory` is re-read through the caller's `factory_pin` before each use;
+///  * the service mirror is fetched with the NON-allocating `sl_service_mirror`
+///    AFTER `factory_return_type` has returned, never held across it;
+///  * the return mirror takes its own pin for the duration of
+///    `isAssignableFrom` and is read back through that pin before the pin
+///    drops, so `Accepted` names the forwarded address, not the pre-GC one;
+///  * `Method.toString()` and `sl_service_name` are driven while the caller's
+///    pins are still standing, i.e. before any of them is released.
+///
+/// The caller's `sl_pin` and `factory_pin` are left exactly as they were found.
+fn factory_return_is_subtype(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    factory_pin: usize,
+    factory: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> FactoryReturn {
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let ret = match factory_return_type(ctx, factory_now) {
+        Some(ret) => ret,
+        None => return FactoryReturn::Unreadable,
+    };
+    let ret_pin = ctx.pin_native_root(ret);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let ret_now = ctx.read_native_pin(ret_pin, ret);
+    let accepted = match sl_service_mirror(ctx, sl_now) {
+        Some(service) => service_accepts_type(ctx, service, ret_now),
+        // No readable service mirror: there is nothing to compare against, so
+        // keep the historic accept rather than refuse on an unasked question.
+        None => true,
+    };
+    if accepted {
+        let ret_now = ctx.read_native_pin(ret_pin, ret);
+        ctx.unpin_native_roots(ret_pin);
+        return FactoryReturn::Accepted(ret_now);
+    }
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let rendered = factory_method_display(ctx, factory_now, fqn);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    ctx.unpin_native_roots(ret_pin);
+    FactoryReturn::Rejected(service_configuration_error(
+        ctx,
+        &format!("{service_name}: {rendered} return type not a subtype"),
+    ))
+}
+
 /// The JDK's own per-loader instance cache: `ServiceLoader.instantiatedProviders`.
 ///
 /// `initialize_real_service_loader_fields` allocates this list and
@@ -1882,36 +2005,18 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 let factory_pin = ctx.pin_native_root(factory);
                 // The JDK fails the load when the factory's return type is not a
                 // subtype of the service; a provider it may not legally hand out
-                // must not be quietly dropped instead.
+                // must not be quietly dropped instead. `native_sl_stream` runs
+                // the SAME call — see `factory_return_is_subtype`, which owns
+                // the pin order both paths depend on.
                 //
-                // Order matters: `factory_return_type` allocates, so the service
-                // mirror is read AFTER it (via the non-allocating
-                // `sl_service_mirror`) rather than being held across that call.
-                let factory_now = ctx.read_native_pin(factory_pin, factory);
-                let subtype_ok = match factory_return_type(ctx, factory_now) {
-                    Some(ret) => {
-                        let ret_pin = ctx.pin_native_root(ret);
-                        let sl_now = ctx.read_native_pin(sl_pin, sl);
-                        let ret_now = ctx.read_native_pin(ret_pin, ret);
-                        let ok = match sl_service_mirror(ctx, sl_now) {
-                            Some(service) => service_accepts_type(ctx, service, ret_now),
-                            None => true,
-                        };
-                        ctx.unpin_native_roots(ret_pin);
-                        ok
-                    }
-                    None => true,
-                };
-                if !subtype_ok {
+                // The error is built INSIDE that call, while `class_pin` and
+                // `factory_pin` are still standing, because rendering the
+                // message drives `Method.toString()`.
+                if let FactoryReturn::Rejected(error) =
+                    factory_return_is_subtype(ctx, sl_pin, sl, factory_pin, factory, &fqn)
+                {
                     ctx.unpin_native_roots(class_pin);
-                    let sl_now = ctx.read_native_pin(sl_pin, sl);
-                    let service_name = sl_service_name(ctx, sl_now);
-                    if let Some(error) = service_configuration_error(
-                        ctx,
-                        &format!(
-                            "{service_name}: provider() of {fqn} returns a type that is not a subtype"
-                        ),
-                    ) {
+                    if let Some(error) = error {
                         ctx.unpin_native_roots(sl_pin);
                         return Err(error);
                     }
@@ -2402,20 +2507,46 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let type_now = ctx.read_native_pin(type_pin, type_class);
             if let Some(method) = provider_factory_method(ctx, type_now) {
                 let method_pin = ctx.pin_native_root(method);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                // Caller-insensitive `setAccessible(true)` so the real
-                // `ProviderImpl.invokeFactoryMethod` bytecode can call it —
-                // see `grant_reflective_override`.
-                grant_reflective_override(ctx, method_now);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                match factory_return_type(ctx, method_now) {
-                    Some(ret) => {
+                // W7-85: the same `!service.isAssignableFrom(returnType)` gate
+                // `native_sl_iterator` applies. It was absent here and nowhere
+                // else, so an illegal module-declared factory raised
+                // `ServiceConfigurationError` from `iterator()` and was quietly
+                // handed out by `stream()` — a `Provider` whose `type()` is the
+                // wrong class and whose `get()` returns an object that is not
+                // of the service type. Nothing downstream catches that: the
+                // `(S)` cast in `ProviderImpl.invokeFactoryMethod` is erased.
+                match factory_return_is_subtype(ctx, sl_pin, sl, method_pin, method, fqn) {
+                    FactoryReturn::Accepted(ret) => {
                         let ret_pin = ctx.pin_native_root(ret);
+                        // Caller-insensitive `setAccessible(true)` so the real
+                        // `ProviderImpl.invokeFactoryMethod` bytecode can call
+                        // it — see `grant_reflective_override`. Granted only
+                        // once the return type is ACCEPTED: opening a factory
+                        // this loader is about to refuse would leave a door
+                        // ajar for a caller that must never exist.
+                        let method_now = ctx.read_native_pin(method_pin, method);
+                        grant_reflective_override(ctx, method_now);
                         factory = Some((method_pin, method, ret_pin, ret));
                     }
                     // Unreadable return type: fall back to the constructor
                     // flavour rather than build a half-formed wrapper.
-                    None => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Unreadable => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Rejected(error) => {
+                        // `type_pin` is this iteration's first pin, so
+                        // truncating to it also releases `method_pin` and
+                        // anything the gate took after it.
+                        ctx.unpin_native_roots(type_pin);
+                        match error {
+                            Some(error) => {
+                                ctx.unpin_native_roots(sl_pin);
+                                return Err(error);
+                            }
+                            // The error object itself could not be built. Drop
+                            // the provider rather than hand it out — handing it
+                            // out is the one outcome this gate exists to stop.
+                            None => continue,
+                        }
+                    }
                 }
             }
         }
