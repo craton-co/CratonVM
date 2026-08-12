@@ -1,5 +1,35 @@
 # `Security.getAlgorithms(type)` answered the EMPTY set for every engine type
 
+> **SUPERSEDED for its residuals, 2026-08-12 — W7-63-jca-advertise-vs-serve.md.**
+> All five live patches below are **FIXED in source** there, together with
+> W7-29's five residuals; the two records were describing one population from
+> two ends. Do not work from the patch blocks in this file — read W7-63 §3,
+> which records what was done and, for two of them, why the prescription here
+> was not what was done:
+>
+> * **Patch A** (unmodifiable set) — applied as written. `wrap_unmodifiable`.
+> * **Patch B** (`MD2`) — the *stronger* half taken: MD2 is **implemented**
+>   (RFC 1319, `crate::real_md2`), not de-advertised. The transcription was
+>   adjudicated against HotSpot's own MD2 on ten messages before it was
+>   written, because this lane could not build.
+> * **Patch C** (SHAKE) — applied, including the alias/service distinction and
+>   the normalisation-agreement test this record asked for.
+> * **Patch D** (the silent wrong-digest defaults) — applied, and the
+>   synthetic-mode door shut too. This patch has **no counterpart in W7-29**,
+>   because W7-29 ran its probes and this arm is unreachable outside
+>   `--synthetic-jdk`.
+> * **Patch F** (`ML-DSA` `KeyFactory`) — the de-advertise half taken. Note
+>   that `Signature` keeps the umbrella, because it genuinely implements it.
+>   A sibling defect this record does not name — `SunJCE` `KeyFactory` `ML-KEM`
+>   — was found by the census and closed the same way.
+> * **Patch E** remains **DEAD**. Not applied. See its own warning block.
+>
+> The census table in the residual pass below should not be quoted as a
+> current measurement: it filed `Signature` / SUN as "7 advertised, 7
+> implemented, none", and `Signature.getInstance` in fact accepted **every
+> string**. That is the direction a source-read census cannot see, and it is
+> W7-63 §2.
+
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
 * **Headline: CLOSED, and now verified.** `Security.getAlgorithms(type)`
