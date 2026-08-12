@@ -621,6 +621,10 @@ fn the_declared_slot_map_sweep_has_a_caller() {
             );
         }
     }
+    // Printed, not asserted on: the SET of triggers is expected to grow (an
+    // embedder teardown, `DestroyJavaVM`) and a gate on the exact list would be
+    // re-baselined on sight. What must never be empty is the list itself.
+    println!("declared-slot-map sweep callers: {callers:?}");
     assert!(
         !callers.is_empty(),
         "nothing outside `native-api/src` calls the declared-slot-map sweep.\n\

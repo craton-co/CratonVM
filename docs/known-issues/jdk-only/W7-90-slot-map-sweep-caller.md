@@ -185,19 +185,25 @@ this lane is closing, stated as an API fact.
 chain, `static` excluded, declaration order within a class — the convention W4-4,
 W7-49, W7-59, W7-69, W7-75 and W7-77 all use.
 
-`java.nio.ByteBuffer` was **re-derived here rather than copied**, by a scanner
-written for this lane, and reproduces exactly: 11 instance fields,
-`mark(0) position(1) limit(2) capacity(3) address(4) segment(5)` from
-`java.nio.Buffer`, then `hb(6) offset(7) isReadOnly(8) bigEndian(9)
-nativeByteOrder(10)`. That is the same table W7-58, W7-59 and W7-69 report by
-three different routes, so the oracle is trusted for the rest.
+**Four of the seven layouts were re-derived here rather than copied**, by a
+chain-walking scanner written for this lane, and **all four reproduce exactly**:
 
-The other six layouts are carried from W7-75 §1 (`Continuation`, `ForkJoinPool`)
-and W7-77 §1 (`Month`, `StringJoiner`, `Method`, `Thread`), each of which states
-the same oracle and re-derived rather than copied. They are cited rather than
-re-derived a third time; a lane that disagrees with a row below should re-run
-`javap -p` before editing anything, because four censuses in this area were each
-wrong about some rows on 2026-08-12.
+| class | fields | agrees with |
+|---|---:|---|
+| `java.nio.ByteBuffer` | 11 — `mark(0) position(1) limit(2) capacity(3) address(4) segment(5)` from `java.nio.Buffer`, then `hb(6) offset(7) isReadOnly(8) bigEndian(9) nativeByteOrder(10)` | W7-58, W7-59, W7-69 — three prior routes |
+| `java.lang.reflect.Method` | 20 — `override(0) accessCheckCache(1)` (`AccessibleObject`), `parameterData(2) declaredAnnotations(3)` (`Executable`), then `clazz(4) slot(5) name(6) returnType(7) parameterTypes(8) exceptionTypes(9) modifiers(10) …` | W7-77 §1 |
+| `java.lang.Thread` | 19 — `eetop(0) tid(1) name(2) interrupted(3) contextClassLoader(4) holder(5) …` | W7-77 §1, and W7-69 §4.3's "5 vs 19" |
+| `java.util.StringJoiner` | 7 — `prefix(0) delimiter(1) suffix(2) elts(3) size(4) len(5) emptyValue(6)` | W7-77 §1 |
+
+Four independent reproductions with zero disagreements is the reason the
+remaining three — `Month` (W7-77 §1), `Continuation` and `ForkJoinPool` (W7-75
+§1) — are cited rather than re-derived a fourth time. Each of those records
+states the same oracle and says it re-derived rather than copied. A lane that
+disagrees with a row below should re-run `javap -p` before editing anything:
+four censuses in this area were each wrong about some rows on 2026-08-12, and
+the `ForkJoinPool` row in particular turns on `AbstractExecutorService`
+declaring **no** instance field, which is the one number a careless count gets
+wrong.
 
 ## 4. The expected census — enumerated, not repaired
 
