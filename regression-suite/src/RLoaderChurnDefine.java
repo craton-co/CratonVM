@@ -171,6 +171,30 @@ public class RLoaderChurnDefine {
     }
 
     /**
+     * Held by the APPLICATION loader, and used by
+     * `anIsolatingLoaderCannotSeeTheAppLoadersClass` as the thing that must NOT
+     * leak. Deliberately distinct from {@link Echo}: that one is loaded through
+     * loaders whose URLs DO contain it, this one through loaders whose URLs do
+     * not.
+     */
+    public static final class Sealed {
+        public static String tag() {
+            return "sealed";
+        }
+    }
+
+    /**
+     * A {@code URLClassLoader} SUBCLASS that adds nothing. The single
+     * {@code extends} is the whole experiment: before W7-87 a subclass answered
+     * correctly and a BARE {@code java.net.URLClassLoader} did not.
+     */
+    static final class SubUrlLoader extends java.net.URLClassLoader {
+        SubUrlLoader(java.net.URL[] urls, ClassLoader parent) {
+            super(urls, parent);
+        }
+    }
+
+    /**
      * The THIRD half of the same rule, and the one this vector was missing: a
      * repeated LOOKUP is not a definition. {@code ClassLoader.loadClass} checks
      * {@code findLoadedClass} first and {@code Class.forName(name, initialize,
@@ -256,11 +280,116 @@ public class RLoaderChurnDefine {
         System.out.println("CK RLoaderChurnDefine repeatLookup=ok");
     }
 
+    /**
+     * W7-87 — the FOURTH half, and the one that points the other way. The three
+     * sections above all ask what a loader may DEFINE. This one asks what it may
+     * SEE, and the answer is narrower than CratonVM used to give.
+     *
+     * {@code new URLClassLoader(urls, null)} — a private URL search path and a
+     * BOOTSTRAP parent — is the standard idiom for a loader that deliberately
+     * cannot reach the application classpath (Spring Boot's
+     * {@code ModifiedClassPathClassLoader}, javax.tools harnesses, plugin
+     * containers, `@ClassPathExclusions`). On HotSpot 25 it raises
+     * {@code ClassNotFoundException} for an application class no matter what the
+     * application loader already holds. CratonVM answered with the application
+     * loader's class: `is_builtin_loader_class` lists
+     * {@code java/net/URLClassLoader}, so `find_loaded_class_for_loader` took the
+     * built-in branch and its GLOBAL FALLBACK, while the namespace allocator had
+     * already classified the same object as user-defined. The isolation the
+     * loader was constructed for did not exist.
+     *
+     * ANTI-VACUITY, three ways. (1) The application loader is asserted to be
+     * holding {@link Sealed} FIRST — asking for a name nothing has loaded would
+     * pass on a leaky VM too. (2) The same loader instance is asserted to still
+     * delegate to bootstrap, so "isolated" cannot degenerate into "broken".
+     * (3) A bare {@code URLClassLoader} parented to the APPLICATION loader is
+     * asserted to still find it, which is the obvious over-correction: narrowing
+     * the cache probe must not break parent-first delegation.
+     *
+     * The URL is {@code java.io.tmpdir}: a directory that certainly exists (so
+     * the loader has a genuine, usable URL search path rather than the
+     * degenerate empty one) and certainly does not contain this class. Nothing
+     * is written.
+     */
+    static void anIsolatingLoaderCannotSeeTheAppLoadersClass() {
+        String name = "RLoaderChurnDefine$Sealed";
+        ClassLoader app = RLoaderChurnDefine.class.getClassLoader();
+        check(Sealed.class.getClassLoader() == app,
+                "the application loader must already hold " + name
+                        + ", or there is nothing for an isolating loader to leak");
+
+        java.net.URL[] urls;
+        try {
+            urls = new java.net.URL[] {
+                new java.io.File(System.getProperty("java.io.tmpdir")).toURI().toURL()
+            };
+        } catch (java.net.MalformedURLException e) {
+            throw new AssertionError("RLoaderChurnDefine: bad java.io.tmpdir URL: " + e);
+        }
+
+        java.net.URLClassLoader iso = new java.net.URLClassLoader(urls, null);
+        try {
+            Class<?> leaked = iso.loadClass(name);
+            throw new AssertionError("RLoaderChurnDefine: new URLClassLoader(urls, null).loadClass("
+                    + name + ") must raise ClassNotFoundException (HotSpot does); got " + leaked
+                    + " owned by " + leaked.getClassLoader());
+        } catch (ClassNotFoundException expected) {
+            check(true, "an isolating URLClassLoader does not see the application loader's class");
+        }
+        try {
+            Class<?> leaked = Class.forName(name, false, iso);
+            throw new AssertionError("RLoaderChurnDefine: Class.forName(" + name
+                    + ", false, isolatingLoader) must raise ClassNotFoundException; got " + leaked
+                    + " owned by " + leaked.getClassLoader());
+        } catch (ClassNotFoundException expected) {
+            check(true, "...and Class.forName through the same loader agrees");
+        }
+
+        // Isolated, not broken: bootstrap delegation is untouched.
+        try {
+            Class<?> boot = iso.loadClass("java.util.zip.CRC32");
+            check(boot.getClassLoader() == null,
+                    "the isolating loader still delegates to the bootstrap loader");
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError(
+                    "RLoaderChurnDefine: the isolating loader lost bootstrap delegation: " + e);
+        }
+
+        // The discriminator, inverted into an invariant.
+        java.net.URLClassLoader isoSub = new SubUrlLoader(urls, null);
+        try {
+            Class<?> leaked = isoSub.loadClass(name);
+            throw new AssertionError("RLoaderChurnDefine: a URLClassLoader SUBCLASS must answer "
+                    + "identically to a bare instance; it returned " + leaked);
+        } catch (ClassNotFoundException expected) {
+            check(true, "a URLClassLoader SUBCLASS answers identically -- the asymmetry is gone");
+        }
+
+        // The over-correction guard: parent-first delegation still works.
+        java.net.URLClassLoader delegating = new java.net.URLClassLoader(urls, app);
+        try {
+            check(delegating.loadClass(name) == Sealed.class,
+                    "a bare URLClassLoader parented to the application loader still delegates "
+                            + "to it, and answers with the PARENT'S class object");
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: over-correction -- parent-first "
+                    + "delegation through a bare URLClassLoader broke: " + e);
+        }
+        try {
+            check("sealed".equals(Sealed.class.getMethod("tag").invoke(null)),
+                    "the application loader's copy still runs");
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("RLoaderChurnDefine: Sealed.tag() failed: " + e);
+        }
+        System.out.println("CK RLoaderChurnDefine isolatingLoader=ok");
+    }
+
     public static void main(String[] args) {
         manyLoadersOneName();
         churnWithSeveralNames();
         aSurvivorKeepsItsClass();
         repeatLookupIsACacheHit();
+        anIsolatingLoaderCannotSeeTheAppLoadersClass();
         System.out.println("CK RLoaderChurnDefine checks=" + checks);
         System.out.println("PASS RLoaderChurnDefine (" + checks + " checks)");
     }
