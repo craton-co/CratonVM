@@ -168,6 +168,70 @@ public class RJdkNio {
                 + " normalize=" + Path.of("a/b/../c").normalize().toString().replace('\\', '/'));
     }
 
+    /**
+     * W7-68 §3.2 / W7-72 §2. The synthetic FileChannel private map used to put
+     * the fd in AbstractInterruptibleChannel.closeLock (an L slot, where the
+     * descriptor coercion degraded the Int to null, so the fd never persisted)
+     * and the file position in `closed`, the boolean isOpen() negates. A channel
+     * whose position moved off zero reported itself CLOSED. Separately, the
+     * winning isOpen() body answered a constant true, so close() never flipped it.
+     *
+     * BOTH directions are asserted on purpose: a VM answering true everywhere
+     * passes the first half, a VM answering false everywhere passes the second.
+     * Only one that tracks the transition passes both. position(1) is the
+     * sharpest single case -- 1 is what a boolean true reads as.
+     *
+     * HONEST LIMIT: in Compatible mode a real sun.nio.ch.FileChannelImpl
+     * declares all these methods itself and never resolves to CratonVM's
+     * natives, so on that path this is a parity green that measures nothing. It
+     * fires only when the newFileChannel reconcile-with-real construction fails
+     * and the legacy synthetic fallback is taken. It does NOT close W7-68 §3.2;
+     * that still needs probes/FileChannelIsOpenProbe.java on a built binary.
+     */
+    static void fileChannelIsOpenTracksCloseNotPosition(Path dir) throws Exception {
+        Path p = dir.resolve("isopen.bin");
+        Files.write(p, new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 });
+        FileChannel ch = FileChannel.open(p, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        check(ch.isOpen(), "a freshly opened FileChannel must report itself open");
+
+        ch.position(0L);
+        check(ch.isOpen(), "isOpen() after position(0)");
+        ch.position(1L);
+        check(ch.isOpen(), "isOpen() after position(1) -- 1 is what a boolean true reads as");
+        check(ch.position() == 1L, "position() must read back 1");
+        ch.position(7L);
+        check(ch.isOpen(), "isOpen() after position(7)");
+        check(ch.position() == 7L, "position() must read back 7");
+
+        ByteBuffer in = ByteBuffer.allocate(2);
+        check(ch.read(in) == 2, "read 2 bytes from position 7");
+        check(in.array()[0] == 8 && in.array()[1] == 9, "the fd must survive a position move");
+        check(ch.isOpen(), "isOpen() after read");
+
+        ch.position(2L);
+        check(ch.write(ByteBuffer.wrap(new byte[] { 99 })) == 1, "write 1 byte at position 2");
+        check(ch.isOpen(), "isOpen() after write");
+        ch.force(true);
+        check(ch.isOpen(), "isOpen() after force");
+        ch.position(0L);
+        check(ch.isOpen(), "isOpen() back at position(0)");
+
+        ch.close();
+        check(!ch.isOpen(), "a closed FileChannel must report itself closed");
+        ch.close();
+        check(!ch.isOpen(), "close() twice must stay closed");
+
+        boolean threw = false;
+        try {
+            ch.position(3L);
+        } catch (ClosedChannelException expected) {
+            threw = true;
+        }
+        check(threw, "position() on a closed channel must throw ClosedChannelException");
+        check(Files.readAllBytes(p)[2] == 99, "the write must have reached the file");
+        System.out.println("CK RJdkNio fileChannelIsOpen=tracked");
+    }
+
     static void randomAccessAndMapping(Path dir) throws Exception {
         Path f = dir.resolve("raf.bin");
         try (RandomAccessFile raf = new RandomAccessFile(f.toFile(), "rw")) {
@@ -318,6 +382,27 @@ public class RJdkNio {
             server.configureBlocking(false);
             try (Selector sel = Selector.open()) {
                 check(sel.isOpen(), "selector open");
+
+                // W7-9 §6 / §8.2 -- Selector.provider(). The ninth abstract on
+                // java.nio.channels.Selector had no native anywhere in the tree,
+                // and CratonVM's Selector.open() hands back an object whose class
+                // is the real sun.nio.ch.SelectorImpl allocated WITHOUT running a
+                // constructor, so the real (final) AbstractSelector.provider()
+                // read an unset field and answered null. The first check is the
+                // red: it fails on the old behaviour in BOTH modes. The second is
+                // a control (null == null would satisfy it). The third pins the
+                // answer to the platform default, which is what makes the
+                // openSocketChannel / openDatagramChannel natives native-io
+                // registers against the concrete provider classes reachable --
+                // returning some other carrier would pass check one and still be
+                // wrong. A red on all three means SelectorProvider.provider()
+                // itself is unavailable, which is a finding, not a harness bug.
+                java.nio.channels.spi.SelectorProvider prov = sel.provider();
+                check(prov != null, "Selector.provider() must not be null");
+                check(prov == sel.provider(), "Selector.provider() must be stable across calls");
+                check(prov == java.nio.channels.spi.SelectorProvider.provider(),
+                        "Selector.provider() must be the platform default provider");
+
                 SelectionKey acceptKey = server.register(sel, SelectionKey.OP_ACCEPT);
                 check(acceptKey.isValid(), "registration key valid");
                 check(sel.keys().size() == 1, "selector key set");
@@ -408,6 +493,7 @@ public class RJdkNio {
         try {
             filesApi(dir);
             randomAccessAndMapping(dir);
+            fileChannelIsOpenTracksCloseNotPosition(dir);
             buffers();
             selectorAndAsyncClose();
         } finally {

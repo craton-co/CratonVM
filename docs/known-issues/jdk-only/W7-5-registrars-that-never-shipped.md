@@ -1,6 +1,8 @@
 # W7-5 — 301 native registrars that are not in the shipping binary, and the four reasons that is sometimes right
 
-Status: **census complete; one registrar wired**. Wave 7, lane W7-5.
+Status: **census complete; one registrar wired; the §6.3 ratchet written and
+the `ConcurrentSkipListMap` verdict settled, 2026-08-12** (§6.3.1, §6.4.1).
+Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.
 
 This started from one bug. `IntStream.summaryStatistics()` was killing whole probe
 runs with `AbstractMethodError: … has no Code attribute`, and the lane fixing it
@@ -565,11 +567,55 @@ landing it here would produce a test that cannot compile until the sibling branc
 merges, and this lane cannot build to check that. It belongs in the same commit
 as §6.2.
 
+### 6.3.1 WRITTEN, 2026-08-12 — `native-builtins/tests/essential_wiring_ratchet.rs`
+
+The sibling branch merged: `register_phase56_primitive_stream_terminals` is in
+`native-builtins/src/phases_late/streams.rs` and
+`reflect_annotations::register_annotation_overrides` calls it, reached from
+`register_essential_natives_with_shims`. So the blocker on §6.3 is gone and the
+ratchet is a real test rather than one that cannot compile.
+
+It went into `native-builtins/tests/` rather than a `#[cfg(test)] mod` inside
+`streams.rs` for two reasons: it asserts about the shipping BOOT PATH, which is
+an integration-level property, and `streams.rs` is another lane's file.
+
+**The triple list is six, not the five §6.3 predicted, and both differences are
+deliberate.** §6.3 was written before the narrowed registrar existed and
+predicted its contents:
+
+* **`java/util/stream/Stream.forEachOrdered(Consumer)V` is NOT asserted.** It is
+  equally abstract and it is still served by the hardcoded method-name special
+  case in `vm/src/runtime/interpreter.rs`'s `!has_code` fallback (§4.1).
+  Asserting it would freeze a state the tree is not in. It is the next row to
+  add, and adding it is what would let that special case be deleted.
+* **`{Long,Double}Stream.forEachOrdered` ARE asserted.** §4.3 named only the
+  `IntStream` one as the unmasked live defect; the registrar that landed covers
+  all three widths.
+
+Three tests, because they fail for three different reasons:
+
+| test | what only it can catch |
+|---|---|
+| `essentials_cover_the_abstract_primitive_stream_terminals` | the regression this record is about — the triple is registered only from a `synthetic-jdk`-gated registrar, so a default `cratonvm-cli` build raises `AbstractMethodError` |
+| `none_of_the_terminals_is_a_synthetic_stub` | the half `find(..).is_some()` cannot see: `register()` refuses a `SyntheticStub` under `JdkOnly`, and these triples have no bytecode underneath, so a refusal hands the method back to `AbstractMethodError` rather than to the JDK |
+| `the_terminals_survive_the_whole_real_jdk_boot` | the hazard the registrar's own doc comment asks a HUMAN to check for: "adding a triple that native-collections also registers makes this registrar silently inert". `register_collections_natives` runs after essentials and `register()` is last-write-wins, so the check has to be taken at the END of the boot, not at the end of essentials |
+
+The third replays `vm_init`'s real-JDK arm through the shared
+`native-builtins/tests/common/vm_init_boot_path.rs` model
+(W7-30-stub-ratchet-boot-path-scope.md §7.1) rather than mirroring it a fourth
+time.
+
+**Not wired into CI** — `.github/workflows/ci.yml` is not this lane's file. It
+belongs beside the existing
+`cargo test -p cratonvm-native-builtins --test stub_ratchet` step; see the
+out-of-file list in the lane report.
+
 ### 6.4 Out-of-file — reported, not patched
 
 * **`native-collections/src/lib.rs::register_concurrent_skip_list_map_natives`**
   (11 registrations, no caller in any configuration). Either wire it or delete
   it; leaving it is the same trap one level down. Read-only for this lane.
+  **Both halves of that instruction are withdrawn — see §6.4.1.**
 * **`register_jdk25_language_natives`** registers 9 triples on 3 class names that
   JDK 25 does not have. The registrar is inert whatever the feature flag says.
   Same for 5 of `register_jdk25_patterns_natives`' 15 and 33 of
@@ -580,6 +626,56 @@ as §6.2.
   a latent §5 slot-index defect. It is harmless only while the registrar stays
   dead, which makes it a trap for the next person who wires it "for coverage".
   If the Int/Long halves are ever wanted, split the registrar first.
+
+### 6.4.1 `ConcurrentSkipListMap` — VERDICT: neither wire nor delete. Leave it, 2026-08-12
+
+§5.3 calls this "the sharpest: 11 registrations that no build of any
+configuration has ever executed", and §6.4 gives a binary instruction: *"Either
+wire it or delete it; leaving it is the same trap one level down."* **The
+binary is the error.** There is a third state, this registrar is in it, and it
+is the state a defect record should want:
+
+> **Disabled deliberately, with the measurement that caused it, a test that
+> enforces the disable, and its bodies kept reachable by test hooks.**
+
+Source-verified in `native-collections/src/lib.rs`, all four:
+
+1. **The disable is a written, measured decision, not an omission.** The
+   `let _ = register_concurrent_skip_list_map_natives;` no-op carries the
+   reason: the native "sorted-array" overlay hardcoded natural ordering and
+   ignored the `(Comparator)` constructor, so puts over keys ordered only by
+   that comparator were silently dropped or misordered — *"broke the Gradle test
+   worker's serializer registry"*. Real
+   `java.util.concurrent.ConcurrentSkipListMap` bytecode runs instead. That is
+   §3.1's verdict, correctly applied.
+2. **A test enforces it.** `concurrent_skip_list_map_not_intercepted` asserts
+   `find(...)` is `None` for the CSLM triples *"so the real class is not
+   shadowed again"*, and its own comment records that it *"previously asserted
+   the opposite and had failed since the natives were disabled"*. Wiring the
+   registrar in reddens that test. This is not dead code nobody is watching; it
+   is code with a guard pointed at it.
+3. **Deleting it would drop the only record of two triples.** The no-op's
+   comment names them: `<init>(Ljava/util/Comparator;)V` and
+   `keySet()Ljava/util/Set;` exist nowhere else in the tree. The sibling
+   `native-builtins/src/util_concurrent_ext.rs::register_t31_concurrent_extras`
+   covers twelve triples and neither of those two, so the symmetric difference
+   is not one-sided and "delete the redundant copy" is not what a deletion would
+   do.
+4. **The bodies are exercised.** `__test_cslm_*` hooks drive these natives from
+   `native-collections/tests/gc_side_table_root_audit.rs`, which exists because
+   the 2026-08-01 GC-safety fixes to this family *"are otherwise untestable — the
+   natives cannot be reached through the registry — and an untested fix in code
+   someone may re-enable is"* the trap worth avoiding.
+
+So the species this record is named after — a registrar that looks like coverage
+and is not — does not apply here. The species it *would* be is different and
+milder: an implementation kept for reference behind a guard. The action is to
+correct this record, which is done, and the one real residual is that §5.3's
+"no caller at all, in any mode" reads as an accident when it is a decision;
+the `let _ =` line is exactly the idiom that makes it survive `dead_code`
+review, and it works.
+
+**No code change. Nothing in `native-collections/` was edited.**
 
 ---
 

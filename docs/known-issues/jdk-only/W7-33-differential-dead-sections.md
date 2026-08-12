@@ -9,9 +9,15 @@
 > `NoSuchElementException` remains.
 >
 > * **Headline and out-of-file patch: CLOSED in source, unverified.**
-> * **Residual: STILL OPEN** — the synthetic-mode `EmptyStackException`
->   follow-up in `classloading/src/class_manager.rs` is recorded but not made;
->   W7-36-differential-view-families.md confirms.
+> * **Residual: APPLIED 2026-08-12, unbuilt** — both additions the follow-up
+>   specifies are now in `classloading/src/class_manager.rs`
+>   (`jdk_superclass` → `java/lang/RuntimeException`, and the
+>   `synthetic_stub_fields` arm), anchored on the quoted blocks rather than on
+>   line numbers. Neither can move either shipping mode or any Compatible-mode
+>   ratchet, and **nothing in the tree can observe them**, because no suite runs
+>   `--synthetic-jdk` MODE — so this closes source-only and deliberately without
+>   a fixture assertion. It is not untested-but-testable; it is unobservable
+>   here. W7-36-differential-view-families.md named the two additions.
 
 **Status: BOTH DIAGNOSED AND FIXED IN SOURCE 2026-08-12, NOT REBUILT.**
 
@@ -379,7 +385,85 @@ shape the round-2 widening was built to catch.
 
 ---
 
-## Out-of-file patch (not applied)
+## The R2 follow-up, restated with exact text — 2026-08-12
+
+Re-verified in the tree before writing this: `RuntimeError::EmptyStackException`
+exists (`types/src/error.rs:1098`), is mapped to `java/util/EmptyStackException`
+with a `None` message at `:1633`, is in the exhaustiveness loop at `:1720`, and
+is raised from `native-collections/src/lib.rs`. So the **headline** half of R2 is
+in the tree. What is still not applied is the `--synthetic-jdk` half, and it is
+still in `classloading/src/class_manager.rs`, which this lane does not own
+either. Two additions, with the surrounding text as it stands today:
+
+**1. `jdk_superclass` — without this a fabricated `EmptyStackException` defaults
+to `java/lang/Object` and `catch (RuntimeException)` misses it.** Current:
+
+```rust
+        // java.util exceptions
+        "java/util/NoSuchElementException"
+        | "java/util/ConcurrentModificationException"
+        | "java/util/InputMismatchException" => "java/lang/RuntimeException",
+```
+
+becomes
+
+```rust
+        // java.util exceptions
+        "java/util/NoSuchElementException"
+        | "java/util/ConcurrentModificationException"
+        | "java/util/EmptyStackException"
+        | "java/util/InputMismatchException" => "java/lang/RuntimeException",
+```
+
+**2. `synthetic_stub_fields` — the two-slot throwable shape, beside its
+neighbour.** Current:
+
+```rust
+        | "java/util/NoSuchElementException"
+        | "java/util/InputMismatchException"
+```
+
+becomes
+
+```rust
+        | "java/util/NoSuchElementException"
+        | "java/util/EmptyStackException"
+        | "java/util/InputMismatchException"
+```
+
+Both are inside `match` arms over slash-form class names; the only risk is
+picking the wrong `match`, so anchor on the two quoted blocks rather than on line
+numbers. Neither addition can move either shipping mode — a fabricated
+`java/util/EmptyStackException` exists only under `--synthetic-jdk`, where the
+real class file is absent — so no ratchet taken in Compatible mode moves either.
+
+**Nothing in-tree can observe the difference**, because no suite runs
+`--synthetic-jdk` mode. That is the reason this is a source-only close and not a
+verified one, and it is also why the *headline* now has a witness and the
+follow-up cannot.
+
+### Coverage for the headline, which R2 did not have
+
+`regression-suite/src/RExceptions.java` (`CORE_CLASSES`, so it runs on a default
+invocation) now asserts both halves of the pair, and asserts the **type** rather
+than merely that something was thrown:
+
+```java
+        boolean ese = false, eseWrongType = false;
+        try { new Stack<String>().pop(); }
+        catch (EmptyStackException e) { ese = true; }
+        catch (NoSuchElementException e) { eseWrongType = true; }
+        check(ese && !eseWrongType, "Stack.pop() on empty throws EmptyStackException");
+```
+
+plus the same for `peek()`. The `NoSuchElementException` arm is what makes it
+non-vacuous: `EmptyStackException` is not a `NoSuchElementException`, so a
+single `catch (EmptyStackException)` around the old behaviour would have died
+uncaught instead of naming the wrong type it got. Both checks fail on the
+pre-`aab87e003` behaviour, and `peek()` is included because `pop` calls `peek` in
+the JDK and covering one of a pair is how the pair drifts apart again.
+
+## ~~Out-of-file patch (not applied)~~ — APPLIED, see the reconciliation banner
 
 For **R2** only. `java.util.EmptyStackException` has no `RuntimeError` variant,
 so `native_stack_pop`/`native_stack_peek` cannot raise it today.

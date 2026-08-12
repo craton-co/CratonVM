@@ -346,7 +346,10 @@ fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let algo = read_algo(ctx, this);
     let data = read_accumulator(ctx, this);
-    let hash = compute_digest(&algo, &data)?;
+    // Canonicalise the ALIAS spellings only here, not in the stored field:
+    // `getAlgorithm()` echoes the caller's `SHAKE128` on HotSpot, while
+    // `compute_digest` only has arms for the primary names.
+    let hash = compute_digest(canonical_algorithm(&algo), &data)?;
     // Reset accumulator after digest() per JDK contract.  Re-seed with an
     // empty entry so subsequent update→digest round-trips on the same
     // instance still satisfy the presence check above.
@@ -405,7 +408,8 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     let algo = read_algo(ctx, this);
     let data = read_accumulator(ctx, this);
-    let hash = compute_digest(&algo, &data)?;
+    // Alias-canonicalised for the same reason as `md_digest`.
+    let hash = compute_digest(canonical_algorithm(&algo), &data)?;
     // JDK contract (MessageDigestSpi.engineDigest(byte[],int,int)): the caller's
     // window must be able to hold the whole digest, else DigestException.
     let buf_len = ctx.array_length(buf);
@@ -493,6 +497,53 @@ fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The alphanumeric-only normalisation `algorithm_supported` and
+/// `digest_length_bytes` both key on. `crate::compute_digest` uses a
+/// `-`/`/`-stripping filter instead; the two agree on every name this engine
+/// serves, which `shake_normalisations_agree_across_the_two_filters` asserts
+/// rather than assumes.
+fn normalise(algo: &str) -> String {
+    algo.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// Resolve an `Alg.Alias.MessageDigest.*` spelling onto the primary service
+/// name, before any of the three name-keyed tables is consulted.
+///
+/// HotSpot 25's `SUN` carries `Alg.Alias.MessageDigest.SHAKE128 =
+/// SHAKE128-256` and `SHAKE256 = SHAKE256-512`; measured, `getInstance`
+/// resolves both bare spellings and returns bytes byte-identical to the
+/// hyphenated primaries, while `Security.getAlgorithms("MessageDigest")`
+/// lists only the two primaries.
+///
+/// **This is the half of W7-63 §3 #2 that did not land.** The alias rows went
+/// into the provider chain (`put_alias(SUN, "MessageDigest", "SHAKE128", …)`)
+/// and the ratchet asserted them through `get_service_entry` — but
+/// `md_get_instance` consults NO registry: its only gate is
+/// `algorithm_supported`, whose own test asserted the bare spellings must be
+/// rejected "because they are resolved by the provider chain's alias table
+/// before this predicate is consulted". They are not; nothing on this path
+/// reads that table, so `MessageDigest.getInstance("SHAKE128")` raised
+/// `NoSuchAlgorithmException` in both shipping modes while the registry-level
+/// ratchet stayed green. That test's other premise — that admitting the
+/// aliases here would grow `Security.getAlgorithms("MessageDigest")` to 17 —
+/// is false in the same way and for the same reason: the advertised set is
+/// built by `provider_chain::algorithms_for_service` from the SERVICE rows,
+/// which this predicate cannot reach either.
+///
+/// The caller's own spelling is what `md_get_instance` stores, so
+/// `getAlgorithm()` still echoes `SHAKE128` as HotSpot does; only the three
+/// name-keyed tables see the canonical form.
+fn canonical_algorithm(algo: &str) -> &str {
+    match normalise(algo).as_str() {
+        "SHAKE128" => "SHAKE128-256",
+        "SHAKE256" => "SHAKE256-512",
+        _ => algo,
+    }
+}
+
 /// The set of digests `MessageDigest.getInstance` will serve. This is the
 /// gate the ADVERTISED set is ratcheted against — see
 /// `provider_chain::every_advertised_sun_message_digest_is_serviceable` —
@@ -504,11 +555,7 @@ fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// `crate::compute_digest`. All three are pinned together by
 /// `every_supported_algorithm_computes_and_has_a_length`.
 fn algorithm_supported(algo: &str) -> bool {
-    let normalised: String = algo
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_uppercase();
+    let normalised = normalise(canonical_algorithm(algo));
     matches!(
         normalised.as_str(),
         // RFC 1319. HotSpot 25's SUN carries MD2 and this VM advertised it
@@ -565,11 +612,7 @@ pub(crate) fn digest_length_bytes_public(algo: &str) -> Option<usize> {
 /// they shared one wrong default is the shape that makes this species so hard
 /// to see from inside. W7-63-jca-advertise-vs-serve.md.
 fn digest_length_bytes(algo: &str) -> Option<usize> {
-    let normalised: String = algo
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_uppercase();
+    let normalised = normalise(canonical_algorithm(algo));
     Some(match normalised.as_str() {
         "MD2" | "MD5" => 16,
         "SHA" | "SHA1" => 20,
@@ -694,22 +737,42 @@ mod tests {
 
     #[test]
     fn algorithm_supported_rejects_unknown() {
-        for algo in [
-            "BLAKE2",
-            "Whirlpool",
-            "FAKEHASH",
-            "",
-            // The bare SHAKE spellings are ALIASES on HotSpot
-            // (`Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256`), resolved by
-            // the provider chain's alias table before this predicate is
-            // consulted. They must NOT be arms here, or
-            // `Security.getAlgorithms("MessageDigest")` grows to 17 where
-            // HotSpot answers 15.
-            "SHAKE128",
-            "SHAKE256",
-        ] {
+        for algo in ["BLAKE2", "Whirlpool", "FAKEHASH", ""] {
             assert!(!algorithm_supported(algo), "{algo} should be rejected");
         }
+    }
+
+    /// The bare `SHAKE128` / `SHAKE256` spellings are `Alg.Alias` rows on
+    /// HotSpot, and `getInstance` resolves them there. They used to be pinned
+    /// as REJECTED here, on two premises that were both false: that "the
+    /// provider chain's alias table [resolves them] before this predicate is
+    /// consulted" — `md_get_instance` reads no registry, this predicate is its
+    /// whole gate — and that admitting them would grow
+    /// `Security.getAlgorithms("MessageDigest")` from 15 to 17, which it
+    /// cannot, because that set is built from the SERVICE rows by
+    /// `provider_chain::algorithms_for_service` and never consults this
+    /// function. Both halves are asserted below, so the pair cannot drift back
+    /// into "advertised count is right, `getInstance` refuses the name".
+    /// W7-63-jca-advertise-vs-serve.md §3 #2, alias half.
+    #[test]
+    fn the_shake_aliases_resolve_but_are_not_separate_algorithms() {
+        for (alias, canonical) in [("SHAKE128", "SHAKE128-256"), ("SHAKE256", "SHAKE256-512")] {
+            assert!(
+                algorithm_supported(alias),
+                "{alias} is an alias of {canonical} and MessageDigest.getInstance must serve it"
+            );
+            assert_eq!(canonical_algorithm(alias), canonical);
+            assert_eq!(digest_length_bytes(alias), digest_length_bytes(canonical));
+            assert_eq!(
+                compute_digest(canonical_algorithm(alias), b"abc").unwrap(),
+                compute_digest(canonical, b"abc").unwrap(),
+                "{alias} must produce byte-identical output to {canonical}, which is what \
+                 HotSpot 25 was measured doing"
+            );
+        }
+        // Anti-vacuity: canonicalisation must be confined to the two aliases.
+        assert_eq!(canonical_algorithm("SHA-256"), "SHA-256");
+        assert_eq!(canonical_algorithm("FAKEHASH"), "FAKEHASH");
     }
 
     /// The gate, the length table and `compute_digest` are three separate

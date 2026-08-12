@@ -11,6 +11,54 @@ the JDK 25 image on this host (`Eclipse Adoptium jdk-25.0.3.9-hotspot`, `javap
 -version` = `25.0.3`) or a read of the tree at `7d4d545e0`. No measurement is
 claimed.
 
+> ## UPDATED 2026-08-12 — §8.2 is DONE, and its stated blocker never existed
+>
+> **§8.2's premise is refuted.** It declines `Selector.provider()` because
+> *"`NativeContext` has `invoke_virtual`, `invoke_virtual_declared` and
+> `invoke_virtual_bytecode_only` but **no `invoke_static`**"*.
+> `NativeContext::invoke(class_name, method_name, descriptor, args)`
+> (`native-api/src/registry.rs:1791`, `NativeInvokeAccess`) resolves by name and
+> dispatches with no receiver — it *is* the static invoker, and
+> `native-collections`'s `drain_spliterator_via_real_iterator` has been calling
+> the public static `java.util.Spliterators.iterator(Spliterator)` through it on
+> the `--jdk-only` path since 2026-08-05. **The record grepped for the name and
+> read the absence of the name as the absence of the capability** — the same
+> methodology failure §4 warns about, one level up: not "a grep gives the wrong
+> answer about a call graph" but "a grep gives the wrong answer about a
+> capability".
+>
+> The registration landed in `native-io/src/nio_selector.rs`
+> (`selector_provider_native`, added to the existing `for c in [sel_iface, sel]`
+> loop), which is the home §8.2 named. Unrun.
+>
+> **And the half this record could not see is the bigger one.** §3 reasons about
+> the *abstract declaration* on `java/nio/channels/Selector` and concludes the
+> gap is an `AbstractMethodError` on a mint of that class. But
+> `selector_open_native` allocates `sun/nio/ch/SelectorImpl` — a real JDK class —
+> with `new_object`, i.e. **no constructor runs**. `provider()` on that receiver
+> resolves to `AbstractSelector.provider()`, which is `final` concrete bytecode
+> returning the `provider` field, and nothing ever set it. So
+> `Selector.open().provider()` answers **`null`** on CratonVM, in Compatible mode
+> as well as strict, for every selector in the process — while the
+> `AbstractMethodError` this record predicted only ever applied to the two
+> synthetic `java/nio/channels/Selector` mints, one of which
+> (`phases_late/net_channels.rs:569`) is `register_synthetic_overrides`-only and
+> the other (`servlet.rs:7527`, via `register_s1_classloading`, called only from
+> `lib.rs:24071`) likewise. **The predicted defect was the dead one and the live
+> one was invisible to the method.** Generalisation worth carrying: *a record that
+> adjudicates an abstract method has to check which class the VM's mint actually
+> WEARS, because a real abstract superclass with a concrete implementation two
+> levels down converts "no Code" into "a field nobody wrote".*
+>
+> Covered by a scheduled fixture rather than left to a probe:
+> `regression-suite/src/RJdkNio.java`, `selectorAndAsyncClose()`, 81 → **84**
+> checks — one red (`provider() != null`, which fails on the old behaviour in
+> both modes), one stability control, and one identity check against
+> `SelectorProvider.provider()` so a fabricated carrier cannot pass.
+>
+> §8.1 and §8.3 are re-checked below; §8.1's precondition 1 is now satisfiable
+> and §8.3's blocker holds.
+
 ---
 
 ## 1. What was being tested
@@ -254,8 +302,11 @@ The three interfaces-only classes are immune for the reason in §2's corollary.
 ## 6. The five residual triples, and why four are not fixed here
 
 **`java/nio/channels/Selector.provider()Ljava/nio/channels/spi/SelectorProvider;`**
-— confirmed missing everywhere (`"provider"` appears as a registered method name
-on no class in `native-io`, `native-builtins` or `native-collections`). It is
+— **FIXED 2026-08-12; the rest of this paragraph is kept as history and its
+premise is refuted — see the UPDATED block at the top of this file.** It was
+confirmed missing everywhere (`"provider"` appears as a registered method name
+on no class in `native-io`, `native-builtins` or `native-collections`) — true then
+and true until the fix. It was
 **not fixed here, deliberately**: the only correct body calls the *static*
 `SelectorProvider.provider()`, and `NativeContext` has `invoke_virtual`,
 `invoke_virtual_declared` and `invoke_virtual_bytecode_only` but **no
@@ -296,6 +347,13 @@ datagram assembled from them, so a loop over `read(ByteBuffer)` would consume
 A correct body has to reach the socket, which means the layout question above.
 
 ## 7. What was changed in the tree by this record
+
+**Superseded 2026-08-12 for two of the five residuals** — `Selector.provider()`
+is registered in `native-io/src/nio_selector.rs` and
+`Stream.forEachOrdered(Consumer)V` in `native-collections/src/lib.rs`, both on
+shipping registrars, both unrun. Fixtures: `RJdkNio` 81 → 84, and no new
+`RJdkCollections` row (see §8.1's note on why one would be vacuous). The
+paragraph below describes the state at filing:
 
 Nothing in Rust. Nine of the eleven classes were already covered; the
 `Spliterator` and `Map$Entry` halves in particular are covered by
@@ -392,6 +450,62 @@ If (1) is not yet true, **do not delete** — the deletion converts a wrong answ
 into an `AbstractMethodError`, which is worse for the WildFly path than the
 status quo. The correct order is: land the registration, prove it live, then
 delete.
+
+#### 8.1 re-checked 2026-08-12 — precondition 1 was FALSE and is now SATISFIABLE
+
+The precondition held exactly as written. Re-verified by call graph, not by grep:
+`java/util/stream/Stream.forEachOrdered(Ljava/util/function/Consumer;)V` had one
+registration in the whole tree, `native-builtins/src/phases_late/streams.rs:177`,
+inside `register_phase56_stream_extras` → `register_synthetic_overrides` → a no-op
+shim in both shipping builds. `native-builtins/tests/essential_wiring_ratchet.rs`
+says the same in prose and deliberately does *not* assert the triple, calling it
+*"the next row to add"*; the three PRIMITIVE widths are asserted there and are
+live, on a different descriptor.
+
+**That row has now been added, on the shipping registrar:**
+`native-collections/src/lib.rs::register_stream_natives` registers the triple to
+`native_stream_for_each`, beside the `forEach` it already owned.
+`register_collections_natives` runs in both real-JDK arms at `vm_init.rs:2434`,
+which is after everything that could out-vote it, and the ambient category there
+is `Bridge` — the kind `--jdk-only` keeps.
+
+**The deletion is still NOT taken, and the ordering is why.** The interpreter's
+special case runs ~20 lines ABOVE the `resolve_native_for_dispatch` call in the
+same `!has_code` arm, so it still wins and the new callback is not yet reached.
+The registration is therefore **behaviour-neutral today**, which is the safest
+possible first half: precondition 1 is satisfied without changing an answer.
+Precondition 3 is not, and cannot be satisfied by this lane in the useful
+direction — with the hack in place, any `forEachOrdered` assertion passes on the
+old behaviour too, so writing one would be a vacuous test (`W6-5`'s species). The
+instrument for the deletion is that assertion run AFTER the deletion, on a binary,
+which is a build this pool cannot do. Two consequences to hand on:
+
+* the deletion (`vm/src/runtime/interpreter.rs`, the block quoted above) is now a
+  one-file change gated on **one run**, not on a registration;
+* `essential_wiring_ratchet.rs`'s comment calling this triple "not registered
+  today" is stale as of this change, and its `ABSTRACT_PRIMITIVE_STREAM_TERMINALS`
+  table would now accept the row. Neither file is this lane's.
+
+#### 8.3 re-checked 2026-08-12 — the blocker HOLDS
+
+Re-derived rather than assumed. The two layouts are still two:
+`native-io/src/lib.rs`'s own `register_datagram_channel` with its `DC_NUM_FIELDS`,
+and `native-builtins/src/phases_late/net_channels.rs`'s, reading `field 2` as the
+connected flag and `field 4` as a socket-registry id. And the reason the blocker
+is real rather than merely inconvenient is now stated in the campaign's own words:
+`W7-77-guarded-slot-maps.md` records that on a fabricated class **each slot map IS
+the layout**, so a renumber breaks the only receiver that exists. Unifying two
+layouts for one class name is a renumber on at least one side. That makes this a
+collections-style reclassification (make one owner, then drop the other
+interception), not a wiring change, and it needs the lane that owns
+`native-io/src/lib.rs` — not this one, which owns only `nio_selector.rs`,
+`datagram.rs`, `socket_channel.rs` and `nio_native.rs`.
+
+The two vectored overloads (`read([Ljava/nio/ByteBuffer;II)J`,
+`write(…)J`) keep their separate reason and it is unchanged: one call must move
+exactly one datagram, so they cannot be composed from the single-buffer natives,
+and a correct body has to reach the socket registry — i.e. the layout question
+again.
 
 ### 8.2 `Selector.provider()` — needs `invoke_static` first
 

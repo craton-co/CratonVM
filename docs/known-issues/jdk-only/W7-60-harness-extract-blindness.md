@@ -4,6 +4,39 @@ Status: **the filter is measured, the population is closed, the instrument is
 mutation-checked, and the three named vectors are repaired.** One new finding
 arrived inside the repair (§5).
 
+> **2026-08-12 — §7.3, the last recorded-not-fixed row, is CLOSED.**
+> `RPriorityQueueGc` and `RTreeRangeGc` publish check counts and their rows are
+> **deleted** from `regression-suite/harness-uncounted.txt`; that file now holds
+> exactly one entry, `RClassUnloadSweep`. Deleting rather than annotating is
+> forced by the ratchet's reverse direction, which is the half that keeps the
+> baseline from decaying. Detail in §7.3 itself; the two things worth carrying
+> forward are:
+>
+> * **The deferred "what is the unit" decision needed no run.** The unit is one
+>   `check()` call, matching every other vector. The count is a property of the
+>   SOURCE — how many assertion sites executed — not of the heap; `--nojit` and
+>   `--Xmx 64m` decide whether those assertions FAIL, not how many of them run.
+>   The old rows' premise that a count "measured outside those conditions means
+>   nothing" conflated the two.
+> * **One of the two needed a genuinely uncounted twin, and that is the finding.**
+>   `RPriorityQueueGc`'s concurrent drain loop runs three assertions per element
+>   drained, and how many elements survive the workers' interleaved `poll()`s is
+>   scheduling-dependent — the vector's own comment already says so about the
+>   neighbouring `CK` line. Folding those into a count that is *diffed against
+>   HotSpot* would have made a CORRECT VM go red at random: a new instrument
+>   defect installed while closing an instrument defect, the §5 reflex again.
+>   They go through `checkDyn()`, identical failure behaviour, not counted.
+>
+> **A premise handed to that lane was also false and is recorded so it is not
+> re-tried:** `RMapResizeGc` and `RMapGcStress` were reported as uncounted and
+> unbaselined, i.e. as two live `HARNESS ERROR` rows on every run. They are
+> neither. Both print `CK n=…` **and** `PASS <Class> (N checks)`
+> (`RMapResizeGc.java:108`, `RMapGcStress.java:233`), so G2 and G3 are both
+> satisfied, and adding them to `harness-uncounted.txt` would have fired the
+> reverse ratchet on every run — turning a green pair red in the name of fixing
+> them. Re-measured by reading all 72 sources: the only vectors without a count
+> were the two closed here plus `RClassUnloadSweep`, exactly as §1 recorded.
+
 Predecessors: `W7-51-vacuous-sweep-round-2.md` (which found this, repaired three
 vectors, and left the harness itself and three named vectors open),
 `W6-5-vacuous-tests.md` (round 1, the two shapes).
@@ -36,7 +69,7 @@ byte-identical to a clean run**. Scheduled, executed, incapable of failing.
 | vectors executed on HotSpot and re-filtered through `extract()` | **70 / 70** |
 | vectors whose evidence `extract()` discards, **after** W7-51's three repairs | **0** |
 | vectors whose extracted output is a bare constant | **0** |
-| vectors that publish no count of the assertions they ran | **5** → **3** |
+| vectors that publish no count of the assertions they ran | **5** → **3** → **1** (2026-08-12, §7.3) |
 | guards added | 4, each **mutation-checked** |
 | vectors repaired here | 5 (`RNioNoFollow`, `RCrypto`, `RJdkX509Intercept`, `RFileTimes`, and `RNioNoFollow`'s uncovered line-separator bug) |
 | mutants run | **11**, each side by side against the pre-repair source |
@@ -110,7 +143,7 @@ level up.
 | --- | --- | --- |
 | **G1** DISCARDED EVIDENCE | the ORACLE printed a line `extract()` deletes and that is not JDK stderr noise | 0 offenders |
 | **G2** CONSTANT EXTRACT | what survives carries no observable at all — no `CK` line, no check count — so the diff compares a constant against itself. Empty extract is the degenerate case | 0 |
-| **G3** NO CHECK COUNT | the vector publishes no count of the assertions it executed | 3, all baselined |
+| **G3** NO CHECK COUNT | the vector publishes no count of the assertions it executed | 3, all baselined → **1** (2026-08-12) |
 | **G4** SICK ORACLE | the HotSpot run supplying ground truth did not itself succeed | 0 |
 
 **G4 is a defect in its own right, found while building the guard.** `run.sh`
@@ -133,10 +166,13 @@ established.
 The three baselined entries each carry their reason: `RClassUnloadSweep` has zero
 assertions by design (whether a weak reference has been cleared is a GC-policy
 outcome, not a language guarantee, so its one observable is deliberately
-diff-only); `RPriorityQueueGc` and `RTreeRangeGc` have no counter at all, and
+diff-only); ~~`RPriorityQueueGc` and `RTreeRangeGc` have no counter at all, and
 adding one to them is a real repair that belongs to a lane which can run them
 under the `--nojit --Xmx 64m` reproduction conditions `class_cv_args()` supplies,
-since a count measured outside those conditions means nothing.
+since a count measured outside those conditions means nothing.~~
+**Both closed 2026-08-12 — see §7.3 and the box at the top. That clause was
+wrong about *why* it was hard: the count is a source property, and the flags
+decide whether the assertions fail, not how many run.** One entry remains.
 
 ### 2.1 The guard is mutation-checked, which is the only reason to believe it
 
@@ -345,6 +381,12 @@ checking *which* assertion failed does.
 7. **A new CI step**, `Regression-suite harness self-check (HotSpot only)`, in
    the `jdk-only` job. It needs no CratonVM binary, so it still measures the
    harness when the build breaks. Green over all 70 vectors when added.
+8. **ADDED 2026-08-12.** `RPriorityQueueGc` and `RTreeRangeGc` now print
+   `CK <Class> checks=N` and `PASS <Class> (N checks)` where they printed a bare
+   `PASS <Class>`. Two new diffed lines each, and `harness-uncounted.txt` loses
+   two rows — leaving it at one. Nothing about either vector's behaviour changed;
+   if either is red on the first run it is for the reason `class_cv_args()`
+   supplies its flags, which is what those gates are for.
 
 Everything above was measured on HotSpot 25.0.3+9 on Windows. **No CratonVM run
 was possible in this lane**, so no claim here is a claim about CratonVM's
@@ -359,10 +401,19 @@ behaviour, and none is presented as one.
    run — which is the step working.
 2. **The three repaired vectors are red under CratonVM.** Expected, and
    enumerated in §6. Each red is a finding.
-3. **G3's baseline is wrong about `RPriorityQueueGc` / `RTreeRangeGc`.** Their
+3. ~~**G3's baseline is wrong about `RPriorityQueueGc` / `RTreeRangeGc`.** Their
    rows say a count needs a decision about what the unit is, measured under
    their reproduction flags. If someone can make that decision cheaply, the rows
-   should go.
+   should go.~~ **This falsifier FIRED, 2026-08-12, and the rows are gone.** The
+   decision was cheap and the rows' stated reason for deferring it was wrong.
+   What replaces it as a falsifier is narrower: **the two new counts must be
+   constants on a healthy run.** `RTreeRangeGc`'s every loop is over a
+   fixed-size collection, and `RPriorityQueueGc`'s scheduling-dependent drain is
+   excluded through `checkDyn()` — if either number moves between two green runs
+   of the SAME VM, the exclusion is incomplete and the count must come back out
+   (or the row go back in) rather than be widened. Both vectors also gain a
+   `PASS <Class> (N checks)` shape where they printed a bare `PASS <Class>`, so
+   their expected output changes: that is a diffed line, not a behaviour change.
 4. **`extract()` might be the wrong filter, not merely an unguarded one.** This
    lane deliberately did not widen it: widening admits CratonVM's tracing into
    the diff and turns every vector red. The claim defended here is narrower and

@@ -1,5 +1,12 @@
 # `getAnnotation` returned null for "the VM failed"
 
+> **UPDATED 2026-08-12 — R1/R2/R3 partially discharged; see "R3 discharged"
+> near the end.** The census is widened from one file to the workspace (21
+> `loadClass` delegations in **12** files; R1's "twelve" and R2's "five" were
+> both one-file counts), four more sites are narrowed in source, and the
+> thirteen that remain are named with two exact out-of-file patches. Nothing
+> in that section was built or run either.
+
 **Status: FIXED in source 2026-08-11, NOT BUILT.** Every measurement below
 came out of the already-built `dev` binary at `C:/craton/CratonVM`
 (`target/release/cratonvm.exe`, mtime 19:41). No claim is made about the code
@@ -224,11 +231,15 @@ mode that is green today.
 
 ## Out-of-file patch (not applied)
 
-**None required.** Every one of the sixteen changed call sites lives in
+**None required *for the sixteen sites above*.** Every one of them lives in
 `native-builtins/src/lang_class.rs`, and `ladder_rung` is a private helper in
 that file. No other lane's file is touched, and no shared API changed shape:
 `parameter_erased_type_mirror` is a module-private `fn` with two call sites,
 both in the same function.
+
+**Thirteen more were found by the widened census on 2026-08-12 and DO need
+out-of-file patches** — see "R3 discharged" below, which carries the exact
+replacement text for the two whose argument is settled.
 
 ## Residuals
 
@@ -244,18 +255,309 @@ both in the same function.
   it changes behaviour on the `@ConditionalOnClass` path, which is the
   highest-traffic annotation path in the Spring suites, and this lane could
   not build.
+  **PARTIALLY DISCHARGED 2026-08-12** — the census is widened (21 `loadClass`
+  delegations in 12 files, not 12 in one), the policy helper exists
+  (`absorb_class_absent`, two absorbed roots, `ClassId`-hierarchy test), and
+  four sites are narrowed with a scheduled assertion. Thirteen remain, every
+  one in another lane's file; two of them carry exact replacement text. See
+  "R3 discharged" below. The "twelve" in this bullet was a one-file count and
+  should not be quoted as a population.
 * **R2 — five sites re-raise a failure as the wrong exception type.**
   `link_isolated_method_signatures` turns any `initialize_class` failure into
   `ClassNotFoundException`, which swallows the identity of an
   `ExceptionInInitializerError`; `wf_shim_synth_main_method`'s four sites turn
   any failure into `NoSuchMethodException`. Both are loud, so neither is this
   record's species — but a caller that catches on type is still being lied to.
+  **The count of five was also a one-file count.** The widened census found
+  two more, both on the class-loading path and both worse than the five
+  because `ClassNotFoundException` is what a loader's caller *expects*, so the
+  lie is invisible: `ucl_real_find_class` (`classloader_real.rs`) reported
+  every `ctx.load_class` failure as "not found", and `lang_class.rs:10022`
+  re-mints every isolated-loader `loadClass` failure as
+  `isolated_loader_class_not_found`. The first is **FIXED 2026-08-12**; the
+  second carries exact replacement text under "R3 discharged". The original
+  five are untouched.
 * **R3 — this sweep covered one file.** The species is defined by a helper's
   return type, not by a subsystem, so the same two scans are worth running
   over the other large native modules. The second scan (invoke sites followed
   by an `Err`-catching arm) found nine of the sixteen fixed sites and none of
   them were visible to the first; a sweep that only greps swallow shapes will
   under-report by roughly half.
+
+## R3 discharged — the widened census, 2026-08-12
+
+**Nothing below was built or run.** Written by a lane that owns
+`classloading/**` and three `native-builtins` files and could not compile.
+
+R3 was right that the one-file scan under-reports, and wrong about by how
+much. Re-run **workspace-wide** — `native-builtins`, `native-io`,
+`native-collections`, `vm` and `classloading` — with the second scan
+re-keyed on the two helpers that define the loader-ladder species rather than
+on `invoke_virtual` in general:
+
+```sh
+# the loader-ladder population, by delegation site rather than by shape
+grep -rn --include=*.rs '"loadClass"' native-builtins/src native-io/src \
+    native-collections/src vm/src classloading/src
+grep -rn --include=*.rs 'class_id_by_name_via_referencing_class'
+# then READ each `ctx.invoke*(` / `ctx.class_id_by_name_via_referencing_class(`
+# that names one, and classify the arm that receives its `Err`
+```
+
+That is the pattern to extend; the raw shape grep is not. Over the ten files
+this lane owns the shape grep returns **~367** lines and **zero** of them
+would have found a single site fixed below — the two in `class_manager.rs` are
+`.ok()` and `filter_map(… .ok())` inside a supertype loop, which the shape
+grep does hit and drowns among 117 other hits in that one file, and the two in
+`classloader_real.rs` are `_ =>` and `if let Ok(…)` arms indistinguishable
+from forty correct ones.
+
+### The `loadClass` delegation population: 21 sites in 12 files
+
+R1's "twelve" was a count of one file. The real population, with the
+disposition of the arm that receives the `Err`:
+
+| disposition | n | sites |
+|---|---|---|
+| propagates | 4 | `classloader.rs:2239` (wrapped in `Some`), `classloader.rs:2830`, `classloader_real.rs:931`, `lang_system.rs:4601` |
+| **discriminates on the failure** | 2 | `lang_class.rs:13621` (`resolve_annotation_class_via_loader` — hands the exception OBJECT back), `lang_class.rs:2820` |
+| documented best-effort preload, returns `()` | 1 | `lang_system.rs:4555` |
+| **swallows ANY failure** | **14** | below |
+
+The fourteen: `cglib_enhancer.rs:4219`, `classloader.rs:3260`,
+`classloader_real.rs:1348`, `generics.rs:312`, `jboss_module_loader.rs:2271`,
+`lang_class.rs:4380`, `:10022`, `:19469`, `:19796`, `:19928`,
+`service_loader.rs:420`, `:648`, `spring_startup_bootstrap.rs:3596`,
+`vm/src/runtime/interpreter/constants.rs:1289`.
+
+**One of the fourteen is in a file this lane owns and is fixed; thirteen are
+not.** The one that matters most among the thirteen is
+`classloader.rs:3260` — it is the *synthetic-mode twin* of the fixed site,
+the same `_ => {}` arm on the same parent delegation, and the out-of-file
+patch for it is written out below.
+
+### The `class_id_by_name_via_referencing_class` population: 10 sites
+
+| disposition | n | sites |
+|---|---|---|
+| propagates with `?` | 1 | `apps_h2.rs:2049` |
+| **swallows** | 9 | `cglib_enhancer.rs:3945`, `generics.rs:260`, `lang_class.rs:13707`, `:14358`, `:14497`, `:14808`, `lookup_define.rs:248`, `:256`, `test_frameworks.rs:1288` |
+
+Two of the nine (`lookup_define.rs`) are fixed below.
+
+### Fixed, 2026-08-12 — four functions, six arms
+
+| site | was | now | what now escapes |
+|---|---|---|---|
+| `classloader_real.rs` · `cl_real_load_class_base_rooted`, step 0 | `_ => { parent_user_defined_authoritative_miss = true }` over `Ok(_)` **and** `Err(_)` alike | `Ok(_)` keeps the flag; `Err` goes through `absorb_class_absent` | a parent loader's `LinkageError` / `ExceptionInInitializerError` / `RuntimeException` leaves `loadClass` instead of arriving as `ClassNotFoundException` |
+| `classloader_real.rs` · `ucl_real_find_class` | `if let Ok(Some(mirror)) = ctx.load_class(…)` then fall through to `ClassNotFoundException` | `match`, with `absorb_class_absent` on the `Err` | R2's species: a class that IS found and cannot be linked (`ClassFormatError`, `VerifyError`, `UnsupportedClassVersionError`) stops being reported as "not found" |
+| `lookup_define.rs` · `resolve_lookup_supertypes` ×2 | `Err(_) => return (None, None)` | returns `Result`, `absorb_class_absent` then the same fall-through | `Lookup.defineClass`/`defineHiddenClass` deliver the supertype's real `LinkageError` rather than defining the generated class against a name-only supertype |
+| `classloading/src/class_manager.rs` · `upgrade_synthetic_class` ×2 | `.ok()` on the superclass, `filter_map(… .ok())` on the interfaces | explicit `match`es that `return Err(e)` after releasing `loading_guard` | an upgrade whose supertype cannot be resolved fails instead of installing a layout with `first_field_index = 0` and a short interface list |
+
+The last row is the sharpest of the four and it is **not** a lost-diagnostic
+defect — it is the slot-index species
+(`docs/architecture/natives-over-real-jdk-classes.md` §5). `superclass_id`
+feeds `compute_field_layout` directly, so `None` for a class whose own class
+file declares a superclass collapses every inherited field slot. The sibling
+that defines the same class from the same bytes,
+`define_class_with_options`, already propagates both; this function was the
+outlier, exactly as `native_method_get_annotation` was the convention the
+original five sites departed from.
+
+### The policy helper
+
+`absorb_class_absent` (`native-builtins/src/classloader_real.rs`,
+`pub(crate)`) is `native-api/src/delegated_close.rs`'s `absorb_thrown` shape
+with two absorbed roots instead of one, because R1 names two:
+`ClassNotFoundException` **and** `NoClassDefFoundError`. The type test is by
+`ClassId` hierarchy, never by name. It is not in `delegated_close.rs` because
+that module is `native-api`'s and this lane does not own it; if a later lane
+moves it there, the two roots and the `InternalError` residual must move with
+it.
+
+**The `InternalError` residual, stated rather than hidden.**
+`absorb_class_absent` absorbs `MethodCallFailed::InternalError` as well.
+`delegated_close.rs` argues it should not — an internal error is not a Java
+throwable and no JDK `catch` can name it. It is kept absorbed because it is
+*also* the shape `resolve_class_loader_aware` returns for a plain "not on any
+classpath entry" miss: its terminal arm is `Err(MethodCallFailed::from(e))`
+over a `VmError`, which is the single most common reason a rung legitimately
+falls through. Narrowing it before the resolver stops reporting absence as an
+internal error would refuse every ordinary miss. That is a real residual and
+the next lane should take it from the resolver's end, not from here.
+
+### Blast radius of the one behaviour change that reaches applications
+
+`cl_real_load_class_base_rooted` step 0 fires only when the receiver's
+**parent** is a user-defined loader. What newly escapes is any throwable from
+that parent's own `loadClass` that is not a `ClassNotFoundException` or a
+`NoClassDefFoundError`. Who is likely to catch it:
+
+* **Spring Boot** — `ModifiedClassPathClassLoader` / `ResourcesClassLoader`
+  (`@ClassPathExclusions`, `@WithPackageResources`) are the loaders this
+  branch was written for and they raise `ClassNotFoundException`, which is
+  still absorbed. `ClassUtils.isPresent` catches `Throwable` and answers
+  `false`, so `@ConditionalOnClass` is unaffected either way.
+* **Quarkus** — `RunnerClassLoader` calls `getParent().loadClass(name)` inside
+  `try { } catch (ClassNotFoundException)`. Still absorbed.
+* **Tomcat** — `WebappClassLoaderBase` catches `ClassNotFoundException` around
+  its parent delegation and rethrows everything else. Same as HotSpot.
+* **The at-risk shape** is a loader that raises a `RuntimeException` from
+  `loadClass` and relies on a *caller* further out catching only
+  `ClassNotFoundException`. On HotSpot that caller does not catch it either,
+  so a red here is a divergence being removed, not one being introduced —
+  but it will look like a new failure.
+
+`ucl_real_find_class` widens nothing in practice: `ctx.load_class` reports an
+absent class as `InternalError`, which is still absorbed.
+
+### Coverage
+
+`regression-suite/src/RLoaderChurnDefine.java` ·
+`aParentsFailureIsNotAMiss()` — in `CORE_CLASSES`, so it runs on a default
+`run.sh` invocation and in both modes, not only under `SUITE=all`.
+
+The parent is a `ClassLoader` subclass overriding
+`loadClass(String,boolean)` — the canonical override point, and the one form
+**both** VMs reach (HotSpot's `loadClass` calls `parent.loadClass(name,
+false)`; CratonVM's native calls the one-argument form, which routes into the
+override through `receiver_overrides_load_class_resolve`). The child is a
+**bare `java.net.URLClassLoader`**, per this record's own rule about the shape
+a real application builds — Spring Boot's
+`PropertiesLauncher.wrapWithCustomClassLoader` is this exact topology and is
+named in the delegation native's own comment.
+
+Three checks, and only the first fails on the old behaviour:
+
+1. a parent raising `IllegalStateException` must deliver it; **old behaviour
+   delivered `ClassNotFoundException`** and the check names that explicitly.
+2. a parent raising `ClassNotFoundException` must still be absorbed and the
+   child must still define its own copy from its own URLs — the
+   over-correction guard.
+3. a parent that resolves normally is still the answer.
+
+The parent counts its own invocations, so a run in which delegation never
+happened cannot read green.
+
+**Not covered by any scheduled assertion, and why:** the `ucl_real_find_class`
+and `resolve_lookup_supertypes` narrowings both need a class that is *present
+and malformed*, which means writing a bad `.class` to disk — this vector
+writes nothing and stays deterministic. `upgrade_synthetic_class` needs a
+synthetic stub whose real bytes appear later with an unresolvable supertype,
+which no fixture in the suite constructs. All three are source-only.
+
+## Out-of-file patches (not applied) — the thirteen this lane could not reach
+
+Owned by other lanes this wave. Listed with the exact replacement text for the
+two where the argument is settled; the rest are named with their disposition
+so the next lane does not have to re-derive the census.
+
+### 1. `native-builtins/src/classloader.rs:3260` — the synthetic-mode twin
+
+This is the same defect as the fixed site, in the same shape, one file over.
+`cl_load_class_base_delegation_inner`'s parent rung:
+
+```rust
+            match delegated {
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+                _ => {}
+            }
+```
+
+becomes
+
+```rust
+            match delegated {
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+                // W7-26 R1 — the synthetic-mode twin of the narrowing applied
+                // to `classloader_real.rs`'s step 0. JDK 25
+                // `ClassLoader.loadClass` catches `ClassNotFoundException`
+                // around its parent delegation and nothing else; the bare
+                // `_ =>` also caught a `LinkageError` and every
+                // `RuntimeException` a loader raised, and reported the class
+                // as merely absent.
+                Ok(_) => {}
+                Err(failed) => {
+                    crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                }
+            }
+```
+
+`absorb_class_absent` is `pub(crate)` in the same crate. The enclosing
+function returns `MethodCallResult`, so the `?` type-checks. **Check the
+GC-refresh lines immediately below the call before applying** — the
+`read_native_pin` refreshes must stay above the `match`, as they already are.
+
+### 2. `native-builtins/src/lang_class.rs:10022` — R2's shape, a wrong-type re-raise
+
+```rust
+        let mirror = match loaded {
+            Ok(Some(Value::Object(Some(mirror)))) => mirror,
+            _ => return Err(isolated_loader_class_not_found(ctx, name)?),
+        };
+```
+
+Every failure of the isolated loader's `loadClass` — including a
+`LinkageError` it raised itself — is re-minted as a `ClassNotFoundException`
+naming the class. Replacement:
+
+```rust
+        let mirror = match loaded {
+            Ok(Some(Value::Object(Some(mirror)))) => mirror,
+            Ok(_) => return Err(isolated_loader_class_not_found(ctx, name)?),
+            Err(failed) => {
+                // W7-26 R2 — a failure is not a miss. Only the
+                // class-absent shapes may be re-minted as this loader's
+                // `ClassNotFoundException`; anything else the loader raised
+                // is the answer and a caller's `catch
+                // (ClassNotFoundException)` deliberately does not match it.
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Err(isolated_loader_class_not_found(ctx, name)?);
+            }
+        };
+```
+
+### 3–13. The remaining eleven, with dispositions rather than patches
+
+| site | shape | disposition |
+|---|---|---|
+| `lang_class.rs:4380` (`descriptor_to_class_mirror_via_loader`) | `if let Ok(Some(…))` → `descriptor_to_class_mirror` | R1's named site. Same narrowing; the fallback is documented and must survive an absorbed CNFE. |
+| `lang_class.rs:19469`, `:19796`, `:19928` | `_ => None` / `if let Ok(…)` | The `nest_host` / `declared_classes` / `declaring_class_loader_aware` rungs R1 names. Same narrowing. |
+| `lang_class.rs:13707`, `:14358`, `:14497`, `:14808` | `.ok()` on `class_id_by_name_via_referencing_class` | Annotation-element resolution. Each ends in a defined sentinel, so the fall-through must survive; only the non-absent throwables should escape. |
+| `generics.rs:260`, `:312` | `.ok()` / `if let Ok(…)` | Generic-signature resolution, global fallback below. Same narrowing. |
+| `service_loader.rs:420`, `:648` | `if let Ok(…)` | `ServiceLoader` provider resolution; the next rung is a jar scan / `findClass`. Same narrowing. |
+| `jboss_module_loader.rs:2271`, `spring_startup_bootstrap.rs:3596`, `cglib_enhancer.rs:3945`, `:4219`, `test_frameworks.rs:1288` | `if let Ok(…)` / `.ok()?` / `_ => false` | Third-party shims. `cglib_enhancer.rs:4219` is a **predicate** (`_ => false`) and needs the caller widened before it can carry anything, so it is the one of the thirteen where the narrowing is not local. |
+| `vm/src/runtime/interpreter/constants.rs:1289` | `_ =>` → `impl_jars_load_class` | The Elasticsearch `EmbeddedImplClassLoader` fallback, documented in place. Same narrowing; the fallback must survive an absorbed CNFE. |
+
+### False positives the shape grep produced in this lane's files — do not "fix" these
+
+* `classloading/src/class_manager.rs`, the two
+  `let _ = self.loader_constraints.pin/impose(…)` beside the JVMS §5.3.4
+  supertype check. **Not a swallow.** Both return
+  `Option<LoaderConstraintViolation>`, not a `Result`; the violation is already
+  recorded in the table, and `classloading/src/loader_constraints.rs`'s module
+  doc states the deferral as a decision ("Fail-closed, but not fail-loud yet
+  … turning a violation into a thrown `LinkageError` is a separate, flagged
+  step"). This is W7-57's lesson restated: `let _ =` is not the discard.
+* `classloading/src/class_path.rs`, ~165 raw hits and **zero** in species.
+  Every non-test one is an `Err(_) => continue` over a classpath **entry**,
+  which is `URLClassPath$Loader`'s own `catch (Exception e) { return null; }`
+  reproduced faithfully, or filesystem/zip I/O. Roughly forty are
+  `let _ = fs::remove_dir_all` in `#[cfg(test)]` teardown.
+* `classloader_real.rs`'s `init_classloader_common_fields` /
+  `init_urlclassloader_fields` — three `if let Ok(…) = ctx.new_object(…)` and
+  two `let _ = ctx.invoke(… "<init>" …)`. The documented best-effort
+  constructor group: both functions return `()`, and the contract the callers
+  rely on is that the field is non-null, which holds on every arm.
+* `classloading/src/{loaders,class_origin,resolution,builtin_loaders,loader_constraints}.rs`
+  and `native-builtins/src/classloader_value_sidetable.rs` — **0 in species
+  between them.** The sidetable's one `invoke_virtual` propagates with `?`;
+  the rest are env-var reads, `Option`-shaped cache lookups and `matches!`
+  over enums.
 
 ## How to re-take this
 

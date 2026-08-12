@@ -432,7 +432,51 @@ starts being trusted for something it does not check.
    natives) and gated them. This row's four maps contribute 15 of the 29
    predicted census rows; the two synthetic-only ones can only be swept in
    synthetic mode, because their registrars are.
+   **RE-VERIFIED 2026-08-12: the wiring is in the tree** — `vm-cli/src/main.rs`
+   `:4281`, `vm/src/vm/vm_init.rs:7965`, `native-builtins/src/lang_system.rs`
+   `:137` / `:1354` / `:2628` / `:2664`, with links 7–9 of
+   `native-api/tests/read_alias_coverage.rs` holding it. The sentence above the
+   CLOSED note is kept as written and struck by it; HANDOFF-20260812.md still
+   repeats the pre-W7-90 claim and is stale on this row.
+   **The denominator moved.** `declare_slot_map(` now has **eight** call sites,
+   not seven — W7-88 added `SSC_P58_SLOT_MAP`
+   (`java/nio/channels/ServerSocketChannel`, synthetic-only, four disagreeing
+   slots). This row's four maps contribute 15 of **33**, and the real-JDK-mode
+   figure is unchanged at 24 because every map added since has been
+   synthetic-only. W7-90 §4.6.1 and §4.7 carry the corrected arithmetic.
+   **One door is still open and it is the one that matters for this row's two
+   synthetic-only maps' siblings**: a Surefire fork leaves through four
+   `ForkedBooter` triples that never reach `System.exit`, so neither trigger
+   fires there — W7-90 §2.2.1.
 3. **The dead `util_time.rs` Month surface is documented, not deleted.** §5.1.
+   **Re-examined 2026-08-12 by the lane that owns that file, and the disposition
+   is DELIBERATELY UNCHANGED.** The surface is `MONTH_FIELD_VALUE`
+   (`util_time.rs:5523`), `alloc_month` (`:5526`) and five bodies (`:5532`,
+   `:5548`, `:5557`, `:5576`, `:5590`) registered at `:5866`–`:5870`; all five
+   triples are still overwritten by `register_phase52_time_enums`, so §2.1's
+   finding reproduces exactly. Three reasons not to delete, in the order they
+   decided it:
+   * It is dead by call **order**, and the deletion's whole safety argument is
+     that order. A source-only lane cannot re-establish the order after removing
+     the thing that made it observable, and there is no gate on it — W7-77 added
+     `month_registrars_stay_synthetic_only`, which asserts the registrars' mode,
+     **not** which of the two wins.
+   * The `#[cfg(test)]` block at `:6105`–`:6170` is the only executable coverage
+     of the month-length arithmetic anywhere in this crate — ten tests over
+     leap/non-leap February, 30- and 31-day months and the `of()` range refusal.
+     Deleting the production bodies deletes those with them, trading a documented
+     dead row for a real loss of cover, and this lane cannot run `cargo` to
+     confirm nothing else picks it up.
+   * Nothing is gained. The row is already inert in both shipping modes, the
+     hazard (two answers for slot 0) is a hazard only if someone swaps two lines
+     in `register_synthetic_overrides`, and the in-place comment at `:5498`
+     onwards states that and points at the funnel a revival would have to go
+     through.
+   **What would actually close it** is not a deletion: it is a source gate
+   asserting `register_t25_natives` is called *above* `register_phase52_natives`
+   in `register_synthetic_overrides`. That is the claim the deadness rests on and
+   the only one nothing currently checks. It belongs in
+   `native-builtins/tests/`, which is another lane's directory.
 4. **`Month`'s witness is unmeasured for cost.** It adds one
    `resolve_field_index_by_class_id` per Month read and write. `java.time.Month`
    is not on any hot path this tree measures, but "not measured" is not "free",
@@ -444,6 +488,17 @@ starts being trusted for something it does not check.
    something else — a `ClassId`, or a "is this class fabricated" predicate
    `NativeContext` does not have, which is the same gap W7-69 §7.5 names for
    `Unknown`.
+   **Re-verified 2026-08-12 and STANDING, not stale.** `SJ_STUB_SLOT_MAP` is
+   still declared with `class: "java/util/StringJoiner"`
+   (`native-collections/src/lib.rs:30147`) and `SlotMap.class` is still
+   `&'static str` (`native-api/src/read_alias.rs:439`), so the limit is
+   structural rather than an oversight. It is worth being explicit that this row
+   is **not** a defect and must not be "fixed" by editing the declaration: W7-90
+   §6.4 states the general form — the sweep reports that a map disagrees with a
+   class, never whether the code holding the map is reached with that receiver,
+   so a printed row is a measurement and **guarded is not clean**. This row is
+   the case where that distinction is load-bearing in both directions at once,
+   because both classes really exist and each is right about itself.
 6. **`W7-69`'s remaining unguarded rows are untouched here** —
    `jdk/internal/vm/Continuation` (5 slots) and
    `java/util/concurrent/ForkJoinPool` (2), both LIVE and both unguarded, are

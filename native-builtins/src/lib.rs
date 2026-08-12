@@ -20102,22 +20102,66 @@ pub fn register_essential_natives_with_shims(
         Ok(cratonvm_types::Value::Object(Some(obj)))
     }
 
-    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::Value, MethodCallFailed> {
-        // Fallback id when `TimeZone.setDefault(...)` has never run this
-        // process: honour the embedder's `user.timezone` system property
-        // (set at VM init from `-Duser.timezone`/the environment) instead of
-        // hardcoding "UTC", so a configured startup zone is visible before
-        // any Java code calls `setDefault`.
-        let fallback_id = cratonvm_types::flags::runtime_var("user.timezone")
-            .ok()
+    /// The id to use when `TimeZone.setDefault(...)` has never run this
+    /// process, in the same precedence order real `TimeZone.setDefaultZone()`
+    /// uses: the configured `user.timezone`, then the HOST's own zone, then
+    /// UTC.
+    ///
+    /// W7-92 added the middle step. Without it this native — which is what
+    /// `TimeZone.getDefault()` resolves to in `Compatible`/`--real-jdk` mode,
+    /// where the real `getDefaultRef`/`setDefaultZone` bytecode, and therefore
+    /// `getSystemTimeZoneID`, never runs — answered UTC on every host whose
+    /// `user.timezone` was unset, which on Windows is every host: `vm_init`
+    /// seeds that property from `$TZ` alone and Windows does not set `$TZ`.
+    ///
+    /// Two reads for `user.timezone`, deliberately. `get_system_property` is
+    /// the one that can succeed: `vm_init` writes the key into the VM's
+    /// property table (as `""` when there is no `$TZ`, hence the emptiness
+    /// filter, which also matches `setDefaultZone`'s own
+    /// `zoneID == null || zoneID.isEmpty()`). The `runtime_var` read below it
+    /// is the pre-W7-92 behaviour, kept so an embedder relying on it does not
+    /// regress — but note that `user.timezone` is not a declared flag name, so
+    /// `runtime_var` falls through to `std::env::var("user.timezone")`, i.e. it
+    /// looks for an ENVIRONMENT VARIABLE of that name and never saw the system
+    /// property its own comment claimed to honour.
+    fn timezone_fallback_zone_id(ctx: &mut dyn NativeContext) -> String {
+        let configured = ctx
+            .get_system_property("user.timezone")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "UTC".to_string());
+            .or_else(|| {
+                cratonvm_types::flags::runtime_var("user.timezone")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(id) = configured {
+            return id;
+        }
+        match crate::tzdb::system_zone_id(ctx, None) {
+            Some(id) => {
+                // Exactly what the real `setDefaultZone()` does with the id it
+                // just resolved (`props.setProperty("user.timezone", id)`), so
+                // `System.getProperty("user.timezone")` reports it as HotSpot
+                // does — and so the branch above answers every later call
+                // without re-reading `tzmappings`.
+                ctx.set_system_property("user.timezone", &id);
+                id
+            }
+            None => "UTC".to_string(),
+        }
+    }
+
+    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::Value, MethodCallFailed> {
+        // The fallback id is resolved LAZILY, in each branch that needs it,
+        // because the common case by far is the first one — the static field is
+        // already populated — and that case must stay free of the file reads
+        // `timezone_fallback_zone_id` can make.
         if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
             if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
                 let current = ctx.get_static_field(class_id, field_index);
                 if matches!(current, Value::Object(Some(_))) {
                     return Ok(current);
                 }
+                let fallback_id = timezone_fallback_zone_id(ctx);
                 let fallback = alloc_synth_timezone(ctx, &fallback_id)?;
                 if matches!(fallback, Value::Object(Some(_))) {
                     ctx.set_static_field(class_id, field_index, fallback);
@@ -20125,6 +20169,7 @@ pub fn register_essential_natives_with_shims(
                 return Ok(fallback);
             }
         }
+        let fallback_id = timezone_fallback_zone_id(ctx);
         Ok(alloc_synth_timezone(ctx, &fallback_id)?)
     }
 
@@ -21336,6 +21381,17 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
         ctx.set_field(this, 1, Value::Object(None));
         Ok(None)
     });
+    // `Formatter(Appendable, Locale)` is deliberately NOT registered here,
+    // and W7-34's proposed patch to add it is not taken. On this registrar's
+    // boot path the class is the REAL `java.util.Formatter`, whose own
+    // constructor already writes `a` at slot 0 and `l` at slot 1 — the two
+    // slots this layout uses — plus `zero`, which no native writes and which
+    // real `Formatter` bytecode (the `format(Locale, String, Object[])`
+    // overload, which has no native) reads as the digit base. Shadowing that
+    // constructor would trade a locale bug for an unwritten `zero`. Once
+    // `format` below reads slot 1, the real constructor is all this needs.
+    // The synthetic-mode registrar `register_formatter_natives` DOES need the
+    // overload, because there is no real constructor there; it has it.
     registry.register(
         f,
         "format",
@@ -21349,12 +21405,33 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
             let fmt_obj = args.get(1).copied().unwrap_or(Value::Object(None));
             let arr_obj = args.get(2).copied().unwrap_or(Value::Object(None));
 
-            // Delegate to the full String.format implementation
-            let format_result = lang_string::native_string_format(ctx, &[fmt_obj, arr_obj])?;
+            // Field 1 is the `Locale` this Formatter was constructed with —
+            // written either by the `(Ljava/util/Locale;)V` ctor above or, for
+            // the overloads no native declares, by real `java.util.Formatter`'s
+            // own constructor, whose `l` field is slot 1 in the same place.
+            // `Formatter.format(String, Object[])` has no locale argument, so
+            // the receiver's is the only place one can come from — and
+            // discarding it made `new Formatter(sb, Locale.GERMANY)
+            // .format("%,.2f", 1234.5)` answer the US `1,234.50` where HotSpot
+            // 25 answers `1.234,50`. `native_string_format_locale` takes a null
+            // locale as "root defaults", which is what the no-locale ctors
+            // store, so the `Locale.ROOT`/`()V` path is byte-for-byte
+            // unchanged. W7-34-formatter-family-residuals.md.
+            //
+            // GC: resolving a non-null locale runs real JDK bytecode (resource
+            // bundles, locale providers) and allocates, so the receiver can
+            // move across the format call in a way it could not when this
+            // delegated to the no-locale path. Pin and re-derive.
+            let locale = ctx.get_field(this, 1);
+            let this_pin = ctx.pin_native_root(this);
+            let format_result =
+                lang_string::native_string_format_locale(ctx, &[locale, fmt_obj, arr_obj])?;
             let formatted_str = match format_result {
                 Some(Value::Object(Some(o))) => ctx.read_string(o).unwrap_or_default(),
                 _ => String::new(),
             };
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
 
             // Append to internal output (field 0)
             let sb = match ctx.get_field(this, 0) {
@@ -29267,21 +29344,62 @@ fn native_vm_get_nano_time_adjustment(
     Ok(Some(Value::Long(now_nanos - offset_nanos)))
 }
 
-/// TimeZone.getSystemTimeZoneID — return the system default time zone ID.
-fn native_timezone_get_system_id(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Return "UTC" as default. A more complete implementation would query the OS.
-    let tz_id = "UTC";
-    let s = ctx.create_string(tz_id);
+/// `TimeZone.getSystemTimeZoneID(String javaHome)` — the platform's own zone,
+/// mapped to an id `TimeZone.getTimeZone` understands.
+///
+/// W7-92: this used to be `let tz_id = "UTC";` with the comment *"A more
+/// complete implementation would query the OS"*, and it is one of the two
+/// producers of "the system zone is UTC" (the other is `timezone_default_ref`
+/// in `register_essential_natives_with_shims`, which is what
+/// `TimeZone.getDefault()` resolves to in `Compatible`/`--real-jdk` mode). This
+/// one is the `--jdk-only` producer: the method is `ACC_NATIVE` with no `Code`,
+/// so the native runs in every mode, and real `TimeZone.setDefaultZone()`
+/// bytecode calls it whenever `user.timezone` is empty — which on Windows is
+/// always, because `vm_init` seeds that property from `$TZ` alone.
+///
+/// `javaHome` is not decoration: `<java.home>/lib/tzmappings` is the file that
+/// maps a Windows time-zone key name to an IANA id, and HotSpot's own
+/// `TimeZone_md.c` is handed the same argument for the same reason. See
+/// `tzdb::system_zone_id`.
+///
+/// Unresolvable hosts keep answering `"UTC"` rather than the JDK's `null`
+/// (which `setDefaultZone` would turn into `GMT`): the point of this fix is to
+/// change the answer where the platform DOES state a zone, not to change it
+/// everywhere else.
+fn native_timezone_get_system_id(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let java_home = match args.first() {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o),
+        _ => None,
+    }
+    .filter(|home| !home.is_empty());
+    let tz_id = crate::tzdb::system_zone_id(ctx, java_home.as_deref())
+        .unwrap_or_else(|| "UTC".to_string());
+    let s = ctx.create_string(&tz_id);
     Ok(Some(Value::Object(Some(s))))
 }
 
-/// TimeZone.getSystemGMTOffsetID — return the GMT offset string (e.g. "").
+/// `TimeZone.getSystemGMTOffsetID` — the host's standard UTC offset as a
+/// custom `"GMT±HH:MM"` id, or `null` when the platform does not say.
+///
+/// W7-92: this used to be an unconditional `null`. `null` is a legal answer
+/// and the JDK handles it, but it discards the one piece of information that
+/// survives when a zone NAME cannot be resolved — the OFFSET.
+/// `TimeZone.setDefaultZone()` calls this exactly when
+/// `getTimeZone(getSystemTimeZoneID(...), false)` returned null, and uses the
+/// result in place of the unresolvable id; with `null` here that path lands on
+/// `GMT`, i.e. back on a wrong zero offset. See `tzdb::platform_gmt_offset_id`.
 fn native_timezone_get_gmt_offset_id(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Return null to indicate no custom GMT offset
-    Ok(Some(Value::Object(None)))
+    match crate::tzdb::platform_gmt_offset_id() {
+        Some(id) => {
+            let s = ctx.create_string(&id);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        // The JDK's own "no custom GMT offset id" encoding.
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 // ===========================================================================
@@ -36282,6 +36400,24 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodC
     // because it is a coincidence of these names and not a property of the
     // two functions.
     let upper = algo.to_uppercase().replace(['-', '/'], "");
+    // `Alg.Alias.MessageDigest.SHAKE128 = SHAKE128-256` (and `SHAKE256`).
+    // `jca::message_digest::canonical_algorithm` folds these before the
+    // real-JDK path calls in; the synthetic-mode `native_md_digest` passes the
+    // raw name, and its `getInstance` gate now ADMITS the aliases because it
+    // shares `algorithm_supported_public`. Without this fold that door turns an
+    // admitted name into an IllegalArgumentException at digest() instead of a
+    // NoSuchAlgorithmException at getInstance. W7-63-jca-advertise-vs-serve.md.
+    //
+    // Written as `if`/`else` rather than `match upper.as_str() { _ => upper }`
+    // on purpose: the match form moves `upper` out of an arm while the
+    // scrutinee still holds a `&str` borrow of it, which is the E0505 shape.
+    let upper = if upper == "SHAKE128" {
+        "SHAKE128256".to_string()
+    } else if upper == "SHAKE256" {
+        "SHAKE256512".to_string()
+    } else {
+        upper
+    };
     match upper.as_str() {
         "MD2" => Ok(real_md2(data)),
         "MD5" => Ok(real_md5(data)),
@@ -37944,22 +38080,21 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(i32::from(line == -2))))
     });
 
-    // ProcessBuilder + Process (simplified)
-    let pb = "java/lang/ProcessBuilder";
-    registry.register(pb, "<init>", "(Ljava/util/List;)V", native_pb_init);
-    registry.register(pb, "<init>", "([Ljava/lang/String;)V", native_pb_init);
-    registry.register(pb, "command", "()Ljava/util/List;", native_pb_command);
-    // `native-io`'s ProcessBuilder.start, not a local stub. What stood here
-    // was `native_pb_start`: it consulted the SecurityManager and then handed
-    // back a dummy Process that had never spawned anything, on a ONE-slot
-    // `try_alloc_concurrent_synthetic(ctx, "java/lang/Process", 1)?`. Registering
-    // the real one costs nothing and cannot lie.
-    registry.register(
-        pb,
-        "start",
-        "()Ljava/lang/Process;",
-        cratonvm_native_io::process::native_process_builder_start,
-    );
+    // ProcessBuilder: NOT registered here any more.
+    //
+    // These four triples were also registered by
+    // `phases_late::register_phase57_process`, which states `SyntheticStub` for
+    // the whole ProcessBuilder cluster so `--jdk-only` refuses it. This block is
+    // reached only from `register_synthetic_overrides`, which opens with
+    // `set_category(Intrinsic)` — a CHOSEN kind — so it ran LAST in
+    // synthetic-JDK mode and rewrote three of those slots from `SyntheticStub`
+    // to `Intrinsic`, the one kind `JdkOnly` does not drop. `start()` was the
+    // fourth and is re-won afterwards by `native-io`'s
+    // `register_process_natives`, which restates `SyntheticStub`.
+    //
+    // The bodies here were also the weaker pair: `native_pb_init` writes only
+    // slot 0, where phases_late writes the indexed slot AND the real-JDK
+    // `command` field by name. See W7-46-process-cluster.md §8.2.
 
     // The five `java/lang/Process` natives that stood here -- waitFor,
     // exitValue, isAlive, destroy and destroyForcibly -- read slot 0 of a THIRD
@@ -41412,7 +41547,23 @@ fn register_formatter_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Appendable;)V",
         native_formatter_init_appendable,
     );
-    r.register(c, "<init>", "(Ljava/util/Locale;)V", native_formatter_init);
+    // `native_formatter_init` served BOTH `()V` and `(Locale)V` and wrote null
+    // into field 1 either way, so a locale handed to the constructor was
+    // dropped at construction and `format` had nothing to read. Splitting them
+    // is the second half of the W7-34 locale fix; the first half is
+    // `native_formatter_format` reading field 1.
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/util/Locale;)V",
+        native_formatter_init_locale,
+    );
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/lang/Appendable;Ljava/util/Locale;)V",
+        native_formatter_init_appendable_locale,
+    );
     r.register(
         c,
         "format",
@@ -41472,6 +41623,38 @@ fn native_formatter_init_appendable(
     Ok(None)
 }
 
+/// `Formatter(Locale)` — the locale-carrying no-sink constructor.
+///
+/// Split out of [`native_formatter_init`], which served this descriptor too
+/// and wrote `null` into field 1 regardless, so the locale never survived
+/// construction. W7-34-formatter-family-residuals.md.
+fn native_formatter_init_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let empty = ctx.create_string("");
+    ctx.set_field(this, 0, Value::Object(Some(empty)));
+    ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+    Ok(None)
+}
+
+/// `Formatter(Appendable, Locale)` — declared by neither registrar before
+/// W7-34, so `new Formatter(sb, Locale.GERMANY)` ran real JDK bytecode over
+/// this two-field synthetic layout.
+fn native_formatter_init_appendable_locale(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+    Ok(None)
+}
+
 fn native_formatter_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -41481,12 +41664,24 @@ fn native_formatter_format(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let fmt_obj = args.get(1).copied().unwrap_or(Value::Object(None));
     let arr_obj = args.get(2).copied().unwrap_or(Value::Object(None));
 
-    // Delegate to the full String.format implementation
-    let format_result = lang_string::native_string_format(ctx, &[fmt_obj, arr_obj])?;
+    // Field 1 is the receiver's `Locale`; `format(String, Object[])` has no
+    // locale argument, so this is the only place one can come from. A null
+    // (the `()V` / `(Appendable)V` ctors) means "root defaults", which is
+    // exactly what `native_string_format` did unconditionally — so the
+    // no-locale path is unchanged. W7-34-formatter-family-residuals.md.
+    //
+    // GC: same obligation as the real-JDK registrar's copy — resolving a
+    // non-null locale runs Java and allocates, so the receiver is pinned across
+    // the format call and re-derived from its pin.
+    let locale = ctx.get_field(this, 1);
+    let this_pin = ctx.pin_native_root(this);
+    let format_result = lang_string::native_string_format_locale(ctx, &[locale, fmt_obj, arr_obj])?;
     let formatted_str = match format_result {
         Some(Value::Object(Some(o))) => ctx.read_string(o).unwrap_or_default(),
         _ => String::new(),
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
 
     // Append to internal StringBuilder (field 0)
     let sb = match ctx.get_field(this, 0) {

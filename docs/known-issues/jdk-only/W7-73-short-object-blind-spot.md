@@ -29,6 +29,36 @@ was validated against W7-68 §2 before it was trusted: `Pattern` 20, `ZipEntry` 
 `FileChannel` 4, `ArrayList` 3, `ZoneOffset` 3, `HashSet` 1,
 `AsynchronousSocketChannel` 1 — **all sixteen reproduce exactly**.
 
+> **CORRECTIONS BANNER — 2026-08-12, later pass. Read this before quoting any
+> number or line below.**
+>
+> 1. **§3.1's headline of 16 short sites is wrong; the answer today is 12 of 28.**
+>    W7-74-short-object-repairs.md §1 took it to 14 (`alloc_time_synthetic` in
+>    `native-builtins/src/lib.rs` was never short; `MappedByteBuffer`'s row is
+>    structurally unreachable), then repaired the two `java/lang/Thread` mirrors,
+>    which were **members of that 14** — so the short count fell to **12** at the
+>    same moment the population fell 30 → 28. Two later movements land on the
+>    same day and cancel, which is how a stale 14 looks like it still
+>    reconciles: `native-io/src/lib.rs`'s `native_fc_open` LEFT the short column
+>    (W7-72-ssc-socket-and-filechannel.md put its width on
+>    `synthetic_file_channel::alloc_slots`, making the row unreachable in exactly
+>    the `MappedByteBuffer` way), and `native-io/src/socket_channel.rs`'s
+>    `alloc_obj` JOINED it (§3.2 files it as "12 against 10 — over"; W7-66-live-over-allocations.md
+>    §4.3 narrowed its four callers to `SC_OBJECT_SLOTS` = **6** against a
+>    declared 10, so it is now short by 4). §3.3's arithmetic is the current
+>    statement.
+> 2. **Every line number in §3.1 and §3.2 is stale.** W7-74 §1.4 corrected the
+>    `native-io/src/lib.rs` rows by +8..+131 and they have moved again. The
+>    re-derived table is §3.4. `native-builtins/**` and `native-collections/**`
+>    numbers move under other lanes' edits; the ratchet prints the current list,
+>    which is the only source that cannot go stale.
+> 3. **§3.3's two rows are DONE.** Both `java/lang/Thread` carrier mirrors were
+>    repaired by W7-74 §3 and are no longer in the population.
+> 4. **§8 item 3 is closed** by the same repair. §8 items 1, 2, 4, 5 and 6 stand.
+>
+> Nothing in §1, §2, §4, §5, §6 or §7 changes — the mechanism findings are
+> re-read and hold. The arithmetic and the line numbers are what moved.
+
 ---
 
 ## 1. The clamp-after-detect analysis: CONFIRMED, and one correction
@@ -178,7 +208,11 @@ and on 30.
 
 `javap -p` transitive widths, JDK 25.0.3.9. "short" = requested < declared.
 
-### 3.1 The 16 short sites
+### 3.1 The 16 short sites — SUPERSEDED, see the banner and §3.4
+
+*(Kept as filed. Four of its rows are wrong — two were never short, one left the
+population by repair, one left it by W7-72 — and every line number is stale.
+§3.4 is the current table.)*
 
 | site | class it names | requested | declared | short by |
 |---|---|---:|---:|---:|
@@ -219,7 +253,7 @@ flagged here so nobody re-derives it.
 | `native-io/src/lib.rs:12128` | `java/nio/file/Path` is an **interface**, declares 0 — a 1-slot fabrication is intended |
 | `native-io/src/lib.rs:17290` | `java/util/stream/Stream`, same |
 | `native-io/src/lib.rs:16591` | `FileLock` 6 against 4 — `over`, the appended-slot idiom |
-| `native-io/src/socket_channel.rs:637` | `SocketChannel`/`ServerSocketChannel` 12 against 10 — `over` |
+| `native-io/src/socket_channel.rs:637` | ~~`SocketChannel`/`ServerSocketChannel` 12 against 10 — `over`~~ **WRONG TODAY.** W7-66-live-over-allocations.md §4.3 narrowed all four callers of `alloc_obj` from 12 to `SC_OBJECT_SLOTS` = 6. Against a declared 10 that is **short by 4**, so this row belongs in §3.4, not here. A repair aimed at the `over` census moved a site into the `under` one and no record noticed on the day |
 | `native-builtins/src/lang_math.rs:2724`, `:2729` | the boxed wrappers all declare exactly 1 — exact |
 | `native-io/src/nio_selector.rs:3141` | `HashSet` 1 against 1 — exact |
 | `native-collections/src/lib.rs:9632`, `:44808` | `HashMap$Node` 4 against 4 — exact, and deliberately untyped (the in-file comment records nine probe failures from a previous attempt to type it) |
@@ -258,6 +292,75 @@ Whether it is live depends on which `java/lang/Thread` methods are registered as
 natives and win last-write-wins, which needs a build. It is not repaired here —
 this lane's product is the instrument and the census, and a lane that widens an
 instrument and then gets lost repairing what it finds delivers neither.
+
+**DONE.** Both rows were repaired by W7-74-short-object-repairs.md §3 — through
+`try_alloc_concurrent_synthetic` and a real `Thread.<init>` invoke, not through
+`real.max(n)`, because width was the smaller of the two defects. Neither site is
+in the population any more.
+
+### 3.4 The census re-derived, 2026-08-12 later pass — 28 sites, 12 short
+
+The ratchet's own scanner was reimplemented line-for-line a third time
+(`strip_comments`, `match_brace`, `cfg_test_spans`, `paren_args`,
+`split_top_level`) and returns **28**, the same 28 the bound holds. Line numbers
+are against the tree at that moment; the ones under `native-builtins/**` and
+`native-collections/**` are the likeliest to move again, and running the ratchet
+prints the current list.
+
+Declared widths are **not** re-run here: `javap -p` against JDK 25.0.3.9 has now
+been taken independently by W7-68 §2, W7-73 §3 and W7-74 §1, agreeing on every
+class in this table. `SocketChannel`/`ServerSocketChannel` = 10 has the fullest
+derivation, slot by slot, in W7-72 §1.1.
+
+**The 12 short.** "Short" = requested < declared, on the helper's worst caller.
+
+| site | class (worst caller) | req | decl | short by | disposition |
+|---|---|---:|---:|---:|---|
+| `native-io/src/lib.rs:5062` | `java/util/regex/Pattern` | 2 | 20 | 18 | latent — a real image returns a compiled `Pattern` above the arm |
+| `native-io/src/async_socket.rs:1980` (`alloc_obj`) | `sun/nio/ch/Iocp` | 1 | 14 | 13 | **dead** — `method-nowhere`, W7-68 §3.7 |
+| `native-io/src/zip_real_jar.rs:650` | `java/util/zip/ZipEntry` | 6 | 14 | 8 | latent — live arm is `real.max(6)` + writes by name |
+| `native-builtins/src/service_loader.rs:90` | `java/util/ServiceLoader` | 2 | 10 | 8 | latent — live arm is `real.max(2)` |
+| `native-builtins/src/util_time.rs:140` (`alloc_time_synthetic`) | `java/time/zone/ZoneRules` | 1 | 7 | 6 | **dead in Compatible** — synthetic-only registrar |
+| `native-io/src/lib.rs:7663` | `java/nio/ByteBuffer` | 5 | 11 | 6 | latent |
+| `native-io/src/nio_native.rs:1410` (`alloc_t16`) | `java/nio/channels/DatagramChannel` | 5 | 10 | 5 | latent **and vacuous** — the slot map is empty |
+| `native-io/src/socket_channel.rs:637` (`alloc_obj`) | `SocketChannel` / `ServerSocketChannel` | 6 | 10 | 4 | latent — **new to this column**, see the banner |
+| `native-io/src/lib.rs:15494` (`alloc_typed_buffer`) | `java/nio/CharBuffer` &c. | 5 | 9 | 4 | latent — live arm is `BB_NUM_FIELDS.max(real)` |
+| `native-io/src/lib.rs:13124` | `java/io/File` | 1 | 4 | 3 | latent — slot 0 *is* `path`, and `File` is fully overlaid |
+| `native-io/src/lib.rs:13384` | `java/util/ArrayList` | 2 | 3 | 1 | latent — the collections overlay is an architecture |
+| `native-builtins/src/apps_h2.rs:62` | `java/lang/Thread$State` | 2 | 3 | 1 | **dead** — `register_apps_h2_overrides` has no call site |
+
+Every one of the twelve is on an `Err(_) => alloc_object(ClassId::new(0), N)` arm
+of a `match ctx.ensure_class_initialized(…)`. That is W7-74 §2's spine and it
+still holds with no exception: the two sites that were *not* on such an arm were
+the two `Thread` mirrors, and they are repaired. W7-74 §2.1 is the reason none of
+the twelve is repaired here — the arm exists *because* the class did not resolve,
+so there is nothing to allocate against, and the object's problem on that arm is
+**identity**, not width.
+
+**The 16 that are not short.**
+
+| site | why not |
+|---|---|
+| `native-io/src/lib.rs:9811` (`native_fc_open`) | **structurally unreachable as a short row** — the width is `synthetic_file_channel::alloc_slots` = `base_for_class(…) + 2`, so either the class resolved (base 4, request 6, an `over` row) or it did not (base 0, and no declared 4 to be short against). W7-72's repair, observed from the census's blind side, exactly as W7-74 §1.3 established for `MappedByteBuffer` |
+| `native-io/src/lib.rs:17141` (`alloc_mapped_byte_buffer`) | same shape — `mbb_base + MBB_PRIVATE_WIDTH` |
+| `native-io/src/lib.rs:12530` | `java/nio/file/Path` is an **interface**, declares 0 — a 1-slot fabrication is intended |
+| `native-io/src/lib.rs:17828` | `java/util/stream/Stream`, same |
+| `native-io/src/lib.rs:17129` | `FileLock` 6 against 4 — `over`, the appended-slot idiom hand-written |
+| `native-io/src/nio_selector.rs:3199` | `HashSet` 1 against 1 — exact |
+| `native-builtins/src/lib.rs:30782` (`alloc_time_synthetic`) | **never short** — this is the crate-root twin of the `util_time.rs` helper; its four callers are 3/3, 4/4, 2/2, 2/2 (W7-74 §1.1) |
+| `native-builtins/src/lang_math.rs:2724`, `:2729` | the boxed wrappers all declare exactly 1 — exact |
+| `native-collections/src/lib.rs:9632`, `:45680` | `HashMap$Node` 4 against 4 — exact, deliberately untyped |
+| `native-collections/src/lib.rs:45251` | a `ConcurrentHashMap` segment — an internal shape with no Java class at all |
+| `native-builtins/src/quarkus_staticinit.rs:451`, `:455` | Quarkus classes; not in the JDK image, no oracle |
+| `native-builtins/src/shared_secrets_bridge.rs:180` | dynamic `owner_class`, resolved per call; not settleable from source |
+| `native-builtins/src/test_utils.rs:2432` | a mock `NativeContext`; the over-count of exactly one the ratchet keeps deliberately |
+
+The two appended-slot rows are now held by a gate rather than by prose:
+`native-api/tests/layout_alias_coverage.rs::the_appended_slot_allocators_do_not_regress_to_a_literal_width`.
+A literal width restored at either site is invisible to the ratchet (the site
+count does not move) and to the width census (the reported width is correct for
+the object actually allocated) — what moves is where the private map lands and
+whether the row can be short at all.
 
 ---
 
@@ -522,9 +625,12 @@ sixteen rows.
    `CRATONVM_DBG_LAYOUT_ALIAS=1` and grep `direction=undeclared`; a row under
    `class=<unresolved:ClassId(0)>` names a taken arm, with the Java frames that
    reached it.
-3. **The two `java/lang/Thread` mirrors (§3.3).** 5 against 19, unconditional,
+3. ~~**The two `java/lang/Thread` mirrors (§3.3).** 5 against 19, unconditional,
    published to the thread registry. Repair needs a build to settle which
-   `java/lang/Thread` natives win last-write-wins.
+   `java/lang/Thread` natives win last-write-wins.~~ **CLOSED** by
+   W7-74-short-object-repairs.md §3. The last-write-wins question was met head-on
+   rather than settled: the repair invokes `Thread.<init>` **by name** through
+   `ctx.invoke`, so it gets whichever registrar actually won in whichever mode.
 4. **Whether the stub-narrower-than-real-class producer (§2, row 2) is live.**
    `fabricate_class` registers a stub at exactly the requested width, so a stub's
    `declared` equals whatever the *first* caller asked for. A second caller

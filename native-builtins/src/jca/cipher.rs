@@ -3010,6 +3010,33 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     }
 }
 
+/// The validation half of `Cipher.getConfiguredPermission(String)`, for the
+/// two public `getMaxAllowed*` methods that would otherwise call it.
+///
+/// Real `getConfiguredPermission` is two steps: an explicit `if
+/// (transformation == null) throw new NullPointerException();` and then
+/// `tokenizeTransformation`, before it ever consults the policy. The policy
+/// answer is unconditional under the shipped unlimited policy, so the callers
+/// only need the two refusals. The NPE is unmessaged — measured on HotSpot 25,
+/// `getMaxAllowedKeyLength(null)` is a `NullPointerException` with a null
+/// message, NOT `tokenizeTransformation`'s `NoSuchAlgorithmException: No
+/// transformation given`, because the explicit check runs first.
+fn check_transformation_well_formed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<(), MethodCallFailed> {
+    let Some(Value::Object(Some(s))) = args.first() else {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    };
+    let transformation = ctx.read_string(*s).unwrap_or_default();
+    match tokenize_transformation(&transformation) {
+        Ok(_) => Ok(()),
+        Err(msg) => Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx, &msg,
+        )),
+    }
+}
+
 /// Register the WP6.3 Cipher class-init shim.
 ///
 /// The chain is: `Cipher.<clinit>` → `Debug.getInstance` →
@@ -3308,59 +3335,111 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `javax/crypto/Cipher.getMaxAllowedKeyLength(String)` and its twin
+    // `getMaxAllowedParameterSpec(String)` — the two PUBLIC doors into the
+    // policy chokepoint above, and the reason the `getCryptoPermission` native
+    // cannot be the whole answer on JDK 25.
+    //
+    // Neither of them can REACH that native. Their first act is `invokestatic
+    // Cipher.getConfiguredPermission`, whose first act is `getstatic
+    // JceSecurityManager.INSTANCE` — and that getstatic runs
+    // `JceSecurityManager.<clinit>`, which on JDK 25 ends with
+    //
+    //     WALKER = StackWalker.getInstance(
+    //         Set.of(Option.DROP_METHOD_INFO, Option.RETAIN_CLASS_REFERENCE));
+    //
+    // (`JceSecurityManager.java:71`; the `WALKER` field is new-ish — it is how
+    // the class finds its caller now that `SecurityManager` is gone). Every
+    // `java/lang/StackWalker$Option` constant reads back NULL in this VM, so
+    // `Set.of` NPEs on `e0.equals(e1)` inside
+    // `ImmutableCollections$Set12.<init>` and the whole clinit dies as
+    // `ExceptionInInitializerError`. `getCryptoPermission` never runs; the
+    // comment above it describes a LATER wall (`defaultPolicy` null) that the
+    // class never survives long enough to hit.
+    //
+    // That StackWalker hole is not JCA's and is NOT fixed here. It is not new
+    // either: measured identically on the pristine-dev 44044c7e2 control
+    // binary, where `StackWalker$Option.RETAIN_CLASS_REFERENCE` is also null.
+    // See `phases_late.rs`'s three `StackWalker$Option` static-field
+    // registrations — they cover 3 of the enum's 4 constants (JDK 22 added
+    // `DROP_METHOD_INFO`) and are not consulted for a `getstatic` when the real
+    // class bytes are authoritative.
+    //
+    // Answering here keeps the entire clinit off the path. `Integer.MAX_VALUE`
+    // and `null` are not conservative guesses: they are what HotSpot 25 returns
+    // on this host with the `crypto.policy=unlimited` that has shipped by
+    // default since Java 9 — measured
+    // `getMaxAllowedKeyLength("AES"|"DES"|"RC4") = 2147483647` and
+    // `getMaxAllowedParameterSpec("AES") = null`. Note what these methods do
+    // NOT do: they never check that the algorithm EXISTS, so `"Bogus"` also
+    // answers unlimited (measured). They check only that the transformation is
+    // well FORMED, which is `tokenizeTransformation`'s job — and
+    // `tokenize_transformation` above is that method's port, carrying its exact
+    // messages.
+    //
+    // Live path, not a hypothetical: `AESKeyGenerator.<init>` calls
+    // `SecurityProviderConstants.getDefAESKeySize`, which calls
+    // `getMaxAllowedKeyLength("AES")`. All of that is real JDK bytecode we do
+    // not intercept, so `KeyGenerator.getInstance("AES", "SunJCE")` could not
+    // build its SPI without this. Covered by `RCrypto`'s `keygen2arg` checks.
+    r.register(
+        "javax/crypto/Cipher",
+        "getMaxAllowedKeyLength",
+        "(Ljava/lang/String;)I",
+        |ctx, args| {
+            check_transformation_well_formed(ctx, args)?;
+            Ok(Some(Value::Int(i32::MAX)))
+        },
+    );
+    r.register(
+        "javax/crypto/Cipher",
+        "getMaxAllowedParameterSpec",
+        "(Ljava/lang/String;)Ljava/security/spec/AlgorithmParameterSpec;",
+        |ctx, args| {
+            check_transformation_well_formed(ctx, args)?;
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
     register_cipher_dispatch(r);
-    register_keygen_dispatch(r);
+    // No `register_keygen_dispatch`: the two 2-arg `KeyGenerator.getInstance`
+    // overloads it registered are DELETED, not moved. W7-21 Patch A. They minted
+    // a 2-field synthetic `javax/crypto/KeyGenerator` whose `init`/`generateKey`
+    // exist only in `phases_early::register_phase53_crypto` — reachable solely
+    // from `lib::register_synthetic_overrides` — so in the two shipping modes
+    // the very next call ran REAL bytecode against a receiver with no `spi`.
+    // The real path they were bypassing works now: `provider_chain` seeds
+    // thirteen `SunJCE` `KeyGenerator` services under real JDK class names
+    // (W7-39) and the `sun/security/jca/GetInstance` bridges are wired whenever
+    // `route_ec_to_real()` is on, which is the default. The 1-arg overload has
+    // taken that same real path all along.
     register_param_specs(r);
     r.set_category(__prev_cat);
 }
 
-/// Register the missing 2-arg `KeyGenerator.getInstance` overloads
-/// (`(String, String)` and `(String, Provider)`).  The 1-arg form is
-/// registered in `phases_early.rs::register_phase53_crypto`; the 2-arg
-/// forms fall through to the real-JDK bytecode which routes through
-/// `JceSecurity.getInstance(String, Class, String, String)` →
-/// `GetInstance.getService(type, algo, providerName)`.  In our boot we
-/// don't populate the per-provider Service tables, so `getService`
-/// returns null and the JDK code NPEs at `service.getProvider()`
-/// (KeyGenerator.java:288).
-///
-/// The native intercept ignores the provider name/object — we have a
-/// single AES/HmacSHA* implementation in `crypto_impl`, so requesting
-/// "BC" vs "SunJCE" yields identical bytes.  The synthetic layout
-/// matches `register_phase53_crypto`'s `KeyGenerator` shim:
-/// `(algorithm@0, keySize@1)`, so `KeyGenerator.init(int)` /
-/// `generateKey()` (also registered in `phases_early.rs`) work
-/// unchanged on instances allocated here.
-fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let kg = "javax/crypto/KeyGenerator";
-    r.register(
-        kg,
-        "getInstance",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128)); // default key size
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        kg,
-        "getInstance",
-        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.set_category(__prev_cat);
-}
+// `register_keygen_dispatch` — DELETED 2026-08-12, W7-21 Patch A. Its two
+// registrations (`KeyGenerator.getInstance(String,String)` and
+// `(String,Provider)`) were written when the per-provider service tables were
+// empty, so the real path NPE'd at `service.getProvider()`. They replaced that
+// with a worse failure one call later: the synthetic they returned had the
+// `(algorithm@0, keySize@1)` layout of `register_phase53_crypto`'s shim, but
+// that registrar is reachable only from `lib::register_synthetic_overrides`, so
+// in `--real-jdk` and `--jdk-only` the matching `init` / `generateKey` natives
+// DO NOT EXIST and the real bytecode ran against a receiver with no `spi`.
+// Worse still under real-JDK, where `try_alloc_concurrent_synthetic` upsizes to
+// the real `KeyGenerator` layout and slot 0 is `spi`, not `algorithm` — so the
+// algorithm String was written into the SPI field.
+//
+// Nothing replaces them. `provider_chain::seed_direct_native_engine_services`
+// seeds the `SunJCE` `KeyGenerator` services under real JDK class names with
+// public no-arg constructors, and the `sun/security/jca/GetInstance` bridges
+// answer both the named-provider and the search overloads whenever
+// `route_ec_to_real()` is on — the default. The 1-arg overload has taken that
+// route in shipping modes all along, which is what makes the deletion safe
+// rather than hopeful. `provider_chain`'s own comment above that seed —
+// "`KeyGenerator` is NOT natively intercepted in `--real-jdk` mode" — was made
+// true by this deletion; these two registrations were the only thing making it
+// false. Covered by `RCrypto`'s `keygen2arg` checks.
 
 /// Register `Cipher.getInstance` / `init` / `update` / `updateAAD` /
 /// `doFinal` and the small set of accessor methods the probe path
@@ -4153,8 +4232,35 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     // downstream encrypted, signed and stored under a key of all zeros.
     r.register(sks, "<init>", "([BLjava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // The real `<init>` (JDK 25 src.zip) opens with
+        //     if (key == null || algorithm == null)
+        //         throw new IllegalArgumentException("Missing argument");
+        //     if (key.length == 0) throw new IllegalArgumentException("Empty key");
+        // Both checks precede any use. A zero-length key is exactly the
+        // artefact the all-zero-key family produces, so accepting it removes
+        // the one place the platform would have caught it. The null case is a
+        // CLASS difference, not wording: `obj_arg` raises NullPointerException
+        // (native-builtins/src/lib.rs:25137), which a caller's
+        // `catch (IllegalArgumentException)` does not catch — so the null test
+        // must run BEFORE obj_arg. W7-21 Patch C.
+        if !matches!(args.get(1), Some(Value::Object(Some(_))))
+            || !matches!(args.get(2), Some(Value::Object(Some(_))))
+        {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Missing argument",
+            ));
+        }
         let key_bytes = obj_arg(args, 1)?;
         let algo = obj_arg(args, 2)?;
+        if ctx.array_length(key_bytes) == 0 {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Empty key",
+            ));
+        }
         let raw = read_bytes(ctx, key_bytes);
         // `make_bytes_array` allocates, so both refs we still need must survive
         // a moving collection. Unpinning from the FIRST handle releases both.

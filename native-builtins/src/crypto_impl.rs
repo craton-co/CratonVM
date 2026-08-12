@@ -1292,73 +1292,29 @@ fn native_secure_random_generate_seed(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-// nb-crypto-impl VULN(secrand-collision) [FIXED]: the setSeed / seeded-ctor
-// natives below NO LONGER mutate any per-instance, identity-hash-keyed DRBG
-// state (that state was the collision/aliasing hazard and has been removed).
-// Output is now drawn straight from the OS CSPRNG, which is already maximally
-// and freshly seeded, so a user-supplied seed can only *supplement* it — and
-// supplementing a CSPRNG that already has full entropy is a no-op. This matches
-// the `java.security.SecureRandom` contract precisely: `setSeed` "supplements"
-// the existing seed and is explicitly permitted not to weaken the source; we
-// never downgrade the OS-CSPRNG stream to honour a caller seed. (`java.util.
-// Random`'s bit-reproducible `setSeed` is a different class, handled in
-// `securerandom.rs`.) We still validate the argument shape so a malformed call
-// is a clean no-op rather than a panic.
-
-/// `java/security/SecureRandom.setSeed(J)V`.
-fn native_secure_random_set_seed_long(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Long(_)) => {}
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
-
-/// `java/security/SecureRandom.setSeed([B)V`.
-fn native_secure_random_set_seed_bytes(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Object(Some(_))) => {}
-        // setSeed(null) is an NPE in the JDK; the interpreter raises the NPE
-        // before reaching here for a real null deref. Nothing to do.
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
-
-/// `java/security/SecureRandom.<init>([B)V` — the seeded constructor. Per the
-/// JDK this equals the no-arg ctor followed by `setSeed(seed)`; the stream keeps
-/// its OS-entropy base and the user seed only supplements it.
-fn native_secure_random_init_seed_bytes(
-    _ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    match args.first() {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    match args.get(1) {
-        Some(Value::Object(Some(_))) => {}
-        _ => return Ok(None),
-    };
-    // Supplement-only against an OS CSPRNG → no state change (see note above).
-    Ok(None)
-}
+// nb-crypto-impl VULN(secrand-collision) [FIXED]: the `nextBytes` /
+// `generateSeed` natives below NO LONGER mutate any per-instance,
+// identity-hash-keyed DRBG state (that state was the collision/aliasing hazard
+// and has been removed). Output is drawn straight from the OS CSPRNG, which is
+// already maximally and freshly seeded.
+//
+// The `setSeed(J)V`, `setSeed([B)V` and `<init>([B)V` natives that used to live
+// here were DELETED (L8 residual pass, 2026-08-12), bodies and registrations
+// alike. Each was a shape-checking no-op justified by "a caller seed cannot
+// weaken an already-fully-seeded OS CSPRNG". That argument is sound for entropy
+// and WRONG for replay: `securerandom.rs`'s `setSeed` bodies check
+// `secure_random_is_sha1prng` and route SHA1PRNG through real reseeding,
+// because `SecureRandom.getInstance("SHA1PRNG")` seeded twice alike yields
+// identical bytes on HotSpot — the one replay guarantee the JDK gives a
+// `SecureRandom`, and the property H2's `TestAll` depends on. The no-ops here
+// won by registration order in synthetic mode (see `register_crypto_impl_natives`)
+// and undid that wholesale. The seeded constructor went with them because its
+// body stamped neither `algorithm` nor `provider`, so `new SecureRandom(seed)`
+// answered `null` from `getAlgorithm()` and `getProvider()` in synthetic mode —
+// L8's own headline defect, surviving in one mode because a later registrar
+// overwrote the fix. `securerandom.rs` now serves all three triples in every
+// mode. (`java.util.Random`'s bit-reproducible `setSeed` is a different class,
+// also handled in `securerandom.rs`.)
 
 // nb-crypto-impl VULN(3): The single-shot MessageDigest/Cipher/Mac stubs that
 // formerly lived here have been DELETED outright. They were dead code (registered
@@ -1386,13 +1342,22 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
     // splitmix64-predictability and identity-hash-collision aliasing hazards are
     // both closed (see VULN(secrand) / VULN(secrand-collision) in this file).
     //
-    // IMPORTANT (registration order): `register_crypto_impl_natives` runs AFTER
-    // `securerandom::register_random_and_securerandom_natives` (lib.rs phase
-    // ordering: register_security_natives ~line 9773 vs register_crypto_impl
-    // ~line 10010), so these last-write registrations WIN. The setSeed / seeded-
-    // ctor natives are registered HERE so the OS-CSPRNG output surface is owned
-    // in one place; they are supplement-only no-ops (a caller seed cannot weaken
-    // an already-fully-seeded OS CSPRNG — JDK setSeed semantics, never replaces).
+    // Registration order: both this registrar and
+    // `securerandom::register_random_and_securerandom_natives` are called from
+    // `register_synthetic_overrides`, this one SECOND, so these bodies win —
+    // `register()` is last-registration-wins. That scope is the whole story:
+    // `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`,
+    // the feature is in no crate's default set, and `vm_init` reaches it only
+    // when `config.use_synthetic_jdk` is also true. So none of this exists in a
+    // default CLI build, and `--real-jdk` / `--jdk-only` are served by
+    // `securerandom.rs` — see docs/architecture/natives-over-real-jdk-classes.md §2.
+    // Only `nextBytes` / `generateSeed` are registered here: both draw from the
+    // OS CSPRNG in either file, so the shadowing is behaviour-neutral. The
+    // `setSeed` and seeded-ctor rows were REMOVED (L8 residual pass, 2026-08-12)
+    // because their no-op bodies silently undid two fixes in `securerandom.rs`:
+    // SHA1PRNG reseeding, which HotSpot makes reproducible and which is the one
+    // replay guarantee the JDK gives a `SecureRandom`; and the `algorithm` /
+    // `provider` stamping that `getProvider()` returning null was fixed by.
     r.register(
         "java/security/SecureRandom",
         "nextBytes",
@@ -1404,24 +1369,6 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
         "generateSeed",
         "(I)[B",
         native_secure_random_generate_seed,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "setSeed",
-        "(J)V",
-        native_secure_random_set_seed_long,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "setSeed",
-        "([B)V",
-        native_secure_random_set_seed_bytes,
-    );
-    r.register(
-        "java/security/SecureRandom",
-        "<init>",
-        "([B)V",
-        native_secure_random_init_seed_bytes,
     );
     r.set_category(__prev_cat);
 }
@@ -5242,6 +5189,55 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// This registrar must claim `java/security/SecureRandom` for exactly two
+    /// triples, and it must NOT claim either `setSeed` or the seeded ctor.
+    ///
+    /// L8-securerandom-provider.md. It used to register five, and the extra
+    /// three were shape-checking no-ops. In `--synthetic-jdk` this registrar is
+    /// called from `register_synthetic_overrides` AFTER
+    /// `securerandom::register_random_and_securerandom_natives`, and
+    /// `register()` is last-registration-wins, so the no-ops silently replaced
+    /// two working fixes: `securerandom.rs`'s `setSeed` bodies check
+    /// `secure_random_is_sha1prng` and route SHA1PRNG through real reseeding
+    /// (`getInstance("SHA1PRNG")` seeded twice alike yields identical bytes on
+    /// HotSpot — the one replay guarantee the JDK gives a `SecureRandom`), and
+    /// its `<init>([B)V` stamps the `algorithm` and `provider` fields whose
+    /// absence is this record's headline defect.
+    ///
+    /// Asserted as a REGISTRATION census rather than a behavioural check
+    /// because the defect is a registration: the no-op bodies were each
+    /// individually defensible, and what made them wrong was which triple they
+    /// claimed and in what order. A behavioural test would also need a
+    /// `--synthetic-jdk` VM, which no scheduled corpus run builds.
+    #[test]
+    fn crypto_impl_registers_no_securerandom_seeding_triple() {
+        let mut r = NativeMethodRegistry::new();
+        register_crypto_impl_natives(&mut r);
+        let dump = r.dump_registrations();
+        let mut mine: Vec<String> = Vec::new();
+        for row in dump.iter() {
+            if row.0 == "java/security/SecureRandom" {
+                mine.push(format!("{}{}", row.1, row.2));
+            }
+        }
+        assert_eq!(
+            mine,
+            vec!["nextBytes([B)V".to_string(), "generateSeed(I)[B".to_string()],
+            "crypto_impl must own only the two OS-CSPRNG output triples; \
+             re-registering setSeed or <init>([B)V here shadows securerandom.rs \
+             in synthetic mode and undoes SHA1PRNG reseeding — L8"
+        );
+        // Stated separately so a future widening of the list above cannot
+        // quietly re-admit the two rows this record is about.
+        for row in dump.iter() {
+            assert!(
+                !(row.0 == "java/security/SecureRandom"
+                    && (row.1 == "setSeed" || row.1 == "<init>")),
+                "SecureRandom.setSeed / <init> must be served by securerandom.rs alone"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

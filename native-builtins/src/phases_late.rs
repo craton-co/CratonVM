@@ -5220,6 +5220,28 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     );
 
     // StackWalker.Option enum
+    //
+    // DEAD REGISTRATIONS — measured, not inferred (2026-08-12; see
+    // docs/known-issues/jdk-only/W7-93-stackwalker-option-constants-null.md).
+    // These three name a FIELD descriptor in the METHOD registry's descriptor
+    // slot, so the triple they key is one no dispatch can ever produce: a
+    // `getstatic` resolves through the class's static-field storage and never
+    // consults the native method registry, and no call site invokes a method
+    // named `RETAIN_CLASS_REFERENCE`. Confirmed under `--jdk-only`: the values
+    // a program actually reads back out of these statics are the objects
+    // `stack_walker::native_option_clinit` allocated (identity-checked), and
+    // `values()[0] == Option.RETAIN_CLASS_REFERENCE` holds — so nothing here
+    // ran.
+    //
+    // They are worse than merely inert: `p57_alloc_enum` allocates a FRESH
+    // instance per call, so if a future dispatch change ever made them live
+    // they would hand back constants that are NOT `==` to the ones in
+    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` comparison
+    // an enum switch compiles to. Do not treat them as the place to fix an
+    // `Option` constant; the initialiser is `native_option_clinit`. They are
+    // left in place only because deleting registrations moves
+    // `scripts/baselines/jdk-only-bridge-ratchet.json`, which needs a build to
+    // re-freeze.
     let swo = "java/lang/StackWalker$Option";
     r.register(
         swo,

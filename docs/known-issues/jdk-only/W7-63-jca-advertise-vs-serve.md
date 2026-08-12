@@ -5,6 +5,24 @@ lane could not build or run Rust. Every Rust change below is source work backed
 by in-tree unit tests and by a HotSpot 25 oracle; nothing here has been observed
 on a CratonVM binary. The verification command is in §9.
 
+> **Second pass, 2026-08-12 (JCA advertise-vs-serve lane).** Six of the seven
+> dispositions in §3 were re-read against the tree and are present as written.
+> **One was not: #2's ALIAS half never reached the surface it claims.** The
+> `put_alias` rows landed and the ratchet went green on them, but
+> `MessageDigest.getInstance("SHAKE128")` still raised
+> `NoSuchAlgorithmException` in both shipping modes. §3 #2 now carries the
+> correction and the fix; §9's row `C.md[SHAKE128].abc … (the ALIAS must
+> resolve)` was **false against the source** when it was written.
+>
+> Also this pass: the record's assertions now have a home in a **scheduled**
+> vector. `regression-suite/src/RJdkSecurity.java` gains
+> `advertisedVersusServed()` — MD2, both SHAKE primaries, both SHAKE aliases,
+> the two advertised-implies-serviceable loops, the `Signature` refusals and the
+> unmodifiable set, all against HotSpot's own answers. `RJdkSecurity` is in
+> `JDKONLY_CLASSES`; `probes/JcaAdvertisedVsServedProbe.java` is not run by
+> `regression-suite/run.sh` and never was. **The expected count moves from
+> `PASS RJdkSecurity (61 checks)` to `(80 checks)` in all three arms.**
+
 This record **supersedes and closes the residual halves of two others**:
 
 * `W4-3-security-getalgorithms-short-list.md` — Patches A, B, C, D, F.
@@ -134,6 +152,55 @@ in two files now have their own test
 (`shake_normalisations_agree_across_the_two_filters`). W7-29 asked for exactly
 that, on the grounds that the agreement is a coincidence of these names and not
 a property of the functions. It is.
+
+> **CORRECTION, second pass 2026-08-12 — the alias half above was NOT true when
+> it was written, and it is this record's own species one layer in.**
+>
+> `every_advertised_sun_message_digest_is_serviceable` asserts the aliases with
+> `get_service_entry("SUN", "MessageDigest", "SHAKE128").is_some()` — a lookup
+> in the provider chain's service map. **`MessageDigest.getInstance` never
+> reads that map.** `jca::message_digest::md_get_instance`'s only gate is
+> `algorithm_supported`, and `algorithm_supported` had no alias arms — its own
+> test pinned the bare spellings as *rejected*, justified in a comment saying
+> they are "resolved by the provider chain's alias table before this predicate
+> is consulted". Nothing on that path consults it. So the ratchet was green on
+> a **proxy for the surface it claims to guard**, and
+> `MessageDigest.getInstance("SHAKE128")` raised `NoSuchAlgorithmException` in
+> `--real-jdk` and `--jdk-only` alike while `Security.getAlgorithms` was
+> already correct.
+>
+> That comment's second premise was false in the same way: admitting the
+> aliases at the gate was said to grow `Security.getAlgorithms("MessageDigest")`
+> from 15 to 17. It cannot. The advertised set is built by
+> `algorithms_for_service` from the SERVICE rows, which `algorithm_supported`
+> does not reach in either direction. **A guard justified by a stated premise is
+> only as good as the premise, and both of this one's were checkable in the same
+> file.**
+>
+> Fixed here, in `native-builtins/src/jca/message_digest.rs`:
+> `canonical_algorithm` resolves the two `Alg.Alias` spellings onto their
+> primaries and runs *before* all three name-keyed tables —
+> `algorithm_supported`, `digest_length_bytes`, and the `compute_digest` call in
+> `md_digest` / `md_digest_into`. The caller's own spelling is still what
+> `md_get_instance` stores, so `getAlgorithm()` echoes `SHAKE128` as HotSpot
+> does; only the tables see the canonical form.
+> `the_shake_aliases_resolve_but_are_not_separate_algorithms` replaces the two
+> rows deleted from `algorithm_supported_rejects_unknown` and asserts **both**
+> halves — the alias serves, and it is still not a separate advertised
+> algorithm — so the pair cannot drift back. The Java-side cover is
+> `RJdkSecurity.advertisedVersusServed()`, which compares the alias's bytes
+> against the primary's rather than merely asking whether it resolved.
+>
+> **Not done, and the reason:** the synthetic-mode door is still half shut for
+> the aliases. `crate::compute_digest` has arms for `SHAKE128256` /
+> `SHAKE256512` only, so a `--synthetic-jdk` caller now passes
+> `native_md_get_instance`'s gate (it shares `algorithm_supported_public`) and
+> would meet an `IllegalArgumentException` at `digest()` instead of a
+> `NoSuchAlgorithmException` at `getInstance`. `native-builtins/src/lib.rs` is
+> outside this lane's ownership; the one-line repair is to fold `SHAKE128` →
+> `SHAKE128256` and `SHAKE256` → `SHAKE256512` into `compute_digest`'s `upper`
+> immediately after it is computed. The two shipping modes are unaffected —
+> both go through `md_digest`, which canonicalises.
 
 ### #3 the mutable set — WRAPPED
 
@@ -431,6 +498,35 @@ size, and the length is the only observation that can see it. That
   vacuous-green trap:** a probe run under `--synthetic-jdk` reports
   `D.getAlgorithms[MessageDigest] class=java.util.HashSet add=SUCCEEDED`, which
   reads exactly like "§3 #3 never landed" and is not that.
+
+  > **Corrected and completed, second pass 2026-08-12.** The row above says the
+  > `native-collections` binding is "live in real-JDK and `--jdk-only`". It is
+  > live in **real-JDK only**: those six `unmodifiable*` factories sit in their
+  > own `r.set_category(NativeKind::SyntheticStub)` window inside
+  > `register_collections_extras_natives`, and `SyntheticStub` is the one kind
+  > `--jdk-only` drops at registration
+  > (`native-builtins/tests/stub_ratchet.rs`'s strict siblings assert **zero**
+  > surviving `SyntheticStub` rows). So §3 #3 has **three** arms, not two, and
+  > the middle one was never stated:
+  >
+  > * `--real-jdk` — the native wins; `wrap_unmodifiable` gets a fabricated
+  >   `cratonvm/internal/UnmodifiableSet` whose `add` is `native_unmod_throw`.
+  >   Immutable, but `getClass().getName()` is not HotSpot's.
+  > * `--jdk-only` — the registration is dropped, so real
+  >   `java.util.Collections` bytecode runs and the view is the genuine
+  >   `Collections$UnmodifiableSet`. Immutable, and byte-for-byte HotSpot's.
+  > * `--synthetic-jdk` — identity, as the row above says.
+  >
+  > The middle arm is worth stating because the alternative reading is a live
+  > hazard rather than a quibble: **had those rows survived into `--jdk-only`,
+  > the fix would have been silently inert there.** `alloc_unmod_wrapper` calls
+  > `try_alloc_synthetic`, which strict-mode policy refuses for a
+  > `cratonvm/internal/*` class with a catchable `NoClassDefFoundError` — and
+  > `wrap_unmodifiable`'s deliberate `_ => set` fallback would have swallowed it
+  > and returned the plain mutable `HashSet`, on the one path with no way to
+  > tell that from "the wrapper was never applied". Anyone retagging that window
+  > away from `SyntheticStub` re-opens §3 #3 in strict mode without touching a
+  > line of this record's code.
 * `--synthetic-jdk` has never been built by any lane, so #6's live half has
   never been observed — only reasoned about.
 
@@ -466,8 +562,17 @@ D.getAlgorithms[MessageDigest]        class=java.util.HashSet add=SUCCEEDED
 D.SUN.getServices.add                 SUCCEEDED -> UnsupportedOperationException
 ```
 
-`RJdkSecurity` must still run to `PASS RJdkSecurity (61 checks)` in all three
-arms, and `RCrypto` / `RChaCha20Cipher` must be unchanged.
+`RJdkSecurity` must run to **`PASS RJdkSecurity (80 checks)`** in all three arms
+— 61 before the second pass added `advertisedVersusServed()` — and `RCrypto` /
+`RChaCha20Cipher` must be unchanged.
+
+Since that vector is scheduled and the probe is not, the suite is now the
+cheaper instrument for everything in §3 except #4 and #7. Those two are knowing
+divergences from HotSpot (`KeyFactory` no longer advertising the two umbrellas),
+so they cannot be asserted in a fixture that also runs on the oracle; their
+ratchet stays `every_advertised_key_factory_name_is_serviceable`, and the
+fixture asserts the invariant the removals restore — advertised implies
+serviceable — which is true on both VMs by different routes.
 
 ## 10. The single falsifying observation
 
@@ -477,6 +582,12 @@ then some `MessageDigest` path still reaches a SHA-256 default that neither
 worth more than the rest of section C put together: every other row can be
 satisfied by an engine that computes the right answer for names it knows, and
 only this one asks what it does with a name it does not.
+
+If `C.md[SHAKE128].abc` reads `n/a` on a CratonVM arm, the alias correction in
+§3 #2 did not take and `getInstance` is still refusing a name the provider chain
+advertises an alias row for — the state this record shipped in before its second
+pass, and the reason a registry-level assertion is not cover for a
+`getInstance`-level claim.
 
 If instead `A.Signature[*]` rows start reading `THREW` for names the oracle
 serves, the `signature_name_is_offered` disjunction has lost its second arm —

@@ -4,6 +4,16 @@
 **Branch:** `fix/stream-reuse-throws-20260812`
 **Status:** fixed for reference streams; a named residual set is left open on purpose.
 
+> **UPDATED 2026-08-12 — two of the six residuals are closed, and the widest one
+> is re-costed.** `close()` (§5.3) and `onClose()` (§5.4) are implemented, both in
+> `native-collections/src/lib.rs`, each behind the source census the residual was
+> waiting on. Both are now covered by a **scheduled** fixture rather than by
+> `probes/`, which `run.sh` never runs: `RJdkCollections.streamReuse()`,
+> `JDKONLY_CLASSES`, 61 → **69** checks, two reds and six controls. §5.1
+> (primitive streams) and §5.6 (short-layout streams) are unchanged in verdict and
+> changed in *cost* — the numbers in this record were the wrong ones and §5.1.1 /
+> §5.6.1 carry the corrections. Nothing here has been built or run.
+
 This was the last divergence in the shadow differential. Measured on the
 repaired runner (`probes/shadow-differential.ps1`, one class file, stdout and
 stderr kept apart):
@@ -235,6 +245,7 @@ The streams that do **not** grow, and are therefore untouched by this record:
 |-----------|-------|---------|
 | `service_loader.rs :: StreamSupport.stream(realSpliterator, false)` | 3 | never |
 | `service_loader.rs :: alloc_synthetic_stream` | 1 | never |
+| *(§5.6.1, 2026-08-12: this table undercounts — `service_loader.rs` has **four** `java/util/stream/Stream` mints, at `:3051`, `:3303`, `:3371`, `:3415`)* | | |
 | twelve `try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)` sites in `native-builtins` (`Files.list`/`Files.walk` shims, `reflect_invoke`, `phases_late`) | 1 | never |
 | in-tree fixtures in `vm/src/vm/tests.rs` (six `alloc_receiver(…, 1)`) | 1 | never |
 
@@ -258,6 +269,49 @@ guess that could fire spuriously.
    *Cost:* `reuse.intStreamTwice` / `longStreamTwice` / `doubleStreamTwice` stay
    `no-throw`.
 
+### 5.1.1 — 2026-08-12: what the swallow eats today (nothing), and what the
+### conversion actually costs (not 25 `?`s)
+
+Verdict unchanged: **still open, still on purpose.** Two corrections to the
+reasoning, because both change what a taker should plan for. Re-derived from
+source and written into the doc comment on `int_stream_elements` itself, so the
+next reader can check it rather than trust it.
+
+**(a) The swallow is currently eating nothing, and "the chain branch is
+unreachable" was only one of three reasons.** `stream_elements` has exactly three
+error paths and a primitive receiver reaches none of them:
+
+| `stream_elements` error path | why no primitive receiver reaches it |
+|---|---|
+| `stream_link_or_consume` | gated on `class_name == "java/util/stream/Stream"` |
+| `materialize_lazy_stream(..)?` | needs slot 2. Only `StreamSupport.stream(Spliterator,Z)` writes it, and it mints `java/util/stream/Stream`. `StreamSupport.intStream`/`longStream`/`doubleStream` live in `phases_late/streams.rs`, `register_synthetic_overrides`-only — absent from both shipping modes |
+| the real-pipeline `toArray()[Ljava/lang/Object;` branch | needs a receiver whose class is not one of the four interface names. Every `native_{int,long,double}_stream_*` native is registered on an INTERFACE, and every native-shadow hierarchy walk in the tree is a *superclass* walk (W7-9 §2), so a real `IntPipeline$Head` resolves its own `Code`. `prim_stream_values` is the function for real primitive pipelines, and it uses `()[I`/`()[J`/`()[D` |
+
+So this residual is a *latent* trap, not a live loss — which is worth stating
+precisely, because "25 sites swallow errors" reads as an active defect and the
+census that produced it did not say which errors.
+
+**(b) The conversion is not "add `?` at 25 sites", and the difference is the
+pin stack.** At least `native_int_stream_peek` holds a live
+`ctx.pin_native_root` handle across its `int_stream_elements` call; a bare `?`
+there returns without `unpin_native_roots` and leaks a pin. The pin stack is
+strictly LIFO per scope and this file has already paid for corrupting it twice
+(`stream_apply_chain_full`'s `cceres3` note: a callback pinning into its callee's
+scope made `read_value_slice` degrade to stale values, surfacing as
+`to_array_gen` canary firings). `stream_match`, two hundred lines away, already
+shows the correct form — `match … { Err(e) => { unpin; return Err(e) } }`. So the
+taker's unit of work is **check the live pins at each of the 25**, not append a
+character, and the compiler cannot help: a leaked pin compiles.
+
+Only once that lands is extending the mark worth doing, and then it is one line:
+`if class_name == "java/util/stream/Stream"` becomes
+`if is_synthetic_stream(&class_name)`. Two properties make that safe and are
+worth recording now so the next pass does not re-derive them: all three
+`make_{int,long,double}_stream` mints use `STREAM_NUM_FIELDS` (5), so the width
+guard admits them; and `native_int_stream_flat_map` reads its receiver through
+`prim_stream_values` (a direct slot-0 read), not through the funnel, so the
+mapper's sub-streams cannot double-mark.
+
 2. **The deferred intermediate op (`stream_defer_op`), in Compatible mode
    only.** The lazy pipeline is ON by default, so `s.filter(f)` records an op on
    a new stage and never reads `s`'s snapshot — `s` is not marked. Marking there
@@ -273,21 +327,86 @@ guess that could fire spuriously.
    (peek/map/filter/limit/skip/flatMap). The eager intermediate ops — `sorted`,
    `distinct`, `mapToInt`, `mapTo*`, `flatMapTo*` — mark in both modes.
 
-3. **`close()` (JDK site 7).** The JDK sets unconditionally there. Ours does
-   not, because I could not rule out, without a build, a VM-internal path that
-   closes a synthetic stream earlier than HotSpot would; a mark on such a path
-   breaks the *next* legitimate operation. Three lines whenever someone can
-   measure it.
-   *Cost:* `reuse.closeThenCount` stays `no-throw`.
+3. **`close()` (JDK site 7).** ~~The JDK sets unconditionally there. Ours does
+   not~~ — **CLOSED 2026-08-12.** The blocker was *"I could not rule out, without
+   a build, a VM-internal path that closes a synthetic stream earlier than HotSpot
+   would"*. That census is a grep, not a build, and it comes back clean: the only
+   `invoke_virtual(_, "close", "()V", _)` calls in `native-collections/src/lib.rs`
+   are the two `flatMap` inner-stream closes — the lazy chain's, inside
+   `stream_process_chain`, and the eager body's, in `native_stream_flat_map` — and
+   **both run after that inner stream's elements have been read**, which is
+   precisely what the JDK's own `try (Stream<R> result = mapper.apply(u))` does.
+   Neither inner stream is touched again. `native_stream_close` now calls
+   `stream_mark_linked` (the unconditional setter, *not*
+   `stream_link_or_consume`), **before** running the handlers, matching
+   `AbstractPipeline.close()` whose first statement is `linkedOrConsumed = true`
+   and whose `closeAction.run()` is last. That ordering is observable twice: a
+   handler operating on the stream must see it spent, and a handler that throws
+   must still leave it marked.
+   *Cost:* none. `reuse.closeThenCount` now throws; `closeTwice` and
+   `consumeThenClose` still do not, because `close()` sets without checking.
+   *Gate:* `RJdkCollections.streamReuse()` rows 1, 3, 4.
 
-4. **`onClose()` (the check-only site).** Adding a check there can only ever
-   produce throws, never prevent one, so it is off the same reasoning.
-   *Cost:* `reuse.onCloseAfterConsume` stays `no-throw`.
+4. **`onClose()` (the check-only site).** ~~Adding a check there can only ever
+   produce throws~~ — **CLOSED 2026-08-12**, and the asymmetry that made it a
+   residual is the reason it is now safe. `native_stream_on_close` raises
+   `IllegalStateException(STREAM_LINKED_MSG)` when `stream_is_linked`, and marks
+   nothing. Placement is the whole fix: the check sits **after** the
+   `is_synthetic_stream` gate, because slot 4 on a real `ReferencePipeline` is one
+   of its own fields and could hold `Int(1)` for reasons of its own — and
+   `stream_is_linked`'s own width guard exempts every short-layout stream. Nothing
+   else in the file writes slot 4, so the flag can only be there because
+   `stream_link_or_consume` put it there.
+   *Cost:* none. `reuse.onCloseAfterConsume` now throws.
+   *Gate:* `RJdkCollections.streamReuse()` row 2, with row 5 as the
+   handler-still-runs control.
 
 5. **The stage-replacement constructor and `linkOrConsume` (JDK sites 2/3).**
-   Both exist for `GathererOp`, which CratonVM does not model.
+   Both exist for `GathererOp`, which CratonVM does not model. Re-checked
+   2026-08-12: still true, nothing to do, and nothing to measure — there is no
+   `Gatherer` surface in the tree to attach a residual to.
 
 6. **Short-layout streams** — the four rows in §4.1.
+
+### 5.6.1 — 2026-08-12: the short-layout residual is one out-of-lane edit, and
+### the record understated which streams it covers
+
+Verdict unchanged: **not taken.** But it is worth being exact, because §7's
+"what cannot throw" list reads like a design decision and it is really a
+consequence of two `.max()` calls in a file this lane does not own.
+
+`native-builtins/src/service_loader.rs` mints `java/util/stream/Stream` at
+**four** `ctx.class_num_total_fields(cid).max(N)` sites, not the two §4.1 lists —
+re-counted 2026-08-12, and the miscount matters because raising only the two named
+ones leaves half the family exempt and the residual would read as closed:
+
+| site | `N` | arm |
+|---|---|---|
+| `:3051` | 1 | — |
+| `:3303` | 3 | `native_stream_support_stream_from_spliterator`, the REAL-spliterator arm (stashes the source in slot 2) |
+| `:3371` | 1 | the same function's synthetic-spliterator arm (snapshot already materialised) |
+| `:3415` | 1 | `alloc_synthetic_stream` |
+
+Raising all four to `.max(5)` is the entire mechanical change:
+`Heap::try_alloc_object` zeroes, only the exact `Int(1)` reads as linked, so the
+new slots need no explicit init. (The two `.max(3)` sites at `:3197` and `:3230`
+are `java/util/Spliterator`, a different class — do not touch them.)
+
+Why it is still declined, in the record's own terms rather than as a shrug: this
+is the **most pervasive stream path in the SB / Tomcat / Hibernate arms**
+(`getResultStream`, `ServiceLoader`, the `Files.list`/`Files.walk` shims), and the
+declining argument at the top of this record — *"a flag set once too often turns a
+working stream into a throw on the most pervasive path"* — is a description of
+exactly this row. Two lines is not the cost; the arm run is. Do not take it from
+a lane that cannot run those arms.
+
+One thing the earlier text got wrong and a taker would trip over: §7 lists
+*"every real JDK `ReferencePipeline` reaching `stream_elements` through the
+`toArray()` branch"* as unable to throw. That is right, but not for the reason the
+line implies — those receivers never enter `stream_link_or_consume` at all,
+because it is gated on `class_name == "java/util/stream/Stream"` and a real
+pipeline's class name is `java/util/stream/ReferencePipeline$…`. The JDK's own
+flag is irrelevant to it.
 
 ---
 
@@ -398,6 +517,21 @@ instrument for that, and it has not been run on this branch.
 | `probes/StreamReuseThrowsProbe.java` | new, two-sided |
 | `probes/StreamReuseThrowsProbe.expected.txt` | new, measured on HotSpot 25 |
 | `docs/known-issues/jdk-only/README.md` | the `W7-36` residual row updated |
+
+Added 2026-08-12 (§5.3 / §5.4, unbuilt):
+
+| file | change |
+|------|--------|
+| `native-collections/src/lib.rs` | `stream_mark_linked` in `native_stream_close`, ahead of the handlers; the `stream_is_linked` check in `native_stream_on_close`, after the `is_synthetic_stream` gate; the `int_stream_elements` doc comment replaced with the three-path derivation and the pin hazard (§5.1.1) |
+| `regression-suite/src/RJdkCollections.java` | `streamReuse()`, 8 checks, 61 → **69**. Two reds (rows 1, 2) and six controls; `JDKONLY_CLASSES`, so it runs on `CRATONVM_ARGS=--jdk-only` and on `SUITE=all` |
+
+**The swallow question, answered for this pass.** Neither new raise is in the
+primitive-stream family, so neither can be eaten by `int_stream_elements`'
+`.unwrap_or_default()`: `native_stream_close` returns `MethodCallResult` to the
+interpreter and marks rather than raising, and `native_stream_on_close`'s
+`IllegalStateException` is returned from the native's own `MethodCallResult` — the
+25 swallowing sites all call `stream_elements`, which is a different funnel that
+neither of these two functions enters.
 
 ## 9. What to run
 

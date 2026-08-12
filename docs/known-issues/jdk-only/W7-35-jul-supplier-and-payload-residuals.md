@@ -1,5 +1,17 @@
 # W7-35 — the JUL residuals: two of the four were mine, one was already fixed, and the two that keep the vector red are the same bug as W7-25 §1
 
+> **2026-08-12 — both `--jdk-only` survivors now have a landed cause, and §5's
+> patch is superseded.** #54 is FIXED by giving `Formatter.formatMessage` a
+> correct body (W7-43-formatmessage-substitution.md — see §5's own CORRECTION
+> block). #59's strict half is FIXED in three parts in the tree by
+> W7-56-infercaller-strict.md, whose cause is neither of the two this record
+> named: the accessors' retirement was necessary and NOT sufficient, because a
+> shadow **constructor** dropped `needToInferCaller`. Read W7-56's "Landed state"
+> section for the registrar census, and do **not** apply §5's `with_category`
+> patch — a category makes a row eligible for retirement, it does not retire it.
+> One thing found in this record's own files while closing that: §2's Compatible
+> fix had a second, weaker inference point overriding it — §2.1.
+
 **Status:** `regression-suite/src/RJdkLogging.java` is scheduled in
 `JDKONLY_CLASSES` and is the suite's only red. The full divergence census is
 below — **`--jdk-only` 2 failures, `--real-jdk` 3, HotSpot 0** — measured on the
@@ -166,6 +178,45 @@ equivalent placement reachable from a native.
 
 **This does not fix #59 under `--jdk-only`**, where the record is real and the
 frames are already right. That half is §5.
+
+### 2.1 The Compatible half had TWO inference points, and the weaker one won
+
+Found and fixed 2026-08-12 while closing the strict half. `stamp_inferred_caller`
+is called from `publish_to_jul_handlers_full` and stamps the pair; the block
+§2 landed then ran **unconditionally afterwards** and stamped it again from
+`infer_jul_caller_source`. Two consequences, both live in the tree until now:
+
+* a **second `capture_stack_trace` on every published record** — precisely the
+  cost §2 argued about, paid twice on the handler path;
+* the second answer overwrote the first, and it is the **weaker** of the two
+  predicates.
+
+Which is weaker is adjudicated against the JDK 25 source rather than by
+preference, because §2's own text argues for the narrow one. `LogRecord$CallerFinder.test`
+has **two stages**: a latch (`isLoggerImplFrame`, exactly
+`java.util.logging.Logger` and `sun.util.logging.PlatformLogger*`) that skips
+until the logger is SEEN, and then a filter,
+`jdk.internal.logger.SurrogateLogger.isFilteredFrame` →
+`SimpleConsoleLogger.Formatting.isFilteredFrame`, which skips everything
+implementing `System.Logger` plus the prefixes `java.util.logging.`,
+`sun.util.logging.`, `jdk.internal.logger.`, `java.lang.invoke.MethodHandle`
+and `java.security.AccessController`. So §2's "the two class names are exactly
+the two `isLoggerImplFrame` admits" is right about the LATCH and wrong to use
+that set as the SKIP set: those two names are the marker to look *for*, and the
+frames to skip are the wider filter's. `infer_jul_caller_source` uses the latch
+names as its skip set, so it can name `java.util.logging.Handler`, a
+`java.lang.reflect` frame or the record's own class as the caller;
+`stamp_inferred_caller`'s wider set is the analogue of the filter stage.
+
+Fixed by making the second block a **fallback** instead of an override — it now
+also requires that `sourceClassName` is not already a reference — rather than by
+deleting it: the wider set can in principle reject every frame (a log driven
+entirely from `java.util.logging` code), and there a narrow answer beats a null
+pair, which `SimpleFormatter` renders as the logger name. On the synthetic
+`LogRecord` layout both writes no-op (no field names to resolve) and the new
+guard reads `Object(None)` for the absent field, so that layout is unchanged.
+Unbuilt; the observable is #59's `Compatible` rendering, already asserted by
+`RJdkLogging.formattedOutputIsRealBytes`.
 
 ## 3. RETRACTED: the `lib.rs` `Supplier` conveniences were already fixed (#44)
 

@@ -13,7 +13,13 @@
 >   adjudicated against HotSpot's own MD2 on ten messages before it was
 >   written, because this lane could not build.
 > * **Patch C** (SHAKE) — applied, including the alias/service distinction and
->   the normalisation-agreement test this record asked for.
+>   the normalisation-agreement test this record asked for. **Re-verified
+>   2026-08-12 by a second pass, which found the ALIAS half unfinished:** the
+>   `put_alias` rows and their ratchet were in the tree, but
+>   `MessageDigest.getInstance("SHAKE128")` still threw, because
+>   `md_get_instance` gates on `jca::message_digest::algorithm_supported` and
+>   nothing on that path reads the provider chain's alias map. Closed in that
+>   pass (`canonical_algorithm`); W7-63 §3 #2 carries the correction.
 > * **Patch D** (the silent wrong-digest defaults) — applied, and the
 >   synthetic-mode door shut too. This patch has **no counterpart in W7-29**,
 >   because W7-29 ran its probes and this arm is unreachable outside
@@ -29,6 +35,20 @@
 > implemented, none", and `Signature.getInstance` in fact accepted **every
 > string**. That is the direction a source-read census cannot see, and it is
 > W7-63 §2.
+>
+> **Verified against the tree 2026-08-12, second pass.** All five live patches
+> are present as source: `wrap_unmodifiable` (A), `real_md2` + the `"MD2"` arm
+> (B), the `SHAKE128256` / `SHAKE256512` arms and the two `put_service` /
+> `put_alias` pairs (C), the fail-closed `compute_digest` default and
+> `digest_length_bytes -> Option` (D), and the `ML-DSA` umbrella gone from the
+> `SUN` `KeyFactory` seed (F). Patch E is still not applied and must not be.
+> **Nothing in this file is work any more** — the one residual the second pass
+> found is C's alias half, noted above and closed there. The record's
+> assertions now also run in a scheduled vector:
+> `RJdkSecurity.advertisedVersusServed()` covers MD2, both SHAKE primaries,
+> both SHAKE aliases, the advertised-implies-serviceable invariant for
+> `MessageDigest` and `KeyFactory`, the `Signature` refusals and the
+> unmodifiable set. Expect `PASS RJdkSecurity (80 checks)`, not 61.
 
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
@@ -37,7 +57,11 @@
   record said it was missing was taken 2026-08-12 against the dev binary at
   `ba65f1a19`: `RJdkSecurity` runs to `PASS RJdkSecurity (61 checks)` in **both**
   `--jdk-only` and `--real-jdk`.
-* **Residual: STILL OPEN — five of the six out-of-file patches.** Re-grepped
+* ~~**Residual: STILL OPEN — five of the six out-of-file patches.**~~
+  **STRUCK 2026-08-12 (second pass).** True when written that morning, false by
+  that evening: all five landed with W7-63 the same day, and every `file:line`
+  in the sub-list below has rotted with them. Kept only so the next reader can
+  see what the pre-fix tree looked like. Re-grepped
   2026-08-12; each is genuinely unapplied:
   * **A** (unmodifiable set) — `security_get_algorithms` still returns the bare
     `HashSet` (`native-builtins/src/jca/provider_chain.rs:2830-2832`); so does

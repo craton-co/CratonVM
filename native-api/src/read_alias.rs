@@ -130,6 +130,23 @@
 //! * Whether a wrong field is *harmful*. Slot 6 read as an `Int` when it holds
 //!   an array reference is caught by the value tag on most paths; the census is
 //!   a risk register until a row is confirmed against a workload.
+//! * **A wrong-KIND read of the RIGHT field** — one layer further out again,
+//!   and the first instance is recorded rather than theoretical.
+//!   W7-83-segment-as-backing-array.md found `bb_resolve_heap_array`
+//!   (`native-io`) and `s2_bb_arr` (`native-builtins`) reading
+//!   `java.nio.Buffer.segment` at slot 5 and returning it as the backing
+//!   `byte[]`. The slot index is right, the field name the site declares is
+//!   right, the read is in bounds, and the value is a `MemorySegment` where an
+//!   array is required. [`classify_read`] compares a name against a name, so it
+//!   answers **clean** — correctly, and that clean row is a deliberate
+//!   non-firing control (W7-69 §3), which is why the repair was a screen on the
+//!   VALUE after the read rather than a change here. Nothing in this module can
+//!   be widened to catch the species: it would need the field's DESCRIPTOR and
+//!   the value's runtime kind, i.e. a third instrument. The screen that does
+//!   catch it is `ctx.heap_kind_of(a) == ObjectKind::Array` at each of those two
+//!   sites; `native-api/tests/read_alias_coverage.rs
+//!   ::the_calibration_site_is_still_observed_before_its_own_read` is what pins
+//!   the observation to stay above it.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;

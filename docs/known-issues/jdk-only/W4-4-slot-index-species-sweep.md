@@ -3,6 +3,44 @@
 Status: two MISMATCHes fixed, the rest of **this lane's enumerated surface**
 verified safe with a reason per site. Wave 4, lane W4-4.
 
+> **2026-08-12 (SECOND PASS) — this record's value is its CENSUS, and the census
+> is stale in the good direction. Read this note before quoting any number
+> below, including the numbers in the note under it.**
+>
+> Two of the three instrument holes every table here is bounded by have since
+> been closed, so the figures below are a *snapshot of a narrower instrument*
+> rather than a measurement of the species.
+>
+> 1. **The detector is no longer on one funnel.** It lives in
+>    `native-api/src/layout_alias.rs` with two observation points —
+>    `NativeContextImpl::alloc_object` (`vm/src/vm/vm_exec.rs:12058`), which every
+>    native object allocation in every native crate reaches, and the fabrication
+>    funnel, kept because it clamps `n = requested.max(real)` before allocating
+>    and is therefore the only place an `under` request is still visible. One
+>    implementation, two callers. The note below this one says the "intersect list
+>    1 with lists 2 and 3" procedure has a list 1 that cannot contain
+>    `AsynchronousSocketChannel`; **that is no longer true**, and the procedure in
+>    "Visible, not fatal" is now sound as written.
+> 2. **`declared == 0` is no longer silent.** It was `None` — the same bytes on
+>    the wire as clean — and is now `direction = "undeclared"`
+>    (`W7-73-short-object-blind-spot.md`). This matters more than it sounds:
+>    the base allocator clamps two lines *after* it observes, so `under` describes
+>    a mis-request and **never a short object**, and `undeclared` is the only
+>    direction in which a genuinely short object can appear. The `real == 0`
+>    column below — 152 pairs / 339 sites here, 197 / 447 in W7-49 — was the
+>    "unmeasured, not cleared" bucket and is now reportable.
+> 3. **Still open, and it bounds everything:** no figure in this file or in W7-49
+>    has ever been produced by a *run*. They are `javap`-plus-source upper bounds.
+>    The commands that produce the real numbers are in the closing section of this
+>    note's parent record and in W7-49 §9.4.
+>
+> The source-level counts that ARE current, because they are held by gates rather
+> than by prose: the `ClassId::new(0)` fallback population is **28** sites, 14 of
+> them naming a class whose real layout is wider (so those objects are short),
+> ratcheted downward-only by
+> `native-api/tests/layout_alias_coverage.rs::the_unresolved_class_fallback_population_only_shrinks`.
+> Everything else in this file needs the run.
+
 > **2026-08-12 — re-censused against the un-blinded detector; the status line
 > above is narrower than it reads, and three paragraphs below are wrong on the
 > facts.** `W7-49-slot-index-recensus.md` re-derives this census with

@@ -30,12 +30,49 @@ public class RJdkHello {
         check(System.in != null, "System.in is null");
         check(System.out instanceof PrintStream, "System.out is not a PrintStream");
         check(System.err instanceof PrintStream, "System.err is not a PrintStream");
-        // Well-known properties must be present (values are host-specific, so we
-        // assert presence and shape only -- never print them).
-        check(System.getProperty("java.version") != null, "java.version absent");
-        check(System.getProperty("line.separator") != null, "line.separator absent");
-        check(System.getProperty("path.separator") != null, "path.separator absent");
+        // Well-known properties. The VALUES are host-specific, so nothing here
+        // is pinned to a literal and nothing is printed -- but presence alone is
+        // not an assertion: a VM whose property table answers "" for every key,
+        // or whose System.getProperty is a hardcoded switch that disagrees with
+        // its own Properties table, satisfies `!= null` exactly as well as a
+        // correct one does. What is asserted instead is (a) non-emptiness,
+        // (b) the closed set or cross-accessor identity each key is SPECIFIED to
+        // agree with, and (c) that the single-key accessor and the whole-table
+        // accessor answer the same thing.
+        String javaVersion = System.getProperty("java.version");
+        check(javaVersion != null && !javaVersion.isEmpty(), "java.version absent or empty");
+        check(Character.isDigit(javaVersion.charAt(0)),
+                "java.version must start with the feature number");
+
+        String lineSep = System.getProperty("line.separator");
+        check(lineSep != null && !lineSep.isEmpty(), "line.separator absent or empty");
+        // System.lineSeparator() is SPECIFIED to be the line.separator property.
+        check(lineSep.equals(System.lineSeparator()),
+                "line.separator and System.lineSeparator() must agree");
+        // Not a host pin: this is every value either can legally take.
+        check(lineSep.equals("\n") || lineSep.equals("\r\n"), "line.separator shape");
+
+        String pathSep = System.getProperty("path.separator");
+        check(pathSep != null && pathSep.length() == 1, "path.separator absent or not one char");
+        // File.pathSeparator is SPECIFIED to be this property's value.
+        check(pathSep.equals(java.io.File.pathSeparator),
+                "path.separator and File.pathSeparator must agree");
+        check(pathSep.equals(":") || pathSep.equals(";"), "path.separator shape");
+
+        // The two accessors are two views of one table. A VM that special-cases
+        // the well-known keys in getProperty() while its Properties object never
+        // received them answers differently here -- and every one of the reads
+        // above would still have been green.
+        java.util.Properties props = System.getProperties();
+        check(props != null, "System.getProperties() returned null");
+        for (String key : new String[] { "java.version", "line.separator", "path.separator" }) {
+            check(System.getProperty(key).equals(props.getProperty(key)),
+                    "getProperty and getProperties disagree on " + key);
+        }
+
         check(System.getProperty("cratonvm.no.such.property") == null, "phantom property");
+        check(props.getProperty("cratonvm.no.such.property") == null,
+                "phantom property in the table");
         check(System.getProperty("cratonvm.no.such.property", "dflt").equals("dflt"),
                 "getProperty default");
         check(System.lineSeparator() != null && !System.lineSeparator().isEmpty(),

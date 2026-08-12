@@ -5359,6 +5359,23 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     // interpreter agree. `aastore_element_assignable` fails open on imprecise
     // type info, so this is additive (never a false ArrayStoreException) — the
     // store still proceeds below for null elements and assignable references.
+    //
+    // W7-37 residual, measured 2026-08-12: **on x64 this arm does not run at
+    // all**, because nothing calls this function. `jit/src/x64/bytecode_walk.rs`
+    // lowers `aastore` (0x53) inline — null check, bounds check, SATB pre-write
+    // barrier, `MOV [array + index*8 + HEADER_SIZE], val`, card mark — and never
+    // reaches `self.helpers.aastore`. The comment at that arm justified the
+    // inline path with "the current `jit_aastore` helper does NOT enforce the
+    // ASE check … no regression"; that premise was true when it was written and
+    // was falsified when this check landed here, silently, because a premise in
+    // a comment is not a compile-time link. `RExceptions`'s tier-parity
+    // assertion reads `cold=[java.lang.Integer] hot=[no-throw]` at i=500 as a
+    // result: the compiled store completes and raises nothing.
+    //
+    // So do NOT read the funnel routing below as "the JIT and the interpreter
+    // now print the same text". They do — but only once the emitter calls this
+    // helper. See docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
+    // §"Part 4" for the codegen change that wires it up.
     if val != 0 {
         let vm = &*(vm_ptr as *const SharedVm);
         let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
@@ -5382,13 +5399,30 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
                 .get_class(vm.mem.heap.class_id_of(value_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            // W7-37 -- raise this through `throw_runtime_error`, the single
+            // funnel every VM-minted `RuntimeError` passes through, instead of
+            // building the throwable here. The funnel is where an
+            // `ArrayStoreException` message is given HotSpot's EXTERNAL class
+            // name; `class.name` above is the INTERNAL one, so minting the
+            // object directly printed `java/lang/Integer` where HotSpot (and
+            // the interpreter's own `aastore`, which does go through the
+            // funnel) print `java.lang.Integer`. A slashed name there is a
+            // real defect and not untidiness: callers regex the message and
+            // feed the capture to `Class.forName`.
+            //
+            // Behaviour on failure is unchanged -- if no thread is available,
+            // or the funnel cannot build the throwable and degrades to an
+            // `InternalError`, we fall through and perform the store rather
+            // than corrupting VM state.
             if let Some((thread, _guard)) = jit_thread_mut() {
-                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArrayStoreException",
-                    Some(&elem_cls),
-                ) {
+                use crate::error::MethodCallFailed;
+                if let MethodCallFailed::ExceptionThrown(exc) =
+                    crate::runtime::exceptions::throw_runtime_error(
+                        vm,
+                        thread,
+                        crate::error::RuntimeError::ArrayStoreException { message: elem_cls },
+                    )
+                {
                     set_jit_pending_exception(thread, exc);
                     return;
                 }
@@ -7759,12 +7793,29 @@ pub unsafe extern "C" fn jit_checkcast(
                 obj_cls_name,
                 class_name.replace('/', ".")
             );
-            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                "java/lang/ClassCastException",
-                Some(&msg),
-            ) {
+            // W7-37 -- and this one is a correction to that record, which
+            // listed "the JIT cast helper's `class ... cannot be cast to
+            // class ...`" among the paths its funnel rewrite newly covers. It
+            // did not: this site builds the throwable itself and so never
+            // reaches `throw_runtime_error`, which is where the message gains
+            // HotSpot's module/loader parenthetical
+            // (`(java.lang.String and java.lang.Integer are in module
+            // java.base of loader 'bootstrap')`). The interpreter's `checkcast`
+            // raises a `RuntimeError` and does get it, so the two execution
+            // modes printed different text for the same refusal.
+            //
+            // `msg` is already in the two-operand shape `split_cast_operands`
+            // requires, and the rewrite fails open: when either operand's
+            // module/loader cannot be named -- a user-defined loader, most
+            // of all -- the funnel returns `msg` byte-identical.
+            use crate::error::MethodCallFailed;
+            if let MethodCallFailed::ExceptionThrown(exc) =
+                crate::runtime::exceptions::throw_runtime_error(
+                    vm,
+                    thread,
+                    crate::error::RuntimeError::ClassCastException { message: msg },
+                )
+            {
                 set_jit_pending_exception(thread, exc);
                 return i64::MIN;
             }

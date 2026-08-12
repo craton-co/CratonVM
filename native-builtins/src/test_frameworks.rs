@@ -3681,6 +3681,16 @@ pub(crate) fn native_surefire_forkedbooter_acknowledged_exit(
         eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
+    // W7-90 trigger C. A Surefire fork never reaches `System.exit`: this triple
+    // is registered, so real `ForkedBooter` bytecode never runs, which skips
+    // both the launcher's post-`main` sweep and `lang_system`'s three exit
+    // natives. Same shared helper, gated with no `else`, carrying its own
+    // trigger label. Below the soft-exit return so a soft-returned exit does not
+    // consume the census the launcher would print later.
+    crate::lang_system::sweep_declared_slot_maps_before_exit(
+        &*ctx,
+        "ForkedBooter.acknowledgedExit",
+    );
     std::process::exit(0);
 }
 
@@ -3707,6 +3717,11 @@ pub(crate) fn native_surefire_forkedbooter_exit1(
         eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
+    // W7-90 trigger C — see `native_surefire_forkedbooter_acknowledged_exit`.
+    // This body serves TWO registered triples (`exit()V` and `exit1()V`), so one
+    // label covers both; the label is `exit1` because that is the name the
+    // registration this body was written for uses.
+    crate::lang_system::sweep_declared_slot_maps_before_exit(&*ctx, "ForkedBooter.exit1");
     std::process::exit(1);
 }
 
@@ -3732,6 +3747,8 @@ pub(crate) fn native_surefire_forkedbooter_exit_code(
         eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
+    // W7-90 trigger C — see `native_surefire_forkedbooter_acknowledged_exit`.
+    crate::lang_system::sweep_declared_slot_maps_before_exit(&*ctx, "ForkedBooter.exit");
     std::process::exit(code);
 }
 

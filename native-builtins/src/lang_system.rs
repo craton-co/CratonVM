@@ -124,6 +124,19 @@ fn invoke_pre_exit_hook(code: i32) {
 /// soft-returned exit does not consume the census the launcher would print
 /// later.
 ///
+/// `pub(crate)` since 2026-08-12, and the reason is the third exit door.
+/// `std::process::exit` has **seven** call sites in this crate, not three: four
+/// triples on `org/apache/maven/surefire/booter/ForkedBooter` are registered
+/// from `register_essential_natives_with_shims` — LIVE in **both** modes — onto
+/// three bodies in `test_frameworks.rs` that each terminate on their own and
+/// never reach `native_system_exit`. Registration is the gate, so real
+/// `ForkedBooter` bytecode never runs: on a Surefire fork the launcher's
+/// post-`main` line is skipped **and** these three natives are skipped, and the
+/// sweep printed nothing at all on precisely the corpus this trigger was
+/// written for. Those three bodies call this helper rather than open-coding a
+/// fourth gate — one gated block with no `else`, one place to read. See
+/// W7-90-slot-map-sweep-caller.md §2.2.1.
+///
 /// Gated with **no `else`** and observation-only: the report is printed by the
 /// sweep and dropped here. With the flag off it is one `OnceLock` load and a
 /// branch, on a path that runs once per process.
@@ -134,7 +147,7 @@ fn invoke_pre_exit_hook(code: i32) {
 /// The fix is not a second emitter — two detectors on one primitive drift and
 /// then disagree — it is to prefer the launcher's post-`main` trigger when a
 /// workload can be made to return.
-fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
+pub(crate) fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
     if cratonvm_native_api::layout_alias::enabled() {
         let _ = cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(ctx, trigger);
     }
@@ -930,6 +943,40 @@ pub(crate) fn native_thread_start0(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // JVMS / `java.lang.Thread`: `start()` on a thread that has already been
+    // started must throw `IllegalThreadStateException`. We did not, and the
+    // consequence was worse than a missing exception — MEASURED 2026-08-12, a
+    // second `start()` RE-RAN the body and spawned a second OS thread for a
+    // retired `Runnable`.
+    //
+    // The real `Thread.start()` branches on `holder.threadStatus`, and that
+    // field is INERT on this VM: measured NEW=0 / terminated=0 here against
+    // HotSpot's NEW=0 / terminated=2. A guard reading it would never fire.
+    // `native_thread_get_state` says the same in its own doc comment and
+    // computes from the registry instead, which retains dead entries
+    // (`mark_dead` only flips `alive`), so present-but-not-alive is
+    // TERMINATED and missing is NEW.
+    //
+    // Two readers because only one lookup route is aliasing-proof: a real-JDK
+    // mirror resolves through the process-unique `Thread.tid` index, while a
+    // fabricated mirror has no `tid` field and would fall back to an unguarded
+    // pointer walk, so it reads the on-mirror marker `vm_exec::thread_start`
+    // writes instead. This native is the convergence point of all four
+    // registrations and of the container route, including the `--jdk-only`
+    // case where the real `start()` bytecode runs; a refusal here does not
+    // leak a container registration, because that bytecode's `finally` calls
+    // `container.onExit(this)`. See W7-27-thread-exit-java-cleanup.md §13.
+    let already_started = if crate::has_real_jdk_thread_layout(ctx, this) {
+        ctx.thread_run_state(this) != 0
+    } else {
+        ctx.object_num_fields(this) > 2 && matches!(ctx.get_field(this, 2), Value::Long(_))
+    };
+    if already_started {
+        return Err(RuntimeError::IllegalThreadStateException {
+            message: "Thread.start: this thread has already been started".to_string(),
+        }
+        .into());
+    }
     // Round-7 CRIT fix #3: snapshot the parent's `InheritableThreadLocal`
     // entries and queue them against the child's Java Thread identity
     // hash. The child's first `ThreadLocal.get/set/remove` will drain

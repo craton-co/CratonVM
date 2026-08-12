@@ -258,11 +258,97 @@ public class RJdkStrict {
         System.out.println("CK RJdkStrict generated=array,lambda,proxy,hidden,accessor");
     }
 
+    /**
+     * P0 "Native <clinit> over a real enum": a real JDK enum's constants must be
+     * whatever its OWN declared fields say they are. CratonVM registers a native
+     * <clinit> for java.lang.StackWalker$Option, and a registered native beats
+     * real bytecode, so that native — not javac's initialiser — decides what the
+     * constants are. W7-93.
+     *
+     * Deliberately NOT written as "Option has 4 constants": DROP_METHOD_INFO
+     * arrived in JDK 22 and a hard-coded count is the exact mistake being
+     * asserted against. Every check below is a SELF-CONSISTENCY check between
+     * the class's declared static fields and what values()/valueOf()/
+     * getEnumConstants() report, so it holds on any JDK and on HotSpot.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    static void realEnumsAreSelfConsistent() throws Throwable {
+        for (Class<?> k : new Class<?>[] {
+            java.lang.StackWalker.Option.class,
+            java.time.DayOfWeek.class,
+            java.nio.file.StandardOpenOption.class,
+            java.lang.annotation.RetentionPolicy.class,
+            java.util.concurrent.TimeUnit.class,
+            Thread.State.class,
+        }) {
+            check(k.isEnum(), k.getName() + " must be an enum");
+
+            // The declared constants, in declaration order == ordinal order.
+            List<String> declared = new ArrayList<>();
+            for (java.lang.reflect.Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) && f.getType() == k) {
+                    declared.add(f.getName());
+                }
+            }
+            check(!declared.isEmpty(), k.getName() + " declares no enum constants");
+
+            Object[] values = (Object[]) k.getMethod("values").invoke(null);
+            check(values.length == declared.size(), k.getName() + ".values() has "
+                    + values.length + " entries but the class declares "
+                    + declared.size() + " constants " + declared);
+
+            Object[] shared = k.getEnumConstants();
+            check(shared != null && shared.length == declared.size(),
+                    k.getName() + ".getEnumConstants() disagrees with the declared fields");
+
+            java.lang.reflect.Method valueOf = k.getMethod("valueOf", String.class);
+            for (int i = 0; i < declared.size(); i++) {
+                String n = declared.get(i);
+                java.lang.reflect.Field f = k.getDeclaredField(n);
+                f.setAccessible(true);
+                Object c = f.get(null);
+                check(c != null, k.getName() + "." + n + " reads back null");
+                // A non-null constant that never ran Enum.<init>(String,int) is
+                // the harder half of this defect: every null-check passes while
+                // name() is null and ordinal() is 0 for every constant.
+                check(n.equals(((Enum<?>) c).name()),
+                        k.getName() + "." + n + " has name() = " + ((Enum<?>) c).name());
+                check(((Enum<?>) c).ordinal() == i,
+                        k.getName() + "." + n + " has ordinal() = " + ((Enum<?>) c).ordinal()
+                                + ", expected " + i);
+                check(values[i] == c, k.getName() + ".values()[" + i + "] is not == " + n);
+                check(shared[i] == c, k.getName() + ".getEnumConstants()[" + i
+                        + "] is not == " + n);
+                check(valueOf.invoke(null, n) == c,
+                        k.getName() + ".valueOf(\"" + n + "\") is not == the constant");
+                check(c.toString() != null,
+                        k.getName() + "." + n + ".toString() must not be null");
+            }
+
+            // The shape that took down the real JCA: JceSecurityManager.<clinit>
+            // ends in Set.of(Option.DROP_METHOD_INFO, Option.RETAIN_CLASS_REFERENCE),
+            // and ImmutableCollections$Set12.<init> NPEs on a null element.
+            check(java.util.Set.of(values).size() == declared.size(),
+                    "Set.of(" + k.getName() + ".values()) must hold every constant");
+            java.util.EnumSet<?> es = java.util.EnumSet.allOf(k.asSubclass(Enum.class));
+            check(es.size() == declared.size(),
+                    "EnumSet.allOf(" + k.getName() + ") = " + es.size()
+                            + ", expected " + declared.size());
+        }
+
+        // StackWalker.getInstance(Set) is the call the JCA path actually makes.
+        check(StackWalker.getInstance(java.util.Set.of(
+                StackWalker.Option.RETAIN_CLASS_REFERENCE)) != null,
+                "StackWalker.getInstance(Set) must return a walker");
+        System.out.println("CK RJdkStrict enumSelfConsistent=6");
+    }
+
     public static void main(String[] args) throws Throwable {
         noFabricatedEnterpriseClasses();
         functionIdentityIsNotAStandIn();
         processHandleHasRealBytes();
         concreteBytecodeWins();
+        realEnumsAreSelfConsistent();
         generatedClassesStillAllowed();
         System.out.println("CK RJdkStrict checks=" + checks);
         System.out.println("PASS RJdkStrict (" + checks + " checks)");

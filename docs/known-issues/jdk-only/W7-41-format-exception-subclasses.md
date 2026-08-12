@@ -301,6 +301,35 @@ models every `Date`/`Calendar`/`Long` as a zero-offset wall clock, so `%tz` is
 always `+0000` and `%tZ` is always `UTC`. That is a pre-existing timezone gap
 with its own shape and is not a refusal question.
 
+> **2026-08-12 — that gap now has a measured sibling, and the `%t` arm's THIRD
+> half turned out to be worse than either.** (1) The timezone gap is not
+> confined to `extract_temporal_fields`' own model:
+> `ZoneId.systemDefault()` answers `UTC` on every Windows host, so even a
+> `ZonedDateTime` — which this arm reads correctly, field by field — arrives
+> already three hours wrong on this UTC+3 machine. Producer and measurement in
+> `W7-91-format-date-symbols-hardcoded-english.md` §4. (2) The *name* fields
+> this record's legality checks were placed around (`%tB` `%tb`/`%th` `%tA`
+> `%ta` `%tp` `%tr` `%tc`) rendered from four hard-coded English arrays in
+> every locale; they now go through `java.text.DateFormatSymbols`, which is what
+> `Formatter.print(TemporalAccessor, char, Locale)` does. Same record. Nothing
+> in this record's refusal set moved: the new code is inside the arms
+> `FMT_DATETIME_FIELDS` has already admitted, so which refusal a bad specifier
+> gets is unchanged. One rendering did change beyond the locale —
+> `%tc`'s day is now zero-padded, which is `DAY_OF_MONTH_0`, the composite's
+> own rule.
+
+**Verified against JDK 25's source 2026-08-12** (`jdk25src`, this host), because
+the whole record turns on getting the class right per case: `IllegalFormatException`
+is `sealed ... permits` exactly the twelve named in the table above, in that
+spelling; `UnknownFormatFlagsException.getMessage()` really is the unquoted
+`"Flags = " + flags` where `IllegalFormatFlagsException` and
+`DuplicateFormatFlagsException` both quote; and
+`IllegalFormatArgumentIndexException` really is a package-private `final class`
+with a package-private constructor. The source side is present too —
+`fmt_exception_class_available`, the `FmtFault` enum and both previously
+unraised classes are in `native-builtins/src/lang_string.rs`. What is still
+unverified is only the run.
+
 **The `%t` argument-type check is by class name, not by interface.**
 `extract_temporal_fields` accepts `Long`, `java.util.Date`, `Calendar` and a
 hand-listed set of `java.time` classes. HotSpot accepts any `TemporalAccessor`.

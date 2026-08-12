@@ -18,6 +18,29 @@ is testable on the oracle alone; not doing so is a habit worth losing.
 **Files changed:** `native-io/src/process.rs`,
 `regression-suite/src/RJdkProcess.java`.
 
+> ## Follow-up pass, 2026-08-12 (lane W7-46b) — the two recorded-not-fixed rows
+>
+> Both are now dispositioned; §8 below is the whole of it. In one line each:
+>
+> * **The Linux `isAlive0` double-read is FIXED IN SOURCE**, on an arm this host
+>   still cannot compile — `linux_liveness_and_start_time` is now the single
+>   door, shaped exactly like `win_liveness_and_start_time`, and the parser it
+>   shares with `linux_proc_stat_times` is what keeps the two start times one
+>   number. **NOT BUILT, NOT RUN, and it must go to a Linux host.**
+> * **The four double-registered `java/lang/ProcessBuilder` triples are
+>   ADJUDICATED, not fixed** — the fix is out of lane, and §8.2 carries the
+>   exact deletion. Re-measured rather than restated: the collision costs a
+>   `SyntheticStub` → **`Intrinsic`** kind rewrite on three of the four, which is
+>   worse than this record originally supposed, and `start()` is not one of them.
+> * The **inventory row inherited from W6-10** has no target left and is closed
+>   as such, not carried forward — §8.3. W6-10's claim that the retired W2-7
+>   record's "table stops at row 4" is **wrong**: it stops at row 5, and row 5 is
+>   this very family.
+> * W6-10's finding 4 — five signatures widened across arms nobody compiled —
+>   was audited on **every** arm. All five are consistent; §8.4 has the table.
+> * W6-10's finding 1 has gone **stale in `--jdk-only`** through this record's own
+>   §3 fix, and in the expensive direction. §8.5.
+
 ## What this lane was handed, and what was actually left of it
 
 Three inherited records, re-verified row by row rather than triaged by their own
@@ -115,6 +138,12 @@ partition the target space with no default-off hole. No `TODO`, `FIXME`,
 species is absent from this surface; that is a measurement, not an assumption.
 
 ### One shape recorded, not fixed — out of lane
+
+> **Re-measured 2026-08-12 — §8.2.** Two claims below are too gentle. The
+> untagged block inherits **`Intrinsic`** (a *chosen* kind, so it rewrites the
+> slot's kind, not merely its callback), and it wins **three** of the four, not
+> all four — `start()` is re-won afterwards by `native-io`'s
+> `register_process_natives`. §8.2 carries the exact deletion.
 
 `java/lang/ProcessBuilder.<init>(Ljava/util/List;)V`,
 `<init>([Ljava/lang/String;)V`, `command()Ljava/util/List;` and
@@ -305,11 +334,16 @@ the degradation to `STARTTIME_ANY` when `GetProcessTimes` fails. The
 would have no caller, and leaving a boolean-only door onto the same probe is how
 the pairing grows back.
 
-`foreign_start_time_or_dead` is the seam. Its `not(windows)` arm is the old
-two-step verbatim, because on Linux those two probes read two *different* files
-(`/proc/<pid>` for existence, `/proc/<pid>/stat` for the start time) and merging
-them is a separate change on an arm this host cannot compile. Recorded, not
-attempted.
+`foreign_start_time_or_dead` is the seam. Its `not(windows)` arm was left as the
+old two-step verbatim, because on Linux those two probes read two *different*
+files (`/proc/<pid>` for existence, `/proc/<pid>/stat` for the start time) and
+merging them is a change on an arm this host cannot compile.
+
+**That was taken on 2026-08-12 — §8.1.** The seam now has three arms rather than
+two, the Windows and Linux bodies are textually identical below the probe name,
+and only the platform-of-last-resort arm still takes two steps (correctly: there
+`os_process_start_time` answers `None` outright, so there is no second read to
+straddle a recycle with).
 
 ### The free half of the remaining cost
 
@@ -419,11 +453,14 @@ that this lane could not check:
 * the `descendants()` guard and the `getProcessPids0` hoist — **platform-neutral**,
   outside every `#[cfg]`.
 * the Linux double-read (`/proc/<pid>` then `/proc/<pid>/stat` for one
-  `isAlive0`) is the same shape as §5 and is **recorded, not fixed**. It is
+  `isAlive0`) is the same shape as §5 and was **recorded, not fixed**. It is
   cheaper there — two file reads, not two handle opens — but the pid-recycle
   attribution hole is identical, and HotSpot's `ProcessHandleImpl_unix.c` reads
   ppid and start time from one `/proc/<pid>/stat`. A lane on a Linux host should
-  take it.
+  take it. **Taken in source 2026-08-12 (§8.1) by a lane that is still on
+  Windows, so the "should" is only half discharged: what is left is a
+  `cargo build --target x86_64-unknown-linux-gnu` (or a Linux host) and
+  `cargo test -p cratonvm-native-io process`.**
 
 ## The rule this lane is an instance of
 
@@ -438,3 +475,288 @@ assertion**, so the next instance fails instead of printing.
 Corollary, and it is what made §3 findable at all: a comment that says *"every
 X now does Y"* and then enumerates is a list, not a census. Re-derive it from
 the image before trusting it. The five it named were right; the sixth existed.
+
+---
+
+# 8. The follow-up pass, 2026-08-12 — clearing the two recorded-not-fixed rows
+
+**Still SOURCE-ONLY. No CratonVM binary was built or run, no `javac`, no
+`cargo`.** Everything below is provable by reading, and where it is not, it says
+so at the point it is claimed. The lane host is Windows, and **the substantive
+change is on Linux**, which is the whole difficulty and is stated per item.
+
+## 8.1 The Linux `isAlive0` double-read — FIXED IN SOURCE, UNCOMPILED
+
+`foreign_start_time_or_dead`'s `not(windows)` arm was `foreign_pid_is_alive(pid)`
+— an `exists()` on `/proc/<pid>` — followed by `start_time_or_any(pid)`, which
+reads `/proc/<pid>/stat`. Two probes of two different paths for one question, in
+the native whose return value exists so `ProcessHandleImpl.isAlive()` and
+`destroy0` can detect a **recycled pid**.
+
+The Windows shape was ported rather than re-invented, and the port is smaller
+than the original because there is no handle to own:
+
+| | before | after |
+|---|---|---|
+| `isAlive0(foreign pid)`, Linux | `exists("/proc/<pid>")` + `read("/proc/<pid>/stat")` | **one** `read("/proc/<pid>/stat")` |
+| the pair `(alive, start)` | two reads, two instants | one read, one line |
+
+Three things are worth stating because each was a decision, not a transcription:
+
+1. **The READ and the PARSE are now separate functions.** `linux_proc_stat_times`
+   keeps its name and becomes read-then-`linux_stat_line_times`; the new
+   `linux_liveness_and_start_time` does its own read and calls the same parser.
+   Collapsing them into "the parse failed, therefore dead" would have been
+   shorter and **wrong**: `linux_stat_line_times` also answers `None` when
+   `/proc/stat` carries no `btime` or `_SC_CLK_TCK` is 0 — machine-wide
+   conditions that say nothing about the process — and a live process would then
+   be reported DEAD. The old code degraded those to `STARTTIME_ANY` and so does
+   this one. That is the "`(true, None)` when the file opened but the line will
+   not parse" arm.
+2. **`ENOENT` is the liveness answer, and only `ENOENT`.** `/proc/<pid>/stat` is
+   mode 0444, so a live process cannot be missing it; any *other* error is
+   reported `(true, None)` rather than dead, which is the same asymmetry the
+   Windows arm makes for `ERROR_ACCESS_DENIED`. A zombie still reads as alive,
+   because `/proc/<pid>/stat` survives until the process is reaped — that is what
+   the deleted `exists("/proc/<pid>")` knew, preserved.
+3. **It is the oracle's own shape.** `ProcessHandleImpl_unix.c`'s `isAlive0` is
+   one `os_getParentPidAndTimings` — a single `/proc/<pid>/stat` open — returning
+   `-1` when it fails. So this is HotSpot's structure, not a local invention;
+   the divergence was ours.
+
+`#[cfg(target_os = "linux")] fn foreign_pid_is_alive` is **deleted**, on the same
+argument the Windows one was: it would have no caller, and a boolean-only door
+onto the same probe is how the pairing grows back. A tombstone comment stands
+where it was. The `not(any(target_os = "linux", windows))` arm keeps both the
+function and the two-step, correctly — there `os_process_start_time` has no probe
+at all and answers `None`, so there is no second read to straddle a recycle with.
+
+### What covers it, and the check that could NOT be written
+
+**No `RJdkProcess` assertion was added, and that is a finding rather than an
+omission.** What the merge removes is a pid-recycle attribution window and a race
+between two `/proc` reads. Neither is provokable from a vector: to observe the
+old code answering wrongly you must exit a process between its two reads and have
+the pid recycled onto another, which no test can arrange on demand. Every
+assertion this lane could think of would have passed on the OLD behaviour too,
+and a check that cannot fail is the exact species `W6-5-vacuous-tests.md`
+catalogues. The rule this directory runs on — *"every assertion you add must fail
+on the old behaviour"* — refused it, so it was not written.
+
+What IS assertable is the invariant the merge must not break, and it is asserted
+where its Windows twin already is: `native-io/src/process.rs`'s test module gains
+`one_stat_read_reports_the_same_start_time_as_the_separate_probe`, a
+`#[cfg(target_os = "linux")]` mirror of
+`one_open_reports_the_same_start_time_as_the_separate_probe`. It asserts that
+`linux_liveness_and_start_time`'s start time is **identical** to
+`os_process_start_time`'s, which is not a tautology: the moment the two parse
+field 22 differently, `Info.info(pid, startTime)`'s bare `!=` wipes the record and
+W5-2's two silently-skipped checks come straight back. It is a scheduled test —
+`cargo test -p cratonvm-native-io process` is the command this record already
+names — and, being Linux-only, **it has never run**.
+
+There is a second reason `RJdkProcess` was left alone, and it is a triage reason:
+this directory's own index records that the vector may not be back to its
+expected count and that **a control binary pre-dating the 2026-08-12 merges fails
+it identically**. Moving `EXPECTED_CHECKS` from a Windows host with no build
+would put a fresh arithmetic failure on top of a pre-existing one.
+
+## 8.2 The four `java/lang/ProcessBuilder` triples — ADJUDICATED; the fix is out of lane
+
+Re-measured against the registrars rather than restated, and **this record's
+original framing was too gentle on two counts**.
+
+The four triples — `<init>(Ljava/util/List;)V`, `<init>([Ljava/lang/String;)V`,
+`command()Ljava/util/List;`, `start()Ljava/lang/Process;` — are registered by:
+
+| registrar | file | reached from | kind |
+|---|---|---|---|
+| `register_phase57_process` | `native-builtins/src/phases_late.rs:1340` | `register_essential_natives_with_shims` (`lib.rs:9356`) — **every mode** | `SyntheticStub`, stated |
+| the untagged block in `register_enterprise_natives` | `native-builtins/src/lib.rs:37971-37986` | `register_synthetic_overrides` (`lib.rs:23905`) — synthetic-JDK mode **only** | **ambient `Intrinsic`** |
+| (`start` only) `register_process_natives` | `native-io/src/process.rs`, near the end | `register_io_natives` — **every mode, and LAST** | `SyntheticStub`, stated |
+
+**Correction 1 — the ambient kind is not "no opinion".**
+`register_synthetic_overrides` opens with
+`registry.set_category(NativeKind::Intrinsic)` and `register_enterprise_natives`
+sets no category of its own, so the four inherit **`Intrinsic`**. That matters
+because `NativeMethodRegistry::register_inner`'s kind-merge rule keeps a prior
+*chosen* kind only against a registration that **expressed no opinion**, and
+`set_category` counts as choosing. So this is not a callback-only shadowing: it
+**rewrites the slot's kind from `SyntheticStub` to `Intrinsic`**, and `Intrinsic`
+is precisely the kind `CompatibilityMode::JdkOnly` does *not* drop. The whole
+point of `register_phase57_process`' `SyntheticStub` restatement is undone for
+three of the four, in the one mode where it runs.
+
+**Correction 2 — `start()` is NOT one of the affected triples.** `register_io_natives`
+runs after `register_builtins` on both arms of `vm_init` (`vm_init.rs:1837-1840`
+for the synthetic arm), and it re-registers `ProcessBuilder.start` with an
+explicit `NativeKind::SyntheticStub`. So `start` is re-won and re-tagged after the
+collision, in every mode. Three triples are live, not four.
+
+**What it costs, in synthetic-JDK mode.** Behaviourally, little: `PB_FIELD_COMMAND`
+is `0` (`phases_late.rs:1270`) and `native_pb_init` writes slot 0, so the only
+lost write is the `set_field_by_name(this, "command", …)` that phases_late also
+does — and on a fabricated `ProcessBuilder` there is no named field for it to
+reach. **The damage is the kind rewrite and the duplicate itself**: three triples
+whose whole reason for carrying a stated `SyntheticStub` now carry `Intrinsic` in
+the census, and a latent trap — the day `register_enterprise_natives` becomes
+reachable from a shipping mode, three `Intrinsic` registrations survive
+`--jdk-only` and `native_pb_init` writes **slot 0 of a real
+`java.lang.ProcessBuilder`** with no layout witness of any kind.
+
+**The fix is a deletion, and it is the shape that already landed for
+`SecureRandom` on 2026-08-12** (three shadowing registrations deleted from a
+synthetic-only registrar; see this index's §2.3 note on `L8`). It is out of this
+lane's files.
+
+> ### OUT-OF-FILE PATCH — `native-builtins/src/lib.rs`, in `register_enterprise_natives`
+>
+> Delete the four registrations at `native-builtins/src/lib.rs:37971-37986`,
+> i.e. replace
+>
+> ```rust
+>     // ProcessBuilder + Process (simplified)
+>     let pb = "java/lang/ProcessBuilder";
+>     registry.register(pb, "<init>", "(Ljava/util/List;)V", native_pb_init);
+>     registry.register(pb, "<init>", "([Ljava/lang/String;)V", native_pb_init);
+>     registry.register(pb, "command", "()Ljava/util/List;", native_pb_command);
+> ```
+>
+> and the `registry.register(pb, "start", …)` call that follows it (through its
+> closing `);`) with:
+>
+> ```rust
+>     // ProcessBuilder: NOT registered here any more.
+>     //
+>     // These four triples were also registered by
+>     // `phases_late::register_phase57_process`, which states `SyntheticStub`
+>     // for the whole ProcessBuilder cluster so `--jdk-only` refuses it. This
+>     // block is reached only from `register_synthetic_overrides`, which opens
+>     // with `set_category(Intrinsic)` — a CHOSEN kind — so it ran LAST in
+>     // synthetic-JDK mode and rewrote three of those slots from `SyntheticStub`
+>     // to `Intrinsic`, the one kind `JdkOnly` does not drop. `start()` was the
+>     // fourth and was re-won afterwards by `native-io`'s
+>     // `register_process_natives`, which restates `SyntheticStub`.
+>     //
+>     // The bodies here were also the weaker pair: `native_pb_init` writes only
+>     // slot 0, where phases_late writes the indexed slot AND the real-JDK
+>     // `command` field by name. Deleting the duplicate leaves one owner per
+>     // triple in every mode. See W7-46-process-cluster.md §8.2.
+> ```
+>
+> **Blast radius.** `register_phase57_process` is reached from
+> `register_essential_natives_with_shims`, which `register_essential_natives`
+> calls unconditionally and which `register_builtins` therefore reaches in
+> synthetic mode too — so its reachability is a strict superset of this block's
+> and no mode loses a body. Compatible and `--jdk-only` cannot move by any
+> amount: this registrar does not run in either.
+>
+> **Leftovers, deliberately not prescribed here.** `native_pb_init` and
+> `native_pb_command` (`native-builtins/src/lang_system.rs:3443`, `:3452`) then
+> have zero callers. The workspace sets `dead_code = "allow"`, so nothing breaks;
+> deleting them is a `lang_system.rs` owner's call, not a precondition.
+>
+> **How to prove it took effect.** `--dump-native-registry` on a
+> `--features synthetic-jdk` binary in `--synthetic-jdk` **mode**, before and
+> after: the three `java/lang/ProcessBuilder` rows must move from `Intrinsic`
+> back to `SyntheticStub`, and their `overwrote=` provenance must go empty. A
+> census taken in Compatible mode cannot see this change at all — that is
+> `docs/architecture/natives-over-real-jdk-classes.md` §7's scoping trap, and it
+> is why `bridge-ratchet.sh` will not move either.
+
+## 8.3 The inventory row inherited from W6-10 — CLOSED, no target
+
+W6-10's `## Out-of-file addition (not applied)` asks for a sixth row in the
+inventory table of `W2-7-fabricated-success-where-the-spec-mandates-failure.md`.
+That record left this directory on 2026-08-11 and the index reassigned the row
+here when `W3-6`/`W5-2` were finally moved.
+
+Two things settle it:
+
+* **W6-10's own description of the target is wrong.** It says the retired
+  record's *"table stops at row 4"*. It does not: the retired file's table has a
+  **row 5**, and row 5 is `ProcessHandleImpl.isAlive0` in
+  `native-io/src/process.rs`, marked FIXED — i.e. the same family the missing
+  row would describe, filed from the other end.
+* The row would be a sixth entry in the inventory of a species, in a record that
+  is **retired and internal**, describing a defect that is **fixed** and already
+  recorded twice in live records (W6-10 finding 4 and this one, §2). It documents
+  nothing a reader of this directory can act on.
+
+So it is closed as *no target*, not carried forward. If the species inventory is
+ever re-established as a live record, the row it wants is the one W6-10 already
+drafted — the text is still there — plus the correction that this instance
+entered through the ERROR path of code whose default path wave 3 had already
+fixed.
+
+## 8.4 W6-10 finding 4's five widened signatures — audited on EVERY arm
+
+Finding 4 widened five signatures to `Result<_, ProcessScanError>` across `cfg`
+arms that no lane which edited them has ever compiled. Every arm of every one was
+re-read; **all five are consistent, and every caller matches.**
+
+| function | arms present | signature on each | callers |
+|---|---|---|---|
+| `os_snapshot_processes` | `windows` only | `Result<Vec<(i64,i64)>, ProcessScanError>` | three, all `windows`, all `?` |
+| `os_parent_pid` | `linux` / `windows` / `not(any(…))` | `Result<i64, ProcessScanError>` — identical on all three | `native_proc_handle_parent0` (`match`), `os_list_processes`'s Linux arm (`?`) |
+| `os_list_processes` | `linux` / `windows` / `not(any(…))` | `Result<Vec<(i64,i64)>, ProcessScanError>` — identical | `native_proc_handle_get_process_pids0` (`match`) |
+| `direct_child_pids` | `linux` / `not(any(…))` — **no `windows` arm, correctly** | `Result<Vec<i64>, ProcessScanError>` | only `collect_descendant_pids`'s `not(windows)` arm (`?`) |
+| `collect_descendant_pids` | `windows` / `not(windows)` | `Result<Vec<i64>, ProcessScanError>` | `native_process_descendants` (`match`) |
+
+Method, since a source read of an uncompilable arm is only as good as its
+method: every `fn` in `native-io/src/process.rs` with more than one `cfg` arm was
+extracted and its arms compared textually — eleven such functions, and **no arm
+of any of them differs from its siblings by parameter type, arity or return
+type**. The `cfg` predicates also partition the target space for each: the only
+function with a hole is `direct_child_pids`, whose missing `windows` arm is
+exactly matched by its sole caller being `not(windows)`.
+
+This is not a compile. It rules out the failure modes a source read *can* rule
+out — a `Result` widened on one arm only, an arity that drifted, a caller left
+unwrapping a bare value. It cannot rule out a borrow or an inference error inside
+a body. **The Linux arms still need a Linux build; that is the standing item in
+this index's §2.6, and this pass adds to it rather than discharging it.**
+
+## 8.5 W6-10's performance premise, re-checked — finding 1 is now STALE under `--jdk-only`
+
+Asked because a record that prices a change is worth nothing if the code no
+longer runs. Finding by finding:
+
+| W6-10 finding | premise today |
+|---|---|
+| 1 — `collect_descendant_pids` took `1 + D` machine-wide snapshots | **STALE in `--jdk-only`, and stale because of §3 of this record.** `Process.descendants()` on a real `java.lang.ProcessImpl` receiver now returns `toHandle().descendants()`, which is JDK bytecode reaching `getProcessPids0`. The optimised Windows walk is reached **only** for a `cratonvm/synthetic/Process` receiver — i.e. Compatible mode. |
+| 2 — `info0` opened the same process twice | **LIVE and unaffected.** `ProcessHandle.info()` reaches `native_proc_handle_info0` in both shipping modes. |
+| 3 — one `OpenProcess` per enumerated row is inherent | **LIVE, and MORE reached than when it was written** — see below. |
+| 4 — a failed enumeration read as an empty machine | **LIVE** for `parent0` and `getProcessPids0`; for `native_process_descendants` it now guards only the VM-receiver path, the foreign path having moved into JDK bytecode. |
+
+The part worth stating plainly, because it is a cost this campaign **added** and
+nobody has priced: under `--jdk-only`, `Process.descendants()` on Windows went
+from *one Toolhelp snapshot and zero `OpenProcess` calls* — `collect_descendant_pids`
+reads the topology straight out of the snapshot, and `build_process_handle`
+stamps `startTime` 0 without probing — to the JDK's own route, which is
+`getProcessPids0(0, …)` with `ProcessHandleImpl`'s mandatory 100-element retry:
+**2 snapshots and `100 + N` `OpenProcess` calls**, where `N` is every process on
+the machine. That is a real regression in cost and an unambiguous improvement in
+correctness (the old path answered for the wrong process — §3), so it is not a
+reason to revisit the fix. It is a reason not to quote finding 1's `1 + D → 1` as
+a live saving in strict mode, and a reason finding 3's per-row `OpenProcess` is
+now the dominant cost of the whole surface.
+
+**Still no measurement, and none is claimed.** These are syscall counts read off
+the code, in the units the rest of this record uses.
+
+## 8.6 What this pass did NOT do
+
+* **Nothing was compiled.** No `cargo`, no `javac`, no CratonVM run. The
+  substantive change is on `target_os = "linux"`, which this Windows host cannot
+  compile even in principle.
+* **`RJdkProcess.java` was not touched** — §8.1 gives both reasons, and the
+  second one (a vector already red on a pre-merge control) is the kind that gets
+  worse when two lanes edit a count nobody can measure.
+* **The `ProcessBuilder` deletion was not applied**, because
+  `native-builtins/src/lib.rs` belongs to another lane. §8.2 is the patch.
+* **`register_enterprise_natives`' other registrations were not swept** for the
+  same shape. `StackTraceElement` has seven triples in the same block and they
+  are registered nowhere else in that file, but "nowhere else in that file" is
+  not the census that question needs — it needs a `--dump-native-registry` diff,
+  which needs a build.

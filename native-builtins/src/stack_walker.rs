@@ -11,6 +11,24 @@
 //! clinit in turn depends on MethodHandles.Lookup's clinit, which is
 //! fragile in our VM bootstrap order.
 //!
+//! **That last clause is the premise `native_option_clinit` was written on, and
+//! it is unverified.** It has never been re-tested since, and it is the only
+//! stated reason this module shadows a real `<clinit>` at all. Measured
+//! 2026-08-12 (`docs/known-issues/jdk-only/W7-93-stackwalker-option-constants-null.md`):
+//! under `--jdk-only` the real `StackWalker$Option` class bytes ARE loaded — all
+//! five declared fields including the JDK-22 `DROP_METHOD_INFO`, and the real
+//! `values`/`valueOf`/`$values` bodies — and every OTHER real JDK enum measured
+//! (`DayOfWeek`, `StandardOpenOption`, `TimeUnit`, `RetentionPolicy`,
+//! `Thread$State`) initialises correctly through its own real `<clinit>`. This
+//! defect is StackWalker-only, and it is a consequence of the shadowing, not of
+//! anything wrong with enums. Deleting the `<clinit>` registration so the real
+//! one runs is the end state; it is not done here because the same registrar
+//! also serves `--synthetic-jdk`, where the class is FABRICATED
+//! (`classloading/src/class_manager.rs`, `"java/lang/StackWalker$Option"`) and
+//! has no `<clinit>` bytecode to fall back on. Until the registration is made
+//! conditional on the runtime JDK mode, this native must reproduce what the real
+//! `<clinit>` would have done — see [`native_option_clinit`].
+//!
 //! Keycloak / WildFly / JBoss Modules' auto-registered frameworks probe
 //! `StackWalker.getInstance()` and `StackWalker.getInstance(Set, int)` at
 //! boot; they do not actually consume frames during the boot path — the
@@ -289,24 +307,121 @@ pub(crate) fn native_get_caller_class(
     Ok(Some(Value::Object(None)))
 }
 
+/// The enum constants `class_name` declares, in declaration order.
+///
+/// **Ask the class, never a hard-coded list.** A javac-generated enum declares
+/// one `static` field of its OWN type per constant, in source order — which is
+/// ordinal order — followed by the synthetic `$VALUES`, whose descriptor is the
+/// ARRAY type and so filters itself out here. Reading the shape off the loaded
+/// class is what makes this version-proof: `StackWalker$Option` gained a fourth
+/// constant, `DROP_METHOD_INFO`, in JDK 22, and the three-name list this
+/// function replaced had silently frozen the JDK-21 shape. A VM that publishes
+/// N-1 of a real class's N constants leaves the missing one reading `null`
+/// forever, which is what `JceSecurityManager.<clinit>`'s
+/// `Set.of(Option.DROP_METHOD_INFO, Option.RETAIN_CLASS_REFERENCE)` tripped over
+/// (`ImmutableCollections$Set12.<init>` NPEs on a null `e0`). The next JDK to
+/// add a constant now costs nothing here.
+///
+/// The historical three-name list survives only as the empty-result fallback,
+/// for a receiver whose declared fields cannot be read at all (an unloaded class,
+/// or `MockNativeContext` with no field table installed).
+fn option_constant_names(ctx: &mut dyn NativeContext, class_name: &str) -> Vec<String> {
+    let self_descriptor = format!("L{class_name};");
+    // Bound to a local first: an `if let` scrutinee's temporaries live for the
+    // whole `if let`, which would keep the receiver borrow open across the
+    // `declared_fields` call in the body.
+    let class_id = ctx.class_id_by_name(class_name);
+    if let Some(class_id) = class_id {
+        let declared: Vec<String> = ctx
+            .declared_fields(class_id)
+            .into_iter()
+            .filter(|f| f.is_static && f.descriptor == self_descriptor)
+            .map(|f| f.name)
+            .collect();
+        if !declared.is_empty() {
+            return declared;
+        }
+    }
+    ["RETAIN_CLASS_REFERENCE", "SHOW_HIDDEN_FRAMES", "SHOW_REFLECT_FRAMES"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `java.lang.StackWalker$Option.<clinit>` — publish the enum constants.
+///
+/// This native SHADOWS the real `<clinit>` whenever the real class bytes are
+/// loaded: `register_stack_walker_boot` runs on the real-JDK boot path too (via
+/// `register_essential_natives_with_shims`), and a registered native beats real
+/// bytecode unconditionally on the cold interpreter path — registration is the
+/// gate, not `NativeKind`. See docs/architecture/natives-over-real-jdk-classes.md
+/// §1. So whatever this function does not do, nothing else does either.
+///
+/// It therefore has to reproduce what real `<clinit>` bytecode would have done,
+/// not merely allocate an object per constant. Two obligations the earlier
+/// version dropped, both of which are silent:
+///
+/// 1. **`name` and `ordinal` must be written.** The real `<clinit>` runs
+///    `new Option(<name>, <ordinal>)`, whose ctor chains to
+///    `Enum.<init>(String,int)`. Allocating a bare instance and storing it to the
+///    static leaves a NON-NULL constant whose `name()`, `toString()` and
+///    `getDeclaringClass()`-keyed lookups all answer null and whose `ordinal()`
+///    is 0 for every constant — so `Enum.valueOf`/`Option.valueOf` cannot find
+///    any of them, and `compareTo` says every pair is equal. That is strictly
+///    harder to diagnose than a null, because every null-check passes.
+/// 2. **Every declared constant must be published** — see
+///    [`option_constant_names`].
+///
+/// The two field writes below are exactly the ones `lang_misc::native_enum_init`
+/// performs for `Enum.<init>(String,int)`, resolved against `java/lang/Enum`
+/// (never the receiver's class) for the reason `lang_misc::native_enum_name`
+/// records: `Enum` declares `name` then `ordinal`, inherited fields come first
+/// in the layout, so slots 0/1 hold for any enum subclass whatever fields IT
+/// declares.
 fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let class_name = "java/lang/StackWalker$Option";
-    let mut values = Vec::with_capacity(3);
+    let names = option_constant_names(ctx, class_name);
 
-    for name in [
-        "RETAIN_CLASS_REFERENCE",
-        "SHOW_HIDDEN_FRAMES",
-        "SHOW_REFLECT_FRAMES",
-    ] {
+    // GC-SAFETY: no allocated `ObjectRef` is held across a later allocation.
+    // The name String is created BEFORE its option so that, once the option
+    // exists, the very next call publishes it to its static field — a GC root —
+    // with nothing allocating in between. Pass two then re-READS each constant
+    // back out of its static field rather than caching the refs from pass one,
+    // so `new_ref_array` cannot leave this function storing stale (forwarded)
+    // references into `$VALUES`.
+    let mut option_class = None;
+    for (ordinal, name) in names.iter().enumerate() {
+        let name_str = ctx.create_string(name);
         let option = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
+        let name_slot = ctx.resolve_field_index("java/lang/Enum", "name").unwrap_or(0);
+        let ordinal_slot = ctx
+            .resolve_field_index("java/lang/Enum", "ordinal")
+            .unwrap_or(1);
+        ctx.set_field(option, name_slot, Value::Object(Some(name_str)));
+        ctx.set_field(option, ordinal_slot, Value::Int(ordinal as i32));
         ctx.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
-        values.push(option);
+        if option_class.is_none() {
+            option_class = Some(ctx.class_id_of_object(option));
+        }
     }
 
-    let option_class = ctx.class_id_of_object(values[0]);
-    let values_array = ctx.new_ref_array(option_class, values.len());
-    for (idx, option) in values.into_iter().enumerate() {
-        ctx.set_array_element(values_array, idx, Value::Object(Some(option)));
+    let Some(option_class) = option_class else {
+        return Ok(None);
+    };
+    let values_array = ctx.new_ref_array(option_class, names.len());
+    for (idx, name) in names.iter().enumerate() {
+        // Re-read through the static so `$VALUES[i]` is `==` the constant, which
+        // is what `Enum.valueOf`, `Class.getEnumConstants` and `EnumSet` all
+        // rely on. `set_array_element` does not allocate, so the array cannot
+        // move underneath this loop.
+        // Bound to a local for the same reason as in `option_constant_names`:
+        // a `match` scrutinee's temporaries outlive the arms.
+        let slot = ctx.static_field_index_by_name(option_class, name);
+        let published = match slot {
+            Some(slot) => ctx.get_static_field(option_class, slot),
+            None => Value::Object(None),
+        };
+        ctx.set_array_element(values_array, idx, published);
     }
     ctx.set_static_field_by_name(class_name, "$VALUES", Value::Object(Some(values_array)));
     ctx.set_static_field_by_name(class_name, "ENUM$VALUES", Value::Object(Some(values_array)));
@@ -680,6 +795,35 @@ mod tests {
             let slot = ctx.static_field_index_by_name(option_class, name).unwrap();
             let static_value = ctx.get_static_field(option_class, slot);
             assert_eq!(ctx.get_array_element(values_array, idx), static_value);
+
+            // A constant is not published until it carries the `name` and
+            // `ordinal` a real `<clinit>` would have passed to
+            // `Enum.<init>(String,int)`. Storing a bare allocation to the
+            // static satisfied every null-check while leaving `name()` null
+            // and `ordinal()` 0 for every constant — the shape this test
+            // used to accept. See `native_option_clinit`.
+            let option = match static_value {
+                Value::Object(Some(o)) => o,
+                other => panic!("constant {name} must be non-null, got {other:?}"),
+            };
+            let name_slot = ctx.resolve_field_index("java/lang/Enum", "name").unwrap_or(0);
+            let ordinal_slot = ctx
+                .resolve_field_index("java/lang/Enum", "ordinal")
+                .unwrap_or(1);
+            let name_value = ctx.get_field(option, name_slot);
+            match name_value {
+                Value::Object(Some(s)) => assert_eq!(
+                    ctx.read_string(s).as_deref(),
+                    Some(name),
+                    "constant {name} carries the wrong name"
+                ),
+                other => panic!("constant {name} has no name String: {other:?}"),
+            }
+            assert_eq!(
+                ctx.get_field(option, ordinal_slot),
+                Value::Int(idx as i32),
+                "constant {name} must carry its declaration-order ordinal"
+            );
         }
     }
 

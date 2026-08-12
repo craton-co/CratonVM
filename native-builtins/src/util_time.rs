@@ -5136,6 +5136,20 @@ fn os_default_zone_id() -> String {
     }
     #[cfg(windows)]
     {
+        // JDK-ONLY-NOTE (W7-91): this arm answers `UTC` on every Windows host,
+        // and REPAIRING IT ALONE IS INERT. It is only
+        // `jvm_default_zone_id`'s fallback for a failed real-`TimeZone`
+        // round-trip, and that round-trip succeeds: it reaches
+        // `TimeZone.setDefaultZone()`, which — `user.timezone` being empty,
+        // `vm_init` seeding it from `$TZ` alone — calls
+        // `TimeZone.getSystemTimeZoneID`, i.e.
+        // `native_timezone_get_system_id` in `native-builtins/src/lib.rs`,
+        // which hard-codes `"UTC"` and is the producer a fix has to start
+        // from. Measured consequence: `ZoneId.systemDefault()` is UTC here, so
+        // `SimpleFormatter` dates run three hours behind HotSpot's on this
+        // UTC+3 host — two of the four characters `RJdkLogging`'s cross-VM
+        // diff reports. See W7-91-format-date-symbols-hardcoded-english.md §4.
+        //
         // On Windows the timezone display key is under
         // HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation.
         // Reading the registry would pull in a dependency (winreg);

@@ -3635,7 +3635,28 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
 /// hands back an untyped default slot for the `long` getters.
 fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let pid = std::process::id();
-    let name = ctx.create_string(&format!("cratonvm@{}", pid));
+    // `RuntimeMXBean.getName()` is specified only as "a name representing the
+    // running VM", but every JDK implements it as `pid + "@" + hostname`
+    // (`VMManagementImpl.getVmId()`), and — the part that matters here — the
+    // platform MBeanServer's `java.lang:type=Runtime` `Name` attribute is
+    // answered by that REAL JDK code even when `getRuntimeMXBean()` hands back
+    // this synthetic. `"cratonvm@<pid>"` therefore made one VM report two
+    // different names for itself depending on which accessor you asked
+    // (`RJdkJmx.platformBeans` pins them equal), and it was not even the
+    // shape any JDK uses. Build `pid@host` instead.
+    //
+    // Host name source, stated exactly because it is NOT the same function the
+    // JDK's `InetAddress.getLocalHost()` ends up in: that goes to
+    // `Inet{4,6}AddressImpl.getLocalHostName`, i.e. `inet_address.rs`'s
+    // `local_host_name()` (a raw `gethostname`), which is private to that
+    // module. `resolve_real_hostname()` is this crate's other, cached resolver
+    // (`HOSTNAME` env, then `COMPUTERNAME`, then the `hostname` binary,
+    // FQDN-trimmed to the short form for the same reason). The two answer the
+    // same short host name on every supported platform in the normal case, and
+    // were MEASURED equal on the Windows gate host; if a host is ever found
+    // where they differ, the fix is to make `local_host_name()` `pub(crate)`
+    // and call it here, not to widen the assertion.
+    let name = ctx.create_string(&format!("{}@{}", pid, crate::resolve_real_hostname()));
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     let vm_name = ctx.create_string("CratonVM");
     ctx.set_field(obj, 1, Value::Object(Some(vm_name)));
@@ -5398,15 +5419,30 @@ fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallF
 /// Populate the 5 synthetic `OperatingSystemMXBean` slots — shared by the
 /// factory path and the `<init>` native.
 fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
-    // REAL: OS name / arch / version come from the live process. name+arch
-    // use std::env consts; version prefers the `os.version` system property
-    // (populated by the VM at startup, same source RuntimeMXBean.getClassPath
-    // reads), falling back to "unknown" only if the property is absent —
-    // i.e. we report the real version when the VM knows it rather than always
-    // faking "unknown".
-    let name = ctx.create_string(std::env::consts::OS);
+    // REAL: OS name / arch / version come from the live process, and all three
+    // come from the SAME place the corresponding system property does — the
+    // `os.name` / `os.arch` / `os.version` properties the VM seeds at startup
+    // (vm_init's `canonical_os_name` / `canonical_os_arch` /
+    // `canonical_os_version`, which reproduce HotSpot's spellings).
+    //
+    // `getName`/`getArch`/`getVersion` are SPECIFIED as those properties, so
+    // reading anything else is a divergence by construction. `std::env::consts`
+    // is exactly such an "anything else": it answers `"windows"` where HotSpot
+    // says `"Windows 11"`, and `"x86_64"` where HotSpot says `"amd64"` — the
+    // bean and `System.getProperty("os.name")` then disagree inside one VM.
+    // The consts survive only as the fallback for a VM whose property table is
+    // somehow unseeded, where a lowercase-but-true answer beats "unknown".
+    let os_name = ctx
+        .get_system_property("os.name")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from(std::env::consts::OS));
+    let name = ctx.create_string(&os_name);
     ctx.set_field(obj, 0, Value::Object(Some(name)));
-    let arch = ctx.create_string(std::env::consts::ARCH);
+    let os_arch = ctx
+        .get_system_property("os.arch")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from(std::env::consts::ARCH));
+    let arch = ctx.create_string(&os_arch);
     ctx.set_field(obj, 1, Value::Object(Some(arch)));
     let os_version = ctx
         .get_system_property("os.version")
@@ -6741,8 +6777,14 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             //
             // Sources used:
             //   AvailableProcessors -> available_parallelism (real)
-            //   Name / Arch         -> std::env consts (real)
-            //   Version             -> os.version system property (real)
+            //   Name / Arch / Version
+            //                       -> the os.name / os.arch / os.version
+            //                          system properties (real), the same
+            //                          source `init_os_mxbean_fields` reads.
+            //                          These attributes ARE those properties;
+            //                          answering from `std::env::consts`
+            //                          instead made this server row disagree
+            //                          with the direct bean read in one VM.
             //   *PhysicalMemory* / *Swap* / *FileDescriptor* /
             //   CommittedVirtualMemorySize / ProcessCpuTime
             //                       -> -1  (no in-VM source; spec sentinel)
@@ -6756,8 +6798,16 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                     // Container-aware (cgroup CPU quota under container support).
                     Some(ctx.available_processor_count().to_string())
                 }
-                "Name" => Some(std::env::consts::OS.to_string()),
-                "Arch" => Some(std::env::consts::ARCH.to_string()),
+                "Name" => Some(
+                    ctx.get_system_property("os.name")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| std::env::consts::OS.to_string()),
+                ),
+                "Arch" => Some(
+                    ctx.get_system_property("os.arch")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| std::env::consts::ARCH.to_string()),
+                ),
                 "Version" => Some(
                     ctx.get_system_property("os.version")
                         .filter(|s| !s.is_empty())

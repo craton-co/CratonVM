@@ -1,5 +1,44 @@
 # W7-59 — the layout-alias detector, moved onto the allocation every native reaches
 
+> **ADJUDICATED 2026-08-12 — RETIRE-RETIRED. There is no defect left in this
+> record; what is left is a RUN.** The nomination was tested against the tree,
+> not against the record's own status line, and it holds on every count:
+>
+> * **The instrument is built, shared and gated.** `native-api/src/layout_alias.rs`
+>   is the single implementation; the observation is on
+>   `NativeContextImpl::alloc_object` (`vm/src/vm/vm_exec.rs:11804`/`:11820`,
+>   with the funnel's second point at `:12027`/`:12058`). The five gates in
+>   `native-api/tests/layout_alias_coverage.rs` are all still there and have
+>   grown to **twelve** plus `census` — later lanes added the `undeclared`
+>   direction, the allocation-door ordering, the unresolved-class sentinel, the
+>   fabrication funnel and the appended-slot regression gate on top of §7's
+>   five.
+> * **The read-side successor exists.** §6 specified it and declined to build
+>   it; W7-69-read-side-alias-instrument.md built it
+>   (`native-api/src/read_alias.rs`), W7-77-guarded-slot-maps.md dispositioned
+>   its first four rows, and W7-90-slot-map-sweep-caller.md wired the sweep's
+>   trigger. §6 is discharged as a specification.
+> * **Every defect §8 enumerated has an owner or was deleted.** The seven OVER
+>   rows (`AsynchronousSocketChannel`, `AsynchronousServerSocketChannel`,
+>   `TreeSet`, `CompletableFuture`, `SocketChannel`/`ServerSocketChannel`,
+>   `FileLock`, `InetSocketAddress`) are W7-66-live-over-allocations.md's, which
+>   states 16 repaired and 6 left with a measured reason; the UNDER risk
+>   register is W7-68-live-under-allocations.md's; `SSLEngine` is
+>   W7-61-sslengine-layout-and-tls-blocking.md's, and README §2.3 already
+>   records W7-49's row corrected to synthetic-only; the read-side species is
+>   W7-69's; and §6's slot-5 `keys` clobber is repaired by
+>   W7-72-ssc-socket-and-filechannel.md §1. **Item 8's dead code is GONE**:
+>   `register_selector` has zero occurrences anywhere in the workspace, so its
+>   `SelectionKey` 4-vs-1 and `HashSet` 2-vs-1 sites cannot appear in any future
+>   run of the flag. No enumerated row is ownerless.
+>
+> **What the run is, and why no suite delivers it.** §9's first residual —
+> "runtime confirmation of anything" — is untouched and is the whole remainder.
+> `CRATONVM_DBG_LAYOUT_ALIAS` appears **nowhere** under `regression-suite/` or
+> `ci/`, so no scheduled run has ever produced a single row of this census. The
+> command is in the run list of this record's adjudication; §5's tables stay a
+> source-level upper bound until it is run.
+
 Status: the detector's blind spot is closed and the closure is gated. The
 counting, the flag, the dedup key and the output channel moved out of
 `native-builtins` into `cratonvm_native_api::layout_alias`; the observation now

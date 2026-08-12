@@ -37,4 +37,25 @@ module cratonvm.jdkonly.svc {
     // the wrapper is built -- see Nulled.
     provides com.cratonvm.jdkonly.svc.Nulled
             with com.cratonvm.jdkonly.svc.internal.NullProvider;
+
+    // The CONSTRUCTOR-form negatives -- the half of ServiceLoader.loadProvider
+    // that applies once findStaticProviderMethod has answered null. Both
+    // providers are compiled TWICE for the same reason WrongFactory is: javac
+    // enforces BOTH rules on a `provides` clause, so neither illegal shape can
+    // be written here directly. modules-overlay/ carries what actually runs.
+    //
+    //   Unsub  <- NotSubProvider  implements nothing        => "not a subtype"
+    //   Ctored <- HiddenCtor      private no-arg ctor       => "Unable to get
+    //                                                          public no-arg
+    //                                                          constructor"
+    //
+    // That javac enforcement is also the blast-radius argument for arming the
+    // two gates: every `provides` clause in the JDK's own boot modules is javac
+    // output, so no boot-module provider can be in the set either gate refuses.
+    // Do not "fix" either provider.
+    provides com.cratonvm.jdkonly.svc.Unsub
+            with com.cratonvm.jdkonly.svc.internal.NotSubProvider;
+
+    provides com.cratonvm.jdkonly.svc.Ctored
+            with com.cratonvm.jdkonly.svc.internal.HiddenCtor;
 }

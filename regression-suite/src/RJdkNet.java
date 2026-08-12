@@ -254,6 +254,152 @@ public class RJdkNet {
         }
     }
 
+    /**
+     * The WRITE and ACCEPT twins of the async-close family (W7-53), on the
+     * surfaces a default run actually takes.
+     *
+     * WHY THIS BLOCK EXISTS. `soTimeoutAndAsyncClose` above covers exactly one
+     * of the family's thirteen Java-reachable shapes -- a blocked READ. The
+     * write twin was fixed on 2026-08-12 (`native-io/src/net.rs`,
+     * `net_write_close_aware`) and the accept twin on 2026-05-17
+     * (`net_accept_close_aware`), and NEITHER had a scheduled assertion: the
+     * family's own instrument, `probes/AsyncCloseProbe.java`, is not in
+     * `src/` and `run.sh` reads a word list, so it has never run in any suite.
+     *
+     * WHICH NATIVE THIS REACHES. `real_net_sockets` is default-ON, so
+     * `java.net.Socket`/`ServerSocket` run real JDK bytecode down to
+     * `sun/nio/ch/SocketDispatcher.write0` and `sun/nio/ch/Net.accept`, both
+     * registered `NativeKind::Bridge` by `native-io`'s
+     * `net::register_sun_nio_ch_net` -- reached from
+     * `nio_native::register_t16_channel_overrides` and thence from
+     * `register_io_natives`, which `vm_init` calls on all three boot arms. So
+     * this is the SHIPPING registrar, and `Bridge` is not a kind `--jdk-only`
+     * drops: Compatible and strict run the same bodies.
+     *
+     * WHY `SocketException` IS THE RIGHT ASSERTION ON BOTH VMS.
+     * `NioSocketImpl.implWrite` (JDK 25, src.zip) catches every `IOException`
+     * from the dispatcher and rethrows `asSocketException(ioe)` -- "throw
+     * SocketException to maintain compatibility" -- and `endWrite`/`endAccept`
+     * throw `SocketException("Socket closed")` in their `finally` whenever the
+     * call did not complete and the impl is `>= ST_CLOSING`. So the concrete
+     * type does not depend on which error the native chose; what the native
+     * must do is RETURN. Before the fixes it did not: `close_net_fd` marks the
+     * registry slot and issues `shutdown(Both)`, but cannot take the OS handle
+     * away from a thread holding an `Arc` clone of the `TcpStream`, and Winsock
+     * has no `shutdown` that aborts a pending blocking call.
+     *
+     * IT CANNOT HANG, AND IT CANNOT BE VACUOUS. Every wait is bounded by `T`,
+     * so a native that stays parked yields a FAIL rather than a suite timeout;
+     * both workers are daemons; the write row closes the ACCEPTED end in a
+     * `finally` BEFORE it asserts, so even a completely unfixed VM has its
+     * writer released by the peer's reset instead of left in the kernel. The
+     * `...WasBlocked` checks are the anti-vacuity guards: a row whose worker had
+     * already returned before the close was issued tested nothing, and says so
+     * instead of passing.
+     */
+    static void asyncCloseWriteAndAccept() throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+
+        // A peer that never reads: 64 MiB cannot fit in any socket buffer pair,
+        // so the writer is certain to be parked in `send` when the close lands.
+        // Sliced into 256 KiB writes so the vector never allocates 64 MiB.
+        final int chunk = 256 * 1024;
+        final int chunks = 256;
+
+        String writeOutcome = "none";
+        boolean writeWasBlocked = false;
+        boolean writeWoke = false;
+        try (ServerSocket server = new ServerSocket(0, 4, lo)) {
+            final Socket client = new Socket(lo, server.getLocalPort());
+            Socket accepted = server.accept();
+            CountDownLatch writing = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(1);
+            AtomicReference<String> outcome = new AtomicReference<>("none");
+            try {
+                Thread writer = new Thread(() -> {
+                    byte[] payload = new byte[chunk];
+                    try {
+                        java.io.OutputStream out = client.getOutputStream();
+                        writing.countDown();
+                        for (int i = 0; i < chunks; i++) {
+                            out.write(payload);
+                        }
+                        outcome.set("completed");
+                    } catch (SocketException e) {
+                        outcome.set("SocketException");
+                    } catch (IOException e) {
+                        outcome.set(e.getClass().getSimpleName());
+                    }
+                    done.countDown();
+                });
+                writer.setDaemon(true);
+                writer.start();
+                check(writing.await(T, TimeUnit.SECONDS), "the writer never started");
+                Thread.sleep(300);
+                writeWasBlocked = done.getCount() == 1;
+                client.close();
+                writeWoke = done.await(T, TimeUnit.SECONDS);
+            } finally {
+                // Releases the writer even on a VM where the close is invisible
+                // to it, so a FAIL here never leaves a thread in the kernel.
+                accepted.close();
+                try {
+                    client.close();
+                } catch (IOException ignored) {
+                    // close() is idempotent; a second one is not a failure.
+                }
+            }
+            writeOutcome = outcome.get();
+        }
+        check(writeWasBlocked,
+                "64 MiB into an undrained loopback socket must still be in flight when the "
+                        + "close is issued, else the write row proves nothing: " + writeOutcome);
+        check(writeWoke, "the blocked writer never woke up: " + writeOutcome);
+        check(writeOutcome.equals("SocketException"),
+                "close-during-write outcome: " + writeOutcome);
+        System.out.println("CK RJdkNet asyncCloseWrite=" + writeOutcome);
+
+        String acceptOutcome = "none";
+        boolean acceptWasBlocked = false;
+        boolean acceptWoke = false;
+        final ServerSocket listener = new ServerSocket(0, 1, lo);
+        try {
+            CountDownLatch accepting = new CountDownLatch(1);
+            CountDownLatch acceptDone = new CountDownLatch(1);
+            AtomicReference<String> outcome = new AtomicReference<>("none");
+            Thread acceptor = new Thread(() -> {
+                accepting.countDown();
+                try {
+                    Socket s = listener.accept();
+                    s.close();
+                    outcome.set("accepted");
+                } catch (SocketException e) {
+                    outcome.set("SocketException");
+                } catch (IOException e) {
+                    outcome.set(e.getClass().getSimpleName());
+                }
+                acceptDone.countDown();
+            });
+            acceptor.setDaemon(true);
+            acceptor.start();
+            check(accepting.await(T, TimeUnit.SECONDS), "the acceptor never started");
+            Thread.sleep(300);
+            acceptWasBlocked = acceptDone.getCount() == 1;
+            listener.close();
+            acceptWoke = acceptDone.await(T, TimeUnit.SECONDS);
+            acceptOutcome = outcome.get();
+        } finally {
+            listener.close();
+        }
+        check(acceptWasBlocked,
+                "nothing ever connects to this listener, so the accept must still be blocked "
+                        + "when the close is issued: " + acceptOutcome);
+        check(acceptWoke, "the blocked accept never woke up: " + acceptOutcome);
+        check(acceptOutcome.equals("SocketException"),
+                "close-during-accept outcome: " + acceptOutcome);
+        System.out.println("CK RJdkNet asyncCloseAccept=" + acceptOutcome);
+    }
+
     static void loopbackUdp() throws Exception {
         InetAddress lo = InetAddress.getLoopbackAddress();
         try (DatagramSocket server = new DatagramSocket(0, lo);
@@ -303,11 +449,160 @@ public class RJdkNet {
         }
     }
 
+    /** "iae" when the body raised IllegalArgumentException, "se" for SocketException, else a token. */
+    static String reject(ThrowingBody body) {
+        try {
+            body.run();
+            return "accepted";
+        } catch (IllegalArgumentException expected) {
+            return "iae";
+        } catch (SocketException expected) {
+            return "se";
+        } catch (Exception other) {
+            return "wrong-type:" + other.getClass().getName();
+        }
+    }
+
+    interface ThrowingBody {
+        void run() throws Exception;
+    }
+
+    /**
+     * A NEGATIVE SO_TIMEOUT is refused on every socket surface, and a zero one
+     * is not.
+     *
+     * WHY THIS BLOCK EXISTS. `setSoTimeout(-1)` is how a miscomputed deadline
+     * (`remaining = end - now`, gone negative) arrives at a socket. JDK 25
+     * refuses it on all four surfaces, with the check placed AFTER the
+     * closed-socket check:
+     *
+     *   java.net.Socket:1276           IllegalArgumentException("timeout can't be negative")
+     *   java.net.ServerSocket:709      IllegalArgumentException("timeout < 0")
+     *   sun.nio.ch.DatagramSocketAdaptor:234  IllegalArgumentException("timeout < 0")
+     *                                  (this is what both java.net.DatagramSocket.setSoTimeout
+     *                                   and DatagramChannel.socket() delegate to)
+     *
+     * CratonVM's `DatagramChannel` bridge (`native-io/src/lib.rs`,
+     * `register_datagram_channel`, registered in every arm) instead did
+     * `.max(0)` and then read `0` as "no timeout" — so a caller asking for a
+     * bounded receive got an UNBOUNDED one, which is the single value that
+     * cannot be told apart from a healthy configuration. That is the row this
+     * asserts; the three JDK-served surfaces beside it are the controls that say
+     * the rule is the JDK's and not this vector's invention.
+     *
+     * THE POSITIVE HALF IS NOT OPTIONAL. Without the `accepted` rows a VM that
+     * threw on EVERY timeout would satisfy all four refusals — and `0` is the
+     * value that must keep working, because `0` means "block forever" and every
+     * default-constructed socket has it.
+     */
+    static void negativeSoTimeout() throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+
+        try (java.nio.channels.DatagramChannel ch = java.nio.channels.DatagramChannel.open()) {
+            // `DatagramChannel.socket()` is specified to return a
+            // java.net.DatagramSocket. Published rather than assumed: CratonVM
+            // has a native on this triple that used to answer the CHANNEL
+            // itself, and if that ever wins here the failure arrives as a
+            // ClassCastException on this line rather than on the timeout row
+            // below, which would otherwise read as a timeout defect.
+            DatagramSocket obtained = null;
+            String outcome;
+            try {
+                obtained = ch.socket();
+                outcome = "ok";
+            } catch (Throwable t) {
+                // A native answering the channel itself fails the assignment's
+                // type, so catch Throwable: a ClassCastException here would
+                // otherwise kill the vector with no PASS line and no clue.
+                outcome = "threw:" + t.getClass().getName();
+            }
+            // THE CLASS NAME IS DELIBERATELY NOT PUBLISHED. This row used to
+            // print `obtained.getClass().getName()`, which reads
+            // `sun.nio.ch.DatagramSocketAdaptor` on HotSpot — a java.base
+            // INTERNAL class that `DatagramChannel.socket()`'s contract never
+            // names. A correct implementation is free to call its adaptor
+            // something else, so the raw name diffed a VM's private spelling
+            // rather than its behaviour. Publish instead the two facts the JDK
+            // does specify, which are the same two the defect violates.
+            //
+            // AND THE CHECK BESIDE IT WAS VACUOUS. It asserted `obtained !=
+            // null`, which cannot see this defect at all: javac emits NO
+            // checkcast at a call whose DECLARED return type already satisfies
+            // the assignment, so a native answering the channel lands in a
+            // `DatagramSocket`-typed local intact and non-null. Only a real
+            // `instanceof` catches it, and only through an Object-typed local —
+            // `obtained instanceof DatagramSocket` on a DatagramSocket-typed
+            // local is the same vacuous test in a different spelling.
+            Object answer = obtained;
+            boolean isDatagramSocket = answer instanceof DatagramSocket;
+            boolean isTheChannel = (answer == ch);
+            System.out.println("CK RJdkNet dcSocketAdaptor=" + outcome
+                    + ",isDatagramSocket=" + isDatagramSocket
+                    + ",isChannel=" + isTheChannel);
+            check(isDatagramSocket,
+                    "DatagramChannel.socket() must return a java.net.DatagramSocket, got "
+                            + (answer == null ? outcome : answer.getClass().getName()));
+            check(!isTheChannel,
+                    "DatagramChannel.socket() must not answer the CHANNEL itself: a"
+                            + " java.nio.channels.DatagramChannel is not a java.net.DatagramSocket");
+            final DatagramSocket adaptor = obtained;
+            String neg = reject(() -> adaptor.setSoTimeout(-1));
+            check(neg.equals("iae"), "DatagramChannel.socket().setSoTimeout(-1): " + neg);
+            // The value a caller actually gets wrong most often after -1.
+            String negBig = reject(() -> adaptor.setSoTimeout(Integer.MIN_VALUE));
+            check(negBig.equals("iae"),
+                    "DatagramChannel.socket().setSoTimeout(MIN_VALUE): " + negBig);
+            // ... and the two that must still be accepted.
+            check(reject(() -> adaptor.setSoTimeout(0)).equals("accepted"),
+                    "setSoTimeout(0) means no timeout and must be accepted");
+            check(reject(() -> adaptor.setSoTimeout(1234)).equals("accepted"),
+                    "a positive timeout must be accepted");
+            System.out.println("CK RJdkNet dcSoTimeoutNegative=" + neg + "," + negBig);
+        }
+
+        try (DatagramSocket ds = new DatagramSocket(0, lo)) {
+            check(reject(() -> ds.setSoTimeout(-1)).equals("iae"), "DatagramSocket.setSoTimeout(-1)");
+            check(reject(() -> ds.setSoTimeout(0)).equals("accepted"), "DatagramSocket zero timeout");
+            check(ds.getSoTimeout() == 0, "a refused setSoTimeout must not have taken effect");
+        }
+
+        try (Socket s = new Socket()) {
+            check(reject(() -> s.setSoTimeout(-1)).equals("iae"), "Socket.setSoTimeout(-1)");
+            s.setSoTimeout(77);
+            check(reject(() -> s.setSoTimeout(-1)).equals("iae"), "Socket.setSoTimeout(-1) again");
+            check(s.getSoTimeout() == 77, "a refused setSoTimeout must leave the old value");
+        }
+
+        try (ServerSocket ss = new ServerSocket(0, 1, lo)) {
+            check(reject(() -> ss.setSoTimeout(-1)).equals("iae"), "ServerSocket.setSoTimeout(-1)");
+        }
+
+        // ORDER OF CHECKS. The closed-socket refusal comes FIRST upstream, so a
+        // closed socket with a negative timeout is a SocketException, not an
+        // IllegalArgumentException. Asserted only on the two surfaces that run
+        // real JDK bytecode here: CratonVM's DatagramChannel bridge has no
+        // closed check at all, which is stated in that native's comment rather
+        // than asserted as though it were fixed.
+        Socket closed = new Socket();
+        closed.close();
+        String closedOrder = reject(() -> closed.setSoTimeout(-1));
+        check(closedOrder.equals("se"), "closed beats negative on Socket: " + closedOrder);
+        ServerSocket closedServer = new ServerSocket(0, 1, lo);
+        closedServer.close();
+        String closedServerOrder = reject(() -> closedServer.setSoTimeout(-1));
+        check(closedServerOrder.equals("se"),
+                "closed beats negative on ServerSocket: " + closedServerOrder);
+        System.out.println("CK RJdkNet soTimeoutClosedFirst=" + closedOrder + ","
+                + closedServerOrder);
+    }
+
     public static void main(String[] args) throws Exception {
         dns();
         loopbackTcp();
         soTimeoutAndAsyncClose();
+        asyncCloseWriteAndAccept();
         loopbackUdp();
+        negativeSoTimeout();
         System.out.println("CK RJdkNet checks=" + checks);
         System.out.println("PASS RJdkNet (" + checks + " checks)");
     }

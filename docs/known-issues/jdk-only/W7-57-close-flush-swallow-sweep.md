@@ -368,6 +368,61 @@ throw.
 * Rows 44–47 (comments only), row 12 (an unregistered function), and rows
   48–51 (untouched).
 
+## Residual audit, 2026-08-12 — by a lane that owns none of the close/flush files
+
+Re-grepped on this tree (`dev@44044c7e2` plus in-flight lane edits) by the
+`--jdk-only` lane holding `classloading/**`,
+`native-builtins/src/{classloader_real,classloader_value_sidetable,lookup_define}.rs`.
+Nothing built, nothing run. Three results, all verifiable by re-running the
+greps quoted:
+
+**1. This record has ZERO residuals inside those ten files.** The scan was
+`grep -nE '"(close|flush)"'` over all ten plus a read of every
+`ctx.invoke*` in them. The only hits are in `classloading/src/class_manager.rs`
+and every one is a `mk("close", "()V")` entry in a **fabricated method table**
+(`synthetic_stub_methods`), not a delegation — there is no `ctx` and no call.
+`classloader_value_sidetable.rs`'s single `invoke_virtual` propagates with
+`?`. So the close/flush family really is confined to `native-builtins/src`,
+`native-io`, `native-collections`, `native-awt`, `native-api` and `vm`, as the
+census says.
+
+**2. Rows 48–51 are STILL OPEN, and the condition this record set for that has
+been met.** The record says the four `java.util.Formatter` sites "remain open"
+if `W7-52-formatter-close-and-locale.md` does not merge. It has not:
+
+```
+native-builtins/src/lib.rs:21440   let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
+native-builtins/src/lib.rs:21455   let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
+native-builtins/src/lib.rs:41498   let _ = ctx.invoke_virtual(target, "close", "()V", &[]);
+native-builtins/src/lib.rs:41506   let _ = ctx.invoke_virtual(target, "flush", "()V", &[]);
+```
+
+No `Closeable`/`Flushable` `instanceof` guard is present at any of the four;
+registrar 1 still uses `ctx.read_string(target).is_none()` as its
+StringBuilder discriminator, which is a *value-shape* test of exactly the kind
+`docs/architecture/natives-over-real-jdk-classes.md` §4 warns about. These are
+in `native-builtins/src/lib.rs`, which another lane holds, so they are an
+out-of-file item and not touched here.
+
+**3. The five false positives this record identified are confirmed still
+`?`-terminated**, so its arithmetic (51 − 4 + 5 = 52) still reconciles:
+`lib.rs:312`, `:326`, `:9725`, `:9966`, `:9985` all read
+`let _ = ctx.invoke_virtual*(…)?;`. Rows 44–47's documented kept-whole
+swallows are also all present (`classloader.rs:6938`, `lib.rs:26662`,
+`logmanager.rs:4403`, `net_phase_e.rs:16245`).
+
+**One cross-record note.** `native-api/src/delegated_close.rs`'s
+`absorb_thrown` turned out to be the right shape for a *different* species one
+crate over: `W7-26`'s loader ladders needed "absorb the class-absent
+throwables, propagate the rest", which is the same decision with two absorbed
+roots instead of one. That helper is now duplicated as `absorb_class_absent`
+in `native-builtins/src/classloader_real.rs` rather than added to
+`delegated_close.rs`, because `native-api` was another lane's file that wave.
+If the two are ever merged, the two roots and `absorb_class_absent`'s
+`InternalError` residual have to move with it — `delegated_close` propagates
+`InternalError` and `absorb_class_absent` deliberately does not, for a reason
+stated at its definition.
+
 ## What is left
 
 * **Rows 48–51 — the four `java.util.Formatter` sites**, if

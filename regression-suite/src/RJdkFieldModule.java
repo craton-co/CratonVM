@@ -183,9 +183,15 @@ public class RJdkFieldModule {
         Field out = System.class.getField("out");
         check(Modifier.isPublic(out.getModifiers()), "System.out must be public");
         check(Modifier.isStatic(out.getModifiers()), "System.out must be static");
-        check(out.get(null) != null, "System.out must read through Field.get(null)");
-        // A static field ignores the receiver rather than rejecting it.
-        check(out.get(new Object()) != null, "a static Field.get must ignore its receiver");
+        // IDENTITY, not `!= null`. This VM's get-field-by-name path has a
+        // recorded habit of answering a plausible default for a field it did
+        // not resolve, and any non-null PrintStream satisfied the old check --
+        // including one that is not the stream every other caller writes to.
+        check(out.get(null) == System.out, "System.out must read through Field.get(null)");
+        // A static field ignores the receiver rather than rejecting it, and
+        // must answer the SAME object it answered for a null receiver.
+        check(out.get(new Object()) == System.out,
+                "a static Field.get must ignore its receiver");
 
         Field max = Integer.class.getField("MAX_VALUE");
         check(((Integer) max.get(null)) == Integer.MAX_VALUE, "Integer.MAX_VALUE via get");

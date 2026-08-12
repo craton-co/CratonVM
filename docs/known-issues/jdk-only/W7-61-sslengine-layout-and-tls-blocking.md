@@ -300,6 +300,45 @@ Linux arm was run**.
   A close that has *already* landed is still observed on Windows, because the
   classification runs on every return.
 
+### The Windows half, re-derived 2026-08-12 — what closes it, and the trap that nearly did not get named
+
+Both halves above are **verified present in the tree** on this pass
+(`servlet::s2_tls_close` and `t27_tls::rustls_stream_close` shut down
+`entry.raw`; `s2_tls_classify_after_block` and `rustls_classify_after_block` run
+on every return of all four sites). The Windows arm is still open and stays open.
+Three things were established about *how* it closes, and they belong here because
+this record is where the Windows half lives:
+
+1. **The mechanism is not a `shutdown` and not `closesocket`.** It is the one the
+   nineteen fixed sites use: never enter the blocking call until a bounded
+   `poll`/`WSAPoll` on the registry-held duplicate says the socket is ready, and
+   re-ask the registry after each slice. Winsock's lack of an aborting `shutdown`
+   is then irrelevant — the thread is parked in `WSAPoll` with a 25 ms bound, not
+   in `recv`.
+2. **A socket-readiness gate in front of a TLS read is a DEADLOCK unless it is
+   screened by the assembler first.** TLS decrypts a whole record at a time, so a
+   caller that asked for less than the assembler holds gets the rest with no
+   socket I/O at all — `rustls-0.23.42`'s `Stream::prepare_read` touches the
+   transport only `while conn.wants_read()`, and `wants_read()` is false while
+   `received_plaintext` is non-empty. The screens exist (`conn.wants_read()` for
+   rustls, `native_tls::TlsStream::buffered_read_size()` in
+   `native-tls-0.2.18`), and they must be asked **under the stream mutex, before
+   it is released for the poll**. W7-53-blocking-close-family.md's "Third pass"
+   section carries the full derivation, the ordering, and the
+   `Option<TcpStream>` → `Option<Arc<TcpStream>>` change that removes the
+   per-read `try_clone` its own design assumed.
+3. **The two WRITE sites must still get nothing**, and that is not a scoping
+   decision — it is the measurement in "The two WRITE sites get no close-aware
+   loop" above. A close-aware TLS write would be a behaviour HotSpot does not
+   have.
+
+So the Windows half is now specified rather than merely named, and it is still
+**not applied**: the whole gain is on the platform with no build, the blast radius
+is every TLS read in the VM, the `LegacyDsa` screen is `#[cfg(unix)]` and cannot
+be written from this host, and the row is masked by a 30 s timeout rather than
+hanging. The pilot to take first is `rustls_stream_read`'s client arm, which has
+no `cfg` arms at all.
+
 ### The two WRITE sites get no close-aware loop, and that is now measured
 
 This was going to be an argument. It is a measurement instead.
@@ -507,6 +546,12 @@ before or with this record; neither file is touched here.
    A build lane's work.
 2. **The Windows half of the TLS read wakeup.** Named, with the design that
    would close it, and expected to read `tlsRead TIMEOUT` until then.
+   **Re-derived and specified 2026-08-12** — see "The Windows half, re-derived"
+   above and W7-53-blocking-close-family.md's "Third pass": the design that was
+   written down would have *deadlocked* on buffered plaintext, the screen that
+   makes it sound is named per stack, and the per-read `try_clone` it assumed is
+   replaced by an `Arc`. Still not applied, and the reasons are stated there
+   rather than reduced to "no build".
 3. **Any Linux reading at all.** The Unix arms added here are not compilable on
    this host, and the platform claims are contracts rather than observations.
 4. **`SSLEngineResult` / `HandshakeStatus` width disagreement** (2 vs 4, 1 vs 2
