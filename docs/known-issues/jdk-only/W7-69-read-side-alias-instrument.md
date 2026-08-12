@@ -456,6 +456,14 @@ run of `CRATONVM_DBG_LAYOUT_ALIAS=1`.
    and is published to by `register_io_natives` — but nothing calls it yet.
    Choosing its trigger (a debug-only VM hook after a workload, most likely)
    needs a build, and wiring it blind would be a call nobody has seen run.
+   **CLOSED 2026-08-12 by W7-90-slot-map-sweep-caller.md**, and the guess in
+   parentheses was right: the trigger is the launcher's teardown immediately
+   after `main(String[])` returns, plus the three self-terminating natives,
+   because a `System.exit` never reaches the first. Three gates (links 7-9 of
+   `read_alias_coverage.rs`) fail if a `SlotMap` is declared and never swept;
+   all three are RED on the tree as it stood before that lane. Note that
+   **§4.1's 11,948 / 6 figures did not improve** — the sweep covers a different
+   and much smaller population (38 slots in 7 maps).
 3. **11,942 of 11,948 constant-slot reads state no expected field.** They are
    printed, not covered. Closing that is a per-crate migration to `SlotMap`
    declarations, and it should be done class-by-class from §6's list rather than

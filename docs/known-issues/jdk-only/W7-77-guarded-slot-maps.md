@@ -427,6 +427,11 @@ starts being trusted for something it does not check.
    trigger needs a build. Until then the four rows' `SlotMap`s are checked only
    by `every_guarded_row_publishes_its_slot_map`, which proves they are wired,
    not that the sweep ever runs.
+   **CLOSED 2026-08-12 by W7-90-slot-map-sweep-caller.md**, which wired two
+   triggers (the launcher's post-`main` teardown, and the three self-terminating
+   natives) and gated them. This row's four maps contribute 15 of the 29
+   predicted census rows; the two synthetic-only ones can only be swept in
+   synthetic mode, because their registrars are.
 3. **The dead `util_time.rs` Month surface is documented, not deleted.** §5.1.
 4. **`Month`'s witness is unmeasured for cost.** It adds one
    `resolve_field_index_by_class_id` per Month read and write. `java.time.Month`
