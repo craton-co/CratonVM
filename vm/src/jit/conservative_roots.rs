@@ -1346,6 +1346,18 @@ fn unreg_memo_gc_reset_enabled() -> bool {
 /// [`note_jit_boundary`] at *every* Rust↔JIT crossing — leaves the cache able
 /// to hit at all.
 ///
+/// **`cache_hits` MEASURED 2026-08-12: 0.0%, in every run.** Three netty
+/// `io.netty.buffer` classes on dev `6d1bfd531` — 1,022 scans, 41,894 scans and
+/// 60,163 scans respectively — and **zero** hits in all three. The
+/// boundary-generation key is bumped from `push_entry_full`, which ran 826
+/// million times in one of those runs, so the generation never survives long
+/// enough for a second scan to match it. The answer is 0%, not "small".
+///
+/// That is not the cost on those classes — `band_words` was **0**, i.e. no band
+/// scanning fired at all — so this is recorded as a fact about the cache rather
+/// than as a lead. Anything that reworks the key should know it starts from
+/// zero. See `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
+///
 /// Off by default and read through one cached bool, so a default run pays a
 /// predictable branch per scan and nothing else.
 pub mod scan_prof {
@@ -1360,6 +1372,23 @@ pub mod scan_prof {
     /// Transfers of control into compiled code (`push_entry_full`). The run's
     /// interpreter→JIT entry count; the JIT's CPU delta divided by this is the
     /// per-entry cost.
+    ///
+    /// **MEASURED 2026-08-12** on netty `io.netty.buffer`, dev `6d1bfd531`, and
+    /// the answer to the question this counter was added for. On
+    /// `AdaptiveByteBufAllocatorTest`: **826,764,658 entries in a 551 s run**
+    /// (1.5 M/s), against 1.59 M tracked method invocations. A flat `perf`
+    /// profile of the same workload puts the entry/exit bookkeeping — this
+    /// function, `pop_jit_entry`, `pin_jit_code_range_owner`,
+    /// `validate_code_ptr`, `gc_quiescence::{enter,leave}`,
+    /// `record_transition`, `jit_execution_{enter,leave}` — at **~15% of CPU**,
+    /// i.e. **~200 ns of pure bookkeeping per entry**, with another ~14% in the
+    /// dispatch that reaches it and 3.3% in the interpreter itself.
+    ///
+    /// So yes: on call-dense code the entry machinery is a first-order cost,
+    /// and it is paid per *transfer*, not per compiled method. Wall time tracks
+    /// entry count across the family — 116.8 M entries/35.3 s, 120.4 M/62.3 s,
+    /// 826.8 M/551 s. Full write-up, including the two hypotheses this refuted,
+    /// in `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
     pub static JIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {

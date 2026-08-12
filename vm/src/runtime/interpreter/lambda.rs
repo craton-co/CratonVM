@@ -775,6 +775,24 @@ pub(crate) fn lambda_impl_dispatch_override(
     if !crate::runtime::env_cache::loader_aware_resolution() {
         return None;
     }
+    // Nothing to override when no user-defined loader has ever defined a class
+    // in this process: `lookup_loader_initiated` below already returns `None`
+    // unless `get_loader_id(host)` is `UserDefined(_)`, and this atomic is
+    // exactly the "could that ever be true" question — `register_defining_loader`
+    // is called whenever any `ClassId` is assigned a `UserDefined` identity, so
+    // `false` guarantees no class anywhere has one. Behaviour-preserving; the
+    // same short-circuit, for the same reason, already sits inside
+    // `lookup_loader_initiated`.
+    //
+    // Hoisted here because the lambda path reached it only AFTER a
+    // `lambda_proxy_hosts` read lock + hash, and paid that per LAMBDA CALL.
+    // Measured on a lambda-only profile: this function plus its `_driven`
+    // sibling plus `lambda_global_impl_owner` were 11.3% of the run, essentially
+    // all of it re-deriving a per-proxy constant that is `None` for every
+    // program without a custom classloader.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let host = *shared
         .classes
         .lambda_proxy_hosts
@@ -825,6 +843,14 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
         return Some(cid);
     }
     if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    // Same short-circuit as the passive sibling, and here it subsumes the
+    // `UserDefined(_)` test four lines below: if no class in the process has a
+    // user-defined defining loader, `get_loader_id(host)` cannot return one.
+    // Without it this arm took a SECOND `lambda_proxy_hosts` read lock and a
+    // `class_manager` read lock per lambda call, to reach that same verdict.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
         return None;
     }
     let host = *shared

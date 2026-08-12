@@ -814,7 +814,10 @@ mod tests {
             match ctx.get_field_by_name(constant, "name") {
                 Value::Object(Some(s)) => assert_eq!(
                     ctx.read_string(s).as_deref(),
-                    Some(name.as_str()),
+                    // `name` is `&&str` from `constants.iter()`; deref rather
+                    // than `.as_str()`, which resolves to the still-unstable
+                    // `str::as_str` and fails to compile the whole test target.
+                    Some(*name),
                     "{name} carries the wrong Enum.name — a wrong or null name makes \
                      Enum.valueOf's constant directory match nothing"
                 ),
