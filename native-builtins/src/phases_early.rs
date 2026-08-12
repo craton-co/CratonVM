@@ -20328,30 +20328,46 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         lr_set(ctx, args, "message", 1)
     });
-    r.register(
-        lr,
-        "getSourceClassName",
-        "()Ljava/lang/String;",
-        |ctx, args| lr_get(ctx, args, "sourceClassName", 2),
-    );
-    r.register(
-        lr,
-        "setSourceClassName",
-        "(Ljava/lang/String;)V",
-        |ctx, args| lr_set(ctx, args, "sourceClassName", 2),
-    );
-    r.register(
-        lr,
-        "getSourceMethodName",
-        "()Ljava/lang/String;",
-        |ctx, args| lr_get(ctx, args, "sourceMethodName", 3),
-    );
-    r.register(
-        lr,
-        "setSourceMethodName",
-        "(Ljava/lang/String;)V",
-        |ctx, args| lr_set(ctx, args, "sourceMethodName", 3),
-    );
+    // NOT `Intrinsic`, unlike the ambient category this function sets at its
+    // head. An intrinsic is the kind that cannot give an answer the bytecode
+    // would not — and these can. `getSourceClassName` here is the REAL getter
+    // with the `inferCaller()` call deleted: JDK 25's body is
+    // `if (needToInferCaller) inferCaller(); return sourceClassName;`, this one
+    // is a bare field read, and the field is null because nothing ever inferred
+    // it. Measured: HotSpot renders the caller class, CratonVM renders null.
+    //
+    // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
+    // under `--jdk-only` these survived after the retirement refused every
+    // honest `Bridge` and `SyntheticStub` on the same classes — a refusal is
+    // not a removal. W7-25 lifted the two `LogManager` rows out of the ambient
+    // block for exactly this reason; these are the same defect at sites that
+    // pass did not cover. W7-35-jul-supplier-and-payload-residuals.md
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            lr,
+            "getSourceClassName",
+            "()Ljava/lang/String;",
+            |ctx, args| lr_get(ctx, args, "sourceClassName", 2),
+        );
+        r.register(
+            lr,
+            "setSourceClassName",
+            "(Ljava/lang/String;)V",
+            |ctx, args| lr_set(ctx, args, "sourceClassName", 2),
+        );
+        r.register(
+            lr,
+            "getSourceMethodName",
+            "()Ljava/lang/String;",
+            |ctx, args| lr_get(ctx, args, "sourceMethodName", 3),
+        );
+        r.register(
+            lr,
+            "setSourceMethodName",
+            "(Ljava/lang/String;)V",
+            |ctx, args| lr_set(ctx, args, "sourceMethodName", 3),
+        );
+    });
 
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
         lr_get(ctx, args, "loggerName", 4)
@@ -20521,7 +20537,18 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // JUnit's `CapturedOutput` wrapping) -- let it run instead of stubbing.
 
     // --- Formatter (abstract) ---
+    //
+    // `formatMessage` is NOT an `Intrinsic`, unlike this function's ambient
+    // category: JDK 25's body resolves the resource bundle and then runs
+    // `java.text.MessageFormat.format` whenever the message contains `{n}` and
+    // the record carries parameters, where this body returns `getMessage()`
+    // verbatim. Measured: HotSpot `one=A two=B`, CratonVM `one={0} two={1}`,
+    // in BOTH modes. `Intrinsic` is exempt from the `java/util/logging/` shadow
+    // retirement, so under `--jdk-only` this survived every honest row being
+    // refused — a refusal is not a removal.
+    // W7-35-jul-supplier-and-payload-residuals.md
     let fmt = "java/util/logging/Formatter";
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
     r.register(
         fmt,
         "formatMessage",
@@ -20599,6 +20626,7 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    });
 
     // --- SimpleFormatter ---
     // Previously `<init>`/`format` were stubbed here the same way
