@@ -179,6 +179,39 @@ public class RJdkReflect {
         check(threw, "setAccessible on a non-opened java.base internal must be refused");
 
         Field hidden = k.getDeclaredField("hidden");
+
+        // L15: the nestmate FIELD arm, asked with NO setAccessible -- the
+        // mirror of the nestmate METHOD arm above. Until this block existed,
+        // every field assertion in this vector called setAccessible(true)
+        // first, so the same-class-only predicate that check_field_access used
+        // to apply read green here: the narrowing that replaced it (nestmate,
+        // same-package and subclass callers admitted) landed UNEXERCISED.
+        // Do not add setAccessible above these four checks.
+        //
+        // HotSpot 25 oracle, measured 2026-08-12: Subject is a nestmate of
+        // RJdkReflect, so a private instance field get AND set both succeed
+        // from here without setAccessible, as does a private static final
+        // field READ; the same read against a non-nestmate throws
+        // IllegalAccessException. The fourth check is the falsifier for the
+        // other three -- under a gate that admits too much, or no gate at all,
+        // the positive checks still pass and only that one goes red.
+        check(hidden.getInt(s) == 3, "nestmate private field get without setAccessible");
+        hidden.setInt(s, 4);
+        check(hidden.getInt(s) == 4, "nestmate private field set without setAccessible");
+        hidden.setInt(s, 3);
+        Field nestmateConst = k.getDeclaredField("CONST");
+        check(nestmateConst.getLong(null) == 99L,
+                "nestmate private static field get without setAccessible");
+        boolean nonNestmateRefused = false;
+        try {
+            Field locked = RJdkReflectOutsider.class.getDeclaredField("locked");
+            locked.getInt(new RJdkReflectOutsider());
+        } catch (IllegalAccessException expected) {
+            nonNestmateRefused = true;
+        }
+        check(nonNestmateRefused,
+                "non-nestmate private field get must be refused without setAccessible");
+
         hidden.setAccessible(true);
         check(hidden.getInt(s) == 3, "private field get");
         hidden.setInt(s, 11);
@@ -428,5 +461,28 @@ public class RJdkReflect {
         serialization();
         System.out.println("CK RJdkReflect checks=" + checks);
         System.out.println("PASS RJdkReflect (" + checks + " checks)");
+    }
+}
+
+/**
+ * The NON-nestmate half of {@code accessAndInvoke}'s L15 block. A top-level
+ * class in the same compilation unit is NOT a nestmate of {@code RJdkReflect}
+ * -- its nest host is itself -- so its {@code private} field must stay refused
+ * to a reflective read from {@code RJdkReflect} that has not called
+ * {@code setAccessible(true)}. It is in the same (unnamed) package on purpose:
+ * that isolates the {@code private} rule from the package rule, so a gate that
+ * has collapsed to "same package wins" is caught here rather than read as
+ * green.
+ *
+ * <p>Deliberately not a separate {@code src/*.java} file: {@code run.sh}'s list
+ * hygiene globs {@code src/*.java} and requires every one to be a listed vector
+ * or named in {@code UNREGISTERED_CLASSES}. It has no {@code main} and is never
+ * run on its own.
+ */
+class RJdkReflectOutsider {
+    private int locked = 5;
+
+    int visible() {
+        return locked;
     }
 }
