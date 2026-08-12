@@ -603,3 +603,179 @@ discriminator for §4; the discriminator needs a `ReadableByteChannel` and a
 `asIntBuffer` is also absent from the fixture, deliberately: `asLongBuffer` and
 friends are not on the forced-native list, so on a real receiver those rows
 measure the JDK's own bytecode rather than anything this campaign changed.
+
+---
+
+## 11. Triage re-read against source, 2026-08-12 (lane A24, doc-only)
+
+This lane may not build, check, test or run anything. Everything below is read
+from the working tree at `70bf05ed3`+ and says which claim it checked. It is
+**verification of the record against source**, not measurement of behaviour, and
+the distinction is kept in every row.
+
+### 11.1 What is now CLOSED, and by whom
+
+| record item | disposition | evidence read |
+|---|---|---|
+| §8.1 `bb_resolve_heap_array` can return a `MemorySegment` as a backing array | **CLOSED by W7-83, in the order §8.1 prescribed** | `native-io/src/lib.rs`, `bb_resolve_heap_array`: the slot-5 arm is now `if ctx.heap_kind_of(a) == ObjectKind::Array { return Some(a); }`, falling **through** rather than returning `None` — the shape §8.1 asked for. The blocker was cleared first: `native-io/src/test_support.rs:746` `MockNativeContext::heap_kind_of` now answers from its own `HeapEntry::Array`/`Object` discriminant instead of `ObjectKind::Object` unconditionally, and `heap_element_type_of`/`object_is_array` with it. §8.1 said "teach that mock's `heap_kind_of` … **then** add the screen, in that order and preferably in that many commits"; that is what happened. |
+| §8.3 / §9(4) `verify_declared_slot_maps` has no caller | **CLOSED, and now gate-enforced** | one caller at `vm-cli/src/main.rs:4258`, plus a source-witness test — `native-api/tests/read_alias_coverage.rs:589` asserts the function has at least one caller outside its own module, and its message names the failure mode ("reporting zero rows means *it was never run*"). §8.3's own "CLOSED by W7-90" annotation is correct; the guard against it silently regressing is the part that was not recorded. |
+| §10 the four derived views propagate the order | **LANDED for `java/nio/ByteBuffer`** | all four `s2` sites now read `let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view` — `native-builtins/src/servlet.rs:5968` (`slice()`), `:6019` (`slice(II)`), `:6069` (`duplicate()`), `:6107` (`asReadOnlyBuffer()`). The block comment at `:5919-5961` carries §10's argument, its measured oracle and its exclusion. §10 asked for "four lines and no new helper"; it is four lines and no new helper. |
+
+### 11.2 The exclusion landed too, and it is WIDER than §10 stated
+
+§10 closes "`as<T>Buffer()` must **not** be changed with them". True, and the
+code honours it — but the sites that still propagate are not `asIntBuffer()`.
+They are `slice()`, `slice(II)`, `duplicate()` and `asReadOnlyBuffer()` **on a
+typed view receiver**, inside the per-width macro at
+`native-builtins/src/servlet.rs:6428` / `:6465` / `:6497` / `:6523`, each still
+ending `let ord = s2_bb_order(ctx, this); s2_bb_set_order(ctx, vb, ord);`
+(`:6461`, `:6493`, `:6519`; `$ro` delegates to `$dup`).
+
+Whether that is right is **not settled by §10's transcript**, which measured
+`{direct,heap}.ord.{slice,sliceRange,duplicate,readOnly}` on a **`ByteBuffer`**
+receiver only. `intBuf.slice()` is a different question with a different JDK
+answer — the derived view is allocated as the *same* `$cls`, so on
+`ByteBufferAsIntBufferL` the endianness is already frozen into the class and the
+propagation is redundant rather than wrong, while on `HeapIntBuffer` `order()` is
+specified as `ByteOrder.nativeOrder()` and neither the propagation nor a literal
+`0` is obviously it. **No row of any probe or fixture in this tree measures
+`intBuf.slice().order()`.** Recorded as an open question, not as a defect: §10's
+prescription was scoped to the receiver it measured and should not be read as
+having adjudicated this one.
+
+### 11.3 `is_plausible_native_addr` — §3's row is right, and the screen has a blind spot it does not state
+
+§3's slot-4 `bb_resolve_direct_address` row ("**YES, and CORRECT**") **verifies**.
+The predicate is `v >= 0x1_0000`, declared **twice** — `native-io/src/lib.rs:8045`
+and `native-builtins/src/servlet.rs:3462`, identical bodies, no shared helper —
+and `native-io/src/lib.rs:24193-24194` pins both directions
+(`!is_plausible_native_addr(16)`, `is_plausible_native_addr(0x1_0000)`), with a
+third pin at `servlet.rs:8726` against `ARRAY_BYTE_BASE_OFFSET`. So a real
+`HeapByteBuffer`'s `address = 16` is refused on both passes, exactly as §3 says.
+
+**What the screen cannot see is a tagged arena handle, and that is the live
+hazard in this family.** `Unsafe.allocateMemory` does not return a raw address:
+`native-builtins/src/unsafe_natives_ext.rs:4151` declares
+`pub(super) const ARENA_TAG: i64 = 1 << 62;` and `ARENA_BASE = ARENA_TAG |
+0x10_0000_0000`, with the doc stating *"The tag is part of the address value
+end-to-end — it is NEVER stripped"* and naming `DirectByteBuffer.address()` as
+one of the paths handles flow through opaquely. Every such handle is therefore
+`>= 0x4000_0010_0000_0000`, which passes `v >= 0x1_0000` **trivially**.
+
+So `is_plausible_native_addr` separates an array-relative `Unsafe` offset from a
+pointer and nothing else. It is *not* a dereferenceability test, and the value it
+admits most often on a direct receiver in this VM is precisely the one value that
+must not be dereferenced. The exact classifier already exists one crate over —
+`unsafe_arena_addr_is_tagged(addr)` (`unsafe_natives_ext.rs:4447`, `addr &
+ARENA_TAG != 0`), whose own doc says the VM's `copy_from_native_memory` bridge
+classifies with it rather than with the liveness test because a *freed* handle
+must not fall down the raw-pointer branch. `is_plausible_native_addr`'s two
+copies consult neither.
+
+This does **not** falsify §3 or §5.1 — both are about which slot holds what, and
+both hold. It falsifies the *impression* the guard's name gives, which §5.1
+leans on when it separates the two slot-4 readers "only by value type": a
+`Value::Long` past this screen is not necessarily an address, it is anything at
+all above 64 KiB. See NOMINATION 1.
+
+### 11.4 Which of this record's claims are VACUOUS TESTS
+
+Asked explicitly, because two standing arguments retire evidence in this family.
+
+* **The `address`=16 argument.** JDK 21+ heap buffers carry `address` = 16, not
+  0, so a *differential probe on the `address` field* reads green on both VMs and
+  proves nothing. **No claim in W7-76 rests on such a probe** — §3's slot-4 row
+  uses `address = 16` as an input to a source argument about which arm control
+  reaches, not as a cross-VM comparison, and the probe rows §7 lists are
+  `order()`, `array()`, `arrayOffset()` and typed values. Clean.
+* **The tagged-handle argument.** Any row whose discriminator is "the address
+  looked plausible" is vacuous by §11.3. **No probe row in §7 is of that shape.**
+  The claim that *is* weakened is §5.1's "the two readers are separated only by
+  value type", which the record already calls "thin" — it is thinner than it
+  says.
+* **The one genuinely vacuous row this record already flags** is §6's
+  `DatagramChannel` comparison (W7-68 §3.4, "real and vacuous"), quoted rather
+  than owned here.
+
+### 11.5 Is this record's evidence SCHEDULED?
+
+| evidence | scheduled? |
+|---|---|
+| `probes/DirectByteBufferStateProbe.java` — §7's 233 checks, and every CratonVM column §9(1) asks for | **NO.** The string `probes` occurs **zero** times in `regression-suite/run.sh` (checked, not assumed), at any `SUITE=` value. |
+| §10.1's `RDirectBufferElem.derivedViewOrderIsReset()` | **YES.** Defined `regression-suite/src/RDirectBufferElem.java:313` and — the half that matters — **called** at `:132`, so it is not an orphan method. `RDirectBufferElem` is in `run.sh`'s `CORE_CLASSES` word list, so it runs in a plain `run.sh` and again under `CRATONVM_ARGS=--jdk-only`. |
+| §5.3's three predicted `wrong-field` rows | **the sweep is now reachable** (§11.1) but nobody has run it; still a prediction. |
+
+### 11.6 Residuals after this pass
+
+1. **§9(1) is undischarged and is still the highest-value next step.** No
+   CratonVM column has ever been produced for this probe. §10.1 discharges the
+   `ord` and `win` sections into a scheduled fixture; the rest is unmeasured.
+2. **§11.2's typed-view order question** — new, unmeasured, no vector.
+3. **`is_plausible_native_addr`'s tagged-handle blind spot** — NOMINATION 1.
+4. **§5.1's `buf_set_mark` save/restore** and **§5.2's slot-6 fallback** —
+   unchanged; both refusals still stand for the reasons given.
+5. **§8.2's five copies of the `bigEndian`/`nativeByteOrder` seed** — unchanged,
+   still five, still nothing making them agree.
+6. **§9(7)** `native_bb_slice`'s copy-instead-of-alias and
+   `native_bb_is_read_only`'s constant `0` — unchanged.
+7. **§9(3)**, whether `register_nio_natives` should overwrite s2 in synthetic
+   mode, is **unadjudicable by any run of a shipping binary**: it lives only in
+   `--features synthetic-jdk` + `--synthetic-jdk`, and a shipping binary refuses
+   that mode outright. Rank it low because it cannot affect a shipped run — but
+   say that, rather than recording it as merely untested.
+
+### 11.7 NOMINATION 1 — `is_plausible_native_addr` admits a tagged arena handle
+
+Doc-only lane; not applied. **Two files, and they must move together** — a
+one-sided edit reproduces exactly the disagreement §5.1 refuses elsewhere.
+Behaviour-affecting, so it wants a build and the §7 probe, not a paste.
+
+`native-io/src/lib.rs:8045`, old:
+
+```rust
+fn is_plausible_native_addr(v: i64) -> bool {
+    v >= 0x1_0000
+}
+```
+
+new:
+
+```rust
+fn is_plausible_native_addr(v: i64) -> bool {
+    // W7-76 §11.3. Two separate refusals, and the second is not implied by
+    // the first. `v >= 0x1_0000` rejects an array-relative `Unsafe` offset
+    // (`ARRAY_BYTE_BASE_OFFSET + i`), which is what a real HeapByteBuffer
+    // carries in `address`. It does NOT reject an Unsafe-arena HANDLE:
+    // `unsafe_natives_ext::ARENA_TAG` is bit 62, so every handle is
+    // >= 0x4000_0010_0000_0000 and passes the magnitude test trivially —
+    // and a handle is the ONE value in this family that must never be
+    // dereferenced as a pointer (`addr=0x4000_0010_…` in a register at a
+    // SIGSEGV inside a third-party `.so` IS this diagnosis). Only
+    // `GetDirectBufferAddress` is audited to convert one.
+    v >= 0x1_0000 && !cratonvm_native_builtins::unsafe_arena_addr_is_tagged(v)
+}
+```
+
+and the identical body at `native-builtins/src/servlet.rs:3462`, where the call
+is in-crate (`crate::unsafe_natives_ext::unsafe_arena_addr_is_tagged(v)`).
+
+**Read before applying — three things this lane could not settle.**
+
+1. **The crate dependency may not exist.** `native-io` calling into
+   `native-builtins` is a direction this lane did not verify is permitted. If it
+   is not, the classifier belongs on `NativeContext` or in `native-api`, which is
+   the same conclusion §8.2 reaches for the order seed and is the better shape
+   anyway — one predicate, two callers, no third copy.
+2. **The two unit pins move.** `native-io/src/lib.rs:24193-24194` and
+   `servlet.rs:8726` assert only the magnitude behaviour and stay green; a new
+   pin for the tagged case is the point of the change and must be added, or the
+   fix is untested by construction.
+3. **Blast radius is a widening into a refusal**, in the direction the guard was
+   written for: a receiver whose `address` is a live arena handle stops being
+   read through `copy_from_native_memory` and degrades to this module's "no
+   backing storage" error. Per the guard's own doc that is the *intended*
+   degradation. But `unsafe_natives_ext.rs:1541-1551` records a case where
+   clamping a live handle to 0 silently delivered zeros on every small real
+   `Socket` write — so the arm that must be checked before landing is a direct
+   `ByteBuffer` over an arena-backed block still reading and writing correctly,
+   not just the SIGSEGV going away. §7's probe has both arms already.

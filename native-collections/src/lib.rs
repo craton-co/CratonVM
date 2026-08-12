@@ -48756,6 +48756,70 @@ fn register_chm_key_set_view_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// A real `java.util.Enumeration` over `array`, or `None` when this image
+/// cannot build one.
+///
+/// The `Enumeration` form of `real_snapshot_iterator` (spelled without an
+/// intra-doc link because that helper is private and this item is not), and the
+/// same rule in its strongest form: prefer a class the JDK BUILDS ITSELF over one whose
+/// fields we fill. The snapshot is already an `Object[]`,
+/// `java.util.Arrays$ArrayList` is the JDK's own fixed-size list over exactly
+/// that shape, and `Collections.enumeration(Collection)` turns one into a real
+/// `Enumeration` — real bytecode the whole way, so nothing here has to know
+/// what the resulting anonymous class is CALLED (it is `java.util.Collections$3`
+/// on JDK 25, and an anonymous class's number must not be written down).
+///
+/// Deliberately a duplicate of `native-builtins`' `classloader::
+/// real_snapshot_enumeration`, not a call to it: `native-builtins` depends on
+/// this crate, so the dependency cannot run the other way. This is the copy the
+/// crate that owns `cratonvm/internal/SnapshotEnumeration` can reach; it is
+/// `pub` so the `native-builtins` copies can converge on it later.
+///
+/// `hasMoreElements`/`nextElement` on the result are real JDK bytecode: neither
+/// name is in `vm_exec`'s `check_override` chain, and the anonymous class
+/// declares both concretely, so the interface-level
+/// `java/util/Enumeration.hasMoreElements` native registered by
+/// `register_collections_natives` never intercepts it (that native is reachable
+/// only through the C25 *abstract*-method arm).
+pub fn real_snapshot_enumeration(
+    ctx: &mut dyn NativeContext,
+    array: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let list = match ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(array))],
+    )? {
+        Some(Value::Object(Some(list))) => list,
+        _ => return Ok(None),
+    };
+    match ctx.invoke(
+        "java/util/Collections",
+        "enumeration",
+        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
+        &[Value::Object(Some(list))],
+    )? {
+        Some(Value::Object(Some(enm))) => Ok(Some(enm)),
+        _ => Ok(None),
+    }
+}
+
+/// The snapshot enumeration over `elems`: the fabricated
+/// `cratonvm/internal/SnapshotEnumeration` in `Compatible` mode, and a real
+/// `java.util.Enumeration` when `--jdk-only` refuses that fabrication.
+///
+/// WHY A FALLBACK AND NOT A DROPPED SHADOW. The two callers that reach strict
+/// mode are `ConcurrentHashMap.keys()`/`elements()`, and a natively-backed CHM
+/// keeps its entries in a SEGMENTED layout that never populates `table` — the
+/// same reason `native_chm_reduce_values` and `native_chm_search_keys` are
+/// registered right beside them. Real `ConcurrentHashMap.keys()` bytecode
+/// builds a `KeyIterator` over `table`, so deleting these natives would answer
+/// an EMPTY enumeration over a populated map, which is strictly worse than the
+/// refusal it replaced. Only the CARRIER was fabricated, so only the carrier is
+/// replaced.
+///
+/// `Compatible` mode is byte-for-byte what it was: the fallback is reached only
+/// from the refusal arm, which only strict mode takes.
 fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
     let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
     let arr = alloc_ref_array(ctx, elems.len());
@@ -48765,18 +48829,36 @@ fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> Re
         let val = read_pinned_elem(ctx, elem_handles[i], *val);
         ctx.set_array_element(arr, i, val);
     }
-    let en = try_alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2)?;
-    let en_pin = ctx.pin_native_root(en);
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    let en = ctx.read_native_pin(en_pin, en);
-    ctx.set_field(en, 0, Value::Object(Some(arr)));
-    ctx.set_field(en, 1, Value::Int(0));
-    ctx.unpin_native_roots(if elem_base == usize::MAX {
+    // Unwind to this base on EVERY path. The old `?` on the allocation leaked
+    // both pin sets on the refusal it is now the whole point of handling.
+    let unpin_base = if elem_base == usize::MAX {
         arr_pin
     } else {
         elem_base
-    });
-    Ok(en)
+    };
+    let out = match try_alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2) {
+        Ok(en) => {
+            let en_pin = ctx.pin_native_root(en);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let en = ctx.read_native_pin(en_pin, en);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(en)
+        }
+        Err(refusal) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            match real_snapshot_enumeration(ctx, arr) {
+                Ok(Some(en)) => Ok(en),
+                // Nothing real to stand in — an image with no
+                // `Arrays$ArrayList` — so the refusal stands rather than
+                // silently becoming a fabrication again.
+                Ok(None) => Err(refusal),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    ctx.unpin_native_roots(unpin_base);
+    out
 }
 
 fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

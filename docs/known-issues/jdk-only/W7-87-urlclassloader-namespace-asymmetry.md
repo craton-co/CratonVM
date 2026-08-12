@@ -494,3 +494,59 @@ returns `PROBE result=OK` with and without it, on both arms, on the pinned
 binary. Had that not been checked, the flag would have been the obvious — and
 wrong — explanation for the `FAILED(10)` → `OK` swing the rebuild actually
 caused.
+
+---
+
+## Re-verified against the working tree, 2026-08-12 (lane A2, P1-B/P3-C)
+
+Read, not rebuilt. Nothing here was built or run; these are source facts.
+
+**The fix is present and unmodified.** `native-builtins/src/classloader.rs:2706`:
+
+```rust
+let takes_builtin_branch = !is_user_defined
+    && (is_generated_proxy_name(internal_name) || !is_bare_url_class_loader(ctx, this));
+```
+
+with the W7-82/W7-87 rationale at `classloader.rs:2649-2705`. The allocator's two
+matching guards are still spelled the same way, at `classloader.rs:2401`
+(`loader_namespace_id_at`) and `:2503` (`peek_loader_namespace_id`), so the three
+sites still agree. `is_bare_url_class_loader` is `classloader.rs:2275`. **Status
+FIXED stands.**
+
+**The sharpest ASYMMETRIC row is still open, and its line numbers have moved.**
+The three `defineClassN` namespace picks are today at
+`native-builtins/src/lang_system.rs:5323` (`defineClass1`), `:5418`
+(`defineClass2`) and `:5513` (`defineClass0`). All three still read
+
+```rust
+Some(Value::Object(Some(loader_obj)))
+    if crate::classloader::is_user_defined_loader(ctx, *loader_obj) && (…) => …
+_ => 0,
+```
+
+with no `|| is_bare_url_class_loader(..)` disjunct, so a bare `URLClassLoader`
+still defines into namespace 0 while `ucl_try_define_local_class` gives the same
+object ns ≥ 3. `lang_system.rs`'s other row, `preload_supertypes_via_loader`
+(`lang_system.rs:4984-4986`), also still returns early for a bare instance.
+
+**A blocker the record did not name.** `is_bare_url_class_loader` is a private
+`fn` in `classloader.rs` — not `pub(crate)` — so the `lang_system.rs` sites
+**cannot call it at all** as the tree stands. Closing that row is therefore a
+two-file change (a visibility widening in `classloader.rs` plus the three
+predicates), which is one more reason it belongs in the dedicated lane §7 asks
+for rather than being folded into an adjacent fix. Lane A2 owned
+`lang_system.rs` and deliberately did **not** touch these three sites: a
+narrowing on the class-defining path, in a nine-lane parallel campaign, with no
+build and no oracle available, is exactly the shape this record warns about.
+
+**Unrelated edits landed in `lang_system.rs` in the same pass** (`System.getenv`'s
+wrapper, and typed linkage errors out of `defineClass0/1/2`). Neither touches
+loader-namespace selection. The `defineClassN` failure tail now calls
+`define_class_linkage_error` instead of `define_class_format_error`, which
+changes the *type* of the exception a duplicate-namespace collision surfaces as:
+the `IncompatibleClassChangeError: already defined by application loader` this
+record predicts will now arrive as a real `java.lang.IncompatibleClassChangeError`
+rather than as a `ClassFormatError` wrapping its `Debug` text. That makes the
+predicted failure **easier** to recognise, not harder, and does not change
+whether it happens.

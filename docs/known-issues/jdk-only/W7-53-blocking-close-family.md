@@ -367,6 +367,20 @@ that is new:
   kernel at exit. `AsyncCloseProbe` solves the same problem with `System.exit`,
   which a suite vector must not call.
 
+**Re-checked 2026-08-12 and one sentence above is wrong in a way that matters.**
+This record's Classification section says the family is a Compatible-mode defect
+that strict merely inherits, and its scheduling note above says the probe belongs
+in `CORE_CLASSES`, "**core, not `JDKONLY_CLASSES`**", for exactly that reason.
+But the two shapes that *were* scheduled went into `regression-suite/src/
+RJdkNet.java`, and `RJdkNet` appears **only** in `JDKONLY_CLASSES`
+(`regression-suite/run.sh:119`) — it is not in `CORE_CLASSES`
+(`run.sh:106`). So `asyncCloseWriteAndAccept` runs in the strict arm alone, and
+**this family still has zero scheduled cover in Compatible mode**, which is the
+shipping default. Either the rows move to a core fixture or `RJdkNet` is added to
+`CORE_CLASSES`; both are `run.sh`/fixture edits outside this record's lane. Not a
+defect in the rows — they are real assertions where they run — but the coverage
+claim above overstates their reach.
+
 `SocketException` is the assertion on both VMs and it does not depend on which
 error the native picks: JDK 25's `NioSocketImpl.implWrite` catches every
 `IOException` from the dispatcher and rethrows `asSocketException(ioe)` ("throw
@@ -512,7 +526,7 @@ The single observation is the probe's `outcome` column, per row, per arm.
 | `DatagramChannel.receive` close-awareness | `native-builtins/src/phases_late/net_channels.rs` | The lock half is the census branch's edit (`fix/w2-stream-stack-blocked-reader-moduledesc-20260812`), not yet on dev. Re-doing it here would only produce a conflict. Once it lands, add the same `s2_wait_ready_close_aware` call this branch added to `DatagramChannel.read` twenty lines below it — the helper is already `pub(crate)` |
 | Windows pipe sink write | `native-io/src/pipe.rs` | Needs `CreateNamedPipe(FILE_FLAG_OVERLAPPED)` + a bounded `GetOverlappedResultEx`, i.e. a change to how the pipe is created. Not landable on inspection. **NARROWED 2026-08-12, still open — see "The Windows pipe sink write, narrowed" below** |
 | `s2_tls_read_direct`, `s2_tls_write` | `native-builtins/src/servlet.rs` | TLS record layer. A close-aware loop must not abandon a read mid-record, so the wakeup has to be expressed against the *underlying* socket while the record assembler keeps its state. Genuinely a different problem, and not one to solve without a build. **Designed 2026-08-12 — see "The four TLS sites" below; the design is written down and NOT applied.** Two halves of it DID land (W7-61: a `shutdown` on the registry-held duplicate, which is the whole wakeup on Unix, plus an after-the-call classifier); what is open is the **Windows** arm, and on the third pass the remaining design was found unsound as written — "Third pass" below, trap 5 |
-| `rustls_stream_read`, `rustls_stream_write` | `native-builtins/src/t27_tls.rs` | as above. Both already have the correct lock discipline; it is only close-awareness they lack. **Same design; the "no poll binding of its own" obstacle is GONE** — `cratonvm_native_io::net::poll_stream_readable` is `pub`. `rustls_stream_read`'s CLIENT arm is the **pilot** the third pass recommends: no `cfg` arms, one exact screen (`conn.wants_read()`), and its reading decides the other three. `rustls_stream_write` must get NO loop — W7-61 measured HotSpot NOT waking a parked TLS write |
+| `rustls_stream_read`, `rustls_stream_write` | `native-builtins/src/t27_tls.rs` | as above. Both already have the correct lock discipline; it is only close-awareness they lack. **DESIGNED IN FULL 2026-08-12 — `docs/feature-designs/jdk-only-tls-async-close.md`; read that before this section, and see "Fourth pass" below for what it corrects here.** **Same design; the "no poll binding of its own" obstacle is GONE** — `cratonvm_native_io::net::poll_stream_readable` is `pub`. `rustls_stream_read`'s CLIENT arm is the **pilot** the third pass recommends: no `cfg` arms, one exact screen (`conn.wants_read()`), and its reading decides the other three. `rustls_stream_write` must get NO loop — W7-61 measured HotSpot NOT waking a parked TLS write |
 | multi-acceptor race in `s2_blocking_accept` | `native-builtins/src/servlet.rs` | With two threads accepting one listener, the loser of the race between the poll and the `accept()` parks again, not close-aware. Not closed by flipping the clone non-blocking: `try_clone` shares the blocking mode with the registry's listener on both platforms. Every accept parked before; at most one loser parks after |
 | the seven-way poll-binding consolidation | tree-wide | W7-47's correction stands and this lane did not take it on. No eighth binding was added, and three of the seven grew parameters instead. **Two of the seven became callable across the crate boundary on 2026-08-12** — `net::poll_stream_readable` and `net::poll_stream_writable` are now `pub`, which is the precondition W2-2's collapse was blocked on |
 
@@ -780,6 +794,50 @@ one site where the entire mechanism is expressible in safe, portable, compilable
 Rust, and running `AsyncCloseProbe`'s `tlsRead` + `tlsReadIntegrity` rows against
 it decides the design for the other three. Do the pilot; do not do all four at
 once.
+
+### Fourth pass, 2026-08-12 — the design is now WRITTEN DOWN, and one of its
+### citations was against the wrong crate version
+
+**`docs/feature-designs/jdk-only-tls-async-close.md`** is the P3-D design
+document the roadmap asked for. It supersedes this section as the place to read
+before implementing; this section stays because it is the history of how the
+shape was arrived at. Still **nothing applied** — no file named in any of the
+four passes has been edited.
+
+Four corrections and additions this record should carry:
+
+1. **The third pass quoted `rustls-0.23.42`. This tree builds `rustls-0.23.38`**
+   (`Cargo.lock`). The evidence was read off a version that is not shipped. It
+   was re-derived against 0.23.38 and `prepare_read` / `wants_read` are
+   **byte-identical**, so the conclusion stands — but a reader checking the quote
+   against the tree would have found nothing at the cited path.
+2. **`wants_read()` is exact in BOTH directions, and the third pass only argued
+   one.** The unaddressed worry is a false `true`: rustls holding a fully
+   received but undeframed record while `received_plaintext` is empty. It cannot
+   happen — `ConnectionCommon::complete_io` (`rustls-0.23.38/src/conn.rs:602`)
+   runs `process_new_packets()` after every pass of its read loop, so at the
+   instant any `complete_io` returns everything deframable is already deframed.
+   That is what makes the pilot expressible at all.
+3. **The native-tls screen does NOT have the same standing, and the third pass's
+   table implies it does.** `buffered_read_size()` is documented as "bytes that
+   can be read without resulting in any network calls", but the Windows backend
+   is `Ok(self.0.get_buf().len())`
+   (`native-tls-0.2.18/src/imp/schannel.rs:394`) and schannel's `get_buf` returns
+   the **decrypted** buffer only — bytes in the *encrypted* input buffer are not
+   counted. A false zero there is the deadlock direction. So the two screens are
+   not interchangeable and the other three sites must not be done "the same way".
+4. **The workspace is edition 2021**, so the `if let` scrutinee-temporary hazard
+   is live in these crates today: a guard bound in an `if let` scrutinee is alive
+   inside the `else`, which is where the poll would go. Do not plan around an
+   edition bump — `match` scrutinee temporaries live for the whole `match` in
+   *every* edition. The rule is structural: bind the guard with an explicit
+   `let`, `drop(guard)` explicitly, then branch.
+
+The design also names a **row that does not exist**: nothing in
+`AsyncCloseProbe` currently exercises "peer writes more than one `read` request
+and then goes silent", which is the exact shape the unsound gate deadlocks on.
+`tlsReadBufferedRemainder` has to be written **before** the pilot lands, not
+after.
 
 ## The Windows pipe sink write, narrowed — the row stays OPEN
 

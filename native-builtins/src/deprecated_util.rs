@@ -1177,11 +1177,42 @@ fn make_hashtable_enumeration(
     // FIX: allocate 3 fields (was 2) so the type marker in field 2 has a
     // backing slot; fields 0/1 (array, cursor) keep the layout that
     // `register_enumeration_impl_natives` reads.
-    let en = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3)?;
-    ctx.set_field(en, 0, Value::Object(Some(arr)));
-    ctx.set_field(en, 1, Value::Int(0));
-    // FIX: stamp the keys/values discriminator into field 2.
-    ctx.set_field(en, 2, Value::Int(type_marker));
+    // `--jdk-only` refuses `Enumeration$Impl` — no JDK image declares it — and
+    // the bare `?` here turned that correct refusal into a
+    // `NoClassDefFoundError` at the application's `Hashtable.keys()` call site.
+    // Measured 2026-08-12; HotSpot 25 does the same program cleanly.
+    //
+    // This registration is the WINNER of a double registration: `lib.rs` calls
+    // `deprecated_io_util::register_*` then `deprecated_util::register_*`, and
+    // `register()` is last-write-wins. The loser (`deprecated_io_util.rs:1201`)
+    // routes through `classloader::make_snapshot_enumeration`, which HAS the
+    // fallback and would have recovered — so the run died precisely because the
+    // winning copy is the one without it. Two copies of one rule, drifted.
+    //
+    // Land it the way that funnel already does: a real `Arrays$ArrayList`
+    // wrapped by real `Collections.enumeration` bytecode. Compatible mode is
+    // byte-identical — the `Ok` arm below is the old body unchanged.
+    //
+    // The `type_marker` is dropped on the real carrier, which is safe because
+    // nothing reads field 2: `register_enumeration_impl_natives`
+    // (`classloader.rs:6104`) reads slots 0 and 1 only, and `classloader.rs`
+    // documents the class as "2-field (array=0, index=1)". It is a write-only
+    // slot — which is also why the 2-field boot declaration never lost a write.
+    let en = match try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3) {
+        Ok(en) => {
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            // FIX: stamp the keys/values discriminator into field 2.
+            ctx.set_field(en, 2, Value::Int(type_marker));
+            en
+        }
+        Err(refusal) => match crate::classloader::real_snapshot_enumeration(ctx, arr)? {
+            Some(en) => en,
+            // Nothing real to stand in — an image with no `Arrays$ArrayList` —
+            // so the refusal stands rather than silently re-fabricating.
+            None => return Err(refusal),
+        },
+    };
     Ok(Some(Value::Object(Some(en))))
 }
 

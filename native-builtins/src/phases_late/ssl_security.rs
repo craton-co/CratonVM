@@ -1012,6 +1012,156 @@ pub(crate) fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> 
     crate::net_phase_e::sock_stream_id_for_upcall(ctx, this)
 }
 
+// ---------------------------------------------------------------------------
+// The receiver `SSLSocket.getInputStream()` / `getOutputStream()` hands back
+// ---------------------------------------------------------------------------
+//
+// P1-C (`--jdk-only`). Until 2026-08-12 these two natives allocated
+// `javax/net/ssl/SSLSocketInputStream` / `…OutputStream`. **No supported JDK
+// image declares either name** — they are enumerated as such in
+// `native-api/src/no_image_receiver.rs::NO_IMAGE_JDK_RECEIVERS`, which is what
+// re-tags their natives `SyntheticStub`. Under `--jdk-only` the mint is
+// refused, so the surviving `getInputStream` bridge ran, asked for a class §5
+// forbids, and died as
+//
+//     java.lang.NoClassDefFoundError: javax/net/ssl/SSLSocketOutputStream
+//
+// at the application's first stream access — *after* a handshake that had
+// genuinely succeeded. Net effect: no HTTPS at all under strict mode, client
+// or server.
+//
+// The refusal was correct. The defect was the receiver, so the receiver is now
+// a class the image really declares: the exact pair real JSSE's
+// `SSLSocketImpl.getInputStream()`/`getOutputStream()` return, so
+// `getClass().getName()` now agrees with HotSpot instead of naming a class
+// HotSpot has never had. Present on every supported image (verified with
+// `javap -p` against JDK 25 on this host; the pair has been nested inside
+// `SSLSocketImpl` since the JDK 11 JSSE rewrite, so JDK 21 carries it too —
+// that half is a reading, not a measurement).
+//
+// **This is the plain-socket precedent, and that precedent is sound.**
+// `net_phase_e`'s `java/net/Socket.getInputStream()` allocates
+// `java/net/Socket$SocketInputStream` — a real, image-declared nested class —
+// and keeps its state in an identity-keyed side table *because* the real
+// layout is not the native's layout ("Side-table the stream's owner+sid so we
+// don't depend on field layout"). Both halves are carried over here: a real
+// image class, and no native `Int` written over a field the real class
+// declares.
+//
+// What is NOT carried over is the class name. Registering these natives on
+// `java/net/Socket$SocketInputStream` would put the same (class, name,
+// descriptor) triples in two registrars, and `net_phase_e::
+// register_phase_e_networking` runs AFTER `register_p68_ssl` (lib.rs 18214 vs
+// 18191), so last-write-wins would silently hand every TLS stream to the
+// plain-socket natives — which resolve their id through `sock_get(owner)
+// .stream_id` into the RAW `s2_registry.streams` table, not the TLS one.
+pub(crate) const TLS_APP_IN_CLASS: &str = "sun/security/ssl/SSLSocketImpl$AppInputStream";
+
+/// See [`TLS_APP_IN_CLASS`].
+pub(crate) const TLS_APP_OUT_CLASS: &str = "sun/security/ssl/SSLSocketImpl$AppOutputStream";
+
+/// The pre-2026-08-12 carriers. **Still registered, deliberately.**
+///
+/// `net_phase_e::register_phase_e_networking` mints these two names from its
+/// own `java/net/Socket.getInputStream()`/`getOutputStream()` when the socket
+/// turns out to be a layered `SSLSocket` (net_phase_e.rs ~5273/5296), and that
+/// file is not this lane's to edit. Dropping the registrations here would leave
+/// that mint site with a well-formed carrier and no implementation — turning
+/// today's `NoClassDefFoundError` at the mint into an `UnsatisfiedLinkError` at
+/// the first `read()`, which is exactly the half-change
+/// `no_image_receiver.rs::STRICT_STILL_FABRICATES` warns about, running in the
+/// other direction.
+///
+/// `scripts/baselines/jdk-only-gated-never-delete.tsv` also pins all eight rows
+/// by name, so deleting them trips a gate as well as a caller.
+pub(crate) const TLS_LEGACY_IN_CLASS: &str = "javax/net/ssl/SSLSocketInputStream";
+
+/// See [`TLS_LEGACY_IN_CLASS`].
+pub(crate) const TLS_LEGACY_OUT_CLASS: &str = "javax/net/ssl/SSLSocketOutputStream";
+
+/// Whether `this` is one of the four carriers above.
+///
+/// Used by `SSLSocket.close()V` to refuse a receiver that is a *stream* — see
+/// the guard there for why one can arrive.
+fn is_tls_stream_carrier(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        Some(name) => {
+            name == TLS_APP_IN_CLASS
+                || name == TLS_APP_OUT_CLASS
+                || name == TLS_LEGACY_IN_CLASS
+                || name == TLS_LEGACY_OUT_CLASS
+        }
+        None => false,
+    }
+}
+
+/// Allocate a TLS stream carrier of `class_name` bound to `tls_id`.
+///
+/// The id is recorded TWICE and both are load-bearing:
+///
+/// * in the **appended** slot — `try_alloc_with_appended_slots` puts the
+///   native's private slot ABOVE every field the real class declares, so on
+///   `AppInputStream` (7 declared fields on JDK 25: `oneByte`, `buffer`,
+///   `appDataIsAvailable`, `readLock`, `isClosing`, `hasDepleted`, `this$0`)
+///   the `Int` lands at slot 7 and not on top of `appDataIsAvailable`. The
+///   pre-existing code wrote slot 0 unconditionally, which was harmless only
+///   because the fabricated carrier declared nothing; on a real layout it is
+///   the W7-49 aliasing shape.
+/// * in `net_phase_e`'s identity-keyed side table, which is layout-independent
+///   and is what answers for a carrier some other path allocated.
+///
+/// Readers use [`tls_stream_id`], which reads the LAST slot and falls back to
+/// the side table — see there for why the last slot is the right index.
+fn alloc_tls_stream(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    tls_id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let (obj, base) = crate::try_alloc_with_appended_slots(ctx, class_name, 1)?;
+    // Layout-independent record first: if the `set_field` below is ever
+    // clamped away, the side table still answers.
+    crate::net_phase_e::sock_set_for_create(ctx, obj, 0, tls_id);
+    ctx.set_field(obj, base, Value::Int(tls_id));
+    Ok(obj)
+}
+
+/// The `s2_registry` TLS id a stream carrier is bound to, or `-1`.
+///
+/// **Why the last slot.** Every carrier this file hands out is allocated by
+/// [`alloc_tls_stream`] with `width == 1`, so its width is `base + 1` and the
+/// private slot is `object_num_fields(this) - 1` — one header read, no class
+/// lookup by name. That matters: `SSLSocketInputStream.read()I` is called ~134
+/// million times by `TestSsl.testPost` alone, and the measured budget for the
+/// whole native body is ~265 ns. Asking `appended_slot_base_for_class` per call
+/// would put a string-keyed class lookup on that path.
+///
+/// It is only sound BECAUSE the receiver is one this file allocated: on any
+/// other instance of the same class (a real JSSE `AppInputStream`, were one
+/// ever to reach here) the last slot is `this$0`, a reference, `as_int()`
+/// answers `None`, and the side-table fallback runs. That is the
+/// W7-49 "a base cannot be recovered from a foreign receiver's width" caveat,
+/// satisfied by never trusting the slot's *presence* — only a non-negative
+/// `Int` read out of it.
+fn tls_stream_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    let n = ctx.object_num_fields(this);
+    if n > 0 {
+        if let Some(id) = ctx.get_field(this, n - 1).as_int() {
+            if id >= 0 {
+                return id;
+            }
+        }
+    }
+    crate::net_phase_e::sock_stream_id_for_upcall(ctx, this)
+}
+
+/// Stamp a stream carrier's id slot to `-1` so a second `close()` is a no-op.
+fn tls_stream_clear_id(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let n = ctx.object_num_fields(this);
+    if n > 0 {
+        ctx.set_field(this, n - 1, Value::Int(-1));
+    }
+}
+
 // SSLSession field layout: 3 fields.
 //   0 = protocol String
 //   1 = cipher String
@@ -3465,12 +3615,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     this, fd_id
                 );
             }
-            // Return an InputStream that reads from the TLS fd
-            let is = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1)?;
-            // Real JDK stream layouts do not have our synthetic Int slot 0.
-            // Preserve the TLS id in the identity-keyed socket side table too.
-            crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
-            ctx.set_field(is, 0, Value::Int(fd_id));
+            // Return an InputStream that reads from the TLS fd.
+            //
+            // P1-C: `TLS_APP_IN_CLASS`, not the old
+            // `javax/net/ssl/SSLSocketInputStream` — no supported image
+            // declares that name, so under `--jdk-only` this line WAS the
+            // `NoClassDefFoundError` that made HTTPS unusable. Read the block
+            // on `TLS_APP_IN_CLASS` for the full argument and for why the
+            // plain-socket precedent is followed on the layout but not on the
+            // class name.
+            let is = alloc_tls_stream(ctx, TLS_APP_IN_CLASS, fd_id)?;
             // INVESTIGATED AND REVERTED (tls-handshake-enforcement-gap, doc
             // 21 — `TestSsl.testPost`): wrapping this in a real
             // `java.io.BufferedInputStream`, so that a single-byte `read()`
@@ -3515,14 +3669,43 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     fd_id
                 );
             }
-            let os = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1)?;
-            crate::net_phase_e::sock_set_for_create(ctx, os, 0, fd_id);
-            ctx.set_field(os, 0, Value::Int(fd_id));
+            // P1-C: see the `getInputStream` sibling above and the block on
+            // `TLS_APP_IN_CLASS`. This is the half the strict-mode witness
+            // actually reported (`NoClassDefFoundError:
+            // javax/net/ssl/SSLSocketOutputStream`); the input half was the
+            // same defect one call earlier and is fixed with it.
+            let os = alloc_tls_stream(ctx, TLS_APP_OUT_CLASS, fd_id)?;
             Ok(Some(Value::Object(Some(os))))
         },
     );
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // GUARD (P1-C, 2026-08-12) — this native can be handed a STREAM.
+        //
+        // `vm_exec.rs` and `invoke.rs` each carry an unconditional route:
+        // any receiver whose class name `starts_with("sun/security/ssl/
+        // SSLSocketImpl")` and whose (method, descriptor) is in a fixed
+        // tuple list is dispatched to `javax/net/ssl/SSLSocket`'s native for
+        // that pair. `("close", "()V")` is in that list, and the new stream
+        // carriers — `sun/security/ssl/SSLSocketImpl$AppInputStream` and
+        // `$AppOutputStream` — match the PREFIX. So `in.close()` on a stream
+        // arrives here with the stream as `this`.
+        //
+        // Without this guard the body below would write `Value::Int` over
+        // `NEW13_SOCK_TLSID`/`NEW13_SOCK_CLOSED` — slots 2 and 3, which on a
+        // real `AppInputStream` are `appDataIsAvailable` (boolean) and
+        // `readLock` (a `ReentrantLock` reference). That is the exact
+        // wrong-type-into-a-reference-slot shape this campaign is fixing,
+        // reached through a dispatch rule in a file this lane does not own.
+        //
+        // The right answer is also the documented one: closing a socket's
+        // stream closes the socket, which is what `ssl_stream_close` does.
+        // So detect and delegate rather than narrowing the predicate in
+        // `vm_exec.rs` — that narrowing is nominated separately as the
+        // durable fix, and this guard is correct with or without it.
+        if is_tls_stream_carrier(ctx, this) {
+            return ssl_stream_close(ctx, args);
+        }
         // Drop any handshake-listener global roots first: they keep the
         // listener objects permanently reachable, and a closed socket will
         // never fire another event. Unconditional (not gated on `tls_id >= 0`
@@ -3753,31 +3936,38 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // NEW-13: SSLSocketInputStream — reads from a `s2_registry` TLS stream
-    // identified by the tls_id stored in field 0 of the synthetic stream
-    // instance. A -1 id or short-read of 0 maps to Java EOF (-1) per
-    // InputStream.read semantics.
+    // NEW-13: the TLS socket's InputStream — reads from a `s2_registry` TLS
+    // stream identified by the tls_id in the carrier's appended private slot
+    // (see `alloc_tls_stream` / `tls_stream_id`). A -1 id or short-read of 0
+    // maps to Java EOF (-1) per InputStream.read semantics.
+    //
+    // P1-C (2026-08-12): the carrier class changed from the never-declared
+    // `javax/net/ssl/SSLSocketInputStream` to the image's own
+    // `sun/security/ssl/SSLSocketImpl$AppInputStream`, and every body below
+    // therefore stopped reading slot 0 — on a real layout slot 0 is
+    // `oneByte`, a `byte[]`. Both class names are registered: the new one is
+    // what this file's `getInputStream` hands out, the old one is still minted
+    // by `net_phase_e`'s layered-socket branch and is pinned by
+    // `scripts/baselines/jdk-only-gated-never-delete.tsv`. See the
+    // `TLS_APP_IN_CLASS` block for the whole argument.
     //
     // PERF NOTE (testssl-testpost bulk TLS, 2026-08-05): this native's own body
     // is NOT what makes a byte-at-a-time reader slow. Measured against
     // `SSLSocketOutputStream.flush()` — a registered no-op native on the same
     // receiver, so the difference is the body and nothing else — one `read()`
     // costs 814 ns at 1 thread, of which 549 ns is the Java->native transition
-    // and only ~265 ns is everything this closure does. Counters over a full
-    // `testPost` confirmed the two candidate slow spots are absent: the field
-    // read at slot 0 hits every time (16,777,216 of 16,777,216 calls — the
+    // and only ~265 ns is everything this body does. Counters over a full
+    // `testPost` confirmed the two candidate slow spots are absent: the private
+    // slot read hits every time (16,777,216 of 16,777,216 calls — the
     // side-table fallback never fires), and the readahead does exactly one real
     // socket read per 16 KiB (1024 refills, avg 16384 bytes). What remained of
     // the body was the descriptor lookup behind `get_field`; see
     // `vm_exec::resolve_field_descriptor_byte_cached`'s stub note.
-    let ssl_is = "javax/net/ssl/SSLSocketInputStream";
-    r.register(ssl_is, "read", "()I", |ctx, args| {
+    // `tls_stream_id` keeps that shape: one `object_num_fields` header read
+    // plus the same single `get_field`, and NOT a class lookup by name.
+    fn ssl_stream_read_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -3820,14 +4010,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             .into()),
         }
-    });
-    r.register(ssl_is, "read", "([BII)I", |ctx, args| {
+    }
+    fn ssl_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -3883,8 +4069,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             .into()),
         }
-    });
-    r.register(ssl_is, "available", "()I", |ctx, args| {
+    }
+    fn ssl_stream_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // native-tls does not expose a non-blocking peek, so match the
         // reference JDK behaviour of reporting 0 bytes readable without
         // blocking — EXCEPT for plaintext already pulled off the socket into
@@ -3893,18 +4079,75 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // reported, or a caller that loops on `available()` would stall on
         // bytes it has effectively already received.
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         if tls_id < 0 {
             return Ok(Some(Value::Int(0)));
         }
         Ok(Some(Value::Int(
             crate::servlet::s2_tls_buffered_len(tls_id) as i32,
         )))
-    });
+    }
+    // MUST be registered, and this is new with P1-C. `java.io.InputStream`'s
+    // own `skip(long)` would have been fine — it reads into a temporary array
+    // through `read([BII)` — but the real `SSLSocketImpl$AppInputStream`
+    // DECLARES `skip(long)`, and its body takes `this.readLock` and reads
+    // `this.buffer`. Both are `null` on a carrier this file allocated without
+    // running the real constructor, so leaving `skip` unregistered would turn
+    // `in.skip(n)` (every HTTP client that discards a response body) into an
+    // NPE inside java.base. This is the general hazard of moving onto a real
+    // receiver: every concrete method the real class declares must either be
+    // shadowed or be safe against an all-null layout. `available`, `read()`,
+    // `read([BII)` and `close` are shadowed above/below; `checkEOF`,
+    // `deplete` and `readLockedDeplete` are private and reachable only from
+    // those; `read([B)`, `mark`, `reset`, `markSupported`, `readAllBytes`,
+    // `readNBytes` and `transferTo` are NOT declared by `AppInputStream`, so
+    // they run `java.io.InputStream`'s bodies over the shadowed
+    // `read([BII)` — which is what they do on HotSpot too.
+    fn ssl_stream_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        let tls_id = tls_stream_id(ctx, this);
+        let n = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
+        if tls_id < 0 || n <= 0 {
+            return Ok(Some(Value::Long(0)));
+        }
+        // Drain the readahead first — free, and the common case for a small
+        // skip over an already-buffered body.
+        let mut skipped: i64 = 0;
+        while skipped < n {
+            match crate::servlet::s2_tls_pop_buffered_byte(tls_id) {
+                Some(_) => skipped += 1,
+                None => break,
+            }
+        }
+        if skipped >= n {
+            return Ok(Some(Value::Long(skipped)));
+        }
+        // STW-COOPERATION: blocking socket I/O — see the full rationale on
+        // `read()I` above. One region around the whole loop, and the error is
+        // carried out rather than returned from inside it.
+        let mut scratch = vec![0u8; 8192];
+        let mut err: Option<String> = None;
+        ctx.begin_blocking_region();
+        while skipped < n {
+            let want = ((n - skipped) as usize).min(scratch.len());
+            match crate::servlet::s2_tls_read(tls_id, &mut scratch[..want]) {
+                Ok(0) => break,
+                Ok(read) => skipped += read as i64,
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        ctx.end_blocking_region();
+        if let Some(message) = err {
+            // Bytes already skipped are gone from the stream either way; report
+            // the failure rather than claiming a clean partial skip, which is
+            // what the real body does (it propagates the IOException).
+            return Err(RuntimeError::IOException { message }.into());
+        }
+        Ok(Some(Value::Long(skipped)))
+    }
     // STUB-REMOVAL (wave 2): `close()` on either of the two TLS socket streams
     // was an unconditional no-op, so `sslSocket.getInputStream().close()` (and
     // the output-stream sibling) left the TLS session and its OS socket open —
@@ -3916,31 +4159,27 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // close_notify), stamp the id field to -1 so a second close is a no-op and
     // any later read reports EOF rather than reusing a recycled id, and keep
     // `net_phase_e`'s side table in sync.
+    //
+    // NOT CHANGED HERE, and deliberately: this closes the TLS stream, it does
+    // not add or alter any asynchronous/interruptible close behaviour. The
+    // wake-a-parked-reader question is a different lane's (W7-61 item 2,
+    // W2-2) and nothing in P1-C touches it.
     fn ssl_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         if tls_id >= 0 {
             let _ = crate::servlet::s2_tls_close(tls_id);
-            ctx.set_field(this, 0, Value::Int(-1));
+            tls_stream_clear_id(ctx, this);
         }
         crate::net_phase_e::sock_mark_closed_for_upcall(ctx, this);
         Ok(None)
     }
-    r.register(ssl_is, "close", "()V", ssl_stream_close);
 
-    // NEW-13: SSLSocketOutputStream — writes to `s2_registry` TLS stream.
-    let ssl_os = "javax/net/ssl/SSLSocketOutputStream";
-    r.register(ssl_os, "write", "(I)V", |ctx, args| {
+    // NEW-13: the TLS socket's OutputStream — writes to `s2_registry` TLS
+    // stream. Same P1-C carrier change as the input half above.
+    fn ssl_stream_write_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
@@ -3964,14 +4203,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             message: e.to_string(),
         })?;
         Ok(None)
-    });
-    r.register(ssl_os, "write", "([BII)V", |ctx, args| {
+    }
+    fn ssl_stream_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx
-            .get_field(this, 0)
-            .as_int()
-            .filter(|id| *id >= 0)
-            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        let tls_id = tls_stream_id(ctx, this);
         let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
@@ -4045,19 +4280,55 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::IOException { message }.into());
         }
         Ok(None)
-    });
-    // KEEP (genuinely empty): every `write` above hands its bytes straight to
-    // `servlet::s2_tls_write`, which drives the underlying `TlsStream` and its
-    // `TcpStream` synchronously — there is no Java- or Rust-side buffer between
-    // the caller and the socket, so there is nothing for `flush()` to push.
-    // VERIFIED against jdk-25 (`javap -p sun.security.ssl.SSLSocketImpl
-    // $AppOutputStream`): the class declares no `flush` at all, so the real
-    // call inherits `java.io.OutputStream.flush()`, whose body is empty. The
-    // real behaviour is a no-op, not merely equivalent to one.
-    r.register(ssl_os, "flush", "()V", |_ctx, _args| Ok(None));
-    // See `ssl_stream_close` above — closing a socket's stream closes the
-    // socket.
-    r.register(ssl_os, "close", "()V", ssl_stream_close);
+    }
+
+    // The registrations, on BOTH carriers.
+    //
+    // `TLS_APP_IN_CLASS` / `TLS_APP_OUT_CLASS` are what `getInputStream` /
+    // `getOutputStream` now hand out. `TLS_LEGACY_IN_CLASS` /
+    // `TLS_LEGACY_OUT_CLASS` are kept because `net_phase_e`'s own
+    // `java/net/Socket.getInputStream()` still mints them for a layered
+    // `SSLSocket` (net_phase_e.rs ~5273/5296, not this lane's file) and
+    // because `scripts/baselines/jdk-only-gated-never-delete.tsv` pins all
+    // eight legacy rows by name. Nothing else registers these triples on
+    // either receiver, so there is no last-write-wins question here — grepped
+    // across the workspace for `SSLSocketImpl$App` (this file only) and for
+    // the two legacy names (this file and the two `net_phase_e` mint sites,
+    // which register nothing).
+    //
+    // Kind: both receivers inherit `register_p68_ssl`'s ambient category,
+    // which the frozen kind map records as `bridge` for this block. The two
+    // legacy names are re-tagged `SyntheticStub` by
+    // `no_image_receiver::NO_IMAGE_JDK_RECEIVERS` (no image declares them) and
+    // so stay dropped under `--jdk-only` — correctly, since strict mode also
+    // refuses to mint them. The two new names are on none of those tables and
+    // name classes every image DOES declare, so they survive strict mode,
+    // which is the whole of this fix.
+    for is_cls in [TLS_APP_IN_CLASS, TLS_LEGACY_IN_CLASS] {
+        r.register(is_cls, "read", "()I", ssl_stream_read_one);
+        r.register(is_cls, "read", "([BII)I", ssl_stream_read_bytes);
+        r.register(is_cls, "available", "()I", ssl_stream_available);
+        r.register(is_cls, "skip", "(J)J", ssl_stream_skip);
+        r.register(is_cls, "close", "()V", ssl_stream_close);
+    }
+    for os_cls in [TLS_APP_OUT_CLASS, TLS_LEGACY_OUT_CLASS] {
+        r.register(os_cls, "write", "(I)V", ssl_stream_write_one);
+        r.register(os_cls, "write", "([BII)V", ssl_stream_write_bytes);
+        // KEEP (genuinely empty): every `write` above hands its bytes straight
+        // to `servlet::s2_tls_write`, which drives the underlying `TlsStream`
+        // and its `TcpStream` synchronously — there is no Java- or Rust-side
+        // buffer between the caller and the socket, so there is nothing for
+        // `flush()` to push. VERIFIED against jdk-25 (`javap -p
+        // sun.security.ssl.SSLSocketImpl$AppOutputStream`): the class declares
+        // no `flush` at all, so the real call inherits
+        // `java.io.OutputStream.flush()`, whose body is empty. The real
+        // behaviour is a no-op, not merely equivalent to one — which is also
+        // why this registration is safe on the real carrier.
+        r.register(os_cls, "flush", "()V", |_ctx, _args| Ok(None));
+        // See `ssl_stream_close` above — closing a socket's stream closes the
+        // socket.
+        r.register(os_cls, "close", "()V", ssl_stream_close);
+    }
 
     // NEW-13: SSLSession methods are now backed by the s2_registry TLS id
     // stored at NEW13_SESS_TLSID. Each accessor falls back to the session's
@@ -5878,7 +6149,26 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 return Err(cert_type_not_found(ctx, &type_name));
             }
             let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1)?;
-            ctx.set_field(obj, 0, Value::Object(None));
+            // W7-29 residual, closed 2026-08-12. This used to be
+            // `ctx.set_field(obj, 0, Value::Object(None))`, and W7-29's "what
+            // was deliberately not done" section named the consequence: in
+            // real-JDK mode the funnel widens this object to the real
+            // three-field layout (`provider`, `certFacSpi`, `type` — `javap
+            // -p`), so raw slot 0 is `provider`, NOT `type`, and `getType()`
+            // — which is real bytecode reading the real `type` field —
+            // answered `null` where HotSpot echoes the caller's spelling
+            // (`getInstance("x509").getType()` is `x509`).
+            //
+            // Writing BY NAME is the fix the record asked for and could not
+            // verify: it lands on `type` whatever the layout is, and
+            // `set_field_by_name` is a no-op when the field is absent
+            // (synthetic-stub mode), so it is safe on both. The raw slot-0
+            // write is gone rather than moved — nothing reads slot 0 of this
+            // receiver (grepped), and writing a native's idea of a field over
+            // whichever real field happens to sit at index 0 is the same
+            // defect species as P1-C's stream carriers.
+            let spelling = ctx.create_string(&type_name);
+            ctx.set_field_by_name(obj, "type", Value::Object(Some(spelling)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );

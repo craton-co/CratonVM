@@ -1855,16 +1855,48 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             _ => None,
         },
     };
-    if let Some(fd) = fd {
+    // W7-70's residual, SECOND site. `native_fos_close` is the fallback body;
+    // THIS is the one the shipping Compatible/real-JDK arm reaches, because the
+    // real `FileOutputStream.close()` bytecode routes through
+    // `FileDescriptor.closeAll` -> `close()` -> `close0()`. Repairing only the
+    // fallback would have left the default mode swallowing and taken the row
+    // off the census anyway — the shape W7-53 refused for the Windows pipe
+    // write.
+    //
+    // Only the FLUSH half is propagated here, and the asymmetry with
+    // `native_fos_close` is deliberate rather than an oversight:
+    //
+    //   * the flush is the byte delivery (writer entries are `BufWriter`s), so
+    //     dropping it is lost data reported as success. Its blast radius
+    //     outside buffered file writers is provably empty: `FdTable::flush`
+    //     ends in `_ => Ok(())` for every non-writable entry, so a read-side
+    //     `FileInputStream.close()` and the `sun.nio.ch.UnixDispatcher.close0`
+    //     socket registration that shares this body cannot start throwing.
+    //   * the CLOSE half is not propagated here. This body is registered for
+    //     three different receivers, one of which is a socket dispatcher; a
+    //     close error there is fd release rather than data loss, and turning it
+    //     into an `IOException` on a path no measurement has covered is the
+    //     kind of blind widening these records exist to refuse. Named, not
+    //     quietly counted.
+    let flush_result = if let Some(fd) = fd {
         // stdin/stdout/stderr (0..=2) are process-lifetime streams — never
         // release them or a later console write/read would hit a dead fd.
         if fd > 2 {
-            let _ = ctx.fd_table().flush(fd);
+            let flushed = ctx.fd_table().flush(fd);
             let _ = ctx.fd_table().close(fd);
+            flushed
+        } else {
+            Ok(())
         }
-    }
+    } else {
+        Ok(())
+    };
+    // The descriptor is marked closed BEFORE the failure is raised — HotSpot's
+    // `closeAll` latches `closed = true` before running the delegate, so a
+    // retry after a failing close does not re-close.
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    flush_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2243,13 +2275,53 @@ fn native_fos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(fd) => fd,
         None => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
-    let _ = ctx.fd_table().close(fd);
-    // Mark the descriptor closed so a double-close is a clean no-op.
+    // W7-70-printstream-close-noop.md's named residual, and W7-57's shape one
+    // layer below the delegated-Java-call sites it swept: both host calls used
+    // to be `let _ =`, so a disk-full / quota / device failure at close was
+    // reported as success. `java.io.FileOutputStream.close()` declares
+    // `throws IOException`, runs `fd.closeAll(() -> close0())` and catches
+    // nothing, so HotSpot lets that failure out. Two further reasons this is
+    // not merely tidiness:
+    //
+    //   * the FLUSH here is this VM's byte delivery. `FdTable`'s writer entries
+    //     are `BufWriter`s; HotSpot's `FileOutputStream` is unbuffered and has
+    //     no equivalent step, so dropping our flush is lost data reported as
+    //     success — the exact fault shape W7-57 exists for.
+    //   * its own neighbour already propagates. `native_fos_flush` twelve lines
+    //     up is `ctx.fd_table().flush(fd).map_err(io_err)?`, so this body was
+    //     the odd one out rather than a considered policy.
+    //
+    // fd < 3 keeps the swallow, deliberately and not out of caution:
+    // `FdTable::close` answers `Ok(())` for fd < 3 outright (it refuses to
+    // release the process console), so the close half could never report
+    // anything there; and the flush half on fd 1/2 flushes the PROCESS console
+    // buffer this VM shares between every writer, which HotSpot's unbuffered
+    // `FileOutputStream` has no counterpart for — turning a broken pipe on
+    // stdout into an `IOException` out of an unrelated stream's `close()` would
+    // be a divergence invented here, not parity. Same boundary
+    // `native_printstream_close`'s console branch and `FdTable::close` itself
+    // already draw.
+    let host_result = if fd >= 3 {
+        let flushed = ctx.fd_table().flush(fd);
+        let closed = ctx.fd_table().close(fd);
+        // The flush failure WINS — it is the byte delivery — but the close is
+        // attempted either way, which is the `finally` semantics of the JDK's
+        // `closeAll`: the descriptor is released on the failing path too.
+        flushed.and(closed)
+    } else {
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().close(fd);
+        Ok(())
+    };
+    // Mark the descriptor closed so a double-close is a clean no-op. Done
+    // BEFORE the failure is raised, for the reason HotSpot does the same:
+    // `FileDescriptor.closeAll` sets `closed = true` before it runs the
+    // delegate, so a retry after a failing close does not re-close.
     if let Some(fd_obj) = fos_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
     }
+    host_result.map_err(io_err)?;
     Ok(None)
 }
 
@@ -19117,6 +19189,23 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let boxed = afc_read_boxed(ctx, args)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
+}
+
+/// The whole of `AsynchronousFileChannel.read(ByteBuffer, long)` EXCEPT the
+/// `Future` wrapper: returns the byte count already boxed as a
+/// `java.lang.Integer`.
+///
+/// Split out of `native_afc_read` so that the `CompletionHandler` overload can
+/// reach the result WITHOUT reading slot 0 of the returned future. That peek
+/// (`ctx.get_field(f, 0)`) was safe only while the future was this file's own
+/// two-slot `CompletedFuture`; now that `wrap_completed_future` returns a real
+/// `java.util.concurrent.CompletableFuture`, slot 0 is that class's real
+/// `result` field and reading it would be a layout assumption about `java.base`
+/// — including its private `NIL`/`AltResult` encodings. The value is produced
+/// once and used directly instead.
+fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
@@ -19132,13 +19221,10 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(v) if v > 0 => v as u32,
         // Future<Integer>.get() real bytecode does checkcast Integer on
         // this return value -- a bare Value::Int here (as opposed to
-        // going through wrap_completed_future+afc_box_integer like every
-        // other exit point) crashes the VM instead of raising. Box +
-        // wrap like the rest of this function.
-        _ => {
-            let boxed = afc_box_integer(ctx, -1)?;
-            return Ok(Some(wrap_completed_future(ctx, boxed)?));
-        }
+        // going through afc_box_integer like every other exit point)
+        // crashes the VM instead of raising. Box like the rest of this
+        // function.
+        _ => return afc_box_integer(ctx, -1),
     };
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19146,8 +19232,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        return afc_box_integer(ctx, 0);
     }
 
     let mut buf = vec![0u8; remaining];
@@ -19178,8 +19263,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     })?;
 
     if n == 0 {
-        let boxed = afc_box_integer(ctx, -1)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        return afc_box_integer(ctx, -1);
     }
 
     let view = bb_storage_view(ctx, bb)?;
@@ -19197,11 +19281,17 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // proper Integer. The sibling CompletionHandler-based overloads
     // below already box via afc_box_integer -- this just brings the
     // plain Future overload in line with that established pattern.
-    let boxed = afc_box_integer(ctx, n as i32)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    afc_box_integer(ctx, n as i32)
 }
 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let boxed = afc_write_boxed(ctx, args)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
+}
+
+/// `AsynchronousFileChannel.write(ByteBuffer, long)` without the `Future`
+/// wrapper — see [`afc_read_boxed`] for why the split exists.
+fn afc_write_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
     let position = afc_position_arg(args, 2)?;
@@ -19215,12 +19305,9 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
-        // See the matching arm in native_afc_read: must be a boxed
+        // See the matching arm in afc_read_boxed: must be a boxed
         // Integer inside a real completed Future, not a bare Value::Int.
-        _ => {
-            let boxed = afc_box_integer(ctx, -1)?;
-            return Ok(Some(wrap_completed_future(ctx, boxed)?));
-        }
+        _ => return afc_box_integer(ctx, -1),
     };
 
     // Real AsynchronousFileChannel.write() contract: throws
@@ -19256,8 +19343,7 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0)?;
-        return Ok(Some(wrap_completed_future(ctx, boxed)?));
+        return afc_box_integer(ctx, 0);
     }
 
     let mut data = vec![0u8; remaining];
@@ -19280,11 +19366,10 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     })?;
 
     buf_set_position(ctx, bb, pos + n as i32);
-    // See native_afc_read above for the full rationale: box before
+    // See afc_read_boxed above for the full rationale: box before
     // wrapping, matching the CompletionHandler overloads' afc_box_integer
     // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
-    let boxed = afc_box_integer(ctx, n as i32)?;
-    Ok(Some(wrap_completed_future(ctx, boxed)?))
+    afc_box_integer(ctx, n as i32)
 }
 
 fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Result<Value, MethodCallFailed> {
@@ -19301,28 +19386,23 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let attachment = args.get(3).copied().unwrap_or(Value::Object(None));
     let handler = obj_arg92(args, 4)?;
 
-    // Perform the read synchronously (real async would use thread pool)
+    // Perform the read synchronously (real async would use thread pool).
+    // Call the unwrapped body: `CompletionHandler.completed` takes the value,
+    // not a Future, so building one and then reading slot 0 back out of it was
+    // both wasted work and a layout assumption about `CompletableFuture`
+    // (see `afc_read_boxed`).
     let read_args = vec![
         Value::Object(Some(this)),
         Value::Object(Some(bb)),
         Value::Long(position as i64),
     ];
-    let result = native_afc_read(ctx, &read_args);
+    let result = afc_read_boxed(ctx, &read_args);
 
     match result {
-        Ok(Some(future_val)) => {
-            // Extract the result from the future wrapper
-            let bytes_read = if let Value::Object(Some(f)) = future_val {
-                ctx.get_field(f, 0)
-            } else {
-                Value::Int(-1)
-            };
-            // CompletionHandler.completed erases to (Object,Object); box the
-            // byte count just like HotSpot's AsynchronousFileChannel does.
-            let completed_arg = match bytes_read {
-                Value::Int(n) => afc_box_integer(ctx, n)?,
-                other => other,
-            };
+        Ok(completed_arg) => {
+            // CompletionHandler.completed erases to (Object,Object); the byte
+            // count arrives already boxed as a java.lang.Integer, just like
+            // HotSpot's AsynchronousFileChannel hands it over.
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
@@ -19341,7 +19421,6 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 &[Value::Object(Some(exc)), attachment],
             );
         }
-        _ => {}
     }
     Ok(None)
 }
@@ -19359,19 +19438,11 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Object(Some(bb)),
         Value::Long(position as i64),
     ];
-    let result = native_afc_write(ctx, &write_args);
+    // Unwrapped body — see the matching comment in native_afc_read_handler.
+    let result = afc_write_boxed(ctx, &write_args);
 
     match result {
-        Ok(Some(future_val)) => {
-            let bytes_written = if let Value::Object(Some(f)) = future_val {
-                ctx.get_field(f, 0)
-            } else {
-                Value::Int(0)
-            };
-            let completed_arg = match bytes_written {
-                Value::Int(n) => afc_box_integer(ctx, n)?,
-                other => other,
-            };
+        Ok(completed_arg) => {
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
@@ -19389,7 +19460,6 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 &[Value::Object(Some(exc)), attachment],
             );
         }
-        _ => {}
     }
     Ok(None)
 }
@@ -19425,16 +19495,91 @@ pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Int(if open { 1 } else { 0 })))
 }
 
-/// Wrap a value in a "CompletedFuture" synthetic object.
-/// CompletedFuture layout: [0] = result value, [1] = done (always 1)
+/// A **completed `Future`** for this file's synchronous "async" channel ops.
+///
+/// Returns a real `java.util.concurrent.CompletableFuture.completedFuture(v)`.
+/// `AsynchronousFileChannel.read/write` are declared to return `Future<Integer>`
+/// and `CompletableFuture` implements it, so the static type is satisfied and
+/// the caller gets `get()` / `get(timeout, unit)` / `isDone()` / `isCancelled()`
+/// / `cancel(..)` from real `java.base` bytecode rather than from five constant
+/// natives.
+///
+/// **This used to be a bare
+/// `try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?`, and
+/// that is a `--jdk-only` defect of the "essential native outlives its
+/// receiver" shape.** `java/util/concurrent/CompletedFuture` is a name **no JDK
+/// image declares** — it is listed in `native-api`'s `NO_IMAGE_JDK_RECEIVERS`,
+/// so (a) its five natives are re-tagged `SyntheticStub` centrally and are
+/// therefore REFUSED in strict mode, and (b) `try_ensure_synthetic_class`
+/// refuses to mint the class. Meanwhile every `AsynchronousFileChannel`
+/// registration in this file is `Bridge` (see `register_phase92_io_completeness`)
+/// and so survives strict mode. The refusal is correct; the surviving caller
+/// was the bug, and it surfaced as the application seeing
+/// `NoClassDefFoundError: java/util/concurrent/CompletedFuture` at
+/// `ch.write(buf, 0).get()` — measured 2026-08-12 on `--jdk-only`, where
+/// HotSpot 25 runs the identical program cleanly. H2's `FileAsync.write` /
+/// `TestFileSystem.testConcurrent` on the `async:` filesystem is the corpus
+/// vector.
+///
+/// This is the same remedy `native-builtins`' `aio_completed_future` (the DF07
+/// fix, `phases_late/concurrent.rs`) already applies to the
+/// `AsynchronousSocketChannel` twin, and it is deliberately the *static factory*
+/// rather than `new CompletableFuture()` + `complete(v)`: `completedFuture` has
+/// no native shim registered on it in real-JDK mode (the shims in
+/// `util_concurrent_ext` / `phases_late::concurrent` live inside
+/// `register_synthetic_overrides`), so real bytecode runs, and it encodes a
+/// null result via the private `NIL` sentinel the way the rest of the class
+/// expects. A synthetic `FutureTask` does NOT work here for the reason that
+/// helper records: its real `get()` bytecode reads the real `state` field,
+/// which is stuck at `NEW`.
+///
+/// The synthetic mint stays as a **fallback**, not as the primary: in
+/// `--synthetic-jdk` builds `completedFuture` is answered by the shim above and
+/// still yields a two-slot future with a name a caller can hold, so the fallback
+/// is only reached if `CompletableFuture` is unavailable in *both* shapes.
+/// Laundering a policy refusal into a `NoClassDefFoundError` at the
+/// application's call site is the worst available outcome, so it is the last
+/// resort rather than the first.
 fn wrap_completed_future(
     ctx: &mut dyn NativeContext,
     value: Value,
 ) -> Result<Value, MethodCallFailed> {
-    let future = try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?;
-    ctx.set_field(future, 0, value);
-    ctx.set_field(future, 1, Value::Int(1)); // done
-    Ok(Value::Object(Some(future)))
+    // `value` is used again on the fallback path below, and BOTH the attempt
+    // and the fallback allocation run code that can collect — a moving young GC
+    // there would relocate it (the native stale-local family). Pin across the
+    // whole body and re-read at the point of use, exactly as
+    // `completed_executor_future` does for its result.
+    let value_obj = match value {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let value_pin = value_obj.map(|o| ctx.pin_native_root(o));
+    let real = ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "completedFuture",
+        "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+        &[value],
+    );
+    let outcome = match real {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(v),
+        // Fallback only — see the doc comment. Layout: [0] = result, [1] = done.
+        _ => match try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2) {
+            Ok(future) => {
+                let value = match (value_pin, value_obj) {
+                    (Some(pin), Some(o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+                    _ => value,
+                };
+                ctx.set_field(future, 0, value);
+                ctx.set_field(future, 1, Value::Int(1)); // done
+                Ok(Value::Object(Some(future)))
+            }
+            Err(e) => Err(e),
+        },
+    };
+    if let Some(pin) = value_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    outcome
 }
 
 fn native_completed_future_cancel(
@@ -22887,6 +23032,27 @@ mod io_tests {
             Value::Object(Some(o)) => o,
             other => panic!("expected future object, got {other:?}"),
         };
+
+        // The REAL `java.util.concurrent.CompletableFuture` is tried first, and
+        // the five registrations above are the fallback for the configurations
+        // that cannot answer it. This mock's `invoke` answers `Ok(None)` for
+        // everything, so `future` above IS that fallback and the assertions
+        // below exercise only it — the recorded call is the only trace the
+        // primary path leaves here. Without this assertion the whole test passes
+        // unchanged on the pre-fix body, which minted the no-image
+        // `CompletedFuture` unconditionally and died as
+        // `NoClassDefFoundError` under `--jdk-only`.
+        assert!(
+            ctx.recorded_calls().iter().any(|c| {
+                c.declared_class.as_deref() == Some("java/util/concurrent/CompletableFuture")
+                    && c.method_name == "completedFuture"
+                    && c.descriptor
+                        == "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;"
+            }),
+            "wrap_completed_future must try the real CompletableFuture before \
+             minting the synthetic fallback: {:?}",
+            ctx.recorded_calls()
+        );
 
         assert_eq!(
             get(&mut ctx, &[Value::Object(Some(future))]).unwrap(),

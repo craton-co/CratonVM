@@ -2197,8 +2197,187 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 }
 
 // --- Linker: create downcall handles ---
-// DowncallHandle synthetic: [0]=function_address, [1]=descriptor,
-// [2]=first variadic argument, [3]=cached CIF, [4]=captureCallState flag.
+//
+// The carrier a downcall handle is allocated AS is a real
+// `java/lang/invoke/MethodHandle`. See [`alloc_downcall_handle`] for why, and
+// for the slot layout that used to be a five-field
+// `java/lang/foreign/DowncallHandle`.
+
+/// First slot of the downcall state on a [`DOWNCALL_CARRIER_CLASS`] carrier.
+///
+/// Anchored well past `lang_invoke.rs`'s synthetic MethodHandle window, for the
+/// same reason that window is itself anchored at 16 rather than at the real
+/// JDK's field count of 6: the window GREW once already (`MH_BOUND + 1` to
+/// `MH_VARARGS + 1`, W7-19 §5.2), so a base chosen to sit exactly on top of
+/// today's last slot is a collision waiting for the next combinator.
+///
+/// The gap between the two windows is not addressed by this file and is left
+/// null by [`alloc_downcall_handle`] — see the null-fill there.
+pub(crate) const DOWNCALL_BASE: usize = 32;
+
+/// Discriminator slot: `Int(DOWNCALL_TAG_MAGIC)` on a downcall carrier and
+/// nothing else. See [`is_downcall_handle`].
+pub(crate) const DOWNCALL_TAG: usize = DOWNCALL_BASE;
+/// Target function pointer (`Long`). Never dereferenced without
+/// [`validated_fn_ptr`].
+pub(crate) const DOWNCALL_FN_ADDR: usize = DOWNCALL_BASE + 1;
+/// The `java/lang/foreign/FunctionDescriptor` this handle was linked against.
+pub(crate) const DOWNCALL_DESCRIPTOR: usize = DOWNCALL_BASE + 2;
+/// Index of the first variadic argument, or `-1` for a non-variadic call.
+pub(crate) const DOWNCALL_FIRST_VARIADIC: usize = DOWNCALL_BASE + 3;
+/// T5.6.3 cached `Box<Cif>` raw pointer as `u64` (`0` = not yet built).
+pub(crate) const DOWNCALL_CIF: usize = DOWNCALL_BASE + 4;
+/// `Int(1)` when `Linker.Option.captureCallState` added a leading
+/// `MemorySegment` parameter.
+pub(crate) const DOWNCALL_CAPTURE_CALL_STATE: usize = DOWNCALL_BASE + 5;
+/// Width [`alloc_downcall_handle`] requests.
+pub(crate) const DOWNCALL_SLOT_COUNT: usize = DOWNCALL_CAPTURE_CALL_STATE + 1;
+
+/// `"DCH1"`. Distinctive on purpose: [`is_downcall_handle`] is asked about
+/// arbitrary references, and a magic that could plausibly be a stored `int`
+/// would make the predicate answer yes for a handle that merely happens to be
+/// wide enough.
+const DOWNCALL_TAG_MAGIC: i32 = 0x4443_4831;
+
+/// The class a downcall handle is allocated as.
+///
+/// **This is the whole of the `--jdk-only` fix.** It used to be
+/// `java/lang/foreign/DowncallHandle`, a name NO JDK image declares — it is in
+/// `native-api/src/no_image_receiver.rs`'s `NO_IMAGE_JDK_RECEIVERS`. Strict
+/// mode refuses to fabricate such a class, correctly, so
+/// `Linker.downcallHandle` died with `NoClassDefFoundError:
+/// java/lang/foreign/DowncallHandle` and took all of Panama with it. The
+/// refusal was right; the caller surviving to ask for it was the defect.
+pub(crate) const DOWNCALL_CARRIER_CLASS: &str = "java/lang/invoke/MethodHandle";
+
+/// Is `obj` a downcall handle?
+///
+/// Replaces the `class_name == "java/lang/foreign/DowncallHandle"` test that
+/// the consumers in `lang_invoke.rs` used while the carrier had a class of its
+/// own. Three screens, cheapest first:
+///
+/// 1. **Width.** Every MethodHandle `lang_invoke.rs` mints is 22 slots, so this
+///    rejects the entire ordinary population on one integer compare — and it is
+///    what makes the tag read safe rather than an out-of-bounds access. Same
+///    discipline as `mh_is_varargs_collector`.
+/// 2. **Exact class.** Our carrier is allocated as `java/lang/invoke/
+///    MethodHandle` itself, so a real-JDK `BoundMethodHandle$Species_L` or
+///    `DirectMethodHandle$Constructor` is not one of ours no matter how wide.
+/// 3. **Tag.** [`DOWNCALL_TAG_MAGIC`], written by [`alloc_downcall_handle`].
+pub(crate) fn is_downcall_handle(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.object_num_fields(obj) > DOWNCALL_TAG
+        && ctx
+            .class_name_arc_of_id(ctx.class_id_of_object(obj))
+            .as_deref()
+            == Some(DOWNCALL_CARRIER_CLASS)
+        && matches!(ctx.get_field(obj, DOWNCALL_TAG), Value::Int(tag) if tag == DOWNCALL_TAG_MAGIC)
+}
+
+/// Mint the `MethodHandle` that `Linker.downcallHandle` hands back.
+///
+/// # Why a real `MethodHandle` and not a class of our own
+///
+/// `Linker.downcallHandle` is DECLARED to return `java.lang.invoke.
+/// MethodHandle`, and on a real JDK that is what it returns. Returning an
+/// invented `java/lang/foreign/DowncallHandle` instead cost three separate
+/// compensations, every one of which this carrier deletes rather than moves:
+///
+/// * `vm_exec.rs::is_method_handle_signature_polymorphic_receiver` had to name
+///   the class, or `invokeExact` would not link signature-polymorphically. A
+///   real `java/lang/invoke/MethodHandle` already satisfies that predicate's
+///   first arm. (ES-FAIL-FAMILY-20260710 is that compensation being added.)
+/// * `typecheck.rs` had to hard-code that the invented class is castable to
+///   `java/lang/invoke/MethodHandle`. Now it IS one.
+/// * `lang_invoke.rs`'s `asType` had to refuse to write the `type` field,
+///   because on the compact layout slot 0 was the FUNCTION ADDRESS and writing
+///   a `MethodType` over it turned a later void `invokeExact` into a silent
+///   no-op. Here slot 0 is the genuine `type` field and the write is correct.
+///
+/// # The `type` field is populated here, not lazily
+///
+/// It has to be. `pe_downcall_type` was registered as `DowncallHandle.type()`;
+/// with a `MethodHandle` receiver, `type()` resolves to `lang_invoke.rs`'s
+/// registration on `java/lang/invoke/MethodHandle`, which reads slot 0 and
+/// falls back to `()V` when it is null. A downcall that reported `()V` would
+/// mis-link every signature-polymorphic call site, so the MethodType is
+/// derived from the FunctionDescriptor and stored at mint time.
+///
+/// # GC
+///
+/// `build_method_type_from_descriptor` allocates, so both the carrier and the
+/// caller's `descriptor` are pinned across it and re-read after.
+pub(crate) fn alloc_downcall_handle(
+    ctx: &mut dyn NativeContext,
+    fn_addr: i64,
+    descriptor: ObjectRef,
+    first_variadic: i64,
+    capture_call_state: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Pinned BEFORE the allocation below, which can itself collect.
+    let desc_pin = ctx.pin_native_root(descriptor);
+    let handle = try_alloc_concurrent_synthetic(ctx, DOWNCALL_CARRIER_CLASS, DOWNCALL_SLOT_COUNT)?;
+    let handle_pin = ctx.pin_native_root(handle);
+    let descriptor = ctx.read_native_pin(desc_pin, descriptor);
+
+    let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, capture_call_state)?;
+    let method_type = crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?
+        .ok_or_else(|| -> MethodCallFailed {
+            RuntimeError::IllegalStateException {
+                message: format!(
+                    "Unable to construct MethodType for DowncallHandle descriptor \
+                     {method_descriptor}"
+                ),
+            }
+            .into()
+        })?;
+
+    let handle = ctx.read_native_pin(handle_pin, handle);
+    let descriptor = ctx.read_native_pin(desc_pin, descriptor);
+
+    // Everything between the real JDK's `type` field and our base belongs to
+    // neither of us: slots 1-5 are the JDK's other MethodHandle fields and
+    // 16-21 are `lang_invoke.rs`'s synthetic MethodHandle window. Null rather
+    // than left raw, so a reader that reaches one — `mh_is_varargs_collector`
+    // tests `Int(1)` at slot 21 and would otherwise be interpreting whatever
+    // the allocator left there — gets a definite "absent" instead of padding.
+    // Null is the safe filler in both directions: a reference slot reads as a
+    // null oop and an int-shaped reader's `match` falls to its default arm.
+    for slot in 1..DOWNCALL_BASE {
+        ctx.set_field(handle, slot, Value::Object(None));
+    }
+    // Slot 0 is the real JDK `MethodHandle.type` field.
+    ctx.set_field(handle, 0, Value::Object(Some(method_type)));
+
+    ctx.set_field(handle, DOWNCALL_TAG, Value::Int(DOWNCALL_TAG_MAGIC));
+    ctx.set_field(handle, DOWNCALL_FN_ADDR, Value::Long(fn_addr));
+    ctx.set_field(handle, DOWNCALL_DESCRIPTOR, Value::Object(Some(descriptor)));
+    ctx.set_field(handle, DOWNCALL_FIRST_VARIADIC, Value::Long(first_variadic));
+    ctx.set_field(handle, DOWNCALL_CIF, Value::Long(0));
+    ctx.set_field(
+        handle,
+        DOWNCALL_CAPTURE_CALL_STATE,
+        Value::Int(capture_call_state as i32),
+    );
+
+    ctx.unpin_native_roots(desc_pin);
+    Ok(handle)
+}
+
+/// The function pointer this handle targets, or 0.
+pub(crate) fn downcall_fn_addr(ctx: &dyn NativeContext, handle: ObjectRef) -> i64 {
+    match ctx.get_field(handle, DOWNCALL_FN_ADDR) {
+        Value::Long(n) => n,
+        _ => 0,
+    }
+}
+
+/// The `FunctionDescriptor` this handle was linked against.
+fn downcall_descriptor(ctx: &dyn NativeContext, handle: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(handle, DOWNCALL_DESCRIPTOR) {
+        Value::Object(Some(d)) => Some(d),
+        _ => None,
+    }
+}
 
 pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
     let option = "java/lang/foreign/Linker$Option";
@@ -2245,23 +2424,13 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
 
     // downcallHandle(MemorySegment address, FunctionDescriptor desc) → MethodHandle
     //
-    // The handle synthetic carries 4 fields:
-    //   field 0 : Long   — function pointer
-    //   field 1 : Object — FunctionDescriptor
-    //   field 2 : Long   — first-variadic-arg index (-1 = non-variadic)
-    //   field 3 : Long   — T5.6.3 cached `Box<Cif>` raw pointer as u64
-    //                      (0 = not yet built). See `panama_libffi`.
+    // Layout and carrier class: see `alloc_downcall_handle`.
     r.register(linker, "downcallHandle", "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
         let addr_seg = obj_arg(args, 1)?;
         let descriptor = obj_arg(args, 2)?;
         let fn_addr = crate::panama_libffi::segment_address(ctx, addr_seg);
 
-        let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
-        ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
-        ctx.set_field(handle, 4, Value::Int(0)); // captureCallState disabled
+        let handle = alloc_downcall_handle(ctx, fn_addr, descriptor, -1, false)?;
         Ok(Some(Value::Object(Some(handle))))
     });
 
@@ -2305,12 +2474,13 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-            ctx.set_field(handle, 0, Value::Long(fn_addr));
-            ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-            ctx.set_field(handle, 2, Value::Long(variadic_fixed));
-            ctx.set_field(handle, 3, Value::Long(0)); // cif not yet cached
-            ctx.set_field(handle, 4, Value::Int(capture_call_state as i32));
+            let handle = alloc_downcall_handle(
+                ctx,
+                fn_addr,
+                descriptor,
+                variadic_fixed,
+                capture_call_state,
+            )?;
             Ok(Some(Value::Object(Some(handle))))
         },
     );
@@ -2331,7 +2501,28 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
     register_pe_linker_options(r);
 
     // DowncallHandle.invoke(Object... args) → Object
-    // This is the actual native function call entry point.
+    //
+    // UNREACHABLE since the carrier became a real `java/lang/invoke/
+    // MethodHandle` ([`alloc_downcall_handle`]): nothing in the VM allocates a
+    // `java/lang/foreign/DowncallHandle` any more, so no receiver can ever
+    // resolve to these four rows. Invocation now arrives at `lang_invoke.rs`'s
+    // `MethodHandle.invoke`/`invokeExact`, whose `mh_dispatch` routes downcalls
+    // to `pe_downcall_invoke` before decoding the generic MethodHandle layout.
+    //
+    // NOT DELETED HERE, deliberately. These four rows are frozen by name in
+    // `scripts/baselines/jdk-only-kind-map-25-linux.tsv`,
+    // `jdk-only-gated-never-delete.tsv` and `jdk-only-dead-everywhere-GATED.tsv`,
+    // and removing a registration those gates enumerate is a census change that
+    // has to be made with the gate run, not alongside a behaviour change. The
+    // rows are inert in the meantime, which is the safe direction: a dead
+    // registration decides nothing, whereas deleting one the gate still expects
+    // reddens the gate for a reason unrelated to this fix.
+    //
+    // Do NOT re-point these at `java/lang/invoke/MethodHandle`. `register` is
+    // last-write-wins on (class, method, descriptor), so registering
+    // `pe_downcall_invoke` on `MethodHandle.invoke([Ljava/lang/Object;)…` would
+    // silently replace `lang_invoke.rs`'s body for EVERY method handle in the
+    // VM, not only for downcalls.
     let dh = "java/lang/foreign/DowncallHandle";
     r.register(
         dh,
@@ -2373,27 +2564,23 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// Return the MethodHandle type represented by a synthetic DowncallHandle.
+/// The JVM method descriptor a downcall handle's `MethodType` is built from.
 ///
-/// The synthetic stores its FunctionDescriptor in field 1, while JDK callers
-/// still invoke inherited MethodHandle.type(). Derive its carrier signature
-/// from that descriptor instead of exposing an untyped Object[] invoker.
-pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Derived from the `FunctionDescriptor`'s layouts rather than exposing an
+/// untyped `Object[]` invoker, because a signature-polymorphic call site links
+/// against whatever `type()` reports.
+///
+/// Allocation-free (reads layout fields only), so [`alloc_downcall_handle`]
+/// may call it before it has anything pinned.
+fn downcall_carrier_descriptor(
+    ctx: &dyn NativeContext,
+    descriptor: ObjectRef,
+    captures_call_state: bool,
+) -> Result<String, MethodCallFailed> {
     use crate::panama_libffi as plf;
 
-    let handle = obj_arg(args, 0)?;
-    let descriptor = match ctx.get_field(handle, 1) {
-        Value::Object(Some(descriptor)) => descriptor,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "DowncallHandle has no FunctionDescriptor".into(),
-            }
-            .into());
-        }
-    };
-
     let mut method_descriptor = String::from("(");
-    if downcall_handle_captures_call_state(ctx, handle) {
+    if captures_call_state {
         method_descriptor.push_str("Ljava/lang/foreign/MemorySegment;");
     }
     for layout in plf::descriptor_param_layouts(ctx, descriptor) {
@@ -2414,6 +2601,29 @@ pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         )),
         None => method_descriptor.push('V'),
     }
+    Ok(method_descriptor)
+}
+
+/// Return the `MethodType` represented by a downcall handle.
+///
+/// **Now a fallback, not the primary path.** While the carrier was a class of
+/// its own this was registered as `DowncallHandle.type()`. On a real
+/// `java/lang/invoke/MethodHandle` carrier, `type()` resolves to
+/// `lang_invoke.rs`'s registration, which reads the real `type` field at slot
+/// 0 — populated by [`alloc_downcall_handle`] for exactly that reason. This
+/// stays because the registration on the old receiver is still present (see
+/// the note at the `DowncallHandle` registration block) and because it is the
+/// one place the descriptor→`MethodType` derivation is spelled out.
+pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let handle = obj_arg(args, 0)?;
+    let descriptor = downcall_descriptor(ctx, handle).ok_or_else(|| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "DowncallHandle has no FunctionDescriptor".into(),
+        }
+        .into()
+    })?;
+    let captures = downcall_handle_captures_call_state(ctx, handle);
+    let method_descriptor = downcall_carrier_descriptor(ctx, descriptor, captures)?;
 
     let method_type =
         crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?.ok_or_else(
@@ -2445,7 +2655,7 @@ fn downcall_layout_carrier_descriptor(kind: i32) -> &'static str {
 }
 
 fn downcall_handle_captures_call_state(ctx: &dyn NativeContext, handle: ObjectRef) -> bool {
-    matches!(ctx.get_field(handle, 4), Value::Int(flag) if flag != 0)
+    matches!(ctx.get_field(handle, DOWNCALL_CAPTURE_CALL_STATE), Value::Int(flag) if flag != 0)
 }
 
 fn write_downcall_capture_state(ctx: &dyn NativeContext, state: ObjectRef) {
@@ -2465,18 +2675,18 @@ fn write_downcall_capture_state(ctx: &dyn NativeContext, state: ObjectRef) {
 
 /// Execute a downcall via libffi (NEW-18).
 ///
-/// The handle synthetic carries the function pointer (field 0), the
-/// FunctionDescriptor (field 1), an optional fixed-arg count for
-/// variadic calls (field 2; -1 means non-variadic), and a T5.6.3
-/// cached `Box<Cif>` raw pointer (field 3; 0 means unpopulated).
-/// The descriptor carries the parameter and return layouts.
+/// The handle carries the function pointer, the FunctionDescriptor, an
+/// optional fixed-arg count for variadic calls (-1 means non-variadic) and a
+/// T5.6.3 cached `Box<Cif>` raw pointer (0 means unpopulated) at the
+/// `DOWNCALL_*` slots — see [`alloc_downcall_handle`]. The descriptor carries
+/// the parameter and return layouts.
 ///
 /// libffi handles ABI classification (integer vs float register
 /// allocation, struct-by-value, alignment, padding) for every
 /// supported platform — replacing the previous 8-arg integer-only
 /// dispatcher. See `panama_libffi` for the layout↔ffi_type bridge.
 ///
-/// TODO(T5.6.3 finalization): the `Box<Cif>` stashed on field 3 is
+/// TODO(T5.6.3 finalization): the `Box<Cif>` stashed on `DOWNCALL_CIF` is
 /// currently leaked when the DowncallHandle is garbage-collected —
 /// the Panama synthetic objects don't yet route through a finalizer
 /// callback. Since `Linker::downcallHandle` is called once per native
@@ -2489,23 +2699,17 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     require_native_access(ctx, "downcall")?;
     let handle = obj_arg(args, 0)?;
-    let fn_addr = match ctx.get_field(handle, 0) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
+    let fn_addr = downcall_fn_addr(ctx, handle);
     // Work-list item 14. The symbol name is not carried on the handle, so the
     // scope is the target address — which is what a denial needs to report and
     // what an operator would have to grant. Permissive by default.
     crate::capability_gate::gate_foreign_downcall(&*ctx, &format!("0x{fn_addr:x}"))?;
-    let descriptor = match ctx.get_field(handle, 1) {
-        Value::Object(Some(d)) => d,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "No FunctionDescriptor".into(),
-            }
-            .into())
+    let descriptor = downcall_descriptor(ctx, handle).ok_or_else(|| -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "No FunctionDescriptor".into(),
         }
-    };
+        .into()
+    })?;
 
     if fn_addr == 0 {
         return Err(RuntimeError::IllegalStateException {
@@ -2519,7 +2723,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Variadic flag — the Linker.Option.firstVariadicArg(int) overload
     // populates this when registering the downcall handle. -1 (or
     // missing field) = non-variadic.
-    let variadic_fixed: Option<usize> = match ctx.get_field(handle, 2) {
+    let variadic_fixed: Option<usize> = match ctx.get_field(handle, DOWNCALL_FIRST_VARIADIC) {
         Value::Long(n) if n >= 0 => Some(n as usize),
         Value::Int(n) if n >= 0 => Some(n as usize),
         _ => None,
@@ -2527,7 +2731,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     // T5.6.3 — previously cached `Box<Cif>` pointer (0 = miss). See
     // `panama_libffi::box_cif_to_u64` for the encoding.
-    let cached_cif_u64: u64 = match ctx.get_field(handle, 3) {
+    let cached_cif_u64: u64 = match ctx.get_field(handle, DOWNCALL_CIF) {
         Value::Long(n) => n as u64,
         _ => 0,
     };
@@ -2650,7 +2854,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // Move the Cif into a Box, stash the raw pointer, and return a
         // pointer to the Box-owned Cif for this call.
         let stash_u64 = plf::box_cif_to_u64(cif);
-        ctx.set_field(handle, 3, Value::Long(stash_u64 as i64));
+        ctx.set_field(handle, DOWNCALL_CIF, Value::Long(stash_u64 as i64));
         // SAFETY: stash_u64 was produced above; Box is live for the
         // remainder of this call and beyond.
         let cif_ref =
@@ -4290,6 +4494,38 @@ mod tests {
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
 
+    /// Build a downcall carrier the way [`alloc_downcall_handle`] does, minus
+    /// the `MethodType` derivation.
+    ///
+    /// These tests exercise `pe_downcall_invoke`'s libffi marshalling, not the
+    /// mint. Routing them through `alloc_downcall_handle` would drag
+    /// `build_method_type_from_descriptor` into every one of them, and what
+    /// that measures on a `MockNativeContext` is the mock's class table rather
+    /// than anything about a downcall.
+    ///
+    /// It does allocate the real carrier class at the real width, so the slot
+    /// arithmetic under test is the production arithmetic: a test that kept
+    /// writing the old compact `[0]=addr, [1]=descriptor` layout would read
+    /// back zeros through the `DOWNCALL_*` accessors and pass or fail for a
+    /// reason that has nothing to do with the code it names.
+    fn mk_downcall_handle(
+        ctx: &mut dyn NativeContext,
+        fn_addr: i64,
+        descriptor: Option<ObjectRef>,
+        first_variadic: i64,
+    ) -> ObjectRef {
+        let handle =
+            try_alloc_concurrent_synthetic(ctx, DOWNCALL_CARRIER_CLASS, DOWNCALL_SLOT_COUNT)
+                .unwrap();
+        ctx.set_field(handle, DOWNCALL_TAG, Value::Int(DOWNCALL_TAG_MAGIC));
+        ctx.set_field(handle, DOWNCALL_FN_ADDR, Value::Long(fn_addr));
+        ctx.set_field(handle, DOWNCALL_DESCRIPTOR, Value::Object(descriptor));
+        ctx.set_field(handle, DOWNCALL_FIRST_VARIADIC, Value::Long(first_variadic));
+        ctx.set_field(handle, DOWNCALL_CIF, Value::Long(0));
+        ctx.set_field(handle, DOWNCALL_CAPTURE_CALL_STATE, Value::Int(0));
+        handle
+    }
+
     // FIX(test): RAII guard that enables the process-wide native-access gate
     // for the duration of a downcall test and restores the previous value on
     // drop (even on panic). The Panama implementation is secure-by-default
@@ -5132,10 +5368,8 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        // Build DowncallHandle
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(strlen_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        // Build the downcall handle
+        let handle = mk_downcall_handle(&mut ctx, strlen_addr, Some(descriptor), -1);
 
         // Build args array with the pointer as a Long
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
@@ -5177,9 +5411,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(-42));
@@ -5227,12 +5459,9 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        // Build a DowncallHandle with 4 fields (the new cache layout).
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
-        ctx.set_field(handle, 3, Value::Long(0)); // cache miss marker
+        // `mk_downcall_handle` leaves DOWNCALL_CIF at 0 — the cache-miss marker
+        // this test's first call must observe.
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         // Snapshot the global build counter.
         let before = plf::CIF_BUILD_COUNT.load(Ordering::Relaxed);
@@ -5254,8 +5483,8 @@ mod tests {
             "first call must construct exactly one Cif"
         );
 
-        // Verify field 3 now carries a non-zero pointer.
-        let stash_v = ctx.get_field(handle, 3);
+        // Verify DOWNCALL_CIF now carries a non-zero pointer.
+        let stash_v = ctx.get_field(handle, DOWNCALL_CIF);
         let stash_u64 = match stash_v {
             Value::Long(n) => n as u64,
             _ => 0,
@@ -5288,12 +5517,11 @@ mod tests {
 
     #[test]
     fn panama_cif_cache_field3_sticks_to_boxed_ptr() {
-        // Simpler smoke test: if we don't actually call, field 3 stays 0.
+        // Simpler smoke test: if we don't actually call, DOWNCALL_CIF stays 0.
         // Only the invoke path populates the cache slot.
         let mut ctx = mock_ctx();
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
-        ctx.set_field(handle, 3, Value::Long(0));
-        match ctx.get_field(handle, 3) {
+        let handle = mk_downcall_handle(&mut ctx, 0, None, -1);
+        match ctx.get_field(handle, DOWNCALL_CIF) {
             Value::Long(0) => {}
             other => panic!("expected Long(0), got {:?}", other),
         }
@@ -5395,9 +5623,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
-        ctx.set_field(handle, 0, Value::Long(abs_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
+        let handle = mk_downcall_handle(&mut ctx, abs_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(5));
@@ -5593,10 +5819,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
+        let handle = mk_downcall_handle(&mut ctx, fn_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
@@ -5641,10 +5864,7 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(fn_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
-        ctx.set_field(handle, 2, Value::Long(-1));
+        let handle = mk_downcall_handle(&mut ctx, fn_addr, Some(descriptor), -1);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Int(10));
@@ -5711,11 +5931,8 @@ mod tests {
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
-        ctx.set_field(handle, 0, Value::Long(snprintf_addr));
-        ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         // First 3 args fixed; everything from index 3 is variadic.
-        ctx.set_field(handle, 2, Value::Long(3));
+        let handle = mk_downcall_handle(&mut ctx, snprintf_addr, Some(descriptor), 3);
 
         let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Long(buf_ptr as i64));

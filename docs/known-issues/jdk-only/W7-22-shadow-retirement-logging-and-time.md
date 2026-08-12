@@ -657,3 +657,103 @@ attribute its results to source it was not built from.
   `vm/src/runtime/interpreter.rs` — if the dial is ever to mean what its
   documentation says, the second path has to consult it too. Today it does not,
   and §1 is the cost.
+
+---
+
+## 8. Triage re-read against source, 2026-08-12 (lane A24, doc-only)
+
+Nothing here was built or run. The point of this pass is narrow: a record that
+says "hold, blocked on a platform" decays into "nobody checked" unless somebody
+re-confirms that the hold is still the true state. It is.
+
+### 8.1 §2's seven-row patch is STILL unapplied — checked, not assumed
+
+`native-api/src/retired_shadow.rs` today contains:
+
+* **no** `("java/io/PrintWriter", …)` entries — zero matches for the string
+  `"java/io/PrintWriter"` in the file;
+* **no** `java/io/Print` arm in `triple_is_retired_shadow`'s prefix
+  discriminator.
+
+Both halves of §2's out-of-file patch are absent, which is the correct state:
+§2.1 step 1 warns that landing (b) without (a) makes every new entry answer
+`false` invisibly, and neither is there. **Disposition unchanged: hold.**
+
+### 8.2 The three frozen artefacts have not moved, so §2.1 needs no re-derivation
+
+This is the part most likely to have gone stale, since §2's own history is a
+figure that was wrong when written. It has not:
+
+* `native-builtins/tests/stub_ratchet.rs:493` `BASELINE_SYNTHETIC_STUBS_MANAGEMENT
+  = 1263` and `:498` `BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT = 1253`, with
+  `:534` `const SLACK: usize = 0;`. Exactly the two constants and the slack §2's
+  correction block names, at exactly those values. The `:506`/`:508` cfg pair
+  selecting between them by the `management` feature is intact, and `:528`/`:530`
+  still print the constant's own name, which is what §2.1 step 5 tells the taker
+  to paste from.
+
+So §2.1 is executable as written. **The `1,038` figure struck through in §2
+remains struck through** — do not resurrect it; and do not hand-derive `+7` onto
+1263/1253 either, for the reason §2.1 step 5 gives.
+
+### 8.3 §1's dial finding survives, with one refinement
+
+§1's cause — *exactly one dispatch site in the VM consults the dial* — still
+reads true, and the dial has since been given a scoped form:
+
+* `vm/src/runtime/env_cache.rs:473` `jdk_only_enforce_shadow()`, and `:559`
+  `jdk_only_enforce_shadow_for(class_name)`, whose own doc says *"This is the
+  predicate dispatch must ask"* because the unscoped bool alone answers only "is
+  anything enforced";
+* exactly **one** caller of either outside `env_cache` itself, in all of
+  `vm/src`: `vm/src/runtime/interpreter/native_override.rs:7135`,
+  `strict_bridge && …jdk_only_enforce_shadow_for(class_name)`.
+
+The refinement does not change the verdict. §1's real claim is that the dial is a
+*strictly weaker experiment than the retirement it licenses* — one dispatch path
+honours the dial, every path honours the re-tag — and that is unaffected by the
+predicate becoming class-scoped. §2's "retirable" therefore still means *every
+arm runnable without a rebuild is verdict-neutral*, which is what §6 already
+says.
+
+### 8.4 Is this record's evidence SCHEDULED?
+
+**No, and it is worth being blunt about it.** Every measurement in §§1-4 is a
+bespoke probe (`PwProbe`, `PwNativeCtor`, the per-triple `PrintStream` selector
+runs, the JUL probe), and the string `probes` occurs **zero** times in
+`regression-suite/run.sh` at any `SUITE=` value. Nothing that licensed §2's
+verdict, and nothing that found §4's regression, runs in any suite.
+
+§4 already establishes the sharpest form of this — *no corpus vector calls
+`Logger.getLogger`*, which is why the JUL regression shipped — and §4's closing
+line ("`probes/` needs a JUL vector … Its absence is why this shipped") is still
+outstanding. §3's danger case is the same species and worse: a retired
+`PrintStream` shadow over `System.out` **discards** rather than throwing, and
+nothing in the corpus asserts on stdout's presence, so the suite would read green
+while the VM printed nothing. That is not a hypothetical about a future
+retirement; it is the reason §3 is blocked.
+
+### 8.5 Residuals, unchanged
+
+1. **§2's seven rows** — hold, blocked on a Linux host with a JDK 25 image. Not a
+   question, a platform. §2.1 is the whole recipe and is current (§8.2).
+2. **§2's untaken pre-landing condition** — the **Compatible** arm of `PwProbe`.
+   §2's four arms were all `--jdk-only`. Still untaken; it is §2.1 step 4.
+3. **§3's 29 `PrintStream` rows** — blocked on the five-item list, of which item 1
+   (`System.out`/`System.err` must be constructed, not fabricated) is the whole
+   job and the rest are downstream of it.
+4. **§4's disposition is the orchestrator's call and has not been made here.**
+   Note that §4's own banner records the *cause* as superseded (W7-25) and the
+   category-change fix as landed, so the "hold back the four triples" option
+   described in §4 may already be moot; this lane did not re-measure the JUL
+   regression and does not claim either way.
+5. **§4.1's `Logger.log(Level, Supplier)` record drop** — Compatible-mode,
+   pre-existing, explicitly out of this lane's mandate, and still open.
+6. **A JUL vector in `probes/`** — and, given §8.4, a *scheduled* JUL vector
+   would be worth more than a probe one: a probe that nothing runs is the exact
+   gap §4 diagnoses.
+
+No nominations. Every code change this record wants is already written out as an
+out-of-file patch in §2 and sequenced in §2.1; adding a second copy here would
+give a taker two texts to reconcile, which is how a one-pass recipe becomes a
+two-pass one.

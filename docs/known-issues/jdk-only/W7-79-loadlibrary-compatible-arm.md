@@ -23,6 +23,18 @@ bodies carry the two `args[2]` comments this record's patch specified.
 so the strict-only cross-loader rule did not leak with the fix. **Nothing to
 apply. Do not re-hand this out.**
 
+**THIRD PASS 2026-08-12 (lane A14) — still in the tree, line numbers now stale.**
+Re-checked by reading the fork, not by grepping for a token, and the structure
+holds exactly as the block above describes: four call sites, two per arm, all
+decoding through `runtime_load_args`; the `Compatible` bodies still carry the
+two `args[2]` comments; `LoaderScoping::Off` still on both `Compatible` bodies
+and `LoaderScoping::On` on the strict ones. **Every line number in the block
+above has drifted** — the helper is now at `:1830` (not `:1717`), the strict
+sites at `:1635`/`:1653` and the `Compatible` sites at `:1709`/`:1728`. The
+symbols are the durable reference. **Still nothing to apply. Do not re-hand
+this out.** See the new section at the end for the one arming question that IS
+still open on this road, and why it must not be settled on Windows.
+
 **Vector count moved 40 -> 41 on 2026-08-12** by W5-1's second pass, which
 asserted *which* library `libraryLoading()` ends up with rather than only that
 one loaded. The five checks below are unaffected and still sit where this record
@@ -282,3 +294,70 @@ holds on both shapes, so this record does not freeze the wrong one.
 The `java.library.path` **suffix** HotSpot appends to the bare-name message is
 also absent here. Same function, same one-line fix, same reason for not taking
 it in this lane.
+
+---
+
+## The one thing still open on this road: the `BootLoader.loadLibrary` arming, which MUST be A/B'd on Linux
+
+Added 2026-08-12 (lane A14). Not a defect in this record's two triples — it is
+the adjacent, deliberately-unarmed half of the same loader-scoping feature, and
+it is recorded here so the next lane on this road does not "fix" it into an
+unmeasured state.
+
+**What is true today, read from source:**
+
+* `jdk/internal/loader/BootLoader.loadLibrary(Ljava/lang/String;)V` is
+  registered in `native-builtins/src/lib.rs` as a bare
+  `|_ctx, _args| Ok(None)` — a deliberate no-op, with a `KEEP` comment.
+* `lang_system::record_boot_loader_library` exists, is `pub`, and has
+  **zero callers in the workspace**. Its own doc comment says so outright:
+  *"THIS HAS NO CALLER IN THE TREE. It is a written-down hand-off, not a live
+  path — do not read its presence as the feature being on."* The exact patch
+  that would arm it is written out inside that comment.
+* So the boot loader never claims a library, `LOADED_LIBRARIES` never records
+  loader id 0, and the cross-loader rule cannot fire for anything the boot
+  loader loaded. Under `Compatible` the recording would be inert anyway —
+  nothing reads `LOADED_LIBRARIES` without a `LoaderScoping::On` registration,
+  and only the strict arm installs one.
+
+**Why the hold is not caution, and why Windows cannot settle it.** The no-op is
+load-bearing for a platform-specific reason that is stated at both sites: Linux
+real-JDK boot classes such as `java.net.NetworkInterface` call
+`BootLoader.loadLibrary("net")` during `<clinit>`, and the JDK bytecode can
+block indefinitely acquiring the native-library lock before it reaches the
+non-fatal fallback. The neighbouring `NativeLibraries.load` registration carries
+the same finding from the other direction — *"on Windows the classes exercised
+so far apparently resolve via a different bootstrap route, but on Linux real-JDK
+static init … calls this directly"*.
+
+That is the whole argument: **on Windows this road is inert.** A Windows A/B of
+the arming would exercise a path the boot classes do not take here, come back
+green, and mean nothing — the "a narrow probe reports its own reach, not the
+defect" failure, with the added trap that the green looks like evidence *for*
+arming.
+
+**And the arming is not free.** Arming it makes `System.loadLibrary("net")`
+throw for any program that has already reached a `java.net` boot class. That is
+HotSpot's answer, and it is exactly what `RJdkJni.libraryLoading` depends on NOT
+happening: its `zip` probe falls through to a `net` probe that must succeed, and
+`run.sh` compares `CK` lines. Whether CratonVM reaches
+`BootLoader.loadLibrary("net")` before that line **cannot be settled from
+source**.
+
+**Disposition: leave unarmed. The decision belongs to a Linux run.** What that
+run needs, and it is one binary with the mode flag as the only variable:
+
+1. On **Linux**, both modes, with the HotSpot 25 oracle beside them, confirm
+   whether `BootLoader.loadLibrary("net")` is reached before
+   `RJdkJni.libraryLoading`'s `net` probe.
+2. If it is not reached, arming is a no-op on the vector and the patch in
+   `record_boot_loader_library`'s doc comment can land with a green
+   `RJdkJni`.
+3. If it is reached, arming moves `RJdkJni` and the vector has to change with
+   it in the same commit — and that is a `Compatible`-behaviour change needing
+   its own justification under the freeze, since HotSpot parity here means the
+   `net` probe starts throwing.
+
+Nothing about this was measured by this lane. It is recorded as a stated hold
+with its reason, which is the state this record found it in and the state it
+should stay in until somebody has the Linux arm.

@@ -2,6 +2,9 @@
 
 Status: **census complete; one registrar wired; the §6.3 ratchet written and
 the `ConcurrentSkipListMap` verdict settled, 2026-08-12** (§6.3.1, §6.4.1).
+**Source-re-verified 2026-08-12 — see §8: every verdict survives, §4.3/§6.2's
+`forEachOrdered` gap is CLOSED, §5.1's mechanism needs re-scoping to the
+registrar's accessors, and §5.3's `register_tls_impl_natives` row is wrong.**
 Wave 7, lane W7-5. Nothing was built or run on 2026-08-12.
 
 This started from one bug. `IntStream.summaryStatistics()` was killing whole probe
@@ -699,3 +702,152 @@ Three claims carry the rest, and each has a cheap refutation:
    comparison over resolved registrations, and §0 shows that exact method
    over-stating a gap by 12 once already — a `format!`-built descriptor could hide
    a fourth registration the same way.
+
+---
+
+## 8. Re-verification against the working tree, 2026-08-12 (lane A2)
+
+Read, not rebuilt — nothing below was built or run. §7's falsifiers still need a
+binary; this section only re-checks the *source* claims. **The record's verdicts
+all survive. Two of its factual sub-claims are now stale, both in the direction
+of "already fixed", and several line numbers have moved.**
+
+### 8.1 Mechanism and gating — CONFIRMED, unchanged
+
+`#[cfg(feature = "synthetic-jdk")]` at `native-builtins/src/lib.rs:21525`, over
+`register_synthetic_overrides` at `:21526`. The `#[cfg(not(feature =
+"synthetic-jdk"))]` no-op shims are at `vm/src/native/builtins.rs:23-26`
+(`register_builtins`) and `:28-29` (`register_synthetic_overrides`).
+`synthetic-jdk` is in no default set: `native-builtins/Cargo.toml:19`
+`default = []`, `vm/Cargo.toml:69` `default = ["awt", "management", "zgc"]`,
+`vm-cli/Cargo.toml:94` `default = ["mimalloc", "zgc"]`. §1 stands verbatim.
+
+### 8.2 §6.1's wiring — CONFIRMED live; three line numbers stale
+
+`crate::phases_late::register_phase56_primitive_stream_terminals(registry);` is
+at `native-builtins/src/reflect_annotations.rs:589`, the statement after
+`crate::streams::register_stream_overrides(registry);` (`:560`). The registrar
+exists at `native-builtins/src/phases_late/streams.rs:469`, is **ungated** (no
+`#[cfg]` on it or on any enclosing module), and registers as
+`NativeKind::Bridge` (`streams.rs:471`, restored at `:512`) — so it is neither a
+`SyntheticStub` that strict mode would drop nor a `synthetic-jdk` registrar that
+a shipping build would compile out. Both traps the record is named after are
+avoided.
+
+Chain to the boot path: `lib.rs:7097` `register_essential_natives` → `:7098`
+delegates to `register_essential_natives_with_shims` (`lib.rs:7103`) → `:19159`
+`register_annotation_overrides(registry)` → `reflect_annotations.rs:589`.
+
+Stale numbers, corrected: §6.1 cites `lib.rs:18817` for the essentials call — it
+is `lib.rs:19159`, and it is inside `register_essential_natives_with_shims`, not
+the thin `register_essential_natives` wrapper. It cites `vm_init.rs:2208` /
+`:2434` for the real-JDK arm's ordering — those are `vm/src/vm/vm_init.rs:2498`
+(essentials) and `:2724` (`register_collections_natives`) today; the synthetic
+arm is `:1960` / `:2191`. **The ordering claim itself — essentials before
+collections, so a wiring line added in essentials cannot steal a triple from
+`native-collections` — is CONFIRMED.**
+
+### 8.3 §6.3.1's ratchet — CONFIRMED exactly as described
+
+`native-builtins/tests/essential_wiring_ratchet.rs` exists (265 lines), with the
+three tests `essentials_cover_the_abstract_primitive_stream_terminals` (`:136`),
+`none_of_the_terminals_is_a_synthetic_stub` (`:183`) and
+`the_terminals_survive_the_whole_real_jdk_boot` (`:231`), the last driving the
+shared `#[path = "common/vm_init_boot_path.rs"] mod boot_path` model (`:69-70`).
+`ABSTRACT_PRIMITIVE_STREAM_TERMINALS` (`:94-125`) holds exactly six triples —
+`{Int,Long,Double}Stream.forEachOrdered` and `{Int,Long,Double}Stream.
+summaryStatistics` — and `java/util/stream/Stream.forEachOrdered(Ljava/util/
+function/Consumer;)V` is excluded with the reason written out at `:81-86`. Every
+detail §6.3.1 claims about its own contents is true.
+
+### 8.4 STALE — §4.3 and §6.2 describe a gap that has since been closed
+
+Two claims that were live when written are not any more:
+
+* **`IntStream.forEachOrdered(IntConsumer)V` is no longer "unmasked, live
+  defect".** It is registered at `native-builtins/src/phases_late/streams.rs:475`,
+  inside the essentials-reachable narrowed registrar of §8.2.
+* **`Stream.forEachOrdered(Consumer)V` is no longer unregistered on the default
+  path.** `native-collections/src/lib.rs:19764-19769`, inside
+  `register_stream_natives` (`:19629`), reached from `register_collections_natives`
+  (`:2387`) — live in a plain build. §6.3.1's "it is the next row to add" and
+  §4.1's framing of it as rescued only by an interpreter hack are both overtaken.
+
+`register_phase56_abstract_stream_terminals` (§6.2's proposed patch) exists
+nowhere in the tree except inside this record, which is consistent with "not
+applied" — and it no longer needs to be: both of its two triples are now covered
+by the two registrars above. **§6.2 should be read as superseded, not pending.**
+
+**The interpreter special case survives.** `vm/src/runtime/interpreter.rs:1007-1011`
+still carries
+`if method_name == "forEachOrdered" && method_descriptor == "(Ljava/util/function/Consumer;)V"`
+→ re-dispatch as `forEach`, in the `!has_code` arm, with its comment at `:995-1006`
+still naming `register_phase56_stream_extras` as the reason. It runs *above*
+`resolve_native_for_dispatch`, so the new `native-collections` registration is
+behaviour-neutral today (`native-collections/src/lib.rs:19750-19755` says so at
+the registration site). **The deletion §4.1 asked for is now unblocked and is the
+one open item this section leaves behind** — see residuals.
+
+### 8.5 §5.1 — verdict survives; its stated MECHANISM should be re-scoped
+
+`register_phase56_summary_stats` still exists (`phases_late/streams.rs:1942`),
+its only caller is still `register_phase56_natives` (`streams.rs:29`), which is
+still `register_synthetic_overrides`-only — **still dead, still "do not wire".**
+
+But the reason has narrowed. The record says the natives "would write min and
+max into the compensation accumulators". Since it was written,
+`p56_double_stats_store` (`streams.rs:1908-1943`) grew a real-layout branch: it
+reads `ctx.class_num_total_fields(class_id)` and, above `REAL_DSS_FIELD_MAX`,
+writes `REAL_DSS_FIELD_*` = 0..5 (`streams.rs:1639-1644`), and the header at
+`:1615-1628` records that `try_alloc_concurrent_synthetic` clamps the requested
+slot count **up** to the real class's field count — so the literal `4` at
+`streams.rs:1889` is a floor, not an under-allocation, and the
+`summaryStatistics()` terminal writes the right slots on a real receiver.
+
+The defect is still there, one layer over: the registrar's **accessors** do not
+branch. `<init>()V`, `accept(D)V`, `getMin`, `getMax` and `toString` still use
+the flat `STATS_FIELD_MIN`/`MAX` = 2/3 (`streams.rs:1629-1635`, uses around
+`:2321-2420`), which on a real six-field `DoubleSummaryStatistics` are
+`sumCompensation` and `simpleSum`. **§5.1's conclusion is unchanged; read its
+mechanism as "the registrar's accessors", not "the registrar".**
+
+### 8.6 §6.4.1 (`ConcurrentSkipListMap`) — CONFIRMED, all four legs; one line stale
+
+`register_concurrent_skip_list_map_natives` is at
+`native-collections/src/lib.rs:54440` (§5.3 says `51054` — stale), private, with
+no real caller. The `let _ = register_concurrent_skip_list_map_natives;` no-op is
+at `:2465` inside `register_collections_natives` (`:2360`), and the comment above
+it still names the two triples that exist nowhere else. The guard test
+`concurrent_skip_list_map_not_intercepted` is at `:59744` and asserts
+`find(..).is_none()` for `<init>()V` and `put`. The `__test_cslm_*` hooks are at
+`:54682`, `:54690`, `:54695`, `:54700`, consumed by
+`native-collections/tests/gc_side_table_root_audit.rs`. **The "third state"
+verdict — neither wire nor delete — holds on all four legs.**
+
+### 8.7 §5.3 spot-checks — two rows need a word changed
+
+| row | verdict |
+|---|---|
+| `register_p62_stamped_lock` | dead CONFIRMED, at `phases_late/concurrent.rs:2643` (record says `2636`). "Call site disabled" is imprecise: it has **no call site at all**. The *disabled* thing was `native-collections`' rival StampedLock block (`native-collections/src/lib.rs:2466ff`); `util_concurrent_ext.rs:6449-6452` states this in prose. |
+| `register_tls_impl_natives` | "no caller" is **WRONG**. It is at `tls_impl.rs:1327` and has four callers, all test-only: `tls.rs:4778` and `:4828` inside `#[cfg(test)] mod tls_tests` (`:3160`–`:4893`), plus `tls_impl.rs:2727` and `:2752`. The correct row value is **test-only caller**, the same as `register_jboss_logmanager_natives`. |
+| `register_apps_h2_overrides` | CONFIRMED. `apps_h2.rs:51`; its only reference is the dead-code silencer `let _ = apps_h2::register_apps_h2_overrides;` at `lib.rs:9118`, explained at `lib.rs:9111-9117` and again at `apps_h2.rs:86-87`. |
+
+### 8.8 What this section does NOT establish
+
+* The 301/825 census in §0/§2 was **not** re-run. It is a static graph analysis
+  and rechecking it is its own lane; every number in §2 should still be read as
+  of the date it was taken.
+* Nothing was built. §7's three falsifiers all require a binary and all remain
+  open.
+* `native-collections/src/lib.rs:25943` (§4.1's `LongStream.mapToObj` row) was
+  not re-checked. §4.1's `reflect_annotations.rs:515` citation is stale — the
+  comment it names is at `reflect_annotations.rs:550-560` today.
+
+### 8.9 Residual left by this re-verification
+
+**Delete the `forEachOrdered` special case in `vm/src/runtime/interpreter.rs:1007-1011`.**
+It was a workaround for a registration that did not ship; the registration now
+ships (§8.4), the special case sits above native dispatch so it still wins, and
+while it does, `Stream.forEachOrdered`'s *registered* implementation is
+unreachable and untested. Deleting it needs a build and a run of the stream
+vectors, which this pass could not do. Not this lane's file.

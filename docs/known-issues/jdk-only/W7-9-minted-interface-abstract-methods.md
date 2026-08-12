@@ -59,6 +59,65 @@ claimed.
 > §8.1 and §8.3 are re-checked below; §8.1's precondition 1 is now satisfiable
 > and §8.3's blocker holds.
 
+> ## RE-VERIFIED 2026-08-12 (lane A4 / P3-B) — every claim still holds, and P3-B is NOT this defect
+>
+> This record was re-read against the tree because a lane working
+> `MethodHandleProxies.asInterfaceInstance` was told it might be "adjacent to
+> minted/generated interface classes and their abstract method declarations".
+> **It is not the same root cause.** Both halves are stated because the
+> distinction is the useful output.
+>
+> **Re-verification of this record's own claims — all five checked hold:**
+>
+> | claim | where it is now | verdict |
+> |---|---|---|
+> | §8.1's `forEachOrdered` special case is still in the dispatch core (deletion NOT taken) | `vm/src/runtime/interpreter.rs:995-1011` | holds, byte-identical to the quoted block |
+> | §8.1's re-check: the shipping registration landed | `native-collections/src/lib.rs:19766`, in a block whose comment cites "W7-9 §8.1 precondition 1" | holds |
+> | The UPDATED block's `Selector.provider()` fix landed | `native-io/src/nio_selector.rs:2201` (`selector_provider_native`), registered at `:3889-3898` with a "W7-9 §6 / §8.2" comment | holds |
+> | The UPDATED block's refutation of §8.2's premise (`NativeContext` has no `invoke_static`; `invoke` is it) | `grep -n "fn invoke_static" native-api/src/registry.rs` → no hits; `selector_provider_native`'s body is `ctx.invoke(...)` | holds |
+> | §2's safety mechanism: every native-shadow hierarchy walk is a `superclass` walk | `interpreter/invoke.rs:497`, `dispatch_virtual.rs:623` and `:3219` — all three still `c.superclass` | holds |
+> | The `RJdkNio` cover for `provider()` | `regression-suite/src/RJdkNio.java:400-404`, three checks including the `== SelectorProvider.provider()` identity control | holds |
+>
+> Line anchors moved (§8.2's fix is at `nio_selector.rs:3889`, not where §6 left
+> it), the content did not. Anchor on the marker text, per the README.
+>
+> **Why P3-B is a genuinely separate defect.** P3-B is
+> `ClassFormatError: ldc: unsupported constant pool entry type at #26` under
+> `--jdk-only`. Three discriminators, each of which alone settles it:
+>
+> 1. **The class carrying the defect is not minted by CratonVM.** It is minted
+>    by the *JDK's own* `java.lang.classfile` builder inside
+>    `MethodHandleProxies.createTemplate` and defined through
+>    `Lookup.defineHiddenClass`. It has real bytes and real `Code` on every
+>    method. `try_alloc_concurrent_synthetic` is nowhere on the path, so §2's
+>    corollary, §5's slot-index species and the whole "which class does the mint
+>    WEAR" question do not arise.
+> 2. **The failing opcode is `ldc`, not an invoke.** This record's entire
+>    mechanism is the `if !has_code` arm of dispatch raising
+>    `AbstractMethodError`. P3-B never reaches a dispatch: the frame dies
+>    decoding a constant-pool entry (`CONSTANT_MethodType`) in
+>    `vm/src/runtime/interpreter/constants.rs::execute_ldc`, which has no
+>    hierarchy walk, no native registry lookup and no notion of abstractness.
+> 3. **The two modes fail differently, and only one of them is a stub story.**
+>    In compatible mode `asInterfaceInstance` is a *registered synthetic stub*
+>    that returns the `MethodHandle` itself, so it fails with
+>    `ClassCastException` and never executes the generated class at all. Only
+>    with the stub refused does the real bytecode run and hit the decoder. A
+>    minted-receiver `AbstractMethodError` would fail the same way in both.
+>
+> **One thing the two records do share**, and it is worth carrying: the same
+> methodology failure §4 names. §4's version is "a grep gives the wrong answer
+> about a call graph"; the UPDATED block's is "about a capability"; P3-B's is
+> *"a comment gives the wrong answer about a descriptor"* — see
+> `W7-55-record-reconciliation.md`'s 2026-08-12 addendum for the
+> `MethodHandleProxies.wrapperInstanceType` case, where an in-source comment
+> deleted a correct registration on the stated grounds that its descriptor was
+> "permanently unmatchable", and `javap` says otherwise.
+>
+> Fixed in `vm/src/runtime/interpreter/constants.rs`; covered by
+> `regression-suite/src/RJdkProxyIface.java`. Not a change to anything this
+> record owns.
+
 ---
 
 ## 1. What was being tested

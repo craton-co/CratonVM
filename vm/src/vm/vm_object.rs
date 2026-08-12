@@ -1099,14 +1099,62 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
 
     // Slot 0: store class_id as Int for legacy compatibility (mirror_class_id
     // fallback and internal VM code that reads field 0). This is a VM-internal
-    // convention, not a JDK field, so it stays at a fixed slot. In real-JDK
-    // mode it "occupies" the first instance slot (`cachedConstructor`), but
-    // JDK bytecode that reads `cachedConstructor` gets an Int which it treats
-    // as an invalid reference (effectively null) — safe because the field is
-    // always read under an `if (cachedConstructor == null)` guard.
+    // convention, not a JDK field, so it stays at a fixed slot — but ONLY
+    // where slot 0 is not a real reference field. See the gate below.
     //
-    // JDK-ONLY-LAYOUT: safe (was `unknown`, ranked HIGH; adjudicated
-    // 2026-08-10 — see the three checks below, all now run).
+    // JDK-ONLY-LAYOUT: was `safe` (adjudicated 2026-08-10 on the three checks
+    // recorded below). **That verdict is WITHDRAWN as of 2026-08-12: it rested
+    // on a claim that is true of the interpreter only.**
+    //
+    // The withdrawn argument was: in real-JDK mode this "occupies" the first
+    // instance slot (`cachedConstructor`), but JDK bytecode that reads
+    // `cachedConstructor` gets an Int it treats as an invalid reference
+    // (effectively null) — safe because the field is only ever read under an
+    // `if (cachedConstructor == null)` guard, in `Class.newInstance()`.
+    //
+    // Two things falsify it:
+    //
+    //   a. The value is no longer an Int in the slot. Since all four heaps
+    //      converged on boxing (W7-84), a primitive stored into a declared
+    //      REFERENCE slot is wrapped in an `AUTOBOX_CLASS_ID` object
+    //      (`gc/src/autobox.rs::box_for_reference_slot`). The slot now holds a
+    //      genuinely NON-NULL object reference. Readers that go through
+    //      `Heap::get_field` un-box it back to `Int` and still see an invalid
+    //      reference, so the null guard holds for them.
+    //   b. The JIT does not go through `Heap::get_field`. Verified by reading,
+    //      2026-08-12: `jit_getfield`'s compact-reference arm
+    //      (`vm/src/jit/helpers.rs:5642-5660`) does its own raw
+    //      `read_ref_slot` + `jit_decode_ref_word` — a heap-plausibility
+    //      filter, not a class-id check — and never calls `crate::autobox`.
+    //      The default inline path does not even reach that helper: it emits a
+    //      bare `MOV RAX, [RAX + disp32]` against the slot
+    //      (`jit/src/ir_lower.rs:2419-2421`,
+    //      `jit/src/x64/bytecode_walk.rs:4034-4036`), behind null/alignment/
+    //      region/`GC_FLAG_COMPACT` guards, none of which is a type check.
+    //      `AUTOBOX_CLASS_ID` appears nowhere in `jit/`, `jit-api/`, or
+    //      `vm/src/jit/`.
+    //
+    // So at the JIT tier `cachedConstructor != null` is TRUE, the fast path is
+    // taken, and `Constructor.newInstance` is invoked on an object that is not
+    // a `Constructor` — a wrong-type dispatch on a JDK method any application
+    // can call, reachable only once the method tiers up. That is why the 2026-
+    // 08-04/08-10 probes below came back clean: they ran interpreted, and the
+    // interpreter is the one reader this overlay is safe for.
+    //
+    // FIX (2026-08-12): gate the write on whether slot 0 is a compact
+    // REFERENCE field, the same idiom as the `System.out` fd tag in
+    // `vm_init.rs`. In real-JDK + compact mode the write is skipped, so
+    // `cachedConstructor` stays a true null and both tiers agree. In
+    // synthetic-jdk mode `java/lang/Class` is a fabricated stub with no
+    // registered compact layout at all, `class_layout` returns `None`, and the
+    // legacy convention (plus every test asserting it) is untouched.
+    //
+    // Safety of skipping, established rather than asserted — see the reader
+    // census at check 3 below, re-run 2026-08-12. `class_mirrors_reverse` is
+    // populated a few lines down for every class mirror and answers every
+    // runtime lookup; `mirror_class_id` consults it FIRST and only falls back
+    // to slot 0. One reader was found that never asks the reverse map at all
+    // (`ctx_annotation_values_equal`); it is nominated, not owned here.
     //
     // This is an *overlay*: a VM-internal value deliberately written on top of
     // a real JDK field, which is a different hazard from a mis-numbered slot.
@@ -1169,19 +1217,30 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      `CRATONVM_DBG_OVERLAY=1`. **Zero fallback hits.** The reverse map
     //      answers every runtime lookup.
     //
-    // What that settles, and what it does not. The overlay is not destructive
-    // (1 and 2) and not load-bearing at RUNTIME (3), so the verdict moves from
-    // `unknown` to `safe`. The write nevertheless stays, because it is still
-    // load-bearing for `MockNativeContext`: the unit-test mirrors in
-    // `native-builtins/src/test_utils.rs` and `vm/src/vm/tests.rs` encode their
-    // ClassId as exactly this `Int` at slot 0 and have no reverse map at all.
-    // Deleting it is a test-infrastructure change with no runtime benefit, and
-    // it would also remove the only cover for a reverse-map miss — so it is a
-    // deliberate keep, not an unexamined one.
-    shared
-        .mem
-        .heap
-        .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
+    // What checks 1-3 settle, and what they do not. They establish that the
+    // overlay is not destructive and not load-bearing at runtime — both still
+    // hold, and both are why SKIPPING the write is safe. They do NOT establish
+    // that keeping it is safe, because all three ran interpreted (see (b)
+    // above). The 2026-08-10 conclusion "the write nevertheless stays, because
+    // it is still load-bearing for `MockNativeContext`" was also wrong on its
+    // own terms: `MockNativeContext` never calls this function. It builds its
+    // own two-slot mirror inline (`native-builtins/src/test_utils.rs`
+    // `get_class_mirror` / `primitive_class_mirror`) and its
+    // `class_id_from_mirror` reads that. Nothing in the mock is coupled to
+    // this store, in either mode.
+    //
+    // `class_layout` is only populated when compact reference fields are
+    // enabled, so with that flag off this is a no-op and legacy behaviour
+    // stands — the same caveat the `vm_init.rs` precedent carries.
+    let slot0_is_ref = cratonvm_gc::class_layout(class_class_id.as_u32())
+        .and_then(|l| l.field_is_ref(0))
+        .unwrap_or(false);
+    if !slot0_is_ref {
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
+    }
 
     // name → class name String.
     if let Some(idx) = slots.name {
@@ -1364,20 +1423,32 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy
     // VM-internal convention, not a JDK field — fixed slot).
     //
-    // JDK-ONLY-LAYOUT: safe (was `unknown`) — same overlay as the class-mirror
-    // populator above (slot 0 of a real `java.lang.Class` is
-    // `cachedConstructor`, a reference), and the marker said to resolve the two
-    // together. Adjudicated with it on 2026-08-10: not destructive (checks 1
-    // and 2) and not load-bearing at runtime (check 3, zero fallback hits over
-    // 87 Spring Framework tests).
+    // JDK-ONLY-LAYOUT: same overlay as the class-mirror populator above (slot 0
+    // of a real `java.lang.Class` is `cachedConstructor`, a reference), and the
+    // marker said to resolve the two together — so it carries the same
+    // WITHDRAWN `safe` verdict and the same 2026-08-12 gate. Read the long
+    // note in `get_or_create_class_mirror` for the JIT argument; in short, the
+    // boxed wrapper is non-null and the JIT's field read does not un-box it.
     //
     // This site is the easier of the two to retire, precisely because a
     // primitive mirror has no legitimate `cachedConstructor` reader: `Int(-1)`
-    // is a sentinel nothing but this VM asks for. What keeps it is the same
-    // thing that keeps its sibling — `MockNativeContext`'s mirrors encode their
-    // identity here and have no reverse map — so the two still move together,
-    // and moving them is a test-infrastructure change rather than a fix.
-    shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
+    // is a sentinel nothing but this VM asks for. Two further reasons skipping
+    // it is safe, both checked 2026-08-12 rather than assumed:
+    //   * Primitive mirrors are NOT in `class_mirrors_reverse` (this function
+    //     never inserts; it registers by name in `primitive_mirrors`), so
+    //     `mirror_class_id` returns `None` for them TODAY — `Int(-1)` fails its
+    //     `v >= 0` guard. Skipping the write changes nothing for that reader.
+    //   * "Is this a primitive mirror?" is not answered from slot 0 anywhere.
+    //     `mirror_is_primitive` reads the by-name-resolved `primitive : Z` slot
+    //     written a few lines below, falling back to the name string.
+    // The `MockNativeContext` argument that previously kept this write does not
+    // apply either: the mock builds its own mirrors and never calls this.
+    let slot0_is_ref = cratonvm_gc::class_layout(class_class_id.as_u32())
+        .and_then(|l| l.field_is_ref(0))
+        .unwrap_or(false);
+    if !slot0_is_ref {
+        shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
+    }
 
     // name → primitive type name as String.
     if let Some(idx) = slots.name {
@@ -2294,6 +2365,17 @@ mod tests {
     // Class mirror helpers
     // -----------------------------------------------------------------------
 
+    /// NOTE (2026-08-12): the slot-0 assertion below is mode-dependent by
+    /// design. `get_or_create_class_mirror` now skips the slot-0 write when
+    /// `java/lang/Class` slot 0 is a compact REFERENCE field (real-JDK mode);
+    /// see the long note there. These tests run under `test_shared()`, i.e.
+    /// synthetic-jdk mode, where `java/lang/Class` is a fabricated
+    /// compatibility stub. `build_compact_layout_ordered` returns `None` for a
+    /// class whose slots are entirely padding, so no compact layout is ever
+    /// registered for it, `class_layout` answers `None`, the gate evaluates
+    /// `false`, and the write still happens. The reverse-map half of this test
+    /// is the part that holds in BOTH modes — and it is the half the runtime
+    /// actually depends on.
     #[test]
     fn class_mirror_stores_class_id_in_reverse_map() {
         let shared = test_shared();

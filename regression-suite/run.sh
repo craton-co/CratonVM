@@ -103,7 +103,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # every scheduled class already receives that flag, so a second registration
 # would run the identical command twice. Nothing schedules by glob — every list
 # here is explicit — so the name collision is cosmetic.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -116,7 +116,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
@@ -377,6 +377,25 @@ class_cv_args() {
   case "$1" in
     RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;
     RTreeRangeGc)     printf '%s' "--Xmx 64m" ;;
+    # CratonVM's Panama gate is default-CLOSED (NATIVE_ACCESS_POLICY in
+    # native-builtins/src/panama.rs; only --enable-native-access opens it).
+    # Without this every downcall in RJdkForeign raises IllegalCallerException
+    # and the vector reddens for a reason that is not the thing it tests.
+    # HotSpot needs no counterpart: on JDK 25 the restricted-method call only
+    # WARNS, and the warning goes to stderr, which the cross-VM PASS/CK diff
+    # does not read. `--enable-native-access` is declared require_equals, so
+    # the `=` spelling is the safe one.
+    RJdkForeign)      printf '%s' "--enable-native-access=ALL-UNNAMED" ;;
+    # RJdkSqlPackage is a --jdk-only POLICY vector and is RED without the flag:
+    # its nonVolatileRejected() arm asserts HotSpot's IllegalArgumentException
+    # ("Must be volatile type"), which the Compatible-mode native in
+    # native-builtins/src/atomic_updater.rs does not implement (it rejects
+    # static and final, not plain non-volatile). `SUITE=all` with no
+    # CRATONVM_ARGS runs JDKONLY_CLASSES in Compatible mode, so pin it here.
+    # Repeating the flag when CRATONVM_ARGS already sets it is harmless:
+    # `--jdk-only` is a bool arg, so clap derives ArgAction::SetTrue, which is
+    # idempotent. (`--jdk-only --real-jdk` IS a hard conflict; a repeat is not.)
+    RJdkSqlPackage)   printf '%s' "--jdk-only" ;;
     *) : ;;
   esac
 }

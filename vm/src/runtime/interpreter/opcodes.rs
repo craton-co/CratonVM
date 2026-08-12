@@ -69,7 +69,7 @@ pub(super) fn execute_instruction(
         Instruction::LdcW(index) => execute_ldc(shared, thread, frame_idx, *index)
             .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?,
         Instruction::Ldc2W(index) => {
-            execute_ldc2w(shared, &mut thread.frames[frame_idx], *index)
+            execute_ldc2w(shared, thread, frame_idx, *index)
                 .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?
         }
 

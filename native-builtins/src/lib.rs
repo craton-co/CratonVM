@@ -14528,41 +14528,69 @@ pub fn register_essential_natives_with_shims(
     crate::lang_system::install_spawn_policy_hook();
 
     // Runtime.exec overloads — spawn subprocesses via std::process::Command
-    registry.register(
+    //
+    // W7-17 N1 — `SyntheticStub`, STATED, and the tag is the whole point.
+    // These six and `java/lang/ProcessBuilder.start` share ONE mint:
+    // `native-io/src/process.rs::spawn_and_wrap_with_redirects`, whose
+    // `refused_class(ctx, SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT)?`
+    // propagates a `--jdk-only` refusal out to the caller as
+    // `NoClassDefFoundError: cratonvm/synthetic/Process`. `ProcessBuilder.start`
+    // was re-tagged `SyntheticStub` for exactly that reason; these six were left
+    // ambient `Bridge`, so the OLDER spawn API stayed open into strict mode.
+    // **A retag that pins one caller of a shared mint must enumerate the
+    // callers** — measured 2026-08-12, one probe, both halves:
+    //
+    //     OK   ProcessBuilder.start (the pinned half)
+    //     FAIL Runtime.exec(String[]) -> NoClassDefFoundError:
+    //                                    cratonvm/synthetic/Process
+    //
+    // `Runtime.exec` is ordinary bytecode on the image (`acc_native: false,
+    // has_code: true`), so by contract §1.4 the real method outranks any bridge:
+    // strict drops these, the JDK's own `exec` runs, and it delegates to the
+    // real `ProcessBuilder.start()` -> `ProcessImpl.forkAndExec`, which this
+    // crate registers. Default `--real-jdk` is deliberately unchanged —
+    // `SyntheticStub` survives there and still shadows `exec`.
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_string,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_array,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_string_env,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/Process;",
         native_runtime_exec_array_env,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "(Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;",
         native_runtime_exec_string_env_dir,
+        NativeKind::SyntheticStub,
     );
-    registry.register(
+    registry.register_with_kind(
         "java/lang/Runtime",
         "exec",
         "([Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;",
         native_runtime_exec_array_env_dir,
+        NativeKind::SyntheticStub,
     );
 
     // --- java.lang.Math / StrictMath (native transcendental functions) ---
@@ -27518,18 +27546,49 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// turns its CSV row into four columns), so the probe ran green to completion
 /// and reported no number.
 ///
-/// The locale is dropped, exactly as `String.format(Locale, …)` already drops
-/// it (`lang_string::native_string_format_locale`) — so the two overloads now
-/// agree, instead of one of them being empty. When the formatter learns
-/// locales, both should stop dropping it in the same change.
+/// The `Locale` is HONOURED. It used to be dropped, under a comment claiming
+/// that matched `String.format(Locale, …)` — a claim W7-34's locale patch had
+/// already made false, and which became actively wrong once the no-`Locale`
+/// overload started following `Locale.getDefault(Locale.Category.FORMAT)`
+/// (W7-91 §5): delegating to the no-locale entry renders
+/// `printf(Locale.ROOT, …)` in the HOST's locale.
+/// `regression-suite/src/RJdkHello.java` pins that call's output character for
+/// character, so it is a red vector on any non-en-US host — green on en-US CI,
+/// which is the same hiding place the original defect used.
 fn native_printf_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args = [this, Locale, format String, Object[]] -> [this, format, Object[]]
-    let without_locale = [
-        args.first().copied().unwrap_or(Value::Object(None)),
+    let this_opt = match args.first() {
+        Some(Value::Object(obj)) => *obj,
+        _ => None,
+    };
+    // args = [this, Locale, format String, Object[]]
+    let with_locale = [
+        args.get(1).copied().unwrap_or(Value::Object(None)),
         args.get(2).copied().unwrap_or(Value::Object(None)),
         args.get(3).copied().unwrap_or(Value::Object(None)),
     ];
-    native_printf(ctx, &without_locale)
+    // GC: resolving a non-null locale runs real JDK bytecode (resource bundles,
+    // locale providers) and allocates, so the receiver can move across the
+    // format call in a way it could not when this delegated to the no-locale
+    // path. Pin and re-derive — the same argument the `java/util/Formatter`
+    // `format` registration makes.
+    let this_pin = this_opt.map(|t| ctx.pin_native_root(t));
+    let result = lang_string::native_string_format_locale(ctx, &with_locale)?;
+    let this_cur = match (this_pin, this_opt) {
+        (Some(p), Some(t)) => Some(ctx.read_native_pin(p, t)),
+        _ => this_opt,
+    };
+    if let Some(p) = this_pin {
+        ctx.unpin_native_roots(p);
+    }
+    if let Some(Value::Object(Some(str_ref))) = result {
+        let text = ctx.read_string(str_ref).unwrap_or_default();
+        ctx.record_printed_line(text.clone());
+        // `stream_write` and all three of its helpers read only `args[0]`
+        // (`stream_fd`, `route_write_through_out`, `surefire_forwarding_write`),
+        // so the re-derived receiver alone is a complete argument list.
+        stream_write(ctx, &[Value::Object(this_cur)], &text);
+    }
+    Ok(Some(Value::Object(this_cur)))
 }
 
 /// Return the underlying `Writer` from a `PrintWriter` object when it is a
@@ -29056,25 +29115,22 @@ fn native_reference_wait_pending(
 /// The real dispatch happens in the interpreter via CachedInvokeTarget; this native
 /// fallback returns null for now (MH-heavy code paths use the interpreter's dispatch).
 fn native_method_handle_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // A real-JDK Linker returns a synthetic DowncallHandle that is assignable
-    // to MethodHandle. Some signature-polymorphic void call sites resolve the
-    // inherited MethodHandle entry first and reach this fallback instead of
-    // the specialized interpreter route. Do not turn those native calls into
-    // a silent null return: route by the receiver's runtime class.
+    // A real-JDK Linker returns a downcall handle. Some signature-polymorphic
+    // void call sites resolve the inherited MethodHandle entry first and reach
+    // this fallback instead of the specialized interpreter route. Do not turn
+    // those native calls into a silent null return.
+    //
+    // Both former tests are dead as written (P1-E). The class test named
+    // `java/lang/foreign/DowncallHandle`, the invented class `--jdk-only`
+    // refused; and the layout test read `Long` at slot 0 and a
+    // `FunctionDescriptor` at slot 1, which the carrier no longer has — slot 0
+    // is now the real `type` field (an object) and the downcall state lives
+    // above the MethodHandle window. Left as they were, BOTH would go false and
+    // this fallback would return null for every downcall. That is the failure
+    // mode this comment block exists to prevent, so the two halves had to move
+    // together.
     if let Some(Value::Object(Some(receiver))) = args.first() {
-        let receiver_class = ctx.class_name_of_id(ctx.class_id_of_object(*receiver));
-        let has_downcall_layout = matches!(ctx.get_field(*receiver, 0), Value::Long(ptr) if ptr != 0)
-            && match ctx.get_field(*receiver, 1) {
-                Value::Object(Some(descriptor)) => {
-                    ctx.class_name_arc_of_id(ctx.class_id_of_object(descriptor))
-                        .as_deref()
-                        == Some("java/lang/foreign/FunctionDescriptor")
-                }
-                _ => false,
-            };
-        let is_downcall = receiver_class.as_deref() == Some("java/lang/foreign/DowncallHandle")
-            || has_downcall_layout;
-        if is_downcall {
+        if crate::panama::is_downcall_handle(ctx, *receiver) {
             return crate::panama::pe_downcall_invoke(ctx, args);
         }
     }

@@ -514,3 +514,102 @@ measured heap/direct read-only split exactly (`Some(arr)` + read-only →
 `s2_bb_arr(..).is_some() && !s2_bb_is_read_only(..)`, i.e. the JDK's
 `hb != null && !isReadOnly`. Both are asserted by group 7 as the over-correction
 arm rather than as findings.
+
+---
+
+## 13. Verification pass 2026-08-12 (lane A16)
+
+**Nothing was built or run in this pass.** Source read against today's
+worktree, with today's anchors.
+
+### 13.1 The landed change is intact
+
+| claim | today | verdict |
+|---|---|---|
+| `bb_state` returns `TbView`, heap arm → direct arm → refusal | `native-io/src/lib.rs:7844`–`:7883` | present; the refusal message now names every probe it tried, which is strictly better than the `Int(-1)` string §3 quotes |
+| `buf_metadata`, no storage requirement | `:7724` | present |
+| `is_plausible_native_addr` | `:8045`, `v >= 0x1_0000` | present |
+| `bb_resolve_direct_address` (`address`-by-name → slot 4, screened) | `:8050`–`:8082` | present |
+| `TbView` | `:8159` | present |
+| §5.7 `native_tb_array` refuses a direct receiver with `UnsupportedOperationException` and keeps the storage-less null | `:16018`–`:16030` | present |
+| §7's gating | `:6874`–`:6877`, `#[cfg(feature = "synthetic-jdk")] if !registry.drops_real_layout_synthetic()` | **unchanged** — the 78 sites are still reachable only in a `--features synthetic-jdk` binary running `--synthetic-jdk` |
+
+The three defects §6 named and left are all still exactly as named:
+`native_bb_is_read_only` is still `Ok(Some(Value::Int(0)))` (`:9757`–`:9759`),
+and `native_bb_slice` still copies rather than aliases (`:9801`+). Add one this
+record did not name: `native_bb_duplicate` (`:9761`+) falls back to a **byte
+copy** for a receiver whose array does not resolve (`:9789`–`:9796`), so
+`duplicate()` on a direct buffer does not alias either. Same defect family as
+`slice`, same registrar, still not `bb_state`'s.
+
+### 13.2 §2 and §4 have been amended by a later lane — read W7-83 with this
+
+This record's §2 keeps the slot-5 probe with the justification that `segment` is
+the only Object-typed field `Buffer` declares, and §4's `bb_resolve_heap_array`
+resolves `hb` → slot 5 → slot 0. **W7-83-segment-as-backing-array.md measured
+the "harmless for a real buffer" half and falsified it**: `Buffer.segment` is
+null on `allocate` and `allocateDirect` receivers but is a live
+`jdk.internal.foreign.NativeMemorySegmentImpl` on an
+`Arena…allocate(n).asByteBuffer()` one, which the slot-5 arm was handing to
+`heap_element_type_of` / `get_array_element` as a backing array. The arm now
+carries a **kind screen** — see the doc comment at `native-io/src/lib.rs:7903`+
+and the new unit test `bb_state_refuses_a_memory_segment_at_the_segment_slot`
+(`:24477`). §2's bullet about the old comment being "wrong twice over" is right
+and is now in the source; what it did not anticipate is that the *value's kind*,
+not the slot index or the field name, was the third way to be wrong.
+
+**§8 is correspondingly half-superseded.** §8 concludes that the instrument
+which would have caught this is the §6 probe, because `report_layout_alias` is
+an allocation instrument that compares counts. A **read-side** alias instrument
+now exists — `native-api/src/read_alias.rs`, with
+`bb_state_reading_slot_0_of_a_real_direct_byte_buffer_as_hb_is_flagged`
+(`:711`) — and `bb_resolve_direct_address` calls `read_alias::observe_read` on
+its slot-4 fallback under `layout_alias::enabled()` (`native-io/src/lib.rs:8069`).
+§8's five numbered reasons are still all true **of `report_layout_alias`**; they
+are no longer true of the tree.
+
+### 13.3 A residual this record does not carry: the address screen does not see a TAGGED handle
+
+`is_plausible_native_addr` is `v >= 0x1_0000`, and its doc comment justifies
+exactly one thing — refusing `ARRAY_BYTE_BASE_OFFSET`-shaped small values, which
+is what §4 claims and what the 2026-08-10 `addr=0x10` crash population needed.
+
+It does **not** discriminate a real off-heap address from an **arena-tagged
+handle**. `Unsafe.allocateMemory` in this VM returns a tagged handle, not a raw
+address (`0x4000_0010_…`-shaped), and such a value passes `>= 0x1_0000`
+trivially. §7 states that what actually reaches the direct arm today is
+`servlet.rs`'s `s2_bb_alloc_direct`, which seeds a real address from the VM's
+`NativeMemoryTable` — so this is not a live crash, it is a **missing screen on
+an arm whose sole safety argument is the identity of its one producer**. If any
+other producer ever seeds `address` from `Unsafe.allocateMemory`, `tb_read_elem`
+dereferences a handle and the failure is a SIGSEGV inside the copy, not an
+error. Source-only, not measured; recorded because §11 already lists "whether
+the 28 heap-only sites are genuinely unreachable" as the same species of
+producer-identity argument.
+
+### 13.4 §12's scheduling is real
+
+`RDirectBufferElem` is in `CORE_CLASSES` (`regression-suite/run.sh:106`), so it
+runs on a default `run.sh` invocation in both modes, and the file carries the
+group 6/7 material §12 describes (`RDirectBufferElem.java:83` names "the
+measured heap/direct split in group 7"; the heap/direct/read-only sections are
+at `:391`, `:411`, `:432`).
+
+### 13.5 The passing direct-ByteBuffer probe does NOT contradict this record
+
+A 33-probe reachability screen run today on the current binary reports direct
+`ByteBuffer.allocateDirect` + `putInt`/`getInt` **passing** under `--jdk-only`
+(and on the HotSpot oracle). That looks like a refutation of §3 and is not one,
+for the reason §7 already gives: the screen ran a **default build** in
+`--jdk-only`, where `register_nio_natives` is not compiled at all, so
+`allocateDirect`/`putInt`/`getInt` were answered by real JDK bytecode and the
+`native-builtins` s2 family — none of the 78 sites this record migrated. It is a
+**control for §12's three-way split**, and a useful one: it says the contract
+those rows assert is green in the mode the suite runs, which is what §12 claims
+and what `RDirectBufferElem` groups 1–5 already assert.
+
+**So: no claim in this record is contradicted by the screen, and the screen
+cannot discharge §11 either.** §11's first bullet — "everything about CratonVM's
+behaviour" — still stands in full: the §6 probe has never been run against a
+`--features synthetic-jdk` + `--synthetic-jdk` binary, and that is the only
+configuration in which any of §5's census is executed.

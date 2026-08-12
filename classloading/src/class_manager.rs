@@ -1974,6 +1974,17 @@ impl ImageClassShape {
 /// bounded.
 const IMAGE_HIERARCHY_MAX_DEPTH: usize = 64;
 
+/// One refused fabrication request, identified by *what* was refused and
+/// *who* asked: the class name, and the `file`/`line` of the Rust call site
+/// that `#[track_caller]` attributes it to.
+///
+/// The pair is the identity, not the class alone. The same class is refused
+/// from more than one site in a real run — `cratonvm/internal/UnmodifiableMap`
+/// is refused once by the boot block and again by `System.getenv`'s native —
+/// and those are two different diagnoses. See
+/// [`ClassManager::compatibility_refusal_counts`].
+pub type RefusalSite = (String, &'static str, u32);
+
 /// Manages class loading for the VM.
 ///
 /// Maintains the `ClassStore` (all loaded classes), three built-in class finders
@@ -2319,6 +2330,67 @@ pub struct ClassManager {
     /// Invoked from [`Self::admit_compatibility_class`] while the manager is
     /// mutably borrowed, so the sink must not re-enter the class manager.
     violation_sink: Option<Arc<dyn Fn(&JdkOnlyViolation) + Send + Sync>>,
+
+    /// `(class name, requesting Rust site) -> how many times
+    /// [`Self::try_ensure_synthetic_class`] has refused that pair`, and the
+    /// dedupe key for the refusal `warn!`.
+    ///
+    /// # The key is the PAIR, and that is the whole design
+    ///
+    /// Measured 2026-08-12 under `--jdk-only --explain-jdk-only`: every
+    /// boot-time refusal is reported (the boot block warns) and **every
+    /// runtime refusal is silent** — `AtomicReferenceFieldUpdater$RustJvmImpl`
+    /// (kills `java.sql`), `cratonvm/internal/UnmodifiableMap` (kills
+    /// `System.getenv`), `javax/net/ssl/SSLSocketOutputStream` (kills HTTPS),
+    /// `java/util/function/Consumer$AndThen`, `java/lang/foreign/DowncallHandle`.
+    ///
+    /// `UnmodifiableMap` is in **both** sets: refused at boot from
+    /// `vm_init::ensure_bootstrap_compat_class`, and refused again later when
+    /// `System.getenv()`'s native asks for it. Those are two different events
+    /// with two different diagnoses — one says a boot wiring was skipped, the
+    /// other says an application call just died — and a class-keyed dedupe
+    /// would report the harmless one and swallow the one that matters. Keying
+    /// on the pair keeps them apart, and it is the same discrimination the
+    /// `requested_by` field exists to make: a refusal without a requester is
+    /// half a diagnosis.
+    ///
+    /// # Why this is not [`Self::origin_violations_seen`]
+    ///
+    /// That set is inserted into by [`Self::admit_compatibility_class`]
+    /// *before* it returns the `Err`, so by the time the refusal is back in
+    /// `try_ensure_synthetic_class` the name is always already present and
+    /// "first insert" can no longer be read as "first refusal" — it would
+    /// suppress **every** warn. It is also class-keyed, which is exactly the
+    /// collapse described above, and covers a different population:
+    /// `admit_compatibility_class` also runs from `create_synthetic_stub` (the
+    /// `load_class` chain) and records in both modes, whereas this counts only
+    /// refusals actually handed back to a caller — the set an operator has to
+    /// act on, because each one is a native that did not get its receiver.
+    ///
+    /// # Why a count and not a set
+    ///
+    /// A refused allocation shape is re-requested on every allocation of
+    /// whatever wanted it — thousands of times for a container node class — so
+    /// the warn is rate-limited rather than per-call, and the count is what
+    /// the limiter reads. See [`Self::warn_fabrication_refused`] for the
+    /// schedule. "Refused once at boot" and "refused 40,000 times from a hot
+    /// native" are different diagnoses, and the count is the only thing that
+    /// separates them.
+    ///
+    /// # Where the state lives
+    ///
+    /// A field on the manager — **VM-scoped, never process-global**, for the
+    /// same reason [`Self::violation_sink`] is (contract §2). The nearest
+    /// in-tree precedent for this rate limiter, `gc::autobox`'s
+    /// `observe_primitive_into_reference_field`, uses a process-global
+    /// `static SEEN: AtomicU64`; that is the shape this must NOT copy. A global
+    /// here lets the first VM in a process consume the whole quota and silence
+    /// the second VM's refusals, and the failure is invisible — the second
+    /// VM's log is simply missing a line nobody knows to expect. The map is
+    /// bounded by the number of distinct `(class, call site)` pairs, a smaller
+    /// population than the class store and the same class of bound
+    /// [`Self::origin_violations_seen`] already accepts.
+    jdk_only_refusals: FxHashMap<RefusalSite, u64>,
 
     /// C2 review P1 — VM identity + per-class metadata generation for the
     /// generational handles in [`crate::metadata_handle`].
@@ -2791,6 +2863,7 @@ impl ClassManager {
             origin_violations_seen: FxHashSet::default(),
             origin_requesters: FxHashMap::default(),
             violation_sink: None,
+            jdk_only_refusals: FxHashMap::default(),
             // Unbound: `ClassManager::new` runs before the owning `SharedVm`
             // exists, so it has no `vm_identity` to record yet. `vm_init` calls
             // `bind_vm_id` as soon as it does.
@@ -3597,13 +3670,159 @@ impl ClassManager {
     /// The two are deliberately different error shapes: a caller retrying with
     /// an initiating loader (the right response to 2) must not confuse it with
     /// a policy refusal it cannot retry out of.
+    ///
+    /// # Every refusal is reported, not just the boot block's
+    ///
+    /// `vm_init::ensure_bootstrap_compat_class` `warn!`s when one of its three
+    /// call sites is refused, and until 2026-08-12 that was the only refusal an
+    /// operator saw. Measured that day under `--jdk-only --explain-jdk-only`,
+    /// the split was not "some of the blockers are named" but a clean line:
+    /// **every boot-time refusal was reported and every runtime refusal was
+    /// silent.** Thirteen boot classes named
+    /// (`java/util/Enumeration$Impl`, `java/util/Comparator$Native`, eleven
+    /// `cratonvm/internal/Unmodifiable*`); nothing at all for the runtime
+    /// refusals that were each killing an application path —
+    /// `…/atomic/AtomicReferenceFieldUpdater$RustJvmImpl` (all of `java.sql`),
+    /// `cratonvm/internal/UnmodifiableMap` (`System.getenv`, and through it
+    /// Spring), `javax/net/ssl/SSLSocketOutputStream` (all HTTPS),
+    /// `java/util/function/Consumer$AndThen`,
+    /// `java/lang/foreign/DowncallHandle` (all FFM).
+    ///
+    /// The refusal IS the diagnosis for whatever fails next: a native asks for
+    /// a receiver, is correctly refused, and the application dies far away with
+    /// a `NoClassDefFoundError` naming something else. Emitting it here — the
+    /// choke point every caller shares, boot and runtime alike — is what makes
+    /// the failure self-diagnosing, and it does not depend on the violation-log
+    /// bookkeeping the `--jdk-only-report`/`--trace-jdk-only` path uses, so a
+    /// gap in that plumbing cannot swallow it.
+    ///
+    /// See [`Self::warn_fabrication_refused`] for the rate limit and for what
+    /// the line can and cannot say about the caller.
     #[track_caller]
     pub fn try_ensure_synthetic_class(
         &mut self,
         name: &str,
         num_fields: usize,
     ) -> Result<ClassId, VmError> {
-        self.fabricate_class(name, num_fields, fabricated_origin_for_name(name), true)
+        // Captured before the call, not inside the error arm: `Location` is
+        // the *caller's*, and taking it here keeps it identical to the one
+        // `admit_compatibility_class` records as the violation's `requester`,
+        // so the live line and the report name the same site.
+        let site = core::panic::Location::caller();
+        let fabricated =
+            self.fabricate_class(name, num_fields, fabricated_origin_for_name(name), true);
+        if let Err(err) = &fabricated {
+            self.warn_fabrication_refused(name, num_fields, site, err);
+        }
+        fabricated
+    }
+
+    /// One `warn!` per distinct `(refused class, requesting site)` pair, then
+    /// rate-limited on the repeats.
+    ///
+    /// # What the line names, and why that is the caller
+    ///
+    /// The `#[track_caller]` chain is unbroken from the native down to here —
+    /// `NativeContext::try_ensure_synthetic_class` (the trait default and the
+    /// `vm_exec` impl), `native-collections`/`native-io`/`native-builtins`'
+    /// `refused_class` funnels, and
+    /// [`Self::try_ensure_synthetic_class`] itself are each `#[track_caller]`
+    /// — so `site` is the native's own `file:line`, not the funnel's. That is
+    /// the half of the attribution this record needs: a bare class name says
+    /// what was refused, and the requester says *who asked*, which is the
+    /// native to fix.
+    ///
+    /// The class is named in full and nothing screens on a prefix. Three of
+    /// the five runtime refusals measured on 2026-08-12 are in JDK package
+    /// namespaces (`java/util/concurrent/atomic/…$RustJvmImpl`,
+    /// `javax/net/ssl/SSLSocketOutputStream`,
+    /// `java/lang/foreign/DowncallHandle`), so a `cratonvm/internal/*` screen
+    /// — which the roadmap's definition of done still uses — would have missed
+    /// the majority of them.
+    ///
+    /// What it cannot name is the **Java** frame. That arrives later, from
+    /// `attach_origin_requester`, once the load unwinds to a VM choke point
+    /// that can see a frame; waiting for it would defeat the point of
+    /// reporting at the instant of refusal. `--jdk-only-report` /
+    /// `--explain-jdk-only` carry both halves, and this line says so.
+    ///
+    /// # The rate limit, and where its state lives
+    ///
+    /// Keyed on the pair, counted in [`Self::jdk_only_refusals`] (a manager
+    /// field — VM-scoped, never process-global; see that field's doc for why
+    /// the key is the pair and not the class).
+    ///
+    /// The schedule is `n < 8 || n.is_power_of_two()`, which is the in-tree
+    /// precedent (`gc::gc_quiescence::record_moving_young_coverage_fallback`,
+    /// `gc::autobox::observe_primitive_into_reference_field`) and is chosen for
+    /// the same reason: **the first occurrence is always visible**, a genuinely
+    /// hot refusal cannot flood the log, and the `occurrence` field still shows
+    /// it is hot. That last part matters here — "refused once during boot
+    /// wiring" and "refused on every call of a live application path" are
+    /// different defects, and a strict once-per-pair warn cannot tell them
+    /// apart while nothing consumes the counters.
+    ///
+    /// Cost on the suppressed path is one `String` key and a hash. The refusal
+    /// path already allocates a `String` per refusal for the
+    /// `ClassNotFound { class_name }` it is about to return, and it ends in a
+    /// Java throwable, so this does not put an allocation anywhere that did not
+    /// have one. The `format!` for the message stays inside the emit branch.
+    ///
+    /// # Both refusals, deliberately
+    ///
+    /// `fabricate_class` has two (see this type's `try_ensure_synthetic_class`
+    /// doc): the `--jdk-only` **policy** refusal, and the **identity** refusal
+    /// for an ambiguous name, which fires in `Compatible` mode too. Both are
+    /// warned. The identity refusal is rare, is a correctness event rather
+    /// than a policy one, and was previously visible only to a caller that
+    /// chose to log it; `error = %err` distinguishes the two without this
+    /// function having to re-classify the name.
+    fn warn_fabrication_refused(
+        &mut self,
+        name: &str,
+        num_fields: usize,
+        site: &'static core::panic::Location<'static>,
+        err: &VmError,
+    ) {
+        let occurrence = {
+            let counter = self
+                .jdk_only_refusals
+                .entry((name.to_string(), site.file(), site.line()))
+                .or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        if occurrence >= 8 && !occurrence.is_power_of_two() {
+            return;
+        }
+        let requested_by = format!("{}:{}", site.file(), site.line());
+        tracing::warn!(
+            class = name,
+            fields = num_fields,
+            requested_by = requested_by.as_str(),
+            occurrence,
+            error = %err,
+            "refusing to fabricate a compatibility stand-in for this class. It is NOT \
+             registered and the requester above did not get its receiver, so the failure \
+             will surface later, at that caller's own call site and usually naming a \
+             different class. One line per (class, requester); repeats are rate-limited \
+             and `occurrence` counts them. --jdk-only-report and --explain-jdk-only list \
+             every refusal with its requester, including the Java frame when there is one."
+        );
+    }
+
+    /// `(class name, requester file, requester line) -> refusal count`.
+    ///
+    /// The census view of what the rate-limited `warn!` above reports. A
+    /// caller that wants "which refusals are on a hot path", or wants the full
+    /// set in one place at shutdown rather than interleaved through the run,
+    /// reads this rather than the log.
+    ///
+    /// Deliberately **not** named `jdk_only_refusal_counts`: `SharedVm` already
+    /// has a method by that name returning `JdkOnlyRefusalCounts`, which is the
+    /// JIT/dispatch event tally and a different thing entirely.
+    pub fn compatibility_refusal_counts(&self) -> &FxHashMap<RefusalSite, u64> {
+        &self.jdk_only_refusals
     }
 
     /// Register a VM-generated class with an explicit, legitimate provenance.
@@ -11487,8 +11706,12 @@ pub(crate) fn is_vm_reserved_namespace_name(name: &str) -> bool {
     name.starts_with("CratonVM$")
 }
 
-/// The origin a **fabricated** class deserves on the strength of its name
-/// alone.
+/// The origin a **fabricated** class deserves.
+///
+/// The answer is [`ClassOrigin::CompatibilityStub`] for everything except three
+/// exact identities the VM invents. It is deliberately NOT a classifier over
+/// name *shapes* any more — see "The three generated-name families are NOT
+/// here" below, which is the `--jdk-only` policy hole this function used to be.
 ///
 /// [`ClassManager::ensure_synthetic_class`] and
 /// [`ClassManager::try_ensure_synthetic_class`] used to hard-code
@@ -11520,21 +11743,88 @@ pub(crate) fn is_vm_reserved_namespace_name(name: &str) -> bool {
 ///   it is taken because a SECOND minting route exists and has no pre-mint of
 ///   its own (`CratonVM$StsForkRunner`, `jdk25_concurrency.rs`), so here the
 ///   arm is not belt-and-braces — it is the only thing covering that name.
-/// * the three generated-name families — a fabricated `$$Lambda` / `$ProxyN` /
-///   `Generated*Accessor*` is what generated it, exactly as
-///   [`ClassManager::classify_defined_origin`] already reports for the same
-///   names when they arrive with real bytes. Neither path may report the same
-///   class differently depending on whether it happened to be fabricated.
-///   Measured 2026-08-05 (L7) and again 2026-08-06: **none of the three fires**
-///   on a strict boot, `JdkOnlyCensusLoadProbe` or `JdkOnlyBreadthProbe`. They
-///   are here so the classification cannot drift, not because anything hits
-///   them — which is the permanent form of the one-off audit the wave-2 record
-///   asked for.
 ///
-/// `host`/`interfaces` are empty rather than guessed: this path has no class
-/// file, so there is no nest host to read and no resolved interface set. A
-/// fabricated generated-name class is a pathology worth seeing in the census
-/// with its producer named, not a place to invent metadata.
+/// `host`/`interfaces` do not appear anywhere below: this path has no class
+/// file, so there is no nest host to read and no resolved interface set, and a
+/// fabrication is not a place to invent metadata.
+///
+/// # The three generated-name families are NOT here — REMOVED 2026-08-12 (A17)
+///
+/// This function used to carry three more arms: a name containing `$$Lambda`
+/// became [`ClassOrigin::GeneratedLambda`], a `$ProxyN` simple name became
+/// [`ClassOrigin::GeneratedProxy`], and a `Generated*Accessor*` simple name
+/// became [`ClassOrigin::ReflectionAccessor`]. All three are non-stub origins,
+/// so [`ClassManager::fabricate_class`]'s `--jdk-only` refusal — which is gated
+/// on `origin.is_compatibility_stub()` — did not fire for them. **A fabricated
+/// class could exempt itself from the strict-mode policy by choosing its own
+/// name.**
+///
+/// That was not hypothetical. Measured 2026-08-12 with
+/// `cratonvm --jdk-only --dump-class-origins`: the run's census had
+/// `compatibility-stub 0` — the refusal working — and exactly one
+/// `generated-lambda` row, `java/util/function/Predicate$$Lambda$And`, a
+/// compatibility stand-in minted by `phases_late/streams.rs` and created in
+/// strict mode purely because of the `$$Lambda$` infix in the name its author
+/// picked. Its sibling `java/util/function/Consumer$AndThen`, the same species
+/// of stand-in with no infix, was correctly refused at the door. The two
+/// failures looked unrelated in the field — `NoClassDefFoundError` for one,
+/// `AbstractMethodError: … has no Code attribute` for the other — which is why
+/// the shared cause went untraced for a week.
+///
+/// ## The measurement the old comment carried was false, not merely stale
+///
+/// It read: *"Measured 2026-08-05 (L7) and again 2026-08-06: none of the three
+/// fires on a strict boot, `JdkOnlyCensusLoadProbe` or `JdkOnlyBreadthProbe`."*
+/// That statement was true **of those two probes** and false of the VM: neither
+/// probe ever calls a `Predicate` combinator, so neither could reach the one
+/// mint site that fires the arm. A narrow probe reports its own reach, not the
+/// defect. Recorded rather than deleted because the next person to add a
+/// name-shape arm here will reach for the same evidence.
+///
+/// ## Why removing them cannot break a real lambda, proxy or accessor
+///
+/// The discriminator is **structural, not lexical**: it is which door the class
+/// came through, and that is decided before this function is consulted.
+///
+/// * A genuine `LambdaMetafactory`/`$ProxyN`/accessor class **has bytes**, is
+///   defined through [`ClassManager::define_class_shared_with_options`], and is
+///   classified by [`ClassManager::classify_defined_origin`] — which still has
+///   all three arms, unchanged, and whose own doc states the invariant that
+///   makes them right there: *"by the time this runs, real class bytes have
+///   been parsed."*
+/// * This function is reached **only** from
+///   [`ClassManager::try_ensure_synthetic_class`] →
+///   [`ClassManager::fabricate_class`], by which point `get_loaded_class_id` has
+///   answered `None` **and** `find_class_bytes_delegated` has failed. The name
+///   resolves to nothing, in any loader, on any classpath entry. A `$$Lambda`
+///   with no bytes anywhere was not spun by `LambdaMetafactory`; it is a
+///   hand-minted stand-in that chose a generated-looking name.
+/// * CratonVM's **own** invokedynamic path never arrives here either, and not by
+///   luck: `invokedynamic.rs::link_lambda_call_site` takes a `ClassId` from
+///   `SharedVm::alloc_lambda_proxy_id` (a bare counter from `0x8000_0000`) and
+///   files the call site in the `lambda_proxies` side table. A CratonVM lambda
+///   proxy has **no `Class` in the store at all**; the `Host$$Lambda/0x…` string
+///   is rendered on demand by `lang_class.rs::lambda_class_name` for
+///   `Class.getName`, and is never fed back into a mint. Consistent with the
+///   census above: a lambda-heavy strict run produced *zero* `generated-lambda`
+///   rows for its real lambdas and one for the fabrication.
+///
+/// So the old comment's symmetry argument — "neither path may report the same
+/// class differently depending on whether it happened to be fabricated" —
+/// inverted the question. The two paths are not looking at the same class.
+/// Having real bytes or not is *precisely* what separates a generated class
+/// from a stand-in, and asking the name instead is what let a stand-in answer.
+///
+/// ## What survives here, and why these three are exact identities
+///
+/// The three `VmInternal` arms above are not name *shapes*: two are exact class
+/// names in packages no other party may define into, and the third is this VM's
+/// own reserved `CratonVM$` prefix. Each carries its own "yes, this binds by
+/// name" justification, and each exists as the second half of a pairing whose
+/// authoritative half is an `ensure_vm_internal_class` pre-mint at the mint
+/// site. **Anything added beside them must be able to make the same statement —
+/// a name nothing but this VM can ever mint — and must not be a shape a caller
+/// could fall into.** That is the rule the three deleted arms broke.
 fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
     if is_vm_proxy_supertype_name(name) {
         return ClassOrigin::VmInternal;
@@ -11545,17 +11835,12 @@ fn fabricated_origin_for_name(name: &str) -> ClassOrigin {
     if is_vm_reserved_namespace_name(name) {
         return ClassOrigin::VmInternal;
     }
-    if is_generated_lambda_name(name) {
-        return ClassOrigin::GeneratedLambda { host: None };
-    }
-    if is_generated_proxy_name(name) {
-        return ClassOrigin::GeneratedProxy {
-            interfaces: Arc::from(Vec::new()),
-        };
-    }
-    if is_reflection_accessor_name(name) {
-        return ClassOrigin::ReflectionAccessor { host: None };
-    }
+    // No generated-name-family arms. See the section above: a class that gets
+    // here has no bytes on any classpath entry, in any loader, so whatever its
+    // name looks like it is a fabricated stand-in and the policy must see it as
+    // one. `is_generated_lambda_name` / `is_generated_proxy_name` /
+    // `is_reflection_accessor_name` remain live — on the REAL-BYTES path, in
+    // `classify_defined_origin`, which is where they were always correct.
     ClassOrigin::compatibility_stub(ENSURE_SYNTHETIC_STUB_REASON)
 }
 
@@ -18472,6 +18757,95 @@ mod tests {
             None,
             "the refusal must not have filed a bootstrap alias for the name",
         );
+    }
+
+    /// A fabrication may NOT exempt itself from `--jdk-only` by choosing a
+    /// generated-looking name.
+    ///
+    /// The measured hole (2026-08-12, `--jdk-only --dump-class-origins`): the
+    /// policy refusal in `fabricate_class` is gated on
+    /// `origin.is_compatibility_stub()`, and `fabricated_origin_for_name` used
+    /// to route any name containing `$$Lambda` to
+    /// [`ClassOrigin::GeneratedLambda`]. A strict run therefore *created*
+    /// `java/util/function/Predicate$$Lambda$And` — a compatibility stand-in —
+    /// while refusing its infix-less sibling `java/util/function/Consumer$AndThen`
+    /// at the door. Same species, opposite verdicts, decided by a substring.
+    ///
+    /// Asserted through the public entry point rather than on
+    /// `fabricated_origin_for_name` directly, because the property that matters
+    /// is the **refusal**, not the label: a future change that keeps the label
+    /// and moves the gate must still fail this test.
+    #[test]
+    fn a_generated_looking_name_does_not_buy_a_jdk_only_exemption() {
+        for name in [
+            // The measured carrier.
+            "java/util/function/Predicate$$Lambda$And",
+            // The other two families the same arm used to exempt. No mint site
+            // reaches them today; they were an OPEN DOOR for the next one.
+            "com/example/Owner$$Lambda$17",
+            "com/example/$Proxy42",
+            "jdk/internal/reflect/GeneratedMethodAccessor3",
+        ] {
+            let mut mgr = ClassManager::new(&[], &[], &[]);
+            let origin = fabricated_origin_for_name(name);
+            assert!(
+                origin.is_compatibility_stub(),
+                "{name} reached the fabrication door with no bytes on any \
+                 classpath entry; it is a stand-in whatever its name looks like",
+            );
+            assert!(
+                !origin.allowed_in(CompatibilityMode::JdkOnly),
+                "{name}: the origin must be one strict mode rejects",
+            );
+
+            // Compatible mode is unchanged: it fabricates through either door.
+            let id = mgr
+                .try_ensure_synthetic_class(name, 2)
+                .expect("Compatible mode fabricates");
+            assert!(mgr
+                .class_store
+                .get(id)
+                .expect("just created")
+                .origin
+                .is_compatibility_stub());
+
+            // Strict mode refuses, and files nothing under the name.
+            let mut strict = ClassManager::new(&[], &[], &[]);
+            strict.set_compatibility_mode(CompatibilityMode::JdkOnly);
+            assert!(
+                strict.try_ensure_synthetic_class(name, 2).is_err(),
+                "{name} was fabricated under --jdk-only",
+            );
+            assert_eq!(
+                strict.get_loaded_class_id(name),
+                None,
+                "{name}: a refused fabrication must not leave the name resolvable",
+            );
+        }
+    }
+
+    /// The three exact identities that DO keep their `VmInternal` exemption.
+    ///
+    /// They are the counterweight to the test above, and the reason it is not
+    /// simply "everything here is a stub": each is a name nothing but this VM
+    /// can ever mint (two exact names in closed packages, one reserved prefix),
+    /// each is the second half of an `ensure_vm_internal_class` pre-mint
+    /// pairing, and removing them takes `HttpServer.start()`,
+    /// `StructuredTaskScope.fork()` and every annotation proxy down in strict
+    /// mode. A *shape* has none of those properties, which is the distinction
+    /// the removed arms failed.
+    #[test]
+    fn the_vm_invented_identities_keep_their_exemption() {
+        for name in [
+            "java/lang/reflect/Proxy$Instance",
+            "java/lang/annotation/AnnotationProxy",
+            "CratonVM$HttpServerLoop",
+            "CratonVM$StsForkRunner",
+        ] {
+            let origin = fabricated_origin_for_name(name);
+            assert_eq!(origin, ClassOrigin::VmInternal, "{name}");
+            assert!(origin.allowed_in(CompatibilityMode::JdkOnly), "{name}");
+        }
     }
 
     /// A caller with no channel for the refusal has to degrade to something

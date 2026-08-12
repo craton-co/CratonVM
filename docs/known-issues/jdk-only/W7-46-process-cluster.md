@@ -760,3 +760,74 @@ the code, in the units the rest of this record uses.
   are registered nowhere else in that file, but "nowhere else in that file" is
   not the census that question needs — it needs a `--dump-native-registry` diff,
   which needs a build.
+
+---
+
+# 9. Re-verified 2026-08-12 (record-triage lane, doc-only — nothing built or run)
+
+A source read of today's tree. Line numbers are today's.
+
+## 9.1 §8.2's out-of-file patch has been APPLIED — that row is discharged
+
+`native-builtins/src/lib.rs:38139-38153` now carries the replacement comment
+this record wrote, and the four `java/lang/ProcessBuilder` registrations are
+gone: the only `java/lang/ProcessBuilder` string left in that file is an
+unrelated comment at `:14533`. `native_pb_init` and `native_pb_command` survive
+as definitions with **zero callers** (`native-builtins/src/lang_system.rs:3667`,
+`:3676`) — exactly the leftover §8.2 said it was deliberately not prescribing,
+and harmless under the workspace's `dead_code = "allow"`.
+
+So each of the four triples now has one owner per mode:
+`phases_late::register_phase57_process` (`native-builtins/src/phases_late.rs:1343`,
+`SyntheticStub` stated) for all four, plus `native-io`'s
+`register_process_natives` re-winning `start` last, as §8.2 measured.
+
+**What is discharged is the SOURCE half only.** §8.2's own proof —
+`--dump-native-registry` on a `--features synthetic-jdk` binary in
+`--synthetic-jdk` mode, the three rows moving from `Intrinsic` back to
+`SyntheticStub` with empty `overwrote=` — still has not been run by anyone, and
+cannot be seen from Compatible mode. Treat the kind-rewrite claim as repaired in
+source and unmeasured.
+
+## 9.2 §8.1 and §3 are present, and the Linux half is still uncompiled
+
+* `linux_liveness_and_start_time` — `native-io/src/process.rs:3041`; its parser
+  `linux_stat_line_times` at `:2310`.
+* Both `foreign_pid_is_alive` tombstone comments are in place (`:2841` Linux,
+  `:2854` Windows); the surviving `foreign_pid_is_alive` at `:3100` is the
+  platform-of-last-resort one, as stated.
+* `win_liveness_and_start_time` at `:2916`; the three `foreign_start_time_or_dead`
+  arms at `:3069`, `:3077`, `:3085`.
+* Both mirror tests exist:
+  `one_open_reports_the_same_start_time_as_the_separate_probe` (`:5783`) and
+  `one_stat_read_reports_the_same_start_time_as_the_separate_probe` (`:5834`).
+  The Linux one **has still never run**; that remains the standing item.
+* §3's fix is at `:4096-4108` — `invoke_virtual(this, "toHandle", …)` then
+  `invoke_virtual(handle, "descendants", …)`, with the
+  `UnsupportedOperationException` arm for a refusing `toHandle()`, as written.
+
+## 9.3 Scheduling, per claim
+
+`RJdkProcess` is in `JDKONLY_CLASSES` (`regression-suite/run.sh:119`), and
+`EXPECTED_CHECKS = 55` is a constant at `RJdkProcess.java:89` asserted at
+`:413`. So §1's ratchet and §3's and §4's falsifiers are **scheduled** and will
+run on all three arms. The two that are not scheduled anywhere are the Linux
+mirror test (needs a Linux build) and §8.2's registry diff (needs a
+`synthetic-jdk` build) — the same two holes this record has carried since §8.
+
+## 9.4 A neighbour that belongs on this cluster's map, not in it
+
+Today's committed strict census — `P1-BASELINE-20260812.md` — lists
+`cratonvm/synthetic/Process` as one of the **nine** families that still block
+`--jdk-only`, entered as **P1-I** through `Runtime.exec` (all six overloads),
+with `ProcessBuilder.start` printed beside it as the **passing control**. That
+is the same shared mint this cluster owns:
+`native-io/src/process.rs::spawn_and_wrap_with_redirects`.
+
+The repair is in source today and this record's readers should not re-derive it:
+`native-builtins/src/lib.rs:14531-14560` re-tags all six `Runtime.exec` overloads
+`NativeKind::SyntheticStub`, on the argument that `Runtime.exec` is ordinary
+bytecode on the image, so strict drops the shadow and the JDK's own `exec` runs
+down to the real `ProcessBuilder.start()`. **Unbuilt, unmeasured**, and its
+comment states the general rule this cluster keeps paying for: *a retag that
+pins one caller of a shared mint must enumerate the callers*.

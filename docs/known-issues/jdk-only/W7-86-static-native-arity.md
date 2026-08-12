@@ -8,6 +8,50 @@ that exits **0 for every status**, on the default configuration.
 
 Branch `fix/continuation-pin-static-arity-20260812`.
 
+> **RE-VERIFIED 2026-08-12 (lane A1, `--jdk-only` field-updater lane). STAYS
+> OPEN, with one row closed and one correction.** Source-level only: this lane
+> may not invoke `cargo` either, and it ran nothing. Every claim below says
+> which file it was read in.
+>
+> **The five "FIXED" rows of §4.1 are in the tree.** Each carries its own repair
+> marker, so the check is not a line-band guess:
+>
+> | row | verified at | what is there now |
+> |---|---|---|
+> | 1,2 `Continuation.pin`/`unpin` | `native-builtins/src/phases_late/concurrent.rs:8580`, `:8592` | `register_with_kind(cls, "pin", "()V", \|ctx, _args\| { ctx.vt_pin(…); Ok(None) }, Bridge)` — no `obj_arg` anywhere in either body, and the comment block above them states the mode analysis |
+> | 3 `ClassLoader.findBootstrapClass` | `native-builtins/src/lib.rs:16143` (registration), `:28823` (body, whose comment opens *"W7-86. `findBootstrapClass` is **`private static native`** on JDK 25's …"*) | repaired |
+> | 4 `Runtime.exit` | `native-builtins/src/lib.rs:14483` — `registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit)`, with `:14467`–`:14482` carrying the rationale | the `lib.rs` row now points at the instance body, so last-write-wins no longer kills `lang_system.rs:1580` |
+> | 5 `Perf.createByteArray` | `native-builtins/src/lang_system.rs:5308` | comment opens *"W7-86. `createByteArray` is … an INSTANCE method"*, and the body reads `args[5]` |
+>
+> **§4.1 row 6 is CLOSED, and §6 item 1 is therefore stale.**
+> `MemorySessionImpl.checkValidState(Ljava/lang/foreign/MemorySegment;)V` was
+> repaired by **W7-89**, whose comment at
+> `native-builtins/src/phases_late/foreign_ffm.rs:2073` credits this record's
+> §4.1 row 6 by name. The body no longer hands the segment to
+> `p67_session_check_valid`; it is now
+> `let segment = obj_arg(args, 0)?; p67_segment_check_scope(ctx, segment)?;`,
+> i.e. resolve the segment's session and check *that* — the JDK's own shape. §6
+> item 1's "wants an owner who can build" is answered. §6 items 2–5 are
+> untouched.
+>
+> **§4.2 is still open, and was re-read rather than assumed.** All four sampled
+> rows still carry the defect verbatim:
+> `HexFormat.fromHexDigits(CharSequence)I` and `fromHexDigitsToLong` at
+> `native-builtins/src/phases_late.rs:4186` and `:4199` still read `args.get(1)`
+> for the *first* parameter of a static, and
+> `NetworkInterface.getByName(String)` at
+> `native-builtins/src/phases_late/nio_file.rs:18150` still opens
+> `obj_arg(args, 1)?` — the `pin`/`unpin` throwing shape. (Note the line numbers
+> have drifted from §4.2's table: `:4181`→`:4186`, `:17936`→`:18150`. Anchor on
+> the symbol, not the band.) Nothing here was fixed, and this record correctly
+> says so.
+>
+> **Nothing in §1, §3 or §7 was re-measured.** The calling convention, the sweep
+> and the recall figures are transcripts of runs this lane cannot reproduce, and
+> are neither endorsed nor challenged here — they are simply unverified by this
+> pass. The record therefore stays OPEN on the strength of §4.2, §4.3 and §6
+> items 2–5.
+
 **This lane may not invoke `cargo`; the orchestrator builds.** Nothing here was
 compiled. Everything measured was measured by *running* — the prebuilt dev
 binary `target/release/cratonvm.exe` of 2026-08-12 07:00 (pre-change) against
@@ -295,7 +339,7 @@ real-JDK keep-list in `native-api/src/registry.rs` depends on.
 
 ## 6. What was not fixed, and why
 
-1. **`MemorySessionImpl.checkValidState(MemorySegment)`** (§4.1 row 6) is LIVE
+1. ~~**`MemorySessionImpl.checkValidState(MemorySegment)`** (§4.1 row 6) is LIVE
    and is not repairable by moving an index. The method is static, so `args[0]`
    *is* the right slot — but it holds the `MemorySegment` being accessed, and
    the body passes it to `p67_session_check_valid` as if it were the session.
@@ -304,7 +348,12 @@ real-JDK keep-list in `native-api/src/registry.rs` depends on.
    function returns `Ok(())`: **the check fails open and validates nothing.**
    A correct repair needs the segment→session mapping, which is a different
    piece of the FFM model and wants an owner who can build. Failing open is the
-   safe direction meanwhile, which is why this is filed rather than guessed at.
+   safe direction meanwhile, which is why this is filed rather than guessed at.~~
+   **CLOSED by W7-89** — verified 2026-08-12 at
+   `native-builtins/src/phases_late/foreign_ffm.rs:2073`, whose comment credits
+   this section by name. The segment→session mapping the paragraph above said
+   was missing already existed as `p67_segment_check_scope`, and the body now
+   calls it. See the status block at the top of this file.
 2. **`Perf.createByteArray` has no probe** and none is pretended.
    `jdk.internal.perf` is exported to nobody and `Perf.getPerf()` is gated, so
    the defect is not observable from ordinary Java. A Rust unit test on the

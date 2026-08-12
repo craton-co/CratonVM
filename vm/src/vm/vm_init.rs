@@ -700,53 +700,109 @@ fn require_jdk_image_for_jdk_only(config: &VmConfig) -> Result<Option<PathBuf>, 
     }
 }
 
-/// Pre-register one of the bootstrap block's compatibility stand-ins,
-/// **refusing diagnosably** under [`CompatibilityMode::JdkOnly`].
+/// Pre-register one of the bootstrap block's compatibility stand-ins, and
+/// under [`CompatibilityMode::JdkOnly`] **do not ask at all**.
 ///
 /// # Why this exists
 ///
 /// The three call sites below (`Enumeration$Impl`, `Comparator$Native`, the
-/// eleven `cratonvm/internal/Unmodifiable*`) are the *only* fabrications a
-/// strict boot performs — measured 2026-08-05 with `--dump-class-origins`
+/// eleven `cratonvm/internal/Unmodifiable*`) are the *only* fabrications the
+/// boot block performs — measured 2026-08-05 with `--dump-class-origins`
 /// against a real JDK 25 image: 13 `compatibility-stub` rows from exactly
 /// these three lines. They used to go through the infallible
 /// `ensure_synthetic_class`, which records the `--jdk-only` violation and then
 /// fabricates anyway, so a strict run reported a violation while continuing in
 /// the state contract §5 forbids.
 ///
-/// # What a refusal means here
+/// # Under `--jdk-only` the question is not asked, because the answer is a constant
 ///
-/// `None`, and the caller skips the wiring — but never *silently*. Two
-/// independent records survive the refusal:
+/// From 2026-08-05 to 2026-08-12 this asked anyway and absorbed the refusal.
+/// Measured 2026-08-12 under `--jdk-only --explain-jdk-only --jdk-only-report`
+/// on an ordinary application: **13 of the 19 `compatibility-class-requested`
+/// rows in the entire census came from this one function**, and every one of
+/// the 13 is decided before the call is made:
 ///
-/// 1. `ClassManager::admit_compatibility_class` has already pushed a
-///    `CompatibilityClassRequested` violation naming the class, the reason and
-///    this Rust call site, so `--jdk-only-report` and `--trace-jdk-only` both
-///    show it;
-/// 2. the `warn!` below, which the CLI's default `EnvFilter` (WARN, stderr)
-///    prints with no extra flag, and which states the *consequence* — the
-///    natives bound to the class are unreachable — rather than just the fact.
+/// 1. **The refusal is unconditional.** None of the 13 names escapes
+///    `fabricated_origin_for_name`'s VM-internal arms — those are `CratonVM$…`
+///    (prefix only), the proxy supertypes, the annotation carrier and the
+///    three generated-name families — so all 13 land on
+///    `ClassOrigin::compatibility_stub` and `try_ensure_synthetic_class`
+///    refuses them on every strict run, in every workload.
+/// 2. **A fabrication that succeeded would be worse than the refusal**,
+///    because strict mode registers no method on any of the 13.
+///    `java/util/Enumeration$Impl` and `java/util/Comparator$Native` are both
+///    in `native_api::no_image_receiver::NO_IMAGE_JDK_RECEIVERS`, so
+///    `NativeMethodRegistry::register` re-tags every native on them
+///    `SyntheticStub` and `JdkOnly` drops the lot; the eleven
+///    `cratonvm/internal/Unmodifiable*` are hand-tagged `SyntheticStub` by
+///    `native-collections`' `register_unmodifiable_natives`. Wiring a
+///    superclass and an interface list onto a carrier with no implementation
+///    is the `UnsatisfiedLinkError` shape
+///    `no_image_receiver::STRICT_STILL_FABRICATES` exists to warn about, run
+///    in the other direction.
 ///
-/// The boot deliberately continues. Under `--jdk-only` a real
-/// `java.util.Collections`/`Enumeration`/`Comparator` is on the boot classpath
-/// and runs its own bytecode; these stand-ins exist for the synthetic
-/// collection shims, which strict mode does not register. Failing the boot
-/// instead would refuse a run that is otherwise conforming.
+/// So the skip is execution-identical to the absorb-and-warn it replaces —
+/// same `None`, same skipped wiring, same absent class, same dispatch — and it
+/// gives the census back its 13 rows. **Nothing diagnostic is lost.** A strict
+/// consumer that genuinely needs one of these asks for it at *its* call site
+/// and produces its own refusal row, keyed on its own `requester`; that is
+/// exactly how `System.getenv`'s dependency on
+/// `cratonvm/internal/UnmodifiableMap` was found, and it was found *despite*
+/// the boot row rather than because of it (the two were separate events with
+/// separate diagnoses — see `ClassManager`'s `jdk_only_refusals`, whose dedupe
+/// key is the `(class, site)` PAIR for precisely this reason).
 ///
-/// Under the default `Compatible` mode `try_ensure_synthetic_class` is
-/// byte-for-byte `ensure_synthetic_class`, so this is a no-op there.
+/// # The premise this doc used to carry, and why it was false
+///
+/// It said these stand-ins "exist for the synthetic collection shims, which
+/// strict mode does not register", flat. True of twelve, and **false of
+/// `cratonvm/internal/UnmodifiableMap`**: `lang_system::wrap_system_env_map`
+/// allocated it, ships in the ESSENTIAL set, and therefore survives strict
+/// mode — so `System.getenv()`, and every Spring `AbstractEnvironment::<init>`
+/// through it, died on a `NoClassDefFoundError` until 2026-08-12, when that
+/// native was moved onto the real `java.util.Collections.unmodifiableMap`.
+/// One over-general sentence is why this family went unrevisited.
+///
+/// **Before adding a name here, find who allocates it and what `NativeKind`
+/// that allocator's registration carries.** The mode flag is not the answer
+/// and the `cratonvm/` prefix is not the answer; the registration's kind is,
+/// and it is ambient (`set_category` around a block, `register()` last-write-
+/// wins), so it has to be read at the registrar and not guessed at the mint
+/// site.
+///
+/// # What a refusal still means, in `Compatible` mode
+///
+/// `ClassManager::try_ensure_synthetic_class` also refuses in **both** modes
+/// when the name is already carried by two or more distinct classes
+/// (`IncompatibleClassChangeError`), so the arm below stays live under
+/// `--real-jdk`. `None`, the caller skips the wiring, and the `warn!` states
+/// the *consequence* — the natives bound to the class are unreachable —
+/// rather than just the fact.
+///
+/// The boot deliberately continues in either mode. Under `--jdk-only` a real
+/// `java.util.Collections` / `Enumeration` / `Comparator` is on the boot
+/// classpath and runs its own bytecode. Failing the boot instead would refuse
+/// a run that is otherwise conforming.
 fn ensure_bootstrap_compat_class(
     class_manager: &mut ClassManager,
     name: &str,
     num_fields: usize,
 ) -> Option<ClassId> {
+    // The policy is already installed when this runs: `set_compatibility_mode`
+    // is the very next statement after the manager is constructed, ~120 lines
+    // above the first call site, precisely so that no class escapes the policy
+    // it was started under. Read from the manager and not from a `cfg!`: a
+    // Cargo feature cannot see a runtime mode.
+    if class_manager.compatibility_mode().is_jdk_only() {
+        return None;
+    }
     match class_manager.try_ensure_synthetic_class(name, num_fields) {
         Ok(id) => Some(id),
         Err(err) => {
             tracing::warn!(
                 class = name,
                 error = %err,
-                "--jdk-only: refusing to fabricate this bootstrap compatibility class. It is \
+                "refusing to fabricate this bootstrap compatibility class. It is \
                  NOT registered, the natives bound to it are unreachable, and any code that \
                  needs it will fail at its own call site naming this class."
             );
@@ -1406,10 +1462,13 @@ impl SharedVm {
         // where `hasMoreElements`/`nextElement`/`hasNext`/`next` are bound.
         //
         // Fallible since 2026-08-05 (JDK-only wave 2, lane L7): under
-        // `--jdk-only` this is refused and the wiring below is skipped. See
-        // `ensure_bootstrap_compat_class` for what "refused" is required to
-        // mean — a recorded violation plus a WARN naming the consequence, not
-        // a silent `None`.
+        // `--jdk-only` the class is not created and the wiring below is
+        // skipped. Since 2026-08-12 the request is not even made in that mode
+        // — `ensure_bootstrap_compat_class` carries the measurement showing
+        // the refusal was a constant and the natives on the resulting class
+        // are all dropped anyway, so asking bought 13 census rows and no
+        // information. `None` here means the same thing it always did: this
+        // wiring did not happen.
         let enum_impl_id =
             ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 2);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
@@ -1602,6 +1661,15 @@ impl SharedVm {
                 // Reclassifying them would silence the violation, keep
                 // fabricating, and make the zero-stub census read green while
                 // the substitution continued.
+                //
+                // That argument is about `Compatible` mode, which is the only
+                // mode that now reaches the fabrication: since 2026-08-12
+                // `ensure_bootstrap_compat_class` returns `None` under
+                // `--jdk-only` without asking, so strict mode neither
+                // fabricates these nor records them. The distinction the
+                // paragraph above protects is unchanged — a `VmInternal`
+                // reclassification would still be a lie, and it would still be
+                // a lie in the mode where the substitution actually happens.
                 let Some(cid) = ensure_bootstrap_compat_class(&mut class_manager, name, 1) else {
                     continue;
                 };

@@ -123,7 +123,28 @@ pub(crate) fn needs_reference_box(value: Value) -> bool {
 }
 
 /// The instrument: a primitive is about to be boxed into a declared-reference
-/// field slot, i.e. a type-punning native has been caught in the act.
+/// field slot, i.e. a type-punning store has been caught in the act.
+///
+/// **The store is NOT always a native, and on the boot path it is not one at
+/// all.** Measured 2026-08-12 on the current binary: the very first record of
+/// this warning in every run, and the overwhelming majority of them, is
+/// `vm/src/vm/vm_object.rs`'s class-mirror populator —
+/// `get_or_create_class_mirror` writes `Value::Int(class_id)` and
+/// `get_or_create_primitive_mirror` writes `Value::Int(-1)` into slot 0 of an
+/// object stamped `java/lang/Class`, whose real JDK 25 slot 0 is
+/// `Constructor<T> cachedConstructor`, a reference. That is a VM-internal
+/// overlay (`docs/internal/audits/jdk-only-object-layout-audit.md` rank 6), it
+/// goes through `shared.mem.heap.set_field` rather than through any
+/// `NativeContext`, and so **no native-side census can ever name it**. Pointing
+/// a reader at the read-side alias census for it — as this message used to —
+/// sends them to an instrument that is structurally unable to answer.
+///
+/// To turn a `class_id=ClassId(N)` here into a class NAME, run with
+/// `CRATONVM_DBG_TOARRAY=1`: `get_or_create_class_mirror` prints
+/// `cid=... name=...` at exactly this site. For stores that genuinely do come
+/// from a native, `native-api`'s read-side alias census
+/// (`CRATONVM_DBG=layout-alias`) is the right instrument — but note it observes
+/// READS, so it names the alias, not this write.
 ///
 /// Rate-limited to the first few plus powers of two, the shape the sibling
 /// `cratonvm::gc::guard` records in `gen_heap.rs` / `g1.rs` / `zgc.rs` already
@@ -153,9 +174,11 @@ pub(crate) fn observe_primitive_into_reference_field(
             occurrence = n,
             "a non-reference value was stored into a slot the class declares as \
              a REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper so the \
-             value survives and every collector agrees (W7-84). The store \
-             itself is a type-punning native; see the read-side alias census \
-             for which one.",
+             value survives and every collector agrees (W7-84). The store is a \
+             type-punning one; it is NOT necessarily a native — on the boot \
+             path it is the VM's own class-mirror populator writing a ClassId \
+             over java.lang.Class.cachedConstructor (vm/src/vm/vm_object.rs). \
+             Run with CRATONVM_DBG_TOARRAY=1 to resolve class_id to a name.",
         );
     }
 }

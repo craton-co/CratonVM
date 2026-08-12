@@ -187,6 +187,119 @@
 //! invisible; `every_entry_is_reachable_through_the_predicate` is the test that
 //! catches exactly that.
 //!
+//! # `java/util` collections — adjudicated 2026-08-12, EIGHT of 68 retirable, HELD
+//!
+//! A `--jdk-only --explain-jdk-only` run reported 226 `native-shadows-bytecode`
+//! rows actually taken; 62 of them are `java.util` collections triples, 68
+//! registrations by the frozen kind map. All 68 were adjudicated against the
+//! rule this module's header states — *a class's state has to become real
+//! before its shadow can be retired* — in
+//! docs/known-issues/jdk-only/P2-COLLECTIONS-SHADOWS-20260812.md. **Eight are
+//! retirable. Sixty are not, and most of them never will be by this route.**
+//!
+//! The eight, in the sorted position they would take (at the HEAD — every
+//! `java/util/A…`, `C…` and `H…` key sorts before `java/util/logging/`):
+//!
+//! ```text
+//!   java/util/ArrayList        <init>          ()V
+//!   java/util/ArrayList        <init>          (I)V                              [2 registrations]
+//!   java/util/ArrayList        <init>          (Ljava/util/Collection;)V
+//!   java/util/ArrayList        add             (Ljava/lang/Object;)Z
+//!   java/util/ArrayList        clear           ()V
+//!   java/util/Arrays$ArrayList iterator        ()Ljava/util/Iterator;
+//!   java/util/Collections      synchronizedMap (Ljava/util/Map;)Ljava/util/Map;
+//! ```
+//!
+//! ## Why the other sixty are a different question, not a longer list
+//!
+//! `TreeMap`, `TreeSet`, `ArrayDeque`, `ConcurrentHashMap`, `Hashtable` and
+//! `LinkedHashSet` keep their entries in **Rust side tables or fabricated
+//! slots**, so retiring their shadows does not hand real bytecode a working
+//! object — it hands it an empty one. `map_buckets_slot`'s doc in
+//! `native-collections/src/lib.rs` states the whole family's position in one
+//! sentence: *"It does not fault today only because the natives shadow every
+//! reader."* Those are collections reclassifications, and no entry in this
+//! table can substitute for one.
+//!
+//! `ArrayList` is the exception and is worth stating precisely, because it is
+//! the only family in the slice whose §1.4 precondition is ALREADY MET:
+//! `al_slots`, `al_mod_count_slot` and `al_itr_slots` resolve `elementData`,
+//! `size`, `modCount`, `cursor`, `lastRet`, `expectedModCount` and `this$0`
+//! **by name**, and `try_alloc_synthetic` loads the real
+//! `java/util/ArrayList$Itr`. Both halves already read and write the fields the
+//! JDK's own bytecode does. It is still mostly not retirable, and the reason is
+//! not layout: `Map.values()` returns a `java/util/ArrayList` with its source
+//! map stashed in a trailing capacity slot, so `size`/`isEmpty`/`get`/
+//! `iterator`/`toArray` are the implementation of `values()` and retiring them
+//! freezes every such view at its creation time — measured once already, against
+//! H2's `TestAlter.testAlterTableDropIdentityColumn`, and recorded at
+//! `vm/src/runtime/interpreter/native_override.rs:2448-2463`. The five
+//! `ArrayList` triples above are the ones that touch no view.
+//!
+//! **One triple in the slice must NOT be retired for the opposite reason.**
+//! `java/util/Arrays.copyOf([Ljava/lang/Object;I)` is load-bearing *for* real
+//! bytecode: the real body allocates through
+//! `Array.newInstance(original.getClass().getComponentType(), n)`, and its
+//! 3-arg sibling's registration says of that same path *"Without this native
+//! the call falls through to bytecode that dereferences unsupported
+//! `arrayClass` reflection internals and NPEs"*
+//! (`native-builtins/src/phases_early.rs:1031-1038`). Real `ArrayList.grow`,
+//! `toArray` and `ArrayList(Collection)` all funnel through it — so the five
+//! `ArrayList` retirements above DEPEND on it staying a `Bridge`.
+//!
+//! ## What holds it, and it is not doubt about the eight
+//!
+//! Two things, and the first is the `java/io/PrintWriter` hold above, verbatim:
+//! `java/util` is Compatible-visible, so eight rows moving
+//! `Bridge` -> `SyntheticStub` move `BASELINE_SYNTHETIC_STUBS_*` (`SLACK = 0`),
+//! `bridge_shadows_bytecode` and the per-row kind freeze, all three keyed
+//! `25/linux`, all three re-frozen from ONE Linux census in the SAME commit.
+//! Both baselines are ALREADY stale and say so in their own bodies, so the
+//! predicted deltas (+8 on the stub ratchet, -8 on four bridge counters, exactly
+//! eight kind-map rows) are deltas on a base nobody has taken. The derivation is
+//! §4 of the P2 record; **it is a diff to check, not a number to paste.**
+//!
+//! The second is new, and is the reason this is held rather than merely
+//! sequenced. **The acceptance measurement has not been run, and it needs no
+//! source edit at all.** `CRATONVM_ENFORCE_NATIVE_SHADOW` takes a prefix list
+//! and yields on the same §1.4 predicate a retirement uses, so
+//! `=java/util/ArrayList,java/util/Arrays$ArrayList,java/util/Collections`
+//! under `--jdk-only` simulates this exact change with no rebuild — the way the
+//! `java/util/logging/` wave was accepted. Three negative controls
+//! (`java/util/TreeMap`, `java/util/ArrayDeque`,
+//! `java/util/concurrent/ConcurrentHashMap`) must go RED in the same session; if
+//! one comes back verdict-neutral, the state-model reading above is wrong for
+//! that family and the eight are not safe either.
+//!
+//! ## The door this table cannot close, and the inert-entry trap
+//!
+//! `register_interface_natives` registers the SAME native functions on
+//! `java/util/List.iterator`, `java/util/Collection.iterator`,
+//! `java/util/Set.iterator` and eight `java/util/Map` triples, and
+//! `java/util/Iterator.{hasNext,next}` carry two `Bridge` registrations of their
+//! own. This table retires TRIPLES, so retiring a concrete-class row leaves the
+//! interface row registered and live. None of the eight above is an `iterator`
+//! on a concrete collection, which is why they are the eight — but any later
+//! wave that reaches for `HashSet.iterator` or `ArrayList.iterator` has to move
+//! the interface rows in the same commit or measure as inert.
+//!
+//! And `Collections.synchronizedMap` is registered at FOUR sites, one of them
+//! under an ambient `Intrinsic` (`native-builtins/src/phases_early.rs:158`).
+//! Only the `Bridge` one is on today's boot path, so the retag fires — but the
+//! retag in `NativeMethodRegistry::register`
+//! fires only on an effective `Bridge`, so a boot-order change would make this
+//! entry inert and silent. That is exactly what happened to
+//! `LogRecord.<init>(Level,String)` for a day; see the source-pair section
+//! above, and read the census kind rather than `CRATONVM_DBG_DROPPED_STUBS`.
+//!
+//! ## Widening the discriminator is half of it
+//!
+//! [`triple_is_retired_shadow`] answers `false` for anything outside
+//! `java/util/logging/`. All seven keys are under `java/util/`, so ONE prefix
+//! covers both populations — but an entry added without that widening reads as
+//! "not retired" and is invisible. `every_entry_is_reachable_through_the_predicate`
+//! is the test that catches it, and it already works; no new test is needed.
+//!
 //! # Why this is applied centrally
 //!
 //! Same reason as [`crate::no_image_receiver`]: the property is a MEASUREMENT

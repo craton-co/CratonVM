@@ -8377,13 +8377,17 @@ pub(crate) fn mh_dispatch(
     mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
-    // A real-JDK guard/invoker adapter can ultimately target a synthetic
-    // foreign downcall. Those compact handles store the function address in
-    // field 0 rather than the MethodHandle metadata slots, so dispatch them
-    // directly before trying to decode the generic MethodHandle layout.
-    if ctx.class_name_arc_of_id(ctx.class_id_of_object(mh)).as_deref()
-        == Some("java/lang/foreign/DowncallHandle")
-    {
+    // A real-JDK guard/invoker adapter can ultimately target a foreign
+    // downcall. Its downcall state lives above the MethodHandle metadata
+    // slots, so dispatch it directly rather than decoding the generic layout.
+    //
+    // This used to test the receiver's class name against
+    // `java/lang/foreign/DowncallHandle` — an invented class no image declares,
+    // which `--jdk-only` therefore refused, killing all of FFM (P1-E). The
+    // carrier is now a real `java/lang/invoke/MethodHandle`, so the question
+    // is no longer "what class is this" but "is this handle's state downcall
+    // state", which is what `is_downcall_handle` answers.
+    if crate::panama::is_downcall_handle(ctx, mh) {
         if crate::nbflags().dbg_mh_dispatch {
             let arg_slots: Vec<Value> = extra_args
                 .iter()
@@ -10557,17 +10561,18 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         "asType",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            // Panama downcalls use a compact synthetic layout whose field 0 is
-            // the native function address. Their MethodHandle type is derived
-            // from the FunctionDescriptor, so assigning the inherited real-JDK
-            // type field here would overwrite that address and turn a later
-            // void invokeExact into a silent no-op.
+            // A Panama downcall's dispatch reads its `FunctionDescriptor`, not
+            // its `type` field, so `asType` stays a passthrough for one.
+            //
+            // The refusal this guard used to be written against is gone: it
+            // tested for the invented class `java/lang/foreign/DowncallHandle`
+            // and existed because assigning `type` would have overwritten the
+            // function address that class kept in field 0. The carrier is now a
+            // real `MethodHandle` whose slot 0 IS the real `type` field, so
+            // that write would be correct rather than destructive — but the
+            // passthrough is still right, and cheaper.
             if let Some(Value::Object(Some(this))) = args.first() {
-                if ctx
-                    .class_name_arc_of_id(ctx.class_id_of_object(*this))
-                    .as_deref()
-                    == Some("java/lang/foreign/DowncallHandle")
-                {
+                if crate::panama::is_downcall_handle(ctx, *this) {
                     return Ok(Some(args[0]));
                 }
             }

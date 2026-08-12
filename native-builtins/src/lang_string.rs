@@ -5735,6 +5735,41 @@ impl Default for FmtSymbols {
     }
 }
 
+/// Which `Locale` a `java.util.Formatter` call localizes against.
+///
+/// This exists because the `Option<Locale>` it replaced could not tell two
+/// different requests apart, and `java.util.Formatter` answers them
+/// differently:
+///
+/// * **The overload has no `Locale` parameter** — `String.format(String,
+///   Object...)`, `String.formatted`, `PrintStream.printf(String, Object...)`,
+///   `new Formatter()`. Every one of these is specified as formatting with
+///   "the locale returned by `Locale.getDefault(Locale.Category.FORMAT)`".
+/// * **The overload was given one, and it is `null`** —
+///   `String.format((Locale) null, …)`. "If `l` is `null` then no localization
+///   is applied", i.e. the root separators and ASCII digits.
+///
+/// Collapsing the two onto one `None` is the defect this type removes (W7-91
+/// §5, and the last open `format` row of
+/// `docs/known-issues/jdk-only/W7-34-formatter-family-residuals.md`): the
+/// no-`Locale` overload took the explicit-null branch and localized against
+/// `Locale.ROOT` on every host. Invisible on a ROOT/en-US host, and wrong
+/// everywhere else — separators, grouping and digits all diverge.
+///
+/// The distinction is resolved AT CONSUMPTION, in [`fmt_symbols_for`] and
+/// [`fmt_date_name`], never by re-encoding one variant as the other. Those two
+/// are one JDK rule implemented twice and they had already drifted: the date
+/// half was reading `DateFormatSymbols.getInstance()` (the FORMAT default) for
+/// the absent-locale case while the number half took the root constants.
+#[derive(Clone, Copy)]
+enum FmtLocale {
+    /// The overload has no `Locale` parameter, so the JDK supplies
+    /// `Locale.getDefault(Locale.Category.FORMAT)`.
+    DefaultFormat,
+    /// The overload carries an explicit `Locale` argument, possibly `null`.
+    Given(Option<cratonvm_types::ObjectRef>),
+}
+
 thread_local! {
     /// Re-entrancy latch for [`fmt_symbols_for`].
     ///
@@ -5747,8 +5782,8 @@ thread_local! {
     static FMT_SYMBOLS_RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Read a `java.util.Locale`'s formatting symbols, or the root defaults for a
-/// null locale.
+/// Read a `java.util.Locale`'s formatting symbols, or the root defaults for an
+/// explicit null locale.
 ///
 /// Goes through `DecimalFormatSymbols.getInstance(Locale)` rather than a
 /// hard-coded table because that is what `java.util.Formatter` does, and
@@ -5757,22 +5792,64 @@ thread_local! {
 /// CratonVM's own `DecimalFormatSymbols` was measured to answer the identical
 /// three characters for ROOT/US/GERMANY/FRANCE, so this reads a real value
 /// rather than reproducing one.
-fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: Option<cratonvm_types::ObjectRef>) -> FmtSymbols {
-    let locale = match locale {
-        Some(l) => l,
-        None => return FmtSymbols::default(),
-    };
+///
+/// The three [`FmtLocale`] arms, and why each is what the JDK does:
+///
+/// * `Given(None)` — an explicit `null` `Locale`. The JDK's own
+///   `Formatter.zero(Locale)` is `if ((l != null) && !l.equals(Locale.US)) {…}
+///   return '0';`, so a null locale takes the three constants and runs no
+///   bytecode at all. Unchanged, and it is also the arm every `new Formatter()`
+///   currently arrives on (see the residual note below).
+/// * `Given(Some(l))` — resolve `l`. Unchanged, deliberately: the
+///   very common `String.format(Locale.ROOT, …)` must not become slower or
+///   different because the no-`Locale` overload was fixed. The only fast path
+///   ROOT ever had is the LAZINESS in [`format_impl`] — this function is not
+///   reached at all unless a conversion actually localizes — and that is
+///   untouched.
+/// * `DefaultFormat` — the overload had no `Locale`. Resolves
+///   through the NO-ARG `DecimalFormatSymbols.getInstance()`, whose body is
+///   `getInstance(Locale.getDefault(Locale.Category.FORMAT))`. Asking the JDK
+///   for the default rather than composing one here is what keeps this from
+///   becoming a fourth opinion about what the default locale is — the same
+///   argument [`fmt_date_name`] already makes, and the reason these two agree
+///   again.
+///
+/// W7-34 left this arm undone and named the hazard: "resolving a default locale
+/// on the no-locale path is the one place where the re-entrancy hazard is
+/// worst — every internal `String.format` in the VM, including the logging
+/// shims, goes through it." Two things bound it, and neither is new code.
+/// First, LAZINESS: `format_impl` only calls this at a `%d`/`%f`/`%e`/`%g`
+/// conversion, so an internal `String.format("{}: {}"-shaped %s format)` still
+/// runs zero locale bytecode. Second, `FMT_SYMBOLS_RESOLVING`: an inner
+/// `String.format` raised while the outer one is resolving answers the root
+/// constants and cannot recurse. `fmt_date_name` has been taking exactly this
+/// route on exactly this path since the `%t` name fields landed.
+fn fmt_symbols_for(ctx: &mut dyn NativeContext, locale: FmtLocale) -> FmtSymbols {
+    if let FmtLocale::Given(None) = locale {
+        return FmtSymbols::default();
+    }
     if FMT_SYMBOLS_RESOLVING.with(std::cell::Cell::get) {
         return FmtSymbols::default();
     }
     FMT_SYMBOLS_RESOLVING.with(|f| f.set(true));
     let resolved = (|| {
-        let dfs = match ctx.invoke(
-            "java/text/DecimalFormatSymbols",
-            "getInstance",
-            "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
-            &[Value::Object(Some(locale))],
-        ) {
+        let instance = match locale {
+            FmtLocale::Given(Some(l)) => ctx.invoke(
+                "java/text/DecimalFormatSymbols",
+                "getInstance",
+                "(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",
+                &[Value::Object(Some(l))],
+            ),
+            // `DefaultFormat`. `Given(None)` returned above, so this arm is
+            // only ever the no-`Locale` overload.
+            _ => ctx.invoke(
+                "java/text/DecimalFormatSymbols",
+                "getInstance",
+                "()Ljava/text/DecimalFormatSymbols;",
+                &[],
+            ),
+        };
+        let dfs = match instance {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return None,
         };
@@ -5817,14 +5894,29 @@ thread_local! {
 /// index into it, in that array's own convention (months 0-based over 13
 /// entries, weekdays 1-based over 8 with slot 0 unused).
 ///
-/// `locale` is the `Locale` an explicit-locale overload was given.
-/// **`None` means the no-locale overload**, and resolves through
-/// `DateFormatSymbols.getInstance()`, whose body is
+/// `locale` is the call's [`FmtLocale`]. `Given(Some(l))` resolves
+/// `DateFormatSymbols.getInstance(l)`; every other arm resolves through the
+/// NO-ARG `DateFormatSymbols.getInstance()`, whose body is
 /// `getInstance(Locale.getDefault(Locale.Category.FORMAT))` — i.e. exactly the
 /// `Locale` a real `java.util.Formatter` built by `String.format(String,
 /// Object...)` would be carrying. Asking the JDK for it rather than composing
 /// one here is what keeps this from becoming a fourth opinion about what the
 /// default locale is.
+///
+/// # `Given(None)` deliberately does NOT take the JDK's `Locale.US` branch
+///
+/// `Formatter.printDateTime` opens every name field with `Locale lt = ((l ==
+/// null) ? Locale.US : l)`, so a literal `String.format((Locale) null, "%tB",
+/// d)` renders English on HotSpot, where this renders the default FORMAT
+/// locale. That divergence is kept ON PURPOSE, because in this VM
+/// `Given(None)` is not only an explicit null: `new Formatter()` and `new
+/// Formatter(Appendable)` reach `format` through natives in
+/// `native-builtins/src/lib.rs` that write `null` into the receiver's locale
+/// slot, and for THOSE the JDK's answer is the FORMAT default, not English.
+/// One of the two readings has to be wrong until that constructor writes what
+/// the real `java.util.Formatter()` constructor writes; answering English here
+/// would trade a rare divergence for a common regression. Recorded in W7-34's
+/// residuals with the constructor patch that closes it.
 ///
 /// `None` on any failure, and the caller then prints the English name it
 /// printed before. Every failure mode is a legitimate one: synthetic-JDK mode
@@ -5837,7 +5929,7 @@ thread_local! {
 /// its speculative `load_class`).
 fn fmt_date_name(
     ctx: &mut dyn NativeContext,
-    locale: Option<cratonvm_types::ObjectRef>,
+    locale: FmtLocale,
     getter: &str,
     index: usize,
 ) -> Option<String> {
@@ -5847,13 +5939,13 @@ fn fmt_date_name(
     FMT_DATE_NAMES_RESOLVING.with(|f| f.set(true));
     let resolved = (|| {
         let instance = match locale {
-            Some(l) => ctx.invoke(
+            FmtLocale::Given(Some(l)) => ctx.invoke(
                 "java/text/DateFormatSymbols",
                 "getInstance",
                 "(Ljava/util/Locale;)Ljava/text/DateFormatSymbols;",
                 &[Value::Object(Some(l))],
             ),
-            None => ctx.invoke(
+            FmtLocale::DefaultFormat | FmtLocale::Given(None) => ctx.invoke(
                 "java/text/DateFormatSymbols",
                 "getInstance",
                 "()Ljava/text/DateFormatSymbols;",
@@ -5908,24 +6000,37 @@ fn fmt_localize(s: &str, sym: FmtSymbols) -> String {
 
 // --- String.format (basic %s/%d/%f support) ---
 
+/// `String.format(String, Object...)` — the overload with NO `Locale`.
+///
+/// [`FmtLocale::DefaultFormat`], not a null locale: `java.util.Formatter`
+/// formats this overload against `Locale.getDefault(Locale.Category.FORMAT)`.
+/// It used to pass `None` here, which [`fmt_symbols_for`] read as "no
+/// localization" — so `String.format("%,.2f", 1234.5)` answered the ROOT
+/// `1,234.50` on a German host where HotSpot answers `1.234,50`. Every
+/// no-`Locale` surface funnels through here ([`native_string_formatted`], and
+/// `PrintStream.printf`/`format` and `PrintWriter.printf`/`format` in
+/// `native-builtins/src/lib.rs` and `logging_shims.rs`), so they all move
+/// together and cannot drift.
 pub(crate) fn native_string_format(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    format_impl(ctx, args, None)
+    format_impl(ctx, args, FmtLocale::DefaultFormat)
 }
 
 /// The body of every `String.format` / `Formatter.format` overload.
 ///
-/// `locale` is the `java.util.Locale` an explicit-locale overload was given,
-/// or `None` for the overloads that have none. It is resolved to
-/// [`FmtSymbols`] LAZILY, at the first conversion that actually localizes, so
-/// the very common `String.format(Locale.ROOT, "%s", x)` pays nothing for a
-/// locale it never consults.
+/// `locale` says which `java.util.Locale` this call localizes against — see
+/// [`FmtLocale`] for why the absent-parameter and explicit-null cases are not
+/// the same request. It is resolved to [`FmtSymbols`] LAZILY, at the first
+/// conversion that actually localizes, so the very common
+/// `String.format(Locale.ROOT, "%s", x)` pays nothing for a locale it never
+/// consults — and, since the fix above, neither does the no-`Locale` overload,
+/// which is the same laziness doing the same job on a hotter path.
 fn format_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-    locale: Option<cratonvm_types::ObjectRef>,
+    locale: FmtLocale,
 ) -> MethodCallResult {
     // Static: args[0] = format String, args[1] = Object[] array
     let fmt_obj = match args.first() {
@@ -6653,7 +6758,7 @@ fn format_temporal_field(
     field: char,
     flags: &str,
     width: Option<usize>,
-    locale: Option<cratonvm_types::ObjectRef>,
+    locale: FmtLocale,
 ) -> Result<String, MethodCallFailed> {
     const MONTHS_ABBR: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -8044,7 +8149,12 @@ pub(crate) fn native_string_format_locale(
         args.get(1).cloned().unwrap_or(Value::Object(None)),
         args.get(2).cloned().unwrap_or(Value::Object(None)),
     ];
-    format_impl(ctx, &format_args, locale)
+    // `Given`, not `DefaultFormat`, EVEN WHEN `locale` IS `None`: an explicit
+    // `null` `Locale` is the JDK's "no localization is applied", a different
+    // request from an overload that has no `Locale` at all. Collapsing the two
+    // is precisely the bug `native_string_format` no longer has, and re-making
+    // it here would be that bug arriving from the other direction.
+    format_impl(ctx, &format_args, FmtLocale::Given(locale))
 }
 
 pub(crate) fn native_string_formatted(

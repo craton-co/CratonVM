@@ -572,3 +572,94 @@ naming the class. Replacement:
 `regression-suite/run.sh` supplies `--java-home` for every invocation; a hand
 run that omits it measures the host's default JDK and has inverted a per-mode
 verdict before (`W7-11`).
+
+---
+
+## Verification pass 2026-08-12 (lane A16) — the two out-of-file patches LANDED
+
+**Nothing was built or run in this pass.** Source read against today's
+worktree, with today's anchors.
+
+### 1. The sixteen in-file sites are intact
+
+| claim | today | verdict |
+|---|---|---|
+| site 1 `native_class_get_declared_annotation` | `lang_class.rs:15423`, `?` on `cached_annotation_proxy_resolving` | present |
+| site 2 `native_class_get_annotation`, own-class scan | `:15465` | present |
+| site 3 the `@Inherited` superclass walk | `:15487`, inside the `while` | present |
+| site 4 `native_field_get_annotation` | `:15971`, `?` on `create_annotation_proxy` | present |
+| site 5 `native_annotated_type_get_annotation` | `:21187`, `ladder_rung` on the `annotationType()` dispatch, then a match on the VALUE | present, and the scan-vs-build reasoning is written in place at `:21171`–`:21186` |
+| `ladder_rung` itself | `lang_class.rs:20851` | present |
+| `absorb_class_absent` | `classloader_real.rs:1146`, `pub(crate)` | present |
+
+**Nothing now depends on the swallow.** The three `Class` sites and the `Field`
+site all still fall through to `null` on `Ok(None)` — the "annotation type would
+not resolve" case — so the intentional filter the `@ConditionalOnClass` path
+needs is untouched; only the `Err` arm moves, exactly as "Which mode moves"
+argues.
+
+### 2. Both out-of-file patches under "the thirteen this lane could not reach" are APPLIED
+
+Applied by other lanes, verbatim in shape:
+
+| patch | applied at | note |
+|---|---|---|
+| #1 `classloader.rs:3260` — the synthetic-mode twin | `native-builtins/src/classloader.rs:3280`–`:3290` | `Ok(_) => {}` + `Err(failed) => absorb_class_absent(&*ctx, failed)?` |
+| #2 `lang_class.rs:10022` — R2's wrong-type re-raise | `native-builtins/src/lang_class.rs:10121`–`:10144` | same shape |
+
+**Correction this record owes, and the source itself flags it.** The comment at
+`lang_class.rs:10137`–`:10141` says, in as many words, that this record's patch
+text names the re-mint as a `ClassNotFoundException` and that it is in fact a
+**`NoClassDefFoundError`** — `isolated_loader_class_not_found`
+(`lang_class.rs:10174`) allocates `java/lang/NoClassDefFoundError`. **The
+argument is unaffected** (a failure is still not a miss, and a caller's `catch`
+still deliberately does not match), but "the lie is invisible because
+`ClassNotFoundException` is what a loader's caller expects" in R2 should read
+`NoClassDefFoundError`. Both are absorbed roots of `absorb_class_absent`, so the
+patch text was correct as code and wrong as prose.
+
+### 3. The remaining eleven: measured as still open, not assumed
+
+`absorb_class_absent` has exactly **six** call sites in the whole tree —
+`classloader_real.rs:1461`, `:1739`; `lookup_define.rs:272`, `:283`;
+`classloader.rs:3290`; `lang_class.rs:10142`. Those are precisely the four
+functions "Fixed, 2026-08-12" names plus the two patches above. **So none of the
+eleven remaining sites in "3–13" has been narrowed by anyone**, and that is a
+count over the policy helper rather than over line numbers, which have rotted.
+Their dispositions in that table stand unrevised; re-derive the line numbers
+before quoting them.
+
+### 4. What today's probe screen does and does not say about this record
+
+A 33-probe reachability screen was run on the current binary (HotSpot 25 oracle
+33/33; `--jdk-only` 28/33).
+
+* **`MXBean`/`ThreadMXBean` PASS under `--jdk-only`.** That corroborates this
+  record's own staging note: the `RJdkJmx` row in the reproduction table is
+  **pre-`5266bf8c7`** and the carrier refusal it shows is gone. The table is a
+  historical measurement of one binary, not a live claim, and should not be
+  re-filed as an open defect. **The swallow it exposed is a separate matter and
+  is fixed in source, unrun.**
+* **`ServiceLoader` iteration PASSES.** This does **not** clear
+  `service_loader.rs:420` / `:648`, two of the eleven. Those swallow a
+  *non-absent* throwable from a user loader's `loadClass`; a green
+  `ServiceLoader` probe over ordinary providers never raises one. Reachability
+  is not the defect.
+* **`Proxy.newProxyInstance` PASSES**, which is relevant to site 5 only in that
+  the JDK dynamic proxy representation the site now reads through the public
+  `Annotation` contract is working — it is corroboration, not coverage.
+
+**No claim in this record is contradicted by the screen.** The one claim it
+*revises* is the staging of the `RJdkJmx` row, which the record already stated
+itself.
+
+### 5. Coverage, restated
+
+`RLoaderChurnDefine.aParentsFailureIsNotAMiss()` is the only scheduled
+assertion for any of this, it covers `cl_real_load_class_base_rooted` step 0
+only, and the two patches that landed above (`classloader.rs`,
+`lang_class.rs:10142`) have **no** scheduled assertion — the synthetic-mode twin
+needs synthetic mode and the isolated-loader site needs a present-and-malformed
+class on disk. The five annotation sites likewise have no vector that makes the
+proxy builder throw; `RReflect` / `RJdkReflect` only prove the non-throwing path
+still answers. That is the same gap this record opened with and it is unchanged.

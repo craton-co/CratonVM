@@ -3014,12 +3014,31 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let dh = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
-            ctx.set_field(dh, 0, Value::Long(fn_addr));
-            ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
-            ctx.set_field(dh, 2, Value::Long(variadic_fixed));
-            ctx.set_field(dh, 3, Value::Long(0)); // cif cache not yet built
-            ctx.set_field(dh, 4, Value::Int(capture_call_state as i32));
+            // P1-E: this WAS the live `--jdk-only` mint of
+            // `java/lang/foreign/DowncallHandle`, a class no real JDK image
+            // declares, so strict mode correctly refused it and every FFM
+            // downcall died as
+            // `NoClassDefFoundError: java/lang/foreign/DowncallHandle` at the
+            // application's call site. The refusal was right; the survival of
+            // this caller was the defect.
+            //
+            // The carrier is now a real `java/lang/invoke/MethodHandle` — which
+            // is what the caller actually holds it as, casts it to, and calls
+            // `invokeExact` on. See `panama::alloc_downcall_handle`.
+            //
+            // Note the panama.rs mints of the same class are NOT this one:
+            // `register_pe_panama` is reached only from
+            // `register_synthetic_overrides`, which is
+            // `#[cfg(feature = "synthetic-jdk")]`, so it is in neither shipping
+            // binary. This site, reached from
+            // `register_essential_natives_with_shims`, is the one that ran.
+            let dh = crate::panama::alloc_downcall_handle(
+                ctx,
+                fn_addr,
+                descriptor,
+                variadic_fixed,
+                capture_call_state,
+            )?;
             Ok(Some(Value::Object(Some(dh))))
         }
     );

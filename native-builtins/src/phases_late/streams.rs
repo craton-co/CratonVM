@@ -2838,8 +2838,33 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // BinaryOperator.maxBy(Comparator) → BinaryOperator
-    r.register(
+    // BinaryOperator.maxBy/minBy — `SyntheticStub`, same family and same
+    // argument as `Function.compose/andThen/identity` and the `Predicate` and
+    // `Consumer` blocks below. Both are `static` methods of
+    // `java.util.function.BinaryOperator` with real bodies in every supported
+    // image (`(a, b) -> comparator.compare(a, b) >= 0 ? a : b`), and both mint a
+    // `BinaryOperator$MaxBy` / `$MinBy` no image declares.
+    //
+    // Found by auditing the family rather than by a probe, and it is worse than
+    // its two measured siblings, not better: **no `apply` is registered on
+    // either minted class anywhere in the workspace** (grep both names — these
+    // two mint sites are the only hits). So the carrier that comes back has no
+    // implementation in ANY mode; the `BinaryOperator.apply` interface bridge a
+    // few lines above re-dispatches `apply` on the receiver, which resolves back
+    // to that same interface native. Under `--jdk-only` the mint is refused
+    // first (`$MaxBy` has no `$$Lambda` infix, so §5's door is shut — see the
+    // `Predicate` block) and the caller gets a `NoClassDefFoundError`.
+    //
+    // Not measured under a probe, so stated as reading, not as a repro: what is
+    // verified here is that the classes are fabricated and that nothing
+    // implements them. Dropping the pair under strict can only improve on a
+    // carrier with no methods, and `Compatible` keeps `SyntheticStub`
+    // registrations, so that mode is byte-for-byte unchanged either way.
+    //
+    // Deliberately NOT added to `NO_IMAGE_JDK_RECEIVERS`: that table re-tags
+    // natives BY RECEIVER, and neither class has a native to re-tag. Adding them
+    // would be inert. The mint sites are the only half that exists.
+    r.register_with_kind(
         bo,
         "maxBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
@@ -2861,10 +2886,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(proxy))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // BinaryOperator.minBy(Comparator) → BinaryOperator
-    r.register(
+    r.register_with_kind(
         bo,
         "minBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
@@ -2885,6 +2911,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(proxy))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // ToIntFunction, ToLongFunction, ToDoubleFunction interface dispatch
@@ -3074,6 +3101,50 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Predicate.and/or/negate/not — `SyntheticStub`, not the enclosing
+    // registrar's `Bridge`. This is the `Function.compose/andThen/identity`
+    // treatment (L7 item 4, 2026-08-05; second copy 2026-08-06) applied to the
+    // sibling two thirds of the family that lane did not reach.
+    //
+    // All four are `default`/`static` methods of `java.util.function.Predicate`
+    // with real bodies in every supported image — `and` is
+    // `(t) -> test(t) && other.test(t)` — so a working real-bytecode fallback
+    // plainly exists, which is exactly what `Bridge` asserts there is not. What
+    // they mint (`Predicate$$Lambda$And` / `$Or` / `$Negate`) is declared by no
+    // image; all three are already in `NO_IMAGE_JDK_RECEIVERS`.
+    //
+    // # Why the strict symptom was `AbstractMethodError`, not `NoClassDefFoundError`
+    //
+    // These four are the measured counter-example to `no_image_receiver.rs`'s
+    // gate-1/gate-2 pairing rule, running in the direction that record warns
+    // about: gate 2 (the `test` natives on the minted classes) was closed
+    // automatically by `register`'s `NO_IMAGE_JDK_RECEIVERS` re-tag, while gate
+    // 1 (this mint site) stayed `Bridge` and kept minting. Strict mode was
+    // therefore handed a well-formed carrier with no implementation.
+    //
+    // And the mint was NOT refused, because of the name. `fabricate_class`
+    // applies the `--jdk-only` policy refusal only when
+    // `origin.is_compatibility_stub()`, and `fabricated_origin_for_name` routes
+    // anything containing `$$Lambda` to `ClassOrigin::GeneratedLambda` instead —
+    // so the `$$Lambda$` infix in these three names walks past §5's door, where
+    // the otherwise identical `Consumer$AndThen` below is refused outright. That
+    // is why one half of this family reported a missing class and the other half
+    // reported `java/util/function/Predicate.test … has no Code attribute`: the
+    // fabricated class exists, carries no `test`, and dispatch resolves up to
+    // the interface's abstract declaration. Two error shapes, one missing half.
+    //
+    // (`class_manager.rs`'s note on that arm records "none of the three fires on
+    // a strict boot", measured 2026-08-05/06 against boot probes. A strict run
+    // of `Predicate.and` fires it. That measurement is stale, not wrong — no
+    // boot probe called a Predicate combinator.)
+    //
+    // Tagged `SyntheticStub`, strict mode drops all four (recording a
+    // `SyntheticNativeRegistered` violation naming this site), nothing mints the
+    // three classes, and `java.base`'s own default methods run.
+    // `Compatible` / `--real-jdk` keep `SyntheticStub` registrations, so both
+    // are byte-for-byte unchanged.
+    let __pred_prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // Predicate.and/or/negate — composite predicates via 2-field synthetic
     let pred = "java/util/function/Predicate";
     r.register(
@@ -3164,6 +3235,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(composite))))
         },
     );
+    r.set_category(__pred_prev_cat);
 
     // --- M3 fix: register test() on synthetic Predicate composition classes ---
 
@@ -3373,9 +3445,23 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__func_prev_cat);
 
-    // Consumer.andThen
+    // Consumer.andThen — `SyntheticStub`, the third and last mint site of this
+    // family that L7 item 4 left `Bridge`. `java.util.function.Consumer.andThen`
+    // is a `default` method returning `(T t) -> { accept(t); after.accept(t); }`,
+    // so the real-bytecode fallback exists, and `Consumer$AndThen` is declared
+    // by no image (it is already in `NO_IMAGE_JDK_RECEIVERS`, which is what
+    // re-tagged its `accept` below).
+    //
+    // Unlike its `Predicate` siblings above, this name carries no `$$Lambda`
+    // infix, so `fabricated_origin_for_name` gives it
+    // `ClassOrigin::CompatibilityStub` and §5 refuses the mint outright: the
+    // strict symptom was `NoClassDefFoundError: java/util/function/Consumer$AndThen`
+    // thrown from `andThen` itself. Same missing half as `Predicate`, different
+    // error shape purely because of how the fabricated name reads — see the long
+    // note on the `Predicate` block for why that distinction is the whole of the
+    // difference between the two.
     let cons = "java/util/function/Consumer";
-    r.register(
+    r.register_with_kind(
         cons,
         "andThen",
         "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
@@ -3398,6 +3484,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // --- M3 fix: register apply/accept on synthetic composition classes ---

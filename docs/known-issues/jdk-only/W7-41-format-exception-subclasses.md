@@ -10,6 +10,50 @@ source of `native-builtins/src/lang_string.rs` and of JDK 25's own
 Everything below is in `native-builtins/src/lang_string.rs` unless said
 otherwise.
 
+> ## Re-verified 2026-08-12 (record-triage lane, doc-only — nothing built or run)
+>
+> A source read of today's tree. Nothing here upgrades the status line: this
+> record is still **UNVERIFIED against a binary**, and this lane could not build
+> either.
+>
+> **Present, at today's lines.** `fmt_exception_class_available` (`:5420`),
+> `fmt_raise` (`:5467`), `FMT_DATETIME_FIELDS` (`:5526`), and both previously
+> unraised classes — `java/util/IllegalFormatCodePointException` (`:5347`) and
+> `java/util/IllegalFormatArgumentIndexException` (`:5358`). The `%c` gate is at
+> `:7850-7862` and reads as this record describes it.
+>
+> **The evidence is still NOT SCHEDULED, and that is the residual to act on.** A
+> sweep of `regression-suite/src/*.java` for the twelve class names finds **zero**
+> hits, so no fixture asserts any of them; the only instrument is
+> `probes/ShadowDifferentialProbe.java`, and `regression-suite/run.sh` never runs
+> `probes/` at any `SUITE=` value. A green suite therefore says nothing about this
+> record. What has changed since it was written is that a **scheduled host now
+> exists**: `regression-suite/src/RJdkFormatLocale.java` is in `CORE_CLASSES`
+> (`run.sh:106`) and is diffed against HotSpot. Every class here extends
+> `IllegalArgumentException` and HotSpot 25 agrees on all of them, so the
+> assertions are arm-uniform and safe to add there. That nomination is filed with
+> this pass.
+>
+> **The two sibling changes landed and neither discharges anything here.**
+> * The locale rework is in: `FmtLocale` with its `DefaultFormat` arm
+>   (`:5765-5811`) and `fmt_symbols_for` (`:5827`), so the no-`Locale` overload
+>   now follows `Locale.getDefault(Locale.Category.FORMAT)` instead of ROOT. That
+>   moves *rendering*, not refusal: which fault a bad specifier raises is decided
+>   before any symbol is read, and `FMT_DATETIME_FIELDS` is locale-independent.
+>   The `%t` name-field half was already handed to `W7-91` by the addendum below.
+> * The `defineClass` linkage retyping is in
+>   (`native-builtins/src/lang_system.rs:4642`,
+>   `classloading/src/class_manager.rs:5500`), so `UnsupportedClassVersionError`
+>   and friends now arrive as their real JDK types. No residual in this record
+>   touches `defineClass` or `ClassFormatError`; it is a neighbour, not a
+>   dependency.
+>
+> **Two residuals re-read and still live, in source:** the lone-surrogate `?` is
+> at `:7854-7861` and its comment names this record; the `%t` argument-type check
+> is still class-name-keyed — `extract_temporal_fields` tests `Long`,
+> `java/util/Date`, `java/util/Calendar` and a hand-listed `java/time` set
+> (`:6641-6672`) with no `TemporalAccessor` interface test anywhere in the arm.
+
 ## The measurement, from W7-40-differential-at-14.md
 
 HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, same class files, both pinned to

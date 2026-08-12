@@ -9,6 +9,16 @@ host, and the probe transcript (`probes/DirectByteBufferStateProbe.expected.txt`
 Branch `fix/heap-kind-mock-and-segment-as-array-20260812`, worktree
 `C:/craton/CratonVM-segarr-20260812`.
 
+> **Re-verified 2026-08-12 (lane A12), source-level, nothing run.** Three
+> claims were re-checked rather than inherited: the kind screen is present in
+> **both** crates (`native-builtins/src/servlet.rs` `s2_bb_arr`,
+> `native-io/src/lib.rs` `bb_resolve_heap_array`, each
+> `ctx.heap_kind_of(a) == ObjectKind::Array`); `asByteBuffer` **still** has no
+> native registration anywhere in the workspace, so §8's finding that §4's
+> Compatible-mode receiver cannot be constructed **still holds** and §4's
+> `before` column is still not a measurement; and §7.2 has since been **closed
+> in source** (see §7). The CratonVM probe column remains unproduced.
+
 Input: W7-76-bytebuffer-alias-residuals.md §8.1, which found the defect, refused
 to repair it, and named the reason — the repair needs a kind screen, and
 `native-io`'s test mock cannot tell an array from an instance. It also
@@ -301,13 +311,16 @@ currently be wrong. `--features synthetic-jdk` + `--synthetic-jdk` exercises the
    **Qualified 2026-08-12 by §8**: the `seg.*` section of that column cannot be
    produced at all until `MemorySegment.asByteBuffer()` is registered, and the
    part of it a scheduled fixture *can* answer is §7.1, which §8.1 now schedules.
-2. **`arrayOffset()` on a direct receiver.** `s2`'s `arrayOffset` returns
-   `s2_bb_heap_base(..)` unconditionally and never throws; HotSpot throws
-   `UnsupportedOperationException`. Pre-existing, untouched here, and already
-   covered by the probe's `direct.arrayOffset.throws` /
-   `seg.native.arrayOffset.throws` rows (expected red on CratonVM). Fixing it is
-   a Compatible-mode parity change of the same species as §4 and a natural next
-   lane. **Prescription and scheduled assertions written 2026-08-12 — see §8.**
+2. ~~**`arrayOffset()` on a direct receiver.**~~ **CLOSED in source
+   2026-08-12** — verified by this lane, not assumed. `s2`'s `arrayOffset`
+   (`native-builtins/src/servlet.rs`, the `r.register(bb, "arrayOffset",
+   "()I", …)` block) now carries both refusals, transcribed from the `array()`
+   arm exactly as §8.1 prescribed: `ReadOnlyBufferException` on a read-only heap
+   receiver, `UnsupportedOperationException` on a direct one, and the
+   storage-less synthetic keeps its historic benign zero. The comment at the
+   site cites W7-83 §7.1 and the measured oracle rows. **Still not run on
+   CratonVM** — this is a source-level verification that the prescribed body
+   landed, not a green probe column.
 3. **`native-api/src/test_mock.rs::object_is_array`** still answers `false` for
    its own arrays (§2.2), and its `superclass_of` still answers `None`
    unconditionally (W7-69 §2.1).

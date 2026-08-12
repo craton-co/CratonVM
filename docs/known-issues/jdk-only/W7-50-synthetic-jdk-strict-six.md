@@ -1,7 +1,47 @@
 # W7-50 — the `synthetic-jdk` build's strict arm, and the six vectors only it fails
 
 **Status: source landed, UNVERIFIED against a VM.** Nothing below has been
-built. The baseline measurement in §1 is quoted as measured, on a binary built
+built.
+
+> **RE-VERIFIED IN TREE 2026-08-12.** All three fixes are still present; line
+> numbers have drifted and are corrected here:
+> `native-builtins/src/lib.rs:9478` and `:9541` (defect A, `OutputStreamWriter`
+> / `BufferedInputStream`); `native-io/src/lib.rs:6474-6475` and `:6566-6567`
+> (defect A, `InputStreamReader` / `BufferedReader`);
+> `native-io/src/lib.rs:6802-6805` (defect B, `register_nio_natives`). Defect C
+> is confirmed by *absence*: both
+> `register_management_factory_platform_server_stub`
+> (`native-builtins/src/jmx.rs:1418`) and `register_mbean_server_factory_synthetic`
+> (`:6871`) have **zero** callers in `vm_init.rs` — only the dated tombstones at
+> `vm/src/vm/vm_init.rs:2381-2409` and `:2421-2434`, and the latter's sole
+> surviving caller is the unit test at `native-builtins/src/jmx.rs:7222`,
+> exactly as §7 predicted. The precedent guard cited as
+> `native-io/src/lib.rs:5797` is now `:5844`; the
+> `set_drop_real_layout_synthetic(true)` pair cited as `vm_init.rs:1659`/`:2192`
+> is now `vm/src/vm/vm_init.rs:1918` and `:2482`.
+>
+> **Baseline drift:** §1's 63/7 and §9's predicted 69/1 are both superseded.
+> Both arms now measure **69 passed / 2 failed**
+> (`RETIREMENT-20260812B.md:3-5`, `HANDOFF-20260812.md:18-19`) — the §9
+> prediction was one vector optimistic. The six vectors themselves are green in
+> the default build in both modes, which is §1's load-bearing claim, and it
+> held.
+>
+> **One residual has moved out:** the `bb_state` direct-buffer arm (§5's
+> "related-but-untouched half") is **FIXED**, closed by W7-58 —
+> `native-io/src/lib.rs:7772`, with a regression test
+> `bb_state_resolves_a_direct_buffer_through_address` at `:24058`.
+> `HANDOFF-20260812.md:173` records the transfer. Strike it here so it is not
+> re-derived. It is the one residual that was reachable from Compatible and so
+> could be closed rather than sealed behind the mode gate.
+>
+> **Still open, verbatim in tree:** the hard-coded `to_be_bytes` endianness
+> family (`native-io/src/lib.rs:9456`, `bigEndian` never read); the
+> `native_br_read_line` slot-0 `Int` fd read (`native-io/src/lib.rs:2650-2653`);
+> the JMX bind-by-name hard-coded return descriptors
+> (`native-builtins/src/jmx.rs:6747-6751`); and the `System.initPhase1/2/3`
+> override still guarded on the feature while its own comment says "mode"
+> (`native-builtins/src/lib.rs:11149`). The baseline measurement in §1 is quoted as measured, on a binary built
 `--features synthetic-jdk -p cratonvm-cli` and run `--jdk-only`. Everything
 downstream of it — the root causes, the call chains, the arm placements — is
 read from source and is stated as such. The one structural claim that was
@@ -10,10 +50,39 @@ the whole fix turns on it.
 
 ## 0. What `synthetic-jdk` is, because the name misleads
 
-`synthetic-jdk` is a **build-time Cargo feature**, not a runtime mode. The two
-runtime modes are `--real-jdk` (Compatible) and `--jdk-only` (strict), and a
-binary built with the feature still runs both. The feature adds CratonVM's own
-synthesised stand-in classes and the natives written against their layouts.
+> **CORRECTED 2026-08-12.** The paragraph that stood here overshot in both of
+> its sentences, and the correction matters because the rest of the record is
+> about a mode/feature confusion. `synthetic-jdk` names **two** things:
+>
+> * a build-time Cargo feature, `--features synthetic-jdk` (CI exercises this
+>   at `.github/workflows/ci.yml:447-480` — `cargo check` and `cargo test` only,
+>   it never launches the binary); **and**
+> * a runtime class-library flag, `--synthetic-jdk`, parsed at
+>   `vm-cli/src/main.rs:312` (`#[arg(long = "synthetic-jdk", conflicts_with =
+>   "real_jdk")]`), with a second parser for the embedding path at
+>   `libcratonvm/src/lib.rs:710`.
+>
+> So there are **three** runtime selections, not two, and `--jdk-only` is not a
+> peer of `--real-jdk`: it is a *compatibility policy* that **implies**
+> `JdkMode::Real` (`vm-cli/src/main.rs:3327`, `args.real_jdk || args.jdk_only`).
+> Authoritative resolution is `resolve_jdk_mode`, `vm-cli/src/main.rs:2172-2209`.
+>
+> Defaults: the launcher defaults to **`JdkMode::Real`**
+> (`vm/src/config.rs:214`, `LAUNCHER_DEFAULT_JDK_MODE`); the *embedded* default
+> is `JdkMode::Synthetic` (`vm/src/config.rs:225`). The two names are coupled
+> one way only — `--synthetic-jdk` on a binary built **without** the feature is
+> a hard launch error (`vm/src/config.rs:1515`, `require_synthetic_jdk()`,
+> gated on `SYNTHETIC_JDK_COMPILED_IN`) — and that asymmetry is precisely where
+> this record's five `cfg` defects lived.
+>
+> The record's *operative* point is unaffected and still correct: **a `#[cfg]`
+> cannot see `config.use_synthetic_jdk`**, so a site that needed to ask which
+> class library is loaded must not ask what was compiled.
+
+`synthetic-jdk` is a build-time Cargo feature **and** a runtime mode flag of
+the same spelling. A binary built with the feature still runs every mode. The
+feature adds CratonVM's own synthesised stand-in classes and the natives
+written against their layouts.
 
 Every defect in this record is a consequence of that distinction being lost at
 a decision point: a site that needed to ask *which class library is loaded*
@@ -369,7 +438,82 @@ one function is how a family gets re-opened.
   `:21018`, `:21125`. None is on any of the six paths. Whether each is the same
   species or a legitimately build-scoped decision was not determined, and
   guessing would have meant changing registrations no vector measures.
-* **The `System.initPhase1/2/3` override** at `native-builtins/src/lib.rs:10889`,
-  whose comment says "only override in synthetic-jdk **mode**" while the guard
-  is the feature. Same species by inspection, not implicated in any of the six,
-  and boot-path — not a thing to change speculatively.
+* **The `System.initPhase1/2/3` override** at `native-builtins/src/lib.rs:10889`
+  (now `:11149`), whose comment says "only override in synthetic-jdk **mode**"
+  while the guard is the feature. Same species by inspection, not implicated in
+  any of the six, and boot-path — not a thing to change speculatively.
+
+---
+
+## 10. Where the remaining residuals actually live (2026-08-12)
+
+This section exists because the answer is uncomfortable and easy to state
+wrongly in either direction.
+
+### 10.1 "It has never been executed, ever" is **too strong**
+
+That claim is asserted in four places —
+`docs/feature-designs/jdk-only-completion-roadmap.md:173`,
+`docs/known-issues/jdk-only/README.md:601`, `:606`, and
+`W7-18-structured-task-scope-jep505.md:712`. It is **falsified** by a dated
+artefact: `apps/h2database-suite-runner/RESULTS-20260721.md:91-95` records a
+`--synthetic-jdk` run that "fails immediately on an unrelated gap
+(`NoSuchMethodError: java.time.format.DateTimeFormatter.ofPattern`, a missing
+synthetic stub hit from `TestBase.<clinit>`)". A `NoSuchMethodError` naming a
+*missing synthetic stub* is only producible with the synthetic library loaded,
+so a VM did boot in that mode on 2026-07-21.
+
+Four live invocation sites also pass the flag today:
+`apps/h2database-suite-runner/run-h2-suite.sh:272` and `:276`,
+`apps/hib-suite-runner/run-hib.sh:473`,
+`apps/spring-suite-runner/run-suite.sh:347-348`, and
+`apps/tomcat-suite-runner/run-tomcat-suite.ps1:338`.
+
+**The defensible restatement**, which is what the roadmap should say:
+
+> The `--features synthetic-jdk` binary W7-50 built has never been run in
+> `--synthetic-jdk` mode, and **no `RJdk*` vector has ever been run in that
+> mode at all.**
+
+### 10.2 …but the operative consequence is unchanged, and it is structural
+
+Nothing that gates the tree ever launches the mode:
+
+* `regression-suite/run.sh` has **no synthetic arm**. Its only mode knob is
+  `CRATONVM_ARGS`, and the only value it recognises is `--jdk-only`
+  (`run.sh:203`). Zero `--synthetic-jdk` hits under `regression-suite/` except a
+  comment in `src/RDirectBufferElem.java:59`.
+* CI's `synthetic-jdk` job (`.github/workflows/ci.yml:447-480`) runs
+  `cargo check` / `cargo test` with the feature and **never launches the
+  binary** — it exercises the *feature* and never the *mode*.
+* `scripts/`, `probes/`, `difftest/`, `test-infra/`, `tools/`, `bench/`: prose
+  only, no invocations.
+
+The four runners that *do* pass the flag drive H2 / Hibernate / Spring /
+Tomcat, none of which run `RJdk*` vectors — and the last recorded synthetic run
+died in `TestBase.<clinit>` before reaching anything this record is about.
+
+### 10.3 Which residuals are unobservable because of it
+
+By construction of W7-50's **own** fix, every surviving residual is now behind
+`cfg!(feature = "synthetic-jdk") && !drops_real_layout_synthetic()` — feature
+build **and** `JdkMode::Synthetic`:
+
+| residual | file:line | reachable only in |
+|---|---|---|
+| `to_be_bytes` endianness family | `native-io/src/lib.rs:9456` | runtime `--synthetic-jdk` |
+| `native_br_read_line` slot-0 fd | `native-io/src/lib.rs:2650-2653` | runtime `--synthetic-jdk` |
+| JMX bind-by-name descriptors | `native-builtins/src/jmx.rs:6747-6751` | runtime `--synthetic-jdk` |
+| `System.initPhase1/2/3` override | `native-builtins/src/lib.rs:11149` | runtime `--synthetic-jdk`, boot path |
+
+W7-58 states the same gate independently at
+`W7-58-bytebuffer-direct-arm.md:411`: "Every affected registration is inside
+`register_nio_natives`, which since W7-50 runs only in a synthetic-jdk build in
+synthetic mode."
+
+**So the honest status is: these residuals cannot be observed, confirmed, or
+retired by anything currently run in this repo.** They are not "probably fine"
+and not "probably broken" — they are *unmeasured*, and the fix that made the
+feature build's real-JDK arm converge on the default build's is what pushed
+them there. Retiring any of them requires a `--features synthetic-jdk` binary
+launched with `--synthetic-jdk`, which is P4-B's job.

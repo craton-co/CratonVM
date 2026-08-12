@@ -3210,32 +3210,120 @@ fn set_system_env_singleton(vm: usize, obj: ObjectRef) -> ObjectRef {
 /// HotSpot exposes the no-arg environment as a
 /// `java.util.Collections$UnmodifiableMap` whose private field `m` points at
 /// that backing map. System Rules reflects on that field by name, so the
-/// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
-/// slot 0, matching the JDK's `m` field slot.
-/// Fallible since 2026-08-05 (JDK-only wave 2, lane L7 residual R1): the
-/// wrapper stands in for `java.util.Collections$UnmodifiableMap`, whose real
-/// bytecode is not running, so under `--jdk-only` it is refused as a catchable
-/// `NoClassDefFoundError` rather than fabricated behind a recorded violation.
+/// CratonVM unmodifiable-map stand-in deliberately keeps the backing in slot 0,
+/// matching the JDK's `m` field slot.
+///
+/// # Why this asks `java.util.Collections` first (P1-B, 2026-08-12)
+///
+/// This used to go straight to `try_ensure_synthetic_class(
+/// "cratonvm/internal/UnmodifiableMap", 2)`. That stand-in is a compatibility
+/// fabrication, so under `--jdk-only` it is refused — correctly. What was wrong
+/// was the *caller*: `System.getenv` is registered from
+/// `register_essential_natives_with_shims`, so it survives strict mode, runs,
+/// asks for a fabricated receiver, and dies as `NoClassDefFoundError:
+/// cratonvm/internal/UnmodifiableMap` at the application's call site. Spring
+/// takes that in `AbstractEnvironment.<init>`, before bean one.
+///
+/// The native already holds a REAL `java/util/HashMap`, so the real
+/// `java.util.Collections.unmodifiableMap(Map)` can wrap it and there is no
+/// need to fabricate anything. `vm_init.rs::ensure_bootstrap_compat_class`
+/// claims these stand-ins "exist for the synthetic collection shims, which
+/// strict mode does not register" — that premise is FALSE for
+/// `UnmodifiableMap`, and this site was the counter-example.
+///
+/// Per mode, what the `ctx.invoke` below reaches:
+///
+/// * `--jdk-only`: `native-collections`' `Collections.unmodifiableMap`
+///   registration is `NativeKind::SyntheticStub` and is dropped at
+///   registration, so the **real `java.base` bytecode** runs and the result is a
+///   genuine `java.util.Collections$UnmodifiableMap` — HotSpot's own answer.
+/// * `--real-jdk` (default): that same registration wins and
+///   `alloc_unmod_wrapper` allocates `cratonvm/internal/UnmodifiableMap` with
+///   the backing at slot 0 — bit-for-bit what this function used to build
+///   itself, so compatible mode is unchanged.
+/// * `--synthetic-jdk`: `phases_early::register_collections_extras_natives`
+///   binds the same triple to `native_return_first_arg` and runs later, so the
+///   raw `HashMap` comes back. That is the mutable-map degradation below, and it
+///   is a pre-existing property of that mode's identity binding
+///   (`native-collections/src/lib.rs::wrap_unmodifiable`'s "vacuous-green trap"
+///   note documents the same shape for `unmodifiableSet`), not something this
+///   change introduces.
+///
+/// # Boot ordering — `allow_java_call`
+///
+/// Running Java bytecode from a native is only safe once the class library can
+/// actually answer. The caller says whether that holds:
+///
+/// * The REAL-LAYOUT path passes `true`. It has already resolved every
+///   `java/util/HashMap` and `java/util/HashMap$Node` field index off the real
+///   classes, so `java.util.HashMap` is loaded and initialized by then, and
+///   `java.util.Collections.<clinit>` — three `EMPTY_LIST`/`EMPTY_MAP`/
+///   `EMPTY_SET` allocations — cannot need more than that, cannot do I/O, and
+///   cannot re-enter `System.getenv()`.
+/// * The LEGACY 3-field fallback passes `false`. That arm exists precisely
+///   *because* the real `HashMap` layout was not resolvable, i.e. the class
+///   library is not usable yet; and a real `Collections$UnmodifiableMap`
+///   delegating to a 3-field synthetic map would be worse than the stand-in
+///   whose native shims read slot 0.
+///
+/// # Why it no longer returns `Result`
+///
+/// If every wrapper is unavailable the answer is the **raw `HashMap`**: a
+/// mutable map is far less wrong than an unloadable class, and it keeps
+/// `System.getenv()` answering instead of killing the caller. The refusal is
+/// still *recorded* — `ClassManager::try_ensure_synthetic_class` records the
+/// `CompatibilityClassRequested` violation before returning `Err`, so the
+/// `--jdk-only-report` census still sees it; only the throw is dropped.
 fn wrap_system_env_map(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
-) -> Result<ObjectRef, MethodCallFailed> {
+    allow_java_call: bool,
+) -> ObjectRef {
     let pin = ctx.pin_native_root(map);
-    // Not `?`: the pin above must be released before unwinding.
-    let wrapper_class =
-        match ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2) {
-            Ok(id) => id,
-            Err(err) => {
-                ctx.unpin_native_roots(pin);
-                return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err));
-            }
-        };
+
+    // 1. The real `java.util.Collections.unmodifiableMap(Map)`.
+    if allow_java_call && ctx.ensure_class_initialized("java/util/Collections").is_ok() {
+        let backing = ctx.read_native_pin(pin, map);
+        // A failure here is deliberately swallowed rather than propagated: it
+        // means the real wrapper is unavailable, which is what steps 2 and 3
+        // are for. Same precedent as
+        // `jca::provider_chain::wrap_unmodifiable`, which discards a failed
+        // `Collections.unmodifiableSet` and returns the plain set.
+        if let Ok(Some(Value::Object(Some(view)))) = ctx.invoke(
+            "java/util/Collections",
+            "unmodifiableMap",
+            "(Ljava/util/Map;)Ljava/util/Map;",
+            &[Value::Object(Some(backing))],
+        ) {
+            ctx.unpin_native_roots(pin);
+            return view;
+        }
+    }
+
+    // 2. The compatibility stand-in. Refused under `--jdk-only`, which is the
+    //    whole point of the mode; `try_` rather than the infallible spelling so
+    //    the refusal is a value and not a fabrication.
+    let stand_in = ctx.try_ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    if let Ok(wrapper_class) = stand_in {
+        let map = ctx.read_native_pin(pin, map);
+        let wrapper = ctx.alloc_object(wrapper_class, 2);
+        let map = ctx.read_native_pin(pin, map);
+        ctx.set_field(wrapper, 0, Value::Object(Some(map)));
+        ctx.unpin_native_roots(pin);
+        return wrapper;
+    }
+
+    // 3. Degrade to the backing map itself. Mutable where HotSpot's is not —
+    //    say so in the log rather than letting it pass silently — but a real
+    //    `java.util.HashMap` that every caller can read.
+    tracing::warn!(
+        "System.getenv(): neither java.util.Collections.unmodifiableMap nor the \
+         cratonvm/internal/UnmodifiableMap stand-in was available; returning the \
+         backing HashMap, which is MUTABLE unlike HotSpot's"
+    );
     let map = ctx.read_native_pin(pin, map);
-    let wrapper = ctx.alloc_object(wrapper_class, 2);
-    let map = ctx.read_native_pin(pin, map);
-    ctx.set_field(wrapper, 0, Value::Object(Some(map)));
     ctx.unpin_native_roots(pin);
-    Ok(wrapper)
+    map
 }
 
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
@@ -3516,7 +3604,12 @@ pub(crate) fn native_system_getenv_all(
         // Cache the OpenJDK-shaped process-wide singleton (double-checked
         // publish). The wrapper's field 0 is the private `m` backing field that
         // libraries such as System Rules reach via reflection.
-        let env = wrap_system_env_map(ctx, map)?;
+        //
+        // `true`: this is the real-layout arm, so every `java/util/HashMap`
+        // field index above came off the real class and running
+        // `java.util.Collections` bytecode here is safe. See
+        // `wrap_system_env_map`'s boot-ordering note.
+        let env = wrap_system_env_map(ctx, map, true);
         let env = set_system_env_singleton(ctx.vm_identity(), env);
         return Ok(Some(Value::Object(Some(env))));
     }
@@ -3562,7 +3655,12 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    let env = wrap_system_env_map(ctx, map)?;
+    // `false`: this arm was reached BECAUSE the real `java/util/HashMap` layout
+    // was not resolvable, so the class library cannot be asked to run
+    // `java.util.Collections.unmodifiableMap` — and a real wrapper delegating to
+    // a 3-field synthetic map would be worse than the stand-in whose shims read
+    // slot 0. Uncached, as before, so a later call retries the real path.
+    let env = wrap_system_env_map(ctx, map, false);
     Ok(Some(Value::Object(Some(env))))
 }
 
@@ -4378,6 +4476,282 @@ fn define_class_format_error(class_name: &str, method: &str, message: String) ->
     .into()
 }
 
+// ---------------------------------------------------------------------------
+// defineClass0/1/2 — recovering the TYPE of a backend failure (W7-31 §Falsifier 3)
+//
+// `NativeContext::define_class_full` is typed `Result<ClassId, String>`, and the
+// VM's implementation fills that `String` with
+// `class_manager::define_class_with_options`'s `VmError` rendered by
+// `.map_err(|e| format!("{e:?}"))` — a Rust `Debug` string. Every `defineClassN`
+// failure arm then re-wrapped it as `ClassFormatError`, so a class file that
+// must raise `UnsupportedClassVersionError` produced instead:
+//
+//   HotSpot : java.lang.UnsupportedClassVersionError: Preview features are not
+//             enabled for <Unknown> (class file version 69.65535). Try running
+//             with '--enable-preview'
+//   CratonVM: java.lang.ClassFormatError: : defineClass1:
+//             Linkage(UnsupportedClassVersionError { class_name: "", message:
+//             "Preview features are not enabled for <Unknown> (class file
+//             version 69.65535). Try running with '--enable-preview'" })
+//
+// Two separate breakages in one line. The TYPE is wrong — a container catching
+// the JDK's typed exception (application servers probing whether they can load
+// a bundle, test frameworks branching on linkage kind) does not catch ours — and
+// the MESSAGE is a Rust value dump.
+//
+// The right repair is to widen `define_class_full` to carry `VmError`; that is a
+// trait-signature change across ~25 call sites in six crates and is nominated,
+// not done here. What is done here is the repair the record asks for: give the
+// `defineClassN` tail a pass-through that recovers the already-typed
+// `VmError::Linkage(..)` from the rendering it was flattened into, and rebuild
+// the typed variant so `runtime::exceptions::linkage_throwable` — which already
+// has a complete, correct arm per variant — produces the JDK exception.
+//
+// **Never re-emit the Debug text.** Every arm below either carries a field the
+// backend wrote (already human-readable — `LinkageError`'s own `#[error]`
+// strings and HotSpot's verbatim version wording) or names the variant. The raw
+// `msg` is used only when the string is NOT a `Debug` rendering at all, which is
+// the case for `define_class_full`'s own plain-string failures ("define_class_full
+// failed for X", "initialize after define failed for X: ...").
+//
+// **`class_name: ""` is not a lost name.** It is the caller's own argument: the
+// Java call was `ClassLoader.defineClass(null, bytes, off, len)`, and the class
+// manager's version check runs BEFORE `this_class` is read from the constant
+// pool, so no name exists to substitute. HotSpot has the identical ordering and
+// prints `<Unknown>` mid-message — which the recovered `message` field already
+// contains. What was visibly damaged was the outer wrapper's
+// `format!("{class_name}: {message}")`, i.e. the stray leading `": "` above;
+// that disappears with the flattening, because the `UnsupportedClassVersionError`
+// arm of `linkage_throwable` deliberately does not prefix the name.
+// ---------------------------------------------------------------------------
+
+/// Split a Rust `Debug` rendering of an enum into `(outer, inner, body)`.
+///
+/// `Linkage(ClassFormatError { class_name: "A", message: "b" })`
+///   -> `("Linkage", "ClassFormatError", "class_name: \"A\", message: \"b\"")`
+///
+/// A tuple variant with no struct body (`JdkOnly(..)`) yields an empty body.
+/// Returns `None` for anything that is not shaped like `Ident(..)` — a plain
+/// human-written error string, which the caller must pass through unchanged.
+fn split_debug_error(msg: &str) -> Option<(&str, &str, &str)> {
+    let open = msg.find('(')?;
+    let outer = &msg[..open];
+    if outer.is_empty() || !outer.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let close = msg.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let inner_all = &msg[open + 1..close];
+    // `#[derive(Debug)]` renders a struct variant as `Name { a: 1, b: 2 }`,
+    // with exactly one space inside each brace.
+    match inner_all.find(" { ") {
+        Some(brace) => {
+            let end = inner_all.rfind(" }")?;
+            if end < brace + 3 {
+                return None;
+            }
+            Some((outer, &inner_all[..brace], &inner_all[brace + 3..end]))
+        }
+        None => Some((outer, inner_all, "")),
+    }
+}
+
+/// Undo the escaping `Debug` applies to a `String`, stopping at the closing
+/// quote. `\u{..}` forms are not decoded — they are rare (control characters in
+/// a class name) and a literal `u{7f}` in a diagnostic is better than a partial
+/// parse that drops the rest of the sentence.
+fn unescape_debug_string(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'),
+                // Covers `\\`, `\"` and `\'`.
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Read a `name: "value"` `String` field out of a `Debug` struct body.
+///
+/// The name must sit at a field boundary (start of the body, or just after a
+/// `", "` separator) so a `field:` appearing INSIDE another field's text cannot
+/// be mistaken for the field itself.
+fn debug_string_field(body: &str, field: &str) -> Option<String> {
+    let mut from = 0usize;
+    while from < body.len() {
+        let at = from + body[from..].find(field)?;
+        let after = at + field.len();
+        let at_boundary = at == 0 || body[..at].ends_with(", ");
+        if at_boundary && body[after..].starts_with(": \"") {
+            return Some(unescape_debug_string(&body[after + 3..]));
+        }
+        from = after;
+    }
+    None
+}
+
+/// Turn a `define_class_full` failure string back into the typed JVM error the
+/// backend actually raised.
+///
+/// `class_name` is the caller's own name argument, used only when the recovered
+/// error names nothing (or names nothing useful). See the module note above for
+/// why an empty name here is faithful rather than lost.
+fn define_class_linkage_error(class_name: &str, method: &str, msg: String) -> MethodCallFailed {
+    match typed_define_class_error(class_name, method, &msg) {
+        Some(err) => err,
+        // Not a `Debug` rendering — `define_class_full`'s own plain-string
+        // failures land here, and they are already readable.
+        None => define_class_format_error(class_name, method, msg),
+    }
+}
+
+/// The recovery half of [`define_class_linkage_error`]. Split out so the
+/// borrow of `msg` that [`split_debug_error`] produces ends before the caller
+/// needs to move the `String` into its fallback.
+fn typed_define_class_error(class_name: &str, method: &str, msg: &str) -> Option<MethodCallFailed> {
+    let (outer, inner, body) = split_debug_error(msg)?;
+
+    // The backend's own name when it has one (a supertype-resolution failure
+    // names the SUPERTYPE, not the class being defined), else the caller's.
+    let named = |field: &str| {
+        debug_string_field(body, field)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| class_name.to_string())
+    };
+    // A recovered variant always has a readable message: the field the backend
+    // wrote, or — if the field cannot be read — the variant's own name. Never
+    // `msg`, which is the `Debug` text this function exists to remove.
+    let detail = |field: &str| {
+        debug_string_field(body, field).unwrap_or_else(|| format!("{method}: {inner}"))
+    };
+
+    Some(match (outer, inner) {
+        // -- VmError::Linkage: already the right shape, just re-typed. --------
+        ("Linkage", "UnsupportedClassVersionError") => LinkageError::UnsupportedClassVersionError {
+            class_name: named("class_name"),
+            // HotSpot's wording verbatim; it already names the class
+            // mid-sentence, which is why `linkage_throwable` does not prefix.
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "ClassFormatError") => LinkageError::ClassFormatError {
+            class_name: named("class_name"),
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "VerifyError") => LinkageError::VerifyError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "NoClassDefFoundError") => LinkageError::NoClassDefFoundError {
+            class_name: named("class_name"),
+        }
+        .into(),
+        ("Linkage", "IncompatibleClassChangeError") => LinkageError::IncompatibleClassChangeError {
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "DuplicateClassDefinition") => LinkageError::DuplicateClassDefinition {
+            class_name: named("class_name"),
+            loader: debug_string_field(body, "loader").unwrap_or_else(|| "<unknown>".to_string()),
+        }
+        .into(),
+        ("Linkage", "NoSuchFieldError") => LinkageError::NoSuchFieldError {
+            class_name: named("class_name"),
+            field_name: debug_string_field(body, "field_name").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "NoSuchMethodError") => LinkageError::NoSuchMethodError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+            method_descriptor: debug_string_field(body, "method_descriptor").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "IllegalAccessError") => LinkageError::IllegalAccessError {
+            message: detail("message"),
+        }
+        .into(),
+        ("Linkage", "AbstractMethodError") => LinkageError::AbstractMethodError {
+            class_name: named("class_name"),
+            method_name: debug_string_field(body, "method_name").unwrap_or_default(),
+        }
+        .into(),
+        ("Linkage", "UnsupportedClassRedefinitionError") => {
+            LinkageError::UnsupportedClassRedefinitionError {
+                class_name: named("class_name"),
+                message: detail("message"),
+            }
+            .into()
+        }
+
+        // -- VmError::Runtime: only the one JVMS-mandated shape. --------------
+        //
+        // JVMS §5.3.5 / `ClassLoader.preDefineClass`: a non-bootstrap loader
+        // defining into `java.*` is a `SecurityException`, NOT a linkage error,
+        // and `class_manager.rs` raises it as `RuntimeError::SecurityException`.
+        // `classify_fastpath_invoke_error` routes `VmError::Runtime` to the
+        // ordinary runtime-exception path, so this arrives at Java as
+        // `java.lang.SecurityException` with the backend's own sentence.
+        ("Runtime", "SecurityException") => RuntimeError::SecurityException {
+            message: detail("message"),
+        }
+        .into(),
+
+        // -- VmError::ClassFile: MUST be re-homed onto a Linkage variant. -----
+        //
+        // Not cosmetic. `classify_fastpath_invoke_error` (vm/src/runtime/
+        // interpreter.rs) converts `VmError::Linkage` and `VmError::Runtime`
+        // into Java throwables and sends everything else to
+        // `FastPathInvokeError::Fatal` — so returning a `ClassFile` variant from
+        // a native is UNCATCHABLE and unwinds past every handler.
+        ("ClassFile", "ClassNotFound") => LinkageError::NoClassDefFoundError {
+            class_name: named("class_name"),
+        }
+        .into(),
+        ("ClassFile", "UnsupportedVersion") => LinkageError::UnsupportedClassVersionError {
+            class_name: named("class_name"),
+            // This variant carries `major`/`minor` ints rather than a message,
+            // so build HotSpot's shape by hand instead of dumping the fields.
+            message: format!("{} has an unsupported class file version", named("class_name")),
+        }
+        .into(),
+
+        // Everything else recognised-but-unmapped keeps `ClassFormatError` —
+        // today's answer — but with a readable message rather than the dump.
+        //
+        // KNOWN GAP, and it is the one shape in this set that HotSpot gives its
+        // own type: a circular hierarchy is
+        // `ClassFile(InvalidClassFile { message: "circular class hierarchy
+        // detected: ..." })` here and `java.lang.ClassCircularityError` on
+        // HotSpot. `LinkageError` has no `ClassCircularityError` variant — the
+        // spelling does not occur anywhere in this tree — so it cannot be
+        // produced from this side. Adding the variant plus its
+        // `linkage_throwable` arm is nominated in the lane report.
+        _ => LinkageError::ClassFormatError {
+            class_name: named("class_name"),
+            message: format!(
+                "{method}: {}",
+                debug_string_field(body, "message").unwrap_or_else(|| inner.to_string())
+            ),
+        }
+        .into(),
+    })
+}
+
 fn validate_classfile_header(
     class_name: &str,
     method: &str,
@@ -5008,7 +5382,7 @@ pub(crate) fn native_classloader_define_class1(
                 }
             }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
-            Err(define_class_format_error(&name, "defineClass1", msg))
+            Err(define_class_linkage_error(&name, "defineClass1", msg))
         }
     }
 }
@@ -5096,7 +5470,7 @@ pub(crate) fn native_classloader_define_class2(
                 }
             }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
-            Err(define_class_format_error(&name, "defineClass2", msg))
+            Err(define_class_linkage_error(&name, "defineClass2", msg))
         }
     }
 }
@@ -5244,7 +5618,7 @@ pub(crate) fn native_classloader_define_class0(
                 }
             }
             tracing::warn!("ClassLoader.defineClass0({effective_name}) failed: {msg}");
-            Err(define_class_format_error(
+            Err(define_class_linkage_error(
                 &effective_name,
                 "defineClass0",
                 msg,
@@ -6202,5 +6576,226 @@ mod runtime_version_parse_tests {
         assert!(parse_runtime_version_str("nonsense").is_none());
         // `1.8.0_392` is the pre-JEP-223 spelling; the JDK rejects it too.
         assert!(parse_runtime_version_str("1.8.0_392").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P3-C — `defineClass0/1/2` must not flatten a typed linkage error
+// (W7-31-enable-preview-wiring.md, Falsifier 3)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod define_class_error_typing_tests {
+    use super::*;
+    use cratonvm_types::error::{ClassFileError, VmError};
+
+    /// Reproduce EXACTLY what `NativeContextImpl::define_class_full` puts in its
+    /// `Err(String)`: `class_manager::define_class_with_options`' `VmError`,
+    /// rendered by `.map_err(|e| format!("{e:?}"))` (`vm/src/vm/vm_exec.rs`).
+    ///
+    /// This is deliberately not a hand-written literal. The recovery in
+    /// `typed_define_class_error` is a parse of that rendering, so the coupling
+    /// is real and these tests are the thing that notices if either side moves —
+    /// in particular if that `map_err` is ever "tidied" to `{e}` (`Display`),
+    /// which would silently return every arm below to `ClassFormatError`.
+    fn as_backend_string(err: VmError) -> String {
+        format!("{err:?}")
+    }
+
+    fn linkage_of(failed: &MethodCallFailed) -> &LinkageError {
+        match failed {
+            MethodCallFailed::InternalError(VmError::Linkage(l)) => l,
+            other => panic!("expected a LinkageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_class_version_survives_the_string_boundary() {
+        // HotSpot 25's wording verbatim, from the W7-31 falsifier. `<Unknown>`
+        // is what HotSpot prints when the caller passed a null name, and the
+        // version check runs before `this_class` is read — so the empty
+        // `class_name` here is faithful, not lost.
+        let hotspot = "Preview features are not enabled for <Unknown> (class file version \
+                       69.65535). Try running with '--enable-preview'";
+        let backend = as_backend_string(VmError::Linkage(
+            LinkageError::UnsupportedClassVersionError {
+                class_name: String::new(),
+                message: hotspot.to_string(),
+            },
+        ));
+        // The shape this test exists to defend against.
+        assert!(
+            backend.contains("Linkage(UnsupportedClassVersionError {"),
+            "the backend rendering changed shape: {backend}"
+        );
+
+        let failed = define_class_linkage_error("", "defineClass1", backend);
+        match linkage_of(&failed) {
+            LinkageError::UnsupportedClassVersionError { message, .. } => {
+                assert_eq!(message, hotspot, "the message must be HotSpot's, verbatim");
+            }
+            other => panic!("must stay an UnsupportedClassVersionError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_recovered_message_carries_a_rust_debug_rendering() {
+        for err in [
+            VmError::Linkage(LinkageError::UnsupportedClassVersionError {
+                class_name: "P".to_string(),
+                message: "bad version".to_string(),
+            }),
+            VmError::Linkage(LinkageError::ClassFormatError {
+                class_name: "P".to_string(),
+                message: "truncated constant pool".to_string(),
+            }),
+            VmError::Linkage(LinkageError::IncompatibleClassChangeError {
+                message: "already defined by application loader".to_string(),
+            }),
+            VmError::Linkage(LinkageError::VerifyError {
+                class_name: "P".to_string(),
+                method_name: "m".to_string(),
+                message: "bad stack map".to_string(),
+            }),
+            VmError::Runtime(RuntimeError::SecurityException {
+                message: "Prohibited package name: java.evil".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: "P".to_string(),
+                message: "circular class hierarchy detected: P".to_string(),
+            }),
+        ] {
+            let rendered = format!("{err:?}");
+            let failed = define_class_linkage_error("P", "defineClass1", rendered.clone());
+            // `Display`, not `Debug`: this is the text that becomes the Java
+            // exception's message. `Debug` of the *outcome* is a Rust value dump
+            // by definition and asserting on it would measure nothing.
+            let text = format!("{failed}");
+            for artifact in ["class_name:", "message:", "Linkage(", "Runtime(", "ClassFile("] {
+                assert!(
+                    !text.contains(artifact),
+                    "a Debug artifact {artifact:?} reached the Java-visible error \
+                     for {rendered}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_prohibited_package_stays_a_security_exception() {
+        let backend = as_backend_string(VmError::Runtime(RuntimeError::SecurityException {
+            message: "Prohibited package name: java.evil".to_string(),
+        }));
+        match define_class_linkage_error("java/evil/X", "defineClass1", backend) {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::SecurityException {
+                message,
+            })) => {
+                assert_eq!(message, "Prohibited package name: java.evil");
+            }
+            other => panic!("JVMS §5.3.5 wants a SecurityException, got {other:?}"),
+        }
+    }
+
+    /// A `VmError::ClassFile` returned from a native is UNCATCHABLE —
+    /// `classify_fastpath_invoke_error` sends it to `FastPathInvokeError::Fatal`.
+    /// Every `ClassFile` arm must therefore leave as a `Linkage` variant.
+    #[test]
+    fn class_file_errors_are_re_homed_onto_catchable_linkage_variants() {
+        for err in [
+            VmError::ClassFile(ClassFileError::ClassNotFound {
+                class_name: "Missing".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::InvalidClassFile {
+                class_name: "P".to_string(),
+                message: "circular class hierarchy detected: P".to_string(),
+            }),
+            VmError::ClassFile(ClassFileError::UnsupportedVersion {
+                class_name: "P".to_string(),
+                major: 99,
+                minor: 0,
+            }),
+        ] {
+            let failed = define_class_linkage_error("P", "defineClass1", format!("{err:?}"));
+            assert!(
+                matches!(&failed, MethodCallFailed::InternalError(VmError::Linkage(_))),
+                "a ClassFile error must be re-homed onto a Linkage variant, got {failed:?}"
+            );
+        }
+        let failed = define_class_linkage_error(
+            "P",
+            "defineClass1",
+            format!(
+                "{:?}",
+                VmError::ClassFile(ClassFileError::ClassNotFound {
+                    class_name: "Missing".to_string(),
+                })
+            ),
+        );
+        match linkage_of(&failed) {
+            LinkageError::NoClassDefFoundError { class_name } => assert_eq!(class_name, "Missing"),
+            other => panic!("an unresolvable supertype is a NoClassDefFoundError, got {other:?}"),
+        }
+    }
+
+    /// `define_class_full`'s own plain-string failures are not `Debug`
+    /// renderings and must pass through as they always did.
+    #[test]
+    fn a_plain_backend_string_keeps_the_old_class_format_error() {
+        let failed = define_class_linkage_error(
+            "Foo",
+            "defineClass1",
+            "define_class_full failed for Foo".to_string(),
+        );
+        match linkage_of(&failed) {
+            LinkageError::ClassFormatError {
+                class_name,
+                message,
+            } => {
+                assert_eq!(class_name, "Foo");
+                assert_eq!(message, "defineClass1: define_class_full failed for Foo");
+            }
+            other => panic!("expected the unchanged ClassFormatError fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_quoted_message_round_trips_through_the_debug_escaping() {
+        let quoted = "class \"P\" has a \\ in it";
+        let backend = as_backend_string(VmError::Linkage(LinkageError::ClassFormatError {
+            class_name: "P".to_string(),
+            message: quoted.to_string(),
+        }));
+        match linkage_of(&define_class_linkage_error("P", "defineClass1", backend)) {
+            LinkageError::ClassFormatError { message, .. } => assert_eq!(message, quoted),
+            other => panic!("expected ClassFormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_backend_name_wins_over_the_callers_when_the_caller_has_none() {
+        let backend = as_backend_string(VmError::Linkage(LinkageError::NoClassDefFoundError {
+            class_name: "Super".to_string(),
+        }));
+        match linkage_of(&define_class_linkage_error("", "defineClass1", backend)) {
+            LinkageError::NoClassDefFoundError { class_name } => assert_eq!(class_name, "Super"),
+            other => panic!("expected NoClassDefFoundError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_debug_error_rejects_a_human_written_string() {
+        assert!(split_debug_error("initialize after define failed for Foo: boom").is_none());
+        assert!(split_debug_error("").is_none());
+        assert!(split_debug_error("no parens here").is_none());
+    }
+
+    #[test]
+    fn debug_string_field_only_matches_at_a_field_boundary() {
+        let body = r#"class_name: "A", message: "the class_name: \"B\" is wrong""#;
+        assert_eq!(debug_string_field(body, "class_name").as_deref(), Some("A"));
+        assert_eq!(
+            debug_string_field(body, "message").as_deref(),
+            Some(r#"the class_name: "B" is wrong"#)
+        );
+        assert!(debug_string_field(body, "loader").is_none());
     }
 }

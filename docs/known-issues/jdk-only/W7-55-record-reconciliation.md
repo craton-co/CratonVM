@@ -10,6 +10,106 @@ Nothing was built or run for this pass. Every verdict below is git and source
 archaeology, plus one set of vector measurements handed in from a run that
 happened before it started.
 
+> ## ADDENDUM 2026-08-12, later the same day (lane A4 / P3-B) — §8 re-adjudicated, and the record's own anchors had already rotted
+>
+> This record's §8 is a hand-off list, so it was re-checked against the tree by
+> the rule §2 prescribes: **content, not line numbers.** Three of its bullets
+> are now closed, one is refuted, one stands, and the record's own arithmetic
+> has moved.
+>
+> **The anchors rotted within hours.** Six line citations were checked; **all
+> six missed**, every one of them landing in unrelated code, because parallel
+> lanes edited those files the same day:
+>
+> | §8 citation | where the content is now |
+> |---|---|
+> | `jdk-only-kind-map-25-linux.tsv:283-291` | `:379-387` |
+> | `classloading/src/class_manager.rs:10824` | `:11198` |
+> | `native-builtins/src/classloader.rs:13004/:13028/:13110` | gone (see below) |
+> | `native-builtins/src/phases_early.rs:18236-18320` | `:18545-18560` |
+> | `native-builtins/src/jca/provider_chain.rs:4043` | not at that line |
+> | `native-builtins/src/phases_late/concurrent.rs:8566-8577` | `:8951` |
+>
+> §8's own last bullet says *"line citations rot fast here"*. It is now
+> demonstrated **on this record, on the day it was written**. The half-life is
+> hours, not weeks. Treat every line number in this directory as a hint and grep
+> the marker text.
+>
+> **CLOSED — W7-20's frozen baseline.** The bullet says nine
+> `LinkedListSnapshotListItr` rows *"must flip `synthetic-stub` → `bridge`"* and
+> calls it build-blocking. `scripts/baselines/jdk-only-kind-map-25-linux.tsv:379-387`
+> already reads `bridge` on all nine, and the file's own header comment (`:51`)
+> now documents the nine rows. Nothing to do.
+>
+> **CLOSED — W4-1's four unit tests aimed at dead code.**
+> `native-builtins/src/classloader.rs:1587` and `:9173` both record
+> *"DELETED 2026-08-12: … `enforce_lookup_access` … never-registered dead"*. The
+> predicate and its tests are gone; the bullet describes a file state that no
+> longer exists.
+>
+> **REFUTED — W7-16's residual did not "get worse", it was fixed.** The bullet
+> says *"the carrier still implements no interfaces
+> (`classloading/src/class_manager.rs:10824`), so an erased `(ListIterator) x`
+> throws `ClassCastException` — and now does so in strict mode too"*. At
+> `:11198` the arm exists and reads
+> `"cratonvm/internal/LinkedListSnapshotListItr" => &["java/util/ListIterator", "java/util/Iterator"]`,
+> with a comment naming W7-16 and W7-20 and explaining that it reaches the
+> `ClassOrigin::VmInternal` door as well as the compatibility one — i.e. it
+> closes exactly the strict-mode half the bullet says is open. This is the first
+> §8 bullet found **wrong in the dangerous direction** (claiming open work that
+> is done *and* mis-describing the current source), which is the direction §3
+> reports as never having occurred. §3's *"understated: 0"* row is a claim about
+> status LINES; §8's prose bullets are not covered by it and should not inherit
+> its confidence.
+>
+> **STANDS — the fourth W2-2 async-close surface.**
+> `native-builtins/src/phases_early.rs:18560` still registers
+> `java/net/SocketInputStream` (the comment at `:18545` calls itself *"the only
+> registrations of `java/net/SocketInputStream` in the tree"*), and
+> `:18287` still mints one with `try_alloc_concurrent_synthetic`. Still
+> *plausible*, still settled by one `--dump-native-registry`.
+>
+> **STANDS — §6's W6-12 quote.** *"ORDER IS THE CONTRACT HERE … probing the
+> policy first (the variant recorded in W6-12) would mint the class one call
+> earlier"* is verbatim in `phases_late/concurrent.rs:8951`. The prescription is
+> still the one that must not be applied.
+>
+> **§3's arithmetic is a snapshot, not a standing claim.** The directory held 62
+> records when §3 was computed and holds **102** now — the same day. The 58/30
+> split cannot be re-derived from a later tree and should not be quoted as a
+> current rate.
+>
+> ### A finding for the next pass: a *comment* can be the stale record
+>
+> This record's whole subject is a status line that outlived its truth. The same
+> failure occurs one layer down, in source comments that justify a deletion, and
+> it is worse there because there is no index to reconcile against.
+>
+> `native-builtins/src/lang_invoke.rs` (in `register_p68_invoke_extras`) deletes
+> the `MethodHandleProxies.wrapperInstanceType` registration and explains:
+>
+> > *"The registration deleted here keyed on `(Ljava/lang/Object;)Ljava/lang/Class;`,
+> > but the real `MethodHandleProxies.wrapperInstanceType(Object)` returns a
+> > `MethodType` … so the key was permanently unmatchable against real JDK
+> > bytecode."*
+>
+> `javap java.lang.invoke.MethodHandleProxies` on JDK 25.0.3.9 says
+> `public static java.lang.Class<?> wrapperInstanceType(java.lang.Object)` — the
+> method has returned `Class<?>` since Java 7. **The deleted key was the correct
+> one**, and the comment's reasoning is inverted. Nominated for the lane that
+> owns `native-builtins/`; the fixture that asks the question is
+> `regression-suite/src/RJdkProxyIface.java`'s `wrapperRoundTrip` step
+> (`wrapperInstanceType(g) == Greeter.class`).
+>
+> Also for the next pass: `MethodHandleProxies.asInterfaceInstance`'s
+> `--jdk-only` failure (`ClassFormatError: ldc: unsupported constant pool entry
+> type at #26`) was flagged by `STUB-CENSUS-20260812.md` §8 as needing *"its own
+> record"* and had none. It was a constant-pool decoder gap, is fixed in
+> `vm/src/runtime/interpreter/constants.rs`, and is adjudicated against the
+> nearest-looking record in
+> `W7-9-minted-interface-abstract-methods.md`'s 2026-08-12 re-verification block
+> (verdict: separate root cause).
+
 ---
 
 ## 1. The defect being fixed
