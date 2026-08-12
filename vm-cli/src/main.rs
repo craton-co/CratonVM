@@ -1671,10 +1671,23 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         }
         // Assertion control flags: `-ea`/`-enableassertions[:<pkgname>...|:<classname>]`,
         // `-da`/`-disableassertions[...]`, `-esa`/`-enablesystemassertions`,
-        // `-dsa`/`-disablesystemassertions`. CratonVM does not implement assertion
-        // checking; silently ignore so Gradle/Maven forks that pass `-ea`
-        // unconditionally don't crash clap (which would treat `-ea` as
-        // short-option bundling `-e -a` and abort with "unexpected argument '-e'").
+        // `-dsa`/`-disablesystemassertions`.
+        //
+        // They are dropped HERE (clap would read `-ea` as the short-option
+        // cluster `-e -a` and abort with "unexpected argument '-e'"), but they
+        // are no longer *ignored*: `main` scans the same argv with
+        // [`launcher_assertions_requested`] before the flag snapshot is
+        // latched, and the unscoped spellings set `CRATONVM_ENABLE_ASSERTIONS`.
+        // This arm has to stay a pure token filter — see that function for why
+        // the switch cannot be flipped from inside this (pure, ~60-test)
+        // normaliser.
+        //
+        // The *scoped* forms (`-ea:some.pkg...`, `-da:some.Class`) really are
+        // ignored: `assertion_status_default()` is one global with no
+        // per-package granularity, and reading `-ea:some.pkg` as global-enable
+        // would switch on assertions for the classes the caller deliberately
+        // left out. `CRATONVM_DBG_ARGS` names them so the silence is
+        // discoverable.
         else if a == "-ea"
             || a == "-da"
             || a == "-esa"
@@ -1687,7 +1700,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             || a.starts_with("-disablesystemassertions")
         {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
-                eprintln!("[cratonvm] ignoring assertion flag: {a}");
+                if assertion_flag_scope(a).is_some() {
+                    eprintln!("[cratonvm] assertion flag applied JVM-wide: {a}");
+                } else {
+                    eprintln!(
+                        "[cratonvm] ignoring scoped assertion flag (no per-package \
+                         granularity): {a}"
+                    );
+                }
             }
             i += 1;
         } else {
@@ -2675,6 +2695,72 @@ fn launcher_nojit_requested(argv: &[String]) -> bool {
     argv.iter()
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--nojit")
+}
+
+/// Which assertion scope an argv token switches, and to what.
+///
+/// `Some((system, enable))` for the four **unscoped** spellings; `None` for
+/// everything else, including the scoped forms (`-ea:pkg...`, `-da:Class`) —
+/// see [`launcher_assertions_requested`].
+fn assertion_flag_scope(arg: &str) -> Option<(bool, bool)> {
+    match arg {
+        "-ea" | "-enableassertions" => Some((false, true)),
+        "-da" | "-disableassertions" => Some((false, false)),
+        "-esa" | "-enablesystemassertions" => Some((true, true)),
+        "-dsa" | "-disablesystemassertions" => Some((true, false)),
+        _ => None,
+    }
+}
+
+/// The JVM-wide assertion status requested on the command line, or `None` when
+/// no unscoped assertion flag was passed.
+///
+/// `Class.desiredAssertionStatus()` decides whether a class's `<clinit>` stores
+/// `$assertionsDisabled = false`, i.e. whether real `assert` bytecode throws.
+/// CratonVM has always implemented it — `assertion_status_default()` in
+/// `native-builtins` — but the only way to reach the switch was
+/// `CRATONVM_ENABLE_ASSERTIONS`, which no Maven Surefire or Gradle fork will
+/// ever set. Surefire forks the test JVM with `-ea` by default, so every
+/// `assert`-based validation test in the corpus silently did nothing. The
+/// recorded case is netty's HTTP/2 flow-controller classes, where HotSpot goes
+/// 34/34 with `-ea` and CratonVM stayed at 28/34 — see the retired
+/// `ea-flag-ignored-so-assert-never-fires-20260812` write-up.
+///
+/// **Why it is scanned here and not inside `normalize_java_launcher_argv`.**
+/// That function is pure and has ~60 unit tests; `CRATONVM_ENABLE_ASSERTIONS` is
+/// a declared flag served from the immutable snapshot `install_flags` latches at
+/// the top of `main`. A `set_var` from inside the normaliser would be invisible
+/// to the VM (the snapshot is already taken by the time `run()` normalises) and
+/// would make those tests order-dependent. Injecting a launcher override is the
+/// supported route and the one `--nojit` and `--dump-phase-report` already use.
+///
+/// **The two scopes are tracked separately, then OR-ed.** HotSpot's `-ea` and
+/// `-esa` are independent switches (user classes vs. bootclasspath classes);
+/// CratonVM has one global. Reducing the command line by plain last-wins would
+/// make `-ea -dsa` resolve to *off* and quietly undo the `-ea` a build tool put
+/// there on purpose. Last-wins **within** each scope and OR **across** them
+/// keeps every combination that asks for assertions anywhere answering "on".
+/// The residual over-breadth is a lone `-esa`, which turns them on for user
+/// classes too; that is the direction that fails loudly rather than silently.
+///
+/// Scoped forms are skipped entirely — see the comment on the strip arm in
+/// `normalize_java_launcher_argv`.
+fn launcher_assertions_requested(argv: &[String]) -> Option<bool> {
+    let mut user: Option<bool> = None;
+    let mut system: Option<bool> = None;
+    for arg in argv.iter().take_while(|arg| arg.as_str() != "--") {
+        if let Some((is_system, enable)) = assertion_flag_scope(arg) {
+            if is_system {
+                system = Some(enable);
+            } else {
+                user = Some(enable);
+            }
+        }
+    }
+    match (user, system) {
+        (None, None) => None,
+        (u, s) => Some(u.unwrap_or(false) || s.unwrap_or(false)),
+    }
 }
 
 /// The `--dump-phase-report <FILE>` path, scanned out of the launcher portion
@@ -5286,7 +5372,22 @@ fn main() {
             flag_overrides = flag_overrides.with(phase::FLAG_ENABLE, "coarse");
         }
     }
-    let runtime_flags = cratonvm_types::VmFlags::from_env_with_overrides(flag_overrides);
+    // `-ea` / `-da` / `-esa` / `-dsa`: the HotSpot spelling of
+    // `CRATONVM_ENABLE_ASSERTIONS`, applied here for the same reason as the two
+    // overrides above — the flag is declared, so the snapshot latched three
+    // lines below is the last point at which it can be set at all.
+    let mut flag_unsets: Vec<&str> = Vec::new();
+    match launcher_assertions_requested(&early_argv) {
+        Some(true) => flag_overrides = flag_overrides.with("CRATONVM_ENABLE_ASSERTIONS", "1"),
+        // `-da` has to make the name *absent*, not set it to "0": the flag is
+        // parsed with `present`, under which `=0` still reads as enabled. An
+        // explicit `-da` therefore also overrides an inherited export, which is
+        // what HotSpot does.
+        Some(false) => flag_unsets.push("CRATONVM_ENABLE_ASSERTIONS"),
+        None => {}
+    }
+    let runtime_flags =
+        cratonvm_types::VmFlags::from_env_with_overrides_and_unsets(flag_overrides, &flag_unsets);
     if cratonvm_types::install_flags(runtime_flags).is_err() {
         eprintln!("[cratonvm] runtime flags were read before launcher configuration");
         std::process::exit(1);
@@ -6848,6 +6949,128 @@ mod tests {
         let expanded = expand_aggregate_jars(vec![missing.clone()]);
         assert_eq!(expanded, vec![missing]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Assertion flags: `-ea` and friends.
+    //
+    // Two halves that must both hold. `normalize_java_launcher_argv` still
+    // *strips* every spelling (clap cannot parse them), and
+    // `launcher_assertions_requested` reads the same argv for the switch. A
+    // test that only checked the strip would pass with the switch deleted,
+    // which is exactly the state this fixed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assertion_flags_are_stripped_before_clap() {
+        for flag in [
+            "-ea",
+            "-da",
+            "-esa",
+            "-dsa",
+            "-enableassertions",
+            "-disableassertions",
+            "-enablesystemassertions",
+            "-disablesystemassertions",
+            "-ea:io.netty...",
+            "-da:some.Class",
+        ] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "Main"]), "flag {flag} survived the strip");
+        }
+    }
+
+    #[test]
+    fn unscoped_ea_enables_and_da_disables() {
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-enableassertions", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-disableassertions", "Main"])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn no_assertion_flag_leaves_the_env_var_in_charge() {
+        // `None`, not `Some(false)`: a plain command line must not clear an
+        // inherited CRATONVM_ENABLE_ASSERTIONS.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-Xmx1g", "Main"])),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_assertion_flags_are_not_honoured() {
+        // One global switch has no per-package granularity, so `-ea:io.netty`
+        // must NOT read as global-enable — that would turn assertions on for
+        // every class the caller deliberately left out.
+        for flag in ["-ea:io.netty...", "-da:io.netty.Foo", "-ea:com.example"] {
+            assert_eq!(
+                launcher_assertions_requested(&argv(&["java", flag, "Main"])),
+                None,
+                "scoped flag {flag} was honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn last_wins_within_a_scope() {
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "-da", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "-ea", "Main"])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_flag_never_cancels_a_user_scope_enable() {
+        // HotSpot's `-ea -dsa` is "user assertions on, system assertions off".
+        // Collapsed onto one global switch that has to stay ON, or the `-dsa`
+        // silently undoes the `-ea` Surefire put there.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "-dsa", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-esa", "-da", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-dsa", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-esa", "Main"])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn an_ea_after_the_program_args_separator_is_the_programs_own() {
+        // `java -jar app.jar -- -ea` passes `-ea` to the application; scanning
+        // past `--` would let a program argument reconfigure the VM.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "Main", "--", "-ea"])),
+            None
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "Main", "--", "-ea"])),
+            Some(false)
+        );
     }
 
     // -----------------------------------------------------------------------

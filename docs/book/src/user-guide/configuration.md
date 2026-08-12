@@ -69,7 +69,7 @@ implementations are experimental opt-ins.
 | Variable | Effect |
 |----------|--------|
 | `CRATONVM_EAGER_STREAMS` | Opt **out** of the lazy/short-circuiting `java.util.stream` pipeline back to the legacy eager one. Lazy mode is the default and matches HotSpot (intermediate ops defer; short-circuit terminals stop early). |
-| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements. Set for you by an unscoped `-ea` on the command line; setting it directly is only needed for a launcher that cannot pass VM flags. |
 
 ## Security & sandboxing
 

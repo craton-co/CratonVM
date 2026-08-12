@@ -39,7 +39,7 @@ a knob with an on/off sense.
 | `CRATONVM_JAVA_HOME` | JDK to boot from; overrides `JAVA_HOME` for the boot probe. |
 | `CRATONVM_BIN` | Path to the `cratonvm` binary, for harnesses that re-exec it. |
 | `CRATONVM_MAVEN_REPO_LOCAL` | Local Maven repository root. |
-| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements. Set for you by an unscoped `-ea` on the command line; setting it directly is only needed for a launcher that cannot pass VM flags. |
 | `CRATONVM_DISABLE_JIT` | Interpreter-only execution. Also set by `--nojit`. |
 
 ## Legacy names
