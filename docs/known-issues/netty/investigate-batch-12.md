@@ -56,7 +56,7 @@ HotSpot either, so "green" was never the target for them.
 | `AutoScalingEventExecutorChooserFactoryTest` | **1 FAIL** | 7/7 | 7/7 | CratonVM better than the oracle |
 | `DefaultPromiseTest` | 20/20 | 18/20 | **20/20** | tier-dependent SOE depth (**fixed**) |
 | `DefaultThreadFactoryTest` | 3 ok, **2 aborted** | 1 fail | 1 fail | accepted divergence — see below |
-| `FastThreadLocalTest` | 13 ok, 3 skipped | HANG | HANG | JIT ctor-elision **fixed**; throughput wall remains |
+| `FastThreadLocalTest` | 13 ok, 3 skipped | HANG | HANG | ctor-elision **fixed**; 2.1e9-iteration throughput wall — [own page](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md) |
 | `NonStickyEventExecutorGroupTest` | 10/10 | 10/10 | 10/10 | flaky under host load only |
 | `PromiseAggregatorTest` | 6/6 | 2/6 | **6/6** | `StackWalker$Option` (fixed) |
 | `PromiseCombinerTest` | 12/12 | 2/12 | **12/12** | `StackWalker$Option` (fixed) |
@@ -123,7 +123,12 @@ HotSpot either, so "green" was never the target for them.
    counter now advances correctly (1 000 000 of 1 000 000 constructor calls,
    was 11 000). **The class still times out**, exactly as predicted below — its
    loop is ~2.1 billion iterations by construction, so what is left is a
-   throughput item, not a correctness one. Full write-up in
+   throughput item, not a correctness one. **Sized and written up in
+   [fastthreadlocal-2e9-iteration-throughput-wall-20260812.md](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)**:
+   measured against HotSpot, CratonVM needs 2 508 s for the loop, and even its
+   *components* need 410 s (allocation) and 534 s (atomics) alone — both already
+   over the 180 s wall — so no targeted fix closes it. A 3000 s ground-truth run
+   still does not finish. Full JIT write-up in
    [jit-elided-constructor-side-effects-20260812.md](jit-elided-constructor-side-effects-20260812.md).
    `is_trivial_void_init` in `jit/src/x64/driver.rs` is computed from the
    constructor's *signature* alone, so any no-arg `()V` constructor is treated
