@@ -1546,53 +1546,32 @@ impl UnregMemo {
             self.hiwater = self.hiwater.max(search_lo);
         }
         let floor = self.floor(hiwater_on);
-        // A NEW COMPILATION DOES NOT INVALIDATE A CLEAN VERDICT.
-        //
-        // This used to `return UnregScan::Detect { hi: None }` — a full,
-        // unbounded rescan to `stack_high` — whenever `code_ranges` differed
-        // from the count at the last clean verdict, on the grounds that "a slot
-        // that held a plain value at the last scan can now sit where a new JIT
-        // code range claims to start". True, and irrelevant: such a slot is a
-        // FALSE positive, never a missed frame.
-        //
-        // The band this memo vouches for is `[floor, stack_high)`, which by the
-        // memo's own core invariant is FROZEN — nothing above the current stack
-        // pointer can change while this thread is nested below it. A genuine
-        // return address into code range R can only be written by a CALL into
-        // R, which requires R to have existed when the write happened. The band
-        // has not been written since it was verified clean, so a range
-        // registered after that verdict cannot have a real return address in
-        // it. (Range recycling is covered by the same argument: if a live JIT
-        // frame were in the band, its range was live at verification time and
-        // the probe would have found it then.)
-        //
-        // So the old check paid a full stack rescan to discover only false
-        // positives, and it paid it constantly: `code_ranges` is
-        // `jit_code_range_count()`, which rises on every compilation, so any
-        // workload that keeps compiling keeps the memo permanently cold.
-        // Measured on `DefaultCatalogAndSchemaTest` (132 SessionFactory
-        // bootstraps, so a JIT that never stops compiling):
-        // `native_stack_has_jit_frame` ran 1.14M times reading 35.2 BILLION
-        // stack words — an average of 31,000 words, i.e. ~248 KB of stack, per
-        // call — against 16 calls from the GC root scan and 16 from the
-        // safepoint path. All of it came from `deposit_root_snapshot_inner`.
-        //
-        // `verified_ranges` is still recorded, so
-        // `CRATONVM_DBG_UNREG_MEMO_AUDIT` can still report on it, but it no
-        // longer gates the verdict.
-        // Never verified anything: there is no band to be frozen, so scan the
-        // whole stack. Stated explicitly rather than falling out of
-        // `floor == usize::MAX` arithmetic, which reaches the same answer only
-        // because the call site clamps an out-of-range `hi` back to
-        // `stack_high`.
-        if self.verified_lo == usize::MAX {
-            return UnregScan::Detect { hi: None };
+        if code_ranges == self.verified_ranges {
+            if search_lo >= floor {
+                return UnregScan::AlreadyClean;
+            }
+            return UnregScan::Detect { hi: Some(floor) };
         }
-        if search_lo >= floor {
-            return UnregScan::AlreadyClean;
-        }
-        let _ = code_ranges;
-        UnregScan::Detect { hi: Some(floor) }
+        // A new compilation invalidates the verdict outright: a slot that held
+        // a plain value at the last scan can now sit where a new JIT code range
+        // claims to start.
+        //
+        // MEASURED 2026-08-11, and left alone deliberately. This rule can be
+        // argued away — the band is frozen (nothing above the current stack
+        // pointer changes while the thread is nested below it) and a genuine
+        // return address into range R requires R to have existed when the CALL
+        // wrote it, so a range registered after the verdict can only produce a
+        // FALSE positive. Removing the check was implemented, unit-tested and
+        // measured on `DefaultCatalogAndSchemaTest`, which compiles
+        // continuously across 132 SessionFactory bootstraps and so keeps this
+        // memo permanently cold: `native_stack_has_jit_frame` read 35.2 BILLION
+        // stack words with the check and 35.2 billion without it — byte for
+        // byte no change, because the probes that dominate this workload come
+        // from `refresh_moving_young_coverage_for_current_thread`, which
+        // consults no memo at all. So the rule is a real inefficiency and it is
+        // NOT the binding one; it stays until something measures it binding,
+        // rather than trading heap-safety-critical behaviour for nothing.
+        UnregScan::Detect { hi: None }
     }
 
     /// A scan starting at `search_lo` came back clean.
@@ -4419,41 +4398,17 @@ mod tests {
         }
     }
 
-    /// A new compilation does NOT invalidate a clean verdict.
+    /// A new compilation invalidates the verdict regardless of depth — a slot
+    /// that held a plain value can now sit inside a brand-new code range.
     ///
-    /// This test asserted the opposite until 2026-08-11, and the behaviour it
-    /// pinned was the single largest cost on `DefaultCatalogAndSchemaTest`:
-    /// `code_ranges` is `jit_code_range_count()`, which rises on every
-    /// compilation, so any workload that keeps compiling kept the memo
-    /// permanently cold — `native_stack_has_jit_frame` ran 1.14M times reading
-    /// 35.2 BILLION stack words, ~248 KB per call.
-    ///
-    /// The band the memo vouches for is FROZEN (nothing above the current stack
-    /// pointer changes while the thread is nested below it), and a genuine
-    /// return address into a code range can only be written by a CALL into that
-    /// range, which requires the range to have existed at write time. So a
-    /// range registered after the verdict cannot have a real return address in
-    /// the band — only a false positive, which costs an unnecessary non-moving
-    /// sweep, never a missed frame.
-    ///
-    /// The depth rule still applies: a DEEPER `search_lo` scans the new band,
-    /// exactly as it does when the count is unchanged.
+    /// The rule is conservative and was measured non-binding on 2026-08-11 —
+    /// see `UnregMemo::observe` for the numbers and why it stays anyway.
     #[test]
-    fn unreg_memo_new_code_range_does_not_invalidate_a_frozen_band() {
+    fn unreg_memo_new_code_range_forces_a_full_rescan() {
         let mut m = UnregMemo::new();
         m.mark_clean(1000, 3);
         assert_eq!(m.observe(1200, 3, true), UnregScan::AlreadyClean);
-        assert_eq!(
-            m.observe(1200, 4, true),
-            UnregScan::AlreadyClean,
-            "a new code range must not re-open a band nothing has written to",
-        );
-        // ...and going deeper still scans only the newly exposed band.
-        assert_eq!(
-            m.observe(900, 9, true),
-            UnregScan::Detect { hi: Some(1200) },
-            "a deeper stack pointer scans the new band, not the whole stack",
-        );
+        assert_eq!(m.observe(1200, 4, true), UnregScan::Detect { hi: None });
     }
 
     /// The throughput case the incremental path exists for must be unchanged:
