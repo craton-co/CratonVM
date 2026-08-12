@@ -52,7 +52,21 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "acos", "(D)D", native_math_acos);
     registry.register(class, "atan", "(D)D", native_math_atan);
     registry.register(class, "atan2", "(DD)D", native_math_atan2);
-    registry.register(class, "log", "(D)D", native_math_log);
+    // `log` is the one function in this block whose backing differs between
+    // the two classes. `Math.log` is allowed 1 ULP of error, so platform libm
+    // satisfies it; `StrictMath.log` is a bit-for-bit contract naming fdlibm,
+    // and platform libm does NOT satisfy that — measured on Temurin 25.0.3+9,
+    // `Math.log` and `StrictMath.log` return different bit patterns for 7.3%
+    // of uniform draws in (0,1). That gap was reaching users through
+    // `java.util.Random.nextGaussian()`, whose multiplier is
+    // `StrictMath.sqrt(-2 * StrictMath.log(s) / s)`: every seeded gaussian
+    // stream came out one ULP off HotSpot's. See
+    // W7-44-numberformat-enum-and-double-tostring.md.
+    if class == "java/lang/StrictMath" {
+        registry.register(class, "log", "(D)D", native_strict_math_log);
+    } else {
+        registry.register(class, "log", "(D)D", native_math_log);
+    }
     registry.register(class, "log10", "(D)D", native_math_log10);
     registry.register(class, "exp", "(D)D", native_math_exp);
     registry.register(class, "floor", "(D)D", native_math_floor);
@@ -1517,6 +1531,24 @@ pub(crate) fn native_math_log(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0.0,
     };
     Ok(Some(Value::Double(v.ln())))
+}
+
+/// `StrictMath.log(double)` — fdlibm, not platform libm.
+///
+/// Separate from `native_math_log` on purpose: `Math.log`'s contract is an
+/// accuracy bound (1 ULP, semi-monotonic) that libm meets, while
+/// `StrictMath.log`'s contract is "the fdlibm result, on every platform".
+/// Sharing one body made the strict class no stricter than the loose one.
+#[inline]
+pub(crate) fn native_strict_math_log(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let v = match args.first() {
+        Some(Value::Double(v)) => *v,
+        _ => 0.0,
+    };
+    Ok(Some(Value::Double(cratonvm_types::fdlibm::log(v))))
 }
 
 #[inline]

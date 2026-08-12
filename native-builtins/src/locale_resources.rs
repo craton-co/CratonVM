@@ -311,12 +311,14 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map_pin,
         map,
         "NumberPatterns",
-        &[
-            "#,##0.###",
-            "\u{00A4}#,##0.00;(\u{00A4}#,##0.00)",
-            "#,##0%",
-            "#E0",
-        ],
+        // Slot 1 must NOT carry a `;(¤#,##0.00)` negative subpattern: that is
+        // the CLDR *accounting* form, no locale uses it as the standard
+        // currency pattern, and its presence stops `DecimalFormat` prefixing a
+        // minus sign. Kept byte-identical to the `getNumberPatterns()` override
+        // below — this is the FormatData bundle copy of the same table, and the
+        // accounting pattern was wrong in both. Grep the pattern STRING, not
+        // the function name, before deciding a table like this has one home.
+        &["#,##0.###", "\u{00A4}#,##0.00", "#,##0%", "#E0"],
     );
     put_arr(
         ctx,
@@ -2130,6 +2132,33 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // (number / currency / percent / scientific).  Used by
     // `NumberFormat.getInstance` and friends.  Same root cause as above:
     // the JDK indexes 0..3 unconditionally — short arrays AIOOBE.
+    //
+    // Slot 1 (currency) used to read `¤#,##0.00;(¤#,##0.00)`. The `;` half is a
+    // NEGATIVE SUBPATTERN, and the parenthesised form it names is the CLDR
+    // *accounting* pattern, which no locale uses as its standard currency
+    // format. With it present, `DecimalFormat` never prefixes a minus sign, so
+    // `NumberFormat.getCurrencyInstance(Locale.US).format(-1234.5)` produced
+    // `($1,234.50)` where HotSpot gives `-$1,234.50`. Dropping the subpattern
+    // restores the JDK rule "negative prefix = minus sign + positive prefix".
+    //
+    // Measured rather than assumed (probes/NumberPatternCensusProbe.java on
+    // Temurin 25.0.3+9): of the 1158 installed locales, the parenthesised
+    // string matched **0**, so this was wrong for every locale, not just en-US
+    // — and the replacement `¤#,##0.00` is the exact CLDR value for **361** of
+    // them (the whole en family included) and the single most common form.
+    // The remaining 797 differ only in symbol PLACEMENT (`#,##0.00 ¤` for the
+    // de/fr/es family, 333 locales; `¤ #,##0.00`, 215) — a pre-existing
+    // en-shaped approximation this table shares with the hardcoded
+    // `getDecimalFormatSymbolsData` above, which likewise returns en's `.`/`,`
+    // separators for every locale. Making the pattern locale-aware WITHOUT
+    // making the symbols locale-aware would render a hybrid (`1,234.50 €`),
+    // which is further from HotSpot than the uniform en shape; the two must
+    // move together, and that is a larger change than this parity fix.
+    //
+    // Slot 0 is right for 1154/1158, slot 2 (percent) for 924/1158 (the 234
+    // misses are the `#,##0 %` no-break-space family — the same en/locale
+    // split), and slot 3 is not reachable from outside `java.text`, so it is
+    // uncounted. See W7-44-numberformat-enum-and-double-tostring.md.
     registry.register(
         "sun/util/locale/provider/LocaleResources",
         "getNumberPatterns",
@@ -2137,12 +2166,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let arr = make_string_array(
                 ctx,
-                &[
-                    "#,##0.###",
-                    "\u{00A4}#,##0.00;(\u{00A4}#,##0.00)",
-                    "#,##0%",
-                    "#E0",
-                ],
+                &["#,##0.###", "\u{00A4}#,##0.00", "#,##0%", "#E0"],
             );
             Ok(Some(Value::Object(Some(arr))))
         },

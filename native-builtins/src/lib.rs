@@ -14299,17 +14299,28 @@ pub fn register_essential_natives_with_shims(
     // every platform and VM — its spec mandates the fdlibm algorithms (the same
     // code the reference JDK ships) for sin/cos/tan/asin/acos/atan/atan2/exp/
     // log/log10/sqrt/cbrt/pow/sinh/cosh/tanh/hypot/expm1/log1p. CratonVM
-    // currently registers the SAME backing implementation for both `Math` and
+    // registers the SAME backing implementation for both `Math` and
     // `StrictMath` (lang_math::register_math_natives), which delegates the
     // transcendental functions to the host platform's libm. Platform libm is
     // NOT guaranteed to be fdlibm-equivalent (last-ULP results vary by OS / libc
     // / CPU), so StrictMath here can differ from HotSpot in the low bits and
-    // VIOLATES the StrictMath bit-reproducibility contract. This is a known,
-    // documented deviation: it does not affect memory safety and is acceptable
-    // for the app-gauntlet workloads (which do not rely on golden last-ULP
-    // StrictMath vectors), but a portable fdlibm-style implementation for the
-    // affected functions should replace the libm delegation in lang_math.rs
-    // before any StrictMath-bit-exact workload is supported. Tracked against the
+    // VIOLATES the StrictMath bit-reproducibility contract.
+    //
+    // PARTIALLY CLOSED 2026-08-12: `log` is now the fdlibm algorithm
+    // (`cratonvm_types::fdlibm::log`, a port of JDK 25's `FdLibm.Log.compute`),
+    // registered for `StrictMath` only — `Math.log`'s contract is a 1-ULP bound
+    // that libm meets. This was not a theoretical deviation: `Math.log` and
+    // `StrictMath.log` disagree on 7.3% of uniform draws in (0,1), and
+    // `java.util.Random.nextGaussian()` — whose multiplier is
+    // `StrictMath.sqrt(-2 * StrictMath.log(s) / s)` — was printing
+    // `1.141905315473055` where HotSpot prints `1.1419053154730547`.
+    // W7-44-numberformat-enum-and-double-tostring.md.
+    //
+    // Every OTHER function in that list is still libm and still violates the
+    // contract. It does not affect memory safety and is acceptable for the
+    // app-gauntlet workloads (which do not rely on golden last-ULP StrictMath
+    // vectors), but the same treatment is owed to them before any
+    // StrictMath-bit-exact workload is supported. Tracked against the
     // 2026-06-20 review finding `nb-lang / StrictMath delegates to platform libm`.
     lang_math::register_math_natives(registry, "java/lang/Math");
     lang_math::register_math_natives(registry, "java/lang/StrictMath");
@@ -16158,6 +16169,10 @@ pub fn register_essential_natives_with_shims(
             // Companion fix to `native_class_get_enum_constants`, which had the
             // same defect one call deeper.
             let mut scope = NativeHandleScope::new(ctx);
+            // The enum's own mirror is rooted for the same reason the array is:
+            // the refusal path below reads its canonical name AFTER the
+            // `name()` calls in the loop, any one of which can move it.
+            let enum_class_h = scope.root(enum_class);
             let constants_h = scope.root(constants);
             let constants_cur = scope.get(&constants_h);
             let len = scope.array_length(constants_cur);
@@ -16179,10 +16194,19 @@ pub fn register_essential_natives_with_shims(
                     return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
-            Err(RuntimeError::IllegalArgumentException {
-                message: format!("No enum constant {}", wanted),
-            }
-            .into())
+            // HotSpot: `"No enum constant " + enumType.getCanonicalName() + "."
+            // + name`. This used to omit the type entirely (`No enum constant
+            // MAUVE`), which is both a divergence and a message that never
+            // names the enum that refused. `enum_class` is the mirror this
+            // native was handed, so the type is always in hand here — no call
+            // site has to guess.
+            let enum_class_cur = scope.get(&enum_class_h);
+            let message = lang_class::no_enum_constant_message_for_mirror(
+                &mut *scope,
+                enum_class_cur,
+                &wanted,
+            );
+            Err(RuntimeError::IllegalArgumentException { message }.into())
         },
     );
     // Spring Boot 2 launcher: avoid ctor-side ClassCastException in

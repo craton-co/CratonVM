@@ -18668,6 +18668,61 @@ pub(crate) fn native_class_get_canonical_name(
     Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
 }
 
+/// The exact refusal text `java.lang.Enum.valueOf` builds for a name that is
+/// not a constant of the enum:
+///
+/// ```text
+/// "No enum constant " + enumType.getCanonicalName() + "." + name
+/// ```
+///
+/// Two things about that expression are easy to get wrong and were:
+///
+/// * The type must be present at all. `Enum.valueOf` here used to raise a bare
+///   `No enum constant MAUVE`, which tells a reader nothing about WHICH enum
+///   refused and does not match HotSpot.
+/// * It is `getCanonicalName()`, not `getName()`. For a nested enum the
+///   canonical name uses DOTS — `ShadowDifferentialProbe.Color` — so building
+///   the message from the binary name yields `ShadowDifferentialProbe$Color`,
+///   which is a different divergence rather than a fix.
+///
+/// Five sites in this crate raise this message (`Enum.valueOf` plus the
+/// synthetic `java.time.Month` / `java.time.DayOfWeek` /
+/// `java.time.temporal.ChronoUnit` / `java.math.RoundingMode` `valueOf`
+/// bodies). They go through this one function so the shape cannot drift
+/// between them — three per-site patches of one idiom is the recurring waste
+/// this codebase keeps paying. See
+/// W7-44-numberformat-enum-and-double-tostring.md.
+pub(crate) fn no_enum_constant_message(canonical_type_name: &str, constant: &str) -> String {
+    format!("No enum constant {canonical_type_name}.{constant}")
+}
+
+/// [`no_enum_constant_message`], resolving the type name from the enum's
+/// `Class` mirror the way `Enum.valueOf` does.
+///
+/// A local or anonymous enum has NO canonical name (JLS 6.7), and
+/// `Class.getCanonicalName()` returns Java `null` there. The JDK concatenates
+/// that null straight into the message, producing a literal `"null."` prefix;
+/// this reproduces that rather than silently substituting the binary name,
+/// because the point of the message is to match HotSpot exactly.
+pub(crate) fn no_enum_constant_message_for_mirror(
+    ctx: &mut dyn NativeContext,
+    enum_mirror: ObjectRef,
+    constant: &str,
+) -> String {
+    // Bound to a `let` before the match on purpose: a `&mut ctx` reborrow left
+    // in a match SCRUTINEE stays alive for the whole match, and the arm below
+    // needs `ctx` again for `read_string`.
+    let resolved = native_class_get_canonical_name(ctx, &[Value::Object(Some(enum_mirror))]);
+    let canonical: String = match resolved {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "null".into()),
+        // `getCanonicalName()` returned Java null (local / anonymous enum), or
+        // the mirror was not a class at all. Either way the JDK's string
+        // concatenation renders it "null".
+        _ => "null".to_string(),
+    };
+    no_enum_constant_message(&canonical, constant)
+}
+
 pub(crate) fn native_class_get_type_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -22220,6 +22275,71 @@ mod tests {
         assert_eq!(ctx.read_string(obj).unwrap(), "Local");
         let r = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Enum.valueOf refusal message
+    // -----------------------------------------------------------------------
+
+    /// The exact HotSpot text, including the dot before the constant.
+    #[test]
+    fn no_enum_constant_message_names_the_type() {
+        assert_eq!(
+            super::no_enum_constant_message("java.math.RoundingMode", "SIDEWAYS"),
+            "No enum constant java.math.RoundingMode.SIDEWAYS"
+        );
+    }
+
+    /// A NESTED enum must appear with a DOT, not the binary `$`. This is the
+    /// case the differential probe exercises (`ShadowDifferentialProbe.Color`);
+    /// building the message from `getName()` would emit
+    /// `ShadowDifferentialProbe$Color.MAUVE`, which is a different divergence
+    /// rather than a fix. Driven through the mirror path so it also covers
+    /// `native_class_get_canonical_name`'s `$` -> `.` rewrite.
+    #[test]
+    fn no_enum_constant_message_uses_dots_for_a_nested_enum() {
+        let mut ctx = mock_ctx();
+        // `CANONICAL_CLASS_NAME_CACHE` is keyed on (vm_identity, class_id) and
+        // every untouched mock reports identity 0, so tests that mint class ids
+        // independently share one cache. Take a private identity rather than
+        // race the rest of the module for id space.
+        ctx.set_vm_identity(0x7744_0001);
+        let cid = ctx
+            .ensure_class_initialized("ShadowDifferentialProbe$Color")
+            .unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "ShadowDifferentialProbe$Color".to_string(),
+                "ShadowDifferentialProbe".to_string(),
+                "Color".to_string(),
+                0,
+            )],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "ShadowDifferentialProbe$Color");
+        assert_eq!(
+            super::no_enum_constant_message_for_mirror(&mut ctx, mirror, "MAUVE"),
+            "No enum constant ShadowDifferentialProbe.Color.MAUVE"
+        );
+    }
+
+    /// A local or anonymous enum has no canonical name; the JDK concatenates
+    /// the resulting null into the message verbatim. Reproduced rather than
+    /// papered over, because the point of the message is HotSpot parity.
+    #[test]
+    fn no_enum_constant_message_renders_a_null_canonical_name_as_null() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x7744_0002);
+        let cid = ctx.ensure_class_initialized("RReflect$2").unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![("RReflect$2".to_string(), String::new(), String::new(), 0)],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "RReflect$2");
+        assert_eq!(
+            super::no_enum_constant_message_for_mirror(&mut ctx, mirror, "X"),
+            "No enum constant null.X"
+        );
     }
 
     // -----------------------------------------------------------------------
