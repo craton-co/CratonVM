@@ -36363,6 +36363,87 @@ pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
     hmac_generic(key, data, real_md5, 64)
 }
 
+// --- The MAC names `mac_algorithm_supported` used to refuse -----------------
+//
+// `phases_late::ssl_security` deliberately served only the five HMACs above and
+// refused every other name, because a MAC computed under the wrong algorithm is
+// worse than a missing one. The reason the refusal stopped there rather than
+// widening was stated in that module: "each needs its own HMAC block size … and
+// this lane could neither build nor run".
+//
+// Those block sizes are RFC 2104's rule applied to each hash's own internal
+// block size, and they are not guessable: SHA-224 is a SHA-256 variant so it
+// keeps 64, but the SHA-512 truncations keep SHA-512's 128, and the SHA-3
+// family's block size IS its sponge RATE — 144/136/104/72 for 224/256/384/512,
+// which SHRINKS as the digest grows. Every function below is checked against
+// HotSpot `Mac.getInstance(name)` output in `hmac_extended_matches_hotspot`.
+//
+// `compute_digest` already implements all seven digests, so these route through
+// it rather than adding a second implementation of any hash.
+
+fn digest_sha224(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA-224", data).unwrap_or_default()
+}
+
+fn digest_sha512_224(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA-512/224", data).unwrap_or_default()
+}
+
+fn digest_sha512_256(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA-512/256", data).unwrap_or_default()
+}
+
+fn digest_sha3_224(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA3-224", data).unwrap_or_default()
+}
+
+fn digest_sha3_256(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA3-256", data).unwrap_or_default()
+}
+
+fn digest_sha3_384(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA3-384", data).unwrap_or_default()
+}
+
+fn digest_sha3_512(data: &[u8]) -> Vec<u8> {
+    compute_digest("SHA3-512", data).unwrap_or_default()
+}
+
+/// HMAC-SHA-224 — SHA-224 is SHA-256's truncation and shares its 64-byte block.
+pub(crate) fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha224, 64)
+}
+
+/// HMAC-SHA-512/224 — a SHA-512 variant, so the block stays 128 (NOT 64).
+pub(crate) fn hmac_sha512_224(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha512_224, 128)
+}
+
+/// HMAC-SHA-512/256 — a SHA-512 variant, so the block stays 128 (NOT 64).
+pub(crate) fn hmac_sha512_256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha512_256, 128)
+}
+
+/// HMAC-SHA3-224 — SHA-3 block size is the sponge rate: 1600−2·224 bits = 144 B.
+pub(crate) fn hmac_sha3_224(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha3_224, 144)
+}
+
+/// HMAC-SHA3-256 — rate = 1600−2·256 bits = 136 bytes.
+pub(crate) fn hmac_sha3_256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha3_256, 136)
+}
+
+/// HMAC-SHA3-384 — rate = 1600−2·384 bits = 104 bytes.
+pub(crate) fn hmac_sha3_384(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha3_384, 104)
+}
+
+/// HMAC-SHA3-512 — rate = 1600−2·512 bits = 72 bytes.
+pub(crate) fn hmac_sha3_512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_generic(key, data, digest_sha3_512, 72)
+}
+
 fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,

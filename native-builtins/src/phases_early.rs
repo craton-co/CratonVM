@@ -14658,6 +14658,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
             pbkdf2_generate_secret,
         );
+        // The two accessors the real body cannot serve on a synthetic: both
+        // read instance fields no constructor ever wrote, and `getProvider()`
+        // additionally synchronizes on a null `lock`. See `skf_algo_table`.
+        r.register(skf, "getAlgorithm", "()Ljava/lang/String;", pbkdf2_get_algorithm);
+        r.register(
+            skf,
+            "getProvider",
+            "()Ljava/security/Provider;",
+            pbkdf2_get_provider,
+        );
     }
     // getAlgorithm() -> String
     r.register(
@@ -15833,6 +15843,7 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             // recycled hash and derive a WRONG key).
             let key = pbkdf2_key_for(ctx, obj);
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         // PKCS#5 v1.5 / PKCS#12 PBE family (`PBEWithMD5AndDES`, …). SunJCE's
@@ -15847,7 +15858,8 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         {
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
             let key = pbkdf2_key_for(ctx, obj);
-            pbe_algo_table().lock().unwrap().insert(key, alg);
+            pbe_algo_table().lock().unwrap().insert(key, alg.clone());
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         None => Err(RuntimeError::SecurityException {
@@ -15855,6 +15867,61 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         .into()),
     }
+}
+
+/// The algorithm name every successful `SecretKeyFactory.getInstance` was asked
+/// for, keyed by the same GC-stable identity `pbkdf2_prf_table` uses.
+///
+/// `getAlgorithm()` and `getProvider()` need it, and they cannot read it off the
+/// object: the synthetic is a REAL `javax.crypto.SecretKeyFactory` whose
+/// constructor never ran, so `algorithm` is null and — the part that actually
+/// breaks — `lock` is null too. `getProvider()` opens with `synchronized
+/// (lock)`, so calling it on a perfectly working factory threw
+/// `NullPointerException: Cannot enter synchronized block because "this.lock" is
+/// null`. That is the same species as the `Mac` overloads in
+/// `phases_late::ssl_security`: any method left to the real body reads
+/// uninitialised instance state, and fails in a way that looks nothing like
+/// "this class is synthetic".
+fn skf_algo_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `SecretKeyFactory.getAlgorithm()` — the name `getInstance` was called with.
+pub(crate) fn pbkdf2_get_algorithm(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = pbkdf2_key_for(ctx, this);
+    let algo = skf_algo_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
+}
+
+/// `SecretKeyFactory.getProvider()` — SunJCE, which is where HotSpot resolves
+/// every `PBKDF2With*` and `PBEWith*` factory.
+pub(crate) fn pbkdf2_get_provider(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
+    let name = ctx.create_string("SunJCE");
+    let info = ctx.create_string("SunJCE provider (cratonvm)");
+    let ver_str = ctx.create_string("25");
+    ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
+    ctx.set_field_by_name(p, "version", Value::Double(25.0));
+    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
+    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
+    ctx.set_field(p, 0, Value::Object(Some(name)));
+    ctx.set_field(p, 1, Value::Double(25.0));
+    ctx.set_field(p, 2, Value::Object(Some(info)));
+    Ok(Some(Value::Object(Some(p))))
 }
 
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.

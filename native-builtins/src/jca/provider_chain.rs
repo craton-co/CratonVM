@@ -1270,9 +1270,27 @@ fn seed_retired_getalgorithms_literals() {
     for (algorithm, class_name) in [
         ("HmacMD5", "com.sun.crypto.provider.HmacMD5"),
         ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1"),
+        ("HmacSHA224", "com.sun.crypto.provider.HmacCore$HmacSHA224"),
         ("HmacSHA256", "com.sun.crypto.provider.HmacCore$HmacSHA256"),
         ("HmacSHA384", "com.sun.crypto.provider.HmacCore$HmacSHA384"),
         ("HmacSHA512", "com.sun.crypto.provider.HmacCore$HmacSHA512"),
+        // The two FIPS 180-4 §5.3.6 truncations and the SHA-3 family. Added
+        // alongside the matching `mac_compute_hmac` arms, never ahead of them:
+        // this list and `phases_late::ssl_security::mac_algorithm_supported`
+        // must answer the same set, which
+        // `mac_supported_set_matches_the_advertised_sunjce_services` asserts.
+        (
+            "HmacSHA512/224",
+            "com.sun.crypto.provider.HmacCore$HmacSHA512_224",
+        ),
+        (
+            "HmacSHA512/256",
+            "com.sun.crypto.provider.HmacCore$HmacSHA512_256",
+        ),
+        ("HmacSHA3-224", "com.sun.crypto.provider.HmacCore$HmacSHA3_224"),
+        ("HmacSHA3-256", "com.sun.crypto.provider.HmacCore$HmacSHA3_256"),
+        ("HmacSHA3-384", "com.sun.crypto.provider.HmacCore$HmacSHA3_384"),
+        ("HmacSHA3-512", "com.sun.crypto.provider.HmacCore$HmacSHA3_512"),
     ] {
         put_service(JCE, "Mac", algorithm, class_name);
     }

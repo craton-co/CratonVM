@@ -2380,6 +2380,35 @@ extern "C" fn jni_pop_local_frame(_env: JNIEnv, result: JObject) -> JObject {
     pop_local_frame(result)
 }
 
+/// Is this handle one of the raw `ClassId`s that `FindClass`/`GetObjectClass`
+/// hand out as a `jclass`, rather than an object handle?
+///
+/// The table has TWO handle conventions and `jclass` uses the one that is not a
+/// pointer: `FindClass` returns `class_id.as_u32() as JClass`, and
+/// `GetSuperclass`, `GetFieldID`, `RegisterNatives` and a dozen others decode it
+/// with `ClassId::new(clazz as u32)`. Nothing about the value distinguishes it
+/// from an object handle by inspection, so this is only ever consulted AFTER
+/// `jobject_to_obj` has already declined the handle — a live object always wins.
+///
+/// A confirmed class id is then its own permanent reference: classes are never
+/// unloaded here, so "a global ref to a class" is just the class id again. That
+/// identity is what makes the round trip work, because native code stores the
+/// RESULT and later passes it back as a `jclass` to `GetMethodID`/`NewObject`.
+fn jclass_id_handle(h: JObject) -> bool {
+    if h == 0 || h > u32::MAX as JObject {
+        return false;
+    }
+    with_shared_vm(|shared| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(ClassId::new(h as u32))
+            .is_some()
+    })
+    .unwrap_or(false)
+}
+
 // ---- Index 22: NewGlobalRef ----
 extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
@@ -2388,7 +2417,23 @@ extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     // Resolve the object whether it's a local ref or another global ref.
     let oref = match jobject_to_obj(obj) {
         Some(r) => r,
-        None => return 0,
+        None => {
+            // `NewGlobalRef(FindClass(env, "..."))` is the first thing almost
+            // every `JNI_OnLoad` does, and a `jclass` here is a raw `ClassId`,
+            // not an object handle — so this returned 0 and the library
+            // concluded the JVM had no `java.lang.Object`. Measured on JNA
+            // 5.13.0: `libjnidispatch`'s init prints `JNA: Problems loading
+            // core IDs: java.lang.Object`, gives up caching `classString` /
+            // `MID_String_init`, and every later `jstring` it builds is NULL —
+            // surfacing as `Native.<clinit>` throwing
+            // `NullPointerException: Cannot invoke "String.split(String)"
+            // because "nativeVersion" is null`, which reads like a missing JNA
+            // feature and is in fact a dead JNI primitive.
+            if jclass_id_handle(obj) {
+                return obj;
+            }
+            return 0;
+        }
     };
     with_shared_vm(|shared| {
         let handle = shared.natives.jni_global_refs.lock().add(oref);
@@ -2405,6 +2450,12 @@ extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
 extern "C" fn jni_delete_global_ref(_env: JNIEnv, gref: JObject) {
     if gref == 0 || gref & 1 == 0 {
         return; // not a global ref handle
+    }
+    // An odd-valued `ClassId` handed back from `NewGlobalRef` above looks like a
+    // global-ref handle by the bit-0 test. Deleting it must be a no-op — the
+    // class outlives every ref to it — and must not disturb the ref table.
+    if jclass_id_handle(gref) {
+        return;
     }
     with_shared_vm(|shared| {
         shared.natives.jni_global_refs.lock().remove(gref);
@@ -4792,6 +4843,12 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
         return 0;
     }
+    // Same `jclass`-is-a-ClassId round trip as `NewGlobalRef` — and this is the
+    // overload JNA's `LOAD_CREF` actually calls, so it is the one that decided
+    // whether `com.sun.jna.Native` could initialise at all.
+    if jclass_id_handle(obj) && jobject_to_obj(obj).is_none() {
+        return obj;
+    }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let mut refs = shared.natives.jni_global_refs.lock();
@@ -4804,6 +4861,10 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
 // ---- Index 227: DeleteWeakGlobalRef ----
 extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
     if wref == 0 {
+        return;
+    }
+    // A class handle is permanent; dropping it is a no-op (see DeleteGlobalRef).
+    if jclass_id_handle(wref) {
         return;
     }
     with_shared_vm(|shared| {

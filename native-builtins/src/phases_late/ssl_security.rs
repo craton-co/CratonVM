@@ -67,6 +67,51 @@ pub(crate) fn mac_read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -
     bytes
 }
 
+/// A genuine, CHECKED `javax.crypto.ShortBufferException` for the output-buffer
+/// overload of `doFinal`.
+///
+/// `ShortBufferException extends GeneralSecurityException`, so it is checked and
+/// a caller's `catch (ShortBufferException)` — or `catch
+/// (GeneralSecurityException)` — only matches a real instance. A
+/// `RuntimeError::IllegalArgumentException` here would be unchecked and would
+/// sail straight past that handler, which is the mistake `md_get_instance` and
+/// `mac_no_such_algorithm` both record having made once already.
+fn mac_short_buffer(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/crypto/ShortBufferException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalArgumentException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
+/// A `java.security.Provider` object naming `SunJCE` — the provider these HMACs
+/// are advertised under by
+/// `jca::provider_chain::seed_retired_getalgorithms_literals`, so
+/// `Mac.getProvider().getName()` agrees with `Security.getProviders()` instead
+/// of contradicting it. Mirrors `jca::message_digest::md_get_provider`, which
+/// does the same for `SUN`.
+fn jce_provider_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
+    let name = ctx.create_string("SunJCE");
+    let info = ctx.create_string("SunJCE provider (cratonvm)");
+    let ver_str = ctx.create_string("25");
+    ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
+    ctx.set_field_by_name(p, "version", Value::Double(25.0));
+    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
+    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
+    ctx.set_field(p, 0, Value::Object(Some(name)));
+    ctx.set_field(p, 1, Value::Double(25.0));
+    ctx.set_field(p, 2, Value::Object(Some(info)));
+    Ok(p)
+}
+
 /// Helper: extract the key bytes from a Key object (field 0 = encoded byte[])
 pub(crate) fn mac_extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec<u8> {
     match ctx.get_field(key_obj, 0) {
@@ -434,6 +479,163 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         ctx.write_byte_array_from(arr, 0, &hmac_result);
         Ok(Some(Value::Object(Some(arr))))
     });
+    // doFinal([BI)V — compute the MAC into the caller's buffer at `outOffset`.
+    //
+    // THIS OVERLOAD WAS MISSING, and its absence is what broke every
+    // SCRAM-SHA-256 login on this VM (hibernate-reactive / Vert.x reactive
+    // Postgres: `FATAL: expected SASL response, got message type 88`, where 88
+    // is 'X' — the client giving up and sending Terminate).
+    //
+    // The failure mode is the trap this whole module is exposed to: `Mac` is
+    // served by natives that keep their state OFF-OBJECT in `mac_state_table`,
+    // so the real `javax.crypto.Mac` instance fields — `initialized`, `spi`,
+    // `provider` — are never written. Any overload left unregistered therefore
+    // runs the REAL JDK body, reads `initialized == false`, and throws
+    // `IllegalStateException("MAC not initialized")` on a Mac that this engine
+    // considers perfectly initialized. It is not a missing feature that reads
+    // as missing: `init`, `update` and `doFinal()` all work, so the object
+    // looks healthy right up to the one call that doesn't.
+    //
+    // `com.ongres.scram.common.CryptoUtil.hi` (the PBKDF2 inside SCRAM, used by
+    // BOTH the Vert.x and pgjdbc SCRAM clients) does exactly
+    // `update(byte[]); doFinal(byte[], 0)` in its iteration loop, so it hit this
+    // on iteration 2 of 4096 — after `doFinal()` had already succeeded once.
+    r.register(mac, "doFinal", "([BI)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let id = ctx.identity_hash_code(this);
+        let out = match args.get(1) {
+            Some(Value::Object(Some(arr))) => *arr,
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("Cannot store MAC in output buffer".to_string()),
+                }
+                .into());
+            }
+        };
+        let out_offset = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let out_len = ctx.array_length(out) as i64;
+        let hmac_result = {
+            let mut t = mac_state_table().lock().unwrap();
+            let st = match t.get_mut(&id) {
+                Some(st) => st,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "MAC not initialized".into(),
+                    }
+                    .into());
+                }
+            };
+            if !(st.initialized || !st.key.is_empty()) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "MAC not initialized".into(),
+                }
+                .into());
+            }
+            // The JDK checks the output buffer AFTER the initialized check and
+            // BEFORE consuming the accumulator, and a ShortBufferException
+            // leaves the Mac's buffered data intact — so this must not
+            // `mem::take` before the size test.
+            let mac_len = match mac_output_length(&st.algo) {
+                Some(n) => n as i64,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!("MAC algorithm unavailable: {}", st.algo),
+                    }
+                    .into());
+                }
+            };
+            if out_offset < 0 || out_len - (out_offset as i64) < mac_len {
+                // Real, checked `javax.crypto.ShortBufferException` — a
+                // `RuntimeError` variant would be unchecked and would sail past
+                // the caller's `catch (ShortBufferException)`.
+                return Err(mac_short_buffer(ctx, "Cannot store MAC in output buffer"));
+            }
+            // mem::take resets the accumulator (keeps Mac initialized for reuse).
+            let data = std::mem::take(&mut st.data);
+            match mac_compute_hmac(&st.algo, &st.key, &data) {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!("MAC algorithm unavailable: {}", st.algo),
+                    }
+                    .into());
+                }
+            }
+        };
+        ctx.write_byte_array_from(out, out_offset as usize, &hmac_result);
+        Ok(None)
+    });
+    // init(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V —
+    // same reason as `doFinal([BI)V`: leaving it to the real body means a
+    // null `spi`/`lock`, not a working two-argument init. No HMAC algorithm
+    // this module serves takes parameters, so the spec is accepted and
+    // ignored exactly as `HmacCore.engineInit` does for a null spec.
+    r.register(
+        mac,
+        "init",
+        "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key_bytes = match args.get(1) {
+                Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
+                _ => Vec::new(),
+            };
+            let id = ctx.identity_hash_code(this);
+            let mut t = mac_state_table().lock().unwrap();
+            let st = t.entry(id).or_default();
+            mac_zeroize(&mut st.key);
+            st.key = key_bytes;
+            st.initialized = true;
+            st.data.clear();
+            Ok(None)
+        },
+    );
+    // update(Ljava/nio/ByteBuffer;)V — consume the buffer's remaining bytes and
+    // leave its position at the limit, which is what the JDK contract says and
+    // what `Mac.update(ByteBuffer)` callers rely on. Draining through the
+    // buffer's own `get(byte[])` keeps heap and DIRECT buffers on the same
+    // path; reading `hb` directly would silently no-op on a direct buffer.
+    r.register(mac, "update", "(Ljava/nio/ByteBuffer;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let Some(Value::Object(Some(buf))) = args.get(1).cloned() else {
+            // JDK: a null ByteBuffer is a silent no-op (`if (input == null) …`).
+            return Ok(None);
+        };
+        let remaining = match ctx.invoke_virtual(buf, "remaining", "()I", &[]) {
+            Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+            _ => return Ok(None),
+        };
+        let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, remaining);
+        let pin = ctx.pin_native_root(tmp);
+        let drained = ctx.invoke_virtual(
+            buf,
+            "get",
+            "([B)Ljava/nio/ByteBuffer;",
+            &[Value::Object(Some(tmp))],
+        );
+        ctx.unpin_native_roots(pin);
+        drained?;
+        let bytes = mac_read_byte_array(ctx, tmp);
+        let id = ctx.identity_hash_code(this);
+        mac_state_table()
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .data
+            .extend_from_slice(&bytes);
+        Ok(None)
+    });
+    // getProvider()Ljava/security/Provider; — the real body is
+    // `chooseFirstProvider(); return provider;`, and `chooseFirstProvider`
+    // opens with `synchronized (lock)` on a field this synthetic never wrote:
+    // `NullPointerException: Cannot enter synchronized block because
+    // "this.lock" is null`. Answer with the provider these HMACs actually
+    // come from, which is what `Security.getProviders()` advertises them under.
+    r.register(mac, "getProvider", "()Ljava/security/Provider;", |ctx, args| {
+        let _this = obj_arg(args, 0)?;
+        Ok(Some(Value::Object(Some(jce_provider_object(ctx)?))))
+    });
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -522,8 +724,11 @@ fn mac_algorithm_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(usi
 /// NOT stripped, because `HmacSHA512/224` and `HmacSHA512/256` are two DISTINCT
 /// SunJCE algorithms (FIPS 180-4 §5.3.6 truncations with their own IVs) and
 /// collapsing them would put serving one where the caller asked for the other
-/// a single keystroke away. Both are unimplemented here and both are refused,
-/// which the table below achieves by omission.
+/// a single keystroke away. Both are implemented below, each over its own
+/// digest — the `/` still must not be stripped, because `HMACSHA512224` would
+/// then be indistinguishable from a `HmacSHA-512-224` spelling that means the
+/// same thing but also from nothing else, and the two truncations differ only
+/// by that suffix.
 fn mac_normalise(algo: &str) -> String {
     algo.to_uppercase().replace('-', "")
 }
@@ -553,28 +758,36 @@ fn mac_normalise(algo: &str) -> String {
 /// as "the crypto is wrong" — it presents as an interop bug against everyone
 /// running a real JDK, if it presents at all.
 ///
-/// ## Why exactly these five, and no more
+/// ## Which names, and why these
 ///
-/// These are the five names `jca::provider_chain::seed_retired_getalgorithms_literals`
-/// registers as `SunJCE` `Mac` services, so `Security.getAlgorithms("Mac")` and
-/// `Mac.getInstance` now answer the SAME set. That agreement is the property
-/// W4-3 exists to establish for `MessageDigest`; this engine was violating it
-/// in the more dangerous direction — serving what it never advertised.
+/// The set started at five (`HmacMD5`, `HmacSHA1`, `HmacSHA256`, `HmacSHA384`,
+/// `HmacSHA512`) — the names
+/// `jca::provider_chain::seed_retired_getalgorithms_literals` registers as
+/// `SunJCE` `Mac` services — with the note that widening it "means implementing
+/// RFC 2104 over the digests `crate::compute_digest` already supplies … and
+/// each needs its own HMAC block size … and this lane could neither build nor
+/// run".
 ///
-/// HotSpot 25 advertises 28 `Mac` names. Under-advertising 23 of them is
-/// truthful precisely because `getInstance` refuses all 23. Widening the set
-/// means implementing RFC 2104 over the digests `crate::compute_digest`
-/// already supplies (SHA-224, SHA-512/224, SHA-512/256, SHA3-*), and each
-/// needs its own HMAC block size — 64 for SHA-224, 128 for the SHA-512
-/// truncations, 144/136/104/72 for SHA3-224/256/384/512. Those are exactly the
-/// sort of per-algorithm constants that cannot be defaulted, and this lane
-/// could neither build nor run; landing unverified HMAC would be the same
-/// class of mistake as the fallback being removed.
+/// This lane could. The seven added names below are implemented in
+/// `crate::hmac_sha224` and friends over `compute_digest`'s existing digests,
+/// each with its own block size, and each verified byte-for-byte against
+/// `Mac.getInstance(name)` on stock HotSpot 25 (`hmac_extended_matches_hotspot`
+/// pins the vectors). `mac_output_length` is widened in lockstep, so
+/// `getMacLength()` still cannot corroborate an answer `mac_compute_hmac`
+/// cannot produce.
+///
+/// `HmacSHA224` in particular is not academic: `com.ongres.scram` advertises
+/// `SCRAM-SHA-224` and `SCRAM-SHA3-512` from `ScramMechanism.supportedMechanisms()`
+/// by probing `Mac.getInstance`, so refusing them made CratonVM's advertised
+/// SCRAM mechanism list 8 entries where HotSpot's is 12 — a visible protocol-
+/// level divergence against any server that negotiates one of the four.
+///
+/// Still refused, deliberately: `Poly1305`, `AESCMAC`, `HmacPBESHA*` and the
+/// rest of HotSpot's 28. They are not HMAC-over-a-digest, so serving them would
+/// mean a second unverified construction — exactly the mistake the `_ =>
+/// hmac_sha256` fallback was removed for.
 fn mac_algorithm_supported(algo: &str) -> bool {
-    matches!(
-        mac_normalise(algo).as_str(),
-        "HMACMD5" | "HMACSHA1" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512"
-    )
+    mac_output_length(algo).is_some()
 }
 
 /// `NoSuchAlgorithmException` for a `Mac` name we cannot compute, in HotSpot's
@@ -615,6 +828,16 @@ pub(crate) fn mac_compute_hmac(algo: &str, key: &[u8], data: &[u8]) -> Option<Ve
         "HMACSHA1" => Some(hmac_sha1(key, data)),
         "HMACMD5" => Some(hmac_md5(key, data)),
         "HMACSHA256" => Some(hmac_sha256(key, data)),
+        "HMACSHA224" => Some(crate::hmac_sha224(key, data)),
+        // `/` survives `mac_normalise` on purpose: these two differ ONLY by the
+        // suffix and have distinct IVs, so collapsing them would serve one for
+        // the other.
+        "HMACSHA512/224" => Some(crate::hmac_sha512_224(key, data)),
+        "HMACSHA512/256" => Some(crate::hmac_sha512_256(key, data)),
+        "HMACSHA3224" => Some(crate::hmac_sha3_224(key, data)),
+        "HMACSHA3256" => Some(crate::hmac_sha3_256(key, data)),
+        "HMACSHA3384" => Some(crate::hmac_sha3_384(key, data)),
+        "HMACSHA3512" => Some(crate::hmac_sha3_512(key, data)),
         _ => None,
     }
 }
@@ -634,6 +857,13 @@ pub(crate) fn mac_output_length(algo: &str) -> Option<usize> {
         "HMACSHA1" => Some(20),
         "HMACMD5" => Some(16),
         "HMACSHA256" => Some(32),
+        "HMACSHA224" => Some(28),
+        "HMACSHA512/224" => Some(28),
+        "HMACSHA512/256" => Some(32),
+        "HMACSHA3224" => Some(28),
+        "HMACSHA3256" => Some(32),
+        "HMACSHA3384" => Some(48),
+        "HMACSHA3512" => Some(64),
         _ => None,
     }
 }
@@ -6441,13 +6671,26 @@ pub(crate) mod new13_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The five names `mac_compute_hmac` implements are exactly the five
-    /// `SunJCE` `Mac` services `jca::provider_chain` seeds. If someone adds a
-    /// service row without an implementation arm — the W4-3 defect species —
-    /// this is the test that says so.
+    /// The names `mac_compute_hmac` implements are exactly the `SunJCE` `Mac`
+    /// services `jca::provider_chain` seeds. If someone adds a service row
+    /// without an implementation arm — the W4-3 defect species — this is the
+    /// test that says so.
     #[test]
     fn mac_supported_set_matches_the_advertised_sunjce_services() {
-        let advertised = ["HmacMD5", "HmacSHA1", "HmacSHA256", "HmacSHA384", "HmacSHA512"];
+        let advertised = [
+            "HmacMD5",
+            "HmacSHA1",
+            "HmacSHA224",
+            "HmacSHA256",
+            "HmacSHA384",
+            "HmacSHA512",
+            "HmacSHA512/224",
+            "HmacSHA512/256",
+            "HmacSHA3-224",
+            "HmacSHA3-256",
+            "HmacSHA3-384",
+            "HmacSHA3-512",
+        ];
         for algo in advertised {
             assert!(
                 mac_algorithm_supported(algo),
@@ -6478,21 +6721,15 @@ pub(crate) mod new13_tests {
     }
 
     /// The defect this lane closed: every unimplemented name used to be served
-    /// as HMAC-SHA-256, with `getMacLength()` corroborating it. Each name below
-    /// is a REAL SunJCE algorithm on jdk-25.0.3.9-hotspot (measured:
-    /// `HmacSHA3-256` len=32, `HmacSHA224` len=28, `HmacSHA512/256` len=32) —
-    /// so a caller asking for one had every reason to expect it to work, and
-    /// got different bytes under the right name.
+    /// as HMAC-SHA-256, with `getMacLength()` corroborating it. The seven names
+    /// that used to head this list (`HmacSHA224`, the two SHA-512 truncations
+    /// and the four SHA-3s) are now genuinely implemented and pinned to
+    /// HotSpot's bytes by `hmac_extended_matches_hotspot`; what remains here is
+    /// everything that is NOT HMAC-over-a-digest, where serving a value would
+    /// mean a second unverified construction.
     #[test]
     fn mac_refuses_every_algorithm_it_cannot_compute() {
         for algo in [
-            "HmacSHA224",
-            "HmacSHA3-224",
-            "HmacSHA3-256",
-            "HmacSHA3-384",
-            "HmacSHA3-512",
-            "HmacSHA512/224",
-            "HmacSHA512/256",
             "HmacPBESHA256",
             "PBEWithHmacSHA256",
             "SslMacSHA1",
@@ -6520,12 +6757,147 @@ pub(crate) mod new13_tests {
     /// with their own FIPS 180-4 §5.3.6 initial values. `mac_normalise` must
     /// not collapse them onto `HmacSHA512224`/`HmacSHA512256`, because the day
     /// someone implements one, the collapse would silently serve it for the
-    /// other. Both are unsupported today; this pins the shape, not the verdict.
+    /// other. Both are implemented now, which makes the collapse a live hazard
+    /// rather than a latent one: `mac_compute_hmac` would return the wrong
+    /// arm's bytes under the right name.
     #[test]
     fn mac_normalise_keeps_the_sha512_truncations_distinct() {
         assert_ne!(mac_normalise("HmacSHA512/224"), mac_normalise("HmacSHA512/256"));
         assert_ne!(mac_normalise("HmacSHA512/256"), mac_normalise("HmacSHA512"));
         assert_ne!(mac_normalise("HmacSHA3-256"), mac_normalise("HmacSHA256"));
+        // …and the three must genuinely produce three different MACs.
+        let (k, d) = (b"key".as_slice(), b"data".as_slice());
+        let t224 = mac_compute_hmac("HmacSHA512/224", k, d).unwrap();
+        let t256 = mac_compute_hmac("HmacSHA512/256", k, d).unwrap();
+        let full = mac_compute_hmac("HmacSHA512", k, d).unwrap();
+        assert_ne!(t224, t256);
+        assert_ne!(&t256[..], &full[..32]);
+        assert_ne!(
+            mac_compute_hmac("HmacSHA3-256", k, d).unwrap(),
+            mac_compute_hmac("HmacSHA256", k, d).unwrap()
+        );
+    }
+
+    // Measured on jdk-25 (`Mac.getInstance(name).init(new SecretKeySpec("key",
+    // name)).doFinal("The quick brown fox jumps over the lazy dog")`), all
+    // reported `prov=SunJCE`.
+    const HOTSPOT_HMAC_SHA224: &str = "88ff8b54675d39b8f72322e65ff945c52d96379988ada25639747e69";
+    const HOTSPOT_HMAC_SHA512_224: &str =
+        "a1afb4f708cb63570639195121785ada3dc615989cc3c73f38e306a3";
+    const HOTSPOT_HMAC_SHA512_256: &str =
+        "7fb65e03577da9151a1016e9c2e514d4d48842857f13927f348588173dca6d89";
+    const HOTSPOT_HMAC_SHA3_224: &str = "ff6fa8447ce10fb1efdccfe62caf8b640fe46c4fb1007912bf85100f";
+    const HOTSPOT_HMAC_SHA3_256: &str =
+        "8c6e0683409427f8931711b10ca92a506eb1fafa48fadd66d76126f47ac2c333";
+    const HOTSPOT_HMAC_SHA3_384: &str = concat!(
+        "aa739ad9fcdf9be4a04f06680ade7a1bd1e01a0af64accb04366234cf9f6934a",
+        "0f8589772f857681fcde8acc256091a2"
+    );
+    const HOTSPOT_HMAC_SHA3_512: &str = concat!(
+        "237a35049c40b3ef5ddd960b3dc893d8284953b9a4756611b1b61bffcf53edd9",
+        "79f93547db714b06ef0a692062c609b70208ab8d4a280ceee40ed8100f293063"
+    );
+
+    /// The SAME seven, keyed with a 200-byte key. A key longer than the block
+    /// size is hashed down to one before padding, which is the ONLY place the
+    /// block-size constant changes the answer for a short key — so this is the
+    /// vector set that actually catches a wrong block size, and it is why the
+    /// SHA-3 rates (144/136/104/72) had to be measured rather than assumed.
+    /// Same HotSpot 25 run, `key[i] = (byte) i` for i in 0..200.
+    #[test]
+    fn hmac_extended_long_key_matches_hotspot() {
+        let key: Vec<u8> = (0u32..200).map(|i| i as u8).collect();
+        let data = b"The quick brown fox jumps over the lazy dog";
+        for (algo, expected) in [
+            (
+                "HmacSHA224",
+                "7776e9af341cb9e8a3041d658522e693ad0c2362cd00e4c03979ae44",
+            ),
+            (
+                "HmacSHA512/224",
+                "624bcaab3a5787fb7546f49dd0f124b6956310bc9852bc4811a0bf53",
+            ),
+            (
+                "HmacSHA512/256",
+                "1eb904abb4c9b1c20c6865f02b794eb6f5d6fa545a8a2f851e8db4ba6ab9d820",
+            ),
+            (
+                "HmacSHA3-224",
+                "bc92b6b85c768d188bb51c807d9be5f9e7de0f32c1c47ee67761b6db",
+            ),
+            (
+                "HmacSHA3-256",
+                "2a48cf931ce513d0b65f67fa1d1376d4d82901de5c39804f0b46bcb99182b53b",
+            ),
+            (
+                "HmacSHA3-384",
+                concat!(
+                    "7d489aae7048186e247eb8695939731ffced8e66c5112737a9c1cb3f666c1af2",
+                    "2033813750e58242dfa53f1dbd2170ad"
+                ),
+            ),
+            (
+                "HmacSHA3-512",
+                concat!(
+                    "a44498c88dbeb3267ec1e380f1bbedde06e99d5dded3719559b88c1d42ff2aa5",
+                    "7d7f2155e654e8c448e7d3547399176bf458d309403d03ea5bcfeba7b531fdc0"
+                ),
+            ),
+            // The two pre-existing algorithms, on the same long-key path, so a
+            // regression in `hmac_generic` itself is not mistaken for a new
+            // algorithm's block size being wrong.
+            (
+                "HmacSHA256",
+                "9b75f034ad627c6ac4e0b7bd883b09870009485aa3842a69b412e7aacd33bae9",
+            ),
+            (
+                "HmacSHA512",
+                concat!(
+                    "35c1cc9d221994b5f6fef4cb786d1b2fa9ce383560fa6ee7080ad0801400bf1e",
+                    "49201749ec16c8dd454458a46e62ef609b2602ebf35b9ff37c00867b9bbea0ed"
+                ),
+            ),
+        ] {
+            let got = mac_compute_hmac(algo, &key, data)
+                .unwrap_or_else(|| panic!("{algo} computes nothing"));
+            let hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, expected, "{algo} long-key disagrees with HotSpot 25");
+        }
+    }
+
+    /// Known-answer vectors for the seven MACs this lane ADDED, every one
+    /// measured on stock HotSpot 25 (`java -cp . MacKat`, key `"key"` over
+    /// `"The quick brown fox jumps over the lazy dog"`) rather than derived
+    /// from a reference implementation here.
+    ///
+    /// These exist because the block size is the part that cannot be defaulted:
+    /// SHA-224 keeps SHA-256's 64, the SHA-512 truncations keep 128, and the
+    /// SHA-3 rate SHRINKS as the digest grows (144/136/104/72). A wrong block
+    /// size still produces plausible-looking bytes of the right length, so only
+    /// a HotSpot-measured vector can tell the difference.
+    #[test]
+    fn hmac_extended_matches_hotspot() {
+        let key = b"key";
+        let data = b"The quick brown fox jumps over the lazy dog";
+        for (algo, expected) in [
+            ("HmacSHA224", HOTSPOT_HMAC_SHA224),
+            ("HmacSHA512/224", HOTSPOT_HMAC_SHA512_224),
+            ("HmacSHA512/256", HOTSPOT_HMAC_SHA512_256),
+            ("HmacSHA3-224", HOTSPOT_HMAC_SHA3_224),
+            ("HmacSHA3-256", HOTSPOT_HMAC_SHA3_256),
+            ("HmacSHA3-384", HOTSPOT_HMAC_SHA3_384),
+            ("HmacSHA3-512", HOTSPOT_HMAC_SHA3_512),
+        ] {
+            let got = mac_compute_hmac(algo, key, data)
+                .unwrap_or_else(|| panic!("{algo} computes nothing"));
+            let hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, expected, "{algo} disagrees with HotSpot 25");
+            assert_eq!(
+                mac_output_length(algo),
+                Some(got.len()),
+                "{algo}: getMacLength() must match the bytes doFinal() produces"
+            );
+        }
     }
 
     /// Known-answer vectors for all five implemented MACs, measured on
