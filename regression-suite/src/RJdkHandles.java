@@ -3,6 +3,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.invoke.VarHandle;
 import java.lang.invoke.WrongMethodTypeException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -16,14 +17,79 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code MethodHandles$Lookup} would take the whole corpus with it.
  *
  * Determinism: no addresses, no identity hashes, no timing.
+ *
+ * <h2>Why this class is built out of {@link #step steps}</h2>
+ *
+ * It used to be one straight-line run of {@code check(...)} calls, and that
+ * made it a ONE-BIT instrument over a TEN-COMBINATOR surface. When every
+ * combinator carrier in {@code lang_invoke.rs} was being refused under
+ * {@code --jdk-only}, this vector reported exactly one failure --
+ * {@code NoClassDefFoundError: __mh_insert_wrapper__} at the first assertion of
+ * {@code adaptation()} -- because the throw ended the run. A scratch probe that
+ * reached each combinator independently, catching per step, named all ten in a
+ * single run. Ten broken combinators, one reported.
+ *
+ * <p>So every independent claim here runs inside {@link #step}: the failure is
+ * caught, PRINTED WITH ITS OWN NAME, recorded, and the next claim still runs.
+ * {@code main} throws at the end if anything failed, so the exit code and the
+ * suite's {@code rc} check are unchanged -- what changes is that one run now
+ * names every broken combinator instead of the first.
+ *
+ * <p>Two rules from {@code W6-5-vacuous-tests.md} govern what may be added:
+ * every check must be one that could be made to FAIL by breaking the VM, and a
+ * check that cannot fail must not be written. Concretely, that is why several
+ * checks here are shaped the way they are:
+ *
+ * <ul>
+ *   <li>{@code permuteArguments} is asserted on a NON-COMMUTATIVE target. The
+ *       old assertion permuted {@code statAdd(int,int)} and demanded 3 from
+ *       {@code (1,2)} -- which a permutation that did nothing at all also
+ *       produces. It could not fail.</li>
+ *   <li>{@code catchException} carries a negative control: a target that does
+ *       NOT throw must return the target's value, not the handler's. Without
+ *       it, a VM that ran the handler unconditionally would pass.</li>
+ *   <li>{@code bindTo} carries both halves: a leading REFERENCE parameter must
+ *       be accepted and a leading PRIMITIVE one refused. Without the first
+ *       half, a VM that refused every {@code bindTo} would pass.</li>
+ *   <li>{@code asCollector} asserts the runtime CLASS of the array it built,
+ *       not only the value that came back out of it. The value can be right for
+ *       the wrong reason; {@code [I} cannot.</li>
+ * </ul>
  */
 public class RJdkHandles {
     static int checks;
+    static int steps;
+    static final List<String> failures = new ArrayList<>();
 
     static void check(boolean c, String m) {
         checks++;
         if (!c) {
             throw new AssertionError(m);
+        }
+    }
+
+    interface Body {
+        void run() throws Throwable;
+    }
+
+    /**
+     * Run one INDEPENDENT claim. A failure is named, recorded and survived; the
+     * next claim still runs.
+     *
+     * <p>The printed line is deliberately not a {@code CK } line: {@code run.sh}
+     * keeps only {@code PASS}/{@code CK} lines for its cross-VM diff, and a
+     * failing run is already red on {@code rc} before that diff is reached. The
+     * line is here for whoever runs the class directly, which is the workflow
+     * that has to distinguish "one carrier broken" from "ten".
+     */
+    static void step(String name, Body body) {
+        steps++;
+        try {
+            body.run();
+        } catch (Throwable t) {
+            failures.add(name);
+            System.out.println("FAIL RJdkHandles step " + name + ": "
+                    + t.getClass().getName() + ": " + t.getMessage());
         }
     }
 
@@ -102,73 +168,398 @@ public class RJdkHandles {
         System.out.println("CK RJdkHandles invoke ok type=" + stat.type());
     }
 
+    static MethodHandle st(String name, Class<?> ret, Class<?>... params) throws Throwable {
+        return MethodHandles.lookup().findStatic(RJdkHandles.class,
+                name, MethodType.methodType(ret, params));
+    }
+
+    /**
+     * The combinator surface, ONE INDEPENDENT STEP PER COMBINATOR.
+     *
+     * <p>Each step builds its own target handle rather than sharing one. That
+     * is the point: a shared setup line that fails takes every later claim with
+     * it, which is precisely the one-bit behaviour being removed here. The cost
+     * is a few extra {@code findStatic} calls; the benefit is that a green run
+     * means every combinator below is green.
+     *
+     * <p>Every value asserted here was measured on HotSpot 25.0.3 before it was
+     * written down.
+     */
     static void adaptation() throws Throwable {
-        MethodHandles.Lookup lk = MethodHandles.lookup();
-        MethodHandle add = lk.findStatic(Holder.class, "statAdd",
-                MethodType.methodType(int.class, int.class, int.class));
+        step("insertArguments", () -> {
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            // Bound at position 0, so the surviving parameter is the SECOND
+            // one. A splice at the wrong end still answers 15 for a commutative
+            // target, so the target is `plus` and the check below is the
+            // non-commutative one.
+            check((int) MethodHandles.insertArguments(add, 0, 10).invokeExact(5) == 15,
+                    "insertArguments at 0");
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            // minus(10, x) at pos 0 -> 10-4 = 6; a splice at pos 1 would be
+            // minus(4, 10) = -6, so this distinguishes the two.
+            check((int) MethodHandles.insertArguments(minus, 0, 10).invokeExact(4) == 6,
+                    "insertArguments at 0 binds the FIRST parameter");
+            check((int) MethodHandles.insertArguments(minus, 1, 10).invokeExact(4) == -6,
+                    "insertArguments at 1 binds the SECOND parameter");
+        });
 
-        MethodHandle plus10 = MethodHandles.insertArguments(add, 0, 10);
-        check((int) plus10.invokeExact(5) == 15, "insertArguments");
+        step("dropArguments", () -> {
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            MethodHandle dropped = MethodHandles.dropArguments(add, 0, String.class);
+            check((int) dropped.invokeExact("ignored", 1, 2) == 3, "dropArguments at 0");
+            // Dropping in the MIDDLE, which a "skip the first N" implementation
+            // gets wrong: the ignored argument sits between 1 and 2.
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            MethodHandle mid = MethodHandles.dropArguments(minus, 1, String.class);
+            check((int) mid.invokeExact(9, "ignored", 4) == 5, "dropArguments at 1");
+        });
 
-        MethodHandle dropped = MethodHandles.dropArguments(add, 0, String.class);
-        check((int) dropped.invokeExact("ignored", 1, 2) == 3, "dropArguments");
+        step("permuteArguments", () -> {
+            // NON-COMMUTATIVE on purpose. The predecessor of this check
+            // permuted `statAdd` and demanded 3 from (1,2) -- a permutation
+            // that did nothing produces 3 as well, so it could not fail. `minus`
+            // separates the two: swapped gives 2-1 = 1, unswapped gives -1.
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            MethodHandle swapped = MethodHandles.permuteArguments(minus,
+                    MethodType.methodType(int.class, int.class, int.class), 1, 0);
+            check((int) swapped.invokeExact(1, 2) == 1, "permuteArguments swaps");
+            // A permutation may also DUPLICATE and DROP: (a,b) -> minus(b,b).
+            MethodHandle dup = MethodHandles.permuteArguments(minus,
+                    MethodType.methodType(int.class, int.class, int.class), 1, 1);
+            check((int) dup.invokeExact(7, 4) == 0, "permuteArguments duplicates and drops");
+        });
 
-        MethodHandle swapped = MethodHandles.permuteArguments(add,
-                MethodType.methodType(int.class, int.class, int.class), 1, 0);
-        check((int) swapped.invokeExact(1, 2) == 3, "permuteArguments");
+        step("filterArguments", () -> {
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            MethodHandle twice = st("twice", int.class, int.class);
+            // Filter only the SECOND argument: minus(9, 2*4) = 1. Filtering
+            // both would give 18-8 = 10 and filtering none 5, so this pins the
+            // position as well as the fact that a filter ran.
+            MethodHandle f1 = MethodHandles.filterArguments(minus, 1, twice);
+            check((int) f1.invokeExact(9, 4) == 1, "filterArguments at 1");
+            MethodHandle f2 = MethodHandles.filterArguments(minus, 0, twice, twice);
+            check((int) f2.invokeExact(9, 4) == 10, "filterArguments at 0, both");
+        });
 
-        MethodHandle asObj = add.asType(
-                MethodType.methodType(Integer.class, Integer.class, Integer.class));
-        check(((Integer) asObj.invokeExact(Integer.valueOf(4), Integer.valueOf(5))) == 9,
-                "asType boxing adapter");
+        step("guardWithTest", () -> {
+            MethodHandle isPos = st("isPositive", boolean.class, int.class);
+            MethodHandle neg = st("negate", int.class, int.class);
+            MethodHandle abs = MethodHandles.guardWithTest(isPos,
+                    MethodHandles.identity(int.class), neg);
+            // BOTH branches, so a guard wired to a constant answer fails one of
+            // them.
+            check((int) abs.invokeExact(5) == 5, "guardWithTest takes the TRUE branch");
+            check((int) abs.invokeExact(-5) == 5, "guardWithTest takes the FALSE branch");
+        });
 
-        MethodHandle constant = MethodHandles.constant(String.class, "K");
-        check("K".equals((String) constant.invokeExact()), "constant");
-        MethodHandle ident = MethodHandles.identity(String.class);
-        check("Z".equals((String) ident.invokeExact("Z")), "MethodHandles.identity");
+        step("filterReturnValue", () -> {
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            MethodHandle negate = st("negate", int.class, int.class);
+            // -7, not 7: an unfiltered return is a different value, so a
+            // pass-through filterReturnValue cannot satisfy this.
+            check((int) MethodHandles.filterReturnValue(add, negate).invokeExact(3, 4) == -7,
+                    "filterReturnValue");
+        });
 
-        // filterArguments / foldArguments
-        MethodHandle twice = lk.findStatic(RJdkHandles.class, "twice",
-                MethodType.methodType(int.class, int.class));
-        MethodHandle filtered = MethodHandles.filterArguments(add, 0, twice, twice);
-        check((int) filtered.invokeExact(3, 4) == 14, "filterArguments");
+        step("foldArguments", () -> {
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            MethodHandle twice = st("twice", int.class, int.class);
+            // fold PREPENDS the combiner's result and KEEPS the original
+            // arguments: minus(twice(5), 5) = 5. `collectArguments` REPLACES
+            // instead, and the step below asserts that difference.
+            check((int) MethodHandles.foldArguments(minus, twice).invokeExact(5) == 5,
+                    "foldArguments prepends and keeps");
+        });
 
-        // guardWithTest picks a branch by predicate.
-        MethodHandle isPos = lk.findStatic(RJdkHandles.class, "isPositive",
-                MethodType.methodType(boolean.class, int.class));
-        MethodHandle neg = lk.findStatic(RJdkHandles.class, "negate",
-                MethodType.methodType(int.class, int.class));
-        MethodHandle abs = MethodHandles.guardWithTest(isPos, MethodHandles.identity(int.class), neg);
-        check((int) abs.invokeExact(5) == 5 && (int) abs.invokeExact(-5) == 5, "guardWithTest");
+        step("collectArguments", () -> {
+            MethodHandle minus = st("minus", int.class, int.class, int.class);
+            MethodHandle twice = st("twice", int.class, int.class);
+            // collect REPLACES parameter 0 with the combiner's result:
+            // minus(twice(3), 4) = 2. Fold on the same handles would need a
+            // third argument, so the two cannot be confused by value.
+            check((int) MethodHandles.collectArguments(minus, 0, twice).invokeExact(3, 4) == 2,
+                    "collectArguments at 0");
+            check((int) MethodHandles.collectArguments(minus, 1, twice).invokeExact(9, 3) == 3,
+                    "collectArguments at 1");
+        });
 
-        // varargs collector
-        MethodHandle sumAll = lk.findStatic(RJdkHandles.class, "sumAll",
-                MethodType.methodType(int.class, int[].class)).asVarargsCollector(int[].class);
-        check((int) sumAll.invoke(1, 2, 3, 4) == 10, "asVarargsCollector");
-        MethodHandle spread = lk.findStatic(RJdkHandles.class, "sumAll",
-                MethodType.methodType(int.class, int[].class))
-                .asFixedArity();
-        check((int) spread.invoke(new int[] { 5, 6 }) == 11, "asFixedArity");
+        step("catchException", () -> {
+            MethodHandle boom = st("boom", int.class, int.class);
+            MethodHandle handler = st("recover", int.class,
+                    IllegalStateException.class, int.class);
+            check((int) MethodHandles.catchException(boom,
+                    IllegalStateException.class, handler).invokeExact(7) == 1007,
+                    "catchException runs the handler on a throw");
+            // NEGATIVE CONTROL. Without this a VM that ran the handler
+            // unconditionally -- or one that never invoked the target at all --
+            // passes the line above.
+            MethodHandle quiet = st("twice", int.class, int.class);
+            check((int) MethodHandles.catchException(quiet,
+                    IllegalStateException.class, handler).invokeExact(7) == 14,
+                    "catchException must NOT run the handler when the target returns");
+            // ...and the guarded type must be honoured: a throwable outside it
+            // propagates rather than being swallowed by the handler.
+            MethodHandle other = st("boomOther", int.class, int.class);
+            boolean propagated = false;
+            try {
+                int unreachable = (int) MethodHandles.catchException(other,
+                        IllegalStateException.class, handler).invokeExact(7);
+                check(unreachable == -1, "unreachable");
+            } catch (IllegalArgumentException expected) {
+                propagated = true;
+            }
+            check(propagated, "catchException must not catch a type it was not given");
+        });
 
-        // arrayElementGetter / setter
-        MethodHandle aget = MethodHandles.arrayElementGetter(int[].class);
-        int[] a = { 7, 8, 9 };
-        check((int) aget.invokeExact(a, 1) == 8, "arrayElementGetter");
+        step("asType boxing adapter", () -> {
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            MethodHandle asObj = add.asType(
+                    MethodType.methodType(Integer.class, Integer.class, Integer.class));
+            check(((Integer) asObj.invokeExact(Integer.valueOf(4), Integer.valueOf(5))) == 9,
+                    "asType boxing adapter");
+        });
 
-        // A wrong invokeExact descriptor is a linkage-time error, not a silent coercion.
-        boolean threw = false;
-        try {
-            long bogus = (long) add.invokeExact(1, 2);
-            check(bogus == 3, "unreachable");
-        } catch (WrongMethodTypeException expected) {
-            threw = true;
-        }
-        check(threw, "invokeExact with the wrong descriptor must throw WrongMethodTypeException");
-        System.out.println("CK RJdkHandles adapt=" + (int) filtered.invokeExact(3, 4));
+        step("constant and identity", () -> {
+            MethodHandle constant = MethodHandles.constant(String.class, "K");
+            check("K".equals((String) constant.invokeExact()), "constant");
+            MethodHandle ident = MethodHandles.identity(String.class);
+            check("Z".equals((String) ident.invokeExact("Z")), "MethodHandles.identity");
+        });
+
+        step("arrayElementGetter", () -> {
+            MethodHandle aget = MethodHandles.arrayElementGetter(int[].class);
+            int[] a = { 7, 8, 9 };
+            check((int) aget.invokeExact(a, 1) == 8, "arrayElementGetter");
+        });
+
+        step("invokeExact descriptor mismatch", () -> {
+            // A wrong invokeExact descriptor is a linkage-time error, not a
+            // silent coercion.
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            boolean threw = false;
+            try {
+                long bogus = (long) add.invokeExact(1, 2);
+                check(bogus == 3, "unreachable");
+            } catch (WrongMethodTypeException expected) {
+                threw = true;
+            }
+            check(threw,
+                    "invokeExact with the wrong descriptor must throw WrongMethodTypeException");
+        });
+
+        System.out.println("CK RJdkHandles adapt combinators=" + steps);
+    }
+
+    /**
+     * {@code asCollector} once per ARRAY CARRIER, plus the spreader family.
+     *
+     * <p>This exists because {@code asCollector} answered a wrong value for
+     * every PRIMITIVE array type while answering correctly for {@code Object[]}
+     * and {@code String[]}: the collect arm gathered into a reference array
+     * unconditionally, so the target's {@code iaload}/{@code laload} read an oop
+     * as a value. Measured on the shipped binary under {@code --real-jdk}:
+     * {@code int[]}&rarr;0, {@code long[]}&rarr;-2527743864898872 (a raw heap
+     * pointer), {@code double[]}&rarr;NaN, against HotSpot's 6, 6 and 7.0.
+     *
+     * <p>The vector could not see it: {@code adaptation()} only ever reached
+     * {@code asCollector} through {@code asVarargsCollector}, which takes a
+     * different path and was green. One reachable carrier is not the surface --
+     * so every carrier is reached here, one step each.
+     *
+     * <p>Each carrier asserts the RUNTIME CLASS of the array that was built as
+     * well as the value computed from it. The value alone is the weaker half:
+     * a container that is wrong but whose elements unbox correctly on the way
+     * out could still produce 6. {@code "[I"} could not.
+     */
+    static void collectors() throws Throwable {
+        step("asCollector int[]", () -> {
+            check((int) st("sumInts", int.class, int[].class)
+                    .asCollector(int[].class, 3).invoke(1, 2, 3) == 6, "asCollector int[] value");
+            check("[I".equals((String) st("classOfInts", String.class, int[].class)
+                    .asCollector(int[].class, 3).invoke(1, 2, 3)),
+                    "asCollector int[] must build an int[]");
+        });
+        step("asCollector long[]", () -> {
+            check((long) st("sumLongs", long.class, long[].class)
+                    .asCollector(long[].class, 3).invoke(1L, 2L, 3L) == 6L,
+                    "asCollector long[] value");
+            check("[J".equals((String) st("classOfLongs", String.class, long[].class)
+                    .asCollector(long[].class, 3).invoke(1L, 2L, 3L)),
+                    "asCollector long[] must build a long[]");
+        });
+        step("asCollector double[]", () -> check((double) st("sumDoubles", double.class,
+                double[].class).asCollector(double[].class, 3).invoke(1.5, 2.5, 3.0) == 7.0,
+                "asCollector double[] value"));
+        step("asCollector float[]", () -> check((float) st("sumFloats", float.class,
+                float[].class).asCollector(float[].class, 2).invoke(1.5f, 2.25f) == 3.75f,
+                "asCollector float[] value"));
+        step("asCollector byte[]", () -> check((int) st("sumBytes", int.class, byte[].class)
+                .asCollector(byte[].class, 3).invoke((byte) 1, (byte) 2, (byte) 3) == 6,
+                "asCollector byte[] value"));
+        step("asCollector short[]", () -> check((int) st("sumShorts", int.class, short[].class)
+                .asCollector(short[].class, 3).invoke((short) 10, (short) 20, (short) 30) == 60,
+                "asCollector short[] value"));
+        step("asCollector char[]", () -> check((int) st("sumChars", int.class, char[].class)
+                .asCollector(char[].class, 2).invoke('A', 'B') == 131,
+                "asCollector char[] value"));
+        step("asCollector boolean[]", () -> check((int) st("countTrue", int.class, boolean[].class)
+                .asCollector(boolean[].class, 3).invoke(true, false, true) == 2,
+                "asCollector boolean[] value"));
+        step("asCollector String[]", () -> {
+            // The two carriers that were already right before the fix, kept so
+            // the fix cannot trade them away: a change that made every collector
+            // primitive would break exactly here.
+            check("abc".equals((String) st("catStrings", String.class, String[].class)
+                    .asCollector(String[].class, 3).invoke("a", "b", "c")),
+                    "asCollector String[] value");
+            check("[Ljava.lang.String;".equals((String) st("classOfStrings", String.class,
+                    String[].class).asCollector(String[].class, 3).invoke("a", "b", "c")),
+                    "asCollector String[] must build a String[], not an Object[]");
+        });
+        step("asCollector Object[]", () -> {
+            check((int) st("countObjects", int.class, Object[].class)
+                    .asCollector(Object[].class, 2).invoke("x", "y") == 2,
+                    "asCollector Object[] value");
+            // A primitive handed to a REFERENCE collector must still be boxed:
+            // this is the Groovy indy shape (`invoke(II)Object`), and the
+            // element's class is the only way to see the boxing happened.
+            check("java.lang.Integer".equals((String) st("classOfFirst", String.class,
+                    Object[].class).asCollector(Object[].class, 2).invoke(1, 2)),
+                    "asCollector Object[] must box a primitive element");
+        });
+        step("asCollector type()", () -> {
+            // Independent of the value: the ARITY bookkeeping was already right
+            // when the container was wrong, so this is not the gate for that
+            // defect and is not written as if it were.
+            MethodHandle c = st("sumInts", int.class, int[].class).asCollector(int[].class, 3);
+            check("(int,int,int)int".equals(c.type().toString()), "asCollector type()");
+        });
+        step("asCollector with a leading argument", () -> {
+            // The collector's trailing-args split: only the LAST two arguments
+            // are gathered, the leading String is passed straight through.
+            MethodHandle c = st("labelled", String.class, String.class, int[].class)
+                    .asCollector(int[].class, 2);
+            check("n=3".equals((String) c.invoke("n", 1, 2)), "asCollector leading argument");
+        });
+
+        step("asSpreader", () -> {
+            MethodHandle add = st("plus", int.class, int.class, int.class);
+            check((int) add.asSpreader(int[].class, 2).invokeExact(new int[] { 3, 4 }) == 7,
+                    "asSpreader int[]");
+            MethodHandle cat = st("catTwo", String.class, String.class, String.class);
+            check("ab".equals((String) cat.asSpreader(String[].class, 2)
+                    .invokeExact(new String[] { "a", "b" })), "asSpreader String[]");
+        });
+        step("asVarargsCollector", () -> {
+            MethodHandle sumAll = st("sumInts", int.class, int[].class)
+                    .asVarargsCollector(int[].class);
+            check((int) sumAll.invoke(1, 2, 3, 4) == 10, "asVarargsCollector spread call");
+            // The same handle must still accept the array form -- that is what
+            // makes it VARIABLE arity rather than a collector.
+            check((int) sumAll.invoke(new int[] { 5, 6 }) == 11,
+                    "asVarargsCollector array call");
+            // NOT asserted: `isVarargsCollector()`. It answers false on
+            // CratonVM, which was measured here and is a DECLARED deviation --
+            // `lang_invoke.rs` says so in place ("Known deviation, deliberately
+            // not papered over"), because the marking would need a sixth
+            // synthetic MethodHandle slot and dispatch derives varargs
+            // behaviour from arity instead. A check for it would make this
+            // vector permanently red for something no fix in this lane can
+            // reach, and a permanently-red vector teaches operators to ignore
+            // the red. Recorded in W7-19 rather than asserted here.
+        });
+        step("asFixedArity", () -> {
+            MethodHandle fixed = st("sumInts", int.class, int[].class)
+                    .asVarargsCollector(int[].class).asFixedArity();
+            check((int) fixed.invoke(new int[] { 5, 6 }) == 11, "asFixedArity array call");
+        });
+    }
+
+    /**
+     * {@code bindTo}: what it must ACCEPT and what it must REFUSE.
+     *
+     * <p>The refusal is the half CratonVM did not have.
+     * {@code MethodHandle.bindTo}'s javadoc: <em>"@throws
+     * IllegalArgumentException if the target does not have a leading parameter
+     * type that is a reference type"</em>, implemented in
+     * {@code MethodType.leadingReferenceParameter()} as
+     * {@code if (ptypes.length == 0 || ptypes[0].isPrimitive()) throw ...}.
+     * Measured on the shipped binary under {@code --real-jdk}: all three
+     * refusals below were ACCEPTED, and the first answered 6.
+     *
+     * <p>The accepting checks are not decoration. Without them a VM that threw
+     * {@code IllegalArgumentException} from every {@code bindTo} passes the
+     * refusals and is indistinguishable from a correct one.
+     */
+    static void binding() throws Throwable {
+        step("bindTo accepts a leading reference parameter", () -> {
+            MethodHandle m = st("labelledTimes", int.class, String.class, int.class);
+            check((int) m.bindTo("abc").invoke(2) == 6, "bindTo(String) binds and invokes");
+            check("(int)int".equals(m.bindTo("abc").type().toString()),
+                    "bindTo drops the bound leading parameter from type()");
+            // A leading ARRAY parameter is a reference parameter too.
+            MethodHandle s = st("sumInts", int.class, int[].class);
+            check((int) s.bindTo(new int[] { 4, 5 }).invoke() == 9, "bindTo(int[])");
+        });
+        step("bindTo accepts null for a reference parameter", () -> {
+            // Measured on HotSpot 25: null is a legal bind, and the type is
+            // still narrowed. A refusal implemented as a null check rather than
+            // a TYPE check fails here.
+            MethodHandle m = st("labelledTimes", int.class, String.class, int.class);
+            check("(int)int".equals(m.bindTo(null).type().toString()), "bindTo(null)");
+        });
+        step("bindTo refuses a leading int parameter", () -> {
+            MethodHandle m = st("labelledTimes", int.class, String.class, int.class);
+            MethodHandle bound = m.bindTo("abc");   // now (int)int
+            boolean threw = false;
+            try {
+                MethodHandle again = bound.bindTo(2);
+                check(false, "bindTo(int) was ACCEPTED and produced " + again.type());
+            } catch (IllegalArgumentException expected) {
+                threw = true;
+            }
+            check(threw, "bindTo on a leading int must raise IllegalArgumentException");
+        });
+        step("bindTo refuses a leading long parameter", () -> {
+            MethodHandle m = st("twiceLong", long.class, long.class);
+            boolean threw = false;
+            try {
+                MethodHandle again = m.bindTo(5L);
+                check(false, "bindTo(long) was ACCEPTED and produced " + again.type());
+            } catch (IllegalArgumentException expected) {
+                threw = true;
+            }
+            check(threw, "bindTo on a leading long must raise IllegalArgumentException");
+        });
+        step("bindTo refuses a zero-arity target", () -> {
+            // `ptypes.length == 0` is the other half of the JDK's test, and it
+            // is a distinct code path from the primitive test.
+            MethodHandle k = MethodHandles.constant(String.class, "K");
+            boolean threw = false;
+            try {
+                MethodHandle again = k.bindTo("x");
+                check(false, "bindTo on ()String was ACCEPTED and produced " + again.type());
+            } catch (IllegalArgumentException expected) {
+                threw = true;
+            }
+            check(threw, "bindTo on a zero-arity target must raise IllegalArgumentException");
+        });
+    }
+
+    static int plus(int a, int b) {
+        return a + b;
+    }
+
+    static int minus(int a, int b) {
+        return a - b;
     }
 
     static int twice(int x) {
         return x * 2;
+    }
+
+    static long twiceLong(long x) {
+        return x * 2L;
     }
 
     static boolean isPositive(int x) {
@@ -179,12 +570,127 @@ public class RJdkHandles {
         return -x;
     }
 
+    static int boom(int x) {
+        throw new IllegalStateException("boom " + x);
+    }
+
+    static int boomOther(int x) {
+        throw new IllegalArgumentException("other " + x);
+    }
+
+    static int recover(IllegalStateException e, int x) {
+        return 1000 + x;
+    }
+
     static int sumAll(int[] xs) {
+        return sumInts(xs);
+    }
+
+    static int sumInts(int[] xs) {
         int s = 0;
         for (int x : xs) {
             s += x;
         }
         return s;
+    }
+
+    static long sumLongs(long[] xs) {
+        long s = 0L;
+        for (long x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static double sumDoubles(double[] xs) {
+        double s = 0.0;
+        for (double x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static float sumFloats(float[] xs) {
+        float s = 0.0f;
+        for (float x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static int sumBytes(byte[] xs) {
+        int s = 0;
+        for (byte x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static int sumShorts(short[] xs) {
+        int s = 0;
+        for (short x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static int sumChars(char[] xs) {
+        int s = 0;
+        for (char x : xs) {
+            s += x;
+        }
+        return s;
+    }
+
+    static int countTrue(boolean[] xs) {
+        int s = 0;
+        for (boolean x : xs) {
+            if (x) {
+                s++;
+            }
+        }
+        return s;
+    }
+
+    static String catStrings(String[] xs) {
+        StringBuilder b = new StringBuilder();
+        for (String x : xs) {
+            b.append(x);
+        }
+        return b.toString();
+    }
+
+    static String catTwo(String a, String b) {
+        return a + b;
+    }
+
+    static int countObjects(Object[] xs) {
+        return xs.length;
+    }
+
+    /** The container the collector actually built -- {@code "[I"}, not a value. */
+    static String classOfInts(int[] xs) {
+        return xs.getClass().getName();
+    }
+
+    static String classOfLongs(long[] xs) {
+        return xs.getClass().getName();
+    }
+
+    static String classOfStrings(String[] xs) {
+        return xs.getClass().getName();
+    }
+
+    static String classOfFirst(Object[] xs) {
+        return xs[0].getClass().getName();
+    }
+
+    static String labelled(String label, int[] xs) {
+        return label + "=" + sumInts(xs);
+    }
+
+    static int labelledTimes(String s, int n) {
+        return s.length() * n;
     }
 
     static void accessChecks() throws Throwable {
@@ -547,12 +1053,24 @@ public class RJdkHandles {
     }
 
     public static void main(String[] args) throws Throwable {
-        lookupAndInvoke();
+        // The sections run as steps too, for the same reason the combinators
+        // do: a VarHandle defect used to hide every access check behind it.
+        step("lookupAndInvoke", RJdkHandles::lookupAndInvoke);
         adaptation();
-        accessChecks();
-        varHandles();
-        varHandlesErased();
+        collectors();
+        binding();
+        step("accessChecks", RJdkHandles::accessChecks);
+        step("varHandles", RJdkHandles::varHandles);
+        step("varHandlesErased", RJdkHandles::varHandlesErased);
+        System.out.println("CK RJdkHandles steps=" + steps);
         System.out.println("CK RJdkHandles checks=" + checks);
-        System.out.println("PASS RJdkHandles (" + checks + " checks)");
+        if (!failures.isEmpty()) {
+            // Named, all of them, in one run. That is the whole point of the
+            // rewrite: the operator should not have to fix one combinator to
+            // discover the next one is broken too.
+            throw new AssertionError(failures.size() + " of " + steps
+                    + " steps failed: " + failures);
+        }
+        System.out.println("PASS RJdkHandles (" + checks + " checks, " + steps + " steps)");
     }
 }
