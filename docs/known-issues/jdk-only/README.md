@@ -1,6 +1,6 @@
 # JDK-only mode — open defects
 
-**Status:** OPEN, **85 records**. Index rebuilt from the tree on **2026-08-12**
+**Status:** OPEN, **99 records** (recount before quoting; this drifts on every merge). Index rebuilt from the tree on **2026-08-12**
 by W7-78-inherited-residual-closeout.md, on top of the reconciliation pass
 W7-55-record-reconciliation.md. Six records left the directory that day —
 four retired by RETIREMENT-20260812.md, and two (`W3-6`, `W5-2`) whose `git mv`
@@ -212,6 +212,36 @@ command each one names in its own final section. **Do not re-derive them.**
 `W7-70-printstream-close-noop.md` ·
 `W7-71-jca-exception-types-and-line-separator.md` ·
 `W7-73-short-object-blind-spot.md` · `W7-74-short-object-repairs.md` ·
+`W7-88-net-channels-dead-registration.md` (the losing `ServerSocketChannel
+.socket()` never registered at all — `--dump-native-registry` shows
+`overwrote=null` in all four configurations; its seven writes land on
+`AbstractInterruptibleChannel.interruptedTarget` and five real
+`java.net.ServerSocket` fields, `closed := -1` among them) ·
+`W7-89-memorysession-checkvalidstate.md` (**the whole FFM lifetime model was
+inert in Compatible mode** — use-after-close returned stale data, off-thread
+access to a *confined* arena succeeded, double-close succeeded; the arity bug
+was real but fixing it alone would have moved nothing, because
+`p67_session_modelled` tested slot 0 for an `Int` on a real `MemorySessionImpl`
+whose slot 0 is the declared-reference `resourceList`) ·
+`W7-90-slot-map-sweep-caller.md` (two triggers, not one: `System.exit` never
+reaches the launcher line, and that is how every Spring Boot and Surefire
+fixture ends) ·
+`W7-75-continuation-forkjoinpool-alias.md` (its §4 per-collector table is
+SUPERSEDED by W7-84's convergence — do not quote it) ·
+`W7-80-locale-data-stage-two.md` (the JDK image's own CLDR data was reachable
+all along, behind eleven comments in four files saying it was not; closed the
+last strict red) ·
+`W7-82-forname-duplicate-define.md` (**RETIRE-FIXED candidate** — a repeated
+`Class.forName` through one bare `URLClassLoader`; its prescribed additive fix
+is now DEAD, deleted by W7-87) ·
+`W7-83-segment-as-backing-array.md` (a `MemorySegment` returned where `[B` is
+declared, LIVE in Compatible mode via `s2_bb_arr`) ·
+`W7-84-primitive-in-reference-store.md` (four heaps, not three; `cargo test -p
+cratonvm-gc --test primitive_in_reference_slot` **RUN 2026-08-12, 10/10**) ·
+`W7-86-static-native-arity.md` (`Runtime.exit` exited 0 for every status;
+`ClassLoader.findBootstrapClass` answered null for every name) ·
+`W7-87-urlclassloader-namespace-asymmetry.md` (`new URLClassLoader(urls, null)`
+— *the* isolating idiom — had no isolation; 17 asymmetric consumers remain) ·
 `W7-72-ssc-socket-and-filechannel.md` (inverts W7-68's registrar reading for
 `FileChannel.isOpen`; the copy that reads a private slot is compiled only into
 the synthetic build and overwritten even there) ·
