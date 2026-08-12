@@ -25,7 +25,11 @@
   *"two optional hardening patches … that are still unapplied"*, was already
   false four days before that audit ran. This page's own 2026-08-11 block is the
   correct one.
-* **Residual: STILL OPEN — one, and it is a deletion, not a behaviour change.**
+* **Residual: CLOSED 2026-08-12 (W7-62-ratchets-and-dead-code.md).** The dead
+  block is deleted and the tests moved to `lang_invoke.rs` aimed at the gate
+  that runs. One line of the prescription was wrong — `lk_public_lookup` is
+  registered and stays. See the patch section below. The old text:
+* **Residual: WAS OPEN — one, and it is a deletion, not a behaviour change.**
   The `## Out-of-file patch (not applied)` below is genuinely unapplied. The dead
   block in `native-builtins/src/classloader.rs` survives: `lk_public_lookup`
   (`:8436`), `enforce_lookup_access` (`:9151`), `lk_find_virtual` (`:9216`),
@@ -378,10 +382,37 @@ in the tree.
    documented as superseded — a same-package test alone over-grants
    `PRIVATE|PROTECTED`, measured 31 where OpenJDK 25.0.3 answers 25.
 
-The dead `enforce_lookup_access` / `lk_find_*` block in `classloader.rs` and its
-four unit tests are **still there**. `classloader.rs` is not this lane's file:
+### Out-of-file patch — APPLIED 2026-08-12 (W7-62-ratchets-and-dead-code.md)
 
-### Out-of-file patch (not applied)
+**Done, and one line of the prescription below was wrong.** The dead block is
+deleted and the tests were re-pointed rather than dropped, as this section asks.
+Recorded here rather than left for a re-grep, because that is the rule
+W7-55-record-reconciliation.md ends on.
+
+* **Deleted** from `native-builtins/src/classloader.rs`: `enforce_lookup_access`,
+  `lk_member_access_flags`, and the eleven `lk_find_*` bodies
+  (`lk_find_static_var_handle` included — this section's list omits it).
+  332 lines, replaced by a tombstone that names what supersedes them.
+* **`lk_public_lookup` was NOT deleted, and must not be.** This section's list
+  is wrong about it: it IS registered, on
+  `MethodHandles$Lookup.publicLookup()`. Deleting it would have dropped a live
+  registration. That is the §2.4 species — an observation that outlived its
+  prescription — inside this record's own patch block.
+* **The tests were SIX, not four**, and they moved to `lang_invoke.rs`'s test
+  module aimed at `lk_enforce_find_access`. Four arms the old ones could not
+  express went with them, the first of which is the point of this whole record:
+  every one of the old tests used `LK_PUBLIC` (0x01) as the `publicLookup()`
+  mode word, and `publicLookup()` is `UNCONDITIONAL` (0x20) and carries no
+  `PUBLIC` bit at all — so they asserted about a Lookup shape the JDK never
+  hands out. The new rows also cover the `UNCONDITIONAL` class rule, a
+  zero-mode Lookup, an unreadable mode word (which must stay permissive), and
+  the positive private case this record's own test-module NOTE claimed could
+  not be exercised in-unit. That note was describing a reader that had already
+  been replaced; it is gone with the tests.
+
+The original prescription follows, for the record.
+
+### Out-of-file patch (as prescribed, superseded by the block above)
 
 No behavioural patch is outstanding — both hardening items are already in. The
 one remaining action is deletion-only and carries no behaviour change: remove

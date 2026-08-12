@@ -1581,8 +1581,11 @@ fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> Result<ObjectRef, Me
 /// absent there, and the old "by name first, synthetic slot second" reader
 /// returned 0 for every synthetic Lookup and never reached the slot that
 /// actually holds the modes: `lookupModes()` answered 0 and
-/// `enforce_lookup_access` saw a powerless Lookup for the whole of
-/// synthetic-JDK mode.
+/// the `find*` access gate saw a powerless Lookup for the whole of
+/// synthetic-JDK mode. (That gate is
+/// `lang_invoke::lk_enforce_find_access`. This module's own copy, named
+/// `enforce_lookup_access`, was deleted 2026-08-12 as never-registered dead
+/// code — see the tombstone above `lk_unreflect`.)
 ///
 /// Asking the CLASS is also descriptor-safe: `resolve_field_index_by_class_id`
 /// resolves the declared `int allowedModes` on `MethodHandles$Lookup`, not
@@ -8427,9 +8430,13 @@ fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// mode word, has a `case UNCONDITIONAL` arm and no `PUBLIC|UNCONDITIONAL`
 /// arm, and its `default:` branch asserts false.
 ///
-/// Dropping the PUBLIC bit does not narrow access here: `enforce_lookup_access`
-/// admits every `public` member irrespective of the mode word, and requires
-/// `PRIVATE` for everything else — which this lookup never had.
+/// Dropping the PUBLIC bit does not narrow access here:
+/// `lang_invoke::lk_enforce_find_access` — the gate that actually runs — needs
+/// no mode bit for a `public` member of a `public` class, and requires
+/// `PRIVATE` for a non-public one, which this lookup never had. What it DOES
+/// key on is `modes == UNCONDITIONAL` exactly, so leaving the PUBLIC bit set
+/// would have skipped that arm and let `publicLookup()` reach public members
+/// of package-private classes.
 ///
 /// (This registration sits on `MethodHandles$Lookup`; the live
 /// `MethodHandles.publicLookup()` static is `lang_invoke.rs`'s. Both now agree.)
@@ -9071,337 +9078,38 @@ fn alloc_method_handle(
     Ok(mh)
 }
 
-/// Resolve the JVMS access flags (`ACC_PUBLIC`/`ACC_PRIVATE`/…) of the member
-/// named `member_name` on the class denoted by `target_mirror`.
-///
-/// Walks the declared members of the target class and, for methods, its
-/// superclass chain (fields are matched on the declaring class only, mirroring
-/// the way `Lookup.find{Getter,Setter}` resolve a single named field). Only the
-/// member *name* is matched — overload resolution by descriptor is not modelled
-/// here, so the first matching member's flags are used, which is sufficient for
-/// the public/non-public boundary this check enforces.
-///
-/// Returns `None` when the class or member cannot be resolved (e.g. a synthetic
-/// stub mirror, or a member that only exists virtually). Callers treat `None`
-/// as "cannot determine" and fall back to *allowing* the lookup so this check
-/// never produces a false `IllegalAccessException` on a member that genuinely
-/// exists but is not reflectively visible to us.
-fn lk_member_access_flags(
-    ctx: &dyn NativeContext,
-    target_mirror: ObjectRef,
-    member_name: &str,
-    is_field: bool,
-) -> Option<u16> {
-    let mut cid = crate::lang_class::mirror_class_id(ctx, target_mirror)?;
-    loop {
-        if is_field {
-            for f in ctx.declared_fields(cid) {
-                if f.name == member_name {
-                    return Some(f.access_flags);
-                }
-            }
-        } else {
-            for m in ctx.declared_methods(cid) {
-                if m.name == member_name {
-                    return Some(m.access_flags);
-                }
-            }
-        }
-        // Fields are resolved on the declaring class only; methods may be
-        // inherited, so continue up the superclass chain for them.
-        if is_field {
-            return None;
-        }
-        match ctx.superclass_of(cid) {
-            Some(parent) if parent != cid => cid = parent,
-            _ => return None,
-        }
-    }
-}
-
-/// Enforce `MethodHandles.Lookup` access control for a `find*` resolution.
-///
-/// Full JLS §6.6 / `MethodHandles.Lookup` access control (package/module/nest
-/// mate / protected-receiver rules) is substantial; this implements the
-/// security-critical **private/public boundary** and documents the residual.
-///
-/// Rules (`this` is the resolving `Lookup`):
-/// * A `public` member is always accessible.
-/// * A non-public member (`private`/`protected`/package-private) requires the
-///   Lookup to retain `PRIVATE` mode. A Lookup without it — notably
-///   `publicLookup()` — can never reach a non-public member and gets an
-///   `IllegalAccessException`. This is the security-critical boundary.
-/// * Additionally, when the Lookup's `lookupClass` is resolvable *and* is a
-///   class **other** than the one declaring the member, access is denied even
-///   if `PRIVATE` is held: a full-power Lookup is only entitled to the privates
-///   of its own class (and nestmates). When `lookupClass` cannot be resolved
-///   we do not apply this extra check, so a legitimate self-private lookup is
-///   never spuriously rejected.
-/// * When the member's flags cannot be resolved, the lookup is allowed (see
-///   [`lk_member_access_flags`]) so legitimate resolutions are never broken.
-///
-/// Residual (intentionally not yet enforced): nestmate/`protected`-receiver
-/// and package/module (`opens`/`exports`) gating. A `PRIVATE`-capable Lookup
-/// whose `lookupClass` equals the declaring class (or is unresolved) is
-/// admitted without verifying the precise JLS §6.6 relationship. This is never
-/// *more* permissive than the spec for the public/non-public boundary it
-/// guards — a non-private Lookup is always rejected — so it cannot leak the
-/// `publicLookup()` -> private escalation the finding describes. See the
-/// access-control finding in `reviews/full-review-2026-06-20.md`.
-fn enforce_lookup_access(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-    target_mirror: Option<ObjectRef>,
-    member_name: Option<&str>,
-    is_field: bool,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    use cratonvm_types::access_flags::ACC_PUBLIC;
-
-    let (target, name) = match (target_mirror, member_name) {
-        (Some(t), Some(n)) => (t, n),
-        // Missing target/name: nothing to enforce; let the (already lenient)
-        // resolution proceed and surface its own error.
-        _ => return Ok(()),
-    };
-
-    let flags = match lk_member_access_flags(ctx, target, name, is_field) {
-        Some(f) => f,
-        None => return Ok(()),
-    };
-
-    // Public members are accessible to any Lookup (including publicLookup()).
-    if (flags & ACC_PUBLIC) != 0 {
-        return Ok(());
-    }
-
-    // Non-public member: the Lookup must retain PRIVATE mode. A lookup that
-    // dropped (or never had) PRIVATE — e.g. publicLookup() — is rejected.
-    let modes = lk_modes_of(ctx, this);
-    let has_private = (modes & LK_PRIVATE) != 0;
-
-    // Stronger check when we can resolve the lookupClass: a full-power lookup
-    // may only reach its *own* class's non-public members. If the lookupClass
-    // resolves to a different class than the declaring class, deny. If it does
-    // not resolve, we skip this check rather than risk a false positive.
-    let foreign_class = match ctx.get_field(this, LK_LOOKUP_CLASS_REF) {
-        Value::Object(Some(lookup_mirror)) => match (
-            crate::lang_class::mirror_class_id(ctx, lookup_mirror),
-            crate::lang_class::mirror_class_id(ctx, target),
-        ) {
-            (Some(a), Some(b)) => a != b,
-            _ => false,
-        },
-        _ => false,
-    };
-
-    if has_private && !foreign_class {
-        return Ok(());
-    }
-
-    let kind = if is_field { "field" } else { "method" };
-    let owner =
-        crate::lang_class::mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
-    Err(
-        cratonvm_types::error::RuntimeError::IllegalAccessException {
-            message: format!(
-                "no access: {kind} {owner}.{name} (modifiers 0x{flags:04x}) \
-                 from Lookup with modes 0x{modes:04x}"
-            ),
-        }
-        .into(),
-    )
-}
-
-// findVirtual(Class refc, String name, MethodType type) -> MethodHandle
-fn lk_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let mtype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
-    let mh = alloc_method_handle(ctx, 0, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let mtype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
-    let mh = alloc_method_handle(ctx, 1, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let mtype = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    enforce_lookup_access(ctx, this, class_mirror, Some("<init>"), false)?;
-    let name_str = ctx.create_string("<init>");
-    let mh = alloc_method_handle(ctx, 2, class_mirror, Some(name_str), mtype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let ftype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let mh = alloc_method_handle(ctx, 3, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let ftype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let mh = alloc_method_handle(ctx, 4, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let ftype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let mh = alloc_method_handle(ctx, 5, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let ftype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let mh = alloc_method_handle(ctx, 6, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-fn lk_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let mtype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
-    let mh = alloc_method_handle(ctx, 7, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh?))))
-}
-
-// VarHandle synthetic layout (3 fields): 0=target_class, 1=field_name, 2=field_type
-fn lk_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let class_mirror = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let name = match args.get(2) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let ftype = match args.get(3) {
-        Some(Value::Object(Some(o))) => Some(*o),
-        _ => None,
-    };
-    let this = obj_arg(args, 0)?;
-    let name_str = name.and_then(|n| ctx.read_string(n));
-    enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3)?;
-    if let Some(cm) = class_mirror {
-        ctx.set_field(vh, 0, Value::Object(Some(cm)));
-    }
-    if let Some(n) = name {
-        ctx.set_field(vh, 1, Value::Object(Some(n)));
-    }
-    if let Some(t) = ftype {
-        ctx.set_field(vh, 2, Value::Object(Some(t)));
-    }
-    Ok(Some(Value::Object(Some(vh))))
-}
-
-fn lk_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    lk_find_var_handle(ctx, args)
-}
+// -----------------------------------------------------------------------
+// DELETED 2026-08-12: `lk_member_access_flags`, `enforce_lookup_access` and
+// the eleven `lk_find_*` natives that called it.
+//
+// SUPERSEDED, not merely unused. Every one of those triples —
+// `findVirtual`, `findStatic`, `findConstructor`, `findGetter`, `findSetter`,
+// `findStaticGetter`, `findStaticSetter`, `findSpecial`, `findVarHandle`,
+// `findStaticVarHandle` — is registered by
+// `lang_invoke::register_p63_method_handles_lookup`, and the registration
+// site a few hundred lines below says in its own comment that this module
+// must NOT re-register them ("that would overwrite the real implementations
+// with incompatible stubs"). So these bodies had no registration in any
+// mode: not `--real-jdk`, not `--jdk-only`, not `synthetic-jdk`. Nothing
+// dispatched into them and nothing ever had.
+//
+// `dead_code` is allowed crate-wide (`lib.rs`), so nothing warned. What kept
+// them looking alive was five unit tests aimed straight at them, green on
+// every run since W3-1 and guarding an access check the VM does not invoke —
+// which is precisely the defect W4-1 was filed for: `publicLookup()` reached
+// a private method while a fully-written check for that exact case sat here
+// passing its own tests. Deleting the tests alone would have left the next
+// reader concluding the check exists. Both went, together, and the five
+// assertions were re-pointed at `lang_invoke::lk_enforce_find_access` — the
+// gate that actually runs, called as the first statement of all ten
+// `lookup_find_*`. See that module's `#[cfg(test)]` block.
+//
+// NOT deleted, against what W4-1's own patch block prescribes:
+// `lk_public_lookup`. It IS registered, on `MethodHandles$Lookup.publicLookup`
+// a few hundred lines below, and its doc comment states the JDK 25 mode word
+// it answers. W4-1's deletion list is wrong on that one entry.
+// W7-62-ratchets-and-dead-code.md · W4-1-publiclookup-allowedmodes-never-checked.md
+// -----------------------------------------------------------------------
 
 fn lk_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // unreflect(Method) -> MethodHandle — extract class/name from the Method object
@@ -12940,222 +12648,19 @@ mod classloader_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Lookup find* access-control enforcement (review finding
-    // `nb-lib` MethodHandles.Lookup access control)
+    // MOVED 2026-08-12 to `lang_invoke.rs`'s test module.
+    //
+    // Six tests lived here — five aimed at `lk_find_virtual` / `lk_find_getter`
+    // and one at this module's `lk_member_access_flags`. All six were green on
+    // every run and none of them touched code the VM can reach: those bodies
+    // were never registered (see the DELETED block above `lk_unreflect` for
+    // why). They now sit beside `lk_enforce_find_access` in `lang_invoke.rs`,
+    // aimed at the gate all ten `lookup_find_*` really call, and two arms the
+    // old tests could not express were added there — a genuine `publicLookup()`
+    // mode word (UNCONDITIONAL, not PUBLIC) and a zero-mode Lookup.
+    // W7-62-ratchets-and-dead-code.md
     // -----------------------------------------------------------------------
 
-    use cratonvm_native_api::{FieldMetadata, MethodMetadata};
-    use cratonvm_types::ClassId;
-
-    /// Build a target class `cls_id` with one method and one field of the
-    /// given access flags, returning its `Class` mirror.
-    fn setup_target(
-        ctx: &mut crate::test_utils::MockNativeContext,
-        class_name: &str,
-        method_flags: u16,
-        field_flags: u16,
-    ) -> (ClassId, ObjectRef) {
-        let cls_id = ctx.ensure_class_initialized(class_name).unwrap();
-        ctx.set_declared_methods(
-            cls_id,
-            vec![MethodMetadata {
-                name: "secret".to_string(),
-                descriptor: "()V".to_string(),
-                access_flags: method_flags,
-                declaring_class_id: cls_id,
-                exceptions: Vec::new(),
-                signature: None,
-            }],
-        );
-        ctx.set_declared_fields(
-            cls_id,
-            vec![FieldMetadata {
-                name: "hidden".to_string(),
-                descriptor: "I".to_string(),
-                access_flags: field_flags,
-                slot_index: 0,
-                declaring_class_id: cls_id,
-                is_static: false,
-            }],
-        );
-        let mirror = ctx.get_class_mirror(cls_id);
-        (cls_id, mirror)
-    }
-
-    fn make_lookup(
-        ctx: &mut crate::test_utils::MockNativeContext,
-        modes: i32,
-        lookup_class: Option<ObjectRef>,
-    ) -> ObjectRef {
-        let lk = ctx.alloc_object(ClassId::new(0), LK_FIELD_COUNT);
-        ctx.set_field(lk, LK_ALLOWED_MODES, Value::Int(modes));
-        ctx.set_field(
-            lk,
-            LK_LOOKUP_CLASS_REF,
-            match lookup_class {
-                Some(m) => Value::Object(Some(m)),
-                None => Value::Object(None),
-            },
-        );
-        lk
-    }
-
-    #[test]
-    fn lk_find_virtual_public_method_allowed() {
-        use crate::test_utils::MockNativeContext;
-        use cratonvm_types::access_flags::ACC_PUBLIC;
-        let mut ctx = MockNativeContext::new();
-        let (_cid, mirror) = setup_target(&mut ctx, "p/Target", ACC_PUBLIC, ACC_PUBLIC);
-        // A public-only lookup (publicLookup) can resolve a public method.
-        let lk = make_lookup(&mut ctx, LK_PUBLIC, None);
-        let name = ctx.create_string("secret");
-        let r = lk_find_virtual(
-            &mut ctx,
-            &[
-                Value::Object(Some(lk)),
-                Value::Object(Some(mirror)),
-                Value::Object(Some(name)),
-                Value::Object(None),
-            ],
-        );
-        assert!(
-            matches!(r, Ok(Some(Value::Object(Some(_))))),
-            "public method must resolve, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn lk_find_virtual_private_method_with_public_lookup_throws() {
-        use crate::test_utils::MockNativeContext;
-        use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PUBLIC};
-        let mut ctx = MockNativeContext::new();
-        let (_cid, mirror) = setup_target(&mut ctx, "p/Target", ACC_PRIVATE, ACC_PUBLIC);
-        // publicLookup (no PRIVATE bit, no lookupClass) must NOT see a private member.
-        let lk = make_lookup(&mut ctx, LK_PUBLIC, None);
-        let name = ctx.create_string("secret");
-        let r = lk_find_virtual(
-            &mut ctx,
-            &[
-                Value::Object(Some(lk)),
-                Value::Object(Some(mirror)),
-                Value::Object(Some(name)),
-                Value::Object(None),
-            ],
-        );
-        assert!(
-            r.is_err(),
-            "private method via public Lookup must throw IllegalAccessException, got {r:?}"
-        );
-    }
-
-    // NOTE on positive private-access coverage: the MockNativeContext used
-    // here cannot represent the real-JDK `allowedModes` field *by name* (the
-    // MOCK's `get_field_by_name("allowedModes")` returns `Int(0)`; production
-    // would return `Value::Object(None)` — either way the mock has no such
-    // field and no declared slot for it), so `lk_modes_of`
-    // always reports mode 0 under the mock and the "full-power lookup may
-    // see its own private member" path cannot be exercised through these
-    // natives in-unit. The same-class / mode-bit branch of
-    // `enforce_lookup_access` is therefore validated indirectly via the
-    // negative tests above and the direct `lk_member_access_flags` tests
-    // below; full positive coverage lives in the cross-VM HotSpot battery.
-
-    #[test]
-    fn lk_find_getter_private_field_with_public_lookup_throws() {
-        use crate::test_utils::MockNativeContext;
-        use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PUBLIC};
-        let mut ctx = MockNativeContext::new();
-        let (_cid, mirror) = setup_target(&mut ctx, "p/Target", ACC_PUBLIC, ACC_PRIVATE);
-        let lk = make_lookup(&mut ctx, LK_PUBLIC, None);
-        let name = ctx.create_string("hidden");
-        let r = lk_find_getter(
-            &mut ctx,
-            &[
-                Value::Object(Some(lk)),
-                Value::Object(Some(mirror)),
-                Value::Object(Some(name)),
-                Value::Object(None),
-            ],
-        );
-        assert!(
-            r.is_err(),
-            "private field getter via public Lookup must throw, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn lk_find_getter_public_field_allowed() {
-        use crate::test_utils::MockNativeContext;
-        use cratonvm_types::access_flags::ACC_PUBLIC;
-        let mut ctx = MockNativeContext::new();
-        let (_cid, mirror) = setup_target(&mut ctx, "p/Target", ACC_PUBLIC, ACC_PUBLIC);
-        let lk = make_lookup(&mut ctx, LK_PUBLIC, None);
-        let name = ctx.create_string("hidden");
-        let r = lk_find_getter(
-            &mut ctx,
-            &[
-                Value::Object(Some(lk)),
-                Value::Object(Some(mirror)),
-                Value::Object(Some(name)),
-                Value::Object(None),
-            ],
-        );
-        assert!(
-            matches!(r, Ok(Some(Value::Object(Some(_))))),
-            "public field getter must resolve, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn lk_find_virtual_unresolvable_member_allowed() {
-        // When the member's flags cannot be determined (no declared_methods
-        // registered for the class), the lookup must be allowed rather than
-        // spuriously throwing.
-        use crate::test_utils::MockNativeContext;
-        let mut ctx = MockNativeContext::new();
-        let cid = ctx.ensure_class_initialized("p/Opaque").unwrap();
-        let mirror = ctx.get_class_mirror(cid);
-        let lk = make_lookup(&mut ctx, LK_PUBLIC, None);
-        let name = ctx.create_string("whatever");
-        let r = lk_find_virtual(
-            &mut ctx,
-            &[
-                Value::Object(Some(lk)),
-                Value::Object(Some(mirror)),
-                Value::Object(Some(name)),
-                Value::Object(None),
-            ],
-        );
-        assert!(
-            matches!(r, Ok(Some(Value::Object(Some(_))))),
-            "unresolvable member must not be blocked, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn lk_member_access_flags_walks_superclass_for_methods() {
-        use crate::test_utils::MockNativeContext;
-        use cratonvm_types::access_flags::ACC_PUBLIC;
-        let mut ctx = MockNativeContext::new();
-        let parent = ctx.ensure_class_initialized("p/Parent").unwrap();
-        ctx.set_declared_methods(
-            parent,
-            vec![MethodMetadata {
-                name: "inherited".to_string(),
-                descriptor: "()V".to_string(),
-                access_flags: ACC_PUBLIC,
-                declaring_class_id: parent,
-                exceptions: Vec::new(),
-                signature: None,
-            }],
-        );
-        let child = ctx.ensure_class_initialized("p/Child").unwrap();
-        ctx.set_declared_methods(child, Vec::new());
-        ctx.set_superclass(child, parent);
-        let mirror = ctx.get_class_mirror(child);
-        let flags = lk_member_access_flags(&ctx, mirror, "inherited", false);
-        assert_eq!(flags, Some(ACC_PUBLIC));
-    }
 
     /// `MockNativeContext::resolve_field_index_by_class_id` now falls back to
     /// `ClassManager::synthetic_stub_fields`, the same table the VM resolves a
