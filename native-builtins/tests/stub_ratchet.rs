@@ -417,6 +417,51 @@ use cratonvm_types::compat::CompatibilityMode;
 /// configurations, which re-opens the blind spot deliberately. So the baseline
 /// is keyed per configuration, as `duplicate_registration_gate.rs` keys its
 /// two.
+///
+/// # PENDING, 2026-08-12: this baseline is STALE and expected to FIRE by +6
+///
+/// **Not re-frozen here, on purpose.** The session that found it could not run
+/// `cargo`, and raising a slack-free exact baseline from a derivation rather
+/// than from the printed recount line is the one edit that can do damage: too
+/// high and it admits that many new stubs in silence. So the number stays and
+/// the reason is written down. W7-62-ratchets-and-dead-code.md
+///
+/// The freeze at `167bf048c` (2026-08-11 22:05) IS an ancestor of `6ae3ca634`
+/// (the `LinkedListSnapshotListItr` retag, which took nine rows OUT of this
+/// population, so that one is already counted here) and is **not** an ancestor
+/// of three commits that put rows in. Checked with
+/// `git merge-base --is-ancestor`, not by timestamp:
+///
+///  * `4eaa5d321` (21:19) tags `LogManager.{getLogManager, getLogger}`
+///    `Bridge`. Both triples are already in `RETIRED_SHADOW_TRIPLES`, so
+///    `register()`'s retired-shadow arm lands them on `SyntheticStub`. **+2**
+///  * `3b20b83b5` (22:34) tags four `LogRecord` source-pair rows and
+///    `Formatter.formatMessage` `Bridge`. None was retired at that commit.
+///    **+0**
+///  * `01cfc2609` (2026-08-12 03:18) adds the four `LogRecord` source-pair
+///    triples to `RETIRED_SHADOW_TRIPLES`, so their `Bridge` becomes
+///    `SyntheticStub`. **+4**
+///
+/// All of them are inside this census's scope:
+/// `register_phase54_logging_extras` is reached from
+/// `register_essential_natives_with_shims`, the first entry in
+/// [`VM_INIT_SEQUENCE`].
+///
+/// So expect **1269 / 1259**, and expect this gate to fail until re-frozen.
+/// **That rise is the 939 -> 1038 motion again, not the motion this gate
+/// guards against** — see the "first §1.4 shadow RETIREMENT" section above.
+/// Six registrations moved `Intrinsic` -> `SyntheticStub` and not one of them
+/// is new: each stands in front of `java/util/logging/` bytecode the image
+/// declares with a `Code` attribute, and re-tagging is what lets `--jdk-only`
+/// refuse the shadow and run the real class. `--real-jdk` is unchanged,
+/// because a `SyntheticStub` registers and dispatches normally there.
+///
+/// **+6 is a LOWER BOUND, and must not be pasted in as the answer.** 182
+/// commits separate the freeze from HEAD and any of them may add or remove a
+/// registration. Take the number from the line this test prints:
+/// `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`,
+/// then paste the constant named by `BASELINE_CONST` in that same run — it
+/// says which of the two this build adjudicates against.
 const BASELINE_SYNTHETIC_STUBS_MANAGEMENT: usize = 1263;
 
 /// The default `-p cratonvm-native-builtins` resolve: ten `jmx::*` registrars

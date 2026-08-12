@@ -10822,6 +10822,56 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         // `AbstractList` (itself `implements List`) and separately
         // `implements RandomAccess`.
         "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        // The object `linkedList.listIterator()` hands back. Same reason as the
+        // entry above, as `java/util/ArrayList$ListItr` two entries up, and as
+        // `cratonvm/synthetic/Process`: with no arm here it fell to this
+        // match's `_ => &[]`, so the carrier declared NO interfaces at all —
+        // `instanceof ListIterator` was `false` and every erased-type
+        // `(ListIterator) x` raised
+        // `ClassCastException: cratonvm.internal.LinkedListSnapshotListItr
+        // cannot be cast to java.util.ListIterator`.
+        //
+        // `AbstractList.equals`/`hashCode`/`indexOf` never trip it, because
+        // their receiver is already typed `ListIterator` and javac emits no
+        // `checkcast` — which is exactly why the family worked at all and why
+        // this went unnoticed. It is user code assigning through `Object` (or
+        // any erased generic) that meets it.
+        //
+        // Recorded HERE rather than as a `superclass` link, unlike
+        // `SSLSocketInputStream`/`OutputStream` which solve the same
+        // checkcast problem that way: `java.util.ListIterator` is an interface
+        // with no fields, so there is no layout to alias and nothing to gain
+        // from the heavier mechanism.
+        //
+        // `Iterator` is listed explicitly even though `ListIterator extends
+        // Iterator` and `is_assignable_to_name_inner` walks super-interfaces
+        // transitively. It costs one `load_class` and it means an
+        // `(Iterator) x` cast does not depend on the image having resolved
+        // `ListIterator`'s own hierarchy — the same belt-and-braces the
+        // `java/util/ArrayList$ListItr` arm above already uses.
+        //
+        // This arm reaches the carrier through `fabricate_class`, which is the
+        // shared body of ALL THREE `ensure_*_class` entry points, so it applies
+        // to the `ClassOrigin::VmInternal` door the carrier is minted through
+        // since 6ae3ca634 as much as it did to the compatibility door before
+        // it. That matters: the mint landing in strict mode without this arm is
+        // what took the ClassCastException from Compatible-only to reachable in
+        // BOTH modes.
+        //
+        // HotSpot parity, and therefore permitted in Compatible mode under the
+        // contract's §5 freeze: real `java.util.LinkedList$ListItr` implements
+        // `ListIterator`, so every cast this admits is one HotSpot admits.
+        // It does NOT make `listIterator().getClass()` answer
+        // `java.util.LinkedList$ListItr`, and it does not touch the
+        // native-owned-`LinkedList`-state defect behind the carrier
+        // (`ListItr.remove()` leaves `size` stale) — those are a collections
+        // reclassification, not an interface list.
+        // W7-16-arraydeque-and-linkedlist-residuals.md
+        // W7-20-refusal-laundered-into-wrong-answer.md
+        // W7-62-ratchets-and-dead-code.md
+        "cratonvm/internal/LinkedListSnapshotListItr" => {
+            &["java/util/ListIterator", "java/util/Iterator"]
+        }
         "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",

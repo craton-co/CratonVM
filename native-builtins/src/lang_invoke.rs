@@ -4819,9 +4819,13 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // Setting it to Object lets findVarHandle on widely visible
             // classes still resolve, while preventing access to
             // package-private members (enforced in
-            // `classloader::enforce_lookup_access`, which admits any public
-            // member regardless of the mode bits and requires PRIVATE for
-            // everything else — so dropping PUBLIC here changes nothing).
+            // `lk_enforce_find_access` in this file, which needs no mode bit
+            // for a public member of a public class and requires PRIVATE for a
+            // non-public one — so dropping PUBLIC here changes nothing, while
+            // KEEPING it would have skipped that gate's `modes ==
+            // UNCONDITIONAL` arm entirely). `classloader::enforce_lookup_access`,
+            // which this comment used to name, was never registered and was
+            // deleted 2026-08-12.
             let object_cid = ctx
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
@@ -12986,6 +12990,273 @@ mod tests {
             ctx.get_field(recv, 0),
             Value::Int(42),
             "field must hold new value on success"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `Lookup.find*` access control — the gate that RUNS
+    // -----------------------------------------------------------------------
+    //
+    // These arrived here on 2026-08-12 from `classloader.rs`, where five of
+    // them had been green since W3-1 aimed at `classloader::lk_find_virtual` /
+    // `lk_find_getter` — bodies no registrar ever registered, because
+    // `register_p63_method_handles_lookup` in THIS file owns all ten `find*`
+    // triples and `classloader.rs`'s registration site says in its own comment
+    // that it must not re-register them. So the check they asserted about was
+    // not the check the VM ran, and `publicLookup().findVirtual(_, <private>)`
+    // reached the private method while its own unit test said it could not.
+    // That is the shape W4-1-publiclookup-allowedmodes-never-checked.md is
+    // named after, and a test guarding the wrong copy is how it shipped.
+    //
+    // Re-pointed at [`lk_enforce_find_access`], the first statement of all ten
+    // `lookup_find_*`. Four arms the old tests could not express are added,
+    // and each exists because it is a way this gate can be wrong WITHOUT any
+    // of the others noticing:
+    //
+    //   * a real `publicLookup()` mode word. The old tests passed
+    //     `LK_PUBLIC` (0x01). `publicLookup()` is measured at **0x20**,
+    //     `UNCONDITIONAL` and nothing else — a lookup that does not carry the
+    //     `PUBLIC` bit at all. Every one of those five tests was therefore
+    //     asserting about a Lookup shape the JDK never hands out.
+    //   * the `UNCONDITIONAL` class rule: a PUBLIC member of a NON-public
+    //     class is refused, because that mode's rule is about the target class.
+    //   * a zero-mode Lookup, refused before the member walk.
+    //   * an UNREADABLE mode word, which must stay permissive. `Some(0)` and
+    //     `None` are different answers here and a gate that collapsed them
+    //     would still pass every other test in this block.
+    //
+    // And the positive private case, which `classloader.rs`'s test module
+    // carried a NOTE saying could not be exercised in-unit ("`lk_modes_of`
+    // always reports mode 0 under the mock"). It can: the mock has no
+    // `allowedModes` entry in `mock_field_slot` and no declared field for it,
+    // so the class-side witness answers `None` and the reader falls through to
+    // the synthetic slot the test wrote. The note described a reader that had
+    // already been replaced. W7-62-ratchets-and-dead-code.md
+
+    use cratonvm_native_api::{FieldMetadata, MethodMetadata};
+    use cratonvm_types::ClassId;
+
+    /// A target class carrying one method `secret` and one field `hidden` with
+    /// the given access flags, plus the CLASS's own access flags — public
+    /// unless a test says otherwise, because `UNCONDITIONAL` asks about the
+    /// class and the mock's default is 0 (package-private).
+    fn lk_target(
+        ctx: &mut MockNativeContext,
+        class_name: &str,
+        class_flags: u16,
+        method_flags: u16,
+        field_flags: u16,
+    ) -> ObjectRef {
+        let cls_id = ctx.ensure_class_initialized(class_name).unwrap();
+        ctx.set_class_access_flags(cls_id, class_flags);
+        ctx.set_declared_methods(
+            cls_id,
+            vec![MethodMetadata {
+                name: "secret".to_string(),
+                descriptor: "()V".to_string(),
+                access_flags: method_flags,
+                declaring_class_id: cls_id,
+                exceptions: Vec::new(),
+                signature: None,
+            }],
+        );
+        ctx.set_declared_fields(
+            cls_id,
+            vec![FieldMetadata {
+                name: "hidden".to_string(),
+                descriptor: "I".to_string(),
+                access_flags: field_flags,
+                slot_index: 0,
+                declaring_class_id: cls_id,
+                is_static: false,
+            }],
+        );
+        ctx.get_class_mirror(cls_id)
+    }
+
+    /// A `Lookup` receiver whose `allowedModes` reads back as `modes`.
+    ///
+    /// Writes the SYNTHETIC slot, which is what
+    /// [`lk_read_allowed_modes_opt`] falls through to when the class-side
+    /// witness finds no declared `allowedModes` — the fabricated-Lookup shape.
+    fn lk_with_modes(ctx: &mut MockNativeContext, modes: i32) -> ObjectRef {
+        let lk = ctx.alloc_object(ClassId::new(0), 4);
+        ctx.set_field(lk, LK_SYNTHETIC_ALLOWED_MODES, Value::Int(modes));
+        lk
+    }
+
+    /// `args` as `Lookup.findVirtual(refc, name, type)` hands them over.
+    fn lk_find_args(lk: ObjectRef, target: ObjectRef, name: ObjectRef) -> [Value; 4] {
+        [
+            Value::Object(Some(lk)),
+            Value::Object(Some(target)),
+            Value::Object(Some(name)),
+            Value::Object(None),
+        ]
+    }
+
+    const ACC_PUBLIC_U16: u16 = cratonvm_types::access_flags::ACC_PUBLIC;
+    const ACC_PRIVATE_U16: u16 = cratonvm_types::access_flags::ACC_PRIVATE;
+
+    /// THE DEFECT W4-1 IS NAMED AFTER. `publicLookup()` must not reach a
+    /// private method of a public class.
+    #[test]
+    fn publiclookup_is_refused_a_private_method() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_err(),
+            "publicLookup (modes 0x20) must not reach a private method; got {r:?}"
+        );
+    }
+
+    /// Calibration for the test above: the same lookup, the same class, a
+    /// PUBLIC method. Without this row a gate that refused everything would
+    /// look correct.
+    #[test]
+    fn publiclookup_reaches_a_public_method_of_a_public_class() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_ok(), "a public member of a public class must resolve; got {r:?}");
+    }
+
+    /// `UNCONDITIONAL`'s rule is about the target CLASS. A public member of a
+    /// package-private class is refused — measured on OpenJDK 25.0.3 as
+    /// `IllegalAccessException: symbolic reference class is not accessible`.
+    #[test]
+    fn publiclookup_is_refused_a_public_member_of_a_non_public_class() {
+        let mut ctx = MockNativeContext::new();
+        // class flags 0 = package-private.
+        let target = lk_target(&mut ctx, "p/Packaged", 0, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_err(),
+            "UNCONDITIONAL reaches public members of PUBLIC types only; got {r:?}"
+        );
+    }
+
+    /// The field half of the same boundary — `findGetter`/`findSetter` pass
+    /// `is_field = true`, and the two halves resolve members differently
+    /// (`lk_member_access_flags` walks superclasses for methods and not for
+    /// fields), so one passing does not imply the other.
+    #[test]
+    fn publiclookup_is_refused_a_private_field_getter() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PRIVATE_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("hidden");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, true);
+        assert!(r.is_err(), "private field getter via publicLookup must throw; got {r:?}");
+    }
+
+    #[test]
+    fn publiclookup_reaches_a_public_field_getter() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("hidden");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, true);
+        assert!(r.is_ok(), "public field getter must resolve; got {r:?}");
+    }
+
+    /// A full-power `MethodHandles.lookup()` reaches a private member. The
+    /// positive case `classloader.rs`'s test module said could not be
+    /// exercised in-unit.
+    #[test]
+    fn a_full_power_lookup_reaches_a_private_member() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_FULL_POWER);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_ok(),
+            "a lookup holding PRIVATE must reach a private member; got {r:?}"
+        );
+    }
+
+    /// `lookup().dropLookupMode(PUBLIC)` is 0 on the real JDK, and a zero-mode
+    /// Lookup is refused EVERY member including a public one — before the
+    /// member walk, which is why the class is public and the member is public
+    /// here and it still throws.
+    #[test]
+    fn a_zero_mode_lookup_is_refused_even_a_public_member() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PUBLIC_U16, ACC_PUBLIC_U16);
+        let lk = lk_with_modes(&mut ctx, 0);
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_err(), "a zero-mode Lookup must be refused; got {r:?}");
+    }
+
+    /// ...and the receiver whose mode word this VM CANNOT READ must stay
+    /// permissive. `Some(0)` and `None` are different answers, and collapsing
+    /// them turns every Lookup shape the VM does not model into an
+    /// `IllegalAccessException`. Every other test in this block would still
+    /// pass with them collapsed, which is why this row is here.
+    #[test]
+    fn an_unreadable_mode_word_stays_permissive() {
+        let mut ctx = MockNativeContext::new();
+        let target = lk_target(&mut ctx, "p/Target", ACC_PUBLIC_U16, ACC_PRIVATE_U16, ACC_PUBLIC_U16);
+        let lk = ctx.alloc_object(ClassId::new(0), 4);
+        // Not an `Int` in either place the reader looks: no declared
+        // `allowedModes` on this class, and a reference in the synthetic slot.
+        ctx.set_field(lk, LK_SYNTHETIC_ALLOWED_MODES, Value::Object(None));
+        let name = ctx.create_string("secret");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(
+            r.is_ok(),
+            "an unreadable mode word must not become a refusal; got {r:?}"
+        );
+    }
+
+    /// A member whose flags cannot be resolved at all must be ALLOWED, so a
+    /// class this VM does not model is never spuriously refused.
+    #[test]
+    fn an_unresolvable_member_is_not_blocked() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized("p/Opaque").unwrap();
+        ctx.set_class_access_flags(cid, ACC_PUBLIC_U16);
+        let target = ctx.get_class_mirror(cid);
+        let lk = lk_with_modes(&mut ctx, LK_MODE_UNCONDITIONAL);
+        let name = ctx.create_string("whatever");
+        let r = lk_enforce_find_access(&ctx, &lk_find_args(lk, target, name), 2, None, false);
+        assert!(r.is_ok(), "an unresolvable member must not be blocked; got {r:?}");
+    }
+
+    /// Methods resolve up the superclass chain; fields do not. Moved from
+    /// `classloader.rs`, where it exercised that module's own now-deleted copy
+    /// of this helper.
+    #[test]
+    fn lk_member_access_flags_walks_superclass_for_methods() {
+        let mut ctx = MockNativeContext::new();
+        let parent = ctx.ensure_class_initialized("p/Parent").unwrap();
+        ctx.set_declared_methods(
+            parent,
+            vec![MethodMetadata {
+                name: "inherited".to_string(),
+                descriptor: "()V".to_string(),
+                access_flags: ACC_PUBLIC_U16,
+                declaring_class_id: parent,
+                exceptions: Vec::new(),
+                signature: None,
+            }],
+        );
+        let child = ctx.ensure_class_initialized("p/Child").unwrap();
+        ctx.set_declared_methods(child, Vec::new());
+        ctx.set_superclass(child, parent);
+        let mirror = ctx.get_class_mirror(child);
+        assert_eq!(
+            lk_member_access_flags(&ctx, mirror, "inherited", false),
+            Some(ACC_PUBLIC_U16)
         );
     }
 }

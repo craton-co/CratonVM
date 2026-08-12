@@ -30971,29 +30971,91 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // natives registered on `java/util/ListIterator` share the same
     // array@0/cursor@1 layout, so dispatch through either route agrees.
     let lit = "cratonvm/internal/LinkedListSnapshotListItr";
-    registry.register(lit, "hasNext", "()Z", native_ll_listitr_has_next);
-    registry.register(lit, "next", "()Ljava/lang/Object;", native_ll_listitr_next);
-    registry.register(lit, "hasPrevious", "()Z", native_ll_listitr_has_previous);
-    registry.register(
+    // `register_with_kind`, NOT the ambient `register`, and the difference is
+    // the census column `kind_stated` rather than the kind itself — the kind is
+    // `Bridge` either way, in both runtime modes, so nothing about dispatch or
+    // policy changes here.
+    //
+    // Until the 2026-08-11 move to `VM_SERVICE_RECEIVERS` these nine carried
+    // `kind_stated = true`, because `register()`'s
+    // `receiver_declared_by_no_supported_image` arm re-tagged them
+    // `SyntheticStub` and STATED the kind (a measurement adjudicated it). The
+    // move is the right fix for the kind and it silently dropped the
+    // adjudication: an EXCLUSION restores the ambient category, and an ambient
+    // category is `kind_stated = false`. `scripts/jdk-only-kind-map.py` scores
+    // that as a regression on purpose and refuses it — adjudication there is
+    // one-way (`false -> true` freely, never `true -> false`), because a row
+    // that goes back to inheriting is a row the next ambient edit moves in
+    // silence again. Re-freezing the baseline to the lost bit would have
+    // converted the gate into a rubber stamp for exactly the defect it exists
+    // to catch.
+    //
+    // Stating `Bridge` here is the honest form of the same claim the exclusion
+    // makes: contract §11 reviewed this receiver as a VM service, and `Bridge`
+    // is the only tag that survives `NativeKind::allowed_in(JdkOnly)`.
+    // W7-62-ratchets-and-dead-code.md
+    registry.register_with_kind(
+        lit,
+        "hasNext",
+        "()Z",
+        native_ll_listitr_has_next,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "next",
+        "()Ljava/lang/Object;",
+        native_ll_listitr_next,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "hasPrevious",
+        "()Z",
+        native_ll_listitr_has_previous,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "previous",
         "()Ljava/lang/Object;",
         native_ll_listitr_previous,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    registry.register(lit, "nextIndex", "()I", native_ll_listitr_next_index);
-    registry.register(
+    registry.register_with_kind(
+        lit,
+        "nextIndex",
+        "()I",
+        native_ll_listitr_next_index,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "previousIndex",
         "()I",
         native_ll_listitr_previous_index,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    registry.register(lit, "set", "(Ljava/lang/Object;)V", native_ll_listitr_set);
-    registry.register(lit, "remove", "()V", native_ll_listitr_remove_noop);
-    registry.register(
+    registry.register_with_kind(
+        lit,
+        "set",
+        "(Ljava/lang/Object;)V",
+        native_ll_listitr_set,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "remove",
+        "()V",
+        native_ll_listitr_remove_noop,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "add",
         "(Ljava/lang/Object;)V",
         native_ll_listitr_remove_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }
