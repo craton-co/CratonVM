@@ -14694,6 +14694,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
             pbkdf2_generate_secret,
         );
+        // The two accessors the real body cannot serve on a synthetic: both
+        // read instance fields no constructor ever wrote, and `getProvider()`
+        // additionally synchronizes on a null `lock`. See `skf_algo_table`.
+        r.register(skf, "getAlgorithm", "()Ljava/lang/String;", pbkdf2_get_algorithm);
+        r.register(
+            skf,
+            "getProvider",
+            "()Ljava/security/Provider;",
+            pbkdf2_get_provider,
+        );
     }
     // getAlgorithm() -> String
     r.register(
@@ -15869,6 +15879,7 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             // recycled hash and derive a WRONG key).
             let key = pbkdf2_key_for(ctx, obj);
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         // PKCS#5 v1.5 / PKCS#12 PBE family (`PBEWithMD5AndDES`, …). SunJCE's
@@ -15883,7 +15894,8 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         {
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
             let key = pbkdf2_key_for(ctx, obj);
-            pbe_algo_table().lock().unwrap().insert(key, alg);
+            pbe_algo_table().lock().unwrap().insert(key, alg.clone());
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         None => Err(RuntimeError::SecurityException {
@@ -15891,6 +15903,51 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         .into()),
     }
+}
+
+/// The algorithm name every successful `SecretKeyFactory.getInstance` was asked
+/// for, keyed by the same GC-stable identity `pbkdf2_prf_table` uses.
+///
+/// `getAlgorithm()` and `getProvider()` need it, and they cannot read it off the
+/// object: the synthetic is a REAL `javax.crypto.SecretKeyFactory` whose
+/// constructor never ran, so `algorithm` is null and — the part that actually
+/// breaks — `lock` is null too. `getProvider()` opens with `synchronized
+/// (lock)`, so calling it on a perfectly working factory threw
+/// `NullPointerException: Cannot enter synchronized block because "this.lock" is
+/// null`. That is the same species as the `Mac` overloads in
+/// `phases_late::ssl_security`: any method left to the real body reads
+/// uninitialised instance state, and fails in a way that looks nothing like
+/// "this class is synthetic".
+fn skf_algo_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `SecretKeyFactory.getAlgorithm()` — the name `getInstance` was called with.
+pub(crate) fn pbkdf2_get_algorithm(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = pbkdf2_key_for(ctx, this);
+    let algo = skf_algo_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
+}
+
+/// `SecretKeyFactory.getProvider()` — SunJCE, which is where HotSpot resolves
+/// every `PBKDF2With*` and `PBEWith*` factory.
+pub(crate) fn pbkdf2_get_provider(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
+    Ok(Some(Value::Object(Some(p))))
 }
 
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.
@@ -15966,9 +16023,22 @@ pub(crate) fn pbkdf2_generate_secret(
         _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
     };
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
+    //
+    // The comment said `"PBKDF2With…"` but the literal was the bare `"PBKDF2"`,
+    // so `generateSecret(...).getAlgorithm()` answered `PBKDF2` where HotSpot
+    // answers the full `PBKDF2WithHmacSHA256`. Callers that re-key a `Mac` or
+    // `Cipher` from the derived key's own algorithm name — the reason
+    // `SecretKeySpec` carries one — would then ask for an algorithm that does
+    // not exist. Use the name `getInstance` was actually called with.
     let key_arr = make_byte_array(ctx, &dk);
     let kpin = ctx.pin_native_root(key_arr);
-    let algo_s = ctx.create_string("PBKDF2");
+    let requested = skf_algo_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| "PBKDF2".to_string());
+    let algo_s = ctx.create_string(&requested);
     let key_arr_r = ctx.read_native_pin(kpin, key_arr);
     let sk = ctx.new_object_initialized(
         "javax/crypto/spec/SecretKeySpec",

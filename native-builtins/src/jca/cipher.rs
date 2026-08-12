@@ -3543,6 +3543,135 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(empty))))
     });
 
+    // update(ByteBuffer,ByteBuffer)I — same "buffered until doFinal" contract as
+    // `update([B)[B` above: drain the input's remaining bytes into the
+    // accumulator and write nothing, so this returns 0.
+    //
+    // Left unregistered, the real JDK body ran against a `Cipher` whose real
+    // instance fields no `getInstance` ever wrote and threw
+    // `IllegalStateException: Cipher not initialized` on a cipher that
+    // `init` + `doFinal` had just used successfully — the same species as
+    // `Mac.doFinal([BI)V` (see `phases_late::ssl_security`). Netty and the JDK's
+    // own `SSLEngine` paths use the ByteBuffer overloads.
+    r.register(
+        cipher,
+        "update",
+        "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(input))) = args.get(1).cloned() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let remaining = match ctx.invoke_virtual(input, "remaining", "()I", &[])? {
+                Some(Value::Int(n)) if n > 0 => n as usize,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, remaining);
+            // Bulk get consumes the input and advances position → limit, which
+            // is what `Cipher.update(ByteBuffer,ByteBuffer)` promises.
+            ctx.invoke_virtual(
+                input,
+                "get",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[Value::Object(Some(tmp))],
+            )?;
+            let bytes = read_bytes(ctx, tmp);
+            let tkey = obj_key(ctx, this);
+            with_table_write(|t| {
+                if let Some(s) = t.get_mut(&tkey) {
+                    s.accumulated.extend_from_slice(&bytes);
+                }
+            });
+            Ok(Some(Value::Int(0)))
+        },
+    );
+
+    // doFinal(ByteBuffer,ByteBuffer)I — the partner of the `update` overload
+    // above. Registering only `update` would have been worse than registering
+    // neither: the input would be consumed into the accumulator and the
+    // `doFinal` that must flush it would still hit the real JDK body and throw
+    // `Cipher not initialized`, losing the plaintext silently.
+    r.register(
+        cipher,
+        "doFinal",
+        "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(Value::Object(Some(input))) = args.get(1).cloned() {
+                if let Some(Value::Int(n)) = ctx.invoke_virtual(input, "remaining", "()I", &[])? {
+                    if n > 0 {
+                        let tmp =
+                            ctx.new_array(cratonvm_types::ArrayElementType::Byte, n as usize);
+                        ctx.invoke_virtual(
+                            input,
+                            "get",
+                            "([B)Ljava/nio/ByteBuffer;",
+                            &[Value::Object(Some(tmp))],
+                        )?;
+                        let bytes = read_bytes(ctx, tmp);
+                        let tkey = obj_key(ctx, this);
+                        with_table_write(|t| {
+                            if let Some(s) = t.get_mut(&tkey) {
+                                s.accumulated.extend_from_slice(&bytes);
+                            }
+                        });
+                    }
+                }
+            }
+            let out_bytes = match cipher_do_final_impl(ctx, this)? {
+                Some(Value::Object(Some(a))) => read_bytes(ctx, a),
+                // Same reasoning as `doFinal([BII[B)I`: this impl returns either
+                // `Err` or a real byte[], so any other shape is an unexpected
+                // state, not a legitimately empty ciphertext. Refusing beats
+                // reporting "0 bytes written" as success.
+                other => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: format!(
+                            "Cipher.doFinal produced no output buffer ({other:?}); \
+                             refusing to report 0 bytes written as success"
+                        ),
+                    }
+                    .into());
+                }
+            };
+            let Some(Value::Object(Some(output))) = args.get(2).cloned() else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("output ByteBuffer is null".to_string()),
+                }
+                .into());
+            };
+            let written = out_bytes.len();
+            if written > 0 {
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, written);
+                ctx.write_byte_array_from(arr, 0, &out_bytes);
+                // Through the buffer's own `put`, so heap and DIRECT buffers take
+                // one path and the position advances as the contract requires.
+                ctx.invoke_virtual(
+                    output,
+                    "put",
+                    "([B)Ljava/nio/ByteBuffer;",
+                    &[Value::Object(Some(arr))],
+                )?;
+            }
+            Ok(Some(Value::Int(written as i32)))
+        },
+    );
+
+    // getProvider()Ljava/security/Provider; — the real body opens
+    // `synchronized (lock)` on a field this synthetic never wrote, so it threw
+    // `NullPointerException: Cannot enter synchronized block because
+    // "this.lock" is null` on a Cipher that encrypts and decrypts correctly.
+    r.register(
+        cipher,
+        "getProvider",
+        "()Ljava/security/Provider;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
+            Ok(Some(Value::Object(Some(p))))
+        },
+    );
+
     r.register(cipher, "updateAAD", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(aad_input))) = args.get(1) {
@@ -3704,6 +3833,26 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             "generateSecret",
             "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
             crate::phases_early::pbkdf2_generate_secret,
+        );
+        // `getAlgorithm`/`getProvider` must be registered HERE, not only beside
+        // the identical trio in `phases_early::register_phase53_natives`: that
+        // registrar is reached only from `register_synthetic_overrides`, which
+        // is `#[cfg(feature = "synthetic-jdk")]`. THIS module is the copy that
+        // runs in the default real-JDK mode — which is why the phase-53 pair
+        // alone left `getProvider()` still throwing `NullPointerException:
+        // Cannot enter synchronized block because "this.lock" is null` on a
+        // real-JDK run. An inert registration looks exactly like a missing one.
+        r.register(
+            skf,
+            "getAlgorithm",
+            "()Ljava/lang/String;",
+            crate::phases_early::pbkdf2_get_algorithm,
+        );
+        r.register(
+            skf,
+            "getProvider",
+            "()Ljava/security/Provider;",
+            crate::phases_early::pbkdf2_get_provider,
         );
     }
 

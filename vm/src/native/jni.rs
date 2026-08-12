@@ -2181,7 +2181,7 @@ extern "C" fn jni_find_class(_env: JNIEnv, name: *const c_char) -> JClass {
     };
     with_shared_vm(|shared| {
         let class_id = shared.load_class_concurrent(name_str).ok()?;
-        Some(class_id.as_u32() as JClass)
+        Some(class_id_to_jclass(class_id))
     })
     .flatten()
     .unwrap_or(0)
@@ -2196,7 +2196,7 @@ extern "C" fn jni_get_superclass(_env: JNIEnv, clazz: JClass) -> JClass {
         let class_id = ClassId::new(clazz as u32);
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
-        class.superclass.map(|sc| sc.as_u32() as JClass)
+        class.superclass.map(class_id_to_jclass)
     })
     .flatten()
     .unwrap_or(0)
@@ -2380,15 +2380,110 @@ extern "C" fn jni_pop_local_frame(_env: JNIEnv, result: JObject) -> JObject {
     pop_local_frame(result)
 }
 
+/// Tag bit that lifts a `ClassId` out of the range where `0` means JNI NULL.
+///
+/// **The defect this closes.** A `jclass` in this table IS a `ClassId` — that is
+/// what `FindClass` returns and what `GetSuperclass`, `GetFieldID`,
+/// `RegisterNatives` and eighteen others decode with `ClassId::new(clazz as
+/// u32)`. But `jclass` is a `jobject`, and in JNI a NULL `jobject` means
+/// *failure*. So whichever class happened to be `ClassId(0)` was unreachable
+/// through `FindClass`: the call returned 0 and every caller read it as "no such
+/// class".
+///
+/// `java.lang.Object` is the first class this VM loads, so `ClassId(0)` is
+/// `java.lang.Object` — the one class essentially every JNI library asks for
+/// first. Measured with a C probe calling `FindClass` from both `JNI_OnLoad` and
+/// a registered native: `FindClass(java/lang/Object) = (nil)` on both, against
+/// a live handle on HotSpot.
+///
+/// Downstream that surfaced as nothing resembling a JNI defect. JNA's
+/// `libjnidispatch` aborts its id cache with `JNA: Problems loading core IDs:
+/// java.lang.Object`, then never caches `classString`/`MID_String_init`, so
+/// every `jstring` it later builds is NULL — and `com.sun.jna.Native.<clinit>`
+/// dies on `NullPointerException: Cannot invoke "String.split(String)" because
+/// "nativeVersion" is null`, which reads like a JNA/version problem.
+///
+/// **Why a HIGH tag and not a +1 bias.** The tag lives entirely above bit 31, so
+/// the low 32 bits stay exactly the `ClassId` and all twenty-one existing
+/// `ClassId::new(clazz as u32)` decode sites keep working untouched — the
+/// truncation discards the tag. A bias would have needed every one of them
+/// changed in lockstep, and a single missed site would silently decode the WRONG
+/// class rather than fail.
+///
+/// **Why these particular bits.** Bits 48-62 are set, which no x86-64 or AArch64
+/// user-space pointer can have (canonical user addresses are below
+/// `0x0000_8000_0000_0000`). So a tagged `jclass` cannot be mistaken for either
+/// of the two object-handle encodings — a raw heap pointer or a tagged
+/// `Box<ObjectRef>` — and [`is_jclass_handle`] is an exact test rather than a
+/// guess that has to be tried second.
+const JCLASS_TAG: JObject = 0x7F51_0000_0000_0000;
+
+/// Mask selecting the tag half of a `jclass` handle.
+const JCLASS_TAG_MASK: JObject = 0xFFFF_FFFF_0000_0000;
+
+/// Encode a `ClassId` as the `jclass` handle native code receives.
+pub fn class_id_to_jclass(id: ClassId) -> JClass {
+    (id.as_u32() as JObject) | JCLASS_TAG
+}
+
+/// Does this handle carry the `jclass` encoding at all? Cheap, allocation-free
+/// and lock-free — no class-manager lookup, so it is safe to consult FIRST, in
+/// paths that would otherwise log a spurious "not found in global ref table".
+fn is_jclass_handle(h: JObject) -> bool {
+    h & JCLASS_TAG_MASK == JCLASS_TAG
+}
+
+/// Is this handle a `jclass` (as produced by [`class_id_to_jclass`]) naming a
+/// live class?
+///
+/// A confirmed class is its own permanent reference: classes are never unloaded
+/// here, so "a global ref to a class" is the same handle again. That identity is
+/// what makes the round trip work, because native code stores the RESULT of
+/// `NewGlobalRef`/`NewWeakGlobalRef` and later passes it back as a `jclass` to
+/// `GetMethodID`/`NewObject`.
+fn jclass_id_handle(h: JObject) -> bool {
+    if !is_jclass_handle(h) {
+        return false;
+    }
+    with_shared_vm(|shared| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(ClassId::new(h as u32))
+            .is_some()
+    })
+    .unwrap_or(false)
+}
+
 // ---- Index 22: NewGlobalRef ----
 extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
         return 0;
     }
+    // A `jclass` is checked FIRST: it is an exact, lock-free bit test
+    // (`is_jclass_handle`), and routing it through `jobject_to_obj` would log a
+    // spurious "handle … not found in global ref table" for every odd ClassId.
+    if jclass_id_handle(obj) {
+        return obj;
+    }
     // Resolve the object whether it's a local ref or another global ref.
     let oref = match jobject_to_obj(obj) {
         Some(r) => r,
-        None => return 0,
+        None => {
+            // `NewGlobalRef(FindClass(env, "..."))` is the first thing almost
+            // every `JNI_OnLoad` does, and a `jclass` here is a raw `ClassId`,
+            // not an object handle — so this returned 0 and the library
+            // concluded the JVM had no `java.lang.Object`. Measured on JNA
+            // 5.13.0: `libjnidispatch`'s init prints `JNA: Problems loading
+            // core IDs: java.lang.Object`, gives up caching `classString` /
+            // `MID_String_init`, and every later `jstring` it builds is NULL —
+            // surfacing as `Native.<clinit>` throwing
+            // `NullPointerException: Cannot invoke "String.split(String)"
+            // because "nativeVersion" is null`, which reads like a missing JNA
+            // feature and is in fact a dead JNI primitive.
+            return 0;
+        }
     };
     with_shared_vm(|shared| {
         let handle = shared.natives.jni_global_refs.lock().add(oref);
@@ -2406,6 +2501,12 @@ extern "C" fn jni_delete_global_ref(_env: JNIEnv, gref: JObject) {
     if gref == 0 || gref & 1 == 0 {
         return; // not a global ref handle
     }
+    // A `jclass` handed back from `NewGlobalRef` above can have bit 0 set (it is
+    // the low bit of the ClassId). Deleting it must be a no-op — the class
+    // outlives every ref to it — and must not disturb the ref table.
+    if is_jclass_handle(gref) {
+        return;
+    }
     with_shared_vm(|shared| {
         shared.natives.jni_global_refs.lock().remove(gref);
     });
@@ -2418,6 +2519,14 @@ extern "C" fn jni_delete_local_ref(_env: JNIEnv, lref: JObject) {
 
 // ---- Index 25: IsSameObject ----
 extern "C" fn jni_is_same_object(_env: JNIEnv, a: JObject, b: JObject) -> JBoolean {
+    // A `jclass` does not resolve through `jobject_to_obj` (it is a tagged
+    // `ClassId`, see `JCLASS_TAG`), so both sides fell into the
+    // `(None, None) => JNI_TRUE` arm and EVERY pair of distinct classes
+    // compared equal. Class handles are canonical — the same class always
+    // yields the same tagged id — so compare them directly.
+    if is_jclass_handle(a) || is_jclass_handle(b) {
+        return if a == b { JNI_TRUE } else { JNI_FALSE };
+    }
     // Resolve both sides through the global-ref layer so that comparing a
     // local ref and a global ref to the same object returns true.
     match (jobject_to_obj(a), jobject_to_obj(b)) {
@@ -2429,6 +2538,12 @@ extern "C" fn jni_is_same_object(_env: JNIEnv, a: JObject, b: JObject) -> JBoole
 
 // ---- Index 26: NewLocalRef ----
 extern "C" fn jni_new_local_ref(_env: JNIEnv, obj: JObject) -> JObject {
+    // A `jclass` is permanent and canonical; handing back a "local ref" to it
+    // means handing back the same tagged id. Resolving it as an object would
+    // yield 0 and lose the class.
+    if is_jclass_handle(obj) {
+        return obj;
+    }
     // Resolve to a raw local-ref pointer (unwrap global-ref tag if present).
     match jobject_to_obj(obj) {
         Some(oref) => {
@@ -2453,7 +2568,7 @@ extern "C" fn jni_get_object_class(_env: JNIEnv, obj: JObject) -> JClass {
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let class_id = shared.mem.heap.class_id_of(oref);
-        Some(class_id.as_u32() as JClass)
+        Some(class_id_to_jclass(class_id))
     })
     .flatten()
     .unwrap_or(0)
@@ -4213,7 +4328,7 @@ extern "C" fn jni_define_class(
                     n.to_string(),
                 ));
         }
-        Some(cid.as_u32() as JClass)
+        Some(class_id_to_jclass(cid))
     })
     .flatten();
 
@@ -4792,6 +4907,12 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
         return 0;
     }
+    // Same `jclass`-is-a-ClassId round trip as `NewGlobalRef` — and this is the
+    // overload JNA's `LOAD_CREF` actually calls, so it is the one that decided
+    // whether `com.sun.jna.Native` could initialise at all.
+    if jclass_id_handle(obj) {
+        return obj;
+    }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let mut refs = shared.natives.jni_global_refs.lock();
@@ -4804,6 +4925,10 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
 // ---- Index 227: DeleteWeakGlobalRef ----
 extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
     if wref == 0 {
+        return;
+    }
+    // A class handle is permanent; dropping it is a no-op (see DeleteGlobalRef).
+    if is_jclass_handle(wref) {
         return;
     }
     with_shared_vm(|shared| {
@@ -4819,6 +4944,13 @@ extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
 extern "C" fn jni_get_object_ref_type(_env: JNIEnv, obj: JObject) -> JInt {
     if obj == 0 {
         return 0; // JNIInvalidRefType
+    }
+    // A `jclass` handle carries `JCLASS_TAG`, not the global-ref bit-0 tag, and
+    // its low bit is just the low bit of the ClassId — so without this it
+    // answered global-or-local at random per class. `FindClass` hands back a
+    // local ref on HotSpot.
+    if is_jclass_handle(obj) {
+        return 1; // JNILocalRefType
     }
     if obj & 1 == 1 {
         2 // JNIGlobalRefType (global or weak — we treat weak as global)
@@ -6016,9 +6148,10 @@ extern "C" fn jni_register_natives(
     }
 
     // A `JClass` in this table IS a `ClassId` — that is what `FindClass`
-    // returns (`class_id.as_u32() as JClass`) and what GetSuperclass,
-    // IsAssignableFrom, GetFieldID, CallStaticXxxMethod and a dozen others
-    // decode with `ClassId::new(clazz as u32)`.
+    // returns (`class_id_to_jclass`, a `ClassId` in the low 32 bits under
+    // `JCLASS_TAG`) and what GetSuperclass, IsAssignableFrom, GetFieldID,
+    // CallStaticXxxMethod and a dozen others decode with
+    // `ClassId::new(clazz as u32)` — the truncation drops the tag.
     //
     // This function decoded it as an OBJECT HANDLE instead, which is the one
     // convention `FindClass` never produces. Every odd-numbered ClassId took
@@ -7186,7 +7319,7 @@ extern "C" fn jni_is_virtual_thread(env: JNIEnv, obj: JObject) -> JBoolean {
     })
     .flatten();
     match base {
-        Some(b) => jni_is_assignable_from(env, clazz, b.as_u32() as JClass),
+        Some(b) => jni_is_assignable_from(env, clazz, class_id_to_jclass(b)),
         None => JNI_FALSE,
     }
 }
@@ -8299,7 +8432,7 @@ mod tests {
         set_jni_context(&vm.shared);
         set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
-            jni_throw_new(get_jni_env(), class_id.as_u32() as JClass, message.as_ptr(),),
+            jni_throw_new(get_jni_env(), class_id_to_jclass(class_id), message.as_ptr(),),
             JNI_OK
         );
 
@@ -9882,6 +10015,46 @@ mod tests {
             unsafe { *(*env).add(233) },
             jni_get_module as *const () as usize,
             "slot 233 (GetModule)"
+        );
+    }
+
+    /// A `jclass` must never be 0, because in JNI a NULL `jobject` means
+    /// FAILURE.
+    ///
+    /// The encoding was the bare `ClassId`, so `ClassId(0)` — the FIRST class
+    /// the VM loads, i.e. `java.lang.Object` — was unreachable through
+    /// `FindClass`: the call returned 0 and every native library read it as
+    /// "no such class". Measured with a C probe:
+    /// `FindClass(java/lang/Object) = (nil)` from both `JNI_OnLoad` and a
+    /// registered native, against a live handle on HotSpot.
+    ///
+    /// The tag also has to stay TRANSPARENT to the twenty-one decode sites that
+    /// read a `jclass` as `ClassId::new(clazz as u32)`.
+    #[test]
+    fn jclass_encoding_is_never_null_and_survives_the_u32_decode() {
+        for raw in [0u32, 1, 2, 255, 0x7fff_ffff, u32::MAX] {
+            let handle = class_id_to_jclass(ClassId::new(raw));
+            assert_ne!(
+                handle, 0,
+                "ClassId({raw}) encoded to a NULL jclass — FindClass would report \
+                 'no such class' for it"
+            );
+            assert_eq!(
+                handle as u32,
+                raw,
+                "the tag must vanish under the `clazz as u32` decode every \
+                 jclass consumer uses"
+            );
+            assert!(is_jclass_handle(handle), "the tag must be present");
+            assert!(
+                handle > 0x0000_8000_0000_0000,
+                "the tag must sit above every canonical user-space address, so a                  jclass can never be confused with a heap pointer"
+            );
+        }
+        // Distinct classes must stay distinct handles.
+        assert_ne!(
+            class_id_to_jclass(ClassId::new(0)),
+            class_id_to_jclass(ClassId::new(1))
         );
     }
 

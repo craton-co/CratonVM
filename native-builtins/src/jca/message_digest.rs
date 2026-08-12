@@ -483,17 +483,9 @@ fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// the layout-aware path from `provider_chain::make_provider` (set fields
 /// by name so the real-JDK class layout is honoured).
 fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
-    let name = ctx.create_string("SUN");
-    let info = ctx.create_string("SUN security provider (cratonvm)");
-    let ver_str = ctx.create_string("25");
-    ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
-    ctx.set_field_by_name(p, "version", Value::Double(25.0));
-    ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
-    ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
-    ctx.set_field(p, 0, Value::Object(Some(name)));
-    ctx.set_field(p, 1, Value::Double(25.0));
-    ctx.set_field(p, 2, Value::Object(Some(info)));
+    // Shared with `Mac`, `SecretKeyFactory` and `Signature` — this was the
+    // original of that object shape and three copies had accreted from it.
+    let p = crate::jca::make_named_provider(ctx, "SUN")?;
     Ok(Some(Value::Object(Some(p))))
 }
 

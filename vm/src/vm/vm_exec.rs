@@ -25100,9 +25100,18 @@ fn invoke_on_class_shared_inner(
             // returned NULL" sentinel (-1) where HotSpot returned 27.
             //
             // The encoding is the one the rest of this JNI table uses for a
-            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
+            // `JClass`: `class_id_to_jclass`, exactly what `FindClass` hands
+            // back. It must go through that helper and not `as u32`: a bare
+            // `ClassId` of 0 IS JNI NULL, and an untagged one is not
+            // recognisable as a class by `NewGlobalRef`. JNA's `initIDs` does
+            // `NewGlobalRef(cls)` on precisely this argument and reported
+            // `UnsatisfiedLinkError: Can't obtain global reference for class
+            // com.sun.jna.Native` when the two encodings disagreed.
             let (receiver, call_args) = if is_static {
-                (declaring_class_id.as_u32() as u64, args)
+                (
+                    crate::native::jni::class_id_to_jclass(declaring_class_id),
+                    args,
+                )
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),
@@ -25202,9 +25211,18 @@ fn invoke_on_class_shared_inner(
             // returned NULL" sentinel (-1) where HotSpot returned 27.
             //
             // The encoding is the one the rest of this JNI table uses for a
-            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
+            // `JClass`: `class_id_to_jclass`, exactly what `FindClass` hands
+            // back. It must go through that helper and not `as u32`: a bare
+            // `ClassId` of 0 IS JNI NULL, and an untagged one is not
+            // recognisable as a class by `NewGlobalRef`. JNA's `initIDs` does
+            // `NewGlobalRef(cls)` on precisely this argument and reported
+            // `UnsatisfiedLinkError: Can't obtain global reference for class
+            // com.sun.jna.Native` when the two encodings disagreed.
             let (receiver, call_args) = if is_static {
-                (declaring_class_id.as_u32() as u64, args)
+                (
+                    crate::native::jni::class_id_to_jclass(declaring_class_id),
+                    args,
+                )
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),

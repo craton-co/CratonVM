@@ -8845,6 +8845,60 @@ mod cert_verify_bounds_security_tests {
         assert!(!bad(0, 0, 0));
     }
 
+    /// Every PUBLIC method of `javax.crypto.Mac` must be registered — not most
+    /// of them.
+    ///
+    /// `Mac` keeps its state off-object in `mac_state_table`, so the real
+    /// instance fields (`initialized`, `spi`, `provider`, `lock`) are never
+    /// written. An overload left unregistered therefore runs the REAL JDK body
+    /// against uninitialised state and throws `IllegalStateException("MAC not
+    /// initialized")` — on a Mac that `init` + `update` + `doFinal()` just
+    /// demonstrated works.
+    ///
+    /// That is exactly how `doFinal([BI)V` went missing: it broke every
+    /// SCRAM-SHA-256 login (hibernate-reactive / Vert.x reactive Postgres saw
+    /// `FATAL: expected SASL response, got message type 88` — 88 is 'X', the
+    /// client sending Terminate after `com.ongres.scram`'s PBKDF2 loop died on
+    /// iteration 2 of 4096), while every other Mac caller in the tree stayed
+    /// green. A per-descriptor census is the only thing that catches the next
+    /// one.
+    #[test]
+    fn every_public_mac_method_is_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_p68_crypto_mac(&mut r);
+        for (name, desc) in [
+            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;"),
+            (
+                "getInstance",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+            ),
+            ("getAlgorithm", "()Ljava/lang/String;"),
+            ("getProvider", "()Ljava/security/Provider;"),
+            ("getMacLength", "()I"),
+            ("init", "(Ljava/security/Key;)V"),
+            (
+                "init",
+                "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+            ),
+            ("update", "(B)V"),
+            ("update", "([B)V"),
+            ("update", "([BII)V"),
+            ("update", "(Ljava/nio/ByteBuffer;)V"),
+            ("doFinal", "()[B"),
+            ("doFinal", "([B)[B"),
+            ("doFinal", "([BI)V"),
+            ("reset", "()V"),
+            ("clone", "()Ljava/lang/Object;"),
+        ] {
+            assert!(
+                r.find("javax/crypto/Mac", name, desc).is_some(),
+                "javax/crypto/Mac.{name}{desc} is not registered — it will run the \
+                 real JDK body against never-initialised instance fields and throw \
+                 \"MAC not initialized\""
+            );
+        }
+    }
+
     #[test]
     fn mac_and_zip_byterange_natives_remain_registered() {
         let mut r = NativeMethodRegistry::new();
