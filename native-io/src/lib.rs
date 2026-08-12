@@ -7331,12 +7331,12 @@ pub static BB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
         origin: "native-io/src/lib.rs BB_FIELD_*",
     };
 
-// FileChannel layout: 2-field synthetic, on a class that declares FOUR.
-//
-// MEASURED AND DELIBERATELY LEFT — W7-68-live-under-allocations.md. Recorded
-// here rather than only in that record, so the next reader does not redo the
-// analysis and, in particular, does not "fix" it the obvious way and break the
-// live path.
+// FileChannel: the private `{fd, position}` map used to be slots 0 and 1 of a
+// class that declares FOUR, and it MOVED — W7-72-ssc-socket-and-filechannel.md.
+// It now lives above every declared field,
+// owned by `cratonvm_native_api::synthetic_file_channel`, which both this crate
+// and `native-builtins` call. The constants that used to sit here are gone on
+// purpose: a map with two owners drifts, and two crates owned this one.
 //
 // `javap -p java.nio.channels.FileChannel` on JDK 25.0.3.9 gives the
 // transitive order
@@ -7345,33 +7345,25 @@ pub static BB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
 //     2 interruptor (Interruptible) 3 interruptedTarget (Object, volatile)
 //
 // all four inherited from `java.nio.channels.spi.AbstractInterruptibleChannel`.
-// So the fd is an `Int` in `closeLock` and the file position is a `Long` in
-// `closed`. The object is NOT short — the base allocator clamps
-// `slots = requested.max(declared)` — it is mis-mapped.
+// So the fd was an `Int` in `closeLock` — a reference-typed slot, where
+// `gc::coerce_field_value_by_descriptor` degrades it to null, so the fd never
+// persisted at all in real-JDK mode — and the file position was a `Long` in
+// `closed`, the boolean `AbstractInterruptibleChannel.isOpen()` returns the
+// negation of. The object was never SHORT (the base allocator clamps
+// `slots = requested.max(declared)`); it was mis-mapped.
 //
-// It is nevertheless not live corruption, and the reason is registration, not
-// luck: every reader of those two fields on this class is a native.
-// `AbstractInterruptibleChannel.isOpen()` — the one that would otherwise read
-// `closed` and report a channel CLOSED as soon as its position moved off zero
-// — is registered TWICE in `native-builtins/src/phases_late/nio_file.rs`, and
-// both copies screen on the exact class name; the surviving one then reads
-// slot 0 as the fd, agreeing with this map. `close()` is registered here
-// (`native_fc_close`, which screens the same way). `begin()`/`end()` are
-// `protected final` and are only called by an implementation subclass, which
-// this object is not. `sun.nio.ch.FileChannelImpl` declares every other
-// registered method itself with `Code`, so a real channel never resolves here.
-//
-// **That agreement is exactly why this is not repaired.** Moving these two onto
-// the appended-slot idiom — the fix `java/nio/MappedByteBuffer` got in the same
-// lane — would silently break `nio_file.rs`'s `isOpen`, which reads
-// `get_field(this, 0)` and answers `fd_id >= 0`: after the move slot 0 is
-// `closeLock`, `as_int()` gives `None`, and `isOpen()` would start answering
-// FALSE for every open channel. Two crates share this map, so it has to move in
-// one step, and which of the three registrations wins is a last-write-wins
-// question that needs a build. This is W7-49 §5's rule in the live direction: a
-// one-sided renumber only moves the disagreement.
-const FC_FIELD_FD: usize = 0; // Int file descriptor id
-const FC_FIELD_POS: usize = 1; // Long position in file
+// W7-68-live-under-allocations.md left this alone on the reading that
+// `nio_file.rs`'s surviving `isOpen` reads slot 0 as the fd, so moving the map
+// would make `isOpen()` answer FALSE for every open channel. **That reading of
+// which registration survives is inverted** — see
+// W7-72-ssc-socket-and-filechannel.md for the ordering, established by reading
+// `vm_init.rs`'s two arms: the copy that reads slot 0 is registered only from
+// `register_phase57_file_channel`, which is reachable only through
+// `register_synthetic_overrides` (`#[cfg(feature = "synthetic-jdk")]`) and is
+// overwritten even there. The winner in every configuration is the copy that
+// never reads a private slot. Its body now answers `!closed` on both arms, so
+// the two registrations agree and the last-write-wins outcome stops mattering
+// for that triple.
 
 // RA.1: When a real JDK `java.nio.Buffer` (or subclass) is loaded, its
 // declared-field order is `mark, position, limit, capacity, address` on
@@ -9565,12 +9557,17 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
     })?;
 
+    // The width and the accessors' base come from ONE function
+    // (`synthetic_file_channel`), so the allocator and every reader cannot
+    // disagree about where the private map starts. `alloc_object` still clamps
+    // UP, so the declared fields are always present too.
+    let fc_slots = cratonvm_native_api::synthetic_file_channel::alloc_slots(ctx);
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
-        Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
+        Ok(cid) => ctx.alloc_object(cid, fc_slots),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), fc_slots),
     };
-    ctx.set_field(fc, FC_FIELD_FD, Value::Int(fd_id as i32));
-    ctx.set_field(fc, FC_FIELD_POS, Value::Long(0));
+    cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, fc, Value::Int(fd_id as i32));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, fc, Value::Long(0));
     Ok(Some(Value::Object(Some(fc))))
 }
 
@@ -9583,8 +9580,8 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -9612,11 +9609,11 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     buf_set_position(ctx, bb, pos + n as i32);
     // Update file position
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -9629,8 +9626,8 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(0))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -9652,11 +9649,11 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.fd_table().write_bytes(fd_id, &buf).map_err(io_err)?;
     let n = buf.len();
     buf_set_position(ctx, bb, pos + n as i32);
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -9665,7 +9662,7 @@ fn native_fc_position(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -9681,7 +9678,7 @@ fn native_fc_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(new_pos));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_pos));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -9690,8 +9687,8 @@ fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
     // Simplified: return 0 (a full impl would query the underlying file)
@@ -9751,11 +9748,21 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(None);
     }
 
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(None),
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
+        _ => {
+            // Still flip `closed`: an already-fd-less synthetic channel is
+            // closed, and `isOpen()` reads that field on both receiver kinds.
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            return Ok(None);
+        }
     };
     let _ = ctx.fd_table().close(fd_id);
+    cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, this, Value::Int(-1));
+    // The real `AbstractInterruptibleChannel.closed`, which is what every
+    // `isOpen()` — ours and the JDK's — answers the negation of. It could not be
+    // used while the file position aliased it; W7-72-ssc-socket-and-filechannel.md.
+    ctx.set_field_by_name(this, "closed", Value::Int(1));
     Ok(None)
 }
 
@@ -16597,8 +16604,8 @@ fn release_file_lock(token: i64) {
 
 /// Extract the FdId from a FileChannel `this`. Returns 0 if the channel
 /// has no associated fd (e.g. synthetic mode without a real open).
-fn fd_from_file_channel(ctx: &dyn NativeContext, fc: ObjectRef) -> i64 {
-    match ctx.get_field(fc, FC_FIELD_FD) {
+fn fd_from_file_channel(ctx: &mut dyn NativeContext, fc: ObjectRef) -> i64 {
+    match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, fc) {
         Value::Int(v) => v as i64,
         Value::Long(v) => v,
         _ => 0,
@@ -17173,8 +17180,8 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         .into());
     }
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => {
             return Err(RuntimeError::IOException {
                 message: "FileChannel.map: invalid fd".into(),
@@ -17338,8 +17345,8 @@ fn native_fc_force_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(None),
     };
     let _ = ctx.fd_table().flush(fd_id);
@@ -17359,12 +17366,12 @@ fn native_fc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
     if fc_pos > new_size {
-        ctx.set_field(this, FC_FIELD_POS, Value::Long(new_size));
+        cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_size));
     }
     Ok(Some(Value::Object(Some(this))))
 }

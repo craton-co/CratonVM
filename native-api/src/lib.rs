@@ -64,6 +64,11 @@ pub mod read_alias;
 pub mod registry;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
+/// The synthetic `java.nio.channels.FileChannel` private slot map. Lives here,
+/// not in a native crate, because `native-io` and `native-builtins` both own
+/// accessors for it and a map with two owners drifts —
+/// W7-72-ssc-socket-and-filechannel.md.
+pub mod synthetic_file_channel;
 pub mod vm_scoped;
 
 /// Lightweight `NativeContext` mock available to tests and to other
