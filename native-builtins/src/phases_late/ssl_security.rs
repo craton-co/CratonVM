@@ -771,7 +771,7 @@ fn mac_normalise(algo: &str) -> String {
 ///
 /// The block size was the stated obstacle, and `hmac::Hmac<D>` removes it: it
 /// reads the size from `D::BlockSize`, so none of 64 / 128 / 144 / 136 / 104 /
-/// 72 is written down here at all. See `hmac_via_crate`.
+/// 72 is written down here at all. See `hmac_over_digest!`.
 ///
 /// The pairing with the advertised list is a RATCHET, not a restatement:
 /// `provider_chain::every_advertised_sunjce_mac_is_computable` derives the list
@@ -843,50 +843,22 @@ pub(crate) fn mac_compute_hmac(algo: &str, key: &[u8], data: &[u8]) -> Option<Ve
         // `/` survives `mac_normalise` on purpose: these two differ ONLY by the
         // suffix and have distinct initial values, so collapsing them would
         // serve one for the other.
-        "HMACSHA512/224" => Some(hmac_via_crate::<sha2::Sha512_224>(key, data)),
-        "HMACSHA512/256" => Some(hmac_via_crate::<sha2::Sha512_256>(key, data)),
-        "HMACSHA3224" => Some(hmac_via_crate::<sha3::Sha3_224>(key, data)),
-        "HMACSHA3256" => Some(hmac_via_crate::<sha3::Sha3_256>(key, data)),
-        "HMACSHA3384" => Some(hmac_via_crate::<sha3::Sha3_384>(key, data)),
-        "HMACSHA3512" => Some(hmac_via_crate::<sha3::Sha3_512>(key, data)),
+        "HMACSHA512/224" => Some(hmac_sha512_224(key, data)),
+        "HMACSHA512/256" => Some(hmac_sha512_256(key, data)),
+        "HMACSHA3224" => Some(hmac_sha3_224(key, data)),
+        "HMACSHA3256" => Some(hmac_sha3_256(key, data)),
+        "HMACSHA3384" => Some(hmac_sha3_384(key, data)),
+        "HMACSHA3512" => Some(hmac_sha3_512(key, data)),
         _ => None,
     }
 }
 
-/// HMAC-SHA-224 (RFC 2104 over FIPS 180-4 SHA-224).
+/// Define an RFC 2104 HMAC over one `digest` hash, with the block size taken
+/// from the hash type rather than written down.
 ///
-/// The other five arms of `mac_compute_hmac` route to `crate::hmac_*`, which
-/// pass a hand-written `block_size` to `crate::hmac_generic`. This one does not,
-/// and the difference is the point: SHA-224's HMAC block is 64 bytes — its
-/// *input* block — not 28, its digest size, and not 128, which SHA-384/512 use.
-/// Every wrong answer there is plausible, and a wrong block size produces a MAC
-/// that is self-consistent and interoperates with nothing. `hmac::Hmac<D>` reads
-/// it from `D::BlockSize`, so the constant is never written down here at all —
-/// see [`hmac_via_crate`], which is this function generalised over the six other
-/// digests that needed the same treatment.
-///
-/// `crate::compute_digest` already reaches for `sha2::Sha224` for
-/// `MessageDigest.getInstance("SHA-224")` for the same reason its comment gives:
-/// the hand-rolled `crypto_impl` SHA-256 code does not cover the 224-bit
-/// variant. Using the same crate keeps `MessageDigest.SHA-224` and
-/// `Mac.HmacSHA224` on one implementation of one primitive.
-///
-/// Measured on jdk-25.0.3.9-hotspot, not recalled — see the vectors in
-/// `mac_kats_match_hotspot_25`, including a 200-byte key, which is the case that
-/// exercises the "key longer than the block gets hashed first" branch where a
-/// wrong block size first shows up.
-fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_via_crate::<sha2::Sha224>(key, data)
-}
-
-/// RFC 2104 HMAC over any `digest` hash, with the block size taken from the hash
-/// type rather than written down.
-///
-/// This is the generalisation of `hmac_sha224` above, and it exists because the
-/// same reasoning applies six more times. `Mac.getInstance` serves
-/// `HmacSHA512/224`, `HmacSHA512/256` and the four `HmacSHA3-*` through this,
-/// and each one has a block size that is neither its digest size nor a family
-/// default:
+/// This is `hmac_sha224` above generalised, and it exists because the same
+/// reasoning applies six more times. Each of these has a block size that is
+/// neither its digest size nor a family default:
 ///
 /// * the SHA-512 truncations keep SHA-512's 128-byte block, NOT the 64 their
 ///   224/256-bit output would suggest;
@@ -896,35 +868,54 @@ fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Every one of those is a number a person would plausibly get wrong, and a
 /// wrong HMAC block size yields a MAC that is perfectly self-consistent and
 /// interoperates with nothing. `hmac::Hmac<D>` reads it from `D::BlockSize`, so
-/// none of them is written down anywhere in this file. `hmac_extended_matches_hotspot`
-/// still pins all seven against measured HotSpot 25 output, including a
-/// 200-byte key — the case that exercises the "key longer than the block gets
-/// hashed first" branch, which is where a wrong block size first shows up.
-fn hmac_via_crate<D>(key: &[u8], data: &[u8]) -> Vec<u8>
-where
-    D: hmac::digest::CoreProxy,
-    D::Core: hmac::digest::HashMarker
-        + hmac::digest::core_api::UpdateCore
-        + hmac::digest::core_api::FixedOutputCore
-        + hmac::digest::core_api::BufferKindUser<BufferKind = hmac::digest::block_buffer::Eager>
-        + Default
-        + Clone,
-    <D::Core as hmac::digest::crypto_common::BlockSizeUser>::BlockSize:
-        hmac::digest::typenum::IsLess<hmac::digest::consts::U256>,
-    hmac::digest::typenum::Le<
-        <D::Core as hmac::digest::crypto_common::BlockSizeUser>::BlockSize,
-        hmac::digest::consts::U256,
-    >: hmac::digest::typenum::NonZero,
-{
-    use hmac::Mac as _;
-    // `new_from_slice` is infallible for HMAC (any key length is legal — RFC
-    // 2104 hashes an over-long key and zero-pads a short one), so the error type
-    // is uninhabited in practice; SunJCE's `HmacCore` accepts any length too.
-    let mut mac =
-        hmac::Hmac::<D>::new_from_slice(key).expect("HMAC accepts a key of any length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+/// none of them is written down anywhere in this file.
+/// `hmac_extended_matches_hotspot` still pins all seven against measured
+/// HotSpot 25 output, including a 200-byte key — the case that exercises the
+/// "key longer than the block gets hashed first" branch, which is where a wrong
+/// block size first shows up.
+macro_rules! hmac_over_digest {
+    ($name:ident, $digest:ty) => {
+        fn $name(key: &[u8], data: &[u8]) -> Vec<u8> {
+            use hmac::Mac as _;
+            // `new_from_slice` is infallible for HMAC (any key length is legal),
+            // exactly as in `hmac_sha224`.
+            let mut mac = hmac::Hmac::<$digest>::new_from_slice(key)
+                .expect("HMAC accepts a key of any length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+    };
 }
+
+// HMAC-SHA-224, and the six that followed it.
+//
+// The remaining four arms of `mac_compute_hmac` (MD5, SHA-1, SHA-256, SHA-384,
+// SHA-512) route to `crate::hmac_*`, which pass a hand-written `block_size` to
+// `crate::hmac_generic`. These do not, and the difference is the point:
+// SHA-224's HMAC block is 64 bytes — its *input* block — not 28, its digest
+// size, and not 128, which SHA-384/512 use. Every wrong answer there is
+// plausible, and a wrong block size produces a MAC that is self-consistent and
+// interoperates with nothing.
+//
+// `crate::compute_digest` already reaches for `sha2::Sha224` for
+// `MessageDigest.getInstance("SHA-224")` for the reason its comment gives: the
+// hand-rolled `crypto_impl` SHA-256 code does not cover the 224-bit variant.
+// Using the same crates keeps `MessageDigest.SHA-224` and `Mac.HmacSHA224` on
+// one implementation of one primitive — and the same for the SHA-3 family.
+//
+// Measured on jdk-25.0.3.9-hotspot, not recalled — see the vectors in
+// `mac_kats_match_hotspot_25` and `hmac_extended_matches_hotspot`, each
+// including a 200-byte key, which is the case that exercises the "key longer
+// than the block gets hashed first" branch where a wrong block size first
+// shows up.
+hmac_over_digest!(hmac_sha224, sha2::Sha224);
+
+hmac_over_digest!(hmac_sha512_224, sha2::Sha512_224);
+hmac_over_digest!(hmac_sha512_256, sha2::Sha512_256);
+hmac_over_digest!(hmac_sha3_224, sha3::Sha3_224);
+hmac_over_digest!(hmac_sha3_256, sha3::Sha3_256);
+hmac_over_digest!(hmac_sha3_384, sha3::Sha3_384);
+hmac_over_digest!(hmac_sha3_512, sha3::Sha3_512);
 
 /// Return the output length in bytes for the given HMAC algorithm, or `None`
 /// for a name this module does not implement.
