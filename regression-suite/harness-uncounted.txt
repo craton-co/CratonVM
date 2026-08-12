@@ -1,0 +1,35 @@
+# Vectors that publish no count of the assertions they executed. Guard G3 in
+# harness-guard.sh; the reasoning is in W7-60-harness-extract-blindness.md.
+#
+# WHY A COUNT IS LOAD-BEARING. A failed assertion throws, so run.sh's rc check
+# already catches it. What a count catches is the other shape: a vector that
+# SILENTLY RAN FEWER ASSERTIONS than it looks like it did. RNioNoFollow was the
+# worked example — one failed Files.createSymbolicLink made it print a bail-out
+# line and return, skipping all 27 checks, on the platform the suite is usually
+# run from. Both VMs bailed identically, so the cross-VM diff agreed and the
+# gate was green. A published count makes that a red, because the oracle's count
+# and the VM's count are different numbers.
+#
+# THIS FILE IS A RATCHET, IN BOTH DIRECTIONS. A vector here that starts
+# publishing a count is ALSO an error, so a repair is not finished until its row
+# is deleted. A baseline that only ever records "known bad" decays into a list
+# nobody re-checks; this one cannot, because clearing an entry is what makes the
+# run green again.
+#
+# Format: one class name per line, `#` to end of line is a comment.
+
+RClassUnloadSweep      # zero assertions by design: whether a weak reference has
+                       # been cleared is a GC-policy outcome, not a language
+                       # guarantee, so its single observable is diff-only and
+                       # there is no assertion population to count. See the
+                       # comment in the vector itself.
+RPriorityQueueGc       # has no `checks` counter at all — its check() helper is
+                       # a bare throw. Adding one is a real repair rather than a
+                       # print, and it belongs to a lane that can run the vector
+                       # under the --nojit --Xmx 64m reproduction conditions
+                       # class_cv_args() supplies, since the count is only
+                       # meaningful measured under them.
+RTreeRangeGc           # same: no counter, and its checkMap/checkSet helpers
+                       # assert per-element inside a walk, so "how many checks"
+                       # needs a decision about what the unit is before a number
+                       # can mean anything.
