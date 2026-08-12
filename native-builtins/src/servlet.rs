@@ -2594,11 +2594,60 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
             }
         }
     };
-    let mut stream = stream.lock();
-    match &mut *stream {
+    let mut guard = stream.lock();
+    let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.read(buf),
         #[cfg(unix)]
         TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+    };
+    drop(guard);
+    s2_tls_classify_after_block(id, result)
+}
+
+/// Re-ask the registry AFTER a blocking TLS call has returned, and report a
+/// concurrent `close()` as such instead of as EOF or as a peer error.
+///
+/// This is the close-awareness half of W7-53's mechanism that a TLS record
+/// layer CAN safely take. The other half — parking in `poll` on a bounded
+/// slice and abandoning the wait when the registry entry disappears — must NOT
+/// be transplanted here: `native_tls::TlsStream::read` assembles a TLS record
+/// across an unbounded number of underlying `recv` calls and exposes no
+/// "is a whole record available" query, so a loop that returned between two of
+/// them would hand the caller a partial record and desynchronise the stream
+/// for good. Classifying a call that has ALREADY returned cannot do that: the
+/// record layer is at rest at that point, by construction.
+///
+/// `ErrorKind::Interrupted` is the carrier the rest of this family uses
+/// (`net_phase_e::re1_socket_closed_err`, `socket_channel::
+/// channel_async_closed_err`) and it is unambiguous here for the same reason:
+/// the only producer below is this function, and it produces it only when the
+/// id has left the registry — a state no successful I/O can be in.
+///
+/// What this does NOT do on its own is END the wait. That is
+/// [`s2_tls_close`]'s job (it shuts the duplicate handle down), and on Windows
+/// it still cannot: see the note there.
+fn s2_tls_classify_after_block(
+    id: i32,
+    result: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    // Cheap and exact: a live id is still in the table. Taken AFTER the call,
+    // deliberately — a close that landed while this thread was parked is then
+    // observed on the very next instruction, and a close that raced a
+    // readiness edge still wins, which is what HotSpot does (it fails an I/O a
+    // concurrent `close()` beat rather than handing back bytes on a socket
+    // Java has already closed).
+    if s2_registry().lock().tls_streams.contains_key(&id) {
+        return result;
+    }
+    match result {
+        // Bytes that genuinely arrived before the close are still delivered:
+        // dropping them would lose data the peer really sent, and the NEXT
+        // call reports the close.
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "socket closed",
+        )),
     }
 }
 
@@ -2621,12 +2670,17 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
             }
         }
     };
-    let mut stream = stream.lock();
-    match &mut *stream {
+    let mut guard = stream.lock();
+    let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.write(data),
         #[cfg(unix)]
         TlsClientStream::LegacyDsa(stream) => stream.write(data),
-    }
+    };
+    drop(guard);
+    // Same after-the-fact classification as the read side, and safe for the
+    // same reason — see `s2_tls_classify_after_block`. A partial write that
+    // did land is reported as such; the next call reports the close.
+    s2_tls_classify_after_block(id, result)
 }
 
 /// NEW-13: perform a graceful TLS shutdown (close_notify) and drop the stream.
@@ -2640,12 +2694,53 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
     // Unregister under the registry lock, shut down outside it.
     let entry = s2_registry().lock().tls_streams.remove(&id);
     if let Some(entry) = entry {
+        // ─── WAKE THE PARKED PEER FIRST (W7-61) ──────────────────────────────
+        //
+        // `TlsEntry::raw` is a `try_clone`d handle on the same socket, and its
+        // doc comment says it exists precisely so an fd-level operation can run
+        // without waiting on `stream`'s mutex. This close never used it, and
+        // the sentence below it — "the entry is already unregistered, so
+        // dropping the handle suffices" — is false in the one case that
+        // matters: a thread parked in `s2_tls_read_direct` holds an `Arc` on
+        // the stream, so dropping OUR `Arc` closes nothing, the `try_lock`
+        // below always fails, and the reader waits forever. That is W7-53's
+        // "four TLS sites" row.
+        //
+        // A `shutdown` on the duplicate is the record-safe wakeup: it does not
+        // take the stream mutex, does not free the handle the parked thread is
+        // mid-syscall on (so it cannot be a use-after-close), and does not
+        // interrupt the record layer at an arbitrary point — it ends the
+        // underlying byte stream, which the record layer already has to handle.
+        //
+        // PLATFORM, stated as a contract rather than as a measurement (no Linux
+        // arm was run for this change):
+        //   * Unix — `shutdown(SHUT_RDWR)` wakes a parked `recv` with EOF, so
+        //     the reader returns and `s2_tls_classify_after_block` then reports
+        //     the close rather than a spurious end-of-stream.
+        //   * Windows — Winsock has NO `shutdown` that aborts a pending
+        //     blocking call; only `closesocket` does, and closing a handle a
+        //     worker is inside a syscall on is exactly the use-after-close
+        //     `pipe.rs` was fixed for. So on Windows this call is a no-op for
+        //     an already-parked reader and that half of the row stays OPEN.
+        //     It is written down rather than quietly counted, for the same
+        //     reason W7-53 left the Windows pipe sink write open: a mechanism
+        //     that compiles, looks like the others, and cannot deliver the
+        //     wakeup is what removes a site from a census while leaving the
+        //     defect. The correct Windows fix is the same one that file names —
+        //     overlapped I/O with a bounded `GetOverlappedResultEx` — which is
+        //     a change to how the socket is created, not landable on
+        //     inspection.
+        if let Some(raw) = entry.raw.as_ref() {
+            let _ = raw.shutdown(std::net::Shutdown::Both);
+        }
         // Best-effort: if the peer already closed the connection, shutdown
         // can legitimately return an error that should not surface as an
         // exception to Java-side callers. `try_lock` because a peer parked in
         // a blocking read on this same stream holds the per-stream mutex —
         // waiting for it here would just relocate the stall we removed. The
-        // entry is already unregistered, so dropping the handle suffices.
+        // graceful TLS `close_notify` this sends is the nicety; the `raw`
+        // shutdown above is the liveness guarantee, and it does not depend on
+        // winning this lock.
         if let Some(mut stream) = entry.stream.try_lock() {
             match &mut *stream {
                 TlsClientStream::Native(stream) => {

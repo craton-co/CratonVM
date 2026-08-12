@@ -12351,7 +12351,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
 // RE.6 — javax.net.ssl.SSLContext
 // ===========================================================================
 
-fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
+/// `pub(crate)` since 2026-08-12 (W7-61) so `tls.rs`'s registrar-ordering
+/// ratchet can name this exact registrar rather than the whole
+/// `register_phase_e_networking` umbrella. It is the LAST writer of
+/// `javax/net/ssl/SSLContext.createSSLEngine` on the Compatible/strict boot
+/// path (lib.rs 18191 `register_p68_ssl`, then 18214 this), and that is what
+/// makes `phases_late::ssl_security::ssleng_alloc` — a 7-slot allocation on a
+/// class declaring 2 — unreachable in that mode. Reordering the two silently
+/// re-arms the over-allocation, so the fact is pinned by a test rather than
+/// left to this comment.
+pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     let ctx_cls = "javax/net/ssl/SSLContext";
     r.register(
         ctx_cls,

@@ -4572,6 +4572,79 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // SSLEngine = 7-field (client_mode=0, need_client_auth=1, want_client_auth=2,
     //                       enabled_protocols=3, enabled_cipher_suites=4,
     //                       handshake_status=5, session=6)
+    //
+    // ─── WHO OWNS THIS TRIPLE SET, MEASURED 2026-08-12 (W7-61) ───────────────
+    //
+    // The real `javax.net.ssl.SSLEngine` declares TWO instance fields on JDK
+    // 25.0.3.9 — `private String peerHost` (slot 0) and `private int peerPort`
+    // (slot 1) — so this 7-slot map, applied to a real-layout instance, would
+    // write an `Int` into a reference field and five values past the end. That
+    // is the species `docs/architecture/natives-over-real-jdk-classes.md` §5
+    // calls heap corruption, and W7-49-slot-index-recensus.md lists it as LIVE.
+    //
+    // It is NOT live, and the reason is last-write-wins. Do not "repair" this
+    // map: a renumber here is inert in Compatible mode and would break the only
+    // mode where it IS the winner. The ordering, re-derived by a brace-depth
+    // scan of the registrar bodies rather than from indentation (indentation
+    // lies in this file — several nested `fn`s inside `register_p68_ssl` close
+    // at column 0, which makes a column-0 scan put line 4575 outside it):
+    //
+    //   Compatible / strict, `register_essential_natives_with_shims`
+    //   (lib.rs 6878..20732), every call below at brace depth 1, i.e.
+    //   unconditional, in source order:
+    //     18191  register_p68_ssl              — this map, plus
+    //                                            SSLContext.createSSLEngine x2
+    //                                            -> `ssleng_alloc` (requests 7)
+    //     18214  net_phase_e::register_phase_e_networking
+    //              -> register_re6_ssl_context — RE-REGISTERS both
+    //                                            createSSLEngine descriptors,
+    //                                            allocating
+    //                                            `sun/security/ssl/SSLEngineImpl`
+    //     18252  t27_tls::register_sslengine_real
+    //                                          — 32 triples on
+    //                                            `sun/security/ssl/SSLEngineImpl`,
+    //                                            keyed by a side table, a
+    //                                            superset by (name, descriptor)
+    //                                            of the 21 registered here
+    //   => `ssleng_alloc` is DEAD in Compatible mode: both of its entry points
+    //      are overwritten 23 lines later, and lib.rs's own comment at 18192
+    //      says that ordering is deliberate and load-bearing.
+    //   => the 21 triples below survive registration but have no receiver.
+    //      `invoke.rs`'s `invoke_class` for a non-special, non-array virtual
+    //      call is the RECEIVER's runtime class name (invoke.rs:1051, the final
+    //      `else` arm reads `args[0]`'s class_id), so step 1 looks this map up
+    //      under the receiver's own class; and the hierarchy walk that would
+    //      otherwise reach an abstract superclass is skipped for
+    //      `walk_native_hierarchy == false` whenever the receiver's class
+    //      declares the method itself (invoke.rs:3271). `javax/net/ssl/SSLEngine`
+    //      is abstract, so the only receivers that could land here are ones
+    //      CratonVM allocated on the abstract class itself — and in Compatible
+    //      mode nothing does.
+    //
+    //   Synthetic (`use_synthetic_jdk == true`, vm_init.rs:1580
+    //   `register_builtins` = essential then `register_synthetic_overrides`):
+    //     23713  register_tls_natives          — tls.rs, `alloc_ssl_engine`
+    //                                            (requests 14) + 19 triples on
+    //                                            a 14-slot map
+    //     23716  register_phase68_natives      — reaches `register_p68_ssl`
+    //                                            AGAIN, so THIS map and
+    //                                            `ssleng_alloc` win back
+    //   => p68 is the last writer in BOTH modes. lib.rs:23708 states that
+    //      ordering explicitly ("Registered BEFORE phase68 so that
+    //      register_p68_ssl's ... implementations take precedence").
+    //
+    // What IS wrong, and is left named rather than half-repaired: in synthetic
+    // mode the 8 tls.rs triples this function does not re-register keep the
+    // 14-slot map on a 7-wide object — `getApplicationProtocol` (slot 7),
+    // `setSSLParameters`/`getSSLParameters` (slots 8-13) and `<init>` (writes
+    // 0-13) all address past the end, and `getPeerHost`/`getPeerPort` read
+    // slots 5/6, which this map uses for handshake_status and session. Two maps
+    // on one class is the shape that made `java.lang.Process` a bug. Repairing
+    // it means giving the surface ONE owner, which moves both this file and
+    // `tls.rs` in one step and re-bases the `vm/src/vm/tests.rs` fixture that
+    // pins this map — a change that needs a build, and is not this lane's.
+    // `registry_ordering_tests::p68_ssl_is_the_last_writer_on_the_ssl_engine_surface`
+    // in `tls.rs` is the ratchet that makes a silent reordering fail.
     let ssleng = "javax/net/ssl/SSLEngine";
     r.register(ssleng, "setUseClientMode", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4672,9 +4745,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // same "missing accessor" shape as the earlier SSLSocket
     // getSupportedCipherSuites/getEnabledCipherSuites gap (see
     // fixed-suite-bugs/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
-    // ssleng_alloc allocates every SSLEngine directly on this abstract class (never a
-    // concrete subclass), so an unregistered method here always throws
-    // AbstractMethodError on any real-JDK caller. Netty's JdkSslContext.<clinit> (via
+    // STALE AS WRITTEN, corrected 2026-08-12 (W7-61): "ssleng_alloc allocates every
+    // SSLEngine directly on this abstract class (never a concrete subclass), so an
+    // unregistered method here always throws AbstractMethodError on any real-JDK
+    // caller" was true when it was written and is false now. In Compatible mode
+    // `net_phase_e::register_re6_ssl_context` re-registers both createSSLEngine
+    // descriptors AFTER this function runs (lib.rs 18191 then 18214) and allocates
+    // `sun/security/ssl/SSLEngineImpl`, so `ssleng_alloc` allocates nothing there and
+    // the Netty case below is served by `t27_tls::register_engine_impl_natives`
+    // (lib.rs 18252), which registers `getSupportedCipherSuites` on SSLEngineImpl
+    // itself. This registration is still the SYNTHETIC-mode answer, where
+    // `register_phase68_natives` runs after `register_tls_natives` and wins. Leaving
+    // the old sentence in place is what made W7-49 read this site as LIVE. Netty's
+    // JdkSslContext.<clinit> (via
     // JdkSslContext$Defaults.init -> supportedCiphers) calls
     // SSLContext.getDefault().createSSLEngine().getSupportedCipherSuites() to validate
     // its configured cipher list against the engine's supported set — every
