@@ -3,6 +3,9 @@ import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -67,7 +70,7 @@ import java.util.zip.ZipOutputStream;
  *
  * <p>Every expected value below was measured on HotSpot 25.0.3.9 (Eclipse
  * Adoptium) before it was written down; it prints {@code RESULT ok} there
- * today — 64 printed lines, all 64 asserted. (The default
+ * today — 96 printed lines, 93 of them asserted. (The default
  * {@code ErrorManager} writes one report and one stack trace to
  * {@code System.err} during {@code streamHandlerCloseIsNarrow}; that is
  * HotSpot's own output, not a failure.)
@@ -183,6 +186,77 @@ public class CloseFlushSwallowProbe {
             flushAttempted = true;
             if (what instanceof IOException) { throw (IOException) what; }
             if (what instanceof Error) { throw (Error) what; }
+        }
+    }
+
+    /**
+     * W7-70 — an {@code OutputStream} that RECORDS the order it was driven in.
+     *
+     * <p>Separate from {@link BoomOut}, which records only "was it attempted".
+     * {@code PrintStream.close()} drives its sink twice, and which of the two
+     * calls happened — and in which order, and whether the second happened at
+     * all — is the whole content of the contract being probed. {@code BoomOut}
+     * cannot express "flush ran and close did not".
+     *
+     * <p>The {@code write} ops are recorded but never asserted on: this VM's
+     * {@code println} writes the text and the line separator as ONE buffer and
+     * uses {@code "\n"} where HotSpot on Windows uses {@code "\r\n"}, so the
+     * byte counts legitimately differ. {@link #flushCloseTrace()} projects the
+     * trace down to just the flush/close sequence, which is the part the JDK
+     * fixes.
+     */
+    static final class TraceOut extends OutputStream {
+        final List<String> ops = new ArrayList<>();
+        final ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        private final Throwable flushBoom;
+        private final Throwable closeBoom;
+
+        TraceOut() { this(null, null); }
+
+        TraceOut(Throwable flushBoom, Throwable closeBoom) {
+            this.flushBoom = flushBoom;
+            this.closeBoom = closeBoom;
+        }
+
+        @Override public void write(int b) { ops.add("write"); sink.write(b); }
+
+        @Override public void write(byte[] b, int off, int len) {
+            ops.add("write");
+            sink.write(b, off, len);
+        }
+
+        @Override public void flush() throws IOException {
+            ops.add("flush");
+            raise(flushBoom);
+        }
+
+        @Override public void close() throws IOException {
+            ops.add("close");
+            raise(closeBoom);
+        }
+
+        private static void raise(Throwable what) throws IOException {
+            if (what == null) { return; }
+            if (what instanceof IOException) { throw (IOException) what; }
+            if (what instanceof RuntimeException) { throw (RuntimeException) what; }
+            if (what instanceof Error) { throw (Error) what; }
+        }
+
+        /** The trace with every {@code write} dropped, joined with commas. */
+        String flushCloseTrace() {
+            StringBuilder sb = new StringBuilder();
+            for (String op : ops) {
+                if (op.equals("write")) { continue; }
+                if (sb.length() > 0) { sb.append(','); }
+                sb.append(op);
+            }
+            return sb.toString();
+        }
+
+        int count(String op) {
+            int n = 0;
+            for (String o : ops) { if (o.equals(op)) { n++; } }
+            return n;
         }
     }
 
@@ -697,6 +771,213 @@ public class CloseFlushSwallowProbe {
                 outcome(shErr::close));
     }
 
+    // ------------------------------------------------------- W7-70: close()
+
+    /** Reads a whole file back as a UTF-8 String, with no java.nio.file. */
+    static String slurp(File f) throws IOException {
+        try (FileInputStream in = new FileInputStream(f)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[512];
+            int n;
+            while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); }
+            return out.toString("UTF-8");
+        }
+    }
+
+    /**
+     * W7-70 — {@code PrintStream.close()} must deliver the bytes and release
+     * the sink.
+     *
+     * <p>The defect: {@code native_printstream_close} was a bare no-op for
+     * EVERY {@code PrintStream}, not only the console ones its comment named.
+     * So the assertions here are that the effect <b>arrives</b> — bytes are on
+     * disk, the sink's {@code close()} ran — never that the call returned. A
+     * no-op {@code close()} returns perfectly cleanly; that is the whole
+     * problem with it.
+     *
+     * <p>The buffered wrapper is load-bearing. A {@code PrintStream} straight
+     * over a {@code FileOutputStream} has its bytes on disk before
+     * {@code close()} is ever called, so the file would be complete even with
+     * the no-op and the check would pass for the wrong reason.
+     */
+    static void printStreamCloseDeliversAndReleases() throws IOException {
+        File f = File.createTempFile("w770-buffered", ".txt");
+        f.deleteOnExit();
+        PrintStream ps = new PrintStream(new BufferedOutputStream(new FileOutputStream(f)));
+        ps.println("data-on-disk");
+        // Nothing has reached the file yet: the BufferedOutputStream holds it.
+        check("printStreamFileEmptyBeforeClose", true, f.length() == 0);
+        ps.close();
+        check("printStreamFileNonEmptyAfterClose", true, f.length() > 0);
+        // Trimmed, because this VM's line separator is "\n" where HotSpot's on
+        // Windows is "\r\n" — the separator is not what is being probed.
+        check("printStreamFileContentAfterClose", "data-on-disk", slurp(f).trim());
+        // OVER-CORRECTION GUARD, same call site: a clean close records nothing.
+        check("printStreamCheckErrorAfterCleanFileClose", false, ps.checkError());
+
+        // The sink-level proof that the handle-releasing call was made. This is
+        // the platform-free half; the delete rows below are the Windows-only
+        // corroboration.
+        TraceOut trace = new TraceOut();
+        PrintStream sinkPs = new PrintStream(trace);
+        sinkPs.print("q");
+        check("printStreamSinkNotClosedBeforeClose", 0, trace.count("close"));
+        sinkPs.close();
+        check("printStreamSinkClosedAfterClose", 1, trace.count("close"));
+        check("printStreamCloseDeliveredEveryByte", "q", trace.sink.toString("UTF-8"));
+
+        // The OS-level handle. On Windows an open handle blocks delete; on
+        // Linux it does not, so the expectation is derived from the platform
+        // rather than fixed. Both halves are real assertions on Windows; on
+        // Linux the first asserts that delete is NOT blocked and the second is
+        // vacuous — which is why the sink rows above exist and this pair is
+        // not the only evidence.
+        boolean windows = System.getProperty("os.name", "").toLowerCase().contains("win");
+        File h = File.createTempFile("w770-handle", ".txt");
+        h.deleteOnExit();
+        PrintStream hps = new PrintStream(new FileOutputStream(h));
+        hps.println("x");
+        boolean deletedWhileOpen = h.delete();
+        check("printStreamDeleteBlockedWhileOpen", windows, !deletedWhileOpen);
+        hps.close();
+        check("printStreamDeleteSucceedsAfterClose", true, !h.exists() || h.delete());
+    }
+
+    /**
+     * W7-70 — the ORDER {@code close()} drives the sink in, and what a failure
+     * at each step does.
+     *
+     * <p>Measured on HotSpot 25.0.3.9, not read off {@code PrintStream.close}'s
+     * source, because that source does not look like it flushes and it does:
+     * {@code charOut} is {@code new OutputStreamWriter(this, charset)}, so
+     * {@code textOut.close()} bottoms out in {@code StreamEncoder.implClose},
+     * whose {@code out} is {@code this} — it calls {@code this.flush()}, which
+     * is {@code out.flush()} on the real sink, and then {@code this.close()},
+     * which the {@code closing} latch turns into a no-op. The sink sees
+     * {@code flush} then {@code close}.
+     */
+    static void printStreamCloseOrdering() {
+        TraceOut clean = new TraceOut();
+        PrintStream p1 = new PrintStream(clean);
+        p1.println("hi");
+        check("printStreamCleanCloseThrowsNothing", "none", outcome(p1::close));
+        check("printStreamCleanCloseSinkTrace", "flush,close", clean.flushCloseTrace());
+
+        // A sink flush that raises an IOException is ABSORBED — `close()`
+        // declares no checked exception — and the close still runs.
+        TraceOut flushIo = new TraceOut(new IOException("ps-flush-io"), null);
+        PrintStream p2 = new PrintStream(flushIo);
+        check("printStreamCloseAbsorbsSinkFlushIOException", "none", outcome(p2::close));
+        check("printStreamFlushIoSinkTrace", "flush,close", flushIo.flushCloseTrace());
+        check("printStreamCheckErrorAfterAbsorbedFlushOnClose", true, p2.checkError());
+
+        // …but an Error is not what that `catch` names, and it PROPAGATES —
+        // and because the two statements are straight-line inside one `try`,
+        // the close is SKIPPED. This is the row a repair spelled
+        // "flush; close;" with the failure dropped between them gets wrong.
+        TraceOut flushErr = new TraceOut(new Error("ps-flush-boom"), null);
+        PrintStream p3 = new PrintStream(flushErr);
+        check("printStreamClosePropagatesSinkFlushError",
+                "java.lang.Error: ps-flush-boom", outcome(p3::close));
+        check("printStreamFlushErrorSkipsTheClose", "flush", flushErr.flushCloseTrace());
+
+        // A sink close that raises an IOException is absorbed and RECORDED.
+        // This is the row W7-64 could not write, because the call this VM made
+        // there was not the call HotSpot makes.
+        TraceOut closeIo = new TraceOut(null, new IOException("ps-close-io"));
+        PrintStream p4 = new PrintStream(closeIo);
+        check("printStreamCloseAbsorbsSinkCloseIOException", "none", outcome(p4::close));
+        check("printStreamCheckErrorAfterAbsorbedClose", true, p4.checkError());
+        check("printStreamCloseIoSinkTrace", "flush,close", closeIo.flushCloseTrace());
+
+        // OVER-CORRECTION GUARD, same call site: an Error propagates and must
+        // NOT set `trouble`. HotSpot's `catch` never sees it, so a `trouble`
+        // set here would be invented state, not parity.
+        TraceOut closeErr = new TraceOut(null, new Error("ps-close-boom"));
+        PrintStream p5 = new PrintStream(closeErr);
+        check("printStreamClosePropagatesSinkCloseError",
+                "java.lang.Error: ps-close-boom", outcome(p5::close));
+        check("printStreamCheckErrorAfterPropagatedCloseError", false, p5.checkError());
+    }
+
+    /**
+     * W7-70 — a second {@code close()} is a TOTAL no-op.
+     *
+     * <p>HotSpot's {@code closing} latch is never cleared, so the second call
+     * does not reach the sink, throws nothing, and does not move
+     * {@code trouble}. This is the over-correction guard for the whole lane:
+     * a {@code PrintStream} that starts throwing from {@code close()}, or that
+     * re-closes its sink, is a worse defect than one that fails to close.
+     */
+    static void printStreamDoubleCloseIsHarmless() {
+        TraceOut trace = new TraceOut();
+        PrintStream ps = new PrintStream(trace);
+        ps.println("dc");
+        ps.close();
+        check("printStreamDoubleCloseThrowsNothing", "none", outcome(ps::close));
+        check("printStreamDoubleCloseDidNotRecloseSink", 1, trace.count("close"));
+        check("printStreamDoubleCloseDidNotReflushSink", 1, trace.count("flush"));
+        check("printStreamCheckErrorAfterDoubleClose", false, ps.checkError());
+
+        // And a close that PROPAGATED still latched: the JDK sets `closing`
+        // before the delegation and never clears it, so the retry after an
+        // Error is a no-op too.
+        TraceOut boom = new TraceOut(null, new Error("dc-boom"));
+        PrintStream bps = new PrintStream(boom);
+        check("printStreamFirstCloseRaised", "java.lang.Error: dc-boom", outcome(bps::close));
+        check("printStreamRetryAfterPropagatedCloseThrowsNothing", "none", outcome(bps::close));
+        check("printStreamRetryAfterPropagatedCloseDidNotRetouchSink", 1, boom.count("close"));
+
+        // A closed stream's `checkError()` does not re-flush: HotSpot reaches
+        // that by nulling `out`, so its `if (out != null) flush()` guard skips.
+        // The ANSWER is asserted; the flush COUNT is only observed, and the
+        // split is per-arm rather than cosmetic.
+        //
+        // Under `--synthetic-jdk` the `checkError` native reads the `closing`
+        // latch and skips its flush, so the count holds. In Compatible mode
+        // `checkError()` is real `java.io` bytecode reading a real, non-null
+        // `out` — `native_printstream_close` cannot null it, because a null
+        // `out` is this VM's "console stream" marker — so it flushes a closed
+        // sink every call. The answer is the same either way, because the
+        // close already recorded; only the extra flush differs. Asserting the
+        // count would make the probe red in Compatible mode for a residual
+        // this lane names rather than fixes.
+        // W7-70-printstream-close-noop.md
+        TraceOut flushOnly = new TraceOut(new IOException("late-flush-io"), null);
+        PrintStream fps = new PrintStream(flushOnly);
+        fps.close();
+        check("printStreamCheckErrorAfterCloseOverFlushBoomSink", true, fps.checkError());
+        int flushesAfterFirstCheck = flushOnly.count("flush");
+        fps.checkError();
+        System.out.println("observed.printStreamCheckErrorOnClosedStreamReflushed="
+                + (flushOnly.count("flush") - flushesAfterFirstCheck));
+    }
+
+    /**
+     * W7-70 — the named residual, printed and NOT asserted.
+     *
+     * <p>HotSpot's {@code close()} nulls {@code out}, so a write afterwards
+     * fails {@code ensureOpen()}, delivers nothing and sets {@code trouble}.
+     * This VM deliberately does not null {@code out} — a null {@code out} is
+     * its "this is a console stream" marker, and nulling it would redirect a
+     * closed stream's output to stdout — so a post-close write reaches the
+     * closed sink instead of being refused at the door. Asserting this would
+     * make the probe red for something this lane did not claim to fix; it is
+     * printed so the next lane can see the gap move. Measured on HotSpot
+     * 25.0.3.9: {@code 0} and {@code true}.
+     */
+    static void printStreamWriteAfterCloseObservation() throws IOException {
+        TraceOut trace = new TraceOut();
+        PrintStream ps = new PrintStream(trace);
+        ps.close();
+        int before = trace.sink.size();
+        ps.println("after-close");
+        System.out.println("observed.printStreamBytesWrittenAfterClose="
+                + (trace.sink.size() - before));
+        System.out.println("observed.printStreamCheckErrorAfterWriteOnClosedStream="
+                + ps.checkError());
+    }
+
     /**
      * A close that SUCCEEDS must stay silent — the trivial direction, kept so a
      * fix that turned every delegated close into a throw is caught here rather
@@ -732,7 +1013,7 @@ public class CloseFlushSwallowProbe {
         Wrapped(Throwable real) { super(real); this.real = real; }
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
         filterOutputStreamClose();
         dataOutputStreamClose();
         inputStreamReaderClose();
@@ -748,6 +1029,11 @@ public class CloseFlushSwallowProbe {
         healthyStreamsReportNoError();
         setErrorAndClearErrorMoveTheSameFlag();
         streamHandlerReachesItsErrorManager();
+        // W7-70 — close() itself, which was a no-op for every PrintStream.
+        printStreamCloseDeliversAndReleases();
+        printStreamCloseOrdering();
+        printStreamDoubleCloseIsHarmless();
+        printStreamWriteAfterCloseObservation();
 
         if (FAILURES.isEmpty()) {
             System.out.println("RESULT ok");
