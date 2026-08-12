@@ -33582,6 +33582,50 @@ const AD_FIELD_SIZE: usize = 3; // Int element count
 /// slot is not an optimisation but the JDK's own emptiness invariant.
 const AD_DEFAULT_CAPACITY: usize = 16;
 
+/// `ArrayDeque.addFirst`/`addLast` open with `if (e == null) throw new
+/// NullPointerException();`, and that refusal is load-bearing rather than
+/// defensive: a null in the ring buffer is how real `ArrayDeque` bytecode
+/// *encodes* "another thread mutated me while I was iterating". `ArrayDeque
+/// .nonNullElementAt` turns any null it reads into a
+/// `ConcurrentModificationException`, so accepting one here does not just lose
+/// three `no-throw` observables — it arms the JDK's own iterator to kill a
+/// caller that never touched null.
+///
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// `dq.add(null)` returned `true`, `dq.size()` answered 3 where HotSpot said 0,
+/// the deque printed `[a, null, null, null, x, y, x, z]`, and then
+///
+/// ```text
+/// java.util.ConcurrentModificationException
+///     at java.util.ArrayDeque.nonNullElementAt(ArrayDeque.java:268)
+///     at java.util.ArrayDeque$DescendingIterator.next(ArrayDeque.java:746)
+/// ```
+///
+/// took the remaining 12 observables of the `dequeEdges` probe section with it.
+/// The CME was therefore never an over-throw and never had anything to do with
+/// the `modCount` this crate gained this session: real JDK bytecode diagnosed
+/// the state this missing check produced, and diagnosed it correctly. See
+/// W7-33-differential-dead-sections.
+///
+/// The check sits in the two funnels rather than at each registration because
+/// that is where the JDK puts it — `add`, `offer`, `offerFirst`, `offerLast`,
+/// `push` and `addAll` all reach the deque through `addFirst`/`addLast` in
+/// both implementations. The one other caller is the `java/util/Queue`
+/// interface bridge, which points at the `ArrayDeque` implementation by
+/// construction; the null-tolerant `Queue` in the JDK is `LinkedList`, and
+/// `((Queue<String>) new LinkedList<String>()).offer(null)` was measured
+/// storing its null on both CratonVM modes today, so it does not route here.
+///
+/// HotSpot's is message-less. `thrownDetail` prints a message when there is
+/// one, so inventing one would itself be a divergence.
+#[inline]
+fn ad_refuse_null(elem: Value) -> Result<(), MethodCallFailed> {
+    if matches!(elem, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    Ok(())
+}
+
 fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32, i32) {
     let data = match ctx.get_field(this, AD_FIELD_DATA) {
         Value::Object(Some(r)) => Some(r),
@@ -33846,6 +33890,8 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
     // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
     // and refresh both, otherwise the store below writes a pre-GC element
@@ -33875,6 +33921,8 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): same shape as
     // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
     // buffer grow and refresh both before the store.
@@ -54465,14 +54513,67 @@ fn cowal_read_snapshot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(Obje
     }
 }
 
+/// Bump the receiver's `modCount` — but only when the receiver actually has
+/// one, and only into a slot no other COW native owns.
+///
+/// `resolve_field_index(class, field)` answers for the *named* class's
+/// hierarchy, not the receiver's. Asked for `java/util/AbstractList`'s
+/// `modCount` it returns AbstractList's slot regardless of what `this` is, and
+/// a real `java.util.concurrent.CopyOnWriteArrayList` does not extend
+/// `AbstractList` at all — JDK 25 declares it
+/// `implements List, RandomAccess, Cloneable, Serializable`, with exactly two
+/// instance fields, `lock` then `array`. AbstractList's `modCount` is its own
+/// first instance field, so the index collided with `lock` and every bump
+/// stored an `Int` over the monitor object the class synchronises on.
+///
+/// The corruption is silent until the next piece of *real* COW bytecode runs.
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// a list survived `add`, `set`, `remove`, `add(int,E)` and `clear` (none of
+/// which bump) and died on the two that do —
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot enter synchronized block because "this.lock" is null
+///     at java.util.concurrent.CopyOnWriteArrayList.addAllAbsent(CopyOnWriteArrayList.java:795)
+/// ```
+///
+/// after `addIfAbsent` with an absent element, or after `addAll`. That killed
+/// the whole `concurrentAndAtomic` probe section: 24 ABQ/Atomic/LongAdder
+/// observables after it were absent rather than measured. See
+/// W7-33-differential-dead-sections.
+///
+/// `al_mod_count_slot` documents this exact hazard for the ArrayList natives
+/// and guards against it; this helper, written separately, never did. Ask the
+/// RECEIVER'S class, and refuse the two slots the COW natives own so a
+/// synthetic layout that happens to collide cannot corrupt them either.
+///
+/// On the real JDK layout the answer is `None` and nothing is written, which is
+/// also the right semantics rather than merely the safe one: a real
+/// `CopyOnWriteArrayList` has no `modCount`, its iterator is a snapshot, and it
+/// never raises `ConcurrentModificationException`. The bump only ever meant
+/// anything for the legacy synthetic stub that mirrored `ArrayList` — and that
+/// stub reaches none of the three call sites, all of which sit on the named-
+/// field (`array`) branch.
 fn cowal_bump_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    if let Some(ms) = ctx.resolve_field_index("java/util/AbstractList", "modCount") {
-        let cur = match ctx.get_field(this, ms) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
+    let cid = ctx.class_id_of_object(this);
+    let Some(ms) = ctx.resolve_field_index_by_class_id(cid, "modCount") else {
+        return;
+    };
+    if ms >= ctx.object_num_fields(this) {
+        return;
     }
+    if ctx.resolve_field_index(COWAL_CLASS, "lock") == Some(ms)
+        || ctx.resolve_field_index(COWAL_CLASS, "array") == Some(ms)
+    {
+        return;
+    }
+    let cur = match ctx.get_field(this, ms) {
+        Value::Int(v) => v,
+        // Anything but an `Int` in the slot means it is not the field this
+        // helper thinks it is — the very confusion above. Leave whatever is
+        // there alone instead of overwriting it with a counter.
+        _ => return,
+    };
+    ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
 }
 
 fn cowal_enter_monitor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
