@@ -60155,6 +60155,109 @@ mod tests {
             ctx.define_field(PROPERTIES_CID, "defaults", 8);
         }
 
+        /// `java.util.Random.nextGaussian()` must return the JDK's seeded
+        /// stream AND advance the LCG once per PAIR of calls.
+        ///
+        /// # Why this exists beside `next_gaussian_matches_jdk_seeded_sequence`
+        ///
+        /// That test is vacuous for the defect it names, and the shape is worth
+        /// keeping in view because it is easy to write by accident: it drives
+        /// `rnd_gaussian_pair` and consumes BOTH variates itself, in a loop it
+        /// implements in its own body. The defect its doc comment names —
+        /// "this used to discard the second and draw a fresh pair every time" —
+        /// lives in the CALLER, `native_random_next_gaussian`, which is not on
+        /// that test's call path at all. Delete the `RND_FIELD_NEXT_GAUSSIAN`
+        /// cache from the native and that test stays green, because the helper
+        /// it exercises is still correct. It asserts the side of the fix that
+        /// was never broken.
+        ///
+        /// This one drives the native through a receiver carrying the two real
+        /// `java/util/Random` slots, so the caching is what is under test.
+        ///
+        /// Measured on Temurin jdk-25.0.3+9, not assumed: `new Random(42)`,
+        /// six `nextGaussian()` calls, then one `nextInt()`. The discarding
+        /// implementation answers -0.9498666368908959 for the second call (the
+        /// THIRD value of the conforming stream) and a different `nextInt()`,
+        /// so both assertions below separate the two.
+        #[test]
+        fn next_gaussian_native_caches_the_second_variate_and_advances_once_per_pair() {
+            let mut ctx = MockCtx::new(1);
+            // Two slots: seed(0) and nextNextGaussian(1) — the layout
+            // `native_random_next_gaussian` addresses.
+            let rnd = ctx.alloc_object_of(ClassId::new(0), 2);
+            ctx.set_field(rnd, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(42)));
+            ctx.set_field(rnd, RND_FIELD_NEXT_GAUSSIAN, Value::Object(None));
+
+            fn call(ctx: &mut MockCtx, rnd: ObjectRef) -> f64 {
+                match native_random_next_gaussian(ctx, &[Value::Object(Some(rnd))]) {
+                    Ok(Some(Value::Double(d))) => d,
+                    other => panic!("nextGaussian must answer a Double, got {other:?}"),
+                }
+            }
+
+            // --- the MECHANISM: one draw feeds two calls -------------------
+            let first = call(&mut ctx, rnd);
+            assert!(
+                matches!(ctx.get_field(rnd, RND_FIELD_NEXT_GAUSSIAN), Value::Double(_)),
+                "after the first call the SECOND variate must be cached in nextNextGaussian; an \
+                 empty slot here IS the discarding implementation"
+            );
+            let seed_after_first = ctx.get_field(rnd, RND_FIELD_SEED);
+            let second = call(&mut ctx, rnd);
+            assert!(
+                matches!(
+                    ctx.get_field(rnd, RND_FIELD_NEXT_GAUSSIAN),
+                    Value::Object(None)
+                ),
+                "the second call must CONSUME the cached variate, clearing the slot"
+            );
+            assert_eq!(
+                ctx.get_field(rnd, RND_FIELD_SEED),
+                seed_after_first,
+                "a call served from the cache must not advance the LCG — advancing here is \
+                 exactly the 'twice the specified rate' defect"
+            );
+
+            // --- the STREAM: six values against the oracle -----------------
+            let mut got = vec![first, second];
+            while got.len() < 6 {
+                got.push(call(&mut ctx, rnd));
+            }
+            // Same tolerance and same reason as the sibling test: the JDK's
+            // multiplier goes through `StrictMath.log` (fdlibm) while this uses
+            // the platform libm, so the last ulp may differ. It is not what
+            // makes this test able to fail — the integer assertion below is.
+            let expected: [i64; 6] = [
+                4607821503525903750,
+                4606456510138157127,
+                -4616641179245592382,
+                -4615707776640798080,
+                4598733263062401967,
+                4604341753479877564,
+            ];
+            for (i, want_bits) in expected.iter().enumerate() {
+                let want = f64::from_bits(*want_bits as u64);
+                assert!(
+                    (got[i] - want).abs() <= 1e-12 * want.abs().max(1.0),
+                    "nextGaussian[{i}] diverged from `new Random(42)` on the oracle: got {:?}, \
+                     want {want:?}",
+                    got[i]
+                );
+            }
+
+            // --- the RATE, exactly, with no tolerance in it ----------------
+            // `nextInt()` is `next(32)`. A tolerance cannot blur an i32, so
+            // this is the assertion that cannot be widened into uselessness: an
+            // implementation that drew a fresh pair per call has consumed twice
+            // as much of the stream and lands somewhere else entirely.
+            assert_eq!(
+                rnd_next(&mut ctx, rnd, 32),
+                1583910553,
+                "after six nextGaussian() calls the LCG must be exactly where `new Random(42)` \
+                 leaves it on Temurin jdk-25.0.3+9"
+            );
+        }
+
         /// A real `HashMap` receiver keeps today's behaviour exactly: the
         /// bucket array at slot 0 AND at the real `table` slot, and no legacy
         /// `Int(capacity)` — writing one there is what put an `Int` in the

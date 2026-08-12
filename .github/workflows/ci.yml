@@ -733,6 +733,35 @@ jobs:
           -p cratonvm-vm -p cratonvm-native-builtins
           --features deprecated-noop-tls,management,experimental-serialization,experimental-aot,experimental-debug,zgc
 
+      # THE INTERSECTION, which until now was compiled by nothing.
+      #
+      # `vm/src/vm/tests.rs` is `#[cfg(all(test, feature = "synthetic-jdk"))]`,
+      # and nine of its tests carry a SECOND gate on `experimental-aot` /
+      # `experimental-debug` (the three `p90_jdwp_*` and the six `cds_*`). The
+      # two steps that could reach them are disjoint: the step above has the
+      # experimental features and not `synthetic-jdk`, and
+      # `cargo test -p cratonvm-vm --lib --features synthetic-jdk` in the
+      # `synthetic-jdk` job has `synthetic-jdk` and not the experimental ones.
+      # So those nine bodies were never even TYPE-CHECKED — deleting them,
+      # or replacing one with `panic!()`, changed nothing anywhere.
+      #
+      # That is strictly worse than a weak assertion, and it is the same rot
+      # this file already documents twice (the E0063 in
+      # `native-builtins/src/jboss_jdkspecific.rs`, and the
+      # `gc/tests/zgc_module_integration.rs` target that stopped compiling while
+      # eight passes were merged against it). A target no job builds rots.
+      #
+      # Its OWN step rather than adding `synthetic-jdk` to the list above, so
+      # that if the intersection does not currently compile the failure names
+      # itself instead of being read as a regression in the experimental
+      # surface. `--lib` because `vm/src/vm/tests.rs` is a unit-test module.
+      - name: Test the synthetic-jdk x experimental intersection
+        timeout-minutes: 30
+        run: >
+          cargo test
+          -p cratonvm-vm --lib
+          --features synthetic-jdk,experimental-aot,experimental-debug
+
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per
   # docs/feature-designs/embedding-api.md ("CI publication of the .so/.dll/.a +
@@ -1283,10 +1312,23 @@ jobs:
       # run.sh defaults CV to target/release/cratonvm[.exe]; this job builds
       # debug, so point CV at it explicitly rather than paying for a release
       # build.
+      # STRICT_COVERAGE=1 is the second half of a gate that had only ever had
+      # one. `run.sh`'s own documentation says "CI should set it"; no workflow
+      # did, so a `regression-suite/src/*.java` vector that appeared in NO class
+      # list printed a warning inside a passing build — which is how RJdkPhaser
+      # (240 checks) arrived inert and stayed that way. A warning in a green run
+      # is not a gate.
+      #
+      # Safe to arm now, and measured rather than assumed: at this commit the
+      # census is exactly 42 CORE + 28 JDK-only + 2 UNREGISTERED = 72 sources,
+      # with no unlisted vector and no list entry whose source is gone. If this
+      # step goes red on a coverage line, the fix is to schedule the vector or
+      # name it in UNREGISTERED_CLASSES with a reason — never to unset this.
       - name: Regression suite under --jdk-only
         shell: bash
         env:
           CRATONVM_ARGS: --jdk-only
+          STRICT_COVERAGE: 1
         run: |
           CV=target/debug/cratonvm
           [ -x "$CV" ] || CV=target/debug/cratonvm.exe
