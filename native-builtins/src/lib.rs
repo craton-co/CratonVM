@@ -343,7 +343,20 @@ fn buffered_input_stream_marks(
 /// their NAME in that slot — so no raw field index is safe for both shapes.
 /// Unlike those two tables this stores a plain `bool`, so there is no
 /// ObjectRef to keep alive and no `add_global_root` is required.
-fn jul_logger_use_parent_handlers_table(
+///
+/// `pub(crate)` because the WRITE and the READ used to live in different
+/// modules and never met: `setUseParentHandlers` recorded here while the
+/// publication walk (`logmanager::jul_use_parent_handlers`) read
+/// `config.useParentHandlers`, which is null on every logger this bridge
+/// mints — so `getUseParentHandlers()` reported `false` correctly while the
+/// record went to the parent's handlers anyway. An accessor agreeing with
+/// itself is not the consumer agreeing with it; the consumer must read the
+/// same table the setter wrote. Measured, `Compatible`, before the change:
+/// `setUseParentHandlers(false)` then `info(...)` still reached the parent's
+/// Handler, where HotSpot and `--jdk-only` (real bytecode, no native holds
+/// the triple) both stop the walk. See
+/// docs/known-issues/jdk-only/W7-35-jul-supplier-and-payload-residuals.md.
+pub(crate) fn jul_logger_use_parent_handlers_table(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<i32, bool>> {
     static STORE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, bool>>> =
         std::sync::OnceLock::new();
