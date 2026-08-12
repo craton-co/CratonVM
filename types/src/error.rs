@@ -1085,6 +1085,18 @@ pub enum RuntimeError {
     #[error("NoSuchElementException: {message}")]
     NoSuchElementException { message: String },
 
+    /// `java.util.EmptyStackException`. NOT a `NoSuchElementException` — it
+    /// extends `RuntimeException` **directly**, so a `catch (EmptyStackException)`
+    /// in application code does not fire when the wrong one is raised, and the
+    /// caller falls through to whatever handler comes next. `java.util.Stack`'s
+    /// `pop`/`peek` are the only throwers in the JDK and the only ones here.
+    ///
+    /// Field-less because the real class declares only a no-arg constructor and
+    /// sets no detail message; `getMessage()` is null on HotSpot.
+    /// See W7-33-differential-dead-sections R2.
+    #[error("EmptyStackException")]
+    EmptyStackException,
+
     /// `java.nio.BufferUnderflowException` — a relative `get` was attempted on
     /// a buffer with no elements remaining. Distinct from IllegalStateException
     /// because real code catches it specifically (e.g. Tomcat
@@ -1616,6 +1628,9 @@ impl RuntimeError {
             RuntimeError::NoSuchElementException { message } => {
                 ("java/util/NoSuchElementException", Some(message.as_str()))
             }
+            // `None`, like `ConcurrentModificationException` above: the real
+            // class has a no-arg constructor only.
+            RuntimeError::EmptyStackException => ("java/util/EmptyStackException", None),
             RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
             RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
             RuntimeError::ReadOnlyBufferException => ("java/nio/ReadOnlyBufferException", None),
@@ -1702,6 +1717,7 @@ mod tests {
             RuntimeError::BufferOverflowException,
             RuntimeError::ReadOnlyBufferException,
             RuntimeError::ConcurrentModificationException,
+            RuntimeError::EmptyStackException,
         ] {
             let (_, msg) = err.as_java_throwable().expect("is a Java throwable");
             assert!(msg.is_none(), "{err:?} must have a null detail message");
