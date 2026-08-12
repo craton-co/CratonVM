@@ -1,6 +1,29 @@
 # `ProcessHandle.current().info()` was empty, so two `RJdkProcess` checks never ran
 
-**Status:** FIXED (2026-08-07). Lane W5-2 of the jdk-wave2 pool.
+**Status: RETIRED 2026-08-12 (W7-46) — the defect, and finally the detector.**
+
+The fix below is present and verifiable by reading: `start_time_or_any(pid)` is
+the single source `isAlive0`, `ProcessHandleImpl$Info.info0` and
+`current_process_start_time` all answer from, `info0` writes `startTime`
+unconditionally on every platform, and both residuals are closed.
+
+What this record left in place is the reason its defect went four waves
+undetected. Its own closing sentence — *"a `check(...)` inside an `if` is only
+as good as the count that surrounds it"* — was right, and then it left the count
+as a **printed observation**. `RJdkProcess` still exited 0 and printed `PASS`
+with a number nothing asserted.
+
+W7-46 converted it. `regression-suite/src/RJdkProcess.java` now has `skip(why)`,
+which records the reason AND increments the counter so the total is invariant;
+`EXPECTED_CHECKS`, asserted in `main`, so a moved count is an `AssertionError`
+rather than a two-digit diff; and a `skipped=[…]` column on the `CK` line, so a
+legal-but-degraded answer is a textual diff against the oracle. A check that
+stops running can no longer be silent in either direction. See
+W7-46-process-cluster.md, which also reports the full population sweep this
+record's shape licensed — fourteen sites read, three live defects, and no
+default-off `#[cfg]` hole on this surface.
+
+Lane W5-2 of the jdk-wave2 pool.
 **Files changed:** `native-io/src/process.rs`, `native-builtins/src/phases_late.rs`.
 
 **AMENDED 2026-08-11**, jdk-only process-natives residual lane, ALSO UNBUILT.
