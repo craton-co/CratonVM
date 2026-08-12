@@ -534,6 +534,32 @@ fn closed_selector() -> MethodCallFailed {
     .into()
 }
 
+/// A genuine `java.nio.channels.ClosedSelectorException`, for the public
+/// entry points that must raise one.
+///
+/// `closed_selector()` above builds an `IOException` whose MESSAGE is the string
+/// "ClosedSelectorException", which is a different thing in every way that
+/// matters. `ClosedSelectorException` extends `IllegalStateException` and is
+/// UNCHECKED; `IOException` is checked. Measured on jdk-25, `selectNow()` on a
+/// closed selector throws `java.nio.channels.ClosedSelectorException` — a caller
+/// with `catch (IOException)` around its select loop does NOT catch that and is
+/// meant not to, while here it caught it and carried on. `keys()` throws the
+/// same and is not declared to throw `IOException` at all, so it could not
+/// report the condition through `closed_selector()` even in principle — which is
+/// why it silently returned an empty set instead.
+///
+/// The ctx-less internal helpers keep `closed_selector()`: by the time they run,
+/// the entry point below has already checked, so their raise is a race guard
+/// rather than the reported condition.
+fn closed_selector_typed(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object_initialized("java/nio/channels/ClosedSelectorException", "()V", &[])
+    {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    closed_selector()
+}
+
 // ---------------------------------------------------------------------------
 // Public API — lifecycle
 // ---------------------------------------------------------------------------
@@ -588,12 +614,15 @@ pub fn selector_close(id: i32) {
 /// Wakeup a concurrently-blocked select.
 pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
     let regs = selectors().read();
+    // A closed or unknown selector is a NO-OP, matching jdk-25 — see
+    // `selector_wakeup_native` for the measurement and for what raising here
+    // cost (a `vertx.close()` that never completes).
     let Some(s) = regs.get(&id) else {
-        return Err(closed_selector());
+        return Ok(());
     };
     let mut st = s.lock();
     if !st.open {
-        return Err(closed_selector());
+        return Ok(());
     }
     st.woken = true;
     if sel_dbg_enabled() {
@@ -2147,12 +2176,32 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// `SelectorImpl.wakeup0()` — no args beyond `this`.
+///
+/// **`wakeup()` on a CLOSED selector is a no-op, not an error.** Measured on
+/// jdk-25 (`SelectorWakeupProbe`): `Selector.open(); close(); wakeup()` returns
+/// normally, twice, while `selectNow()` and `keys()` on the same closed selector
+/// both raise `ClosedSelectorException`. The javadoc agrees — `wakeup()`
+/// declares no exception at all, and `AbstractSelector` deliberately keeps it
+/// safe after close so a shutdown path can wake a selector it is racing with.
+///
+/// Raising here instead cost a hang, not an error. Netty's
+/// `SingleThreadEventExecutor.shutdown0()` calls `wakeup()` on an event loop
+/// whose selector the loop thread may already have closed; the throw escaped
+/// through `NioIoHandler.wakeup` into
+/// `MultithreadEventExecutorGroup.shutdownGracefully`, which runs as a
+/// `DefaultPromise` LISTENER. A listener that throws is logged and DROPPED, so
+/// Vert.x's `VertxImpl$2.operationComplete` never finished shutting down the
+/// remaining event-loop groups and its close promise never completed —
+/// `vertx.close()` blocked forever. In the hibernate-reactive suite that
+/// surfaced as classes timing out in `RunTestOnContext.cleanUp`, one leaked
+/// Postgres container each, with the actual `IOException` swallowed by the
+/// logger delegate.
 fn selector_wakeup_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
         return Ok(None);
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Ok(None);
     }
     let id = selector_id_from_obj(ctx, obj);
     if id != 0 {
@@ -2263,7 +2312,7 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Int(0)));
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Err(closed_selector_typed(ctx));
     }
     let timeout = match args.get(1) {
         Some(Value::Long(v)) => *v,
@@ -2398,7 +2447,7 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         return Ok(Some(Value::Int(0)));
     };
     if !open_flag(ctx, obj) {
-        return Err(closed_selector());
+        return Err(closed_selector_typed(ctx));
     }
     let id = selector_id_from_obj(ctx, obj);
     if id == 0 {
@@ -3040,6 +3089,13 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
+    // Measured on jdk-25: `keys()` on a closed selector raises
+    // `ClosedSelectorException`. Answering an empty set instead reports "this
+    // selector has no registered channels", which is a legitimate state — so a
+    // caller draining keys after an unnoticed close saw a clean, wrong answer.
+    if !open_flag(ctx, obj) {
+        return Err(closed_selector_typed(ctx));
+    }
     let id = selector_id_from_obj(ctx, obj);
     let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()

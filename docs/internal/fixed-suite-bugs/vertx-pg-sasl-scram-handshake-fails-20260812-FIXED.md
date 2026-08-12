@@ -101,25 +101,37 @@ All verified against stock HotSpot 25 on the same host, same classpath.
 5. **Seven previously-refused MAC algorithms implemented**: `HmacSHA224`,
    `HmacSHA512/224`, `HmacSHA512/256`, and `HmacSHA3-224/256/384/512`. These were
    refused with `NoSuchAlgorithmException` on the stated grounds that each needs
-   its own HMAC block size and that lane could neither build nor run. The block
-   sizes are 64 for SHA-224, 128 for the SHA-512 truncations, and the SHA-3
-   sponge RATE — 144/136/104/72 — which SHRINKS as the digest grows. All seven
-   are pinned to HotSpot-measured vectors, including a 200-byte-key set: a key
-   longer than the block is hashed down first, which is the only path where the
-   block-size constant changes the answer, so a short-key vector alone would not
-   have caught a wrong one. `jca::provider_chain` advertises exactly the same
-   twelve names `mac_algorithm_supported` serves, asserted in lockstep.
+   its own HMAC block size and that lane could neither build nor run.
+
+   The block size is exactly the part not to hand-write: 64 for SHA-224, 128 for
+   the SHA-512 truncations (NOT the 64 their 224/256-bit output suggests), and
+   for SHA-3 the sponge RATE — 144/136/104/72 — which SHRINKS as the digest
+   grows, the opposite of every other family. All seven therefore go through
+   `hmac::Hmac<D>`, which reads it from `D::BlockSize`, so none of those numbers
+   appears in the source. That mechanism is `dev`'s, from the `HmacSHA224`
+   landing (W7-39) that arrived mid-investigation; this work generalised it to a
+   `hmac_over_digest!` macro and the six remaining digests.
+
+   All seven are still pinned to HotSpot-measured vectors, including a
+   200-byte-key set: RFC 2104 hashes a key longer than the block before padding,
+   so that is the only path where the block size changes the answer, and a
+   short-key vector alone would pass with a wrong one.
+   `jca::provider_chain` advertises exactly the twelve names
+   `mac_algorithm_supported` serves — a ratchet, since
+   `every_advertised_sunjce_mac_is_computable` derives the list from the
+   registry rather than restating it.
 
    Not academic: `com.ongres.scram` builds its advertised mechanism list by
    probing `Mac.getInstance`, so refusing these made CratonVM offer 8
    SCRAM mechanisms where HotSpot offers 12.
 
-Still refused, deliberately: `Poly1305`, `AESCMAC`, `HmacPBESHA*` and the rest of
-HotSpot's 28 `Mac` names. They are not HMAC-over-a-digest, and serving them would
-mean a second unverified construction — the mistake the old
-`_ => hmac_sha256(key, data)` fallback was removed for. `Security.getAlgorithms("Mac")`
-therefore still answers 12 where HotSpot answers 28, and that under-advertisement
-is the intended state: it agrees exactly with what `Mac.getInstance` will serve.
+Still refused, deliberately: `HmacPBESHA*` and `PBEWithHmac*` (PKCS#12 / PBMAC1
+constructions), and `Poly1305`, `AESCMAC`, `SslMacSHA1` (not HMAC at all).
+Serving any of them would mean a second unverified construction — the mistake the
+old `_ => hmac_sha256(key, data)` fallback was removed for.
+`Security.getAlgorithms("Mac")` therefore answers 12 where HotSpot answers 28,
+and that under-advertisement is the intended state: it agrees exactly with what
+`Mac.getInstance` will serve.
 
 ## Residual sweep — the same species, elsewhere
 
