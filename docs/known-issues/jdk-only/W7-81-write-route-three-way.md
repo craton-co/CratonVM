@@ -85,8 +85,78 @@ impl DelegatedWrite {
 them (`InterruptedIOException` re-asserts the interrupt and does **not** set
 `trouble`; any other `IOException` sets it; nothing else touches it) and returns
 which of the three happened. `record_write_failure` is now
-`classify_write_failure(…).delivered()` — byte-identical behaviour at its six
-other call sites in `native-builtins/src/logging_shims.rs`.
+`classify_write_failure(…).delivered()` — byte-identical behaviour wherever it
+is still used.
+
+### A second site had the same conflation, found by grepping the predicate
+
+Every call site of `record_write_failure` was read, not just the routing helper.
+Five of the six discard the `bool` outright (`native_printwriter_write_string`,
+`…_range`, `…_write_int` and the byte retry, all in
+`native-builtins/src/logging_shims.rs`) — nothing to get wrong there.
+
+**One gated on it**, in `native_printwriter_printf`:
+
+```rust
+let wrote_string = record_write_failure(ctx, this, wrote);
+if !wrote_string && !backing_is_writer { /* retry via write([BII)V) */ }
+```
+
+The comment above it says the retry is for the case where `write(String)`
+"isn't registered" — which is `Refused`, a `NoSuchMethodError` out of our own
+dispatch. But `delivered()` is also `false` for an absorbed `IOException`, so a
+`format` whose sink raised one **re-sent the same characters through the byte
+overload on the same backing**: a double write on a sink the JDK had already
+given up on, and the second attempt sets `trouble` a second time. Now gated on
+`routed()`, so the retry fires only on the case its own comment names.
+
+With that changed, `record_write_failure`'s `bool` is **read at no call site in
+the workspace**. That is the cleanest statement that the conflation is gone: the
+predicate that could not tell "HotSpot wrote it nowhere" from "the sink could
+not take the call" no longer decides anything. It is kept rather than deleted
+because it is a `native-api` public re-export and the recording it performs is
+still wanted.
+
+### Three more natives resolve `out` themselves and never reach the helper
+
+A registration census over every triple that reaches `route_write_through_out`
+turned up the thing that makes a fix in this family look landed and be inert:
+`route_write_through_out` is **not** the only place that reads a
+`PrintStream`/`PrintWriter` `out` and invokes `write` on it. Three natives in
+`native-builtins/src/logging_shims.rs` resolve the backing writer themselves
+(via `printwriter_get_backing_writer`, which is `route_write_through_out`'s
+sink decision expressed a second time) and return before the shared path is
+reached:
+
+| native | had a fallthrough | now |
+|---|---|---|
+| `native_printwriter_write_string` | yes (`native_printstream_write_string`) | gated on `routed()` — a refusal falls through to the console fallback |
+| `native_printwriter_write_string_range` | yes (`…_write_string_range`) | same |
+| `native_printwriter_write_int` | **no** | unchanged — see below |
+
+All three used to `return Ok(None)` unconditionally, which is the **byte
+branch's** old bug on a different receiver shape: a `NoSuchMethodError` out of
+our own dispatch made the text vanish with no fallback at all. The two with a
+fallthrough now hand a `Refused` call to it; an `Absorbed` `IOException` still
+returns, because HotSpot wrote the characters nowhere.
+
+`native_printwriter_write_int` is **deliberately left**. It is the end of its
+own path — there is nothing to fall through to — so giving it the fallback
+means inventing a `stream_write` call for a single character, which is a
+different change and needs its own justification. A `NoSuchMethodError` from
+`out.write(int)` still loses that character silently. Named here rather than
+guessed at.
+
+The picocli / JUnit-console shape is unaffected by all of this and still runs
+through `route_write_through_out`: `printwriter_get_backing_writer` excludes
+`java/io/BufferedWriter`, and a `new PrintWriter(System.out)` backing *is* a
+`BufferedWriter`, so it takes the fallthrough on the first line rather than the
+failure path.
+
+One further site mirrors the routing *predicate* without doing the routing:
+`native-builtins/src/lang_misc.rs` (`printStackTrace`) repeats the null-`out`
+test with a comment saying so. This branch does not touch that predicate — only
+the classification of a failure after it — so that site still agrees.
 
 The `InternalError` arm keeps W7-57's rule intact and states it in the code:
 **`MethodCallFailed::InternalError` is not a Java throwable and can never be the
@@ -271,22 +341,45 @@ own rows.
 ## Which registrar wins
 
 **No registration was added, moved or removed by this branch.** The change is
-entirely inside `route_write_through_out`, `write_string_to_writer` and
-`native-api`'s `print_error_state`, none of which is a registered native. No
-`NativeKind` block boundary moved, and no `retired_shadow.rs` row is affected.
+entirely inside `route_write_through_out`, `write_string_to_writer`, four
+`native-builtins/src/logging_shims.rs` bodies and `native-api`'s
+`print_error_state`. No registration site was edited, so no `NativeKind` block
+boundary moved and no `retired_shadow.rs` row is affected.
 
-`route_write_through_out` is reached from exactly four native bodies —
+The census was run anyway, because a body-only edit still has to reach the body
+that *wins*. Two registrars own every triple that reaches this code, and every
+one of them was read:
+
+| | `register_printstream_fallback_natives` | `register_synthetic_overrides` |
+|---|---|---|
+| file | `native-builtins/src/logging_shims.rs` (115–420) | `native-builtins/src/lib.rs` (21412–24192) |
+| cfg gate | **none** — called unconditionally from `register_essential_natives_with_shims` | `#[cfg(feature = "synthetic-jdk")]`, also runtime-gated on `config.use_synthetic_jdk` |
+| Compatible (`--real-jdk`) | **wins** | not called |
+| synthetic | runs first | **wins** (runs after) |
+| ambient `NativeKind` | `Bridge`, one block, no nested `set_category` | `Intrinsic`, one block, no nested `set_category` |
+
+25 triples are registered by **both**, and in every case the two registrations
+**name the same function**, so the ambient-kind split is a census tag and not a
+behavioural one. Seven more are `register_printstream_fallback_natives`-only
+(winner in both modes) and one — `java/io/PrintWriter.print(Ljava/lang/String;)V`
+— is `register_synthetic_overrides`-only, so Compatible mode runs real bytecode
+for it. Nothing else in the workspace registers any of them; the other hits on
+those class names are `find()` lookups and constant-pool entries.
+
+Because the edit is to shared **bodies** rather than to any registration, it
+covers every winner in both modes by construction. The one thing that would have
+made it inert is a second implementation of the same routing — and there was
+one, which is why the three `native_printwriter_write*` natives above are part
+of this branch rather than a footnote.
+
+`route_write_through_out` itself is reached from exactly four native bodies —
 `stream_write` and `stream_writeln_inner` in `native-builtins/src/lib.rs`,
 `native_printstream_write` and `native_printstream_write_int` in
-`native-builtins/src/logging_shims.rs` — and `stream_write` / `stream_writeln`
-are themselves reached from the 23 call sites counted above. Because the edit is
-to the **one shared helper** rather than to any registration, it covers every
-winner in both modes by construction: whichever registrar last wrote a given
-`print`/`println`/`write` triple, the body it named funnels here.
-
-`record_write_failure` keeps its exact previous semantics, so its six other call
-sites (`native-builtins/src/logging_shims.rs`, the `PrintWriter`/`PrintStream`
-write shims) are behaviourally untouched.
+`native-builtins/src/logging_shims.rs` — plus, through `stream_writeln`, the
+`emit_framework_log` helper, which is not itself a registered native but is
+called from roughly twenty JUL / log4j / jboss-logmanager sites in
+`native-builtins/src/logmanager.rs` and `phases_late.rs`. Those inherit the
+change too.
 
 ## Compatible-mode justification
 
@@ -359,6 +452,20 @@ Spring Boot's `OutputCaptureExtension`, DaCapo's `stdout.log` digest):
 above move bytes across the console boundary. Digest-checking workloads
 (DaCapo's `stdout.log`) are sensitive to this in both directions.
 
+**Medium — `PrintWriter.write(String)` / `write(String,int,int)` over a
+non-`BufferedWriter` `Writer` backing** (`ModelNode.toString()` over a
+`StringWriter`, Spring's response writers). A refused call now falls through to
+the shared write path instead of returning silently, which means the text may
+reach the console where it previously vanished — and `record_printed_line` fires
+on that path, so `OutputCapture`-style collectors see it too. Failure path only;
+a working sink is untouched.
+
+**Medium — `PrintWriter.printf` / `format` over a byte backing.** The retry
+through `write([BII)V` no longer fires on an absorbed `IOException`, only on a
+refusal. Output that was being written twice to such a sink is written once;
+output that was reaching it only via the retry is unaffected, because a
+`NoSuchMethodError` is still a refusal.
+
 **Low — `PrintWriter` char sinks.** Only the `IOException` half applies (the
 char branch already fell back on an `Error`), and only where the receiver's
 slot-0 chain reaches `System.out` / `System.err`; elsewhere the fallback had no
@@ -402,6 +509,13 @@ outside its `observed.` line).
   `observed.psRouteErrorWriteOutcome` is the gap.
 * **`printwriter_autoflush_if_needed` still swallows an `Error`**, and there it
   genuinely is only the 23-call-site arity.
+* **`native_printwriter_write_int` still loses a refused character silently**,
+  because it has no fallthrough to hand the refusal to. Named above.
+* **`printwriter_get_backing_writer` is a second copy of
+  `route_write_through_out`'s sink decision**, and `lang_misc.rs`'s
+  `printStackTrace` is a third copy of its null-`out` predicate. All three agree
+  today. Converting the idiom instead of the sites is the standing repair and
+  is not attempted here.
 * **The console echo has no in-process observable.** Any future change to this
   helper is measurable only by reading the process's stdout, which is why the
   decision table is pinned by Rust unit tests. If someone wants a real assertion,
