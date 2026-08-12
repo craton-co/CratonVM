@@ -35568,15 +35568,27 @@ fn native_md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let upper = algo.to_uppercase().replace('-', "");
-    if ![
-        "MD5", "SHA1", "SHA256", "SHA384", "SHA512", "SHA3256", "SHA3384", "SHA3512",
-    ]
-    .contains(&upper.as_str())
-    {
-        // Accept anyway for compatibility — unknown algorithms fall
-        // back to SHA-256 inside `compute_digest`, matching the JDK
-        // behaviour of NoSuchAlgorithmException being surfaced lazily.
+    // This used to be an `if` with an EMPTY body and a comment explaining
+    // that unknown algorithms "fall back to SHA-256 inside `compute_digest`,
+    // matching the JDK behaviour of NoSuchAlgorithmException being surfaced
+    // lazily". The JDK does not do that: `MessageDigest.getInstance` throws
+    // at `getInstance`, measured on HotSpot 25 (`NO-SUCH-DIGEST MessageDigest
+    // not available`, probes/JcaAdvertisedVsServedProbe.expected.txt §B). The
+    // fallback meant a caller in synthetic mode that asked for a digest this
+    // VM does not implement got SHA-256's bytes labelled with its own
+    // algorithm name and no error anywhere on the path.
+    //
+    // Gate on the SAME predicate the real-JDK-mode `md_get_instance` uses
+    // rather than a second hand-maintained literal list — that list had
+    // already drifted (no SHA-224, no SHA-512/224, no SHA-512/256, no
+    // SHA3-224, all of which `compute_digest` implements), so the check it
+    // was not performing would have been wrong in the other direction too.
+    // W7-63-jca-advertise-vs-serve.md.
+    if !crate::jca::message_digest::algorithm_supported_public(&algo) {
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            &format!("{algo} MessageDigest not available"),
+        ));
     }
     let md = try_alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2)?;
     // GC-safety: `md` is a bare Rust local held across two further
@@ -35692,19 +35704,37 @@ fn native_md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 /// Compute a cryptographic digest using the specified algorithm.
 ///
-/// Classical digests (MD5, SHA-1, SHA-2 family) are served by the
-/// in-tree constant-time implementations (`real_md5` / `real_sha1` /
-/// `real_sha256` / `real_sha384` / `real_sha512`). The SHA-3 family is
-/// provided by the RustCrypto `sha3` crate so CratonVM does not have to
-/// re-implement the Keccak permutation.
+/// Classical digests (MD2, MD5, SHA-1, SHA-2 family) are served by the
+/// in-tree constant-time implementations (`real_md2` / `real_md5` /
+/// `real_sha1` / `real_sha256` / `real_sha384` / `real_sha512`). The SHA-3
+/// family and the two SHAKE XOFs are provided by the RustCrypto `sha3` crate
+/// so CratonVM does not have to re-implement the Keccak permutation.
+///
+/// THE DEFAULT ARM FAILS. It used to be `Ok(real_sha256(data))`, which meant
+/// an unrecognised algorithm name was silently served SHA-256's bytes under
+/// its own name — the same species as the `Cipher` defect that served
+/// ChaCha20 as AES-256-ECB, and the `Mac` defect that served every
+/// unimplemented HMAC as HMAC-SHA-256. W7-63-jca-advertise-vs-serve.md.
+/// `md_get_instance` gates on `algorithm_supported` first, so in the
+/// real-JDK path the arm was unreachable; the synthetic-mode
+/// `native_md_get_instance` accepted any name by design, so there it was
+/// live. Both doors are now shut, and this one is the structural half: a
+/// digest function that cannot name its algorithm must not return bytes.
 pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodCallFailed> {
     use sha3::Digest as _;
     // Strip both `-` and `/` so the truncated SHA-512 spellings
     // ("SHA-512/256", "SHA-512/224") normalise to "SHA512256" / "SHA512224"
     // — matching the alphanumeric-only normalisation used by
-    // `algorithm_supported` / `digest_length_bytes`.
+    // `algorithm_supported` / `digest_length_bytes`. It also collapses the
+    // JDK's `SHAKE128-256` / `SHAKE256-512` to `SHAKE128256` / `SHAKE256512`,
+    // which is what `algorithm_supported`'s alphanumeric-only filter gives
+    // for the same two names — an agreement asserted by
+    // `shake_normalisations_agree_across_the_two_filters` rather than assumed,
+    // because it is a coincidence of these names and not a property of the
+    // two functions.
     let upper = algo.to_uppercase().replace(['-', '/'], "");
     match upper.as_str() {
+        "MD2" => Ok(real_md2(data)),
         "MD5" => Ok(real_md5(data)),
         "SHA1" | "SHA" => Ok(real_sha1(data)),
         "SHA224" => {
@@ -35753,8 +35783,135 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodC
             h.update(data);
             Ok(h.finalize().to_vec())
         }
-        _ => Ok(real_sha256(data)), // default to SHA-256
+        // SHAKE128-256 / SHAKE256-512 (SUN, JDK 21+). These are the plain
+        // SHAKE128 / SHAKE256 extendable-output functions read out to a FIXED
+        // length — 256 and 512 bits, which is exactly what the suffix in the
+        // JDK's algorithm name means. Verified against HotSpot 25 in
+        // probes/JcaAdvertisedVsServedProbe.expected.txt, whose `""` rows are
+        // also the published NIST XOF outputs, so the JDK names are not doing
+        // anything exotic. `native-builtins-crypto/src/bc_newhope.rs` already
+        // drives `sha3::Shake128` through this same XofReader API.
+        //
+        // `sha3::Digest` is imported at the top of this function as
+        // `Digest as _`; the XOF traits are separate, and `Update` and
+        // `Digest` both provide `update`, so importing both unqualified in
+        // one scope is ambiguous. Keeping the `use` inside the arm is the
+        // smaller change.
+        "SHAKE128256" => {
+            use sha3::digest::{ExtendableOutput, Update, XofReader};
+            let mut xof = sha3::Shake128::default();
+            xof.update(data);
+            let mut out = vec![0u8; 32];
+            xof.finalize_xof().read(&mut out);
+            Ok(out)
+        }
+        "SHAKE256512" => {
+            use sha3::digest::{ExtendableOutput, Update, XofReader};
+            let mut xof = sha3::Shake256::default();
+            xof.update(data);
+            let mut out = vec![0u8; 64];
+            xof.finalize_xof().read(&mut out);
+            Ok(out)
+        }
+        // NOT `Ok(real_sha256(data))`. See the doc comment: serving SHA-256's
+        // bytes under a name this VM does not implement is a wrong-algorithm
+        // bug, not graceful degradation, and it is invisible to a caller
+        // because the bytes look exactly like a working digest.
+        other => Err(RuntimeError::IllegalArgumentException {
+            message: format!("unsupported digest algorithm: {other}"),
+        }
+        .into()),
     }
+}
+
+// ===========================================================================
+// Real MD2 implementation (RFC 1319)
+// ===========================================================================
+
+/// RFC 1319 §3.2 `PI_SUBST` — the 256-byte permutation derived from the
+/// digits of pi. There is no shortcut form; the table IS the algorithm.
+const MD2_PI: [u8; 256] = [
+    41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6, 19, 98, 167, 5, 243, 192,
+    199, 115, 140, 152, 147, 43, 217, 188, 76, 130, 202, 30, 155, 87, 60, 253, 212, 224, 22, 103,
+    66, 111, 24, 138, 23, 229, 18, 190, 78, 196, 214, 218, 158, 222, 73, 160, 251, 245, 142, 187,
+    47, 238, 122, 169, 104, 121, 145, 21, 178, 7, 63, 148, 194, 16, 137, 11, 34, 95, 33, 128, 127,
+    93, 154, 90, 144, 50, 39, 53, 62, 204, 231, 191, 247, 151, 3, 255, 25, 48, 179, 72, 165, 181,
+    209, 215, 94, 146, 42, 172, 86, 170, 198, 79, 184, 56, 210, 150, 164, 125, 182, 118, 252, 107,
+    226, 156, 116, 4, 241, 69, 157, 112, 89, 100, 113, 135, 32, 134, 91, 207, 101, 230, 45, 168,
+    2, 27, 96, 37, 173, 174, 176, 185, 246, 28, 70, 97, 105, 52, 64, 126, 15, 85, 71, 163, 35,
+    221, 81, 175, 58, 195, 92, 249, 206, 186, 197, 234, 38, 44, 83, 13, 110, 133, 40, 132, 9, 211,
+    223, 205, 244, 65, 129, 77, 82, 106, 220, 55, 200, 108, 193, 171, 250, 36, 225, 123, 8, 12,
+    189, 177, 74, 120, 136, 149, 139, 227, 99, 232, 109, 233, 203, 213, 254, 59, 0, 29, 57, 242,
+    239, 183, 14, 102, 88, 208, 228, 166, 119, 114, 248, 235, 117, 75, 10, 49, 68, 80, 180, 143,
+    237, 31, 26, 219, 153, 141, 51, 159, 17, 131, 20,
+];
+
+/// MD2 (RFC 1319). HotSpot 25's `SUN` provider carries it — measured
+/// `getDigestLength() == 16` — and `SunRsaSign` and `SunMSCAPI` both
+/// advertise `MD2withRSA`, which resolves `MessageDigest.getInstance("MD2")`
+/// internally. So this closes three advertisements, not one.
+///
+/// Before this landed, `jca::provider_chain::seed_direct_native_engine_services`
+/// listed `MD2` in the `SUN` `MessageDigest` array — three lines above a
+/// comment that declined to advertise SHAKE for exactly the reason MD2 was
+/// being advertised anyway — and `MessageDigest.getInstance("MD2")` raised
+/// `NoSuchAlgorithmException`. Advertise-but-refuse. The choice was implement
+/// or de-advertise, and RFC 1319 is short, fully specified and cheap.
+///
+/// This transcription was adjudicated against HotSpot's own MD2 before it was
+/// written, on ten messages covering all three padding cases (short, exactly
+/// 16, and 17 bytes — an exact multiple takes a FULL 16-byte pad block, which
+/// is the boundary every naive MD2 gets wrong). The vectors are pinned below
+/// in `real_md2_matches_hotspot_vectors`; that test is what stands in for a
+/// build this lane could not run.
+///
+/// MD2 is cryptographically broken (preimage and collision attacks are
+/// published) and is present for parity with the platform JDK, not because
+/// anything should use it. It is not reachable from any TLS or signing path
+/// added here — the only new caller is `compute_digest`'s `"MD2"` arm.
+pub(crate) fn real_md2(data: &[u8]) -> Vec<u8> {
+    // §3.1 Padding: append between 1 and 16 bytes, each equal to the number
+    // of bytes appended. A message that is already a multiple of 16 gets a
+    // full extra block of 0x10 — never zero bytes.
+    let pad = 16 - (data.len() % 16);
+    let mut m = data.to_vec();
+    m.extend(std::iter::repeat(pad as u8).take(pad));
+
+    // §3.2 Checksum, computed over the PADDED message.
+    let mut c = [0u8; 16];
+    let mut l: u8 = 0;
+    for block in m.chunks_exact(16) {
+        for (j, &byte) in block.iter().enumerate() {
+            c[j] ^= MD2_PI[(byte ^ l) as usize];
+            l = c[j];
+        }
+    }
+
+    // §3.3/§3.4 Compression: a 48-byte state, 18 rounds per block. The
+    // checksum is fed through as one additional final block.
+    let mut x = [0u8; 48];
+    let blocks = m.len() / 16;
+    for i in 0..=blocks {
+        let block: &[u8] = if i == blocks {
+            &c
+        } else {
+            &m[i * 16..i * 16 + 16]
+        };
+        for j in 0..16 {
+            x[16 + j] = block[j];
+            x[32 + j] = x[16 + j] ^ x[j];
+        }
+        let mut t: u8 = 0;
+        for j in 0..18u16 {
+            for k in 0..48 {
+                x[k] ^= MD2_PI[t as usize];
+                t = x[k];
+            }
+            t = t.wrapping_add(j as u8);
+        }
+    }
+
+    x[..16].to_vec()
 }
 
 // ===========================================================================
@@ -42391,6 +42548,57 @@ mod t2_6_crypto_acceptance_tests {
             digest, expected,
             "SHA-256(\"hello\") did not match RFC 6234 vector"
         );
+    }
+
+    /// MD2 (RFC 1319) against HotSpot 25's own `MessageDigest.getInstance("MD2")`.
+    ///
+    /// This lane could not build or run Rust, so `real_md2` was adjudicated
+    /// BEFORE it was written: the identical transcription was expressed in
+    /// Java and run against jdk-25.0.3.9-hotspot on these exact ten messages,
+    /// all ten matching. This test is what carries that verification into the
+    /// tree — landing a hand-written digest without published vectors beside
+    /// it would be the same class of mistake as the SHA-256 fallback it
+    /// replaces. W7-63-jca-advertise-vs-serve.md.
+    ///
+    /// The three-way length coverage is deliberate. MD2's padding rule adds
+    /// between 1 and 16 bytes and NEVER zero, so a message that is already an
+    /// exact multiple of 16 takes a full extra block of `0x10`. That is the
+    /// boundary a naive implementation gets wrong and the reason the 15/16/17
+    /// rows are here rather than a single vector.
+    #[test]
+    fn real_md2_matches_hotspot_vectors() {
+        let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
+        for (msg, want) in [
+            ("", "8350e5a3e24c153df2275c9f80692773"),
+            ("a", "32ec01ec4a6dac72c0ab96fb34c0b5d1"),
+            ("abc", "da853b0d3f88d99b30283a69e6ded6bb"),
+            ("message digest", "ab4f496bfb2a530b219ff33031fe06b0"),
+            ("abcdefghijklmnopqrstuvwxyz", "4e8ddff3650292ab5a4108c3aa47940b"),
+            (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "da33def2a42df13975352846c30338cd",
+            ),
+            (
+                "12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "d5976f79d83d3a0dc9806c3c66f3efd8",
+            ),
+            // 15 bytes: a partial pad.
+            ("0123456789abcde", "d95629645108a20ab4d70e8545e0723b"),
+            // 16 bytes: an EXACT multiple, so a whole extra 0x10 pad block.
+            ("0123456789abcdef", "12c8dfa285f14e1af8c5254e7092d0d3"),
+            // 17 bytes: two blocks plus a 15-byte pad.
+            ("0123456789abcdefg", "e4d0efded5ef7b6843a5ba47e1171347"),
+        ] {
+            assert_eq!(hex(real_md2(msg.as_bytes())), want, "MD2({msg:?})");
+            // And through the dispatcher, which is the surface `MessageDigest`
+            // actually reaches — a correct `real_md2` wired to the wrong arm
+            // name would pass the line above and fail this one.
+            assert_eq!(
+                hex(compute_digest("MD2", msg.as_bytes()).unwrap()),
+                want,
+                "compute_digest(\"MD2\", {msg:?})"
+            );
+        }
     }
 
     /// T2.6.2 companion — SHA3-256("") matches the FIPS 202 empty-string
