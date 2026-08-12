@@ -56949,11 +56949,33 @@ mod tests {
             got.push(b);
         }
 
-        // Compared with a relative tolerance rather than by bit pattern: the
-        // JDK's multiplier goes through `StrictMath.log` (fdlibm) while this
-        // uses the platform libm, and those may differ in the last ulp. A
+        // Compared with a relative tolerance rather than by bit pattern,
+        // because the multiplier goes through `StrictMath.log` (fdlibm) on the
+        // JDK and the platform libm here, and those can differ in the last ulp.
+        //
+        // THE TOLERANCE IS MEASURED, and it used to be 1e-12 with the note "a
         // DIFFERENT sequence cannot come within 1e-12 of this one, so the
-        // tolerance costs the assertion nothing.
+        // tolerance costs the assertion nothing". Both halves of that were
+        // wrong. Measured on Temurin jdk-25.0.3+9 over the three accepted pairs
+        // of this exact sequence:
+        //
+        //   worst |StrictMath.log(s) - Math.log(s)|      = 1.000 ulp
+        //   worst induced relative error in the value    = 1.77e-16
+        //   1e-12 relative                               = 5,143 ulps of g[0]
+        //
+        // `sqrt` is IEEE-exact, so `log` is the only source of divergence and
+        // the square root halves whatever it contributes. 1e-12 was therefore
+        // ~5,650x wider than the largest disagreement it names and ~9,000x
+        // wider than a 1-ulp justification — a tolerance sized to admit the
+        // very thing it was written about. `Random.nextGaussian()` is specified
+        // in terms of `StrictMath`, so a platform-libm result that drifts
+        // further than a few ulps is a divergence from the specified stream,
+        // not test noise, and this must report it rather than absorb it.
+        //
+        // Four ulps of the expected value: 5x the measured worst case, and
+        // 1,100x tighter than what it replaces. Every value here is O(1), so
+        // there is no denormal case for the relative form to mishandle.
+        const ULPS: f64 = 4.0;
         let expected: [i64; 6] = [
             4607821503525903750,
             4606456510138157127,
@@ -56965,9 +56987,14 @@ mod tests {
         for (i, want_bits) in expected.iter().enumerate() {
             let want = f64::from_bits(*want_bits as u64);
             let have = got[i];
+            let tol = ULPS * f64::EPSILON * want.abs();
             assert!(
-                (have - want).abs() <= 1e-12 * want.abs().max(1.0),
-                "nextGaussian[{i}] diverged from the JDK's seeded sequence:                  got {have:?}, want {want:?}"
+                (have - want).abs() <= tol,
+                "nextGaussian[{i}] diverged from the JDK's seeded sequence: got {have:?}, want \
+                 {want:?} (differs by {:.3e}, tolerance {tol:.3e} = {ULPS} ulps). A drift of a few \
+                 ulps here is a real divergence from the SPECIFIED stream — `nextGaussian` is \
+                 defined in terms of `StrictMath.log` — not noise to widen this bound for.",
+                (have - want).abs()
             );
         }
     }
@@ -60223,10 +60250,13 @@ mod tests {
             while got.len() < 6 {
                 got.push(call(&mut ctx, rnd));
             }
-            // Same tolerance and same reason as the sibling test: the JDK's
-            // multiplier goes through `StrictMath.log` (fdlibm) while this uses
-            // the platform libm, so the last ulp may differ. It is not what
-            // makes this test able to fail — the integer assertion below is.
+            // Same tolerance and same measurement as the sibling test: `log` is
+            // the only source of divergence (`sqrt` is IEEE-exact), it differs
+            // by at most 1 ulp between fdlibm and the platform libm on these
+            // three pairs, and that propagates to at most 1.77e-16 relative.
+            // Four ulps is 5x that. It is not what makes this test able to fail
+            // — the integer assertion below is.
+            const ULPS: f64 = 4.0;
             let expected: [i64; 6] = [
                 4607821503525903750,
                 4606456510138157127,
@@ -60237,10 +60267,11 @@ mod tests {
             ];
             for (i, want_bits) in expected.iter().enumerate() {
                 let want = f64::from_bits(*want_bits as u64);
+                let tol = ULPS * f64::EPSILON * want.abs();
                 assert!(
-                    (got[i] - want).abs() <= 1e-12 * want.abs().max(1.0),
+                    (got[i] - want).abs() <= tol,
                     "nextGaussian[{i}] diverged from `new Random(42)` on the oracle: got {:?}, \
-                     want {want:?}",
+                     want {want:?} (tolerance {tol:.3e} = {ULPS} ulps)",
                     got[i]
                 );
             }

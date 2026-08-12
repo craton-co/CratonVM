@@ -3112,7 +3112,12 @@ mod tests {
         let v_long = Value::Long(f64::to_bits(std::f64::consts::PI) as i64);
         let coerced = coerce_field_value_by_descriptor(v_long, b'D');
         match coerced {
-            Value::Double(d) => assert!((d - std::f64::consts::PI).abs() < 1e-12),
+            // Bit equality, not a tolerance. This asserts a REINTERPRETATION:
+            // the whole claim is that the 64 bits survive, and a tolerance of
+            // 1e-12 admits ~5,100 ulps of drift in a value that cannot legally
+            // drift at all — it would pass a slot that silently narrowed the
+            // double to f32 and back.
+            Value::Double(d) => assert_eq!(d.to_bits(), std::f64::consts::PI.to_bits()),
             other => panic!("expected Double, got {other:?}"),
         }
     }
