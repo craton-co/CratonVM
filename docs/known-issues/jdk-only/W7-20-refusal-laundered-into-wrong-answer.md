@@ -1,6 +1,8 @@
 # W7-20 — a refusal laundered into a wrong answer, and the paired mint that stops producing them
 
-**Status: DIAGNOSED and FIXED IN SOURCE 2026-08-11, NOT REBUILT.** Nine
+**Status: DIAGNOSED and FIXED IN SOURCE 2026-08-11, NOT REBUILT. Both
+out-of-file items taken 2026-08-12 — see the block above "Out-of-file patch"
+and W7-62-ratchets-and-dead-code.md.** Nine
 helpers in `native-collections/src/lib.rs` gained an error channel, and
 `cratonvm/internal/LinkedListSnapshotListItr` now mints through the
 VM-internal door with its natives kept `Bridge` — both halves in one commit,
@@ -290,7 +292,35 @@ inventory scoped to `cratonvm/*` under-reports these gaps.**
 
 ---
 
-## Out-of-file patch (not applied)
+## Out-of-file patch — (a) PARTLY APPLIED, (b) APPLIED, 2026-08-12
+
+> **W7-62-ratchets-and-dead-code.md took both.** In summary, so nobody
+> re-derives it:
+>
+> * **(a) the kind map is re-frozen; the JSON is not.** Twelve rows of
+>   `scripts/baselines/jdk-only-kind-map-25-linux.tsv`, by hand and disclosed
+>   in its header on W7-56's convention — the nine below plus
+>   `java/util/logging/Formatter.formatMessage` and
+>   `LogManager.{getLogManager, getLogger}`, which this record did not know
+>   about. **The nine were not frozen at what the tree produces:** the retag
+>   also dropped their `kind_stated` from 1 to 0, which the gate refuses
+>   one-way and correctly, so the nine registrations moved to
+>   `register_with_kind(..., NativeKind::Bridge)` and the baseline holds
+>   `bridge 1 1`. `jdk-only-bridge-ratchet.json` is deliberately left firing
+>   with its derived movement written into its `note`: this section is right
+>   that the values must come from a census, and a count hand-written too high
+>   widens a slack-free ratchet.
+> * **(a) also found a THIRD stale ratchet this record does not mention** —
+>   `native-builtins/tests/stub_ratchet.rs`, stale in the firing direction by
+>   at least +6, from the same 2026-08-11-evening retag wave.
+> * **(b) the `jdk_interfaces` arm is applied**, with
+>   `probes/ListItrInterfaceProbe.java` and a HotSpot 25 control transcript
+>   beside it. It closes the `ClassCastException` rather than moving it; the
+>   reasoning is in W7-62 §3.2.
+> * **`probes/LaunderProbe.java`, which Part 1's table was measured with and
+>   this record says was "written for this record", is NOT IN THE TREE.** Not
+>   in `probes/`, not in `regression-suite/src/`. The measurement cannot be
+>   re-run.
 
 ### (a) Two baselines under `scripts/baselines/` must be re-frozen
 
