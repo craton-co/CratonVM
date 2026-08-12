@@ -1232,15 +1232,34 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // `class_layout` is only populated when compact reference fields are
     // enabled, so with that flag off this is a no-op and legacy behaviour
     // stands — the same caveat the `vm_init.rs` precedent carries.
-    let slot0_is_ref = cratonvm_gc::class_layout(class_class_id.as_u32())
-        .and_then(|l| l.field_is_ref(0))
-        .unwrap_or(false);
-    if !slot0_is_ref {
-        shared
-            .mem
-            .heap
-            .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
-    }
+    // REVERTED 2026-08-12, same day, by measurement.
+    //
+    // This store was gated on `!slot0_is_ref` to stop an `Int` landing in a
+    // slot the real `java.lang.Class` declares as `Constructor cachedConstructor`
+    // — every collector boxes it, and the JIT's field helpers read the compact
+    // slot RAW without un-boxing, so a compiled `Class.newInstance()` sees a
+    // non-null `AUTOBOX` wrapper and takes the cached path. That analysis is
+    // sound and the JIT hazard is real (W7-84 §8; `AUTOBOX_CLASS_ID` appears
+    // nowhere under `jit/`).
+    //
+    // But the gate's PREMISE was that `class_mirrors_reverse` answers every
+    // runtime lookup and `mirror_class_id`'s slot-0 fallback is never used —
+    // argued from a measured zero-hit count over 87 Spring tests. **That is
+    // falsified.** With the gate in, `RJdkHello` fails at
+    // `System.out instanceof PrintStream`; the pre-wave binary passes it 41/41.
+    // Some type-check path resolves a mirror through the slot-0 fallback, and a
+    // zero-hit count on one corpus did not license "never".
+    //
+    // A measured regression outweighs an unmeasured hazard, so the overlay is
+    // restored and the JIT hazard stays OPEN with its analysis intact. The
+    // durable fix is on the JIT side (un-box in `jit_getfield`'s compact-ref arm
+    // and the two inline emitters, or refuse to inline reference loads); this
+    // site is the wrong place to force it. Do not re-gate this without first
+    // finding the reader that needs the fallback.
+    shared
+        .mem
+        .heap
+        .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
 
     // name → class name String.
     if let Some(idx) = slots.name {
@@ -1443,12 +1462,15 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     //     written a few lines below, falling back to the name string.
     // The `MockNativeContext` argument that previously kept this write does not
     // apply either: the mock builds its own mirrors and never calls this.
-    let slot0_is_ref = cratonvm_gc::class_layout(class_class_id.as_u32())
-        .and_then(|l| l.field_is_ref(0))
-        .unwrap_or(false);
-    if !slot0_is_ref {
-        shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
-    }
+    // REVERTED 2026-08-12 alongside the class-mirror store above, for the same
+    // reason and out of the same caution: the gate there was falsified by
+    // measurement (`System.out instanceof PrintStream` began failing), and the
+    // two stores are one convention. Reverting only the half that was proven to
+    // regress, while leaving its twin gated, would leave the two mirror kinds
+    // disagreeing about whether slot 0 is written at all — which is a worse
+    // state than either consistent choice and exactly the kind of half-applied
+    // repair this campaign kept finding.
+    shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.
     if let Some(idx) = slots.name {

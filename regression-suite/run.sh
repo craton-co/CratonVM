@@ -392,10 +392,17 @@ class_cv_args() {
     # native-builtins/src/atomic_updater.rs does not implement (it rejects
     # static and final, not plain non-volatile). `SUITE=all` with no
     # CRATONVM_ARGS runs JDKONLY_CLASSES in Compatible mode, so pin it here.
-    # Repeating the flag when CRATONVM_ARGS already sets it is harmless:
-    # `--jdk-only` is a bool arg, so clap derives ArgAction::SetTrue, which is
-    # idempotent. (`--jdk-only --real-jdk` IS a hard conflict; a repeat is not.)
-    RJdkSqlPackage)   printf '%s' "--jdk-only" ;;
+    # MEASURED, and it corrects an earlier claim in this file: repeating the
+    # flag is NOT harmless. `cratonvm --jdk-only --jdk-only` exits 2 with
+    # "the argument '--jdk-only' cannot be used multiple times" — clap's derive
+    # for a bool does not imply an idempotent SetTrue. So emit it only when
+    # CRATONVM_ARGS has not already supplied it.
+    RJdkSqlPackage)
+      case " ${CRATONVM_ARGS:-} " in
+        *" --jdk-only "*) : ;;
+        *) printf '%s' "--jdk-only" ;;
+      esac
+      ;;
     *) : ;;
   esac
 }
