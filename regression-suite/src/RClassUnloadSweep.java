@@ -122,11 +122,21 @@ public class RClassUnloadSweep {
             cleared = ref.get() == null;
         }
 
-        // The one observable. Printed as a bare boolean so the suite's
-        // HotSpot diff is the assertion: HotSpot unloads the class, so a run
-        // that prints `false` here is a CratonVM defect, and a run that prints
-        // `true` on both is the defect staying closed.
-        System.out.println("payload.class.unloaded=" + cleared);
+        // The one observable, and it must be on a `CK ` line. run.sh:218
+        // filters both VMs' output through `grep -aE '^(PASS|CK) '` before
+        // diffing, so the comment that used to stand here — "printed as a bare
+        // boolean so the suite's HotSpot diff is the assertion" — described a
+        // line the harness deleted. What survived was the constant
+        // `PASS RClassUnloadSweep`, and a CratonVM that never unloaded a class
+        // at all passed.
+        //
+        // DIFF-ONLY ON PURPOSE, unlike the other vectors repaired alongside it.
+        // Whether a weak reference has actually been cleared is a GC-policy
+        // outcome, not a language guarantee, so a local `check(cleared)` would
+        // turn a legitimate collector configuration into a red. HotSpot clears
+        // it within the 12 rounds here (measured, 2/2), so a CratonVM printing
+        // `false` is a real divergence and the diff is the right instrument.
+        System.out.println("CK RClassUnloadSweep payload.class.unloaded=" + cleared);
         System.out.println("PASS RClassUnloadSweep");
     }
 }
