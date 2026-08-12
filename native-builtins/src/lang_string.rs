@@ -5034,6 +5034,22 @@ pub(crate) fn native_string_transform(
 ///
 /// Every variant's payload is exactly its JDK constructor's arguments, so
 /// [`fmt_raise`] is a straight translation with no message reconstruction.
+///
+/// The variants cover every member of the `java.util.IllegalFormatException`
+/// family that `Formatter`'s own parser and printers can actually reach on
+/// JDK 25. Two members of the family are deliberately absent:
+///
+/// * `UnknownFormatFlagsException` is UNREACHABLE from `Formatter`. Its only
+///   throw site is `Flags.parse(char)`'s `default` arm, and the only caller of
+///   `Flags.parse` is `FormatSpecifier.flags(s, start, end)` over exactly the
+///   run of characters `FormatSpecifierParser.parseFlag` accepted — and that
+///   accepts precisely the eight characters `Flags.parse(char)` recognises.
+///   The `default` arm is dead for every format string; only a hand-built
+///   caller of the package-private `Flags` could reach it. Modelling it here
+///   would be a variant no input can produce.
+/// * `FormatterClosedException` is not in the family at all — it extends
+///   `IllegalStateException`, not `IllegalFormatException`, and belongs to
+///   `Formatter`'s lifecycle rather than to its format strings.
 enum FmtFault {
     /// `%q` — "Conversion = 'q'". The conversion character is not one the
     /// javadoc's table defines.
@@ -5060,6 +5076,16 @@ enum FmtFault {
     MissingWidth(String),
     /// `%--8d` — "Flags = '-'". The same flag given twice.
     DuplicateFlags(String),
+    /// `%c` of `0x110000` — "Code point = 0x110000". An `int`/`short`/`byte`
+    /// argument to `%c` that `Character.isValidCodePoint` rejects. The message
+    /// is `String.format("Code point = %#x", c)`, so a NEGATIVE code point
+    /// renders as its unsigned 32-bit hex ("Code point = 0xffffffff").
+    IllegalCodePoint(i32),
+    /// `%0$s` — "Illegal format argument index = 0". An explicit argument
+    /// index that is not a positive `int`. `Integer.MIN_VALUE` is the JDK's
+    /// sentinel for "the digits did not parse as an int at all", and it prints
+    /// a different message; see [`FmtFault::message`].
+    ArgumentIndex(i32),
 }
 
 impl FmtFault {
@@ -5096,6 +5122,20 @@ impl FmtFault {
                 "java/util/DuplicateFormatFlagsException",
                 "(Ljava/lang/String;)V",
             ),
+            FmtFault::IllegalCodePoint(_) => {
+                ("java/util/IllegalFormatCodePointException", "(I)V")
+            }
+            // The one member of the family that is PACKAGE-PRIVATE: JDK 25
+            // declares `final class IllegalFormatArgumentIndexException` with
+            // a package-private constructor, so only `java.util` code can name
+            // it. `getClass().getName()` still reports the full name, which is
+            // what a differential transcript records, and `fmt_raise` falls
+            // back to the base class if the construction is refused — so
+            // asking for it costs nothing if this VM ever grows the access
+            // check that HotSpot would apply to a non-`java.util` caller.
+            FmtFault::ArgumentIndex(_) => {
+                ("java/util/IllegalFormatArgumentIndexException", "(I)V")
+            }
         }
     }
 
@@ -5115,24 +5155,92 @@ impl FmtFault {
             FmtFault::IllegalPrecision(p) | FmtFault::IllegalWidth(p) => p.to_string(),
             FmtFault::MissingWidth(s) => s.clone(),
             FmtFault::DuplicateFlags(f) => format!("Flags = '{f}'"),
+            // `String.format("Code point = %#x", c)` over an `int`: `%x`
+            // renders a negative `int` as unsigned 32-bit, so the cast is part
+            // of the message and not a convenience.
+            FmtFault::IllegalCodePoint(c) => format!("Code point = {:#x}", *c as u32),
+            FmtFault::ArgumentIndex(i) => {
+                if *i == i32::MIN {
+                    "Format argument index: (not representable as int)".to_string()
+                } else {
+                    format!("Illegal format argument index = {i}")
+                }
+            }
         }
+    }
+}
+
+/// Is the named `java.util.IllegalFormatException` subclass available to be
+/// thrown as itself?
+///
+/// This is the whole of W7-41. The predicate used to be
+/// `ctx.class_id_by_name(name).is_some()`, and `class_id_by_name` is
+/// `find_unique_class_by_name` — an index read over the ALREADY-LOADED
+/// classes, with no loading of its own. Nothing in a normal program ever
+/// touches `java.util.UnknownFormatConversionException` before the moment
+/// `String.format` needs to throw it, so that predicate was false on every
+/// first refusal and the fallback below ran instead: right message, wrong
+/// class. `format.unknownConversion` was measured as
+/// `java.lang.IllegalArgumentException: Conversion = 'q'` — the base class
+/// carrying the message this file reconstructs — which is that fallback's
+/// exact signature. See W7-40-differential-at-14.md.
+///
+/// So: ask the class loader, not the index. Two screens keep the load from
+/// making things worse than the defect it fixes:
+///
+/// * `would_fabricate_synthetic_stub` is checked FIRST and is non-destructive.
+///   A build with no real `java.util` exception hierarchy would answer the
+///   load with a minted stub that has no `<init>` and does not extend
+///   `IllegalArgumentException`; throwing that would turn a wrong-superclass
+///   defect into an object no `catch (IllegalArgumentException)` can catch.
+/// * after the load, the class must actually BE an `IllegalArgumentException`.
+///   That is the invariant the fallback relies on (see [`fmt_raise`]), and it
+///   is cheap to confirm rather than assume.
+fn fmt_exception_class_available(ctx: &mut dyn NativeContext, class_name: &str) -> bool {
+    let class_id = match ctx.class_id_by_name(class_name) {
+        Some(id) => id,
+        None => {
+            if ctx.would_fabricate_synthetic_stub(class_name) {
+                return false;
+            }
+            // The `Err` is dropped on purpose. A `ClassNotFoundException` from
+            // this speculative load is not the answer `String.format` owes its
+            // caller — the format refusal is — and CratonVM carries a thrown
+            // exception in the return value rather than in thread state, so
+            // there is nothing left pending to clear.
+            if ctx.load_class(class_name).is_err() {
+                return false;
+            }
+            match ctx.class_id_by_name(class_name) {
+                Some(id) => id,
+                None => return false,
+            }
+        }
+    };
+    match ctx.class_id_by_name("java/lang/IllegalArgumentException") {
+        Some(base) => ctx.is_subclass(class_id, base),
+        // No base class to check against means this VM has no exception
+        // hierarchy worth the name; the fallback's `RuntimeError` variant
+        // still knows how to raise one.
+        None => false,
     }
 }
 
 /// Turn a [`FmtFault`] into the thrown Java exception.
 ///
-/// Constructed through the class's real `<init>` because all six override
-/// `getMessage()` off their own fields — allocating the class and setting a
-/// `detailMessage` would produce an object whose `getMessage()` is still null.
+/// Constructed through the class's real `<init>` because every one of them
+/// overrides `getMessage()` off its own fields — allocating the class and
+/// setting a `detailMessage` would produce an object whose `getMessage()` is
+/// still null.
 ///
 /// The fallback is `IllegalArgumentException`, which is the SUPERCLASS of
 /// `IllegalFormatException` and therefore never sends a caller down a `catch`
 /// branch it did not ask for; it is reached only when the specified class is
-/// genuinely absent (a `--synthetic-jdk` build with no `java.util.Formatter`
-/// exception hierarchy), never to make a diff go away.
+/// genuinely unavailable (see [`fmt_exception_class_available`]), never to
+/// make a diff go away.
 fn fmt_raise(ctx: &mut dyn NativeContext, fault: &FmtFault) -> MethodCallFailed {
     let (class_name, ctor) = fault.class_and_ctor();
-    if ctx.class_id_by_name(class_name).is_some() {
+    if fmt_exception_class_available(ctx, class_name) {
         let ctor_args: Vec<Value> = match fault {
             FmtFault::UnknownConversion(s)
             | FmtFault::MissingArgument(s)
@@ -5150,14 +5258,21 @@ fn fmt_raise(ctx: &mut dyn NativeContext, fault: &FmtFault) -> MethodCallFailed 
                 let obj = ctx.create_string(f);
                 vec![Value::Object(Some(obj)), Value::Int(*c as i32)]
             }
-            FmtFault::IllegalPrecision(p) | FmtFault::IllegalWidth(p) => vec![Value::Int(*p)],
+            FmtFault::IllegalPrecision(p)
+            | FmtFault::IllegalWidth(p)
+            | FmtFault::IllegalCodePoint(p)
+            | FmtFault::ArgumentIndex(p) => vec![Value::Int(*p)],
         };
         match ctx.new_object_initialized(class_name, ctor, &ctor_args) {
             Ok(Some(Value::Object(Some(exc)))) => return MethodCallFailed::ExceptionThrown(exc),
-            // A failure INSIDE the constructor is already a thrown exception;
-            // propagating it beats masking it with a fabricated one.
-            Err(err) => return err,
-            Ok(_) => {}
+            // An `InternalError` is a VM fault (heap exhaustion, a broken
+            // class file) and must not be dressed up as a format refusal.
+            // A thrown Java exception, though, means the constructor itself
+            // refused — a missing or inaccessible `<init>` on a class that
+            // passed the screens above — and the caller is owed the refusal it
+            // asked for, in the base class the subclass would have extended.
+            Err(err @ MethodCallFailed::InternalError(_)) => return err,
+            Err(MethodCallFailed::ExceptionThrown(_)) | Ok(_) => {}
         }
     }
     cratonvm_types::error::RuntimeError::IllegalArgumentException {
