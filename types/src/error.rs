@@ -821,6 +821,27 @@ pub enum LinkageError {
     #[error("class format error in {class_name}: {message}")]
     ClassFormatError { class_name: String, message: String },
 
+    /// JVMS §4.1: the class file's `major.minor` pair is not loadable — too
+    /// old, too new, a non-zero minor below the preview encoding, a preview
+    /// class file at the wrong major, or a preview class file without
+    /// `--enable-preview`.
+    ///
+    /// Distinct from [`ClassFormatError`](Self::ClassFormatError) only in the
+    /// throwable it becomes: `java.lang.UnsupportedClassVersionError` extends
+    /// `ClassFormatError`, so an application `catch (ClassFormatError)` fires
+    /// either way — what diverged before this variant existed was
+    /// `e.getClass().getName()` and the text. See
+    /// docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md.
+    ///
+    /// `message` is HotSpot's wording verbatim, built by
+    /// `ClassReaderError::unsupported_class_version_message`. It already
+    /// contains the class name, in internal (slash) form, in the middle of the
+    /// sentence — so nothing downstream may prepend the name again the way the
+    /// `ClassFormatError` arm does. `class_name` is carried alongside for
+    /// callers that need it structurally, not for rendering.
+    #[error("{message}")]
+    UnsupportedClassVersionError { class_name: String, message: String },
+
     #[error("verification error in {class_name}.{method_name}: {message}")]
     VerifyError {
         class_name: String,

@@ -5250,6 +5250,39 @@ impl ClassManager {
 
         // Parse the class file
         let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
+            // A version rejection is `UnsupportedClassVersionError` on HotSpot,
+            // not the bare `ClassFormatError` every other reader error maps to.
+            // The reader cannot build the message itself: HotSpot's wording
+            // embeds the class name, and `this_class` is not read until after
+            // the constant pool — long after the version check. `name` is
+            // already the internal (slash) form HotSpot prints.
+            //
+            // An empty `name` means the caller supplied none and the class
+            // manager is about to derive it from `this_class` — which the
+            // version check runs before. HotSpot has the same ordering problem
+            // and prints a placeholder; measured on Adoptium 25.0.3.9 via
+            // `ClassLoader.defineClass(null, bytes, 0, len)` of a 69.65535
+            // class file:
+            //
+            //   Preview features are not enabled for <Unknown> (class file
+            //   version 69.65535). Try running with '--enable-preview'
+            //
+            // `<Unknown>` is generic, not preview-specific: it appears in all
+            // five of HotSpot's version messages, with and without the flag.
+            // One knowing inaccuracy — HotSpot distinguishes a null name from
+            // an explicitly empty one (`defineClass("", ...)` really does print
+            // the doubled space), but `read_optional_internal_name` folds Java
+            // `null` and `""` into the same Rust `""`, so CratonVM cannot tell
+            // them apart here. Null is the reachable case (JNI DefineClass and
+            // `ClassLoader.defineClass(null, ..)`); `""` is a caller passing a
+            // deliberate empty name, and it gets null's message.
+            let reported = if name.is_empty() { "<Unknown>" } else { name };
+            if let Some(message) = e.unsupported_class_version_message(reported) {
+                return VmError::Linkage(LinkageError::UnsupportedClassVersionError {
+                    class_name: name.to_string(),
+                    message,
+                });
+            }
             VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: e.to_string(),

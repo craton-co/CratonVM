@@ -426,6 +426,23 @@ struct Args {
     )]
     enable_native_access: Option<String>,
 
+    /// Enable preview features (mirrors JDK `--enable-preview`).
+    ///
+    /// A class file whose `minor_version` is 65535 at the running JVM's major
+    /// version is a preview class file (JVMS 4.1), and HotSpot refuses to load
+    /// it without this flag — measured on Adoptium 25.0.3.9:
+    /// `java.lang.UnsupportedClassVersionError: Preview features are not
+    /// enabled for P (class file version 69.65535). Try running with
+    /// '--enable-preview'`. CratonVM loaded such a class file unconditionally
+    /// until docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md.
+    ///
+    /// Takes no value, unlike `--enable-native-access` above: HotSpot's flag is
+    /// a bare boolean, so it needs no `VALUE_TAKING_OPTS` entry either (see the
+    /// comment on that table — boolean flags are copied through verbatim by the
+    /// separator inserter).
+    #[arg(long = "enable-preview")]
+    enable_preview: bool,
+
     /// AOT compilation mode (-XX:AOTMode=off/training/production).
     #[arg(long = "XX:AOTMode", value_name = "MODE", default_value = "off")]
     aot_mode: String,
@@ -2899,6 +2916,28 @@ fn run() -> Result<()> {
     if args.enable_native_access.is_some() {
         cratonvm_native_builtins::panama::set_native_access_enabled(true);
     }
+
+    // --enable-preview: JVMS 4.1 preview class files (`minor_version == 65535`
+    // at the running major version) are refused by the reader unless this is
+    // set, matching HotSpot, whose default is also off. Two consumers must see
+    // the same bit or the VM would refuse to load a preview class file while
+    // telling the class library that preview is enabled:
+    //   * cratonvm_reader::set_preview_enabled — the class-file parser's gate;
+    //   * jdk/internal/misc/PreviewFeatures.isPreviewEnabled — read by
+    //     `Class.isUnnamedClass()` and therefore by JUnit's launcher.
+    // Measured on Adoptium 25.0.3.9: `PreviewFeatures.isEnabled` is false
+    // without the flag and true with it, so the two really are one bit. Set
+    // through `cratonvm_native_builtins` rather than the reader directly
+    // because `vm-cli` does not depend on `cratonvm-reader` at all — and
+    // because one entry point is what keeps the two consumers agreeing.
+    //
+    // Applied here for the same timing reason --enable-native-access gives
+    // above: main thread, before `Vm::new(config)` parses a single class, so
+    // no class file can be checked against the wrong value.
+    //
+    // Set unconditionally rather than under `if args.enable_preview`, so an
+    // embedder that reuses this path cannot inherit a stale `true`.
+    cratonvm_native_builtins::set_preview_enabled(args.enable_preview);
 
     // -XX:+ShowCodeDetailsInExceptionMessages (JEP 358): publish to the
     // env_cache so the interpreter's helpful-NPE opcode gate observes it on
@@ -7060,6 +7099,35 @@ mod tests {
         assert_eq!(parsed.enable_native_access.as_deref(), Some("ALL-UNNAMED"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
         assert_eq!(parsed.args, argv(&["arg"]));
+    }
+
+    #[test]
+    fn enable_preview_is_a_bare_flag_and_does_not_consume_main_class() {
+        // Before docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+        // this was `error: unexpected argument '--enable-preview' found`, with
+        // clap suggesting `--enable-native-access`. Run the whole pre-clap
+        // pipeline, not just `try_parse_from`: a bare boolean needs no
+        // VALUE_TAKING_OPTS entry, and this is what proves it — if it ever
+        // acquired one, `Main` would be eaten as the flag's value.
+        let argv0: Vec<String> = argv(&["java", "--enable-preview", "Main", "arg"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse --enable-preview");
+
+        assert!(parsed.enable_preview);
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        assert_eq!(parsed.args, argv(&["arg"]));
+    }
+
+    #[test]
+    fn enable_preview_defaults_off_like_hotspot() {
+        // HotSpot's default is off, measured: plain `java -cp . P` on a
+        // 69.65535 class file raises UnsupportedClassVersionError.
+        let parsed = Args::try_parse_from(argv(&["cratonvm", "Main"]))
+            .expect("clap must parse without the flag");
+        assert!(!parsed.enable_preview);
     }
 
     #[test]

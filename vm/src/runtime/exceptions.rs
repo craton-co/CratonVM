@@ -1983,6 +1983,13 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
             "java/lang/ClassFormatError",
             format!("{}: {}", class_name, message),
         ),
+        // Deliberately NOT `format!("{class_name}: {message}")` like the arm
+        // above: HotSpot's wording already names the class, mid-sentence
+        // ("Preview features are not enabled for P (class file version
+        // 69.65535)..."), so prefixing would print it twice.
+        LinkageError::UnsupportedClassVersionError { message, .. } => {
+            ("java/lang/UnsupportedClassVersionError", message.clone())
+        }
         LinkageError::UnsupportedClassRedefinitionError {
             class_name,
             message,

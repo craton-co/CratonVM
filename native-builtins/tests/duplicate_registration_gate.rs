@@ -257,7 +257,28 @@ const BASELINE_SHADOWED_MANAGEMENT: Option<usize> = Some(1201);
 
 /// [`BASELINE_SHADOWED_MANAGEMENT`] for the non-shipping `-p`-only resolve.
 /// Seeded and read independently; the two are different registries.
-const BASELINE_SHADOWED_NO_MANAGEMENT: Option<usize> = Some(1148);
+///
+/// **Re-seeded 1148 → 1150 on 2026-08-11, from a real run**, after the
+/// `VM_MINTED_STAND_IN_RECEIVERS` → `VM_SERVICE_RECEIVERS` retag moved nine
+/// registrations `synthetic-stub` → `bridge` and changed which rows this census
+/// counts. The gate did its job: it named the delta rather than absorbing it.
+///
+/// The run reported 1152. Two of those four were a genuine duplicate and were
+/// **deleted** rather than baselined — `cratonvm/internal/ArrayListSubList`'s
+/// `toArray(T[])`/`toArray(IntFunction)` were registered twice in one function,
+/// byte-identically, by two independent regression fixes (JUnit Platform /
+/// ES-FAIL-04 and hibernate-smoke) neither of which noticed the other.
+///
+/// The remaining two are **legitimate and must stay shadowed**:
+/// `cratonvm/internal/UnmodifiableEntrySet`'s `iterator()` and `forEach` are a
+/// deliberate override of the plain-`Set` pair the shared loop registers for
+/// many classes, so each yielded `Map.Entry` is wrapped in
+/// `UnmodifiableMapEntry` and `setValue()` throws instead of silently mutating
+/// the backing map through a "locked" view. Deleting either loser would
+/// reintroduce the Tomcat parameter-map defect that override was written for.
+/// This is the "raise it WITH a written justification" arm, and this is the
+/// justification.
+const BASELINE_SHADOWED_NO_MANAGEMENT: Option<usize> = Some(1150);
 
 /// Frozen upper bound on the SHADOWED registrations where the winner and the
 /// loser disagree about `NativeKind` — the high-signal subset — for the

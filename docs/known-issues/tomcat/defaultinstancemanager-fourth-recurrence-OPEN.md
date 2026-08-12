@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **two root causes now confirmed, only the first is fixed**; see 2026-08-11 update at the bottom |
+| **Status** | OPEN, but **the default-GC symptom is gone**: `-XX:+UseZGC` and no-flag-at-all (ZGC has been the default since 2026-08-10) now both pass. **Explicit `-XX:+UseGenerationalGC` still fails** on a third, not-yet-root-caused factor; see the 2026-08-11 updates at the bottom |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
-| **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
+| **Reproduces** | **explicit `-XX:+UseGenerationalGC` only** as of 2026-08-11. Previously reproduced under default GC and ZGC too; **G1 has always passed**. Deterministic, ~17 s standalone |
 | **Fourth in a chain** | 07-14 `fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md` · 07-27 `fixed-suite-bugs/tomcat/defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md` · 08-01 `fixed-suite-bugs/tomcat/defaultinstancemanager-third-recurrence-FIXED.md` |
 
 ## Reproduction
@@ -475,37 +475,133 @@ this run still has plenty of), but `dead_regions_final=55` — up from the
 original page's measured 51 — so more genuine reclaims are surviving the
 sweep than before either fix.
 
-### The bigger problem: ZGC has no equivalent mechanism, and it is the default
+### The bigger problem, corrected: ZGC's actual gap was narrower than first thought — and is now fixed
 
-Both fixes on this page are Generational-only. `gc/src/zgc.rs` has:
+The paragraph this replaces overstated the ZGC gap. **`mirror_pin_deferrable`
+already returns `true` unconditionally for `VmHeap::Zgc(_)`** (`gc/src/vm_heap.rs`)
+and has since the ZGC backend was first wired
+(`882ebef26` `feat(gc): wire ZGC real heap backend`, 2026-07-09) — over a
+month before this investigation started. Class mirrors, loaders and metadata
+were never pinned unconditionally under ZGC: `collect_garbage`'s mark loop
+(`zgc.rs`) already pushes `loader_pin_addr` / `mirrors_for_loader` /
+`metadata_pin::roots_for_loader` edges from every object it marks live, the
+same shape as Generational's non-moving young marker and old-gen BFS. The
+`zgc.rs:4979-4984` call site cited above IS that mark-time propagation, not a
+bypass of it — reading it as "unconditional" conflated "always runs" (true,
+and correct — it's the propagation mechanism itself) with "ignores liveness"
+(false).
 
-- No `external_roots_for_owner` / `external_roots_for_matching_owners` call
-  anywhere — no per-owner overlay propagation exists for ZGC at all, so the
-  "conditional" branch this page's fix enables can never apply there; ZGC
-  permanently takes the unconditional (safe, over-retentive) overlay scan.
-- Its own class-mirror/loader/metadata pin handling
-  (`collect_garbage`'s hand-pushed pin edges, `zgc.rs:4979-4984`), calling
-  `cratonvm_types::mirror_pin::mirrors_for_loader` **directly and
-  unconditionally** — never `mirror_pin_deferrable`, the conditional variant
-  `roots.rs` uses for Generational. Confirmed via `-XX:+UseZGC` (the actual
-  default): still fails, 3/3 runs.
+The real, narrower gap was exactly what the first bullet above said: **no
+`external_roots_for_owner` / `external_roots_for_matching_owners` call
+anywhere in `zgc.rs`**. Collection-overlays had no owner-based propagation
+under ZGC, so `native_roots.rs`'s `scan_collection_overlays` had nothing to
+defer to and fell back to `mirror_pin_deferrable`'s Generational-only
+sibling gate — permanently unconditional for ZGC, exactly root cause #2's
+defect, just never fixed for this backend.
 
-So under the current default, this test's mirror is pinned by design, not by
-a bug with a small patch — ZGC has not yet grown the precise,
-mark-time-propagated pin mechanism Generational has for either overlays or
-class mirrors. Building that is at minimum the same scope as root cause #2's
-fix, generalized to an architecture with no equivalent infrastructure yet to
-extend, and is not attempted here.
+**Fixed 2026-08-11.** `zgc.rs`'s `collect_garbage` — both the main mark loop
+and the finalizer-resurrection loop — now calls
+`external_roots_for_owner(addr, Some(class_id))` for every object it marks
+live and pushes the results onto the mark worklist, mirroring
+`gen_heap.rs`'s old-gen BFS (`external_roots_for_owner` at its `obj_ptr`) and
+non-moving young marker (`external_roots_for_owner` in `scan_young_object`).
+`native_roots.rs`'s `scan_collection_overlays` gate now matches
+`mirror_pin_deferrable`'s own shape: `GcAlgorithm::Zgc => true` (always
+defers — ZGC's single STW mark-sweep closure is always the precise marker,
+same reasoning as the mirror-pin gate that already existed), `G1 => false`
+(unchanged — G1 has never had this mechanism either, out of scope here).
+
+**Verified: the test now PASSES under the actual default.** Rebuilt release
+binary, ran with no `-XX` flag at all (default = ZGC):
+`CRATONVM_DBG_OVERLAY_GATE=1` reports `conditional=true gc_algo=Zgc` for both
+collections this run (previously always `conditional=false`), and
+`org.junit.runner.JUnitCore TestDefaultInstanceManager` reports `OK (1 test)`.
+Confirmed explicitly with `-XX:+UseZGC` too (same result — it is the same
+code path as the no-flag default). No regressions: full `cratonvm-gc`
+(1472 lib tests) and `cratonvm-vm` (2487 lib tests) suites pass unchanged.
 
 ### Where this leaves the test
 
-- **Fixed and verified, keep regardless:** root cause #1 (sweep anomaly
-  screen) and root cause #2 (overlay-rooting gate), both Generational-only,
-  both real defects independent of this specific test.
-- **Open, Generational-specific:** a third, not-yet-traced mark-phase edge
-  still keeps the evicted loader reachable even with both fixes. Needs a
-  finer root-attribution instrument than exists today.
-- **Open, and now the more consequential gap:** ZGC (the actual default
-  since 2026-08-10) has neither fix's underlying mechanism at all. This is
-  the one worth prioritizing next, precisely because it's what "default GC"
-  now means to anyone who runs this suite without flags.
+- **Fixed and verified: the default-GC symptom is gone.** Root cause #1
+  (sweep anomaly screen, Generational-only) and root cause #2's ZGC
+  counterpart (collection-overlays owner-based propagation, now built for
+  ZGC too) together clear `TestDefaultInstanceManager` under both no-flag
+  default and explicit `-XX:+UseZGC`. Anyone running this suite without GC
+  flags no longer hits this bug.
+- **Open, Generational-specific only:** a third, still-unidentified
+  mark-phase factor keeps the evicted loader reachable under explicit
+  `-XX:+UseGenerationalGC` even with root causes #1 and #2 both fixed. See
+  the investigation below — two plausible explanations were built,
+  tested, and ruled out; the actual mechanism remains open.
+
+## 2026-08-11, continued: chasing the third (Generational-only) factor — two hypotheses built and ruled out
+
+The existing `CRATONVM_DBG_MIRRORPIN_WHY` diagnostic's `root_held_paths`
+helper always passed a hardcoded `&|_| false` as its "is this address a real
+GC root" predicate (`retention_paths`'s own doc comment describes exactly
+this fork — a verified root vs. a side-table-propagated zero-referrer node —
+but the caller never exercised it). That meant a genuine GC root this
+diagnostic's 26-source `VM_ROOT_SOURCES` table doesn't name (a thread frame,
+a static field, a class-lock object) and a wrongly-marked object with no
+heap referrer at all printed the **identical** `[root=<not-a-direct-root>]`
+line. Both the evicted loader/mirror AND the two genuinely-live control
+loaders (`bug36923_jsp`, `bug5nnnn/bug51544_jsp`) hit this bucket — the
+diagnostic could not tell a real bug from expected behavior.
+
+**Instrument fix:** threaded this cycle's actual root vector
+(`cycle_roots: Option<&[ObjectRef]>`) from every `process_references_after_gc`
+call site down into `reconcile_class_mirrors`, and switched the diagnostic
+from `root_held_paths` (always `is_root = false`) to `retention_paths` with a
+real membership check against that vector. G1's call site
+(`g1_remark_process_references`) passes `None` — it has no comparable Vec at
+that point, and `None` correctly disables the verified-root line rather than
+feeding it a wrong answer. `[root=<NOT-A-ROOT-no-heap-referrer>
+verified_root=false]` vs `[root=<root-not-named-by-VM_ROOT_SOURCES>
+verified_root=true]` are now distinguishable.
+
+**Hypothesis 1 — ruled out.** Re-ran under `-XX:+UseGenerationalGC` with both
+root-cause fixes applied. Every mirror/loader path — evicted AND live
+controls alike — reports `verified_root=false`. Membership in the cycle's
+own root vector is simply the wrong test for a mirror/loader address:
+`mirror_pin`/`loader_pin`/`metadata_pin` edges are pushed onto the internal
+mark worklist DURING marking, from a live instance's class id — they are
+never members of the initial `roots` Vec at all, by design, for either the
+evicted loader or a genuinely-live one. This is not the discriminator; ruled
+out.
+
+**A second finding surfaced alongside it:** `live_instances_of_this_loader`
+— the existing enumeration of live objects whose defining loader matches —
+reports **0** for all three loaders tested, including the two known-live
+controls. Since deferred mirror/loader marking is documented to propagate
+only from a live instance, 0 live instances is inconsistent with "still
+marked via the documented mechanism" for ALL three, not just the evicted
+one. Either the enumeration itself has a gap (a stale/pruned
+`defining_loader_for` comparison, matching this repo's recurring
+"defining_loader_for pruned" failure mode), or there is a marking path this
+session has not identified that does not require any live instance
+in the classic sense.
+
+**Hypothesis 2 — also ruled out.** Given the collection-overlays mechanism
+was the exact thing root cause #2 just touched, checked directly whether the
+loader/mirror address is itself an ELEMENT of any overlay-backed collection
+(`cratonvm_gc::external_roots::scan_external_roots`, the unconditional
+all-elements scan, independent of owner liveness). 2798 total overlay
+elements this run; zero match either the mirror or the loader address, for
+any of the three classes tested. The loader/mirror is not itself sitting
+inside a native side-table.
+
+**Status: still open.** Two concrete, testable hypotheses were built and
+refuted with direct evidence rather than left as guesses. What remains
+untried: whether an overlay ELEMENT (not the loader itself) shares the same
+defining loader as one of the JSP classes — i.e. the mark loop visits some
+unrelated-but-live overlay-propagated object whose OWN class happens to be
+loaded by this same per-webapp loader, pushing the loader via the ordinary
+`loader_pin_addr(that object's class_id)` edge rather than via the
+`live_instances_of_this_loader` enumeration's own (possibly stale)
+`defining_loader_for` comparison. That would explain zero heap referrer,
+zero verified-root, zero overlay-element hit, AND zero live-instance hit
+simultaneously — the walk_objects()-based enumeration and the mark loop's
+own instance-encountered-during-marking check are not the same query, and
+this session did not build the third check needed to tell them apart.
+Left for a dedicated follow-up; the Generational-only symptom this gates is
+lower priority than the now-fixed default-GC path.

@@ -4238,6 +4238,22 @@ pub mod x509_manager;
 // land alongside `cipher` here.
 pub mod jca;
 
+/// Set preview-feature enablement for the whole process (JDK `--enable-preview`).
+///
+/// A thin re-export of the reader's switch. Two consumers have to agree on this
+/// bit — the class-file parser's JVMS 4.1 gate and
+/// `jdk/internal/misc/PreviewFeatures.isPreviewEnabled` registered below — and a
+/// single entry point is how they are kept agreeing; a caller that set only one
+/// would produce a VM that loads a `69.65535` class file and then tells it
+/// preview is off, or the reverse. See
+/// docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md.
+///
+/// It lives here rather than being called directly because `vm-cli`, the only
+/// caller, depends on this crate and **not** on `cratonvm-reader`.
+pub fn set_preview_enabled(enabled: bool) {
+    cratonvm_reader::set_preview_enabled(enabled);
+}
+
 /// Real-JCA bring-up gate. When `CRATONVM_REAL_JCA` is set, the synthetic
 /// key/keypair/signature short-circuit shims (both `crypto.rs` and
 /// `jca::key_factory`/`jca::signature`) are NOT registered and BouncyCastle's
@@ -14663,13 +14679,23 @@ pub fn register_essential_natives_with_shims(
     // <clinit> calls this once to cache the `ENABLED` constant. It's reached
     // any time `Class.isUnnamedClass()` is used (e.g. JUnit's launcher during
     // discovery), which otherwise aborts every real-JDK run with
-    // UnsatisfiedLinkError before a single test executes. We don't parse
-    // `--enable-preview` yet (see roadmap), so mirror HotSpot's default: off.
+    // UnsatisfiedLinkError before a single test executes.
+    //
+    // This answers the SAME bit as the class-file parser's preview gate
+    // (`cratonvm_reader::preview_enabled`), because on HotSpot it is the same
+    // bit: measured on Adoptium 25.0.3.9, `PreviewFeatures.isEnabled` is false
+    // on plain `java` and true under `--enable-preview`. Answering 0 while the
+    // reader had accepted a `69.65535` class file — or the reverse — would be
+    // a divergence manufactured by the fix that added the gate.
     registry.register_with_kind(
         "jdk/internal/misc/PreviewFeatures",
         "isPreviewEnabled",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                cratonvm_reader::preview_enabled(),
+            ))))
+        },
         NativeKind::Bridge,
     );
 
