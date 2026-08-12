@@ -220,6 +220,53 @@ where
     socket2_raw::poll_readiness(sock.as_raw())
 }
 
+/// [`poll_socket_readiness`] with a real timeout instead of a zero one.
+///
+/// `None` means the poll primitive itself failed (or this target has none) —
+/// the signal for the caller to fall back to ONE plain blocking call rather
+/// than spin on a stub that answers "not ready" forever. That is the same
+/// three-state contract `native-io::net::poll_stream_readable` states, restated
+/// here because this crate cannot depend on `native-io`.
+fn poll_socket_readiness_timeout(
+    raw: socket2_raw::RawHandle,
+    timeout_ms: i32,
+) -> Option<(bool, bool)> {
+    socket2_raw::poll_readiness_timeout(raw, timeout_ms)
+}
+
+/// The raw OS handle for a socket, taken so the close-aware wait can poll it
+/// **without** holding the entry's `Mutex`. Safe because every caller holds the
+/// entry's `Arc` for the whole operation, so the socket cannot be dropped and
+/// the handle number cannot be recycled while the poll is in flight.
+fn raw_handle_of<S>(sock: &S) -> socket2_raw::RawHandle
+where
+    S: socket2_raw::AsRawHandle,
+{
+    sock.as_raw()
+}
+
+/// How long a close-aware blocking primitive parks inside one poll before
+/// re-asking the table whether the fd was closed under it.
+///
+/// A liveness bound, not a latency cost: the poll returns the instant the
+/// socket becomes ready, so payload is never delayed by it. It only bounds how
+/// long a reader stays parked after another thread calls `close()`. Same value
+/// and same role as `native-io::net::NET_READ_CLOSE_POLL_MS`.
+const FD_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked read/write/accept reports once its fd has been closed
+/// from another thread.
+///
+/// `ErrorKind::Interrupted` is the same carrier the three landed close-aware
+/// readers use (`net_read_close_aware`, `socket_channel::read_close_aware`,
+/// `net_phase_e::re1_read_close_aware`), so the callers of this table can tell
+/// an asynchronous close apart from every other failure without a new error
+/// type. It is unambiguous here because the poll primitive above reports a real
+/// EINTR as "not ready" and never as an error.
+fn fd_async_closed_err() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "socket closed")
+}
+
 /// Thin, dependency-free wrapper over the OS `poll` / `WSAPoll`
 /// readiness primitive. Kept in its own module so the platform `extern`
 /// blocks and constants do not leak into the rest of `fd_table`.
@@ -257,6 +304,25 @@ mod socket2_raw {
 
     #[cfg(unix)]
     pub fn poll_readiness(fd: RawHandle) -> (bool, bool) {
+        poll_readiness_timeout(fd, 0).unwrap_or((false, false))
+    }
+
+    /// [`poll_readiness`] with a caller-chosen timeout.
+    ///
+    /// `None` is "the primitive failed / does not exist", NOT "not ready".
+    /// Callers that park on this must fall back to one plain blocking call on
+    /// `None`, or they would spin forever against a stub.
+    ///
+    /// EINTR is reported as `Some((false, false))` — not ready, not an error,
+    /// and never an in-place re-poll. `poll(2)` is **never** auto-restarted by
+    /// `SA_RESTART`, so a signal delivered to a thread parked here always
+    /// returns EINTR, and this VM sends one on purpose (`jit::xt_root_scan`
+    /// SIGUSR2s every thread for a cross-thread root scan). Re-polling in place
+    /// with the same `timeout` would restart the whole wait on every GC and
+    /// silently defeat any deadline the caller is enforcing. This mirrors
+    /// `native-io::net::net_poll_raw`'s AUDIT 2026-08-02 arm exactly.
+    #[cfg(unix)]
+    pub fn poll_readiness_timeout(fd: RawHandle, timeout_ms: i32) -> Option<(bool, bool)> {
         // struct pollfd { int fd; short events; short revents; }
         #[repr(C)]
         struct PollFd {
@@ -283,23 +349,35 @@ mod socket2_raw {
             revents: 0,
         };
         // SAFETY: `pfd` is a single, properly-initialised `pollfd`;
-        // `nfds == 1` matches the one-element buffer; timeout 0 makes
-        // the call return immediately without blocking.
-        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1 as NfdsT, 0) };
+        // `nfds == 1` matches the one-element buffer; `timeout_ms` is the
+        // caller's bound in milliseconds (0 returns immediately).
+        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1 as NfdsT, timeout_ms) };
         if rc < 0 {
-            return (false, false);
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted || error.raw_os_error() == Some(4) {
+                return Some((false, false));
+            }
+            return None;
         }
         if pfd.revents & POLLNVAL != 0 {
-            return (false, false);
+            return None;
         }
         let err = pfd.revents & (POLLERR | POLLHUP) != 0;
         let readable = pfd.revents & POLLIN != 0 || err;
         let writable = pfd.revents & POLLOUT != 0 || err;
-        (readable, writable)
+        Some((readable, writable))
     }
 
     #[cfg(windows)]
     pub fn poll_readiness(socket: RawHandle) -> (bool, bool) {
+        poll_readiness_timeout(socket, 0).unwrap_or((false, false))
+    }
+
+    /// [`poll_readiness`] with a caller-chosen timeout. See the Unix twin for
+    /// the `None` contract. There is no EINTR arm here: Winsock has no EINTR,
+    /// and therefore no `SA_RESTART` hazard either.
+    #[cfg(windows)]
+    pub fn poll_readiness_timeout(socket: RawHandle, timeout_ms: i32) -> Option<(bool, bool)> {
         // WSAPOLLFD { SOCKET fd; SHORT events; SHORT revents; }
         #[repr(C)]
         struct WsaPollFd {
@@ -324,18 +402,18 @@ mod socket2_raw {
             revents: 0,
         };
         // SAFETY: single properly-initialised WSAPOLLFD, `nfds == 1`
-        // matches the buffer length, timeout 0 returns immediately.
-        let rc = unsafe { WSAPoll(&mut pfd as *mut WsaPollFd, 1, 0) };
+        // matches the buffer length; `timeout_ms` is the caller's bound.
+        let rc = unsafe { WSAPoll(&mut pfd as *mut WsaPollFd, 1, timeout_ms) };
         if rc < 0 {
-            return (false, false);
+            return None;
         }
         if pfd.revents & POLLNVAL != 0 {
-            return (false, false);
+            return None;
         }
         let err = pfd.revents & (POLLERR | POLLHUP) != 0;
         let readable = pfd.revents & POLLRDNORM != 0 || err;
         let writable = pfd.revents & POLLWRNORM != 0 || err;
-        (readable, writable)
+        Some((readable, writable))
     }
 }
 
@@ -384,6 +462,27 @@ fn pipe_available<T>(_pipe: &T) -> usize {
 pub struct FileDescriptorTable {
     entries: RwLock<FxHashMap<FdId, Arc<FileEntry>>>,
     next_fd: AtomicU32,
+    /// Per-fd blocking mode as last requested through [`tcp_set_nonblocking`]
+    /// / [`udp_set_nonblocking`].
+    ///
+    /// [`tcp_set_nonblocking`]: FileDescriptorTable::tcp_set_nonblocking
+    /// [`udp_set_nonblocking`]: FileDescriptorTable::udp_set_nonblocking
+    ///
+    /// The socket itself is the authority on its mode, but `std` exposes no
+    /// getter for it, and the close-aware read/write/accept paths below MUST
+    /// know: a non-blocking socket has to keep answering `WouldBlock`
+    /// immediately (that is the JDK's `IOStatus.UNAVAILABLE` protocol, which
+    /// every selector-driven reactor depends on), while only a blocking one may
+    /// park in the poll loop. Entries are RETAINED after being applied — they
+    /// are the record of the mode, not a one-shot — and dropped on
+    /// [`close`](FileDescriptorTable::close).
+    ///
+    /// An unknown fd answers "blocking", matching both `std`'s default for a
+    /// freshly opened socket and `native-io::net::net_fd_is_nonblocking`'s
+    /// deliberate choice: guessing "cannot park" for a socket that can is the
+    /// unsafe direction, because it drops the close-aware loop around a wait
+    /// that really is unbounded.
+    nonblocking: RwLock<FxHashMap<FdId, bool>>,
 }
 
 impl FileDescriptorTable {
@@ -395,6 +494,111 @@ impl FileDescriptorTable {
         Self {
             entries: RwLock::new(entries),
             next_fd: AtomicU32::new(3),
+            nonblocking: RwLock::new(FxHashMap::default()),
+        }
+    }
+
+    /// Is `fd` still in the table? [`close`](FileDescriptorTable::close)
+    /// `remove`s the entry, so this flips exactly when Java closed the fd —
+    /// which is the whole question a parked read/write/accept has to be able to
+    /// ask. Deliberately a fresh read guard per call, never held across a
+    /// syscall.
+    fn fd_still_registered(&self, fd: FdId) -> bool {
+        self.entries.read().contains_key(&fd)
+    }
+
+    /// Whether `set_nonblocking(true)` is in effect for `fd`. See the
+    /// [`nonblocking`](Self::nonblocking) field for why the answer for an
+    /// unknown fd is `false`.
+    fn fd_is_nonblocking(&self, fd: FdId) -> bool {
+        self.nonblocking.read().get(&fd).copied().unwrap_or(false)
+    }
+
+    fn record_blocking_mode(&self, fd: FdId, nonblocking: bool) {
+        self.nonblocking.write().insert(fd, nonblocking);
+    }
+
+    /// Park until `sock` is ready, the fd is closed, or `deadline` expires.
+    ///
+    /// This is the one close-aware wait shared by [`tcp_read`], [`tcp_write`],
+    /// [`tcp_accept`] and [`udp_recv`] below — the same shape as the three
+    /// readers that landed on 2026-08-07/11 (`net_read_close_aware`,
+    /// `socket_channel::read_close_aware`, `net_phase_e::re1_read_close_aware`):
+    /// park in `poll`, not in the syscall, and re-ask the registry every
+    /// [`FD_CLOSE_POLL_MS`].
+    ///
+    /// [`tcp_read`]: FileDescriptorTable::tcp_read
+    /// [`tcp_write`]: FileDescriptorTable::tcp_write
+    /// [`tcp_accept`]: FileDescriptorTable::tcp_accept
+    /// [`udp_recv`]: FileDescriptorTable::udp_recv
+    ///
+    /// # Why a plain blocking syscall could not observe the close
+    ///
+    /// [`close`](FileDescriptorTable::close) removes the entry from the table
+    /// and lets `Drop` shut the OS handle *when the `Arc` count reaches zero* —
+    /// and it never does while a reader is parked, because the reader cloned
+    /// that `Arc` out through `get_entry` before it started. So the OS handle
+    /// stays open and the syscall stays parked. HotSpot's answer to the same
+    /// situation is to take the descriptor away underneath the call
+    /// (`closesocket` on Windows, `dup2` of a pre-closed fd plus a signal on
+    /// Unix); neither is expressible over a shared `Arc` without a
+    /// use-after-close the moment the OS recycles the handle number.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` — ready; issue the syscall.
+    /// * `Ok(false)` — no poll primitive on this target; the caller must fall
+    ///   back to ONE plain blocking syscall (which cannot see the close, but at
+    ///   least still transfers).
+    /// * `Err(Interrupted)` — the fd was closed from another thread.
+    /// * `Err(TimedOut)` — `deadline` expired. The caller maps this to the
+    ///   `SocketTimeoutException` its own surface specifies.
+    ///
+    /// # On expiry
+    ///
+    /// The wait is bounded twice over, and neither bound is silent. The
+    /// per-pass `FD_CLOSE_POLL_MS` slice expiring is NOT an outcome — it is
+    /// only the point at which the registry is re-asked, and the loop
+    /// continues. The caller's `deadline` expiring IS an outcome, and it ends
+    /// the wait with `TimedOut` rather than leaving anything running. A bounded
+    /// wait that does not actually end the wait would have fixed the hang on
+    /// `close()` and introduced a new one on `SO_TIMEOUT`.
+    fn wait_ready_close_aware(
+        &self,
+        fd: FdId,
+        raw: socket2_raw::RawHandle,
+        want_write: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool, io::Error> {
+        loop {
+            let slice = match deadline {
+                Some(end) => {
+                    let now = std::time::Instant::now();
+                    if now >= end {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+                    }
+                    let remaining = end.saturating_duration_since(now).as_millis();
+                    (remaining.min(FD_CLOSE_POLL_MS as u128)) as i32
+                }
+                None => FD_CLOSE_POLL_MS,
+            };
+            let Some((readable, writable)) = poll_socket_readiness_timeout(raw, slice) else {
+                // No usable poll primitive: the pre-close-awareness behaviour.
+                return Ok(false);
+            };
+            // Asked AFTER the poll, so a close that lands while we are parked
+            // is seen on the very next pass, and a close that raced a readiness
+            // edge still wins — HotSpot fails an I/O that a concurrent
+            // `close()` beat, it does not hand back bytes on a closed socket.
+            if !self.fd_still_registered(fd) {
+                return Err(fd_async_closed_err());
+            }
+            if want_write && writable {
+                return Ok(true);
+            }
+            if !want_write && readable {
+                return Ok(true);
+            }
         }
     }
 
@@ -779,6 +983,10 @@ impl FileDescriptorTable {
             let mut entries = self.entries.write();
             entries.remove(&fd)
         };
+        // Drop the recorded blocking mode with the fd. Taken AFTER the entry
+        // removal so a reader parked in `wait_ready_close_aware` can never see
+        // the mode disappear before the registry answer it actually keys on.
+        self.nonblocking.write().remove(&fd);
         let Some(entry) = removed else {
             return Ok(());
         };
@@ -1373,12 +1581,46 @@ impl FileDescriptorTable {
     }
 
     /// Receive a UDP datagram. Returns (bytes_read, source_addr).
+    ///
+    /// # Close-awareness (2026-08-12)
+    ///
+    /// This is the shared chokepoint for every blocking datagram receive in the
+    /// VM: `native-io::net`'s `MulticastSocket.receive`, and `native-io::lib`'s
+    /// `native_dc_read` / `native_dc_receive`. All three used to park inside
+    /// `recv_from` on a socket whose `Arc` they had cloned out of the table,
+    /// and none of them could observe another thread's `close()` — the failure
+    /// this whole family exists to remove. Fixing the chokepoint fixes all
+    /// three at once rather than three times over.
+    ///
+    /// `SO_RCVTIMEO` stays the first line and is not disturbed: the socket's own
+    /// `read_timeout` is read back here and becomes the poll loop's deadline, so
+    /// a `DatagramSocket.setSoTimeout` reader still gets `TimedOut` at the same
+    /// moment it did before. That matters because the two are different regimes
+    /// — `SO_RCVTIMEO` bounds the *syscall*, and on a socket where the syscall
+    /// is never issued (because we park in `poll` instead) it would never fire
+    /// at all. The deadline is what ends the park where `SO_RCVTIMEO` cannot.
     pub fn udp_recv(&self, fd: FdId, buf: &mut [u8]) -> Result<(usize, String), io::Error> {
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp recv"))?;
         match &*entry {
             FileEntry::UdpSocket(sock) => {
+                // A non-blocking socket must keep answering `WouldBlock`
+                // immediately — parking would take the JDK's
+                // `IOStatus.UNAVAILABLE` protocol away from its caller.
+                if !self.fd_is_nonblocking(fd) {
+                    let deadline = sock
+                        .read_timeout()
+                        .ok()
+                        .flatten()
+                        .map(|t| std::time::Instant::now() + t);
+                    // `Ok(true)` — readable, so the `recv_from` below cannot
+                    // park. `Ok(false)` — no poll primitive on this target;
+                    // fall through to the plain blocking `recv_from`, which
+                    // cannot see the close but at least still transfers.
+                    let _ =
+                        self.wait_ready_close_aware(fd, raw_handle_of(sock), false, deadline)?;
+                }
                 let (n, addr) = sock.recv_from(buf)?;
                 Ok((n, addr.to_string()))
             }
@@ -1394,10 +1636,15 @@ impl FileDescriptorTable {
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
-        match &*entry {
+        let applied = match &*entry {
             FileEntry::UdpSocket(sock) => sock.set_nonblocking(nonblocking),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        };
+        // See `tcp_set_nonblocking` — record only what the socket accepted.
+        if applied.is_ok() {
+            self.record_blocking_mode(fd, nonblocking);
         }
+        applied
     }
 
     /// Get the local address of a UDP socket.
@@ -1523,8 +1770,41 @@ impl FileDescriptorTable {
             FileEntry::TcpListener { listener, pending } => {
                 // Drain any connection that `poll_ready` already accepted
                 // off the OS backlog before touching the listener itself.
-                let (stream, addr) = match pending.lock().pop_front() {
+                let queued = pending.lock().pop_front();
+                let (stream, addr) = match queued {
                     Some(conn) => conn,
+                    // CLOSE-AWARENESS 2026-08-12: an `accept()` on an idle
+                    // listener parks for as long as nobody connects, and
+                    // `close()` on another thread cannot end it — the entry is
+                    // removed from the table but this thread's `Arc` clone keeps
+                    // the listening socket open. Park in `poll` and re-ask the
+                    // table instead, the shape `net::net_accept_close_aware` and
+                    // `socket_channel::accept_close_aware` have carried since
+                    // 2026-05-17. A non-blocking listener is untouched: it must
+                    // keep answering `WouldBlock` for the JDK's
+                    // `IOStatus.UNAVAILABLE` accept protocol.
+                    None if !self.fd_is_nonblocking(fd) => {
+                        let raw = raw_handle_of(&*listener.lock());
+                        loop {
+                            if !self.wait_ready_close_aware(fd, raw, false, None)? {
+                                break listener.lock().accept()?;
+                            }
+                            let l = listener.lock();
+                            // Zero-timeout re-ask under the lock: a second
+                            // acceptor on this fd could have taken the pending
+                            // connection between the poll and this lock, and
+                            // calling `accept()` anyway would park in the
+                            // syscall — the failure this loop exists to remove.
+                            if !poll_socket_readiness_timeout(raw, 0)
+                                .map(|(r, _)| r)
+                                .unwrap_or(true)
+                            {
+                                drop(l);
+                                continue;
+                            }
+                            break l.accept()?;
+                        }
+                    }
                     None => listener.lock().accept()?,
                 };
                 let new_fd = self.insert_tcp_stream(stream);
@@ -1538,14 +1818,63 @@ impl FileDescriptorTable {
     }
 
     /// Read from a TCP stream. Returns bytes read.
+    ///
+    /// # Close-awareness (2026-08-12)
+    ///
+    /// Same shape as [`udp_recv`](Self::udp_recv), and the same reason: this is
+    /// the chokepoint under `native-builtins`' `SocketChannel.read` /
+    /// `Socket.getInputStream().read()` synthetic paths, and none of them could
+    /// observe a `close()` from another thread.
+    ///
+    /// The poll happens **outside** the per-fd `Mutex`, which fixes a second
+    /// defect in passing: the old code held that mutex for the whole duration
+    /// of a blocking read, so every [`tcp_write`](Self::tcp_write) on the same
+    /// fd queued behind a reader waiting on a peer that might never speak. That
+    /// is a per-fd half-duplex wedge, and `try_clone_tcp` below exists only
+    /// because of it. The lock is now taken only once the socket is already
+    /// readable.
     pub fn tcp_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp read"))?;
         match &*entry {
             FileEntry::TcpStream(stream) => {
-                let mut s = stream.lock();
-                s.read(buf)
+                if self.fd_is_nonblocking(fd) {
+                    let mut s = stream.lock();
+                    return s.read(buf);
+                }
+                let (raw, deadline) = {
+                    let s = stream.lock();
+                    (
+                        raw_handle_of(&*s),
+                        s.read_timeout()
+                            .ok()
+                            .flatten()
+                            .map(|t| std::time::Instant::now() + t),
+                    )
+                };
+                loop {
+                    if !self.wait_ready_close_aware(fd, raw, false, deadline)? {
+                        // No poll primitive on this target: one plain blocking
+                        // read, the pre-2026-08-12 behaviour.
+                        let mut s = stream.lock();
+                        return s.read(buf);
+                    }
+                    let mut s = stream.lock();
+                    // Re-ask with a zero timeout under the lock. Between the
+                    // poll above and this lock another reader on the same fd
+                    // could have taken the bytes; issuing the read anyway would
+                    // park inside the syscall, which is the exact thing this
+                    // function exists to stop doing.
+                    if !poll_socket_readiness_timeout(raw, 0)
+                        .map(|(r, _)| r)
+                        .unwrap_or(true)
+                    {
+                        drop(s);
+                        continue;
+                    }
+                    return s.read(buf);
+                }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1579,12 +1908,42 @@ impl FileDescriptorTable {
     }
 
     /// Write to a TCP stream. Returns bytes written.
+    ///
+    /// # Close-awareness (2026-08-12)
+    ///
+    /// The write twin of [`tcp_read`](Self::tcp_read). A blocking `send` parks
+    /// behind peer backpressure exactly as a `recv` parks behind peer silence,
+    /// and measured on this host (`SendWake.java`, Windows 11, JDK 25.0.3, and
+    /// recorded in `socket_channel::write_close_aware`) a writer parked in a
+    /// blocking-mode `send` is *still* parked 6 s after another thread issues
+    /// `shutdown(SHUT_WR)`. Only closing the handle woke it, and this table
+    /// cannot close a handle a writer is mid-syscall on.
+    ///
+    /// Unlike `socket_channel::write_close_aware` this does NOT loop until the
+    /// whole payload is out: `tcp_write` reports a short write to its caller,
+    /// which is the contract it already had. One write-readiness wait, then one
+    /// `send`.
     pub fn tcp_write(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp write"))?;
         match &*entry {
             FileEntry::TcpStream(stream) => {
+                if self.fd_is_nonblocking(fd) {
+                    let mut s = stream.lock();
+                    return s.write(data);
+                }
+                let (raw, deadline) = {
+                    let s = stream.lock();
+                    (
+                        raw_handle_of(&*s),
+                        s.write_timeout()
+                            .ok()
+                            .flatten()
+                            .map(|t| std::time::Instant::now() + t),
+                    )
+                };
+                let _ = self.wait_ready_close_aware(fd, raw, true, deadline)?;
                 let mut s = stream.lock();
                 s.write(data)
             }
@@ -1600,11 +1959,17 @@ impl FileDescriptorTable {
         let entry = self
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
-        match &*entry {
+        let applied = match &*entry {
             FileEntry::TcpStream(stream) => stream.lock().set_nonblocking(nonblocking),
             FileEntry::TcpListener { listener, .. } => listener.lock().set_nonblocking(nonblocking),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
+        };
+        // Record only what actually reached the socket, so the side table can
+        // never claim a mode the OS refused. See the `nonblocking` field.
+        if applied.is_ok() {
+            self.record_blocking_mode(fd, nonblocking);
         }
+        applied
     }
 
     /// Get the local address of a TCP stream or listener.

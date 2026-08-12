@@ -57,8 +57,20 @@ struct PipeEnd {
     /// (source) end.  Used to validate that read/write goes through
     /// the right side.
     is_sink: bool,
-    /// Closed flag — guards against double-close from finalizers.
+    /// Closed flag — guards against double-close from finalizers, and, since
+    /// 2026-08-12, the **generation** a parked reader/writer re-asks. See the
+    /// module-level "Close-awareness" section below.
     closed: bool,
+    /// Threads currently between their liveness check and the return of their
+    /// blocking syscall on `raw`.
+    ///
+    /// This is what makes closing safe at all. `PipeEnd` is `Copy` and the
+    /// handle is a bare `u64` with no ownership attached, so a thread inside
+    /// `ReadFile`/`read(2)` holds nothing that keeps `raw` alive — unlike every
+    /// socket site in this family, which parks holding an `Arc<TcpStream>`.
+    in_flight: u32,
+    /// A close arrived while `in_flight > 0`; the last thread out closes `raw`.
+    close_pending: bool,
 }
 
 fn pipe_table() -> &'static RwLock<HashMap<i32, PipeEnd>> {
@@ -79,6 +91,113 @@ fn register_pipe_end(end: PipeEnd) -> i32 {
     id
 }
 
+// ---------------------------------------------------------------------------
+// Close-awareness (2026-08-12, W7-53)
+// ---------------------------------------------------------------------------
+//
+// # Why the registry re-ask the socket sites use cannot be lifted here
+//
+// Every other site in this family parks holding an `Arc<TcpStream>` cloned out
+// of a registry. Two consequences follow from that, and BOTH of them are load-
+// bearing: the OS handle cannot be closed while the thread is parked (the `Arc`
+// is still alive), so `close` can only *mark* the registry — and marking the
+// registry is therefore a safe, purely advisory question the parked thread can
+// re-ask on any cadence it likes.
+//
+// Neither holds here. `PipeEnd` is `Copy`, so `pipe_end_get` handed out a
+// snapshot containing a bare `u64` handle with no ownership attached, and
+// `close_pipe_end` called `close_raw` on that same handle immediately. So the
+// pre-2026-08-12 code was not merely unable to wake a parked reader — it CLOSED
+// THE HANDLE UNDERNEATH IT, which is a use-after-close the instant the OS
+// recycles the handle number and hands it to an unrelated file. (The census in
+// W7-47-w2-cluster.md records these four as "removing the map entry does not
+// close the handle the parked thread holds". The entry is not removed and the
+// handle is closed; the defect is worse than the row says, not milder.)
+//
+// # The mechanism, and why it is two halves rather than one
+//
+// * `in_flight` / `close_pending` — an ownership discipline that gives the
+//   handle the lifetime the socket sites get from their `Arc`. A thread
+//   announces itself with `pipe_enter` and leaves with `pipe_leave`; `close`
+//   sets `closed` immediately but defers `close_raw` to the last thread out.
+//   Without this half, the generation check below would be a check the answer
+//   to which arrives too late to matter.
+// * `closed` re-read through `pipe_still_open` — the generation question, asked
+//   between bounded readiness probes rather than once at entry. Without this
+//   half, `in_flight` alone would merely make an unbounded park safe instead of
+//   ending it.
+//
+// The readiness probe is what keeps the thread OUT of the syscall so it can ask
+// at all; see `pipe_readable` / `pipe_writable`.
+
+/// How long a parked pipe read/write waits before re-asking whether the end was
+/// closed under it. Smaller than the 25 ms the socket sites use because the
+/// Windows read probe is a zero-timeout query plus a sleep, so this value is a
+/// genuine latency cost there rather than only a liveness bound; on Unix it is
+/// a real `poll(2)` timeout and costs nothing.
+const PIPE_CLOSE_POLL_MS: i32 = 5;
+
+/// The error a parked pipe operation reports once its end has been closed from
+/// another thread. `ErrorKind::Interrupted` is the carrier every close-aware
+/// path in this tree uses, and it is unambiguous here because neither probe
+/// reports EINTR as an error.
+fn pipe_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "channel closed")
+}
+
+/// Announce an in-flight operation on `id` and take a snapshot of the end.
+///
+/// `None` means the id is unknown or already closed — the caller must not touch
+/// `raw`. Every `Some` MUST be paired with exactly one [`pipe_leave`].
+fn pipe_enter(id: i32) -> Option<PipeEnd> {
+    let mut g = pipe_table().write().ok()?;
+    let end = g.get_mut(&id)?;
+    if end.closed {
+        return None;
+    }
+    end.in_flight = end.in_flight.saturating_add(1);
+    Some(*end)
+}
+
+/// A snapshot of the end registered under `id`, or `None` for an unknown id.
+///
+/// NOT a licence to touch `end.raw`: the snapshot's handle is a bare `u64` and
+/// a concurrent close can invalidate it the moment the read guard drops. Use
+/// [`pipe_enter`] for anything that issues a syscall. Kept because the table's
+/// own unit tests read the registration back through it, and because the
+/// distinction between "look at the record" and "touch the handle" is exactly
+/// what the bracket exists to draw.
+fn pipe_end_get(id: i32) -> Option<PipeEnd> {
+    pipe_table().read().ok()?.get(&id).copied()
+}
+
+/// Retire an in-flight operation. If a close arrived while this thread was
+/// inside the syscall and this is the last thread out, the handle is closed
+/// here — which is the point at which closing it is finally safe.
+fn pipe_leave(id: i32) {
+    let Ok(mut g) = pipe_table().write() else {
+        return;
+    };
+    let Some(end) = g.get_mut(&id) else {
+        return;
+    };
+    end.in_flight = end.in_flight.saturating_sub(1);
+    if end.in_flight == 0 && end.close_pending {
+        end.close_pending = false;
+        close_raw(end.raw);
+    }
+}
+
+/// The generation question: is `id` still open? Flips exactly when Java closed
+/// it. A fresh read guard per call, never held across a syscall.
+fn pipe_still_open(id: i32) -> bool {
+    pipe_table()
+        .read()
+        .ok()
+        .and_then(|g| g.get(&id).map(|e| !e.closed))
+        .unwrap_or(false)
+}
+
 fn close_pipe_end(id: i32) -> bool {
     let mut g = match pipe_table().write() {
         Ok(g) => g,
@@ -87,15 +206,19 @@ fn close_pipe_end(id: i32) -> bool {
     if let Some(end) = g.get_mut(&id) {
         if !end.closed {
             end.closed = true;
-            close_raw(end.raw);
+            if end.in_flight == 0 {
+                close_raw(end.raw);
+            } else {
+                // Somebody is inside a syscall on this handle. Closing it now
+                // is the use-after-close described above; the last thread out
+                // does it in `pipe_leave` instead. `closed` is already set, so
+                // that thread's next `pipe_still_open` ends its park.
+                end.close_pending = true;
+            }
             return true;
         }
     }
     false
-}
-
-fn pipe_end_get(id: i32) -> Option<PipeEnd> {
-    pipe_table().read().ok()?.get(&id).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -118,11 +241,15 @@ mod platform {
                 raw: fds[0] as u64,
                 is_sink: false,
                 closed: false,
+                in_flight: 0,
+                close_pending: false,
             },
             PipeEnd {
                 raw: fds[1] as u64,
                 is_sink: true,
                 closed: false,
+                in_flight: 0,
+                close_pending: false,
             },
         ))
     }
@@ -164,6 +291,48 @@ mod platform {
         unsafe {
             libc::close(raw as libc::c_int);
         }
+    }
+
+    /// Wait up to `timeout_ms` for the pipe end to be readable / writable.
+    ///
+    /// `Some(Ok(true))` ready (or hung up, which the following `read` then
+    /// reports as EOF and the following `write` as EPIPE); `Some(Ok(false))`
+    /// the slice expired; `Some(Err(_))` the probe itself failed; `None` no
+    /// probe on this target.
+    ///
+    /// EINTR is reported as "not ready", never as an error and never as an
+    /// in-place re-poll: `poll(2)` is NEVER auto-restarted by `SA_RESTART`, and
+    /// this VM signals its own threads on purpose (`jit::xt_root_scan` SIGUSR2s
+    /// every thread for a cross-thread root scan). Re-polling in place would
+    /// restart the whole wait on every GC. Same arm, same reason, as
+    /// `native-io/src/net.rs`'s `net_poll_raw`.
+    pub(super) fn poll_pipe(
+        raw: u64,
+        want_write: bool,
+        timeout_ms: i32,
+    ) -> Option<std::io::Result<bool>> {
+        let mut pfd = libc::pollfd {
+            fd: raw as libc::c_int,
+            events: if want_write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
+        // matches the one-element buffer.
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, timeout_ms) };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted || error.raw_os_error() == Some(4) {
+                return Some(Ok(false));
+            }
+            return Some(Err(error));
+        }
+        // `rc > 0` rather than a `revents` mask test: POLLERR/POLLHUP/POLLNVAL
+        // are delivered whether or not they were requested and must count as
+        // ready, so the syscall that follows surfaces the concrete error.
+        // Treating them as not-ready would park a thread forever on a pipe that
+        // can never become ready, which is the failure this path exists to
+        // remove.
+        Some(Ok(rc > 0))
     }
 }
 
@@ -218,11 +387,15 @@ mod platform {
                 raw: hread as u64,
                 is_sink: false,
                 closed: false,
+                in_flight: 0,
+                close_pending: false,
             },
             PipeEnd {
                 raw: hwrite as u64,
                 is_sink: true,
                 closed: false,
+                in_flight: 0,
+                close_pending: false,
             },
         ))
     }
@@ -277,6 +450,100 @@ mod platform {
             CloseHandle(raw as Handle);
         }
     }
+
+    /// Readiness probe for a pipe end. See the Unix twin for the contract.
+    ///
+    /// # Read side
+    ///
+    /// `PeekNamedPipe` is documented to work on anonymous pipes (they are
+    /// named pipes internally) and needs only the `GENERIC_READ` access
+    /// `CreatePipe`'s read handle already has. It is a pure query: it consumes
+    /// nothing, waits for nothing, and does not change the handle's mode — so
+    /// unlike a `SetNamedPipeHandleState(PIPE_NOWAIT)` dance it cannot race a
+    /// concurrent reader on the same handle into a spurious short read. Because
+    /// it does not wait, the bounded wait is a `Sleep` between probes; that is
+    /// the same sleep-cadence shape `net::net_accept_close_aware` uses, and it
+    /// is why `PIPE_CLOSE_POLL_MS` is 5 rather than 25.
+    ///
+    /// `ERROR_BROKEN_PIPE` counts as READY, not as an error: the following
+    /// `ReadFile` maps it to a clean 0-byte EOF, which is the answer the JDK
+    /// specifies once the write end is gone.
+    ///
+    /// # Write side
+    ///
+    /// `None`, deliberately, and this is the one row of this family left open
+    /// rather than closed. Windows offers no space-available query for the
+    /// write end of a pipe. The two mechanisms that would give one both change
+    /// how the handle behaves rather than merely observing it:
+    /// `SetNamedPipeHandleState(PIPE_NOWAIT)` (documented as legacy LANMAN
+    /// compatibility, and it alters every write on the handle), or creating the
+    /// pipe with `CreateNamedPipe(FILE_FLAG_OVERLAPPED)` + `CreateFile` instead
+    /// of `CreatePipe` and using a bounded `GetOverlappedResultEx`. The second
+    /// is the correct fix and is named as the follow-up in
+    /// W7-53-blocking-close-family.md; neither is a change worth making
+    /// without a build to run it against, and answering `Some(Ok(false))` here
+    /// would be strictly worse than `None` — it would spin a loop that could
+    /// never report readiness while the caller believed it was close-aware.
+    ///
+    /// `None` routes the caller to one plain blocking `WriteFile`, i.e. exactly
+    /// the pre-2026-08-12 behaviour, with the generation check still applied
+    /// BEFORE it and the deferred close still applied after. So a Windows sink
+    /// write no longer risks a use-after-close, and observes a close that has
+    /// already happened — it is only a close arriving while it is inside
+    /// `WriteFile` that it still cannot see.
+    pub(super) fn poll_pipe(
+        raw: u64,
+        want_write: bool,
+        timeout_ms: i32,
+    ) -> Option<std::io::Result<bool>> {
+        if want_write {
+            return None;
+        }
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn PeekNamedPipe(
+                h_named_pipe: Handle,
+                lp_buffer: *mut c_void,
+                n_buffer_size: u32,
+                lp_bytes_read: *mut u32,
+                lp_total_bytes_avail: *mut u32,
+                lp_bytes_left_this_message: *mut u32,
+            ) -> Bool;
+            fn Sleep(dw_milliseconds: u32);
+        }
+        let mut avail: u32 = 0;
+        // SAFETY: a NULL buffer with size 0 asks for the counts alone, which is
+        // the documented way to use `PeekNamedPipe` as a pure query; `avail` is
+        // a live local for the duration of the call.
+        let ok = unsafe {
+            PeekNamedPipe(
+                raw as Handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut avail,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            // ERROR_BROKEN_PIPE (109): the write end is gone. Ready — the
+            // `ReadFile` that follows turns it into EOF.
+            if err.raw_os_error() == Some(109) {
+                return Some(Ok(true));
+            }
+            return Some(Err(err));
+        }
+        if avail > 0 {
+            return Some(Ok(true));
+        }
+        if timeout_ms > 0 {
+            // SAFETY: no invariants; bounds the wait so the caller can re-ask
+            // the generation.
+            unsafe { Sleep(timeout_ms as u32) };
+        }
+        Some(Ok(false))
+    }
 }
 
 // On non-unix-non-windows platforms, fail at runtime with IOException
@@ -303,9 +570,12 @@ mod platform {
         ))
     }
     pub(super) fn close_raw(_: u64) {}
+    pub(super) fn poll_pipe(_: u64, _: bool, _: i32) -> Option<std::io::Result<bool>> {
+        None
+    }
 }
 
-use platform::{close_raw, create_anonymous_pipe, read_pipe, write_pipe};
+use platform::{close_raw, create_anonymous_pipe, poll_pipe, read_pipe, write_pipe};
 
 // ---------------------------------------------------------------------------
 // Java-side helpers
@@ -315,6 +585,114 @@ fn io_error(message: impl Into<String>) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
         message: message.into(),
     }))
+}
+
+/// Build a real `java.nio.channels.AsynchronousCloseException`.
+///
+/// The concrete type is load-bearing, not decoration: `Pipe.SourceChannel` /
+/// `SinkChannel` are `java.nio.channels` types, and a caller that closes a pipe
+/// end from another thread catches `AsynchronousCloseException` (or its
+/// `ClosedChannelException` supertype). A bare `IOException` whose message
+/// merely mentions the name walks straight past that catch — the same mistake
+/// `sc_read` used to make and that `socket_channel::channel_exception` was
+/// written to fix. Falls back to a plain IOException if the class cannot be
+/// built, which is the pre-2026-08-12 answer.
+fn async_close_error(ctx: &mut dyn NativeContext, what: &str) -> MethodCallFailed {
+    match ctx.new_object_initialized("java/nio/channels/AsynchronousCloseException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(pin, exc);
+            ctx.unpin_native_roots(pin);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => io_error(format!("{what}: channel closed")),
+    }
+}
+
+/// A blocking pipe read that observes a close of the end it is reading.
+///
+/// Callers must be inside a [`pipe_enter`]/[`pipe_leave`] bracket: this
+/// function reads `raw` on the strength of that bracket keeping the handle
+/// alive, which is the half of the mechanism the generation check below cannot
+/// supply on its own. See the module's "Close-awareness" section.
+///
+/// # On expiry
+///
+/// The per-pass `PIPE_CLOSE_POLL_MS` slice expiring is not an outcome — it is
+/// the point at which [`pipe_still_open`] is re-asked, and the loop continues.
+/// There is no second deadline: `Pipe.SourceChannel` has no read timeout.
+fn pipe_read_close_aware(id: i32, raw: u64, buf: &mut [u8]) -> std::io::Result<isize> {
+    loop {
+        // Asked BEFORE the first probe as well as after every one, because
+        // unlike the socket sites this thread may have been handed a snapshot
+        // of an end that has since been closed, and touching `raw` after that
+        // is the use-after-close the bracket exists to prevent.
+        if !pipe_still_open(id) {
+            return Err(pipe_closed_err());
+        }
+        match poll_pipe(raw, false, PIPE_CLOSE_POLL_MS) {
+            // No probe on this target: the pre-2026-08-12 blocking read, which
+            // cannot see a close that lands while it is parked but is at least
+            // no longer racing the handle out from under itself.
+            None => return read_pipe(raw, buf),
+            Some(Err(e)) => return Err(e),
+            Some(Ok(false)) => continue,
+            Some(Ok(true)) => return read_pipe(raw, buf),
+        }
+    }
+}
+
+/// Largest payload handed to one `write` while a blocking pipe write is sliced.
+///
+/// A pipe write of N bytes does not return until all N are in the buffer, and
+/// the Windows `CreatePipe` default buffer is only 4 KiB, so an unsliced write
+/// of a large payload parks for as long as the reader takes. 4 KiB matches that
+/// buffer; the common small write is issued whole.
+const PIPE_WRITE_SLICE_MAX: usize = 4 * 1024;
+
+/// A blocking pipe write that observes a close of the end it is writing — the
+/// write twin of [`pipe_read_close_aware`], with the same bracket requirement.
+///
+/// Returns the bytes transferred. A close after a partial transfer answers the
+/// partial count; a close with nothing out returns [`pipe_closed_err`].
+fn pipe_write_close_aware(id: i32, raw: u64, data: &[u8]) -> std::io::Result<isize> {
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written as isize);
+        }
+        if !pipe_still_open(id) {
+            if written > 0 {
+                return Ok(written as isize);
+            }
+            return Err(pipe_closed_err());
+        }
+        match poll_pipe(raw, true, PIPE_CLOSE_POLL_MS) {
+            // No write-readiness probe on this target — Windows, today. One
+            // plain blocking write of the remainder, exactly the
+            // pre-2026-08-12 behaviour, with the generation check above still
+            // applied before it. See `platform::poll_pipe`'s doc comment for
+            // why answering `Some(Ok(false))` here instead would be worse.
+            None => {
+                let n = write_pipe(raw, &data[written..])?;
+                return Ok(written as isize + n);
+            }
+            Some(Err(e)) => return Err(e),
+            Some(Ok(false)) => continue,
+            Some(Ok(true)) => {
+                let end = (written + PIPE_WRITE_SLICE_MAX).min(data.len());
+                match write_pipe(raw, &data[written..end]) {
+                    Ok(n) if n > 0 => written += n as usize,
+                    // Writable, then not: park again rather than report a short
+                    // write the caller did not ask for.
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
 }
 
 /// Pipe channel layout (3 fields):
@@ -518,25 +896,29 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Value::Int(v) => v,
         _ => return Err(io_error("SinkChannel.write: missing pipe id")),
     };
-    let end = pipe_end_get(id).ok_or_else(|| io_error("SinkChannel.write: closed or unknown"))?;
-    if end.closed {
-        return Err(io_error("SinkChannel.write: channel closed"));
-    }
+    // `pipe_enter` both answers "is this end still open?" and pins the raw
+    // handle against a concurrent close for the duration; every exit below must
+    // reach exactly one `pipe_leave`.
+    let end = pipe_enter(id).ok_or_else(|| io_error("SinkChannel.write: closed or unknown"))?;
     if !end.is_sink {
+        pipe_leave(id);
         return Err(io_error(
             "SinkChannel.write: wrong end (source registered as sink)",
         ));
     }
     let Some(buf) = arg_obj(args, 1) else {
+        pipe_leave(id);
         return Err(io_error("SinkChannel.write: null buffer"));
     };
     let Some(view) = buffer_view(ctx, buf) else {
+        pipe_leave(id);
         return Err(io_error(
             "SinkChannel.write: unrecognised ByteBuffer layout",
         ));
     };
     let remaining = view.remaining();
     if remaining <= 0 {
+        pipe_leave(id);
         return Ok(Some(Value::Int(0)));
     }
     // Clamp to what actually exists behind `offset + position`; a bogus
@@ -545,6 +927,7 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let avail = ctx.array_length(view.arr).saturating_sub(start);
     let to_write = (remaining as usize).min(avail);
     if to_write == 0 {
+        pipe_leave(id);
         return Ok(Some(Value::Int(0)));
     }
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
@@ -559,13 +942,20 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // family" hang shape. `buf` is used after the region, so re-sync it.
     let mut held = [Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let written = write_pipe(end.raw, &bytes);
+    let written = pipe_write_close_aware(id, end.raw, &bytes);
     ctx.end_blocking_region_refs(&mut held);
+    pipe_leave(id);
     let buf = match held[0] {
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = written.map_err(|e| io_error(format!("write: {e}")))?;
+    let n = match written {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(async_close_error(ctx, "SinkChannel.write"));
+        }
+        Err(e) => return Err(io_error(format!("write: {e}"))),
+    };
     if n > 0 {
         buffer_set_position(ctx, buf, position + n as i32);
     }
@@ -583,19 +973,21 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(v) => v,
         _ => return Err(io_error("SourceChannel.read: missing pipe id")),
     };
-    let end = pipe_end_get(id).ok_or_else(|| io_error("SourceChannel.read: closed or unknown"))?;
-    if end.closed {
-        return Err(io_error("SourceChannel.read: channel closed"));
-    }
+    // See `sink_write_buffer` — `pipe_enter` answers the liveness question AND
+    // pins the raw handle; every exit must reach exactly one `pipe_leave`.
+    let end = pipe_enter(id).ok_or_else(|| io_error("SourceChannel.read: closed or unknown"))?;
     if end.is_sink {
+        pipe_leave(id);
         return Err(io_error(
             "SourceChannel.read: wrong end (sink registered as source)",
         ));
     }
     let Some(buf) = arg_obj(args, 1) else {
+        pipe_leave(id);
         return Err(io_error("SourceChannel.read: null buffer"));
     };
     let Some(view) = buffer_view(ctx, buf) else {
+        pipe_leave(id);
         return Err(io_error(
             "SourceChannel.read: unrecognised ByteBuffer layout",
         ));
@@ -607,6 +999,7 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let avail = ctx.array_length(view.arr).saturating_sub(start);
     let space = (view.remaining() as usize).min(avail);
     if space == 0 {
+        pipe_leave(id);
         return Ok(Some(Value::Int(0)));
     }
     let position = view.position;
@@ -619,8 +1012,9 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `end_blocking_region_refs`.
     let mut held = [Value::Object(Some(view.arr)), Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let read = read_pipe(end.raw, &mut bytes);
+    let read = pipe_read_close_aware(id, end.raw, &mut bytes);
     ctx.end_blocking_region_refs(&mut held);
+    pipe_leave(id);
     let arr = match held[0] {
         Value::Object(Some(o)) => o,
         _ => view.arr,
@@ -629,7 +1023,13 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read.map_err(|e| io_error(format!("read: {e}")))?;
+    let n = match read {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(async_close_error(ctx, "SourceChannel.read"));
+        }
+        Err(e) => return Err(io_error(format!("read: {e}"))),
+    };
     if n == 0 {
         // EOF — JDK signals -1.
         return Ok(Some(Value::Int(-1)));
@@ -652,17 +1052,20 @@ fn sink_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(v) => v,
         _ => return Err(io_error("SinkChannel.write[bytes]: missing pipe id")),
     };
-    let end = pipe_end_get(id).ok_or_else(|| io_error("SinkChannel.write[bytes]: closed"))?;
-    if end.closed || !end.is_sink {
+    let end = pipe_enter(id).ok_or_else(|| io_error("SinkChannel.write[bytes]: closed"))?;
+    if !end.is_sink {
+        pipe_leave(id);
         return Err(io_error("SinkChannel.write[bytes]: not a sink"));
     }
     let Some(arr) = arg_obj(args, 1) else {
+        pipe_leave(id);
         return Err(io_error("SinkChannel.write[bytes]: null array"));
     };
     let off = arg_int(args, 2).max(0) as usize;
     let len = arg_int(args, 3).max(0) as usize;
     let alen = ctx.array_length(arr);
     if off.saturating_add(len) > alen {
+        pipe_leave(id);
         return Err(io_error(format!(
             "SinkChannel.write[bytes]: out of bounds off={off} len={len} alen={alen}"
         )));
@@ -675,9 +1078,16 @@ fn sink_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // uses a Java ref after the region, so the plain `end_blocking_region`
     // is sufficient.
     ctx.begin_blocking_region();
-    let written = write_pipe(end.raw, &bytes);
+    let written = pipe_write_close_aware(id, end.raw, &bytes);
     ctx.end_blocking_region();
-    let n = written.map_err(|e| io_error(format!("write: {e}")))?;
+    pipe_leave(id);
+    let n = match written {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(async_close_error(ctx, "SinkChannel.write"));
+        }
+        Err(e) => return Err(io_error(format!("write: {e}"))),
+    };
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -690,17 +1100,20 @@ fn source_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Value::Int(v) => v,
         _ => return Err(io_error("SourceChannel.read[bytes]: missing pipe id")),
     };
-    let end = pipe_end_get(id).ok_or_else(|| io_error("SourceChannel.read[bytes]: closed"))?;
-    if end.closed || end.is_sink {
+    let end = pipe_enter(id).ok_or_else(|| io_error("SourceChannel.read[bytes]: closed"))?;
+    if end.is_sink {
+        pipe_leave(id);
         return Err(io_error("SourceChannel.read[bytes]: not a source"));
     }
     let Some(arr) = arg_obj(args, 1) else {
+        pipe_leave(id);
         return Err(io_error("SourceChannel.read[bytes]: null array"));
     };
     let off = arg_int(args, 2).max(0) as usize;
     let len = arg_int(args, 3).max(0) as usize;
     let alen = ctx.array_length(arr);
     if off.saturating_add(len) > alen {
+        pipe_leave(id);
         return Err(io_error(format!(
             "SourceChannel.read[bytes]: out of bounds off={off} len={len} alen={alen}"
         )));
@@ -710,13 +1123,20 @@ fn source_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `source_read_buffer`. `arr` is written after the region, so re-sync it.
     let mut held = [Value::Object(Some(arr))];
     ctx.begin_blocking_region();
-    let read = read_pipe(end.raw, &mut bytes);
+    let read = pipe_read_close_aware(id, end.raw, &mut bytes);
     ctx.end_blocking_region_refs(&mut held);
+    pipe_leave(id);
     let arr = match held[0] {
         Value::Object(Some(o)) => o,
         _ => arr,
     };
-    let n = read.map_err(|e| io_error(format!("read: {e}")))?;
+    let n = match read {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(async_close_error(ctx, "SourceChannel.read"));
+        }
+        Err(e) => return Err(io_error(format!("read: {e}"))),
+    };
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
@@ -892,6 +1312,107 @@ mod tests {
     fn wp37_pipe_table_unknown_id_returns_none() {
         assert!(pipe_end_get(i32::MAX - 1).is_none());
         assert!(!close_pipe_end(i32::MAX - 1));
+    }
+
+    // --- W7-53 (2026-08-12): close-awareness ---
+
+    /// The row this whole family is about: a thread parked in a blocking pipe
+    /// read must come back when another thread closes the end.
+    ///
+    /// RED-by-construction against the pre-2026-08-12 tree: `read_pipe` there
+    /// parked in `ReadFile`/`read(2)` with `lpOverlapped = NULL`, and
+    /// `close_pipe_end` neither woke it nor could have — it closed the handle
+    /// out from under it instead.
+    ///
+    /// The read is proved to be genuinely parked before the close, not merely
+    /// racing it: the reader publishes `started` and the closing thread waits
+    /// for that AND for a further 100 ms, which is 20 poll slices, before it
+    /// closes anything. A close issued ahead of the read would prove nothing,
+    /// because the read would then return for an unrelated reason.
+    #[test]
+    fn a_close_wakes_a_reader_parked_on_a_pipe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let r_id = register_pipe_end(read_end);
+        let started = Arc::new(AtomicBool::new(false));
+        let reader_started = Arc::clone(&started);
+        let reader = std::thread::spawn(move || {
+            let end = pipe_enter(r_id).expect("open at entry");
+            reader_started.store(true, Ordering::SeqCst);
+            let mut buf = [0u8; 16];
+            let result = pipe_read_close_aware(r_id, end.raw, &mut buf);
+            pipe_leave(r_id);
+            result.map(|n| n as i64).map_err(|e| e.kind())
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Nobody writes to `write_end`, so the reader is parked on an empty
+        // pipe for the whole of this sleep.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!reader.is_finished(), "the read did not park at all");
+        close_pipe_end(r_id);
+        let outcome = reader.join().expect("reader thread");
+        assert_eq!(
+            outcome,
+            Err(std::io::ErrorKind::Interrupted),
+            "a parked pipe read must observe the close"
+        );
+        close_raw(write_end.raw);
+    }
+
+    /// The close-aware read is still a read: the wakeup must not cost payload.
+    #[test]
+    fn a_close_aware_pipe_read_still_delivers_bytes() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let r_id = register_pipe_end(read_end);
+        write_pipe(write_end.raw, b"payload").expect("write");
+        let end = pipe_enter(r_id).expect("open");
+        let mut buf = [0u8; 16];
+        let n = pipe_read_close_aware(r_id, end.raw, &mut buf).expect("read");
+        pipe_leave(r_id);
+        assert_eq!(&buf[..n as usize], b"payload");
+        close_pipe_end(r_id);
+        close_raw(write_end.raw);
+    }
+
+    /// The other half of the mechanism: a close arriving while an operation is
+    /// in flight must NOT close the raw handle underneath it.
+    ///
+    /// Before 2026-08-12 `close_pipe_end` called `close_raw` unconditionally,
+    /// so the handle a parked thread was mid-syscall on was freed and its
+    /// number could be recycled onto an unrelated file. That is why the
+    /// generation check alone is not the fix here and is the fix on every
+    /// socket site in this family: those park holding an `Arc<TcpStream>`,
+    /// which keeps the handle alive for them.
+    #[test]
+    fn a_close_during_an_in_flight_op_defers_the_raw_close() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let r_id = register_pipe_end(read_end);
+        let entered = pipe_enter(r_id).expect("open");
+        assert!(close_pipe_end(r_id), "first close reports it did the work");
+        let mid = pipe_end_get(r_id).expect("entry survives the close");
+        assert!(mid.closed, "the generation flipped immediately");
+        assert!(
+            mid.close_pending,
+            "the raw close is deferred while an op is in flight"
+        );
+        assert!(
+            !pipe_still_open(r_id),
+            "a parked op re-asking now must see the close"
+        );
+        // The handle is still valid here, which is the whole point: a thread
+        // mid-syscall on `entered.raw` has not had it freed under it.
+        assert_eq!(entered.raw, mid.raw);
+        pipe_leave(r_id);
+        let after = pipe_end_get(r_id).expect("entry still present");
+        assert!(
+            !after.close_pending,
+            "the last op out performs the deferred close"
+        );
+        close_raw(write_end.raw);
     }
 
     // --- AUDIT 2026-07-26 (native-io-audit) regressions ---
