@@ -274,7 +274,126 @@ silently empties out fails loudly instead of passing vacuously.
 
 ---
 
-## 7. Not a defect, checked because it looked like one
+## 7. The fix that was on the registrar that loses
+
+W7-44 put fdlibm's `log` into `Random.nextGaussian`'s polar method. The VM went
+on emitting the wrong value anyway, because it fixed the wrong copy.
+
+`java/util/Random.nextGaussian` is registered **twice**, and registration is
+last-write-wins:
+
+| | registrar | body | had the fix? |
+|---|---|---|---|
+| 1 | `native-collections` `register_random_natives` | its own polar helper | **yes** |
+| 2 | `native-builtins::securerandom` | its own polar loop | **no — `f64::ln`** |
+
+and `vm/src/vm/vm_init.rs` calls the second one *after* the first, deliberately,
+inside a block labelled `LAST-WRITE-WINS BOUNDARY — do not reorder`. The
+collections version reads the LCG seed from a synthetic two-field layout; in
+real-JDK mode field 0 is an `AtomicLong` reference rather than a long, so that
+version reads zero and a seeded `Random` produces all-zero output. The
+`securerandom` handlers are layout-independent, so they *must* win.
+
+They won, and they were still on `f64::ln`. A third copy in
+`native-builtins/src/lib.rs` — superseded, unregistered, but compiled and tested
+— was on `f64::ln` too.
+
+### Why nothing caught it
+
+There **was** a bit-exact test asserting the seeded stream, and it was green the
+entire time. It lives in `native-collections` and calls that crate's helper
+directly; it never goes through the registry, so it tests a body the VM does not
+run.
+
+That is the part worth carrying forward. A test on the wrong side of a
+last-write-wins boundary is not weak evidence, it is *no* evidence — and it is
+indistinguishable from a good test by inspection. It asserts the right values,
+by bits, for the right reason. The only thing wrong with it is which function it
+calls.
+
+### What changed
+
+- `securerandom`'s body uses `cratonvm_types::fdlibm::log`. This is the one that
+  runs.
+- Its polar arithmetic is extracted into `rnd_gaussian_pair`, taking `next(bits)`
+  as a closure. The native itself cannot be unit-tested — its draws need a live
+  `NativeContext` — and *that* is why the only test of this arithmetic had ended
+  up written against another crate's duplicate of it. Untestable code grows a
+  tested twin somewhere else, and the twin drifts.
+- `native-builtins` now carries its own `next_gaussian_matches_jdk_seeded_sequence`
+  over its own helper: the same six `new Random(42)` values from Temurin
+  25.0.3+9, asserted as bits.
+- The superseded `lib.rs` copy is fixed too. A superseded copy left on `f64::ln`
+  is what a future re-registration reinstates silently.
+
+**Fixing one registrar of two is indistinguishable from fixing none.**
+
+---
+
+## 8. The tolerance sweep
+
+Eleven tolerances found and tightened to bit comparisons. Criterion: the thing
+compared has an **exact** contract — IEEE-754 correctly-rounded, or specified bit
+manipulation, or a named javadoc special case — but was asserted approximately.
+
+| site | was | contract |
+|---|---|---|
+| `jit/src/x64/tests.rs` | `sqrt(2.0)` within `1e-14` | exactly rounded |
+| `vm/src/vm/tests.rs` | `nextUp(1.0)`, `nextDown(1.0)` within `1e-10` | bit manipulation |
+| `vm/src/vm/tests.rs` | `nextAfter` × 2, ordering only (`v > 1.0`) | bit manipulation |
+| `vm/src/vm/tests.rs` | `ulp(1.0)` `< 1e-10`, `ulp(1.0f)` `< 1e-5` | exactly `2^-52` / `2^-23` |
+| `vm/src/vm/tests.rs` | `hypot(3,4)`, `sinh(1.0)`, `toRadians(180)` | exact in practice |
+| `native-builtins/src/lang_math.rs` | `toRadians(180)`, `toDegrees(PI)` | exact |
+| `vm/tests/…/TckLang.java` | `sqrt(144.0)` in a ±0.01 band | exactly `12.0` |
+| `vm/tests/…/TckLang.java` | `Math.abs(sin(0.0)) < 0.001` | signed zero |
+
+`ulp(1.0)` is the illustrative one: the contract is a single double, `2^-52`, and
+`v > 0.0 && v < 1e-10` passes for roughly a million wrong answers.
+
+### A predicted defect that did not survive the oracle
+
+A source-level reading flagged `toRadians`/`toDegrees` as a **live divergence**,
+not merely a loose test: the JDK computes `angdeg / 180.0 * PI` while
+`native_math_to_radians` delegates to Rust's `f64::to_radians()`, which is
+`self * (PI / 180.0)` — a different expression that rounds differently, and
+structurally the same shape as the `log` bug.
+
+It is wrong. That is **JDK 8's** formula. JDK 25 reads:
+
+```java
+private static final double DEGREES_TO_RADIANS = 0.017453292519943295;
+public static double toRadians(double angdeg) { return angdeg * DEGREES_TO_RADIANS; }
+```
+
+and that literal is `0x3f91df46a2529d39`, **bit-identical** to Rust's
+`PI / 180.0`. Measured over 2M samples across the full exponent range: zero
+disagreements, both conversions. There is no divergence; the tolerance was just
+too wide.
+
+Worth recording because the reasoning was good and the conclusion was still
+wrong. A predicted defect is a hypothesis until an oracle answers it, and the
+cost of checking here was one twelve-line program.
+
+### Left alone, deliberately
+
+- `Math.pow`/`log`/`exp` bands in `TckLang` — a genuine 1-ULP contract, and
+  `exp(1.0) == Math.E` is not guaranteed.
+- `SecureRandom.nextGaussian`'s distribution check — statistical, no seeded
+  contract.
+- The GPU float kernel's `1e-3` — PTX FMA contraction is real.
+- **`types/src/fdlibm.rs`'s own `1e-15` whole-range guard.** This one looks
+  exactly like the defect and is not: it is a deliberately coarse check of the
+  port against *host libm*, paired with the bit-exact golden table beside it to
+  catch a botched branch on an exponent the table misses. Tightening it would
+  make it fail on correct code. The distinguishing question is not "is there a
+  tolerance" but "what is on the other side of the comparison".
+- A cluster of loose asserts on double round-trips through value stacks and FFI:
+  exact contracts, but a tolerance there cannot hide a libm gap, and most already
+  sit beside a correct bit-exact sibling.
+
+---
+
+## 9. Not a defect, checked because it looked like one
 
 `native_math_pow` carries a fast path: integer exponent, `|b| < 64`, finite base ⇒
 `a.powi(b)`. `powi` is repeated multiplication, whose error grows with the exponent, and
@@ -287,7 +406,7 @@ achieves on the same inputs. The fast path meets the contract and stays.
 
 ---
 
-## 8. What is *not* covered
+## 10. What is *not* covered
 
 - **Nothing was re-measured end-to-end on a CratonVM binary.** This lane does not build.
   The differential probe row that would confirm it is `Random.nextGaussian` and the
@@ -304,7 +423,7 @@ achieves on the same inputs. The fast path meets the contract and stays.
 
 ---
 
-## 9. Re-measurement
+## 11. Re-measurement
 
 The steps that would close this record properly, in order:
 
@@ -317,3 +436,10 @@ The steps that would close this record properly, in order:
 4. Re-run `probes/StrictMathOracleDumpProbe.java` against a CratonVM binary rather than
    against Rust's `f64` methods, which measures the *registered natives* end to end rather
    than the ported routines in isolation. That is the arm this record cannot supply.
+5. `cargo test -p cratonvm-native-builtins` — the new
+   `next_gaussian_matches_jdk_seeded_sequence` in `securerandom`, and the two tightened
+   `toRadians`/`toDegrees` unit tests.
+6. `cargo test -p cratonvm-jit` and the `vm` suites, for the other nine tightened
+   assertions. Each expected value was measured against the actual backing before being
+   asserted, so these should pass unchanged — but they are assertions that were loosened
+   once already, and the point of tightening them is that they now can fail.
