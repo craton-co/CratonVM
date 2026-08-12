@@ -1,6 +1,7 @@
 # JIT drops a constructor's side effects when the object does not escape
 
-**Status:** OPEN (2026-08-12). Found while triaging
+**Status:** **FIXED 2026-08-12** on `fix/jit-ctor-side-effects-20260812`
+(see "Resolution" at the bottom). Found while triaging
 [investigate-batch-12.md](investigate-batch-12.md)
 (`io.netty.util.concurrent.FastThreadLocalTest`), but this is **not a netty
 bug and not netty-specific** — it is a general JIT correctness defect that
@@ -104,7 +105,7 @@ where the IR backend uses a body check** — and per
 `jit/src/escape_analysis.rs`'s own module docs, the single-pass one "runs for
 the overwhelming majority of compiled methods".
 
-## Suggested fix
+## Fix (as applied)
 
 Thread the elidability decision into the single-pass backend rather than
 re-deriving it from the descriptor:
@@ -180,3 +181,63 @@ test bug and not a JDK-behaviour difference.
 - Fixed in the same session, for the same two batch pages:
   the `StackWalker$Option` enum defect and the synthetic `CyclicBarrier`
   lost-release defect (see the branch's commit messages).
+
+
+## Resolution (2026-08-12)
+
+Implemented as described above: the resolver-proven pc set is now threaded into
+the single-pass backend instead of being re-derived from the descriptor.
+
+* `jit/src/x64/driver.rs` — `compile_with_param_slots` takes a new trailing
+  `elidable_init_pcs: Option<HashSet<usize>>`, and `is_trivial_void_init` is set
+  from it. `None` means "the caller proved nothing", and nothing may be elided.
+* `jit/src/lib.rs` — `try_compile_inner` builds the set from
+  `cp_elidable_init_resolver` over `scan.invoke_ops`, the same two inputs the IR
+  builder already uses for its `trivial_init_pcs`.
+* `vm/src/runtime/interpreter.rs` and
+  `vm/src/runtime/interpreter/jit_bridge.rs` — **the other two production
+  doors**. Both already called `is_elidable_construction` per `<init>()V` site
+  (to rewrite the emitted class to `java/lang/Object`); they now also collect
+  those pcs and pass them down, so these paths keep scalar replacement for
+  genuinely-empty constructors rather than losing it.
+
+Only that ONE predicate needed correcting. `plan_scalar_replacement`'s matching
+`<init>()V` check (which populates `init_skips`, the set
+`bytecode_walk.rs` consults to actually skip emitting the call) fires only for
+receivers already in `non_escaping_new`, so fixing the single source of truth
+keeps the allocation and its constructor call consistent by construction — no
+second patch, and no change to the scalar-replacement tests.
+
+**A grep would have missed two of the three doors.** `cargo check -p
+cratonvm-jit` passed while the VM crate still failed to compile; the two extra
+call sites were found only because the new parameter made them a type error.
+That is the `compile_gate` "three doors" hazard the driver's own comments warn
+about, working as intended.
+
+### Verification
+
+| check | before | after |
+|---|---|---|
+| `EA` ctor → `static AtomicInteger` (n=1 000 000) | 3 000 | **1 000 000** |
+| `EA` ctor → plain `static int` (n=1 000 000) | **0** | **1 000 000** |
+| `FastThreadLocal` ctor → `nextIndex` (n=1 000 000) | 11 000 | **1 000 000** |
+| HotSpot / `--nojit` on the same probes | 1 000 000 | 1 000 000 (unchanged) |
+
+The optimisation is **not** disabled — only narrowed to what is provable.
+`CRATONVM_DBG_SCALAR_DEOPT=1` over a method that allocates in a loop shows a
+constructor writing a static reported as `non_escaping_new=[]` (allocation and
+call both kept) while a genuinely empty constructor in the same binary is still
+`non_escaping_new=[7]` (scalar-replaced). The empty-ctor loop still runs ~11x
+faster with the JIT than interpreted.
+
+Regressions: `cargo test -p cratonvm-jit --lib` — 1990 passed, 0 failed. The
+19 netty classes of batch-12/13 are unchanged at 13/19.
+
+### Still open: `FastThreadLocalTest`
+
+As predicted above, this fix alone does **not** turn that class green, and it
+was never expected to. `testConstructionWithIndex` loops
+`Integer.MAX_VALUE - 8` (~2.1 billion) times by construction; the counter now
+advances correctly, so the loop terminates in principle, but not inside the
+suite's wall cap. That remains a throughput item, tracked with the class in
+[investigate-batch-12.md](investigate-batch-12.md) — not a correctness one.

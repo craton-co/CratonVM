@@ -110,6 +110,30 @@ same code — that is worth knowing before triaging any further batch page.
 It also means CratonVM's Unsafe implementation is on the hot path for every
 netty buffer operation, so a defect there shows up as a netty buffer bug.
 
+## Working around it while triaging: give HotSpot the same flag
+
+Some netty classes gate every test on `assumeTrue(PlatformDependent.hasUnsafe())`
+or on `isDirectMemoryCacheAlignmentSupported()`. On stock HotSpot 25 those
+predicates are false, so the baseline reports `aborted=<all>` or `started=0` and
+gives you **no oracle at all** for tests CratonVM does run.
+
+Put HotSpot on CratonVM's code path instead:
+
+```bash
+java --sun-misc-unsafe-memory-access=allow -cp "$CP" CratonRunner <class>
+```
+
+That sets the very property CratonVM pins, so netty's `hasUnsafe()` is true on
+both sides and the comparison is like-for-like. Used on batch-02's
+`BigEndianUnsafeDirectByteBufTest`, `LittleEndianUnsafeDirectByteBufTest` and
+`PooledAlignedBigEndianDirectByteBufTest`: HotSpot went from "413 aborted / 412
+aborted / 0 started" to 413/413, 412/412, 417/417 passing, and CratonVM matched
+all three exactly. Without the flag all three would have been recorded as
+untestable.
+
+Note this is a **triage instrument, not a target state** — it makes the two VMs
+comparable, it does not make CratonVM match a default HotSpot run.
+
 ## Suggested fix — ordered, and the order matters
 
 1. **First close the FFM gap**

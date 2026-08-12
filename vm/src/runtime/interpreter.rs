@@ -2392,6 +2392,13 @@ pub fn execute(
                     // freshly zeroed object if the elision somehow did not fire —
                     // is identical to running `C.<init>`.)
                     let dbg_ctor = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+                    // backend may elide only these; a no-arg constructor that is NOT proven empty
+                    // keeps both its allocation and its call, because eliding it would drop
+                    // whatever the body writes to global state (see
+                    // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+                    let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     for (pc, tclass, pcount) in pending_ctor_sites {
                         let elidable = shared
                             .load_class_concurrent(&tclass)
@@ -2401,6 +2408,9 @@ pub fn execute(
                                 is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
+                        if elidable {
+                            elidable_init_pcs.insert(pc);
+                        }
                         if dbg_ctor {
                             eprintln!(
                                 "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
@@ -2883,6 +2893,7 @@ pub fn execute(
                         // de-spec consult (inert in production).
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
                         indy_info,
+                        Some(elidable_init_pcs),
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;

@@ -166,6 +166,9 @@ pub fn compile(
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
+        // elidable_init_pcs: no constant pool here, so nothing is PROVEN empty
+        // and nothing may be elided. See the parameter's doc.
+        None,
     )
 }
 
@@ -377,6 +380,30 @@ pub fn compile_with_param_slots(
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
     indy_info: Vec<(usize, usize, u8, Vec<u8>, usize)>,
+    // Bytecode pcs of `invokespecial` sites whose target constructor the CALLER
+    // has PROVEN empty (`jit_bridge::is_elidable_construction` — a 5-byte
+    // `aload_0; invokespecial Object.<init>()V; return` body), reached here from
+    // `try_compile_inner`'s `cp_elidable_init_resolver`.
+    //
+    // This is the ONLY thing that may license eliding an `<init>`. It used to be
+    // re-derived from the descriptor (`method_name == "<init>" && descriptor ==
+    // "()V"`), which is a check on the SIGNATURE and says nothing about the
+    // body: every no-arg constructor passed, so a receiver whose constructor
+    // wrote global state was marked non-escaping, scalar-replaced, and its
+    // `<init>` call dropped together with the write. `EA.java` in the bug doc
+    // measures it — 1,000,000 `new` whose ctor does `++someStaticInt` left the
+    // counter at 0 with the JIT on and at 1,000,000 with `--nojit`.
+    //
+    // `None` means the caller proved nothing and NOTHING may be elided. That is
+    // the safe direction and the one the IR backend already reasons in
+    // ("Calling an `<init>` runs every side effect the elision path was allowed
+    // to skip"). The legacy/test `compile()` wrapper and the unroll fixture pass
+    // `None`; they have no constant pool to resolve against.
+    //
+    // Pcs are the ORIGINAL (pre-unroll) ones. A loop-unroll copy carries shifted
+    // pcs that are absent from this set, so copies simply keep their `<init>`
+    // calls — an optimisation left on the table, never a miscompile.
+    elidable_init_pcs: Option<std::collections::HashSet<usize>>,
 ) -> Option<CompiledMethod> {
     // The drift witness for `compile_gate`. Every production door must hold an
     // admission token when it gets here; this counts the entries that do not,
@@ -1221,12 +1248,19 @@ pub fn compile_with_param_slots(
             // are kept live by the caller for the whole compilation.
             let info = unsafe { &*info_ptr };
             if info.invoke_kind == 1 {
+                // The descriptor is NOT evidence of an empty body — see
+                // `elidable_init_pcs`. Only a pc the caller's resolver proved
+                // may be treated as a no-op here; everything else falls into
+                // `analyze_escapes`'s arg-bearing arm, which escapes the
+                // receiver and so keeps both the allocation and the call.
+                let proven_empty_init = elidable_init_pcs
+                    .as_ref()
+                    .is_some_and(|pcs| pcs.contains(&ipc));
                 invokespecial_shapes.insert(
                     ipc,
                     InvokeSpecialShape {
                         arg_slots: info.num_jit_args,
-                        is_trivial_void_init: info.method_name == "<init>"
-                            && info.descriptor == "()V",
+                        is_trivial_void_init: proven_empty_init,
                     },
                 );
             }

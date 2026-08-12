@@ -983,6 +983,13 @@ pub(super) fn compile_osr_artifact(
             // elidable `C.<init>()V` AS `java/lang/Object.<init>` so the codegen
             // elision drops the per-object dispatch; else the real dispatch info.
             // (See the `execute` path for the soundness argument.)
+            // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+            // backend may elide only these; a no-arg constructor that is NOT proven empty
+            // keeps both its allocation and its call, because eliding it would drop
+            // whatever the body writes to global state (see
+            // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+            let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
                 let elidable = shared
                     .load_class_concurrent(&tclass)
@@ -992,6 +999,9 @@ pub(super) fn compile_osr_artifact(
                         is_elidable_construction(shared, &cm2, tid)
                     })
                     .unwrap_or(false);
+                if elidable {
+                    elidable_init_pcs.insert(pc);
+                }
                 let info_class: &str = if elidable {
                     "java/lang/Object"
                 } else {
@@ -1332,6 +1342,7 @@ pub(super) fn compile_osr_artifact(
                 // inert in production (empty registry).
                 &format!("{class_name}.{method_name}:{method_descriptor}"),
                 indy_info,
+                Some(elidable_init_pcs),
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
@@ -2492,6 +2503,22 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // conservatism". On a Spring Boot context startup this whole predicate seals
     // 1,279 methods out of the JIT — more than the 1,155 that reach C2 — and
     // until now nothing said which arm was responsible for them.
+    //
+    // MEASURED 2026-08-12 on netty `AdaptiveByteBufAllocatorTest` (dev
+    // `6d1bfd531`), which is the shape this predicate should hurt most: 826 M
+    // calls, and its hot allocator methods call `ArrayList.add`, `Math.min` and
+    // `AtomicIntegerArray.get`, all shadowed. Arm split
+    // `direct=474 interface-blind=97 inherited=60` — the class-blind arm is 15%
+    // of the population, not the bulk.
+    //
+    // And the seal is NOT a throughput lever here. Interleaved on one box:
+    // default 594 s / 1117 sealed, `-native-shadow-interface-blind` 493 s /
+    // 1056 sealed, `-native-shadow-caller-seal` (the whole seal off) **591 s**
+    // / 675 sealed. Compiling 626 more methods moved the wall clock 0.5%. So
+    // making this arm precise is a correctness/coverage argument, not a
+    // performance one — the cost on call-dense code is the per-entry transfer
+    // machinery, not the population this seals. See
+    // `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
     if direct {
         cratonvm_jit::note_jit_native_shadow_cause("direct");
     } else if inherited {
