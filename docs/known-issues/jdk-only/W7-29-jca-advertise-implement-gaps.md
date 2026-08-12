@@ -151,6 +151,44 @@ writes `Value::Object(None)` into raw slot 0, and in real-JDK mode
 run to verify, and the fallback is now only reachable for X.509 in modes where
 the real SPI would not construct. Recorded, not attempted.
 
+### REQUIRED companion edit — one in-tree test asserts the defect
+
+`vm/src/vm/tests.rs`, `certificate_factory_p68` (around line 51053) is the only
+place in the tree that calls this native from Rust, and it calls it like this:
+
+```rust
+        let factory = call_native(
+            &shared, &mut thread, cf,
+            "getInstance",
+            "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
+            &[Value::Object(None)],          // <- a NULL type argument
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(factory, Value::Object(Some(_))));
+```
+
+It passes `null` and asserts a factory comes back — which is only possible
+because the registration ignored its argument entirely. **This test will fail
+against the change in this branch, and it should**: HotSpot answers
+`NullPointerException: null type name` for that exact call, measured. The test
+is not testing `getInstance`; it is a fixture for the `generateCertificate` /
+`X509Certificate` assertions below it, and the type argument was incidental.
+
+The fix is the same like-for-like substitution the
+`rabbitautoconfigurationtests` lane already made in
+`trust_manager_factory_default_returns_concrete_x509_impl` when
+`TrustManagerFactory.getInstance` started validating: pass a real, registered
+name. Replace `&[Value::Object(None)]` with a `"X.509"` string, exactly as the
+three in-tree *Java* callers do —
+`regression-suite/src/RJdkX509Intercept.java:74`,
+`vm/tests/resources/cratonvm/SslServerSocketEcho.java:162` and the
+`pemcertificates-clientauth` repro all ask for `"X.509"` and are unaffected by
+this change.
+
+That file is outside this lane's ownership, so the edit is **not** applied here.
+It is the one thing that must land with this commit.
+
 ## The five live residuals in files this lane does not own
 
 All five were re-verified against the running binary before being written down —
