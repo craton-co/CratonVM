@@ -3228,7 +3228,7 @@ fn lambda_proxy_captures_read_correctly() {
         .classes
         .lambda_proxies
         .write()
-        .insert(proxy_class_id, call_site);
+        .insert(proxy_class_id, std::sync::Arc::new(call_site));
 
     // Allocate a proxy object with 3 captured values
     let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 3);

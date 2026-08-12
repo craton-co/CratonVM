@@ -7370,7 +7370,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         };
         let mut proxies = self.shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
-            proxies.insert(proxy_class_id, call_site);
+            proxies.insert(proxy_class_id, Arc::new(call_site));
             proxy_class_id.as_u32()
         } else {
             0

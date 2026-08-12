@@ -1299,7 +1299,7 @@ fn bootstrap_lambda(
     let registered = {
         let mut proxies = shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
-            proxies.insert(proxy_class_id, call_site.clone());
+            proxies.insert(proxy_class_id, Arc::new(call_site.clone()));
             true
         } else {
             false

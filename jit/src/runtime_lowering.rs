@@ -102,7 +102,7 @@ pub(crate) fn patch_rel32_to_here(buf: &mut ExecutableBuffer, patch: usize) {
     if let Ok(displacement) = i32::try_from(displacement) {
         let _ = buf.try_patch_i32(patch, displacement);
     } else {
-        buf.mark_overflowed();
+        buf.mark_codegen_unencodable("rel32-displacement-out-of-range");
     }
 }
 

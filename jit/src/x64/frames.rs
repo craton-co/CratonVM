@@ -278,7 +278,8 @@ impl Compiler {
         // the displacement-free mod=00 form stays legal at disp == 0.
         debug_assert!(base_requires_sib(RSP));
         let Ok(d) = Disp::encode(disp as i64) else {
-            self.buf.mark_overflowed();
+            self.buf
+                .mark_codegen_unencodable("rsp-displacement-unencodable");
             return;
         };
         self.rex_w_r(reg);

@@ -2493,8 +2493,46 @@ pub(super) fn execute_invoke_kind(
 /// is a single descriptor token such as "I", "J", "Ljava/lang/Integer;", or
 /// "[Ljava/lang/String;".
 pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
+    let (params, ret) = split_method_descriptor_ref(descriptor);
+    (
+        params.into_iter().map(str::to_string).collect(),
+        ret.to_string(),
+    )
+}
+
+/// Borrowing twin of [`split_method_descriptor`]: the parameter tokens and the
+/// return token as slices of `descriptor`, so a caller that only reads them
+/// pays one `Vec` allocation instead of one `String` per parameter plus one for
+/// the return type.
+///
+/// Use this on any per-call path. The lambda dispatcher reached
+/// `split_method_descriptor` four to six times per lambda INVOCATION — twice in
+/// `try_lambda_dispatch` purely to read a return-type character, twice more in
+/// `coerce_lambda_args`, again in `checkcast_lambda_instantiated_args` — and
+/// `mi_malloc`/`mi_free`/`__memmove` were ~36% of a lambda-only `perf` profile
+/// before those sites moved here.
+/// The return-type token of a method descriptor, without parsing (or
+/// allocating for) the parameter list.
+///
+/// A descriptor has exactly one `')'`, so the return type is everything after
+/// it. Two of the lambda dispatcher's `split_method_descriptor` calls wanted
+/// only this and paid a full parameter walk plus a `Vec` for it on every lambda
+/// invocation. Returns `""` for a descriptor with no `')'` (malformed), which
+/// every consumer already treats as "not `V`, not a match".
+#[inline]
+pub fn descriptor_return_ref(descriptor: &str) -> &str {
+    match descriptor.as_bytes().iter().position(|&b| b == b')') {
+        Some(close) => &descriptor[close + 1..],
+        None => "",
+    }
+}
+
+pub fn split_method_descriptor_ref(descriptor: &str) -> (Vec<&str>, &str) {
     let bytes = descriptor.as_bytes();
-    let mut params: Vec<String> = Vec::new();
+    // Pre-size from the `(...)` span: one token is at least one byte, and no
+    // real descriptor holds more than a handful. Without this the per-call Vec
+    // reallocated through `RawVec::grow_one` on the lambda path.
+    let mut params: Vec<&str> = Vec::with_capacity(8);
     let mut i = 1; // skip '('
     while i < bytes.len() && bytes[i] != b')' {
         let start = i;
@@ -2516,14 +2554,13 @@ pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
                 i += 1; // single-char primitive
             }
         }
-        params.push(descriptor[start..i].to_string());
+        params.push(&descriptor[start..i]);
     }
     // Skip ')'
     if i < bytes.len() && bytes[i] == b')' {
         i += 1;
     }
-    let ret = descriptor[i..].to_string();
-    (params, ret)
+    (params, &descriptor[i..])
 }
 
 /// Non-allocating equivalent of `split_method_descriptor(d).0[n].as_bytes().first()`:
@@ -2669,6 +2706,11 @@ pub(super) fn coerce_arg(
     impl_tok: &str,
     v: Value,
 ) -> Result<Value, MethodCallFailed> {
+    // LOAD-BEARING BEYOND THIS FUNCTION: `coerce_lambda_args` skips its whole
+    // body — descriptor walks, pin pushes, the `checkcast` replay — for a
+    // non-capturing lambda whose three descriptors are identical, and that
+    // shortcut is only equivalent because equal tokens coerce to the identity
+    // HERE. If this arm ever has to do work, drop that fast path with it.
     if sam_tok == impl_tok {
         return Ok(v);
     }
