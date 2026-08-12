@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use zstd::zstd_safe::zstd_sys::ZSTD_EndDirective;
@@ -681,30 +681,259 @@ fn zstd_load_dict_object(_ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 // ===========================================================================
 //
 // All LZ4JNI methods are *static*, so args start at index 0 (no receiver). Each
-// (byte[] arr, ByteBuffer buf) pair is "heap array XOR direct buffer"; Kafka's
-// codec always takes the heap-array branch (arr non-null, buf null), which is
-// all we back here.
+// (byte[] arr, ByteBuffer buf) pair is "heap array XOR direct buffer" — lz4-java
+// takes the array branch when both sides `hasArray()` and the ByteBuffer branch
+// otherwise, and passes `null` for the half it is not using.
+//
+// This shim was originally written for Kafka's codec, which only ever takes the
+// heap-array branch, and read `args[0]`/`args[4]` unconditionally — so on the
+// ByteBuffer branch it read an EMPTY input and wrote its output NOWHERE. That is
+// not a crash but a wrong answer: `compress` of nothing returns 1, `decompress`
+// of nothing fails with "expected another byte, found none", and a decompress
+// that writes nothing leaves the destination zeroed, which surfaces one frame
+// later as netty's "stream corrupted: mismatching checksum". Netty's
+// `Lz4FrameDecoder` takes the ByteBuffer branch for every pooled or direct
+// `ByteBuf` — `CompressionUtil.safeNioBuffer` / `internalNioBuffer` — so it hit
+// all three shapes. Both halves are backed now; see `lz4_read` / `lz4_write`.
 
+/// One side of an lz4-java `(byte[] arr, ByteBuffer buf)` pair, resolved to
+/// something this shim can actually read and write.
+enum Lz4Side {
+    /// A `byte[]`, either passed directly or reached through a heap
+    /// `ByteBuffer`'s backing array. `base` is the index in that array that
+    /// the Java-side offset 0 refers to.
+    Array(ObjectRef, usize),
+    /// A direct `ByteBuffer`, as its native base address. On this VM that is an
+    /// arena handle rather than an OS pointer, which is why the transfer goes
+    /// through `copy_from_native_memory` / `copy_to_native_memory` — the same
+    /// bridge `Inflater`'s direct-buffer natives use — instead of a raw deref.
+    Direct(i64),
+}
+
+/// Resolve whichever half of the pair is non-null.
+///
+/// Returns `None` only when neither half is usable. Callers turn that into an
+/// error rather than an empty buffer: answering "0 bytes" for an unresolvable
+/// argument is precisely the silent-wrong-answer mode this replaced.
+fn lz4_side(
+    ctx: &dyn NativeContext,
+    arr: Option<ObjectRef>,
+    buf: Option<ObjectRef>,
+) -> Option<Lz4Side> {
+    if let Some(a) = arr {
+        return Some(Lz4Side::Array(a, 0));
+    }
+    let b = buf?;
+    // A direct buffer carries its base in `Buffer.address`. A slice/duplicate
+    // has already folded its own offset into that field, so the Java-side
+    // offset is added on top of it unmodified — which is exactly what
+    // lz4-java's C does with `GetDirectBufferAddress`.
+    match ctx.get_field_by_name(b, "address") {
+        Value::Long(v) if v != 0 => return Some(Lz4Side::Direct(v)),
+        Value::Int(v) if v != 0 => return Some(Lz4Side::Direct(v as i64)),
+        _ => {}
+    }
+    // A heap `ByteBuffer` reaches here only when lz4-java could not call
+    // `hasArray()` on it (a read-only view). `ByteBuffer.hb` is still the
+    // backing array and `Buffer.offset` its base index.
+    if let Value::Object(Some(hb)) = ctx.get_field_by_name(b, "hb") {
+        let base = match ctx.get_field_by_name(b, "offset") {
+            Value::Int(v) => v.max(0) as usize,
+            Value::Long(v) => v.max(0) as usize,
+            _ => 0,
+        };
+        return Some(Lz4Side::Array(hb, base));
+    }
+    None
+}
+
+/// Read `len` bytes starting at Java-side offset `off` from either half.
+fn lz4_read(
+    ctx: &mut dyn NativeContext,
+    arr: Option<ObjectRef>,
+    buf: Option<ObjectRef>,
+    off: usize,
+    len: usize,
+) -> Option<Vec<u8>> {
+    // Resolved into a local first: the reborrow `lz4_side` takes is shared, and
+    // the `Direct` arm below needs `ctx` mutably.
+    let side = lz4_side(&*ctx, arr, buf)?;
+    match side {
+        Lz4Side::Array(a, base) => Some(read_bytes(&*ctx, Some(a), base + off, len)),
+        Lz4Side::Direct(addr) => {
+            let mut out = vec![0u8; len];
+            if out.is_empty() {
+                return Some(out);
+            }
+            ctx.copy_from_native_memory(addr.wrapping_add(off as i64), &mut out)
+                .then_some(out)
+        }
+    }
+}
+
+/// Write `data` at Java-side offset `off` into either half.
+fn lz4_write(
+    ctx: &mut dyn NativeContext,
+    arr: Option<ObjectRef>,
+    buf: Option<ObjectRef>,
+    off: usize,
+    data: &[u8],
+) -> bool {
+    let side = lz4_side(&*ctx, arr, buf);
+    match side {
+        Some(Lz4Side::Array(a, base)) => {
+            ctx.write_byte_array_from(a, base + off, data);
+            true
+        }
+        Some(Lz4Side::Direct(addr)) => {
+            data.is_empty() || ctx.copy_to_native_memory(addr.wrapping_add(off as i64), data)
+        }
+        None => false,
+    }
+}
+
+fn lz4_bad_buffer(which: &str) -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: format!("lz4: {which} buffer is neither a byte[] nor a readable direct ByteBuffer"),
+    }
+    .into()
+}
+
+/// `LZ4_compressBound(int)`.
+///
+/// liblz4's macro exactly: `n + n/255 + 16`. It used to answer
+/// `lz4_flex::block::get_maximum_output_size`, which is `20 + n * 1.1` — a
+/// different, larger number (4525 vs 4128 for a 4 KiB block). Callers size a
+/// destination buffer from this and lz4-java exposes it as
+/// `LZ4Compressor.maxCompressedLength`, so the value is observable; the larger
+/// bound was safe but diverged from HotSpot for every caller that prints or
+/// asserts on it. The internal scratch buffer in `lz4_compress_into_dst` still
+/// uses lz4_flex's own (more conservative) bound, so nothing here depends on
+/// this number being the one lz4_flex wants.
 fn lz4_compress_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let n = arg_int(args, 0).max(0) as usize;
-    Ok(Some(Value::Int(
-        lz4_flex::block::get_maximum_output_size(n) as i32,
-    )))
+    let n = arg_int(args, 0).max(0) as i64;
+    Ok(Some(Value::Int((n + n / 255 + 16) as i32)))
+}
+
+/// Decode one LZ4 block, reporting BOTH how many input bytes were consumed and
+/// how many output bytes were produced.
+///
+/// `LZ4_decompress_fast` is not given the compressed length — it is told the
+/// *uncompressed* length, decodes until the output is full, and returns the
+/// number of source bytes it read. `lz4_flex` has no such entry point: its
+/// `decompress_into` wants the input to be exactly one block, so handing it the
+/// caller's whole source array (whose tail is unwritten zeroes) made it fail,
+/// and `LZ4_decompress_fast` answered -1 for every call.
+///
+/// The block format is small enough to walk directly, so this walks it: token,
+/// literal run, 16-bit little-endian match offset, match run, repeat, stopping
+/// the moment the output is full. Every length is bounds-checked against both
+/// buffers before use, so malformed input returns `None` rather than reading or
+/// writing out of range.
+fn lz4_block_decode(input: &[u8], output: &mut [u8]) -> Option<(usize, usize)> {
+    let mut ip = 0usize;
+    let mut op = 0usize;
+    loop {
+        // Input exhausted exactly at a sequence boundary is the clean end of a
+        // block. `LZ4_decompress_safe` is given the exact compressed length and
+        // an output bound that may be LARGER than the block produces, so this —
+        // not "output full" — is how that call normally terminates.
+        if ip == input.len() {
+            return Some((ip, op));
+        }
+        let token = *input.get(ip)?;
+        ip += 1;
+
+        let mut lit = (token >> 4) as usize;
+        if lit == 15 {
+            loop {
+                let b = *input.get(ip)?;
+                ip += 1;
+                lit += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        let lit_end = ip.checked_add(lit)?;
+        let op_end = op.checked_add(lit)?;
+        if lit_end > input.len() || op_end > output.len() {
+            return None;
+        }
+        output[op..op_end].copy_from_slice(&input[ip..lit_end]);
+        ip = lit_end;
+        op = op_end;
+        // A block's final sequence is literals only, so BOTH of these end it,
+        // and which one fires depends on the call:
+        //   * output full — `LZ4_decompress_fast`, whose caller knows the
+        //     uncompressed size but not where the block ends, so the input it
+        //     hands over runs on past the block;
+        //   * input exhausted — `LZ4_decompress_safe`, whose caller knows the
+        //     compressed size exactly but bounds the output generously.
+        if op == output.len() || ip == input.len() {
+            return Some((ip, op));
+        }
+
+        // Anything else at the end of the input is a partial match offset.
+        if ip + 2 > input.len() {
+            return None;
+        }
+        let offset = u16::from_le_bytes([input[ip], input[ip + 1]]) as usize;
+        ip += 2;
+        // Offset 0 is invalid, and an offset past what has been produced would
+        // copy from uninitialised output.
+        if offset == 0 || offset > op {
+            return None;
+        }
+
+        let mut mlen = (token & 0x0F) as usize;
+        if mlen == 15 {
+            loop {
+                let b = *input.get(ip)?;
+                ip += 1;
+                mlen += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        mlen += 4; // MINMATCH
+        if op.checked_add(mlen)? > output.len() {
+            return None;
+        }
+        // Byte-at-a-time on purpose: LZ4 matches may overlap their own output
+        // (offset < mlen is how runs are encoded), so this cannot be a
+        // `copy_within`.
+        let mut src = op - offset;
+        for _ in 0..mlen {
+            output[op] = output[src];
+            op += 1;
+            src += 1;
+        }
+        if op == output.len() {
+            return Some((ip, op));
+        }
+    }
 }
 
 /// Shared body for `LZ4_compress_limitedOutput` / `LZ4_compressHC`. lz4_flex
 /// emits the same raw LZ4 block regardless of "HC", so both route here; the
 /// HC level only affects ratio, not format/correctness.
+#[allow(clippy::too_many_arguments)]
 fn lz4_compress_into_dst(
     ctx: &mut dyn NativeContext,
     src_arr: Option<ObjectRef>,
+    src_buf: Option<ObjectRef>,
     src_off: usize,
     src_len: usize,
     dst_arr: Option<ObjectRef>,
+    dst_buf: Option<ObjectRef>,
     dst_off: usize,
     max_dst_len: usize,
 ) -> MethodCallResult {
-    let input = read_bytes(ctx, src_arr, src_off, src_len);
+    let Some(input) = lz4_read(ctx, src_arr, src_buf, src_off, src_len) else {
+        return Err(lz4_bad_buffer("compress source"));
+    };
     let mut tmp = vec![0u8; lz4_flex::block::get_maximum_output_size(input.len())];
     let clen = match lz4_flex::block::compress_into(&input, &mut tmp) {
         Ok(n) => n,
@@ -719,8 +948,8 @@ fn lz4_compress_into_dst(
     if clen > max_dst_len {
         return Ok(Some(Value::Int(0)));
     }
-    if let Some(d) = dst_arr {
-        ctx.write_byte_array_from(d, dst_off, &tmp[..clen]);
+    if !lz4_write(ctx, dst_arr, dst_buf, dst_off, &tmp[..clen]) {
+        return Err(lz4_bad_buffer("compress destination"));
     }
     Ok(Some(Value::Int(clen as i32)))
 }
@@ -730,9 +959,11 @@ fn lz4_compress_limited_output(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     lz4_compress_into_dst(
         ctx,
         arg_obj(args, 0),
+        arg_obj(args, 1),
         arg_int(args, 2).max(0) as usize,
         arg_int(args, 3).max(0) as usize,
         arg_obj(args, 4),
+        arg_obj(args, 5),
         arg_int(args, 6).max(0) as usize,
         arg_int(args, 7).max(0) as usize,
     )
@@ -743,9 +974,11 @@ fn lz4_compress_hc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     lz4_compress_into_dst(
         ctx,
         arg_obj(args, 0),
+        arg_obj(args, 1),
         arg_int(args, 2).max(0) as usize,
         arg_int(args, 3).max(0) as usize,
         arg_obj(args, 4),
+        arg_obj(args, 5),
         arg_int(args, 6).max(0) as usize,
         arg_int(args, 7).max(0) as usize,
     )
@@ -757,50 +990,66 @@ fn lz4_decompress_safe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let src_len = arg_int(args, 3).max(0) as usize;
     let dst_off = arg_int(args, 6).max(0) as usize;
     let max_dst_len = arg_int(args, 7).max(0) as usize;
-    let input = read_bytes(ctx, arg_obj(args, 0), src_off, src_len);
-
-    // `decompress` allocates to the actual size given a `min_uncompressed_size`
-    // upper bound (which `maxDstLen` is — Kafka sizes it to the block size).
-    let out = match lz4_flex::block::decompress(&input, max_dst_len) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(RuntimeError::IOException {
-                message: format!("lz4 decompress_safe: {e}"),
-            }
-            .into());
-        }
+    let Some(input) = lz4_read(ctx, arg_obj(args, 0), arg_obj(args, 1), src_off, src_len) else {
+        return Err(lz4_bad_buffer("decompress source"));
     };
-    if let Some(d) = arg_obj(args, 4) {
-        ctx.write_byte_array_from(d, dst_off, &out);
+
+    // liblz4's contract for a block it cannot decode is a NEGATIVE return, not
+    // an exception — lz4-java turns that into `LZ4Exception`, which is what
+    // callers catch (netty's `Lz4FrameDecoder` has an explicit
+    // `catch (LZ4Exception)` arm that converts it to `DecompressionException`).
+    // Throwing `IOException` from here bypassed that arm and surfaced as a raw
+    // `DecoderException` instead.
+    let mut out = vec![0u8; max_dst_len];
+    let Some((_consumed, produced)) = lz4_block_decode(&input, &mut out) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    if !lz4_write(ctx, arg_obj(args, 4), arg_obj(args, 5), dst_off, &out[..produced]) {
+        return Err(lz4_bad_buffer("decompress destination"));
     }
-    Ok(Some(Value::Int(out.len() as i32)))
+    Ok(Some(Value::Int(produced as i32)))
 }
 
 fn lz4_decompress_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (byte[] src, ByteBuffer, int srcOff, byte[] dst, ByteBuffer, int dstOff, int destLen)
-    // The "fast" decompressor knows the output size up front and returns the
-    // number of *source* bytes consumed. lz4_flex doesn't surface source-bytes
-    // read, so we decompress exactly `destLen` bytes from the source tail and
-    // report its length as consumed. Kafka's codec uses the *safe* path, so
-    // this branch is exercised only by direct LZ4FastDecompressor users.
+    // The "fast" decompressor is told the output size up front and returns the
+    // number of *source* bytes consumed, so the source length is unknown here
+    // by construction: everything from `srcOff` to the end of the source is
+    // offered and `lz4_block_decode` reports where the block actually ended.
     let src_off = arg_int(args, 2).max(0) as usize;
     let dst_off = arg_int(args, 5).max(0) as usize;
     let dest_len = arg_int(args, 6).max(0) as usize;
 
     let src_arr = arg_obj(args, 0);
-    let src_total = src_arr.map(|a| ctx.array_length(a)).unwrap_or(0);
-    let input = read_bytes(ctx, src_arr, src_off, src_total.saturating_sub(src_off));
+    let src_buf = arg_obj(args, 1);
+    let side = lz4_side(&*ctx, src_arr, src_buf);
+    let src_avail = match side {
+        Some(Lz4Side::Array(a, base)) => ctx.array_length(a).saturating_sub(base + src_off),
+        // A direct buffer has no reachable "rest of the array"; its capacity is
+        // the bound. `capacity` rather than `limit` because the caller's own
+        // limit may have been narrowed to the uncompressed view.
+        Some(Lz4Side::Direct(_)) => match ctx.get_field_by_name(src_buf.unwrap(), "capacity") {
+            Value::Int(v) => (v.max(0) as usize).saturating_sub(src_off),
+            Value::Long(v) => (v.max(0) as usize).saturating_sub(src_off),
+            _ => 0,
+        },
+        None => return Err(lz4_bad_buffer("decompress source")),
+    };
+    let Some(input) = lz4_read(ctx, src_arr, src_buf, src_off, src_avail) else {
+        return Err(lz4_bad_buffer("decompress source"));
+    };
 
     let mut out = vec![0u8; dest_len];
-    match lz4_flex::block::decompress_into(&input, &mut out) {
-        Ok(written) if written == dest_len => {
-            if let Some(d) = arg_obj(args, 3) {
-                ctx.write_byte_array_from(d, dst_off, &out);
-            }
-            Ok(Some(Value::Int(input.len() as i32)))
-        }
-        _ => Ok(Some(Value::Int(-1))),
+    let Some((consumed, produced)) = lz4_block_decode(&input, &mut out) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    if produced != dest_len {
+        return Ok(Some(Value::Int(-1)));
     }
+    if !lz4_write(ctx, arg_obj(args, 3), arg_obj(args, 4), dst_off, &out) {
+        return Err(lz4_bad_buffer("decompress destination"));
+    }
+    Ok(Some(Value::Int(consumed as i32)))
 }
 
 // ===========================================================================
@@ -1253,6 +1502,101 @@ mod tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+
+    /// Shapes chosen to reach every branch of the block grammar: an empty
+    /// block, one shorter than the 15-byte literal-length escape, one long
+    /// enough to force multi-byte literal *and* match lengths, a run that
+    /// encodes as an overlapping match (offset 1), and near-incompressible
+    /// data that is almost all literals.
+    fn lz4_decode_shapes() -> Vec<Vec<u8>> {
+        vec![
+            Vec::new(),
+            b"abc".to_vec(),
+            b"the quick brown fox jumps over the lazy dog".to_vec(),
+            vec![0x5Au8; 70_000],
+            (0..40_000u32).map(|i| (i / 3) as u8).collect(),
+            (0..30_000u32)
+                .map(|i| i.wrapping_mul(2654435761).to_le_bytes()[0])
+                .collect(),
+        ]
+    }
+
+    #[test]
+    fn lz4_block_decode_round_trips_and_reports_the_source_length() {
+        for original in lz4_decode_shapes() {
+            let mut comp = vec![0u8; lz4_flex::block::get_maximum_output_size(original.len()) + 16];
+            let clen = lz4_flex::block::compress_into(&original, &mut comp).expect("compress");
+
+            // The source is deliberately longer than the block — this is the
+            // `LZ4_decompress_fast` shape, where the caller cannot say where the
+            // block ends and the tail is whatever was already in the buffer.
+            for tail in [0u8, 0xFF] {
+                let mut src = comp[..clen].to_vec();
+                src.extend(std::iter::repeat_n(tail, 512));
+
+                let mut out = vec![0u8; original.len()];
+                let (consumed, produced) =
+                    lz4_block_decode(&src, &mut out).expect("decode a well-formed block");
+                assert_eq!(out, original, "round trip (tail {tail:#x})");
+                assert_eq!(produced, original.len());
+                assert_eq!(
+                    consumed, clen,
+                    "consumed must be the block length, not the buffer length (tail {tail:#x})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lz4_block_decode_refuses_malformed_input_instead_of_panicking() {
+        let original = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let mut comp = vec![0u8; lz4_flex::block::get_maximum_output_size(original.len()) + 16];
+        let clen = lz4_flex::block::compress_into(&original, &mut comp).expect("compress");
+
+        // Truncated: every prefix must refuse rather than index out of range.
+        // (A prefix can legitimately decode when the output happens to fill
+        // first, so this asserts termination and bounds, not failure.)
+        for cut in 0..clen {
+            let mut out = vec![0u8; original.len()];
+            let _ = lz4_block_decode(&comp[..cut], &mut out);
+        }
+
+        // An output buffer smaller than the block produces is a refusal, not a
+        // truncated write — `LZ4_decompress_safe` reports that as a negative.
+        let mut small = vec![0u8; original.len() - 1];
+        assert!(lz4_block_decode(&comp[..clen], &mut small).is_none());
+
+        // The other direction: an output bound LARGER than the block produces
+        // must succeed and report the real produced length, because that is how
+        // `LZ4_decompress_safe` is normally called.
+        let mut roomy = vec![0u8; original.len() + 4096];
+        let (consumed, produced) =
+            lz4_block_decode(&comp[..clen], &mut roomy).expect("oversized output is not an error");
+        assert_eq!(consumed, clen);
+        assert_eq!(produced, original.len());
+        assert_eq!(&roomy[..produced], &original[..]);
+
+        // A match offset of 0 is invalid, and one reaching before the start of
+        // the output would copy uninitialised bytes. Token 0x00 = no literals,
+        // then a zero offset.
+        let mut out = vec![0u8; 8];
+        assert!(lz4_block_decode(&[0x00, 0x00, 0x00], &mut out).is_none());
+        assert!(lz4_block_decode(&[0x00, 0x04, 0x00], &mut out).is_none());
+    }
+
+    #[test]
+    fn lz4_compress_bound_matches_liblz4() {
+        // liblz4's LZ4_COMPRESSBOUND(n) == n + n/255 + 16, which is what HotSpot
+        // answers through the real .so. The previous body used lz4_flex's own
+        // (larger) estimate and diverged for every input.
+        let mut ctx = crate::test_utils::mock_ctx();
+        for n in [0i64, 1, 255, 256, 4096, 65_536, 1_000_000] {
+            let got = lz4_compress_bound(&mut ctx, &[Value::Int(n as i32)])
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, Value::Int((n + n / 255 + 16) as i32), "bound for {n}");
+        }
+    }
 
     #[test]
     fn snappy_block_round_trip() {
