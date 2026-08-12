@@ -1130,9 +1130,12 @@ fn seed_direct_native_engine_services() {
     // are one set, walked in both directions.
     //
     // Four names came OUT of this list in the W7-15 lane, each measured against
-    // jdk-25.0.3.9-hotspot before removal:
+    // jdk-25.0.3.9-hotspot before removal — and all four went back IN on
+    // 2026-08-11 once they were implemented. Removing them was the correct
+    // answer to "advertised but not computable"; it was never the preferred
+    // one, and the preferred one is now available:
     //
-    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation is
+    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation was
     //     reachable from `Cipher` at all. Advertising them was not an
     //     aspiration, it was wrong crypto: the engine's mode-only dispatch
     //     turned both into AES-256-ECB, byte-identically to
@@ -1140,10 +1143,16 @@ fn seed_direct_native_engine_services() {
     //     producing no tag, so a tampered ciphertext decrypted without an
     //     authentication failure. An AEAD that cannot fail on a bad tag is
     //     worse than no AEAD, because callers build integrity guarantees on it.
-    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implements
+    //     **RFC 8439 is now implemented in `native-builtins/src/chacha20.rs`**,
+    //     pinned by the RFC's own vectors and a differential test against the
+    //     `chacha20poly1305` crate, and `regression-suite/src/RChaCha20Cipher.java`
+    //     matches HotSpot byte-for-byte in both modes.
+    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implemented
     //     either. KWP is RFC 5649, a different padded-wrap scheme with its own
     //     ICV and length prefix, not RFC 3394 with a padding bolted on;
-    //     `aes_key_wrap` computes RFC 3394 only.
+    //     `aes_key_wrap` computed RFC 3394 only. **Both are now implemented**
+    //     (`aes_key_wrap_with_padding` for RFC 5649, PKCS#5 at an eight-byte
+    //     block size for the other), against SunJCE's own wrap vectors.
     //
     // What went IN is the other direction of the same census — code that works
     // and was never advertised, which is the quieter half of the same defect:
@@ -1156,6 +1165,27 @@ fn seed_direct_native_engine_services() {
         "AES",
         "AES/GCM/NoPadding",
         "AES/KW/NoPadding",
+        "AES/KW/PKCS5Padding",
+        "AES/KWP/NoPadding",
+        // W7-39, 2026-08-12. Both were removed from this list on 2026-08-11
+        // while `Cipher.getInstance` served them as AES-128-ECB — the right
+        // move then, because a wrong cipher is worse than a missing one. They
+        // are back because they are now COMPUTED, by the real SunJCE
+        // `BlowfishCipher` / `ARCFOURCipher` SPI (`jca::cipher::
+        // drive_real_ecb_cipher`), byte-identically to HotSpot 25. `ARCFOUR` is
+        // the service and `RC4` its alias, which is HotSpot's own arrangement
+        // and the reason `Security.getAlgorithms("Cipher")` names only one.
+        //
+        // RC4 is broken cryptography and nothing here recommends it. It is
+        // advertised for the same reason DES is: a workload that asks for it on
+        // HotSpot gets bytes, and on this VM it got a hard failure. Refusing an
+        // algorithm the platform implements is a portability defect, not a
+        // security control — a caller who must not use RC4 is not stopped by
+        // this VM lacking it.
+        "ARCFOUR",
+        "Blowfish",
+        "ChaCha20",
+        "ChaCha20-Poly1305",
         // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
         // carries the mode set in a `SupportedModes` attribute. The divergence
         // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
@@ -1205,6 +1235,11 @@ fn seed_direct_native_engine_services() {
     put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
     put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
+    // `Alg.Alias.Cipher.RC4 = ARCFOUR` on SunJCE. Measured on HotSpot 25: both
+    // spellings resolve, both answer `getProvider()=SunJCE`, and both encrypt
+    // the same 16-byte plaintext to `27ca482b161e3ab93f812659b904df95` — while
+    // `Security.getAlgorithms("Cipher")` lists ARCFOUR alone.
+    put_alias(JCE, "Cipher", "RC4", "ARCFOUR");
 
     // Windows only — the provider itself is absent from the seed chain on
     // every other platform (see `provider_chain`), and seeding its services
@@ -1267,9 +1302,20 @@ fn seed_direct_native_engine_services() {
 ///     than a 13-name list.
 fn seed_retired_getalgorithms_literals() {
     const JCE: &str = "SunJCE";
+    // Every class name below is MEASURED — `getServices()` enumerated per
+    // provider on jdk-25.0.3.9-hotspot and printed as
+    // `type|algorithm|className`, not read off a javap of the provider's
+    // `<clinit>` and not recalled. `Mac.getInstance` is natively intercepted
+    // (`phases_late::ssl_security`), so for this type the class name is
+    // documentation rather than a load target; it is still worth being right,
+    // because the same row answers `Provider.Service.getClassName()`.
     for (algorithm, class_name) in [
         ("HmacMD5", "com.sun.crypto.provider.HmacMD5"),
         ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1"),
+        // W7-39: `HmacSHA224` is implemented by `ssl_security::mac_compute_hmac`
+        // as of 2026-08-12 and must be advertised in the same commit. The
+        // reverse drift — implemented but unadvertised — is the quiet half of
+        // this defect species, because nothing asks for a name nobody publishes.
         ("HmacSHA224", "com.sun.crypto.provider.HmacCore$HmacSHA224"),
         ("HmacSHA256", "com.sun.crypto.provider.HmacCore$HmacSHA256"),
         ("HmacSHA384", "com.sun.crypto.provider.HmacCore$HmacSHA384"),
@@ -1294,16 +1340,64 @@ fn seed_retired_getalgorithms_literals() {
     ] {
         put_service(JCE, "Mac", algorithm, class_name);
     }
+    // `KeyGenerator` is NOT natively intercepted in `--real-jdk` mode: the real
+    // `KeyGenerator.getInstance` reaches `sun.security.jca.GetInstance`, which
+    // this module answers from the registry below and then INSTANTIATES the
+    // named class. So every row here has to be a class the real image really
+    // ships with a public no-arg ctor — the SunJCE key generators all are,
+    // being reflectively constructed by the provider itself — and the bytes a
+    // caller gets are the JDK's own, not a reimplementation.
+    //
+    // The list was `[AES, DESede, HmacSHA256]` until 2026-08-12, which made
+    // `KeyGenerator.getInstance("Blowfish")` — and `DES`, `ChaCha20`, and every
+    // Hmac name but one — answer `NoSuchAlgorithmException: <name> KeyGenerator
+    // not available` (measured) where HotSpot hands back a key. That was the
+    // advertised-vs-implemented gap in its quiet direction twice over:
+    // `phases_early::keygen_default_bits` (the `--synthetic-jdk` path) already
+    // implemented all of these, and the real image implements all of them too;
+    // only the registry the two modes share disagreed.
     for (algorithm, class_name) in [
         ("AES", "com.sun.crypto.provider.AESKeyGenerator"),
+        ("ARCFOUR", "com.sun.crypto.provider.KeyGeneratorCore$ARCFOURKeyGenerator"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishKeyGenerator"),
+        ("ChaCha20", "com.sun.crypto.provider.KeyGeneratorCore$ChaCha20KeyGenerator"),
+        ("DES", "com.sun.crypto.provider.DESKeyGenerator"),
         ("DESede", "com.sun.crypto.provider.DESedeKeyGenerator"),
+        ("HmacMD5", "com.sun.crypto.provider.HmacMD5KeyGenerator"),
+        ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1KeyGenerator"),
+        (
+            "HmacSHA224",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA224",
+        ),
         (
             "HmacSHA256",
             "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
         ),
+        (
+            "HmacSHA384",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA384",
+        ),
+        (
+            "HmacSHA512",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512",
+        ),
+        ("RC2", "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator"),
     ] {
         put_service(JCE, "KeyGenerator", algorithm, class_name);
     }
+    // SunJCE's own `KeyGenerator` alias, and the reason `keygen_default_bits`
+    // spells both: `RC4` is not a service, it is
+    // `Alg.Alias.KeyGenerator.RC4 = ARCFOUR`. Aliases stay out of
+    // `Security.getAlgorithms` (their property key is `Alg.Alias.…`), which is
+    // why HotSpot's own list names ARCFOUR and not RC4.
+    put_alias(JCE, "KeyGenerator", "RC4", "ARCFOUR");
+    // Deliberately NOT seeded, and each for a checkable reason rather than an
+    // oversight: `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}`,
+    // because `keygen_default_bits` has no arm for them and the
+    // `--synthetic-jdk` path would refuse a name this list published; and the
+    // five `SunTls*` generators, which are TLS-internal KDFs driven by
+    // `sun.security.ssl` and take `TlsKeyMaterialParameterSpec`-family specs
+    // this engine's `init` surface does not carry.
     put_service(
         "SunRsaSign",
         "KeyPairGenerator",
@@ -4001,22 +4095,164 @@ mod tests {
                  advertising an algorithm the engine cannot compute is the defect W7-15 closed"
             );
         }
-        // And the reverse direction for the names that were the actual bug:
-        // refused now, so they must NOT be back in the advertised set.
-        for gone in [
+        // And the reverse direction for the names that were the actual bug.
+        // They were removed on 2026-08-11 while unimplemented and put back the
+        // same day once implemented, so what this asserts is the INVARIANT —
+        // advertised and computable are one set — rather than a fixed verdict
+        // about these four names. The loop above already proves each is
+        // serviceable; this proves the seed did not quietly drop them.
+        for implemented in [
             "ChaCha20",
             "ChaCha20-Poly1305",
             "AES/KW/PKCS5Padding",
             "AES/KWP/NoPadding",
+            // W7-39, 2026-08-12: same history, one wave later. Both were pulled
+            // from the seed on 08-11 while `getInstance` served them as
+            // AES-128-ECB, and both are back now that `jca::cipher::
+            // drive_real_ecb_cipher` computes them through the real SunJCE SPI.
+            "ARCFOUR",
+            "Blowfish",
         ] {
             assert!(
-                get_service_entry("SunJCE", "Cipher", gone).is_none(),
-                "{gone} is advertised again, but nothing computes it"
+                get_service_entry("SunJCE", "Cipher", implemented).is_some(),
+                "{implemented} is implemented but no longer advertised: the two lists have drifted, which is the defect this test exists for"
             );
             assert!(
-                !crate::jca::cipher::transformation_is_serviceable(gone),
-                "{gone} is serviceable again — if a real implementation landed, advertise it \
-                 here too and delete this arm"
+                crate::jca::cipher::transformation_is_serviceable(implemented),
+                "{implemented} is advertised but Cipher.getInstance refuses it"
+            );
+        }
+        // An ALIAS is resolvable without being advertised — that is the whole
+        // point of one — so `RC4` has to be checked through the alias map rather
+        // than through the advertised list, which is where the loop above would
+        // never have looked. Measured on HotSpot 25: `Cipher.getInstance("RC4")`
+        // resolves, answers `getProvider()=SunJCE`, and produces the same bytes
+        // as `ARCFOUR`, while `Security.getAlgorithms("Cipher")` names only
+        // ARCFOUR.
+        //
+        // `TripleDES` is deliberately NOT in this loop. It resolves through the
+        // alias map like the two below, but `Cipher.getInstance("TripleDES")` is
+        // still refused, because SunJCE maps it to the BARE `DESede` and a bare
+        // DESede defaults to ECB — a mode this engine does not route. That is a
+        // real divergence from HotSpot and it predates W7-39; asserting
+        // serviceability for it here would red the test for a gap this lane did
+        // not open and does not close.
+        for (alias, canonical) in [("RC4", "ARCFOUR"), ("AESWrap", "AES/KW/NoPadding")] {
+            assert!(
+                get_service_entry("SunJCE", "Cipher", alias).is_some(),
+                "{alias} must resolve through the alias map to {canonical}"
+            );
+            assert!(
+                !advertised.iter().any(|a| a.eq_ignore_ascii_case(alias)),
+                "{alias} is an ALIAS and must stay out of Security.getAlgorithms, \
+                 which is where HotSpot keeps it"
+            );
+            assert!(
+                crate::jca::cipher::transformation_is_serviceable(alias),
+                "{alias} resolves as a service but Cipher.getInstance refuses it"
+            );
+        }
+    }
+
+    /// The same ratchet for `Mac`, in the shape
+    /// `every_advertised_sunjce_cipher_is_serviceable` established — and for the
+    /// same reason: `Mac` is where the wrong-algorithm defect was WORST, because
+    /// a MAC that verifies is itself the security decision, and two peers
+    /// computing the same wrong MAC interoperate happily.
+    ///
+    /// This reads the advertised set out of the registry rather than restating
+    /// it, so the list cannot be updated on one side only. `HmacSHA224` was
+    /// added to both sides on 2026-08-12; a census written by hand would have
+    /// been the thing that went stale.
+    #[test]
+    fn every_advertised_sunjce_mac_is_computable() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        let advertised: Vec<String> = services()
+            .lock()
+            .get("SunJCE")
+            .expect("the SunJCE seed must have run")
+            .values()
+            .filter(|e| e.type_str == "Mac")
+            .map(|e| e.algorithm.clone())
+            .collect();
+        assert!(
+            advertised.len() >= 12,
+            "the SunJCE Mac seed looks empty: {advertised:?}"
+        );
+        for algorithm in &advertised {
+            let bytes = crate::phases_late::ssl_security::mac_compute_hmac(algorithm, b"k", b"d");
+            let len = crate::phases_late::ssl_security::mac_output_length(algorithm);
+            assert!(
+                bytes.is_some(),
+                "SunJCE advertises Mac.{algorithm}, but mac_compute_hmac produces nothing — \
+                 advertising a MAC the engine cannot compute is the W4-3 defect"
+            );
+            assert_eq!(
+                len,
+                bytes.as_ref().map(Vec::len),
+                "Mac.{algorithm}: getMacLength() and the bytes doFinal returns must agree — \
+                 the retired `_ => 32` arm made them agree with each other and with nothing else"
+            );
+        }
+        // The reverse direction, which is the one a census does not enumerate:
+        // implemented but unadvertised. Every name `mac_compute_hmac` answers
+        // must have a service row, or `Security.getAlgorithms("Mac")` under-
+        // reports what `Mac.getInstance` will actually serve.
+        for implemented in [
+            "HmacMD5",
+            "HmacSHA1",
+            "HmacSHA224",
+            "HmacSHA256",
+            "HmacSHA384",
+            "HmacSHA512",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "Mac", implemented).is_some(),
+                "{implemented} is computed by mac_compute_hmac but not advertised: the two \
+                 lists have drifted, which is the defect this test exists for"
+            );
+        }
+    }
+
+    /// And for `KeyGenerator`, which is where the drift was widest: the seed
+    /// carried three names while `phases_early::keygen_default_bits` implemented
+    /// fourteen, so `KeyGenerator.getInstance("Blowfish")` answered
+    /// `NoSuchAlgorithmException: Blowfish KeyGenerator not available` —
+    /// measured on this tree's own binary — for an algorithm BOTH modes could
+    /// serve.
+    ///
+    /// The check runs in the implemented→advertised direction only, on purpose.
+    /// The other direction is not this test's to make: in `--real-jdk` mode
+    /// `KeyGenerator.getInstance` resolves through this registry and then
+    /// INSTANTIATES the named class out of the real image, so an advertised row
+    /// is serviceable if and only if that class loads — which no unit test in
+    /// this crate can observe. `keygen_default_bits` is the `--synthetic-jdk`
+    /// half, and it is the half a Rust test can hold to account.
+    #[test]
+    fn every_keygenerator_the_engine_implements_is_advertised() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        for implemented in [
+            "AES", "ARCFOUR", "Blowfish", "ChaCha20", "DES", "DESede", "HmacMD5", "HmacSHA1",
+            "HmacSHA224", "HmacSHA256", "HmacSHA384", "HmacSHA512", "RC2",
+        ] {
+            assert!(
+                get_service_entry("SunJCE", "KeyGenerator", implemented).is_some(),
+                "phases_early::keygen_default_bits generates a {implemented} key, but SunJCE \
+                 does not advertise it — implemented-but-unadvertised is the quiet half of \
+                 this defect, because nothing asks for a name nobody publishes"
+            );
+        }
+        // `RC4` is the alias, `ARCFOUR` the service, exactly as on SunJCE.
+        assert!(get_service_entry("SunJCE", "KeyGenerator", "RC4").is_some());
+        // Deliberately absent, and asserted so that adding one without an arm in
+        // `keygen_default_bits` reds here rather than at a caller: the synthetic
+        // path would refuse a name this registry published.
+        for unimplemented in ["HmacSHA3-256", "HmacSHA512/256", "SunTlsPrf"] {
+            assert!(
+                get_service_entry("SunJCE", "KeyGenerator", unimplemented).is_none(),
+                "{unimplemented} has no keygen_default_bits arm and must not be advertised"
             );
         }
     }

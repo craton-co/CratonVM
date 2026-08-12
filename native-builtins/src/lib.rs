@@ -4174,6 +4174,11 @@ pub mod classfile_api;
 #[allow(dead_code)]
 pub mod classloader;
 pub mod classloader_real;
+// RFC 8439 ChaCha20 / Poly1305 / ChaCha20-Poly1305 AEAD. Separate from
+// `crypto_impl` because it is a self-contained primitive with the RFC's own
+// vectors beside it, and because `crypto_impl`'s ChaCha was a keystream-only
+// SecureRandom fallback that could not encrypt anything.
+pub mod chacha20;
 pub mod crypto_impl;
 pub mod jboss_module_xml;
 pub mod jboss_resource_loader;
@@ -30745,21 +30750,10 @@ pub(crate) fn build_synthetic_module_descriptor(
 //   - `ClassFileDumper.getInstance(String, String)` returning a disabled
 //     dumper object (so downstream `dumper.isEnabled()` returns false).
 
-/// Build a synthetic `java.util.HashSet` with the given elements.
-///
-/// S111r7: previously this allocated a 3-field HashSet (bucket array,
-/// size, capacity) which conflicts with the real-JDK HashSet field
-/// layout (single `map:Ljava/util/HashMap;` at offset 0). When real
-/// bytecode for `HashSet.iterator()` then ran `getfield map →
-/// invokevirtual HashMap.keySet()`, the receiver class came back as
-/// bare `java/lang/Object` (the bucket Object[]) and dispatch raised
-/// `NoSuchMethodError Object.keySet()`. The fix delegates to the
-/// native-collections helper that uses the correct 1-field-with-
-/// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
-/// behaviour and unblocking Spring `getConvertibleTypes()` paths.
-fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, args)?)
-}
+// `build_hashset_from_args` was removed with the ten `Set.of` intrinsics it
+// served (see the retirement note below). Its one remaining caller would have
+// been that block; `cratonvm_native_collections::make_hashset_with_elements`
+// is still the helper for anything that genuinely wants a mutable HashSet.
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     // census-tag: faithful Set.of fixed-arity factories — spec-exact immutable
@@ -30773,83 +30767,50 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
     // only covers the 0-arg and varargs forms; we fill in 2..=10 here
     // because `MethodHandles$Lookup.<clinit>` needs 2 (lookupClass,
     // allowedModes) and `ClassFileDumper.<clinit>` needs 8 (BAD_CHARS).
-    let s = "java/util/Set";
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| {
-            Ok(Some(Value::Object(Some(build_hashset_from_args(
-                ctx, args,
-            )?))))
-        },
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| {
-            Ok(Some(Value::Object(Some(build_hashset_from_args(
-                ctx, args,
-            )?))))
-        },
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| {
-            Ok(Some(Value::Object(Some(build_hashset_from_args(
-                ctx, args,
-            )?))))
-        },
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| {
-            Ok(Some(Value::Object(Some(build_hashset_from_args(
-                ctx, args,
-            )?))))
-        },
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
-    registry.register(
-        s,
-        "of",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
-    );
+    // RETIRED 2026-08-12 — the ten fixed-arity `java/util/Set.of` overloads
+    // that stood here, tagged `Intrinsic`.
+    //
+    // The census tag above them read "faithful Set.of fixed-arity factories —
+    // spec-exact immutable collections replicating real JDK bytecode →
+    // Intrinsic". Every body was
+    // `build_hashset_from_args` → `make_hashset_with_elements`, i.e. a plain
+    // MUTABLE `java.util.HashSet`. Not spec-exact, not immutable, and not what
+    // `Set.of` returns; a synthetic stub wearing the one tag strict mode is
+    // contractually required to keep (jdk-only-mode §1.4: concrete bytecode
+    // wins over any native "except for a reviewed `NativeKind::Intrinsic`").
+    //
+    // It never dispatched in Compatible mode. `register_factory_natives`
+    // (`native-collections`) registers the same ten triples later and
+    // `register()` is last-write-wins, so the census records these ten as
+    // `owns_slot: false, overwrote: intrinsic` — superseded, unreachable.
+    // Removing them is therefore byte-for-byte neutral there, which is what
+    // contract §5/§10 requires.
+    //
+    // Under `--jdk-only` they were live and wrong. The later stub is dropped at
+    // registration, so the slot fell back to THESE — the refusal laundered into
+    // a worse answer than the one it refused (the W7-20 shape, at the kind
+    // level). Measured on JDK 25.0.4/linux with
+    // `probes/ImmutableCollectionsDifferentialProbe`:
+    //
+    //                      HotSpot                          --jdk-only (before)
+    //   Set.of("x")        java.util.ImmutableCollections$Set12   java.util.HashSet
+    //   .add(...)          UnsupportedOperationException          NO THROW, size 2
+    //
+    // A `Set.of` result that accepts `add` is not a nearly-right immutable set,
+    // it is a mutable one. With nothing registered, real `java.util.Set.of`
+    // bytecode runs and answers exactly as HotSpot does.
+    //
+    // The comment that justified them said `MethodHandles$Lookup.<clinit>`
+    // needs the 2-arg form and `ClassFileDumper.<clinit>` the 8-arg one. That
+    // was a real boot dependency when it was written and is discharged by
+    // running the real bytecode: verified by booting `--jdk-only` and
+    // `--real-jdk` and by the regression corpus in both modes.
+    //
+    // Sibling population, same shape, NOT taken here because it is unmeasured:
+    // six `java/util/logging/Handler` triples where a `phases_early.rs`
+    // `Intrinsic` is superseded by a `reflect_annotations.rs` `SyntheticStub`.
+    // Those sixteen triples are the whole intrinsic-superseded-by-stub set in
+    // the schema-4 census.
 
     // --- Reflection.registerFieldsToFilter(Class, Set) ---
     //
@@ -36361,87 +36322,6 @@ pub(crate) fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// HMAC-MD5 (64-byte block size)
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
     hmac_generic(key, data, real_md5, 64)
-}
-
-// --- The MAC names `mac_algorithm_supported` used to refuse -----------------
-//
-// `phases_late::ssl_security` deliberately served only the five HMACs above and
-// refused every other name, because a MAC computed under the wrong algorithm is
-// worse than a missing one. The reason the refusal stopped there rather than
-// widening was stated in that module: "each needs its own HMAC block size … and
-// this lane could neither build nor run".
-//
-// Those block sizes are RFC 2104's rule applied to each hash's own internal
-// block size, and they are not guessable: SHA-224 is a SHA-256 variant so it
-// keeps 64, but the SHA-512 truncations keep SHA-512's 128, and the SHA-3
-// family's block size IS its sponge RATE — 144/136/104/72 for 224/256/384/512,
-// which SHRINKS as the digest grows. Every function below is checked against
-// HotSpot `Mac.getInstance(name)` output in `hmac_extended_matches_hotspot`.
-//
-// `compute_digest` already implements all seven digests, so these route through
-// it rather than adding a second implementation of any hash.
-
-fn digest_sha224(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA-224", data).unwrap_or_default()
-}
-
-fn digest_sha512_224(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA-512/224", data).unwrap_or_default()
-}
-
-fn digest_sha512_256(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA-512/256", data).unwrap_or_default()
-}
-
-fn digest_sha3_224(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA3-224", data).unwrap_or_default()
-}
-
-fn digest_sha3_256(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA3-256", data).unwrap_or_default()
-}
-
-fn digest_sha3_384(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA3-384", data).unwrap_or_default()
-}
-
-fn digest_sha3_512(data: &[u8]) -> Vec<u8> {
-    compute_digest("SHA3-512", data).unwrap_or_default()
-}
-
-/// HMAC-SHA-224 — SHA-224 is SHA-256's truncation and shares its 64-byte block.
-pub(crate) fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha224, 64)
-}
-
-/// HMAC-SHA-512/224 — a SHA-512 variant, so the block stays 128 (NOT 64).
-pub(crate) fn hmac_sha512_224(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha512_224, 128)
-}
-
-/// HMAC-SHA-512/256 — a SHA-512 variant, so the block stays 128 (NOT 64).
-pub(crate) fn hmac_sha512_256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha512_256, 128)
-}
-
-/// HMAC-SHA3-224 — SHA-3 block size is the sponge rate: 1600−2·224 bits = 144 B.
-pub(crate) fn hmac_sha3_224(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha3_224, 144)
-}
-
-/// HMAC-SHA3-256 — rate = 1600−2·256 bits = 136 bytes.
-pub(crate) fn hmac_sha3_256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha3_256, 136)
-}
-
-/// HMAC-SHA3-384 — rate = 1600−2·384 bits = 104 bytes.
-pub(crate) fn hmac_sha3_384(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha3_384, 104)
-}
-
-/// HMAC-SHA3-512 — rate = 1600−2·512 bits = 72 bytes.
-pub(crate) fn hmac_sha3_512(key: &[u8], data: &[u8]) -> Vec<u8> {
-    hmac_generic(key, data, digest_sha3_512, 72)
 }
 
 fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

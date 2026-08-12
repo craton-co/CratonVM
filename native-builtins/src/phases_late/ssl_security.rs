@@ -41,9 +41,9 @@ pub(crate) fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> M
 }
 
 // =============================================================================
-// javax.crypto.Mac — real HMAC over the five algorithms `mac_compute_hmac`
-// implements (HmacMD5 / HmacSHA1 / HmacSHA256 / HmacSHA384 / HmacSHA512),
-// and a NoSuchAlgorithmException for every other name. The header used to read
+// javax.crypto.Mac — real HMAC over the six algorithms `mac_compute_hmac`
+// implements (HmacMD5 / HmacSHA1 / HmacSHA224 / HmacSHA256 / HmacSHA384 /
+// HmacSHA512), and a NoSuchAlgorithmException for every other name. The header used to read
 // "Real HMAC support using SHA-256", which was accurate in a way nobody meant:
 // SHA-256 was the fallback for every algorithm the engine did not implement,
 // so a caller asking for HmacSHA3-256 got HMAC-SHA-256 bytes with no error.
@@ -766,27 +766,38 @@ fn mac_normalise(algo: &str) -> String {
 /// `SunJCE` `Mac` services — with the note that widening it "means implementing
 /// RFC 2104 over the digests `crate::compute_digest` already supplies … and
 /// each needs its own HMAC block size … and this lane could neither build nor
-/// run".
+/// run". `HmacSHA224` joined on 2026-08-12 (W7-39); the remaining six followed
+/// the same day, from the hibernate-reactive SCRAM investigation.
 ///
-/// This lane could. The seven added names below are implemented in
-/// `crate::hmac_sha224` and friends over `compute_digest`'s existing digests,
-/// each with its own block size, and each verified byte-for-byte against
-/// `Mac.getInstance(name)` on stock HotSpot 25 (`hmac_extended_matches_hotspot`
-/// pins the vectors). `mac_output_length` is widened in lockstep, so
-/// `getMacLength()` still cannot corroborate an answer `mac_compute_hmac`
-/// cannot produce.
+/// The block size was the stated obstacle, and `hmac::Hmac<D>` removes it: it
+/// reads the size from `D::BlockSize`, so none of 64 / 128 / 144 / 136 / 104 /
+/// 72 is written down here at all. See `hmac_via_crate`.
 ///
-/// `HmacSHA224` in particular is not academic: `com.ongres.scram` advertises
-/// `SCRAM-SHA-224` and `SCRAM-SHA3-512` from `ScramMechanism.supportedMechanisms()`
-/// by probing `Mac.getInstance`, so refusing them made CratonVM's advertised
-/// SCRAM mechanism list 8 entries where HotSpot's is 12 — a visible protocol-
-/// level divergence against any server that negotiates one of the four.
+/// The pairing with the advertised list is a RATCHET, not a restatement:
+/// `provider_chain::every_advertised_sunjce_mac_is_computable` derives the list
+/// from the registry, so adding a row on either side without the other reds a
+/// test. `mac_supported_set_matches_the_advertised_sunjce_services` restates it
+/// on this side, and earns its place by pinning the normalisation the
+/// registry-derived half cannot see: `mac_normalise` folds case and strips `-`
+/// but keeps `/`, which is what stops `HmacSHA512/224` being served for
+/// `HmacSHA512/256`.
 ///
-/// Still refused, deliberately: `Poly1305`, `AESCMAC`, `HmacPBESHA*` and the
-/// rest of HotSpot's 28. They are not HMAC-over-a-digest, so serving them would
-/// mean a second unverified construction — exactly the mistake the `_ =>
-/// hmac_sha256` fallback was removed for.
+/// `HmacSHA224` in particular is not academic: `com.ongres.scram` builds its
+/// advertised mechanism list by probing `Mac.getInstance`, so refusing
+/// `HmacSHA224` and `HmacSHA3-512` made CratonVM offer 8 SCRAM mechanisms where
+/// HotSpot offers 12 — a protocol-level divergence against any server that
+/// negotiates one of the four.
+///
+/// HotSpot 25 advertises 28 `Mac` names. Under-advertising 16 of them is
+/// truthful precisely because `getInstance` refuses all 16, and they are all
+/// deliberately still refused for one reason: `HmacPBESHA*` / `PBEWithHmac*`
+/// are PKCS#12 and PBMAC1 constructions, and `Poly1305` / `AESCMAC` /
+/// `SslMacSHA1` are not HMAC at all. Serving any of them would mean a second,
+/// unverified construction — the mistake the `_ => hmac_sha256` fallback was
+/// removed for.
 fn mac_algorithm_supported(algo: &str) -> bool {
+    // Derived from `mac_output_length` rather than restated, so the two cannot
+    // disagree about which names exist.
     mac_output_length(algo).is_some()
 }
 
@@ -827,19 +838,92 @@ pub(crate) fn mac_compute_hmac(algo: &str, key: &[u8], data: &[u8]) -> Option<Ve
         "HMACSHA512" => Some(hmac_sha512(key, data)),
         "HMACSHA1" => Some(hmac_sha1(key, data)),
         "HMACMD5" => Some(hmac_md5(key, data)),
+        "HMACSHA224" => Some(hmac_sha224(key, data)),
         "HMACSHA256" => Some(hmac_sha256(key, data)),
-        "HMACSHA224" => Some(crate::hmac_sha224(key, data)),
         // `/` survives `mac_normalise` on purpose: these two differ ONLY by the
-        // suffix and have distinct IVs, so collapsing them would serve one for
-        // the other.
-        "HMACSHA512/224" => Some(crate::hmac_sha512_224(key, data)),
-        "HMACSHA512/256" => Some(crate::hmac_sha512_256(key, data)),
-        "HMACSHA3224" => Some(crate::hmac_sha3_224(key, data)),
-        "HMACSHA3256" => Some(crate::hmac_sha3_256(key, data)),
-        "HMACSHA3384" => Some(crate::hmac_sha3_384(key, data)),
-        "HMACSHA3512" => Some(crate::hmac_sha3_512(key, data)),
+        // suffix and have distinct initial values, so collapsing them would
+        // serve one for the other.
+        "HMACSHA512/224" => Some(hmac_via_crate::<sha2::Sha512_224>(key, data)),
+        "HMACSHA512/256" => Some(hmac_via_crate::<sha2::Sha512_256>(key, data)),
+        "HMACSHA3224" => Some(hmac_via_crate::<sha3::Sha3_224>(key, data)),
+        "HMACSHA3256" => Some(hmac_via_crate::<sha3::Sha3_256>(key, data)),
+        "HMACSHA3384" => Some(hmac_via_crate::<sha3::Sha3_384>(key, data)),
+        "HMACSHA3512" => Some(hmac_via_crate::<sha3::Sha3_512>(key, data)),
         _ => None,
     }
+}
+
+/// HMAC-SHA-224 (RFC 2104 over FIPS 180-4 SHA-224).
+///
+/// The other five arms of `mac_compute_hmac` route to `crate::hmac_*`, which
+/// pass a hand-written `block_size` to `crate::hmac_generic`. This one does not,
+/// and the difference is the point: SHA-224's HMAC block is 64 bytes — its
+/// *input* block — not 28, its digest size, and not 128, which SHA-384/512 use.
+/// Every wrong answer there is plausible, and a wrong block size produces a MAC
+/// that is self-consistent and interoperates with nothing. `hmac::Hmac<D>` reads
+/// it from `D::BlockSize`, so the constant is never written down here at all —
+/// see [`hmac_via_crate`], which is this function generalised over the six other
+/// digests that needed the same treatment.
+///
+/// `crate::compute_digest` already reaches for `sha2::Sha224` for
+/// `MessageDigest.getInstance("SHA-224")` for the same reason its comment gives:
+/// the hand-rolled `crypto_impl` SHA-256 code does not cover the 224-bit
+/// variant. Using the same crate keeps `MessageDigest.SHA-224` and
+/// `Mac.HmacSHA224` on one implementation of one primitive.
+///
+/// Measured on jdk-25.0.3.9-hotspot, not recalled — see the vectors in
+/// `mac_kats_match_hotspot_25`, including a 200-byte key, which is the case that
+/// exercises the "key longer than the block gets hashed first" branch where a
+/// wrong block size first shows up.
+fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_via_crate::<sha2::Sha224>(key, data)
+}
+
+/// RFC 2104 HMAC over any `digest` hash, with the block size taken from the hash
+/// type rather than written down.
+///
+/// This is the generalisation of `hmac_sha224` above, and it exists because the
+/// same reasoning applies six more times. `Mac.getInstance` serves
+/// `HmacSHA512/224`, `HmacSHA512/256` and the four `HmacSHA3-*` through this,
+/// and each one has a block size that is neither its digest size nor a family
+/// default:
+///
+/// * the SHA-512 truncations keep SHA-512's 128-byte block, NOT the 64 their
+///   224/256-bit output would suggest;
+/// * SHA-3's block IS its sponge rate — 144/136/104/72 for 224/256/384/512 —
+///   which SHRINKS as the digest grows, the opposite of every other family here.
+///
+/// Every one of those is a number a person would plausibly get wrong, and a
+/// wrong HMAC block size yields a MAC that is perfectly self-consistent and
+/// interoperates with nothing. `hmac::Hmac<D>` reads it from `D::BlockSize`, so
+/// none of them is written down anywhere in this file. `hmac_extended_matches_hotspot`
+/// still pins all seven against measured HotSpot 25 output, including a
+/// 200-byte key — the case that exercises the "key longer than the block gets
+/// hashed first" branch, which is where a wrong block size first shows up.
+fn hmac_via_crate<D>(key: &[u8], data: &[u8]) -> Vec<u8>
+where
+    D: hmac::digest::CoreProxy,
+    D::Core: hmac::digest::HashMarker
+        + hmac::digest::core_api::UpdateCore
+        + hmac::digest::core_api::FixedOutputCore
+        + hmac::digest::core_api::BufferKindUser<BufferKind = hmac::digest::block_buffer::Eager>
+        + Default
+        + Clone,
+    <D::Core as hmac::digest::crypto_common::BlockSizeUser>::BlockSize:
+        hmac::digest::typenum::IsLess<hmac::digest::consts::U256>,
+    hmac::digest::typenum::Le<
+        <D::Core as hmac::digest::crypto_common::BlockSizeUser>::BlockSize,
+        hmac::digest::consts::U256,
+    >: hmac::digest::typenum::NonZero,
+{
+    use hmac::Mac as _;
+    // `new_from_slice` is infallible for HMAC (any key length is legal — RFC
+    // 2104 hashes an over-long key and zero-pads a short one), so the error type
+    // is uninhabited in practice; SunJCE's `HmacCore` accepts any length too.
+    let mut mac =
+        hmac::Hmac::<D>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// Return the output length in bytes for the given HMAC algorithm, or `None`
@@ -856,8 +940,12 @@ pub(crate) fn mac_output_length(algo: &str) -> Option<usize> {
         "HMACSHA512" => Some(64),
         "HMACSHA1" => Some(20),
         "HMACMD5" => Some(16),
-        "HMACSHA256" => Some(32),
+        // 28, not 32. The retired `_ => 32` arm answered 32 here while
+        // `mac_compute_hmac` returned 32 SHA-256 bytes, so the two agreed with
+        // each other and with nothing else — measured on HotSpot,
+        // `Mac.getInstance("HmacSHA224").getMacLength()` is 28.
         "HMACSHA224" => Some(28),
+        "HMACSHA256" => Some(32),
         "HMACSHA512/224" => Some(28),
         "HMACSHA512/256" => Some(32),
         "HMACSHA3224" => Some(28),
@@ -6675,6 +6763,14 @@ pub(crate) mod new13_tests {
     /// services `jca::provider_chain` seeds. If someone adds a service row
     /// without an implementation arm — the W4-3 defect species — this is the
     /// test that says so.
+    ///
+    /// This half restates the list; the other half,
+    /// `provider_chain::every_advertised_sunjce_mac_is_computable`, DERIVES it
+    /// from the registry, so the pair is a ratchet rather than two censuses. The
+    /// restated copy earns its place by pinning the normalisation, which the
+    /// registry-derived side cannot see: `mac_normalise` folds case and strips
+    /// `-` but keeps `/`, which is what stops `HmacSHA512/224` being served for
+    /// `HmacSHA512/256`.
     #[test]
     fn mac_supported_set_matches_the_advertised_sunjce_services() {
         let advertised = [
@@ -6711,6 +6807,11 @@ pub(crate) mod new13_tests {
             "HMACMD5",
             "hmacsha256",
             "Hmac-SHA512",
+            // `HMAC-SHA224` folds onto `HMACSHA224`; `HmacSHA3-224` must NOT,
+            // which `mac_normalise_keeps_the_sha512_truncations_distinct`
+            // covers from the other side.
+            "HMAC-SHA224",
+            "hmacsha224",
         ] {
             assert!(
                 advertised_upper.contains(&mac_normalise(algo)),
@@ -6721,12 +6822,15 @@ pub(crate) mod new13_tests {
     }
 
     /// The defect this lane closed: every unimplemented name used to be served
-    /// as HMAC-SHA-256, with `getMacLength()` corroborating it. The seven names
-    /// that used to head this list (`HmacSHA224`, the two SHA-512 truncations
-    /// and the four SHA-3s) are now genuinely implemented and pinned to
-    /// HotSpot's bytes by `hmac_extended_matches_hotspot`; what remains here is
-    /// everything that is NOT HMAC-over-a-digest, where serving a value would
-    /// mean a second unverified construction.
+    /// as HMAC-SHA-256, with `getMacLength()` corroborating it. `HmacSHA224`
+    /// left this list on 2026-08-12 (W7-39) and the SHA-512 truncations and the
+    /// four SHA-3s followed the same day — all seven are computed now and pinned
+    /// to HotSpot's bytes by `hmac_extended_matches_hotspot`.
+    ///
+    /// What remains is everything that is NOT HMAC-over-a-digest: `HmacPBE*` and
+    /// `PBEWithHmac*` are PKCS#12 / PBMAC1 constructions, and `Poly1305`,
+    /// `AESCMAC` and `SslMacSHA1` are different primitives entirely. Serving any
+    /// of them would mean a second unverified construction.
     #[test]
     fn mac_refuses_every_algorithm_it_cannot_compute() {
         for algo in [
@@ -6900,14 +7004,14 @@ pub(crate) mod new13_tests {
         }
     }
 
-    /// Known-answer vectors for all five implemented MACs, measured on
+    /// Known-answer vectors for every implemented MAC, measured on
     /// jdk-25.0.3.9-hotspot (`java.version=25.0.3`) with key `"key"` over
     /// `"The quick brown fox jumps over the lazy dog"` — the standard HMAC
     /// demonstration vector, and independently checkable against RFC 2104
     /// implementations elsewhere.
     ///
     /// Their real job is to catch a future widening that gets a block size
-    /// wrong: the five below must keep these exact bytes.
+    /// wrong: each must keep these exact bytes.
     #[test]
     fn mac_kats_match_hotspot_25() {
         let key = b"key";
@@ -6915,6 +7019,10 @@ pub(crate) mod new13_tests {
         for (algo, expected) in [
             ("HmacMD5", "80070713463e7749b90c2dc24911e275"),
             ("HmacSHA1", "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9"),
+            (
+                "HmacSHA224",
+                "88ff8b54675d39b8f72322e65ff945c52d96379988ada25639747e69",
+            ),
             (
                 "HmacSHA256",
                 "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
@@ -6940,6 +7048,52 @@ pub(crate) mod new13_tests {
                 "{algo}: getMacLength() must agree with the bytes doFinal returns"
             );
         }
+    }
+
+    /// HMAC-SHA-224 specifically, against the two inputs that would catch a
+    /// wrong block size — which is the one thing about this algorithm that
+    /// cannot be defaulted, and the reason the retired note gave for not
+    /// widening the set.
+    ///
+    /// Both vectors measured on jdk-25.0.3.9-hotspot, and the first is the one
+    /// `probes/CryptoTrioProbe.java` prints, so a CratonVM run of the probe can
+    /// be diffed against this file without a second measurement:
+    ///
+    /// ```text
+    /// key = 32 x 0x0b, data = "hi"      -> 86d73d8ce8749e5b49d61d6211e3a5493d4623984d9ca51aac19cc51
+    /// key = 200 x 0x00, data = "hi"     -> 7d3925babc9604281f17372a195e0f0351157cc3aa17f032cbfc38de
+    /// ```
+    ///
+    /// The 200-byte key is the load-bearing one: RFC 2104 hashes a key LONGER
+    /// than the block before padding it, so this vector is wrong for any block
+    /// size other than 64 — including 28 (the digest size) and 128 (SHA-384/512's
+    /// block, the neighbouring arms in `mac_compute_hmac`). A 32-byte key
+    /// exercises neither branch and would pass with all three.
+    #[test]
+    fn hmac_sha224_block_size_is_64_not_28_and_not_128() {
+        let short_key = [0x0bu8; 32];
+        assert_eq!(
+            hex(&mac_compute_hmac("HmacSHA224", &short_key, b"hi").expect("implemented")),
+            "86d73d8ce8749e5b49d61d6211e3a5493d4623984d9ca51aac19cc51"
+        );
+        let long_key = [0x00u8; 200];
+        assert_eq!(
+            hex(&mac_compute_hmac("HmacSHA224", &long_key, b"hi").expect("implemented")),
+            "7d3925babc9604281f17372a195e0f0351157cc3aa17f032cbfc38de"
+        );
+        // 28 bytes out, and `getMacLength()` says so. The retired `_ => 32` arm
+        // answered 32 here while serving 32 SHA-256 bytes, so the engine agreed
+        // with itself all the way down.
+        assert_eq!(mac_output_length("HmacSHA224"), Some(28));
+        assert_eq!(
+            mac_compute_hmac("HmacSHA224", &short_key, b"hi").map(|v| v.len()),
+            Some(28)
+        );
+        // …and it is NOT HMAC-SHA-256 truncated to 28, which is the substitution
+        // a `_ =>` arm would produce and which no length check would catch.
+        let sha256 = mac_compute_hmac("HmacSHA256", &short_key, b"hi").expect("implemented");
+        let sha224 = mac_compute_hmac("HmacSHA224", &short_key, b"hi").expect("implemented");
+        assert_ne!(&sha256[..28], &sha224[..]);
     }
 
     // -----------------------------------------------------------------------

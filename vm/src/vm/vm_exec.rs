@@ -5002,14 +5002,21 @@ fn run_thread_exit_shared(shared: &SharedVm, thread: &mut JvmThread, thread_obj:
     // `java/lang/Thread` is a stub without it (a `--synthetic-jdk` build; every
     // mode this binary ships supports has the real one) is a silent no-op
     // rather than a `NoSuchMethodError` warning on every single thread death.
+    //
+    // Routed through `MemberResolver` rather than a bare `find_method_recursive`
+    // -- same idiom as `native_override.rs`'s `native_override_target_has_bytecode`.
+    // Also populates the per-VM `LinkResolver` with the resolution
+    // `invoke_special_shared_on_class` below will ask for anyway.
     let (thread_cid, has_exit) = {
         let cm = shared.classes.class_manager.read();
         match cm.get_loaded_class_id("java/lang/Thread") {
-            Some(cid) => (
-                Some(cid),
-                crate::classloading::find_method_recursive(cid, "exit", "()V", &cm.class_store)
-                    .is_some(),
-            ),
+            Some(cid) => {
+                let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+                let has_exit = resolver
+                    .declared_method(&cm, resolver.scope(cid), "exit", "()V")
+                    .is_ok();
+                (Some(cid), has_exit)
+            }
             None => (None, false),
         }
     };
