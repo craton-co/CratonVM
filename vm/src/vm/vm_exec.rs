@@ -19792,30 +19792,28 @@ pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) ->
     let desc = annotation_proxy_type_descriptor(shared, proxy);
     let class_name = descriptor_to_class_name(&desc);
     let dotted = annotation_type_canonical_name(shared, proxy, &class_name);
+    // NOT sorted: class-file `element_value_pairs` order is what HotSpot prints.
     let elems = annotation_proxy_elements(shared, proxy);
-    let mut s = String::with_capacity(64);
-    s.push('@');
-    s.push_str(&dotted);
-    s.push('(');
-    let omit_single_value_name = elems.len() == 1 && elems[0].0 == "value";
-    let mut first = true;
-    for (name, val) in &elems {
-        if !first {
-            s.push_str(", ");
-        }
-        first = false;
-        // The JDK's AnnotationInvocationHandler elides `value=` for a
-        // single-member annotation whose sole element is conventionally named
-        // `value`, e.g. `@Qualifier("alpha")`, while retaining names for every
-        // multi-member annotation.
-        if !omit_single_value_name {
-            s.push_str(name);
-            s.push('=');
-        }
-        s.push_str(&format_annotation_value(shared, *val));
-    }
-    s.push(')');
-    s
+    let members: Vec<(String, String)> = elems
+        .into_iter()
+        .map(|(name, val)| (name, format_annotation_value(shared, val)))
+        .collect();
+    // Assembly — separators plus the JDK's `value=` elision for a sole `value`
+    // member — is SHARED with this function's twin,
+    // `ctx_annotation_proxy_to_string` in `native-builtins/src/lang_class.rs`,
+    // which serves the SAME method on the SAME objects through
+    // `native_proxy_dispatch_invoke`. The two had drifted three ways at once
+    // (2026-08-12) and one process printed two different strings for one
+    // annotation object on consecutive calls. Which copy answers a given call
+    // is not under the caller's control and is NOT a tier question — measured
+    // with `-Xint`, the split persists; it varies by call shape.
+    //
+    // `vm` depends on `native-builtins`, never the reverse, so the half that
+    // needs no VM handle lives there. Do not re-inline it. The three
+    // VM-touching steps (member extraction, type-name canonicalisation, value
+    // rendering) stay twinned because the two callers hold different handles
+    // (`&SharedVm` vs `&mut dyn NativeContext`) in different crates.
+    cratonvm_native_builtins::lang_class::render_annotation_to_string(&dotted, &members)
 }
 
 /// Java-string-literal escape: backslash, quotes, and control chars.
