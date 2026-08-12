@@ -225,6 +225,15 @@ the probe dies before it reaches the interesting line. Out of this lane; not
 filed here beyond this paragraph, and it is the reason the first version of
 this probe reported "loader2 CANNOT DEFINE".
 
+**Picked up and FIXED 2026-08-12** — see W7-82-forname-duplicate-define.md.
+The observation above is exactly right, and the cause turned out to be one rung
+earlier than a redefinition: `java/net/URLClassLoader` is on
+`is_builtin_loader_class`'s list, so a **bare** instance (a subclass is fine)
+was classified as a built-in LOADER and could not see the class it had itself
+defined. The lookup then re-drove the define, which the duplicate rule
+correctly refused. Note for anyone re-running this record's cross-loader table:
+the caching workaround above is no longer required.
+
 ## Named residual, newly measured: `System.load`/`Runtime.load` message SHAPE
 
 Independent of the argument index, and it is a **both-modes, mode-independent**
