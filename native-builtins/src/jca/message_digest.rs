@@ -555,6 +555,15 @@ pub(crate) fn algorithm_supported_public(algo: &str) -> bool {
     algorithm_supported(algo)
 }
 
+/// The synthetic-mode `crate::native_md_get_digest_length` needs this same
+/// table. It used to carry a THIRD hand-maintained copy, drifted furthest of
+/// the three — no MD2, no SHA-224, no truncated SHA-512s, no SHA3-224, and a
+/// `-`-only normalisation that let `SHA-512/256` fall through to the default
+/// and report 32 by accident rather than by arm. One table, every door.
+pub(crate) fn digest_length_bytes_public(algo: &str) -> Option<usize> {
+    digest_length_bytes(algo)
+}
+
 /// `None` for an algorithm this VM does not implement.
 ///
 /// This used to end `_ => 32`, so `getDigestLength()` corroborated the

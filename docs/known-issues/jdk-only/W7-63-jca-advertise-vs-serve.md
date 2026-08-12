@@ -224,6 +224,25 @@ check it was not performing would have been wrong in the other direction as
 well. It now calls `message_digest::algorithm_supported_public`, the same
 predicate the real-JDK path uses. One predicate, two doors.
 
+**There was a THIRD digest-length table, and adding MD2 and SHAKE would have
+made it worse rather than better.** `native_md_get_digest_length` in
+`lib.rs` — the synthetic-mode `getDigestLength()` — carried its own `match`
+ending `_ => 32`, with no arms for MD2, SHA-224, SHA-512/224, SHA-512/256 or
+SHA3-224, and a `-`-only normalisation that let `SHA-512/256` reach the default
+and report 32 **by accident rather than by arm**. Since `getInstance` now
+*admits* MD2 and the SHAKEs, that table would have reported 16-byte MD2 as 32
+and 64-byte SHAKE256-512 as 32 — a newly implemented digest contradicting its
+own length, which is precisely the defect being closed. It now calls
+`digest_length_bytes_public`. One table, every door, and
+`every_supported_algorithm_computes_and_has_a_length` now covers this surface
+transitively because there is nothing else left for it to disagree with.
+
+Same reasoning applied to §3 #3's surface: the `--synthetic-jdk`
+`Security.getAlgorithms` override in `phases_early` deliberately shadows the
+registry-backed registration in that mode, so it now wraps through
+`wrap_unmodifiable_public` too. Applying the wrapper only to the shadowed twin
+would have been a fix invisible in the one mode that code path serves.
+
 ### #7 `ML-KEM` `KeyFactory` — DE-ADVERTISED
 
 Same disposition and same reasoning as #4. `SunJCE` no longer lists `ML-KEM`;

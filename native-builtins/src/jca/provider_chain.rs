@@ -2923,6 +2923,17 @@ fn wrap_unmodifiable(ctx: &mut dyn NativeContext, set: ObjectRef) -> ObjectRef {
     }
 }
 
+/// `wrap_unmodifiable` for the `--synthetic-jdk` `Security.getAlgorithms`
+/// override in `phases_early`, which deliberately shadows the registry-backed
+/// registration in that mode and therefore has to make the same answer in the
+/// same shape.
+pub(crate) fn wrap_unmodifiable_public(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> ObjectRef {
+    wrap_unmodifiable(ctx, set)
+}
+
 fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `Security.getAlgorithms(null)` returns the EMPTY set on HotSpot (the
     // real body's first branch), it does not NPE — measured.

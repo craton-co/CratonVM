@@ -36695,15 +36695,26 @@ fn native_md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let len = match algo.to_uppercase().replace('-', "").as_str() {
-        "MD5" => 16,
-        "SHA1" | "SHA" => 20,
-        "SHA256" | "SHA3256" => 32,
-        "SHA384" | "SHA3384" => 48,
-        "SHA512" | "SHA3512" => 64,
-        _ => 32,
-    };
-    Ok(Some(Value::Int(len)))
+    // A THIRD hand-maintained digest-length table stood here, and it had
+    // drifted furthest of the three: no MD2, no SHA-224, no SHA-512/224, no
+    // SHA-512/256, no SHA3-224, and — because it only stripped `-` and not `/`
+    // — `SHA-512/256` fell through the `_ => 32` default and reported 32 by
+    // accident rather than by arm. Every one of those `compute_digest`
+    // implements, so `getDigestLength()` was contradicting `digest()` on five
+    // algorithms in synthetic mode.
+    //
+    // Adding MD2 and the SHAKE digests would have made that worse rather than
+    // better: `getInstance` now admits them, so MD2 would have reported 32
+    // where the digest is 16 and SHAKE256-512 would have reported 32 where the
+    // digest is 64. One predicate, one length table, every door —
+    // W7-63-jca-advertise-vs-serve.md.
+    //
+    // `None` is unreachable through either `getInstance` (both gate on
+    // `algorithm_supported` first) and reports 0 rather than a plausible 32,
+    // because a corroborating-but-wrong length is what made the SHA-256
+    // fallback invisible in the first place.
+    let len = crate::jca::message_digest::digest_length_bytes_public(&algo).unwrap_or(0);
+    Ok(Some(Value::Int(len as i32)))
 }
 
 // SecureRandom — uses OS cryptographic entropy (BCryptGenRandom / /dev/urandom)
