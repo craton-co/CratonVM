@@ -340,7 +340,61 @@ public class RJdkStrict {
         check(StackWalker.getInstance(java.util.Set.of(
                 StackWalker.Option.RETAIN_CLASS_REFERENCE)) != null,
                 "StackWalker.getInstance(Set) must return a walker");
+
+        // A SECOND, different producer of the same defect: Thread$State's
+        // values()/valueOf() are shadowed by natives that ran on the real-JDK
+        // boot path (unlike Option, whose <clinit> is the shadowed method), so
+        // the class's own constants were correct while values() handed back a
+        // fresh instance per call. The loop above catches that, but only these
+        // three shapes say WHY it matters, and each is independently green on
+        // HotSpot.
+        //
+        // 1. values() is a defensive copy of $VALUES: a FRESH array whose
+        //    ELEMENTS are stable. Minting fails the second half only.
+        Thread.State[] v1 = Thread.State.values();
+        Thread.State[] v2 = Thread.State.values();
+        check(v1 != v2, "Thread.State.values() must return a fresh array per call");
+        for (int i = 0; i < v1.length; i++) {
+            check(v1[i] == v2[i],
+                    "Thread.State.values()[" + i + "] must be the same object across calls");
+        }
+        // 2. The live producer: a native computes the current thread's state
+        //    from the VM thread registry. It must return the class's own
+        //    constant, because `getState() == State.RUNNABLE` is what every
+        //    caller writes.
+        Thread.State self = Thread.currentThread().getState();
+        check(self == Thread.State.RUNNABLE,
+                "Thread.currentThread().getState() must be == Thread.State.RUNNABLE, got " + self);
+        check(Arrays.asList(Thread.State.values()).contains(self),
+                "getState() must return one of Thread.State.values()");
+        check(Thread.State.valueOf(self.name()) == self,
+                "Thread.State.valueOf(getState().name()) must be == getState()");
+        // 3. The ordinal half, kept honest about what it can see: MEASURED, an
+        //    enum switch still selects the right arm for a MINTED constant,
+        //    because javac's $SwitchMap is indexed by ordinal(), not identity.
+        //    So this is a guard on ordinal/declaration agreement, NOT a second
+        //    detector for the identity defect — checks 1 and 2 are the ones
+        //    that fail when values() mints.
+        check("NEW".equals(stateName(Thread.State.values()[0])),
+                "switch over Thread.State.values()[0] must select NEW, got "
+                        + stateName(Thread.State.values()[0]));
+        check("TERMINATED".equals(stateName(Thread.State.valueOf("TERMINATED"))),
+                "switch over Thread.State.valueOf(\"TERMINATED\") must select TERMINATED, got "
+                        + stateName(Thread.State.valueOf("TERMINATED")));
         System.out.println("CK RJdkStrict enumSelfConsistent=6");
+    }
+
+    /** Forces the compiler to emit an enum switch (a $SwitchMap + tableswitch). */
+    static String stateName(Thread.State s) {
+        switch (s) {
+            case NEW: return "NEW";
+            case RUNNABLE: return "RUNNABLE";
+            case BLOCKED: return "BLOCKED";
+            case WAITING: return "WAITING";
+            case TIMED_WAITING: return "TIMED_WAITING";
+            case TERMINATED: return "TERMINATED";
+            default: return "?";
+        }
     }
 
     public static void main(String[] args) throws Throwable {

@@ -8,6 +8,15 @@ repaired native produces the numbers §6 asserts has been observed. The fixture
 half **is** verified in both directions — it passes on HotSpot and fails on the
 control at the intended assertion (§6).
 
+**This file is the enum-identity record, and it now holds TWO causes.** §1–§7 are
+`StackWalker$Option`: a native `<clinit>` fabricated the constants themselves.
+**§8 is a second, different defect on a different class** — `Thread$State`'s
+constants are correct, but natives on its `values()`/`valueOf()` mint a fresh
+instance per call, so `values()[0] != Thread.State.NEW`. §8 was measured on the
+binary that already carries §5's fix, so the two are independent; §1's
+"`Thread$State` ok" was a non-null check, not an identity check, and §8.1 says
+so.
+
 ---
 
 ## 1. Answer first: this is StackWalker-only, not a real-JDK-enum problem
@@ -33,6 +42,16 @@ sound in this VM. Nothing about enums is broken.
 
 `StackWalker$Option` is broken because it is the one enum whose `<clinit>` a
 CratonVM native replaces.
+
+> **§1's scope claim was measured with a probe too shallow to see the second
+> cause, and is now known to be wrong for `Thread$State`.** The probe above
+> asked only whether each constant was non-null and correctly named — which
+> `Thread$State`'s constants are. It never asked whether `values()` returns
+> *those* objects. It does not: a different native, on a different method,
+> mints a fresh instance per call. See §8. The narrower claim §1 was really
+> testing does survive: no enum's own `<clinit>` is broken, and the general
+> machinery is sound. What §1 could not see is that publishing the constants
+> correctly is not sufficient when a native also owns the *accessors*.
 
 ## 2. What actually reads back — the reporting premise is half right
 
@@ -269,3 +288,182 @@ defect no longer does.
 5. The ES record in §3.2 still states `values()` length 3 as verified-good. It is
    an internal fixed-bug doc and out of this lane's files; its Verification
    section needs the correction.
+
+---
+
+# 8. SECOND CAUSE, SAME FAMILY — `Thread$State.values()` mints a fresh instance per call
+
+**Status: MEASURED RED 2026-08-12 on `cratonvm-final.exe` (this wave's frozen
+binary, which already carries §5's `Option` fix), FIXED IN SOURCE, NOT BUILT and
+NOT RUN.** This section is a *different defect with a different mechanism on a
+different class*. It shares only the species — a native standing in front of a
+real JDK enum — with §1–§7. Do not read §5's fix as covering it, and do not read
+this fix as covering anything on `Option`.
+
+## 8.1 Answer first: the constants are RIGHT; the accessors are wrong
+
+`Option`'s defect was that the constants themselves were fabricated (a native
+`<clinit>`). `Thread$State`'s is the exact opposite: `<clinit>` runs, the static
+fields hold correct constants, and `getEnumConstants()` agrees with them — but
+`values()` and `valueOf()` are *separately* registered natives that allocate a
+NEW instance per call and never consult the statics. Measured, same binary, same
+run, against HotSpot jdk-25.0.3.9:
+
+```text
+                                     CRATONVM --jdk-only     HOTSPOT
+Thread.State.NEW == Thread.State.NEW  true                    true    <- statics fine
+getEnumConstants()[0] == State.NEW    true                    true    <- $VALUES fine
+Thread.currentThread().getState()
+                    == State.RUNNABLE true                    true    <- getState fine
+values()[0] identity                  @2, then @3 on a        stable
+                                      second call
+values()[0] == State.NEW              FALSE                   true    <- THE DEFECT
+valueOf("NEW") == State.NEW           FALSE                   true    <- THE DEFECT
+Arrays.asList(values())
+        .contains(getState())         FALSE                   true
+```
+
+Three consequences worth naming, because two of them are counter-intuitive:
+
+* `getState()` is **not** the culprit and never was. `lang_system.rs`'s
+  `native_thread_get_state` already resolves the constant through
+  `static_field_index_by_name` + `get_static_field`, so it hands back the
+  canonical object. The prompt's leading hypothesis is refuted by measurement.
+* An enum **`switch` still selects the right arm** over a minted constant —
+  measured, both `switch(values()[0])` and `switch(valueOf("TERMINATED"))` are
+  correct on the red binary. javac's `$SwitchMap` is indexed by `ordinal()`, and
+  the minted instances carry correct ordinals. `switch` is therefore *not* a
+  detector for this; only `==` shapes are.
+* `EnumSet`/`EnumMap` likewise survived in the probe, for the same reason. The
+  damage is confined to `==` against a constant, which is exactly what
+  `getState() == State.RUNNABLE`, `Arrays.asList(values()).contains(state)` and
+  every thread-state monitor and leak detector are written as.
+
+## 8.2 Mechanism — the registration, and why it ships under `--jdk-only`
+
+`native-builtins/src/phases_late/concurrent.rs::register_p71_thread_extras`
+registers two natives on `java/lang/Thread$State`:
+
+* `valueOf(Ljava/lang/String;)Ljava/lang/Thread$State;` — maps the name to a
+  hard-coded ordinal and calls `p57_alloc_enum`, which **allocates**.
+* `values()[Ljava/lang/Thread$State;` — allocates a 6-long reference array and
+  fills it with six freshly allocated instances from a hard-coded name list.
+
+Both were correct for `--synthetic-jdk`, where `Thread$State` is a fabricated
+class with no `<clinit>` and no static fields to read. They reach `--jdk-only`
+because `register_p71_thread_extras` is **also** called from
+`register_essential_natives` (`native-builtins/src/lib.rs:9159`), for an
+unrelated reason stated at the call site: `ThreadGroup` is needed early for
+JBoss-Modules' `JBossThreadFactory` during process-controller bootstrap. The
+`ThreadGroup` half of that registrar is what essentials wanted; the
+`Thread$State` half came along with it. Registration is the gate, so the real
+`values()`/`valueOf()` bytecode never runs.
+
+This is the same rule §3 established for `Option`, applied at a different level:
+there, the shadowed method was the initialiser; here, the initialiser is left
+alone and the *readers* are shadowed. That is why §1's probe read `Thread$State`
+as "ok" — it checked what `<clinit>` produced, which is correct.
+
+Confirmed scope, by identity measurement not inference. Twenty real JDK enums
+were checked for full identity (`values()[i] == the declared static field`,
+`getEnumConstants()[i] ==` it, and `valueOf(name) ==` it) on the red binary:
+
+```text
+OK   DayOfWeek, StandardOpenOption, RetentionPolicy, TimeUnit,
+     StackWalker$Option (so §5's area stays green), RoundingMode, Month,
+     Locale$Category, ChronoUnit, ChronoField, ProcessBuilder$Redirect$Type,
+     LinkOption, StandardCopyOption, ElementType, TextStyle,
+     SSLEngineResult$Status, FormatStyle
+BAD  Thread$State   all six constants fail values[] and valueOf
+```
+
+`Thread$State` is the only one, and the registrar census says why: it is the
+only real-JDK enum whose `values`/`valueOf` are registered from a registrar that
+essentials calls. Every other `p57_alloc_enum` minting site
+(`System$Logger$Level`, `HttpClient$Version`/`$Redirect`, `Normalizer$Form`,
+`FormatStyle`, `NumberFormat$Style`, `FileVisitResult`,
+`StructuredTaskScope$Subtask$State`, and `phases_late.rs`'s three dead
+`Option` static-field triples) sits in a phase registrar that `--jdk-only`
+does not run — which the twenty-enum sweep independently confirms rather than
+merely asserts.
+
+## 8.3 The fix, and why it is not fabrication
+
+Two helpers land in `native-builtins/src/lang_system.rs`, next to
+`native_thread_get_state`, whose canonical-constant shape they generalise:
+
+* `canonical_enum_constant(ctx, class_name, name)` — the object the class's own
+  static field holds, or `None`.
+* `canonical_enum_values(ctx, class_name)` — a FRESH array (as
+  `$VALUES.clone()` returns) holding those same objects in ordinal order.
+
+Both **ask the class**: the constant names come from its declared static fields
+filtered by the self descriptor, so declaration order is ordinal order and
+`$VALUES` filters itself out by having the array descriptor. That is the same
+derivation §5 used for `Option`, and it is why neither helper carries a name
+list that a future JDK could invalidate.
+
+Neither helper can fabricate. `canonical_enum_values` returns `None` unless the
+class declares at least one constant **and every one reads back non-null**, so a
+fabricated synthetic-JDK stand-in (no static fields) and a half-initialised
+class both fall through to the caller's existing behaviour rather than yielding
+an array with null holes — the shape `ImmutableCollections$Set12.<init>` NPEs
+on, per §5. `ensure_class_initialized` returning `Ok` is not treated as proof a
+real class answered, because it fabricates rather than failing; the static-field
+lookup is the discriminator.
+
+The two `concurrent.rs` natives then try the canonical route first and keep
+their existing minting body as the fallback. One code path serves both modes: a
+`cfg` feature guard cannot see the runtime JDK mode, and no new flag is
+introduced.
+
+**Why not simply delete the registrations.** That is the right end state and is
+the same open item §7.1 records for `Option`: under `--synthetic-jdk` the class
+is fabricated with no bytecode, so removal alone converts that mode to an
+`UnsatisfiedLinkError`. It needs the registration made conditional on the
+runtime mode, plus a synthetic-mode run. Out of scope for a no-build lane.
+
+## 8.4 Coverage
+
+`realEnumsAreSelfConsistent()` in `regression-suite/src/RJdkStrict.java` already
+carried the failing assertion — `Thread.State` is in its class list and
+`values[i] == c` is exactly the check that fired. It is unweakened. Three
+shapes are added after the loop, each stating what it can and cannot see:
+
+1. `values()` returns a fresh array whose ELEMENTS are stable across calls.
+   This is the direct detector, and it is what a defensive-copy `values()` means.
+2. `getState() == State.RUNNABLE`, `Arrays.asList(values()).contains(getState())`
+   and `valueOf(getState().name()) == getState()`. The first is a regression
+   guard on the already-correct `native_thread_get_state`; the other two fail on
+   the red binary.
+3. A real enum `switch`, annotated in the source with the §8.1 measurement that
+   it does **not** detect this defect, so no later reader mistakes it for one.
+
+Verified on HotSpot jdk-25.0.3.9 before landing:
+
+```text
+PASS RJdkStrict (359 checks)   CK RJdkStrict enumSelfConsistent=6
+```
+
+347 → 359 checks, `-Xlint:all` clean. The added shapes were each measured
+separately on the frozen red binary (§8.1's table) so the record states which of
+them actually catch the defect rather than assuming all three do.
+
+## 8.5 Left open
+
+1. **Not built, not run.** The first lane with a binary should re-run
+   `RJdkStrict` under `--jdk-only` and confirm 359 checks and
+   `CK RJdkStrict enumSelfConsistent=6`.
+2. **`Thread$State.valueOf` still does not throw.** The real
+   `Enum.valueOf` throws `IllegalArgumentException` for an unknown name; the
+   native answers `RUNNABLE`. The fix does not change that — a real name now
+   resolves canonically and only junk reaches the old body — but the deviation
+   is real and unrelated to enum identity.
+3. **The registrar should be split.** Essentials calls
+   `register_p71_thread_extras` for its `ThreadGroup` half; the `Thread$State`
+   half is collateral. Separating the two would remove this class of accident
+   for real-JDK mode without needing a runtime mode query.
+4. **Generalise the sweep.** The twenty-enum identity probe is scratch-only. A
+   census asserting that no real JDK enum's `values`/`valueOf`/`<clinit>` triple
+   is registered under `--jdk-only` would close the species, not just its two
+   known members.
