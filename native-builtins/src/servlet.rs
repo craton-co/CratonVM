@@ -5,6 +5,10 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+// The heap's own object-kind discriminant. `s2_bb_arr` uses it to refuse a
+// `java.nio.Buffer.segment` that is a `MemorySegment` rather than a backing
+// array — see W7-83-segment-as-backing-array.md.
+use cratonvm_types::ObjectKind;
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::phases_late::{
@@ -3387,8 +3391,31 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     // was:<0.0>" across nearly the entire ES vector-codec test family —
     // every value read through a typed-buffer view came back zero
     // regardless of what was actually written.
+    //
+    // W7-83: and slot 5 is `Buffer.segment` on a REAL loaded `java.nio.Buffer`,
+    // where the value is a `MemorySegment`, not an array. Measured on Eclipse
+    // Adoptium 25.0.3.9: `ByteBuffer.allocate(16)` has `segment == null`,
+    // `ByteBuffer.allocateDirect(16)` has `segment == null`, and
+    // `Arena.ofAuto().allocate(16).asByteBuffer()` has `hb == null` and
+    // `segment == jdk.internal.foreign.NativeMemorySegmentImpl`.
+    //
+    // Without the kind screen this function returned that `MemorySegment` to
+    // `array()`, whose declared return type is `[B`, and made `hasArray()`
+    // answer `true` where HotSpot answers `false`. **This registration wins in
+    // Compatible mode** (W7-76 §2: `set_drop_real_layout_synthetic(true)` runs
+    // before `register_io_natives`, so `register_nio_natives` is skipped and
+    // nothing overwrites s2), and `array`/`hasArray`/`arrayOffset` are all on
+    // `native_override.rs`'s forced-native list for `java/nio/ByteBuffer`, so
+    // the native answers even though the real bytecode is present.
+    //
+    // Rejecting the segment is what makes the receiver fall through to the
+    // callers' direct arms: `array()`'s `None if s2_bb_direct_addr(..)` arm
+    // raises `UnsupportedOperationException` and `hasArray()` answers false —
+    // exactly HotSpot. `s2_bb_direct_addr` keeps its own
+    // `is_plausible_native_addr` screen, which is untouched and is still what
+    // stops a heap buffer's `address = 16` being dereferenced.
     match ctx.get_field(buf, BB_SEGMENT_SLOT) {
-        Value::Object(Some(a)) => Some(a),
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == ObjectKind::Array => Some(a),
         _ => None,
     }
 }
@@ -7913,6 +7940,162 @@ mod tests {
                  feature-designs/native-builtins-shim-audit.md."
             );
         }
+    }
+
+    /// W7-83 — `java.nio.Buffer.segment` is not a backing array, on the
+    /// registration that WINS in Compatible mode.
+    ///
+    /// W7-76 §2 settled the registration question: in both Compatible arms
+    /// `set_drop_real_layout_synthetic(true)` runs before `register_io_natives`,
+    /// so `register_nio_natives` is skipped and nothing overwrites
+    /// `register_s2_bytebuffer`. `array()[B`, `hasArray()Z` and `arrayOffset()I`
+    /// are all on `native_override.rs`'s forced-native list for
+    /// `java/nio/ByteBuffer`, so these natives answer even with the real
+    /// bytecode present.
+    ///
+    /// Measured on Eclipse Adoptium 25.0.3.9 (`probes/DirectByteBufferStateProbe.java`,
+    /// section `seg`): `Arena.ofAuto().allocate(16).asByteBuffer()` is a
+    /// `java.nio.DirectByteBuffer` with `hb == null`, `segment ==
+    /// jdk.internal.foreign.NativeMemorySegmentImpl` and a real process pointer
+    /// in `address`; `hasArray()` is **false** and `array()` throws
+    /// `UnsupportedOperationException`. Before the screen `s2_bb_arr` returned
+    /// the segment, so `hasArray()` answered true and `array()` — whose declared
+    /// return type is `[B` — handed back a `MemorySegment`.
+    ///
+    /// The heap control arm is asserted in the same test: a genuine backing
+    /// array must still answer `hasArray() == true` and come back from
+    /// `array()`, or the screen has merely broken the other population.
+    #[test]
+    fn s2_bytebuffer_refuses_a_memory_segment_as_a_backing_array() {
+        use cratonvm_native_api::FieldMetadata;
+
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        register_s2_bytebuffer(&mut registry);
+        let array_fn = registry
+            .find("java/nio/ByteBuffer", "array", "()[B")
+            .expect("ByteBuffer.array native");
+        let has_array_fn = registry
+            .find("java/nio/ByteBuffer", "hasArray", "()Z")
+            .expect("ByteBuffer.hasArray native");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // Answer an unresolvable name the way production does, so `hb` reads
+        // back as absent rather than as the mock's historic `Int(0)`.
+        ctx.set_absent_field_answers_null(true);
+        let cid = ctx
+            .ensure_class_initialized("java/nio/DirectByteBuffer")
+            .expect("mock class");
+        // The real JDK 25 layout, transitively over the superclass chain:
+        // mark(0) position(1) limit(2) capacity(3) address(4) segment(5)
+        // hb(6) offset(7). Declaring it is what makes `hb`-by-name resolve to
+        // slot 6 (and answer null) instead of never resolving at all.
+        ctx.set_declared_fields(
+            cid,
+            [
+                ("mark", "I", 0),
+                ("position", "I", 1),
+                ("limit", "I", 2),
+                ("capacity", "I", 3),
+                ("address", "J", 4),
+                ("segment", "Ljava/lang/foreign/MemorySegment;", 5),
+                ("hb", "[B", 6),
+                ("offset", "I", 7),
+            ]
+            .into_iter()
+            .map(|(name, descriptor, slot_index)| FieldMetadata {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: cid,
+                is_static: false,
+            })
+            .collect(),
+        );
+
+        let mut native = vec![0u8; 16];
+        let addr = native.as_mut_ptr() as i64;
+        let segment = match ctx
+            .new_object("jdk/internal/foreign/NativeMemorySegmentImpl")
+            .expect("segment stand-in")
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        let buf = match ctx.new_object("java/nio/DirectByteBuffer").expect("buffer") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(buf, 0, Value::Int(-1)); // mark
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(16));
+        ctx.set_field(buf, BB_CAP, Value::Int(16));
+        ctx.set_field(buf, BB_MARK, Value::Long(addr)); // real layout: `address`
+        ctx.set_field(buf, BB_SEGMENT_SLOT, Value::Object(Some(segment)));
+
+        assert!(
+            s2_bb_arr(&ctx, buf).is_none(),
+            "a MemorySegment at slot 5 was returned as a backing array"
+        );
+        assert!(
+            matches!(
+                has_array_fn(&mut ctx, &[Value::Object(Some(buf))]),
+                Ok(Some(Value::Int(0)))
+            ),
+            "HotSpot answers hasArray() == false for an Arena segment's \
+             asByteBuffer(); measured, not assumed"
+        );
+        let thrown = array_fn(&mut ctx, &[Value::Object(Some(buf))]);
+        match &thrown {
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { .. },
+            ))) => {}
+            other => panic!(
+                "array() on an Arena segment's buffer must throw \
+                 UnsupportedOperationException as HotSpot does, got {other:?}"
+            ),
+        }
+
+        // --- the control: a genuine heap buffer still answers with its array.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let heap = match ctx.new_object("java/nio/HeapByteBuffer").expect("buffer") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(heap, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(heap, BB_POS, Value::Int(0));
+        ctx.set_field(heap, BB_LIMIT, Value::Int(16));
+        ctx.set_field(heap, BB_CAP, Value::Int(16));
+        assert_eq!(s2_bb_arr(&ctx, heap), Some(arr));
+        assert!(matches!(
+            has_array_fn(&mut ctx, &[Value::Object(Some(heap))]),
+            Ok(Some(Value::Int(1)))
+        ));
+        let got = array_fn(&mut ctx, &[Value::Object(Some(heap))]);
+        match &got {
+            Ok(Some(Value::Object(Some(a)))) if *a == arr => {}
+            other => panic!(
+                "a genuine heap buffer must still answer array() with its own \
+                 backing array, got {other:?}"
+            ),
+        }
+
+        // --- and the OTHER slot-5 population: `native-builtins`' own typed
+        // buffer views park a real array there, because `segment` is the only
+        // Object-typed field `Buffer` declares. The screen must not take them
+        // out with the MemorySegment.
+        let view_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        let view = match ctx.new_object("java/nio/IntBuffer").expect("view") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(view, BB_SEGMENT_SLOT, Value::Object(Some(view_arr)));
+        assert_eq!(
+            s2_bb_arr(&ctx, view),
+            Some(view_arr),
+            "a typed buffer view's backing array lives at slot 5 and must \
+             still resolve"
+        );
     }
 
     #[test]
