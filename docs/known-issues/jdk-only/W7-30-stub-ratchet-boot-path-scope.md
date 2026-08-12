@@ -1,0 +1,349 @@
+# W7-30 — the stub ratchet censused 6 of `vm_init`'s 48 registrars
+
+**Status:** FIXED for the scope, 2026-08-11. Two residuals recorded below and
+not fixed here: one registration that is outside this gate by crate boundary
+(§6), and a duplicated boot-path model that a lane owning both test targets
+should collapse (§7).
+
+**Species:** blind instrument. Same family as W7-22 (the
+`CRATONVM_ENFORCE_NATIVE_SHADOW` dial that yields at most once per triple and
+then hands every later dispatch back to the native, so it is a strictly weaker
+experiment than the retirement it licenses) and W4-4 (the layout-alias detector
+that reported under-allocation and stayed silent on over-allocation, which is
+the direction that is heap corruption rather than a wrong answer). The shared
+shape: **an instrument that cannot observe the thing it is trusted to
+adjudicate, while reporting green.**
+
+**File:** `native-builtins/tests/stub_ratchet.rs`.
+
+---
+
+## 1. The defect
+
+`BASELINE_SYNTHETIC_STUBS` is an **exact** assertion — `SLACK = 0`, and the
+constant's own doc says "adding one synthetic stub fails". It is taken over the
+registry that `register_boot_path` builds.
+
+`register_boot_path` made **six** registrar calls. `vm_init.rs`'s
+`#[cfg(not(feature = "synthetic-jdk"))]` arm — the shipping `cratonvm-cli`
+boot — makes **48**.
+
+So forty registrars' worth of registrations sat outside a zero-slack ratchet.
+A registration there could be **added**, **deleted**, or **retagged
+`Bridge` <-> `SyntheticStub`** and the number would not move by a single row.
+That is not a margin-of-error problem; it is the specific failure a ratchet
+exists to prevent, holding over most of the population it named.
+
+The file's own history says this happened before. On 2026-08-05 the census ran
+`register_essential_natives` and nothing else, "under a doc comment claiming it
+built the default native registry exactly as the VM's real-JDK boot path does.
+That was false, and the gap was large." The fix that day added five registrars
+and wrote a section headed *"What is still not counted, and why that is
+acceptable"*. That section was itself a hand-derived list, and it was short by
+forty.
+
+## 2. How it surfaced — by disagreement, twice, and never by the gate
+
+Both instances of this defect were found because a **second** measurement
+disagreed with this one. Neither was found by reading the gate.
+
+* **2026-08-05.** Retagging four `native-collections` registrars moved 364 rows
+  `Bridge` -> `SyntheticStub`. L6's `bridge-ratchet.sh`, which censuses a
+  running VM, counted every one. This gate did not move. Two ratchets over one
+  VM, 364 apart.
+* **2026-08-11.** A lane retagging the `ProcessHandle` block predicted
+  1038 -> 1041. After its work merged, the gate reported **7 passed, 0 failed,
+  count unmoved**. The same lane had already written down why, in
+  W7-10-processhandle-interface-stub-bodies.md: `register_boot_path` calls
+  neither `register_p60_process_handle` nor `register_classvalue_natives`.
+
+The second one is the sharper evidence, because the prediction was **also
+wrong**, and in a way the gate had no way to correct. The lane expected +3 —
+the three `current`/`pid`/`isAlive` restatements in `register_phase57_process`,
+which it assumed were in scope. Measured: the old census held **zero**
+`java/lang/ProcessHandle` rows **of any kind**. Not three mistagged ones. None.
+Neither the prediction nor the observation was a measurement of anything.
+
+## 3. Every registrar `vm_init` reached and the gate did not
+
+Derived from `vm_init.rs` mechanically, not by `rg` — the README (§"Do not size
+anything here from an `rg` count") records grep-derived sizes in this area as
+wrong by up to an order of magnitude, always the same direction. The extractor
+isolates the `cfg(not(feature = "synthetic-jdk"))` arm by brace depth (so the
+sibling synthetic arm's own real-JDK block, which also calls
+`register_p60_process_handle` at `:1901`, cannot be spliced in) and takes bare
+`register_*` calls at statement start.
+
+**48 registrar calls in the arm. 6 were in the gate. 40 were not.** The two the
+prior lane found incidentally are marked ★.
+
+| # | registrar | `vm_init.rs` |
+|---|---|---|
+| 1 | `register_p61_file_handler` | 2235 |
+| 2 | `register_url_classloader_close_bridge` | 2237 |
+| 3 | ★ `register_p60_process_handle` | 2406 |
+| 4 | ★ `register_classvalue_natives` | 2413 |
+| 5 | `register_random_and_securerandom_natives` | 2447 |
+| 6 | `register_properties_sidetable` | 2460 |
+| 7 | `register_t12_unsafe_natives` | 2463 |
+| 8 | `register_t14_system_bootstrap` | 2466 |
+| 9 | `register_boot_loader_natives` | 2470 |
+| 10 | `register_phase57_nio_file` | 2473 |
+| 11 | `register_phase57_file` | 2483 |
+| 12 | `register_p59_jar` | 2492 |
+| 13 | `register_p59_bulk_stream_transfer` | 2497 |
+| 14 | `register_p59_zip_output_primitives` | 2500 |
+| 15 | `register_spring_boot_logback_apply` | 2508 |
+| 16 | `register_url_codec` | 2705 |
+| 17 | `register_charset_natives_pub` | 2706 |
+| 18 | `register_p58_charset_coder` | 2707 |
+| 19 | `register_real_charset_natives` | 2708 |
+| 20 | `register_deprecated_internal_natives` | 2709 |
+| 21 | `register_arrays_support_natives` | 2712 |
+| 22 | `register_string_latin1_natives` | 2715 |
+| 23 | `register_classloader_real_natives` | 2733 |
+| 24 | `register_phase54_method_handle` | 2736 |
+| 25 | `register_p63_method_handles_lookup` | 2739 |
+| 26 | `register_t4_method_handle_invoke` | 2742 |
+| 27 | `register_t28_method_handle_completeness` | 2746 |
+| 28 | `register_p68_invoke_extras` | 2758 |
+| 29 | `register_reflect_proxy_natives` | 2765 |
+| 30 | `register_instrumentation_natives` † | 2773 |
+| 31 | `register_self_attach_natives` † | 2778 |
+| 32 | `register_vm_management_impl` ‡ | 2783 |
+| 33 | `register_jmx_natives` ‡ | 2817 |
+| 34 | `register_thread_impl` ‡ | 2822 |
+| 35 | `register_class_loading_impl` ‡ | 2824 |
+| 36 | `register_garbage_collector_impl` ‡ | 2826 |
+| 37 | `register_memory_pool_impl` ‡ | 2830 |
+| 38 | `register_memory_manager_impl` ‡ | 2832 |
+| 39 | `register_operating_system_impl` ‡ | 2834 |
+| 40 | `register_hotspot_diagnostic` ‡ | 2836 |
+| 41 | `register_flag_impl` ‡ | 2838 |
+| 42 | `register_slf4j_binder_stubs_pub` | 2842 |
+
+† Lives in the `vm` crate (`crate::runtime::instrument::*`). `native-builtins`
+cannot dev-depend on `vm` — that is a dependency cycle — so these two are the
+only permitted residue, ratcheted as `UNMODELLED_VM_CRATE_REGISTRARS = 2`.
+
+‡ `#[cfg(feature = "management")]` at the `vm_init` call site, and `nb::jmx` is
+itself feature-gated. Replayed under the same `cfg`. See §5.
+
+**`register_random_and_securerandom_natives` and `register_properties_sidetable`
+are the two that make this a WRONG census and not merely a narrow one.**
+`vm_init` runs them immediately after `register_collections_natives`, under a
+banner it carries verbatim — `LAST-WRITE-WINS BOUNDARY — do not reorder` —
+*because* `register_collections_natives` overwrites them with layout-wrong
+versions. Stopping at `register_collections_natives`, as the gate did, counts
+the whole `java/util/Random` family and ~23 `java/util/Properties` triples at
+the kind of the row the shipping VM **discards**.
+
+## 4. The fix, and why the number is the smaller half of it
+
+`register_boot_path` now replays all 46 reachable registrars in `vm_init`'s
+order, including the last-write-wins boundary with its comment intact.
+
+**The load-bearing change is not the wider number.** A count baseline cannot
+detect a registration outside its own scope — that is what "outside the scope"
+means — so widening it once buys nothing against the next drift, which is
+exactly how the 2026-08-05 fix decayed. The scope itself has to be checkable.
+
+Added: `the_censused_scope_is_vm_inits_boot_path`, a source witness that reads
+`vm_init.rs` from the working tree and asserts two things that need different
+fixes:
+
+* an **unmodelled registrar** — present in `vm_init`, absent from
+  `VM_INIT_SEQUENCE` — ratchets against `UNMODELLED_VM_CRATE_REGISTRARS` (2);
+* an **order inversion** among modelled registrars is a hard failure with no
+  baseline, because registration is last-write-wins and an inversion makes the
+  census count the discarded row's kind (§3's boundary is one such pair).
+
+**What the witness honestly does not assert**, stated in its doc comment rather
+than left for a reader to assume: that `register_boot_path` *calls* every name
+in `VM_INIT_SEQUENCE`. Rust has no reflection over a function body. The list is
+checked against `vm_init`, and the replay is checked against the list by review.
+Closing that last gap needs either a proc-macro that generates both from one
+list or a registry-side "which registrars ran" census; neither is this lane's
+work, and pretending the witness covers it would be a third blind instrument.
+
+## 5. New baselines, and the delta split by cause
+
+Taken from real runs of the test in both configurations, per the constant's own
+instruction ("do not hand-derive this number"). `cargo` exit code checked, not a
+trailing command's.
+
+| | old scope | new scope | delta |
+|---|---|---|---|
+| stubs, no-management | 1032 | **1253** | +221 |
+| rows, no-management | 11,471 | **12,445** | +974 |
+| stubs, management | 1032 | **1263** | +231 |
+| rows, management | 11,471 | **12,758** | +1,287 |
+| strict rows, no-management | 10,439 | **11,192** | +753 |
+| strict rows, management | 10,439 | **11,495** | +1,056 |
+
+Result in both configurations: **8 passed, 0 failed, 1 ignored.**
+
+**The +221 splits by cause, measured per row from `registered_by` provenance:**
+
+* **21 rows are the `ProcessHandle` retag** (`0ab1067ec`) — the movement that
+  change was entitled to and could not produce. 18 in
+  `register_p60_process_handle`, plus the 3 `current`/`pid`/`isAlive`
+  restatements in `register_phase57_process`. All 21 were `Bridge` before that
+  commit: it flips `register_p60_process_handle`'s scope
+  `Bridge` -> `SyntheticStub`, and the restated three inherited
+  `register_phase57_process`'s `Bridge` ambient until it wrapped them in an
+  explicit `SyntheticStub` scope.
+* **200 rows predate that retag entirely** and were never counted by anything
+  here. They are not one registrar's backlog — the largest contributors are
+  `messaging_shims.rs` (103 stub rows in the new census),
+  `logging_shims.rs` (53), `logmanager.rs` (44), `plain_socket.rs` (34),
+  `atomic_updater.rs` (32), `spring_startup_bootstrap.rs` (29),
+  `native-io/src/process.rs` (26) and `shared_secrets_bridge.rs` (23).
+
+**No row changed meaning.** Of the 221, **204 sit on triples the old census did
+not hold at all** and the other 17 are second registrations of triples it did
+hold. **Zero** sit on a triple the old census counted as a non-stub. So this is
+a population that grew, not a set of kinds re-decided — the only reading a scope
+fix admits, and the check that separates it from a retag wearing a scope fix's
+clothes.
+
+`register_classvalue_natives` contributes **2 rows and 0 stubs**: it is in the
+gap for the same structural reason, but it holds no fakes.
+
+### 5.1 The frozen constant was six above what the code measured
+
+Independent of the scope: the live count under the OLD scope was **1032**, and
+`BASELINE_SYNTHETIC_STUBS` was frozen at **1038** — in both configurations, so
+this was not feature drift. A constant whose doc says "this is the exact current
+observed count" and "the ratchet has zero slack" had been silently admitting six
+new stubs.
+
+The mechanism is that the printed line and the constant were never compared,
+because nothing in the output named the configuration or the constant. The
+census now prints `stub-ratchet [<config>]: ...` and a paste-ready
+`const <NAME>: usize = <N>;` line, and the failure message names which constant
+to re-freeze.
+
+### 5.2 The baseline is now keyed per configuration
+
+`vm_init` gates ten `jmx::*` registrars on `#[cfg(feature = "management")]`;
+`cratonvm-vm` declares `management` in its defaults so **every shipping
+`cratonvm-cli` build has it**, while a `-p cratonvm-native-builtins` resolve
+does not. The registry therefore genuinely differs by 313 rows and 10 stubs.
+
+Collapsing this to one number requires dropping those ten registrars from the
+model in *both* configurations — i.e. deliberately re-opening the blind spot to
+get a tidier constant. So there are two constants, both compiled in both
+configurations (neither can be edited while invisible to the compiler), with the
+`cfg` selecting which one adjudicates. This mirrors
+W6-4-duplicate-registration-gate.md, which reached the same conclusion
+independently.
+
+## 6. Residual: one `SyntheticStub` is outside this gate by construction
+
+`register_boot_path`'s previous comment said of `vm_init`'s inline
+registrations: *"They are `Bridge`, and a `SyntheticStub` added there would slip
+past."*
+
+**The conditional was already false when it was written.**
+`vm/src/vm/vm_init.rs:2726` registers
+`io/quarkus/bootstrap/runner/RunnerClassLoader.close()V` with an explicit
+`NativeKind::SyntheticStub`, inside the real-JDK arm. The comment beside it is
+deliberate and correct about its own intent; it is simply invisible to this
+census, because `native-builtins` cannot depend on `vm`.
+
+So **the baseline is a floor by one**, and the comment now says so instead of
+predicting the case in the future tense. The only real fix is to move the gate
+to `vm/tests/`, where the whole arm including its inline registrations is
+reachable. That is a cross-crate move touching CI wiring and is not this lane's
+scope.
+
+### Out-of-file patch (not applied)
+
+Nothing in `native-builtins/src/` or `vm/src/` needs to change for the fix in
+this record. The two follow-ups both move test targets:
+
+**(a) Move the gate to `vm/tests/stub_ratchet.rs`.** This is the only change
+that makes the census total rather than scoped. It would subsume
+`UNMODELLED_VM_CRATE_REGISTRARS` (both `crate::runtime::instrument::*`
+registrars become reachable), pick up the inline registrations including the
+`RunnerClassLoader.close` stub above, and let the replay call `vm_init`'s own
+helper instead of mirroring it — at which point the source witness in §4 can be
+deleted rather than maintained. Cost: the baselines shift by the inline
+registrations and must be re-taken in both configurations; CI must run the gate
+from `cratonvm-vm`, whose default features include `management`, so the
+`management` constant becomes the CI-adjudicated one.
+
+**(b) Collapse the duplicated boot-path model.** See §7.
+
+## 7. Residual: the boot-path model now exists twice
+
+`native-builtins/tests/duplicate_registration_gate.rs` already carried a
+complete, source-witnessed replay of `vm_init`'s real-JDK arm
+(`VM_INIT_SEQUENCE` + `vm_init_real_jdk_boot_path` +
+`the_replayed_sequence_matches_vm_init`). This lane owns only
+`stub_ratchet.rs`, and two integration-test binaries cannot share a module
+without a new file, so the model is now duplicated.
+
+That is not free, and it is not catastrophic either: both copies are checked
+against the same `vm_init.rs` by two independent witnesses, so a drift in one
+fails that one. The failure mode of duplication here is *redundant maintenance*,
+not *silent disagreement* — which is strictly better than the single
+unwitnessed model this record is about.
+
+**The collapse, for a lane owning both files:** add
+`native-builtins/tests/common/vm_init_boot_path.rs`, move `VM_INIT_SEQUENCE`,
+the replay and the witness into it, and `#[path = "common/vm_init_boot_path.rs"]
+mod boot_path;` from both test targets. The witness must stay ungated on
+`management` while the replay stays gated, for the reason
+`duplicate_registration_gate.rs` documents: the ten `jmx::*` calls are textually
+present in `vm_init.rs` in every build, so a `cfg`-gated list would report ten
+unmodelled registrars in the default resolve.
+
+If (a) above lands first, this residual disappears with it.
+
+## 8. What the widened gate did NOT reveal
+
+Stated because a widened gate that goes green everywhere invites the suspicion
+that it was widened until it passed. It was not; each of these was a live
+assertion over 974 newly-visible rows and each held:
+
+* `no_registration_runs_on_the_ambient_default` — **0 of 12,445** registrations
+  made with no category scope in effect. Forty registrars entered the census and
+  not one relies on the registry's conservative default.
+* `no_fake_survives_strict_mode_as_someone_elses_bridge` — **0 triples** are a
+  `SyntheticStub` in compatible mode and a `Bridge` in strict. This was 58 when
+  the test was written; the wider scope adds none.
+* `strict_registry_has_zero_synthetic_stubs` — 0 stubs in the strict registry;
+  1,305 refusals recorded (was 1,084).
+* `strict_registry_drops_only_the_stubs` — both one-sided bounds hold at the new
+  scope.
+
+The two vacuity floors were re-derived with the scope, both from the **smaller**
+configuration (a floor that only holds in the build with more registrars in it
+is not a floor): `MIN_TOTAL_REGISTRATIONS` 11,000 -> 11,800 and
+`STRICT_MIN_TOTAL_REGISTRATIONS` 10,200 -> 10,900, the latter keeping the ~300
+rows of headroom its own comment justifies.
+
+## 9. The generalisation
+
+Every gate in this campaign is a predicate over a population. Reviewers argue
+about the predicate, which is visible in the assertion, and the campaign has
+three records now where the predicate was fine and the **population** was the
+defect — W4-4 (a detector whose predicate covered one direction of the
+population), W7-22 (a dial whose population was one dispatch per triple), and
+this one.
+
+Two operational consequences:
+
+1. **A gate's scope needs its own assertion, against a source of truth, or it
+   decays.** The 2026-08-05 fix here widened a scope by hand and wrote a section
+   explaining what remained uncovered. Six days later that section was short by
+   forty registrars and nothing had failed. The witness in §4 is the difference
+   between a scope that is documented and a scope that is checked.
+2. **A gate that does not move when a change predicts it will is a finding about
+   the gate.** In both instances here the disagreement was visible and got read
+   as "the prediction was wrong" rather than "the instrument is blind". W7-22
+   records what that costs when the blind instrument is the one licensing the
+   change: the `java.util.logging` shadow retirement it green-lit is a live
+   regression, shipped because no vector covered it.
