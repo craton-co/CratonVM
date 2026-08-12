@@ -916,10 +916,37 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 _ => ctx.get_field(this, 3),
             };
 
+            // W7-89: a slice stays inside its parent's scope. Slot 2 used to be
+            // written as the "no arena" marker unconditionally, so
+            // `pe_segment_session` answered `None` for every slice and
+            // `pe_segment_check_scope` let it through — HotSpot raises
+            // `IllegalStateException: Already closed` for a slice of a closed
+            // arena exactly as it does for the parent (measured,
+            // `MemorySessionValidStateProbe` row `C.closed.slice.get`).
+            //
+            // Only a session we MODELLED is propagated, which is all
+            // `pe_segment_session` can return. That is what keeps the slot's
+            // OTHER tenant safe: on an `ofArray` segment slot 2 holds the Java
+            // backing array (`SEG_BACKING_ARRAY_FIELD`), an array resolves to no
+            // session, and such a slice keeps the historical `Object(None)` — so
+            // `isNative()` and `sync_heap_backed_segment` see exactly what they
+            // saw before.
+            let parent_session = pe_segment_session(ctx, this);
+            let session_pin = parent_session.map(|session| ctx.pin_native_root(session));
             let slice = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+            // The allocation above can move the session (native stale-local
+            // family), so re-read it through the pin before storing it.
+            let scope_value = match (parent_session, session_pin) {
+                (Some(session), Some(pin)) => {
+                    let session = ctx.read_native_pin(pin, session);
+                    ctx.unpin_native_roots(pin);
+                    Value::Object(Some(session))
+                }
+                _ => Value::Object(None),
+            };
             ctx.set_field(slice, 0, Value::Long(slice_ptr));
             ctx.set_field(slice, 1, Value::Long(new_size));
-            ctx.set_field(slice, 2, Value::Object(None));
+            ctx.set_field(slice, 2, scope_value);
             ctx.set_field(slice, 3, read_only);
             ctx.set_field(slice, 4, Value::Int(1));
             ctx.set_field(slice, 5, Value::Long(0));
@@ -1410,8 +1437,11 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
 // below trivially pass:
 //
 //   Arena   : [0] = open (Int), [1] = session
-//   session : [0] = state (Int; 0 = closed), [1] = acquires, [2] = owner,
-//             [3] = close actions
+//   session : four words, whose SLOTS are `foreign_ffm`'s to decide — see
+//             `P67SessionSlots`. This file used to hard-code `state` at slot 0
+//             and a width of 4; both are deleted (W7-89) because that second
+//             copy of the index is what made the check dead in Compatible mode,
+//             where the real `MemorySessionImpl` types slot 0 as a REFERENCE.
 //
 // Both are `alloc_concurrent_synthetic` objects, so their class names are
 // exactly the two constants below. Every step of the resolution is gated on
@@ -1421,8 +1451,6 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
 const PE_ARENA_CLASS: &str = "java/lang/foreign/Arena";
 const PE_SESSION_CLASS: &str = "jdk/internal/foreign/MemorySessionImpl";
 const PE_ARENA_SESSION_FIELD: usize = 1;
-const PE_SESSION_STATE_FIELD: usize = 0;
-const PE_SESSION_SLOTS: usize = 4;
 /// Slot 2 of a synthetic segment names the arena that allocated it — this
 /// file's own convention (see the `// no arena` writes in `ofAddress` and
 /// `asSlice`), which `foreign_ffm`'s 3-field segments adopted as well.
@@ -1484,13 +1512,23 @@ static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
 /// Whether `session` carries the layout `foreign_ffm` writes. Anything else —
 /// a real JDK `ConfinedSession`/`SharedSession`, or an object that merely
 /// happens to sit in the session slot — is left strictly alone.
+///
+/// The state word is located through `foreign_ffm`'s own slot map rather than
+/// through a second copy of the index. That map is the W7-89 repair: in
+/// Compatible mode the carrier is the REAL `MemorySessionImpl`, whose slot 0 is
+/// a declared REFERENCE (`resourceList`), so the model's `Int` state word never
+/// read back as an `Int` there and this predicate answered false for every
+/// session — which is why the choke point below, though correctly wired since
+/// W7-58, never once fired. Calling the shared resolver keeps the decision in
+/// ONE implementation; open-coding the index here is what let the two files
+/// drift out of step in the first place.
 fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
-    ctx.object_num_fields(session) >= PE_SESSION_SLOTS
-        && PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS)
-        && matches!(
-            ctx.get_field(session, PE_SESSION_STATE_FIELD),
-            Value::Int(_)
-        )
+    if !PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS) {
+        return false;
+    }
+    let slots = crate::phases_late::foreign_ffm::p67_session_slots(ctx, session);
+    ctx.object_num_fields(session) >= slots.required_width()
+        && matches!(ctx.get_field(session, slots.state), Value::Int(_))
 }
 
 /// The session stored on a synthetic `Arena`, if `arena` is one.
@@ -1565,10 +1603,8 @@ fn pe_segment_check_scope(ctx: &dyn NativeContext, seg: ObjectRef) -> Result<(),
     let Some(session) = pe_segment_session(ctx, seg) else {
         return Ok(());
     };
-    if matches!(
-        ctx.get_field(session, PE_SESSION_STATE_FIELD),
-        Value::Int(0)
-    ) {
+    let slots = crate::phases_late::foreign_ffm::p67_session_slots(ctx, session);
+    if matches!(ctx.get_field(session, slots.state), Value::Int(0)) {
         return Err(RuntimeError::IllegalStateException {
             message: "Already closed".into(),
         }
