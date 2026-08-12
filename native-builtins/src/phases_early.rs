@@ -11377,7 +11377,14 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                 "DECEMBER" => 12,
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("No enum constant java.time.Month.{name}"),
+                        // Shared with `Enum.valueOf` and the three other
+                        // synthetic enum `valueOf` bodies so the shape cannot
+                        // drift. `java.time.Month` is top-level, so its
+                        // canonical name is its binary name with dots.
+                        message: crate::lang_class::no_enum_constant_message(
+                            "java.time.Month",
+                            &name,
+                        ),
                     }
                     .into())
                 }
@@ -11538,7 +11545,10 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                 "SUNDAY" => 7,
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("No enum constant java.time.DayOfWeek.{name}"),
+                        message: crate::lang_class::no_enum_constant_message(
+                            "java.time.DayOfWeek",
+                            &name,
+                        ),
                     }
                     .into())
                 }
@@ -12011,7 +12021,10 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
             let tag = p52_chrono_unit_tag(&name);
             if tag < 0 {
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("No enum constant java.time.temporal.ChronoUnit.{name}"),
+                    message: crate::lang_class::no_enum_constant_message(
+                        "java.time.temporal.ChronoUnit",
+                        &name,
+                    ),
                 }
                 .into());
             }
@@ -13657,7 +13670,10 @@ pub(crate) fn register_phase52_rounding_mode(r: &mut NativeMethodRegistry) {
             let ord = p52_rounding_mode_ordinal(&name);
             if ord < 0 {
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("No enum constant java.math.RoundingMode.{name}"),
+                    message: crate::lang_class::no_enum_constant_message(
+                        "java.math.RoundingMode",
+                        &name,
+                    ),
                 }
                 .into());
             }
