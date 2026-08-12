@@ -20834,18 +20834,28 @@ pub(crate) fn native_annotated_type_get_annotation(
                 // proxy is invalid and turns a valid type-use annotation into a
                 // false negative. The public Annotation contract supplies the
                 // precise type mirror for both representations.
-                // W7-26 — `?` on the call, match on the VALUE. Found by the
+                // W7-26 — `ladder_rung`, then match on the VALUE. Found by the
                 // sweep that followed the four `getAnnotation` sites: this is
                 // the fifth instance of the same species and the only one
                 // outside the `Class`/`Field` pair. `annotationType()` here is
                 // a real virtual dispatch into a JDK dynamic proxy's
-                // invocation handler, so it can genuinely throw; swallowing
-                // that turned `AnnotatedType.getAnnotation(X)` into null, which
-                // reads as "no such type-use annotation". A non-Class return
-                // or a void return is still just "not this element" and keeps
-                // scanning, as before.
-                let ann_type =
-                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])?;
+                // invocation handler, so it can genuinely throw, and swallowing
+                // that turned `AnnotatedType.getAnnotation(X)` into null —
+                // which reads as "no such type-use annotation".
+                //
+                // `ladder_rung` rather than a bare `?` because this is a SCAN,
+                // not a build: unlike the four `Class`/`Field` sites, there is
+                // a next element to try, so a stashed object that has no
+                // `annotationType` at all (`InternalError`) should still be
+                // skipped exactly as it was before. Only a real pending
+                // exception aborts. A non-Class or void return is likewise
+                // still just "not this element".
+                let ann_type = ladder_rung(ctx.invoke_virtual(
+                    proxy,
+                    "annotationType",
+                    "()Ljava/lang/Class;",
+                    &[],
+                ))?;
                 if let Some(Value::Object(Some(tm))) = ann_type {
                     if mirror_class_id(ctx, tm) == Some(want) {
                         return Ok(Some(Value::Object(Some(proxy))));

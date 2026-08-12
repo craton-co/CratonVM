@@ -97,7 +97,12 @@ numbers rot.
 | 2 | `native_class_get_annotation`, own-class scan | same | same | `Class.getAnnotation(X)` throws instead of answering `null`; this is the site `RReflect.java:35` and `RJdkReflect.java:267` ran through |
 | 3 | `native_class_get_annotation`, `@Inherited` superclass walk | same, inside a `while` | same | as above, **and** the walk stops instead of continuing up the chain calling `class_annotations` with an exception pending |
 | 4 | `native_field_get_annotation` | `if let Ok(Some(proxy)) = create_annotation_proxy(…)` | `if let Some(proxy) = …?` | `Field.getAnnotation(X)` throws instead of agreeing with `Field.isAnnotationPresent(X) == true` and answering `null` |
-| 5 | `native_annotated_type_get_annotation` | `if let Ok(Some(Value::Object(Some(tm)))) = ctx.invoke_virtual(proxy, "annotationType", …)` | `?` on the call, match on the value | `AnnotatedType.getAnnotation(X)` throws instead of reading as "no such type-use annotation" when the proxy's invocation handler throws |
+| 5 | `native_annotated_type_get_annotation` | `if let Ok(Some(Value::Object(Some(tm)))) = ctx.invoke_virtual(proxy, "annotationType", …)` | `ladder_rung` on the call, match on the value | `AnnotatedType.getAnnotation(X)` throws instead of reading as "no such type-use annotation" when the proxy's invocation handler throws |
+
+Site 5 takes `ladder_rung` (below) rather than a bare `?` because it is a
+**scan**, not a build: unlike sites 1–4 there is a next element to try, so a
+stashed object with no `annotationType` at all is still skipped exactly as it
+was. Only a real pending exception aborts the scan.
 
 Site 5 was **not** in W7-12's list of four. The sweep found it: it is the same
 species, reached through a different helper, and it is the only one outside
