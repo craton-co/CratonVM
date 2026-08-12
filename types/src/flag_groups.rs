@@ -1208,6 +1208,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "await-shortcircuit", on_key: None, off_key: Some("CRATONVM_AWAIT_NO_SHORTCIRCUIT"), off_word: None },
     E { group: Group::THREADS, token: "default-watchdog", on_key: None, off_key: Some("CRATONVM_DISABLE_DEFAULT_WATCHDOG"), off_word: None },
     E { group: Group::THREADS, token: "default-watchdog-sec", on_key: Some("CRATONVM_DEFAULT_WATCHDOG_SEC"), off_key: None, off_word: None },
+    // W7-23/W7-27: the A/B for the thread-container pair. Registration (adding a
+    // thread to its ThreadContainer on start) and de-registration (Thread.exit
+    // removing it) are two halves that MUST ship together -- the add alone turns
+    // "join() waits for nothing" into "join() waits forever", measured. This
+    // selects both halves at once so the pair can be A/B'd in one binary.
+    E { group: Group::THREADS, token: "thread-containers", on_key: Some("CRATONVM_THREAD_CONTAINERS"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "eqe-sync-execute", on_key: Some("CRATONVM_EQE_SYNC_EXECUTE"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "exec-depth-ceiling", on_key: Some("CRATONVM_EXEC_DEPTH_CEILING"), off_key: None, off_word: None },
     // L19 — `ForkJoinTask.fork()` runs the body inline instead of only marking
