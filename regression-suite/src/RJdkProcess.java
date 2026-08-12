@@ -46,11 +46,63 @@ public class RJdkProcess {
     static final long TREE_WAIT_MS = 10_000;
     static int checks;
 
+    /**
+     * Every guard-suppressed assertion, by name.
+     *
+     * <p>This vector's own history is why it exists. Two {@code check(...)}
+     * calls sit behind {@code if (info.command().isPresent())} and
+     * {@code if (info.startInstant().isPresent())}. A JVM that reports those
+     * fields empty does not fail here -- it simply never reaches them, prints
+     * {@code PASS}, exits 0, and differs from HotSpot by nothing but the number
+     * on the {@code checks=} line. That is strictly worse than a missing check,
+     * because it reads as a passing one, and for four waves it read as one:
+     * CratonVM printed {@code checks=51} against HotSpot's 53 and the only
+     * signal was a two-digit diff a human had to notice.
+     *
+     * <p>The fix is not to assert those fields unconditionally -- they are
+     * legally empty on a restricted platform, and {@code ProcessHandle.Info}'s
+     * javadoc says so. It is to make the skip <em>say so</em>. {@link #skip}
+     * counts, so {@link #checks} is INVARIANT across conforming JVMs and a
+     * moved count is a hard {@link AssertionError}; and the reason is printed
+     * on the {@code CK} line, so a legal-but-degraded answer shows up as a
+     * textual diff against the oracle instead of an arithmetic one. Two
+     * severities, neither of them silent.
+     */
+    static final List<String> skipped = new ArrayList<>();
+
+    /**
+     * How many {@code check(...)} + {@code skip(...)} calls a conforming JVM
+     * makes, start to finish. Measured on HotSpot 25, where {@link #skipped} is
+     * empty and every one of them is a real assertion.
+     *
+     * <p>Update this deliberately when adding or removing a check. It is the
+     * ratchet: it is what turns "a check quietly stopped running" -- the defect
+     * this vector was the first to exhibit -- into a failure.
+     *
+     * <p>One {@code check} in this file is dead on the oracle and is therefore
+     * NOT counted: the {@code check(exit == null, "unreachable")} inside the
+     * {@code onExit()} try-block, which HotSpot never reaches because
+     * {@code onExit()} on the current process always throws. A VM that does not
+     * throw runs it, the count becomes {@code EXPECTED_CHECKS + 1}, and this
+     * constant catches that too.
+     */
+    static final int EXPECTED_CHECKS = 54;
+
     static void check(boolean c, String m) {
         checks++;
         if (!c) {
             throw new AssertionError(m);
         }
+    }
+
+    /**
+     * Record that a legally-optional guard was false, so the assertion behind
+     * it did not run. Counts toward {@link #checks} deliberately -- see
+     * {@link #skipped}.
+     */
+    static void skip(String why) {
+        checks++;
+        skipped.add(why);
     }
 
     static boolean windows() {
@@ -132,11 +184,18 @@ public class RJdkProcess {
         check(info.user() != null, "info().user()");
         check(info.toString() != null, "info().toString()");
         // If the command IS reported it must name an executable, not be blank.
+        // The `else` is not decoration: HotSpot 25 reports both of these on
+        // every platform this suite runs on, so an empty one is the two-check
+        // silent drop this vector's `skipped` list exists to name.
         if (info.command().isPresent()) {
             check(!info.command().get().trim().isEmpty(), "reported command must not be blank");
+        } else {
+            skip("info.command() empty -- 'reported command must not be blank' did not run");
         }
         if (info.startInstant().isPresent()) {
             check(info.startInstant().get().toEpochMilli() > 0, "start instant must be positive");
+        } else {
+            skip("info.startInstant() empty -- 'start instant must be positive' did not run");
         }
 
         // onExit() on the CURRENT process is explicitly disallowed.
@@ -241,6 +300,25 @@ public class RJdkProcess {
             threw = true;
         }
         check(threw, "starting a missing executable must raise IOException");
+
+        // An EMPTY program name must fail the same way, and it is a different
+        // code path: the name above reaches the OS and is refused there, this
+        // one does not survive the platform ProcessImpl's own command-line
+        // assembly. HotSpot 25 raises `IOException: Cannot run program "":
+        // CreateProcess error=87` on Windows and
+        // `error=2, No such file or directory` on Unix; both are IOExceptions,
+        // which is all this asserts. Added 2026-08-12 (W7-46): under
+        // `--jdk-only` the real `java.lang.ProcessImpl.create` runs, and this
+        // VM's native answered a handle of 0 for an empty command line -- so
+        // `start()` returned a live `Process` object that named no process, with
+        // `pid() == 0`, and nothing threw.
+        threw = false;
+        try {
+            new ProcessBuilder("").start();
+        } catch (java.io.IOException expected) {
+            threw = true;
+        }
+        check(threw, "starting an empty program name must raise IOException");
         System.out.println("CK RJdkProcess child exit=" + p.exitValue()
                 + " parentIsUs=true killedThenDead=" + !live.isAlive());
     }
@@ -270,7 +348,15 @@ public class RJdkProcess {
         currentProcess();
         childProcess();
         environmentAndDirectory();
-        System.out.println("CK RJdkProcess checks=" + checks);
+        // The count is an ASSERTION now, not a printed observation. A check
+        // that stops running used to move this number and nothing else --
+        // exit 0, `PASS`, no exception, and the drop visible only to whoever
+        // diffed the transcript against HotSpot's. See `skipped`.
+        if (checks != EXPECTED_CHECKS) {
+            throw new AssertionError("check count moved: expected " + EXPECTED_CHECKS
+                    + ", ran " + checks + "; skipped=" + skipped);
+        }
+        System.out.println("CK RJdkProcess checks=" + checks + " skipped=" + skipped);
         System.out.println("PASS RJdkProcess (" + checks + " checks)");
     }
 }
