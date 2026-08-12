@@ -337,6 +337,13 @@ fn emit(class: &str, slot: usize, expected: &str, finding: &ReadFinding, site: &
 /// **Observation only.** The return value must not steer the read: a diagnostic
 /// that changes behaviour is a behaviour change in Compatible mode, which is
 /// contractually frozen.
+///
+/// **A WRITE through an aliased slot is the same finding and uses this same
+/// call.** The question is what slot `k` MEANS on the loaded class, not which
+/// direction the access goes; `site` is where the caller says which it was.
+/// `native-io`'s `buf_set_mark` is the worked example — it stamps an `Int`
+/// mark onto slot 4, which on a real `java.nio.Buffer` is `address`, and the
+/// save/restore either side of it exists precisely because of that.
 pub fn observe_read(
     ctx: &dyn NativeContext,
     obj: ObjectRef,

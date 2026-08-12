@@ -63,7 +63,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{layout_alias, read_alias, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -5597,6 +5597,14 @@ fn real_filewriter_enabled() -> bool {
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-69: publish this crate's ByteBuffer slot map so the read-side alias
+    // sweep can check it against the loaded class. Unconditional and outside
+    // the flag check on purpose — the list is one `&'static` push per process,
+    // and gating it would leave a run that enables the flag later with nothing
+    // to sweep. `register_io_natives` is called in BOTH arms of `vm_init`'s
+    // `if config.use_synthetic_jdk` fork, so the map is published in Compatible
+    // mode too, where it is exactly the mode the census is about.
+    read_alias::declare_slot_map(&BB_SLOT_MAP);
     // SECURITY FIX (V12): apply the requested hardening deployment profile
     // before any I/O natives are registered, so a deployment that requests it
     // (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) fails closed — CWD
@@ -7286,6 +7294,35 @@ const BB_FIELD_CAPACITY: usize = 3; // Int capacity
 const BB_FIELD_MARK: usize = 4; // Int mark (-1 = not set)
 const BB_NUM_FIELDS: usize = 5;
 
+/// The `BB_FIELD_*` constants above, restated as a machine-readable
+/// `(slot, field name)` table for the READ-side alias census.
+///
+/// W7-59-layout-detector-coverage.md section 6 named exactly this gap: the
+/// per-native slot maps are `const F_x: usize = k` constants "with no
+/// machine-readable link to a field name", so no instrument could say "slot 0
+/// is `mark`, not `hb`". This is that link, and it is `const` data — it costs
+/// nothing at runtime and nothing when the flag is off.
+///
+/// Swept against the loaded `java/nio/ByteBuffer` it reports three of these six
+/// slots as `direction=wrong-field`; see W7-69-read-side-alias-instrument.md.
+/// It is published, not repaired: every production reader below resolves by
+/// NAME first and only falls through to the slot when the name does not
+/// resolve, which is the standing W4-4 remedy, so on a real receiver these
+/// indices are the fallback rather than the answer.
+pub static BB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/nio/ByteBuffer",
+        slots: &[
+            (BB_FIELD_ARRAY, "hb"),
+            (BB_FIELD_POS, "position"),
+            (BB_FIELD_LIMIT, "limit"),
+            (BB_FIELD_CAPACITY, "capacity"),
+            (BB_FIELD_MARK, "mark"),
+            (BB_SEGMENT_SLOT, "segment"),
+        ],
+        origin: "native-io/src/lib.rs BB_FIELD_*",
+    };
+
 /// FileChannel layout: 2-field synthetic
 const FC_FIELD_FD: usize = 0; // Int file descriptor id
 const FC_FIELD_POS: usize = 1; // Long position in file
@@ -7356,6 +7393,20 @@ fn buf_set_limit(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
 /// non-`Long`, and nothing is restored.
 fn buf_set_mark(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
     let saved_address = ctx.get_field_by_name(obj, "address");
+    // W7-69, observation only. A WRITE through an aliased slot is the same
+    // species and the same call — the finding is about what slot 4 MEANS, not
+    // about the direction of the access. On a real Buffer this `Int` lands on
+    // `address`, which is why the save/restore below exists at all; the census
+    // row names the field the restore is compensating for.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            &*ctx,
+            obj,
+            BB_FIELD_MARK,
+            "mark",
+            "native-io/src/lib.rs::buf_set_mark (write)",
+        );
+    }
     ctx.set_field(obj, BB_FIELD_MARK, Value::Int(v));
     ctx.set_field_by_name(obj, "mark", Value::Int(v));
     if let Value::Long(_) = saved_address {
@@ -7389,6 +7440,21 @@ fn buf_read_limit(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
 fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
     if let Value::Int(v) = ctx.get_field_by_name(obj, "mark") {
         return v;
+    }
+    // W7-69, observation only. On a REAL java.nio.Buffer slot 4 is `address`
+    // (a long), not `mark` — `mark` is slot 0. Reaching here on a real receiver
+    // means the by-name read above did not resolve, so this fallback is about to
+    // read `address` and call it `mark`. The `Value::Int` match below stops it
+    // returning a pointer as a mark, which is why this has never been a visible
+    // bug; the census row is the point.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            obj,
+            BB_FIELD_MARK,
+            "mark",
+            "native-io/src/lib.rs::buf_read_mark",
+        );
     }
     if let Value::Int(v) = ctx.get_field(obj, BB_FIELD_MARK) {
         return v;
@@ -7547,8 +7613,36 @@ fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Obj
     if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
         return Some(a);
     }
+    // W7-69, observation only. Slot 5 really is `Buffer.segment`, and this
+    // probe is deliberate — see the constant's own doc — so the census is
+    // expected to answer CLEAN here. That matters: an instrument that fires on
+    // every slot read is a probe that cannot fail, and this is the arm that
+    // proves it can stay quiet.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_SEGMENT_SLOT,
+            "segment",
+            "native-io/src/lib.rs::bb_resolve_heap_array",
+        );
+    }
     if let Value::Object(Some(a)) = ctx.get_field(this, BB_SEGMENT_SLOT) {
         return Some(a);
+    }
+    // THE CALIBRATION CASE. This is the read W7-58-bytebuffer-direct-arm.md
+    // repaired: slot 0 of a real java.nio.DirectByteBuffer is
+    // `java.nio.Buffer.mark` = -1, not the backing array `hb` (which is 6).
+    // The read is perfectly IN BOUNDS, so the gc::guard out-of-bounds list
+    // never saw it and the allocation-width census had no vocabulary for it.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_FIELD_ARRAY,
+            "hb",
+            "native-io/src/lib.rs::bb_resolve_heap_array",
+        );
     }
     match ctx.get_field(this, BB_FIELD_ARRAY) {
         Value::Object(Some(a)) => Some(a),
@@ -7564,6 +7658,21 @@ fn bb_resolve_heap_offset(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
         if v >= 0 {
             return v as usize;
         }
+    }
+    // W7-69, observation only. On JDK 25 slot 6 is `ByteBuffer.hb` — the
+    // backing ARRAY — and `offset` is 7. So this fallback names a reference
+    // field and reads it as an `Int`; the `Value::Int` match is the only thing
+    // between it and a fabricated offset. Left as found: the by-name read above
+    // resolves on every real receiver, so repairing the index here is a
+    // different lane's call.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            6,
+            "offset",
+            "native-io/src/lib.rs::bb_resolve_heap_offset",
+        );
     }
     match ctx.get_field(this, 6) {
         Value::Int(v) if v >= 0 => v as usize,
@@ -7597,6 +7706,20 @@ fn bb_resolve_direct_address(ctx: &dyn NativeContext, this: ObjectRef) -> Option
         if is_plausible_native_addr(v) {
             return Some(v);
         }
+    }
+    // W7-69, observation only. `BB_FIELD_MARK` is 4, and on the REAL layout
+    // slot 4 is `address` — so this fallback is right for a reason its constant
+    // name denies. The census answers CLEAN here, and that is the second
+    // non-firing control: the instrument is keyed on what the slot MEANS, not
+    // on what the constant is called.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_FIELD_MARK,
+            "address",
+            "native-io/src/lib.rs::bb_resolve_direct_address",
+        );
     }
     match ctx.get_field(this, BB_FIELD_MARK) {
         Value::Long(v) if is_plausible_native_addr(v) => Some(v),
