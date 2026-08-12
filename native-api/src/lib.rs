@@ -11,6 +11,11 @@ pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
 /// distinction, and the refusal a by-name lookup is allowed to return.
 pub mod class_identity;
+/// Failure policy for a Java call a native **delegates** to (`close`, `flush`,
+/// …): which throwables the JDK method we stand in for actually catches, and
+/// which have to come out. See `delegated_close` for why a blanket
+/// `let _ = ctx.invoke_virtual(…)` is not that policy.
+pub mod delegated_close;
 pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
@@ -51,6 +56,9 @@ pub use capability::{
     CapabilitySet, CapabilityUse, PortSpec, Scope, VmId,
 };
 pub use class_identity::{refusal_to_java_failure, ClassIdentityError, NameLookup};
+pub use delegated_close::{
+    absorb_exception, absorb_io_exception, absorb_thrown, vm_only_best_effort,
+};
 pub use intrinsic::InterpIntrinsic;
 /// Native-dispatch call-site memoization: resolve once, then index.
 ///

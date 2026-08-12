@@ -46482,7 +46482,13 @@ use std::sync::Arc;
             &[Value::Object(Some(handler)), Value::Object(None)],
         )
         .unwrap();
-        // Close
+        // Close. Slot 0 (the wrapped stream) is null on this freshly
+        // allocated handler, so the delegation is skipped entirely — that, and
+        // not a discarded result, is why this is quiet. `close` absorbs an
+        // `Exception` and propagates an `Error` since
+        // W7-57-close-flush-swallow-sweep.md, which this harness cannot
+        // exercise (no sink); probes/CloseFlushSwallowProbe.java does.
+        assert_eq!(shared.mem.heap.get_field(handler, 0), Value::Object(None));
         call_native(
             &shared,
             &mut thread,
@@ -50104,7 +50110,10 @@ use std::sync::Arc;
         .unwrap();
         assert_eq!(ch2, Value::Int(65));
 
-        // close is no-op
+        // `close()` delegates to the wrapped Reader at slot 0, which is null
+        // here — that is why it is quiet, not a discarded result. The
+        // delegation propagates since W7-57-close-flush-swallow-sweep.md.
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Object(None));
         call_native(
             &shared,
             &mut thread,
@@ -52412,7 +52421,16 @@ use std::sync::Arc;
         )
         .unwrap();
 
-        // write, finish, close — all no-ops
+        // write, finish and close reach no sink here: the `<init>` above was
+        // handed a NULL OutputStream, so `dos_underlying` answers `None` and
+        // every delegation is skipped. That is the reason they are quiet — NOT
+        // that the natives discard what the sink says. `close` propagates its
+        // delegated `out.close()` since W7-57-close-flush-swallow-sweep.md, and
+        // this harness has no sink to hear it from; the propagation is
+        // asserted in probes/CloseFlushSwallowProbe.java instead. Pinned so a
+        // later edit cannot hand it a real sink and silently change what this
+        // test means.
+        assert_eq!(shared.mem.heap.get_field(gos, 0), Value::Object(None));
         call_native(
             &shared,
             &mut thread,
@@ -52488,6 +52506,13 @@ use std::sync::Arc;
             &[Value::Object(Some(oos)), Value::Object(None)],
         )
         .unwrap();
+        // `close()` flushes and then closes slot 0. It is null here (the
+        // `<init>` above was handed a null OutputStream), so both delegations
+        // are skipped and the `.unwrap()` below succeeds for that reason — not
+        // because a failing close is discarded. Since
+        // W7-57-close-flush-swallow-sweep.md both propagate; see
+        // probes/CloseFlushSwallowProbe.java for the arriving-failure checks.
+        assert_eq!(shared.mem.heap.get_field(oos, 0), Value::Object(None));
         call_native(
             &shared,
             &mut thread,

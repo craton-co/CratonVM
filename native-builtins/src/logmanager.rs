@@ -4385,6 +4385,20 @@ fn publish_existing_record_to_jul_handlers(
         {
             delivered = true;
         }
+        // KEPT SWALLOW. HotSpot's `Logger.log` does not call `Handler.flush()`
+        // at all — this flush is OURS, added so the native publication bridge
+        // reaches the same durability the JDK gets by other means. There is no
+        // JDK `catch` to copy, and turning a failure in work HotSpot never
+        // performs into a Java-visible throw HotSpot never raises would be a
+        // fresh divergence. `Handler.flush()` declares no checked exception,
+        // and `StreamHandler.flush()` absorbs `Exception` into its
+        // `ErrorManager` anyway.
+        //
+        // Residual: an `Error` is absorbed here too. This helper returns
+        // `bool`, so narrowing it is a signature change, not a one-liner —
+        // unlike its sibling in `publish_to_jul_handlers_full` below, which
+        // returns a `Result` and IS narrowed.
+        // W7-57-close-flush-swallow-sweep.md
         let handler = ctx.read_native_pin(handler_pin, handler);
         let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
     }
@@ -4714,8 +4728,18 @@ fn publish_to_jul_handlers_full(
             // bytecode that can GC; refresh `handler` from its pin before
             // reusing it for `flush` below (same hazard class as the
             // `record`/`message` fix above this loop).
+            //
+            // KEPT SWALLOW, NARROWED. HotSpot's `Logger.log` makes no
+            // `Handler.flush()` call at all, so there is no JDK `catch` to
+            // copy and a Java-visible throw from work HotSpot never performs
+            // would be a fresh divergence. What is NOT that is an `Error`: a
+            // `NoSuchMethodError` here means our own dispatch failed to find
+            // `flush`, which is a broken VM, not a busy log file.
+            // `vm_only_best_effort` absorbs `Exception` and returns the rest.
+            // W7-57-close-flush-swallow-sweep.md
             let handler = ctx.read_native_pin(handler_pin, handler);
-            let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
+            let flushed = ctx.invoke_virtual(handler, "flush", "()V", &[]);
+            cratonvm_native_api::delegated_close::vm_only_best_effort(&*ctx, flushed)?;
         }
         Ok(delivered)
     })();

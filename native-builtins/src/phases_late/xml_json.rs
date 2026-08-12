@@ -1172,12 +1172,23 @@ fn xslt_write_result(
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(payload))],
         );
+        // The flush PROPAGATES, on the same footing as the `write` beside it.
+        // `Transformer.transform` declares `throws TransformerException` and
+        // the JDK serializer's `flush()` failure reaches the caller as one:
+        // `javax.xml.transform.stream.StreamResult` writing to a `Writer` is
+        // the buffered case, so the flush is where the bytes actually land.
+        // The site already propagated `written` and dropped the flush next to
+        // it — two halves of one delivery answered differently.
+        // W7-57-close-flush-swallow-sweep.md
         let writer = ctx.read_native_pin(writer_pin, writer);
-        if written.is_ok() {
-            let _ = ctx.invoke_virtual(writer, "flush", "()V", &[]);
-        }
+        let flushed = if written.is_ok() {
+            ctx.invoke_virtual(writer, "flush", "()V", &[]).map(|_| ())
+        } else {
+            Ok(())
+        };
         ctx.unpin_native_roots(result_pin);
         written?;
+        flushed?;
         return Ok(true);
     }
     let result = ctx.read_native_pin(result_pin, result);
@@ -1194,12 +1205,18 @@ fn xslt_write_result(
         let stream = ctx.read_native_pin(stream_pin, stream);
         let buffer = ctx.read_native_pin(buffer_pin, buffer);
         let written = ctx.invoke_virtual(stream, "write", "([B)V", &[Value::Object(Some(buffer))]);
+        // Same as the `Writer` branch above: the flush is the other half of
+        // the same delivery and propagates with it.
+        // W7-57-close-flush-swallow-sweep.md
         let stream = ctx.read_native_pin(stream_pin, stream);
-        if written.is_ok() {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-        }
+        let flushed = if written.is_ok() {
+            ctx.invoke_virtual(stream, "flush", "()V", &[]).map(|_| ())
+        } else {
+            Ok(())
+        };
         ctx.unpin_native_roots(result_pin);
         written?;
+        flushed?;
         return Ok(true);
     }
     ctx.unpin_native_roots(result_pin);

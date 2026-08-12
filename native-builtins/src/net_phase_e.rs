@@ -16298,6 +16298,16 @@ fn re10_dispatch_pending(
                             "(IJ)V",
                             &[Value::Int(code), Value::Long(-1)],
                         );
+                        //
+                        // KEPT SWALLOW. Same reasoning as that backstop — no
+                        // JDK body to copy a `catch` from — plus one this site
+                        // adds: it sits inside the pending-exchange dispatch
+                        // LOOP, holding `ex_pin`. Propagating would abort
+                        // serving every remaining pending exchange because one
+                        // rejected request failed to close, which is a worse
+                        // defect than the one being removed. The `Error`
+                        // residual is recorded rather than traded for that.
+                        // W7-57-close-flush-swallow-sweep.md
                         let ex = ctx.read_native_pin(ex_pin, ex0);
                         let _ = ctx.invoke_virtual(ex, "close", "()V", &[]);
                     }

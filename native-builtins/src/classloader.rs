@@ -6858,6 +6858,17 @@ fn probe_resource_exists(ctx: &mut dyn NativeContext, url: ObjectRef) -> bool {
         Ok(Some(Value::Object(Some(stream)))) => {
             // Close the probe stream so we don't leak it (ShrinkWrap tracks
             // opened streams for cleanup on classloader close).
+            //
+            // KEPT SWALLOW, at JDK parity. `URLClassPath$Loader.getResource`
+            // wraps its whole `url.openConnection()` / `getInputStream()`
+            // region in `catch (Exception e) { return null; }`, so a failure
+            // anywhere in the probe is "no such resource", not a thrown
+            // exception out of `getResources`. This predicate returns `bool`
+            // and its caller holds two native pins across the call, so it
+            // cannot propagate without a signature change; the residual is
+            // that an `Error` is absorbed here where the JDK's `catch
+            // (Exception)` would let it out. Recorded, not silently kept.
+            // W7-57-close-flush-swallow-sweep.md
             let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
             true
         }
@@ -10592,8 +10603,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
                 _ => None,
             },
         };
+        // `DataInputStream` inherits `FilterInputStream.close()`, which is a
+        // bare `in.close()` under `throws IOException` with no `catch`, so the
+        // delegated failure PROPAGATES. Dropping it hid exactly the class of
+        // fault this registration was added to stop leaking.
+        // W7-57-close-flush-swallow-sweep.md
         if let Some(u) = underlying {
-            let _ = ctx.invoke_virtual(u, "close", "()V", &[]);
+            ctx.invoke_virtual(u, "close", "()V", &[])?;
         }
         Ok(None)
     });

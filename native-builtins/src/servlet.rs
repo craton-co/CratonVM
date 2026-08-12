@@ -1394,11 +1394,16 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
         // BEFORE the nested dispatch because that call runs arbitrary Java and a
         // moving young GC there would relocate `this`, stranding a write made
         // afterwards (native stale-local family).
+        //
+        // The delegated failure PROPAGATES: `InputStreamReader.close()` is a
+        // bare `sd.close()` under `throws IOException`, and `StreamDecoder`'s
+        // `implClose()` is a bare `in.close()` / `ch.close()`. No `catch` on
+        // that chain. W7-57-close-flush-swallow-sweep.md
         r.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
                 ctx.set_field(this, 0, Value::Object(None));
-                let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+                ctx.invoke_virtual(stream, "close", "()V", &[])?;
             }
             Ok(None)
         });

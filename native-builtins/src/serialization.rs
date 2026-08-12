@@ -2083,11 +2083,27 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "close", "()V", |ctx, args| {
         // Flush internal buffer to underlying stream, then close it.
+        //
+        // `ObjectOutputStream.close()` is `flush(); clear(); bout.close();`
+        // under `throws IOException` with no `catch` anywhere on the chain
+        // (`flush()` is a bare `bout.flush()`), so BOTH delegations PROPAGATE.
+        // Dropping them turned a failed serialization flush — a full disk, a
+        // broken socket — into a clean `try`-with-resources exit over a
+        // truncated stream. W7-57-close-flush-swallow-sweep.md
+        //
+        // The per-stream side-table drop still runs on the failing path: it is
+        // our own bookkeeping, not part of the JDK body, and leaving an entry
+        // behind on a recycled address is its own defect. The first failure is
+        // the one reported, matching the JDK's straight-line order.
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
-        let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
-        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+        let mut outcome = ctx.invoke_virtual(this, "flush", "()V", &[]).map(|_| ());
+        if outcome.is_ok() {
+            // Skipped when the flush threw — the JDK body is straight-line, so
+            // `bout.close()` is not reached either.
+            if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+                outcome = ctx.invoke_virtual(stream, "close", "()V", &[]).map(|_| ());
+            }
         }
         // Drop per-stream writer state so a reused address starts clean.
         oos_stream_refs()
@@ -2095,6 +2111,7 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&addr);
         cur_clear(addr);
+        outcome?;
         Ok(None)
     });
 

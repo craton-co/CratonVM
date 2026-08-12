@@ -2604,8 +2604,13 @@ fn native_isr_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     isr_pending().lock().remove(&isr_key);
     // Close underlying InputStream via virtual dispatch if we have one;
     // otherwise attempt the legacy fd-slot path.
+    //
+    // The delegated close PROPAGATES: `InputStreamReader.close()` is a bare
+    // `sd.close()` under `throws IOException`, and `StreamDecoder.implClose()`
+    // is a bare `in.close()` / `ch.close()`. No `catch` on the chain.
+    // W7-57-close-flush-swallow-sweep.md
     if let Value::Object(Some(stream)) = ctx.get_field(this, 1) {
-        let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+        ctx.invoke_virtual(stream, "close", "()V", &[])?;
         return Ok(None);
     }
     if let Value::Int(fd) = ctx.get_field(this, 0) {
@@ -3962,13 +3967,34 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // flush() (DataOutputStream/BufferedOutputStream flush their own buffer), then
     // close the wrapped stream so its close()/finish() runs. `flush()` is
     // virtual and can collect; refresh `this` before reading its `out` slot.
+    //
+    // Both delegations PROPAGATE, in the JDK's own precedence. Its body is:
+    //
+    //     try { flush(); }
+    //     catch (Throwable e) { flushException = e; throw e; }
+    //     finally { out.close() — suppressing its own failure into
+    //               flushException when there was one }
+    //
+    // so the flush failure wins, the close is attempted either way, and a
+    // close failure surfaces only when the flush succeeded. Dropping both,
+    // as this did, turned a full disk into a clean `try`-with-resources exit
+    // over a truncated file — the exact defect this native was written to
+    // avoid one level down. W7-57-close-flush-swallow-sweep.md
+    //
+    // (The JDK's `addSuppressed` link between the two is not reproduced;
+    // recorded as a residual in that record.)
     let this_pin = ctx.pin_native_root(this);
-    let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+    let flushed = ctx.invoke_virtual(this, "flush", "()V", &[]).map(|_| ());
     let this = ctx.read_native_pin(this_pin, this);
-    if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
-    }
+    let closed = if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
+        ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[])
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    flushed?;
+    closed?;
     Ok(None)
 }
 
@@ -9828,8 +9854,14 @@ fn native_reader_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // afterwards pointing at a stale address (native stale-local family).
         // Clearing first also keeps `close()` idempotent when the nested call
         // throws.
+        // The delegated close PROPAGATES. Every `java.io` decorator whose
+        // `close()` this stands in for — `FilterReader` (`in.close()`),
+        // `BufferedReader` (`in.close()` in a `try`/`finally` that only nulls
+        // fields), `InputStreamReader` (`sd.close()`) — declares
+        // `throws IOException` and catches nothing.
+        // W7-57-close-flush-swallow-sweep.md
         ctx.set_field_by_name(this, "in", Value::Object(None));
-        let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+        ctx.invoke_virtual(inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -11193,11 +11225,24 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // Family-1 fix (cce0079): the `flush` dispatch is GC-capable —
         // refresh `inner` before the `close` dispatch, or close() runs on a
         // stale/wrong stream (leaking the real one).
+        //
+        // The flush PROPAGATES too, and its failure wins: `FilterOutputStream
+        // .close()` rethrows the flush exception from its `catch (Throwable)`
+        // and only *suppresses* a close failure into it. The close beneath was
+        // already propagating; the flush beside it was not, so a
+        // `DataOutputStream` over a full disk reported a clean close.
+        // W7-57-close-flush-swallow-sweep.md
         let inner_pin = ctx.pin_native_root(inner);
-        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        let flushed = ctx
+            .invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])
+            .map(|_| ());
         let inner = ctx.read_native_pin(inner_pin, inner);
         ctx.unpin_native_roots(inner_pin);
-        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
+        let closed = ctx
+            .invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])
+            .map(|_| ());
+        flushed?;
+        closed?;
     }
     Ok(None)
 }
@@ -12797,8 +12842,13 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(inner)) = ctx.get_field(this, 0) {
                 // Clear before dispatching — the nested `close()` can trigger a
                 // moving GC that relocates `this`, stranding a later write.
+                // …and `BufferedReader.close()` is `in.close()` in a
+                // `try`/`finally` that only nulls its own fields, under
+                // `throws IOException` with no `catch`, so the delegated
+                // failure PROPAGATES.
+                // W7-57-close-flush-swallow-sweep.md
                 ctx.set_field(this, 0, Value::Object(None));
-                let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+                ctx.invoke_virtual(inner, "close", "()V", &[])?;
             }
             Ok(None)
         });

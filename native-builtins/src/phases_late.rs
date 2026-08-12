@@ -3049,18 +3049,47 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // KEPT SWALLOW, NARROWED — and the width here is `Exception`, not
+    // `IOException`. `java.util.logging.StreamHandler.flush()` is
+    //
+    //     try { writer.flush(); }
+    //     catch (Exception ex) {
+    //         // We don't want to throw an exception here, but we
+    //         // report the exception to any registered ErrorManager.
+    //         reportError(null, ex, ErrorManager.FLUSH_FAILURE);
+    //     }
+    //
+    // and `close()` → `flushAndClose()` wraps `writer.flush(); writer.close();`
+    // in the same `catch (Exception)` with `CLOSE_FAILURE`. `Handler.flush()`
+    // and `Handler.close()` declare no checked exception, so propagating would
+    // be a fresh divergence. `catch (Exception)` does not catch an `Error`,
+    // so a `NoSuchMethodError` out of our own dispatch now comes out.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // Residual: HotSpot routes the absorbed exception to the handler's
+    // `ErrorManager`; we drop it, so it is unobservable rather than unthrown.
     r.register(sh, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, flushed)?;
         }
         Ok(None)
     });
     r.register(sh, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
-            let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            // `flushAndClose` runs both inside ONE `try`, so in HotSpot a
+            // failing flush skips the close. `absorb_exception` answers
+            // `Ok(None)` for a clean void return and for an absorbed
+            // exception alike, so that branch is not reconstructible here; the
+            // close is attempted either way, which for a logging sink is the
+            // safer of the two. Recorded in
+            // W7-57-close-flush-swallow-sweep.md.
+            let flushed = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, flushed)?;
+            let closed = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            cratonvm_native_api::delegated_close::absorb_exception(&*ctx, closed)?;
         }
         Ok(None)
     });

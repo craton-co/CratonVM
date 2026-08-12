@@ -773,9 +773,14 @@ fn native_se_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the underlying stream, or `flush()` would be a no-op from the caller's
     // point of view (real `StreamEncoder.implFlush` does the same:
     // `implFlushBuffer()` then `out.flush()`).
+    // …and `implFlush` propagates that `out.flush()` — it is a two-line body
+    // under `throws IOException` with no `catch`. Dropping the failure here
+    // was the worst possible place for it: the caller flushed precisely to
+    // learn whether the encoded bytes reached the sink.
+    // W7-57-close-flush-swallow-sweep.md
     flush_pending_buffer(ctx, this)?;
     if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
-        let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
+        ctx.invoke_virtual(os, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -800,14 +805,32 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the last partial batch (< buffer capacity) would be silently dropped
     // on close, matching real `StreamEncoder.implClose`'s final
     // `implFlushBuffer()` before closing `out`.
+    //
+    // Both delegations PROPAGATE. `StreamEncoder.implClose()` is
+    // `try (out) { …; out.flush(); } catch (IOException x) { encoder.reset();
+    // throw x; }` — the `catch` rethrows, and the `try`-with-resources runs
+    // `out.close()` on both paths, suppressing its own failure into the body's
+    // when there was one. `close()` wraps that in `try { implClose(); }
+    // finally { closed = true; }`, so the closed marker is set either way.
+    // Dropping the failures here reported a truncated file as a clean close.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // (The `addSuppressed` link between the two is not reproduced; recorded as
+    // a residual in that record.)
     flush_pending_buffer(ctx, this)?;
-    if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
-        let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
-        let _ = ctx.invoke_virtual(os, "close", "()V", &[]);
-    }
+    let (flushed, closed) = if let Value::Object(Some(os)) = ctx.get_field_by_name(this, "out") {
+        let flushed = ctx.invoke_virtual(os, "flush", "()V", &[]).map(|_| ());
+        // Attempted regardless, exactly as the `try`-with-resources does.
+        let closed = ctx.invoke_virtual(os, "close", "()V", &[]).map(|_| ());
+        (flushed, closed)
+    } else {
+        (Ok(()), Ok(()))
+    };
     ctx.set_field_by_name(this, "closed", Value::Int(1));
     ctx.set_field_by_name(this, "out", Value::Object(None));
     se_table().lock().unwrap().remove(&se_key(ctx, this));
+    flushed?;
+    closed?;
     Ok(None)
 }
 

@@ -596,8 +596,14 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         // The wrapped stream is `in` (this is an INPUT stream); the previous
         // `get_field_by_name(this, "out")` never resolved on any layout, so the
         // propagation documented above silently never happened.
+        //
+        // …and the propagation is a real propagation: every link on that
+        // chain (`ZipInputStream.close` → `InflaterInputStream.close` →
+        // `FilterInputStream.close` → `in.close()`) declares
+        // `throws IOException` and catches nothing, so a failed close comes
+        // OUT. W7-57-close-flush-swallow-sweep.md
         if let Some(underlying) = iis_underlying(ctx, this) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+            ctx.invoke_virtual(underlying, "close", "()V", &[])?;
         }
         ctx.set_field(this, 1, Value::Object(None));
         ctx.set_field(this, 2, Value::Object(None));
@@ -778,12 +784,25 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         }
         zo_finalize_current_entry(ctx, this);
         zo_write_zip(ctx, this)?;
-        if let Some(underlying) = dos_underlying(ctx, this) {
-            let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-        }
+        // `ZipOutputStream.close()` is `super.close()` =
+        // `DeflaterOutputStream.close()`, whose `finally` ends in a bare
+        // `out.close()` under `throws IOException`. Nothing catches, so the
+        // delegated failure PROPAGATES — and this is the site where dropping
+        // it costs the most: the whole archive has just been written into the
+        // sink and only `close()` can report that it did not land.
+        // W7-57-close-flush-swallow-sweep.md
+        //
+        // The per-stream state drop runs either way (our own bookkeeping,
+        // keyed by a recyclable address), then the failure is reported.
+        let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+            ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+        } else {
+            Ok(())
+        };
         let key = zo_buf_key(ctx, this);
         zo_real_states().lock().unwrap().remove(&key);
         zo_forget_fast_thread_cache(key);
+        closed?;
         Ok(None)
     });
 
@@ -903,14 +922,26 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 }
             }
             let this = ctx.read_native_pin(this_pin, this);
-            if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
-                let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-            }
+            // `InflaterInputStream.close()` is `if (!closed) { if
+            // (usesDefaultInflater) inf.end(); in.close(); closed = true; }`
+            // under `throws IOException` with no `catch`, so the delegated
+            // close PROPAGATES. Reported after the pin is released and the
+            // side tables are dropped — those are our own bookkeeping and
+            // leaving an entry on a recyclable address is its own defect.
+            // W7-57-close-flush-swallow-sweep.md
+            let closed = if let Value::Object(Some(underlying)) =
+                ctx.get_field_by_name(this, "in")
+            {
+                ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+            } else {
+                Ok(())
+            };
             inflater_fast_states()
                 .lock()
                 .unwrap()
                 .remove(&zo_buf_key(ctx, this));
             ctx.unpin_native_roots(this_pin);
+            closed?;
             Ok(None)
         },
     );
@@ -2858,10 +2889,14 @@ pub(crate) fn dos_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// `flush()` deflates pending input only for a `syncFlush` stream; the
 /// public constructors leave that false, so the spec-correct behaviour is to
 /// flush the sink and leave the deflater buffer alone.
+///
+/// `DeflaterOutputStream.flush()` ends in a bare `out.flush()` under
+/// `throws IOException` with no `catch`, so the delegated failure PROPAGATES.
+/// W7-57-close-flush-swallow-sweep.md
 pub(crate) fn dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+        ctx.invoke_virtual(underlying, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -2876,10 +2911,17 @@ pub(crate) fn dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
-    if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-    }
+    // `DeflaterOutputStream.close()` runs `out.close()` in its `finally` under
+    // `throws IOException` and catches nothing (its only `catch (IOException)`
+    // is around `finish()`, and it rethrows). The delegated failure
+    // PROPAGATES. W7-57-close-flush-swallow-sweep.md
+    let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    closed?;
     Ok(None)
 }
 
@@ -3004,8 +3046,12 @@ pub(crate) fn p58_gzip_out_flush(ctx: &mut dyn NativeContext, args: &[Value]) ->
     if is_real_layout(ctx, this, "crc") {
         return ctx.invoke_virtual_bytecode_only(this, "flush", "()V", &[]);
     }
+    // `GZIPOutputStream` does not declare `flush()`, so it inherits
+    // `DeflaterOutputStream.flush()` — a bare `out.flush()` under
+    // `throws IOException` with no `catch`. The delegated failure PROPAGATES.
+    // W7-57-close-flush-swallow-sweep.md
     if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+        ctx.invoke_virtual(underlying, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -3025,10 +3071,21 @@ pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
-    if let Some(underlying) = dos_underlying(ctx, this) {
-        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
-    }
+    // `GZIPOutputStream` inherits `DeflaterOutputStream.close()`: `finish()` in
+    // a `try`, `out.close()` in the `finally`, nothing caught that is not
+    // rethrown. The delegated close PROPAGATES.
+    //
+    // Precedence follows the JDK: when both fail, the JDK's `finally` throws
+    // the CLOSE exception with the finish exception attached as suppressed, so
+    // the close is reported here too. (We do not reproduce the `addSuppressed`
+    // link — recorded as a residual in W7-57-close-flush-swallow-sweep.md.)
+    let closed = if let Some(underlying) = dos_underlying(ctx, this) {
+        ctx.invoke_virtual(underlying, "close", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    closed?;
     finish?;
     Ok(None)
 }
