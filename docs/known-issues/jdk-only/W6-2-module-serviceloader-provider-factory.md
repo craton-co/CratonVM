@@ -1,5 +1,13 @@
 # `ServiceLoader` had no `provider()` factory form, and discarded the `setAccessible` it depended on
 
+> **STATUS 2026-08-12, read this first: ONE live row, not two.** The stream-path
+> subtype check is **fixed** — W7-85-serviceloader-stream-validation.md owns it
+> and owns the population sweep it produced. What is still open here is the
+> **constructor-form** subtype check (and, newly, the public-no-arg-constructor
+> requirement beside it), both absent on both paths and both waiting on the same
+> unmade measurement. The `44/44` numbers below are historical: the vector is
+> now `104/104` on HotSpot 25.0.3.9. See the amendments after the status block.
+
 **Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
 
 * **Headline: CLOSED, verified, and the wall is gone.** This was the **sixth**
@@ -25,12 +33,42 @@
   `SyntheticStub` rows at registration and runs the real
   `java.util.ServiceLoader` bytecode all the way to 44/44.
 
+**AMENDED AGAIN 2026-08-12 (W7-85-serviceloader-stream-validation.md) — the
+first of the two rows below is CLOSED. This record now carries exactly ONE live
+row, the second one. It is still NOT retired.**
+
+* **Row 1, the stream-path subtype check: FIXED**, on branch
+  `fix/serviceloader-stream-accepts-type-20260812`. `service_accepts_type` now
+  has one caller, `factory_return_is_subtype`, and *that* has two —
+  `native_sl_iterator` and `native_sl_stream`. The `44/44` this record was proud
+  of is `104/104` on HotSpot 25.0.3.9: `RJdkModule` gained a `Rejected` service
+  whose module-declared `provider()` returns a non-subtype and a `Nulled`
+  service whose `provider()` returns null, and asserts
+  `ServiceConfigurationError` — exact type, null cause, HotSpot's exact message
+  — from BOTH families, plus that the two families emit the **same** message.
+  The RED was measured on the dev binary first, and it was worse than "the wrong
+  `Provider.type()`": `stream().map(Provider::get)` handed out a `String` for a
+  service interface, which nothing downstream can catch because
+  `invokeFactoryMethod`'s `(S)` cast is erased. The fix, the pin order, the
+  registration argument, the population sweep of this file's other one-path
+  validations, and the blast radius are all in
+  W7-85-serviceloader-stream-validation.md. **Do not re-derive any of it from the
+  text below**, which is kept only because its analysis is correct and is what
+  the fix was built from.
+* **Row 2, the constructor-form subtype check: STILL OPEN**, unchanged, still
+  "deferred for want of a measurement". W7-85's sweep confirms it independently
+  and adds a sibling: the JDK's requirement that a constructor-form provider
+  have a **public** no-arg constructor is also enforced on neither path (both
+  paths use `getDeclaredConstructor` and silently skip on absence). One census
+  settles both — `isAssignableFrom` **and** constructor visibility over the boot
+  modules' `provides` clauses. Nobody has taken it.
+
 **AMENDED 2026-08-12 (RETIREMENT-20260812.md §3) — this record was nominated for
 retirement and is NOT retired. It carries two live rows.**
 
-* **STILL OPEN, and it is not one of the two scope decisions above: the
-  factory-return-type subtype check is applied on ONE of the two provider
-  paths.** `service_accepts_type` (`native-builtins/src/service_loader.rs:1677`)
+* **CLOSED 2026-08-12 by W7-85; see the amendment above. As written when it was
+  found: the factory-return-type subtype check is applied on ONE of the two
+  provider paths.** `service_accepts_type` (`native-builtins/src/service_loader.rs:1677`)
   has exactly one caller, at `:1897`, inside the **iterator** path
   (`native_sl_iterator`). The **stream** path (`native_sl_stream`, factory block
   at `:2401-2420`) calls `factory_return_type` and uses the result only to build

@@ -278,7 +278,7 @@ fn boot_layer_memo() -> &'static std::sync::Mutex<std::collections::HashMap<usiz
 /// ModuleLayer.boot()` and `someModule.getLayer() == ModuleLayer.boot()` are
 /// both spec'd identities, and JDK code compares layers with `==`. This used to
 /// allocate a FRESH layer on every call, so both comparisons were always false
-/// (measured: `regression-suite/src/RJdkModule.java:57` fails with "module must
+/// (measured: `regression-suite/src/RJdkModule.java:60` fails with "module must
 /// be in the boot layer" in real-jdk AND jdk-only, while HotSpot 25 passes).
 /// Memoise per VM instead.
 fn build_boot_layer(
@@ -430,7 +430,7 @@ fn populate_boot_layer_modules(
         // `ClassLoaderValue` — and NOT the layer. Populating `nameToModule`
         // above fixes only `ServiceLoader.load(layer, Service.class)`; without
         // this the plain overload still answers `[]`. Both are asserted, three
-        // lines apart, in `RJdkModule.moduleServices()` (`:223` is this route,
+        // lines apart, in `RJdkModule.moduleServices()` (`:233` is this route,
         // `:242` the layer one), and fixing the layer alone moved the failure
         // by zero lines.
         //
@@ -559,7 +559,7 @@ fn record_module_packages(ctx: &mut dyn NativeContext, module: ObjectRef, name: 
 /// not override `equals`, so every JDK comparison of two Modules is `==`; a
 /// fresh Module per `findModule` call made
 /// `Greeter.class.getModule() == ModuleLayer.boot().findModule(m).get()` false
-/// (measured: `regression-suite/src/RJdkModule.java:129`, HotSpot passes).
+/// (measured: `regression-suite/src/RJdkModule.java:139`, HotSpot passes).
 ///
 /// Fabricated stand-ins for names the registry does NOT know are deliberately
 /// left out of that cache: they are a permissive fallback, not a fact about the
@@ -756,7 +756,7 @@ pub(crate) fn native_module_layer_find_module(
     // `ModuleLayer.boot().findModule(anything).isPresent()` was unconditionally
     // true. Two costs, both measured: `RJdkFailure.java:274`
     // (`findModule("cratonvm.no.such.module").isEmpty()`) failed outright, and
-    // `RJdkModule.java:48`'s "was --module-path passed?" check passed
+    // `RJdkModule.java:51`'s "was --module-path passed?" check passed
     // VACUOUSLY — which is why the real module defect only surfaced several
     // checks downstream.
     //
@@ -783,7 +783,7 @@ pub(crate) fn native_module_layer_find_module(
 
 /// `Module.getResourceAsStream(String)`.
 ///
-/// Registered nowhere before this — `RJdkModule.java:192/198/204/208` are the
+/// Registered nowhere before this — `RJdkModule.java:202/208/214/218` are the
 /// four checks that need it, and real JDK bytecode for this method routes
 /// through `BuiltinClassLoader.findResourceAsStream` / a `ModuleReader`, neither
 /// of which CratonVM models. Companion entry required in
@@ -1211,7 +1211,7 @@ fn build_unqualified_export(
 // `regression-suite/src/RJdkModule.java` (`--module-path build-modules
 // --add-modules cratonvm.jdkonly.svc`): HotSpot reports
 // `exports=[com.cratonvm.jdkonly.svc, com.cratonvm.jdkonly.svc.open]`, CratonVM
-// reported `[]` and the vector died at `RJdkModule.java:69`.
+// reported `[]` and the vector died at `RJdkModule.java:72`.
 //
 // The registry stores names in INTERNAL (slash) form; every `java.lang.module`
 // API speaks BINARY (dot) form, so each name crosses `dotted` on the way out.
@@ -2033,7 +2033,7 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // `register_jboss_jdkspecific` at ~:9578 and registers
     // `java/lang/Module.getResourceAsStream` again at ~:18208). Until that site
     // was pointed at this callback, the encapsulation check above was DEAD CODE
-    // and every module resource was served unconditionally — `RJdkModule.java:198`
+    // and every module resource was served unconditionally — `RJdkModule.java:208`
     // ("a resource in a non-open package must NOT be readable from another
     // module") failed in both jdk modes while the three permissive checks around
     // it passed. Keeping this row means the gate is installed even if the lib.rs

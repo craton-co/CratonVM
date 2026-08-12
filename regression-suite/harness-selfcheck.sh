@@ -84,6 +84,17 @@ copy_tree() {
 HAVE_MODULE=""
 if [ -f "$HERE/modules/$JDKONLY_MODULE/module-info.java" ]; then
   if "$JAVAC" --module-source-path "$HERE/modules" -d "$WORK/mod" --module "$JDKONLY_MODULE"; then
+    # Second pass, mirroring run.sh's `compile_modules`: recompile
+    # modules-overlay/ over the module output on a PLAIN CLASSPATH, so the
+    # illegal `provider()` return type javac refuses inside a `provides` clause
+    # is what the VM actually loads. Without it RJdkModule's negative
+    # ServiceLoader checks read green here and red under run.sh.
+    if [ -d "$HERE/modules-overlay/$JDKONLY_MODULE" ]; then
+      ovl=$(find "$HERE/modules-overlay/$JDKONLY_MODULE" -name '*.java' | tr '\n' ' ')
+      # Unquoted on purpose: a source-file word list, not one path.
+      [ -n "$ovl" ] && { "$JAVAC" -classpath "$WORK/mod/$JDKONLY_MODULE" \
+          -d "$WORK/mod/$JDKONLY_MODULE" $ovl || { echo "ERROR: overlay javac failed"; exit 3; }; }
+    fi
     copy_tree "$HERE/modules/$JDKONLY_MODULE" "$WORK/mod/$JDKONLY_MODULE"
     HAVE_MODULE=1
   fi
