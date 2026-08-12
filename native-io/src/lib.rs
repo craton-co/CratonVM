@@ -20618,6 +20618,41 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         native_dc_local_addr,
     );
+    // Package-private `localAddress()` — the SAME bridge `SocketChannel` and
+    // `ServerSocketChannel` already register (see `socket_channel.rs`), and for
+    // the same reason: it is declared on `sun.nio.ch.DatagramChannelImpl`, not
+    // on the abstract `java.nio.channels.DatagramChannel` this VM actually
+    // instantiates, while `channel.socket()` hands back the REAL
+    // `sun.nio.ch.DatagramSocketAdaptor` whose JDK bytecode calls it.
+    //
+    // Without this row every DatagramSocket accessor that goes through the
+    // adaptor dies with
+    //   NoSuchMethodError: java.nio.channels.DatagramChannel.localAddress()
+    // — `isBound()`, and through it `getLocalAddress()` answering null, which
+    // is what NPEs `DefaultDatagramChannelConfig.setBroadcast` (netty
+    // `NioDatagramChannelTest.testBindMultiple`) and makes `isBroadcast()`
+    // report `SocketException: Socket is closed` on an open socket
+    // (`testGetOptions`, `testNioChannelOption`).
+    //
+    // NOTE THE DESCRIPTOR. `DatagramChannelImpl.localAddress()` returns the
+    // NARROWER `java.net.InetSocketAddress`, unlike `SocketChannelImpl`'s
+    // `java.net.SocketAddress`. Registering the SocketChannel spelling here
+    // resolves nothing -- the NoSuchMethodError just comes back naming
+    // `()Ljava/net/InetSocketAddress;`. Register both spellings so either
+    // resolution wins; `native_dc_local_addr` already builds a real
+    // `java.net.InetSocketAddress`, so both are type-correct.
+    r.register(
+        dc,
+        "localAddress",
+        "()Ljava/net/InetSocketAddress;",
+        native_dc_local_addr,
+    );
+    r.register(
+        dc,
+        "localAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_local_addr,
+    );
 
     // socket() → DatagramSocket
     r.register(dc, "socket", "()Ljava/net/DatagramSocket;", native_dc_socket);
