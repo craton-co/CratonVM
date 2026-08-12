@@ -5190,14 +5190,15 @@ fn fmt_spec_text(
     precision: Option<usize>,
     conversion: char,
 ) -> String {
+    // `FormatSpecifier.toString` writes the FLAGS before the argument index,
+    // and writes them in `Flags.toString`'s canonical order rather than the
+    // order they were typed — `%#-s` reports itself as `%-#s`. The '<' flag
+    // is one of them, so it survives here as written.
     let mut s = String::from("%");
+    s.push_str(&fmt_flags_string(flags));
     if let Some(i) = explicit_index {
         s.push_str(&format!("{}$", i + 1));
     }
-    // The '<' flag is stored with the others but is written as the argument
-    // index, so it survives verbatim here — as it does in the JDK, whose
-    // `toString` re-emits `Flags.toString(flags)` including PREVIOUS.
-    s.push_str(flags);
     if let Some(w) = width {
         s.push_str(&w.to_string());
     }
@@ -5265,11 +5266,18 @@ fn fmt_check_spec(
         // them here — the JDK admits it only for a `Formattable` argument,
         // which this native never dispatches to.
         'b' | 'B' | 'h' | 'H' | 's' | 'S' => {
-            mismatch("#")?;
+            // `checkGeneral` rejects '#' up front for 'b'/'h' only; for
+            // 's' the JDK gets there later, inside `print(Object)`, which is
+            // why `%#-s` reports the MISSING WIDTH and `%#-b` reports the
+            // flag mismatch. Order is the whole of the difference.
+            if matches!(conversion, 'b' | 'B' | 'h' | 'H') {
+                mismatch("#")?;
+            }
             if width.is_none() && flags.contains('-') {
                 return Err(FmtFault::MissingWidth(spec_text()));
             }
             mismatch("+ 0,(")?;
+            mismatch("#")?;
         }
         'c' | 'C' => {
             if let Some(p) = precision {
@@ -6645,12 +6653,20 @@ fn format_arg_full(
             // accepts '0' for them. %a/%A stay out deliberately: their zeros go
             // AFTER the "0x" prefix, which this generic insert cannot do.
             //
-            // The trailing-digit test stands in for Formatter's structure,
-            // where zero padding happens only inside the FINITE branch —
-            // "Infinity"/"NaN" reach the width justifier and get spaces.
+            // The non-finite test stands in for Formatter's structure, where
+            // zero padding happens only inside the FINITE branch —
+            // "Infinity"/"NaN" reach the width justifier and get spaces. It
+            // used to be "ends with an ASCII digit", which mistook two finite
+            // renderings for infinities the moment this lane gave them
+            // non-digit tails: `%#010x` ends in a HEX digit and `%(08d` ends in
+            // the closing parenthesis, and both silently reverted to space
+            // padding.
             else if zero_pad
                 && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
-                && formatted.ends_with(|c: char| c.is_ascii_digit())
+                && !formatted.ends_with("Infinity")
+                && !formatted.ends_with("INFINITY")
+                && !formatted.ends_with("NaN")
+                && !formatted.ends_with("NAN")
             {
                 // The zeros go INSIDE whatever the value already leads with —
                 // a sign, an opening parenthesis, or an alternate-form radix
