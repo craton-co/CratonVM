@@ -8046,18 +8046,15 @@ mod tests {
              asByteBuffer(); measured, not assumed"
         );
         let thrown = array_fn(&mut ctx, &[Value::Object(Some(buf))]);
-        assert!(
-            matches!(
-                thrown,
-                Err(MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Runtime(
-                        RuntimeError::UnsupportedOperationException { .. }
-                    )
-                ))
+        match &thrown {
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { .. },
+            ))) => {}
+            other => panic!(
+                "array() on an Arena segment's buffer must throw \
+                 UnsupportedOperationException as HotSpot does, got {other:?}"
             ),
-            "array() on an Arena segment's buffer must throw \
-             UnsupportedOperationException as HotSpot does, got {thrown:?}"
-        );
+        }
 
         // --- the control: a genuine heap buffer still answers with its array.
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
@@ -8075,11 +8072,13 @@ mod tests {
             Ok(Some(Value::Int(1)))
         ));
         let got = array_fn(&mut ctx, &[Value::Object(Some(heap))]);
-        assert!(
-            matches!(got, Ok(Some(Value::Object(Some(a)))) if a == arr),
-            "a genuine heap buffer must still answer array() with its own \
-             backing array, got {got:?}"
-        );
+        match &got {
+            Ok(Some(Value::Object(Some(a)))) if *a == arr => {}
+            other => panic!(
+                "a genuine heap buffer must still answer array() with its own \
+                 backing array, got {other:?}"
+            ),
+        }
 
         // --- and the OTHER slot-5 population: `native-builtins`' own typed
         // buffer views park a real array there, because `segment` is the only
