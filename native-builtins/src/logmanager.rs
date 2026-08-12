@@ -1313,8 +1313,22 @@ pub(crate) fn reset_state_for_tests() {
 // ---------------------------------------------------------------------------
 
 fn native_get_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
-    Ok(Some(Value::Object(Some(obj?))))
+    let obj = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
+    // Real `LogManager.ensureLogManagerInitialized()` finishes by adding TWO
+    // loggers to the root context: the root logger `""` and `Logger.global`.
+    // Ours demand-created the root on first use and never registered `global`
+    // at all, so `getLoggerNames()` came back one short of HotSpot —
+    // `[, namesprobe.one]` against `[, global, namesprobe.one]` (measured).
+    //
+    // `Logger.getGlobal()` still ANSWERED, because our `getLogger` demand-
+    // creates any name; what was missing is the REGISTRATION, and only an
+    // enumeration of the registry can see the difference. That is the whole
+    // reason regression-suite RJdkLogging prints `loggerNames=` instead of
+    // only asserting `contains(...)`: a registry that fabricates on demand
+    // satisfies every membership test and still has the wrong contents.
+    let _ = get_or_create_logger(ctx, "");
+    let _ = get_or_create_logger(ctx, "global");
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn native_get_jboss_log_manager(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -3656,6 +3670,7 @@ fn notify_jul_logger_filter(
     let message = ctx.read_native_pin(message_pin, message);
     ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
     ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+    stamp_inferred_caller(ctx, record);
     let _ = ctx.invoke_virtual(
         record,
         "setLevel",
@@ -3754,6 +3769,7 @@ fn publish_jul_handlers_src(
         let record_pin = ctx.pin_native_root(record);
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        stamp_inferred_caller(ctx, record);
         // Real JDK LogRecord's instance layout is level, sequenceNumber,
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
@@ -4120,6 +4136,63 @@ fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -
     Ok(None)
 }
 
+/// Stamp a bridge-built `LogRecord` with the class and method that called the
+/// log method, the way `java.util.logging.LogRecord.inferCaller()` does.
+///
+/// Neither record site in this file ran it, so the pair stayed null on every
+/// `logger.warning("...")`-shaped call — only the `logp` family, whose caller
+/// hands the pair in, ever carried one. That is not a silent gap:
+/// `SimpleFormatter`'s default pattern renders the source pair and falls back
+/// to the LOGGER NAME when there is none, so the JDK's own formatter papers
+/// over it and the output merely looks wrong. HotSpot renders
+/// `RJdkLogging formattedOutputIsRealBytes`; CratonVM rendered
+/// `rjdklogging.stream` (regression-suite RJdkLogging,
+/// `formattedOutputIsRealBytes`).
+///
+/// EAGER, where the JDK is lazy, and the reason is measured rather than
+/// stylistic. `inferCaller` can afford to run inside `getSourceClassName()`
+/// because on HotSpot the frames it walks — `Logger.warning`, `Logger.log`,
+/// `doLog` — are Java frames still on the stack when the formatter asks. On
+/// CratonVM that whole chain is NATIVE, so a stack captured from the accessor
+/// holds only `[caller…, Handler.publish]` with no `java/util/logging` frame
+/// in it at all (measured: `frames=2 stack=["SrcProbe2.main",
+/// "SrcProbe2$Cap.publish"]`), and the JDK's "skip the logging frames, take
+/// the next one" latch can never trip. Here, at record construction, the
+/// innermost Java frame IS the caller.
+///
+/// Known divergence, deliberate: reading the pair AFTER the log call has
+/// returned yields the caller here and `null` on HotSpot, because HotSpot's
+/// inference is lazy and fails once its frames are gone. Nothing rests on that
+/// null — `SimpleFormatter` reads during `publish`, where both now answer
+/// identically — and being deterministic is the better failure mode.
+fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
+    let frames = ctx.capture_stack_trace(0);
+    // Outermost-first, so the innermost frame — the direct caller of the log
+    // method — is the LAST one. Skip any logging/reflection frame a re-entrant
+    // log call could have left on top.
+    let Some(frame) = frames.iter().rev().find(|f| {
+        let c = f.class_name.as_ref();
+        !c.starts_with("java/util/logging/")
+            && !c.starts_with("sun/util/logging/")
+            && !c.starts_with("java/lang/reflect/")
+            && !c.starts_with("jdk/internal/reflect/")
+    }) else {
+        return;
+    };
+    let class = frame.class_name.replace('/', ".");
+    let method = frame.method_name.as_ref().to_string();
+    let record_pin = ctx.pin_native_root(record);
+    let cls_obj = ctx.create_string(&class);
+    let cls_pin = ctx.pin_native_root(cls_obj);
+    let mth_obj = ctx.create_string(&method);
+    let cls_obj = ctx.read_native_pin(cls_pin, cls_obj);
+    let record = ctx.read_native_pin(record_pin, record);
+    ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
+    ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+    ctx.unpin_native_roots(cls_pin);
+    ctx.unpin_native_roots(record_pin);
+}
+
 /// Real JUL keeps `useParentHandlers` inside the private
 /// `Logger$ConfigurationData` (`config`), which our natively-constructed
 /// loggers never materialize — and the compact synthetic shape has no such
@@ -4417,6 +4490,7 @@ fn publish_to_jul_handlers_full(
         // surface explicit just as the direct-handler bridge does.
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        stamp_inferred_caller(ctx, record);
         ctx.set_field(record, 4, Value::Object(Some(message)));
         // FIX (logbackloggingsystemtests-julbridge-loggername-null): this
         // synthetic `LogRecord` bypasses `Logger.log(LogRecord)`'s real
