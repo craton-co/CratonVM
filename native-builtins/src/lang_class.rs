@@ -13694,9 +13694,12 @@ fn create_annotation_proxy_with_type(
     // creates without a class file. Minted through
     // `try_alloc_concurrent_synthetic` alone it looked like a §5 compatibility
     // stand-in, and `--jdk-only` refused it: measured, that took
-    // `getAnnotation` to null on RReflect/RJdkReflect (the four
-    // `if let Ok(Some(proxy))` sites below swallow the refusal — residual R1 of
-    // the record) and to `NoClassDefFoundError` on RJdkJmx.
+    // `getAnnotation` to null on RReflect/RJdkReflect and to
+    // `NoClassDefFoundError` on RJdkJmx. The reason ONE cause wore two faces
+    // was that the single-annotation entry points below spelled the call
+    // `if let Ok(Some(proxy)) = …` and dropped this `?`'s error on the floor;
+    // that was residual R1 of the record and is fixed separately under W7-26,
+    // so a refusal here now reaches its caller by both routes.
     //
     // The refusal is the ONLY half that moves. `--dump-native-registry` over a
     // boot in each mode reports **zero** natives registered under this class
@@ -15131,7 +15134,31 @@ pub(crate) fn native_class_get_declared_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            // W7-26 — `?`, not `if let Ok(..)`. This was the first of five
+            // single-annotation sites that dropped the builder's `Err` and fell
+            // through to the `Ok(Some(Value::Object(None)))` below, i.e. to
+            // **null**. Null is a LEGITIMATE answer here — it means "not
+            // present" — so the caller has no way to tell a VM failure from an
+            // absent annotation, which is why the refusal measured in W7-12
+            // surfaced three frames away as a bare `AssertionError` instead of
+            // naming its class. Its array-valued siblings
+            // (`build_class_annotation_array` and friends) have always used
+            // `?`, and so does `native_method_get_annotation` a few hundred
+            // lines down; one run of the pre-fix binary showed both faces of the
+            // same cause at once — `RJdkJmx` (array path) got
+            // `NoClassDefFoundError: java/lang/annotation/AnnotationProxy`
+            // verbatim while `RReflect` (this path) got null.
+            //
+            // The discrimination line is the one W7-20 drew for the collection
+            // helpers: **`Err` propagates; `Ok`-with-nothing-usable stays
+            // empty.** `cached_annotation_proxy_resolving` still answers
+            // `Ok(None)` for an annotation type it cannot resolve, and that
+            // keeps falling through to null exactly as before — only the `Err`
+            // arm moves. `MethodCallFailed::ExceptionThrown` is the arm that
+            // matters most: it means a real exception is already pending in the
+            // VM, and the old spelling both hid it and kept calling back into
+            // the VM underneath it.
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -15170,7 +15197,10 @@ pub(crate) fn native_class_get_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            // W7-26 — `?`. See `native_class_get_declared_annotation` above for
+            // the full argument; this is the site the `RReflect` and
+            // `RJdkReflect` assertions actually ran through.
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -15185,7 +15215,14 @@ pub(crate) fn native_class_get_annotation(
                 if ann.type_descriptor == target_desc {
                     // Key by the queried class (class_id), matching HotSpot's
                     // per-class annotationData for inherited annotations.
-                    if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                    //
+                    // W7-26 — `?`. Propagating matters more here than at the
+                    // two flat sites, not less: this is a LOOP, so the old
+                    // spelling walked on to the next superclass with an
+                    // exception already pending in the VM and kept calling
+                    // `class_annotations` / the builder underneath it. HotSpot
+                    // would have bailed at the first `CHECK`.
+                    if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
                 }
@@ -15661,7 +15698,16 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = annotation_container_loader(ctx, class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = create_annotation_proxy(ctx, ann, Some(class_id), container_loader)
+            // W7-26 — `?`. Same species as the three `Class` sites above; this
+            // one reaches the builder directly rather than through the cache,
+            // but `create_annotation_proxy` has the identical
+            // `Result<Option<_>, MethodCallFailed>` shape, so `Ok(None)` (an
+            // annotation type that would not resolve) still falls through to
+            // null and only the `Err` arm changes. Caller-visible: a
+            // `Field.getAnnotation` that fails now throws instead of agreeing
+            // with `Field.isAnnotationPresent` = true and answering null.
+            if let Some(proxy) =
+                create_annotation_proxy(ctx, ann, Some(class_id), container_loader)?
             {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
@@ -20440,6 +20486,42 @@ fn annotated_type_stashed_anns(
     Some((arr, ctx.array_length(arr)))
 }
 
+/// One rung of a type-mirror resolution LADDER: keep the fallback, keep the
+/// exception.
+///
+/// W7-26. The `AnnotatedType` builders below are written as ladders — try
+/// `getGenericReturnType()`, else the erased `getReturnType()`, else a
+/// `ClassId(0)` mirror — and every rung was spelled `_ =>`, which catches
+/// `Err` along with the "this rung had no answer" cases. That is the same
+/// species as the `getAnnotation` sites this record is named for: a thrown
+/// exception became an `AnnotatedType` wrapping the WRONG type (usually the
+/// `ClassId(0)` mirror), which is a plausible-looking object no caller can
+/// tell from a real one.
+///
+/// The two `MethodCallFailed` variants are not the same thing and the ladder
+/// only ever meant one of them:
+///
+/// * `ExceptionThrown` — a real Java exception is pending in the VM (a
+///   malformed `Signature` attribute raising `GenericSignatureFormatError`, a
+///   `TypeNotPresentException` from a class-valued member). HotSpot propagates
+///   these out of `getAnnotatedReturnType` too, and continuing to call back
+///   into the VM with an exception pending is what HotSpot's `CHECK_` macros
+///   exist to prevent. Re-raised.
+/// * `InternalError` — the receiver has no such method at all, which is
+///   exactly the "unavailable, use the next rung" case the ladders were
+///   written for (a CratonVM-built `Method`, a synthetic-JDK receiver). Mapped
+///   to `Ok(None)` so the existing fallback runs unchanged.
+///
+/// So no non-throwing path moves in either mode; only a previously-vanishing
+/// exception now reaches its caller.
+fn ladder_rung(result: MethodCallResult) -> MethodCallResult {
+    match result {
+        Ok(value) => Ok(value),
+        Err(e @ MethodCallFailed::ExceptionThrown(_)) => Err(e),
+        Err(MethodCallFailed::InternalError(_)) => Ok(None),
+    }
+}
+
 /// `Method.getAnnotatedReturnType()Ljava/lang/reflect/AnnotatedType;`
 ///
 /// Builds an AnnotatedType wrapping the return type and carrying the
@@ -20467,15 +20549,23 @@ pub(crate) fn native_method_get_annotated_return_type(
         ),
         None => (None, Vec::new(), Vec::new()),
     };
-    let type_mirror = match ctx.invoke_virtual(
+    // W7-26 — `ladder_rung` keeps both fallbacks and re-raises a real pending
+    // exception instead of reflecting the `ClassId(0)` mirror as this method's
+    // return type.
+    let type_mirror = match ladder_rung(ctx.invoke_virtual(
         this,
         "getGenericReturnType",
         "()Ljava/lang/reflect/Type;",
         &[],
-    ) {
-        Ok(Some(Value::Object(Some(m)))) => m,
-        _ => match ctx.invoke_virtual(this, "getReturnType", "()Ljava/lang/Class;", &[]) {
-            Ok(Some(Value::Object(Some(m)))) => m,
+    ))? {
+        Some(Value::Object(Some(m))) => m,
+        _ => match ladder_rung(ctx.invoke_virtual(
+            this,
+            "getReturnType",
+            "()Ljava/lang/Class;",
+            &[],
+        ))? {
+            Some(Value::Object(Some(m))) => m,
             _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
         },
     };
@@ -20487,11 +20577,27 @@ pub(crate) fn native_method_get_annotated_return_type(
 /// `Parameter.getType()`, as a `Class` mirror вЂ” the fallback backing `Type`
 /// for [`native_parameter_get_annotated_type`] when the declaring
 /// executable's generic parameter type isn't available.
-fn parameter_erased_type_mirror(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
-        Ok(Some(Value::Object(Some(m)))) => m,
-        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-    }
+/// W7-26 — this returns `Result`, and the return type IS the fix.
+///
+/// W7-20's sharpest observation was that the same refusal was loud on four
+/// rows and silent on one, and the only difference was the return type of the
+/// helper it landed in. This was that helper: a bare `ObjectRef` gave it no
+/// error channel, so an exception out of `Parameter.getType()` had nowhere to
+/// go but the `ClassId(0)` mirror, and `Parameter.getAnnotatedType()` reflected
+/// a parameter whose type was garbage. Both call sites are inside
+/// `native_parameter_get_annotated_type`, which is a `MethodCallResult` and
+/// already `?`s the `make_annotated_type_with_anns` two lines below — the
+/// channel was always there, this helper just did not reach it.
+fn parameter_erased_type_mirror(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(
+        match ladder_rung(ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]))? {
+            Some(Value::Object(Some(m))) => m,
+            _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        },
+    )
 }
 
 /// `Parameter.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
@@ -20533,19 +20639,22 @@ pub(crate) fn native_parameter_get_annotated_type(
         }
         None => (None, Vec::new(), Vec::new()),
     };
-    let type_mirror = match ctx.invoke_virtual(
+    // W7-26 — see `ladder_rung`. The erased fallback still covers every
+    // non-throwing reason it already covered (no generic array, index out of
+    // range for a synthetic/mandated parameter, a non-object element).
+    let type_mirror = match ladder_rung(ctx.invoke_virtual(
         exec,
         "getGenericParameterTypes",
         "()[Ljava/lang/reflect/Type;",
         &[],
-    ) {
-        Ok(Some(Value::Object(Some(arr)))) if idx < ctx.array_length(arr) => {
+    ))? {
+        Some(Value::Object(Some(arr))) if idx < ctx.array_length(arr) => {
             match ctx.get_array_element(arr, idx) {
                 Value::Object(Some(m)) => m,
-                _ => parameter_erased_type_mirror(ctx, this),
+                _ => parameter_erased_type_mirror(ctx, this)?,
             }
         }
-        _ => parameter_erased_type_mirror(ctx, this),
+        _ => parameter_erased_type_mirror(ctx, this)?,
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
     stash_annotated_type_argument_anns(at, type_arg_anns);
@@ -20576,9 +20685,14 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
+    // W7-26 — see `ladder_rung`. An empty erased-mirror vector here is also the
+    // LENGTH reference for the generic array below, so a swallowed exception
+    // did not merely lose one type: it silently shortened
+    // `getAnnotatedParameterTypes()` to zero elements.
     let erased_type_mirrors: Vec<ObjectRef> =
-        match ctx.invoke_virtual(this, "getParameterTypes", "()[Ljava/lang/Class;", &[]) {
-            Ok(Some(Value::Object(Some(arr)))) => {
+        match ladder_rung(ctx.invoke_virtual(this, "getParameterTypes", "()[Ljava/lang/Class;", &[]))?
+        {
+            Some(Value::Object(Some(arr))) => {
                 let n = ctx.array_length(arr);
                 (0..n)
                     .map(|i| match ctx.get_array_element(arr, i) {
@@ -20589,15 +20703,16 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
             }
             _ => Vec::new(),
         };
-    let generic_type_mirrors: Vec<ObjectRef> = match ctx.invoke_virtual(
+    // W7-26 — see `ladder_rung`. The erased-mirror fallback below stays for
+    // every non-throwing reason it already covered, including the deliberate
+    // length-mismatch guard.
+    let generic_type_mirrors: Vec<ObjectRef> = match ladder_rung(ctx.invoke_virtual(
         this,
         "getGenericParameterTypes",
         "()[Ljava/lang/reflect/Type;",
         &[],
-    ) {
-        Ok(Some(Value::Object(Some(arr))))
-            if ctx.array_length(arr) == erased_type_mirrors.len() =>
-        {
+    ))? {
+        Some(Value::Object(Some(arr))) if ctx.array_length(arr) == erased_type_mirrors.len() => {
             let n = ctx.array_length(arr);
             (0..n)
                 .map(|i| match ctx.get_array_element(arr, i) {
@@ -20654,14 +20769,21 @@ pub(crate) fn native_field_get_annotated_type(
         ),
         None => (None, Vec::new(), Vec::new()),
     };
-    let type_mirror =
-        match ctx.invoke_virtual(this, "getGenericType", "()Ljava/lang/reflect/Type;", &[]) {
-            Ok(Some(Value::Object(Some(m)))) => m,
-            _ => match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
-                Ok(Some(Value::Object(Some(m)))) => m,
-                _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-            },
-        };
+    // W7-26 — see `ladder_rung`. `Field.getAnnotatedType()` reflecting the
+    // `ClassId(0)` mirror because `getGenericType()` threw is a wrong answer
+    // dressed as a right one.
+    let type_mirror = match ladder_rung(ctx.invoke_virtual(
+        this,
+        "getGenericType",
+        "()Ljava/lang/reflect/Type;",
+        &[],
+    ))? {
+        Some(Value::Object(Some(m))) => m,
+        _ => match ladder_rung(ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]))? {
+            Some(Value::Object(Some(m))) => m,
+            _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        },
+    };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
@@ -20712,9 +20834,29 @@ pub(crate) fn native_annotated_type_get_annotation(
                 // proxy is invalid and turns a valid type-use annotation into a
                 // false negative. The public Annotation contract supplies the
                 // precise type mirror for both representations.
-                if let Ok(Some(Value::Object(Some(tm)))) =
-                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])
-                {
+                // W7-26 — `ladder_rung`, then match on the VALUE. Found by the
+                // sweep that followed the four `getAnnotation` sites: this is
+                // the fifth instance of the same species and the only one
+                // outside the `Class`/`Field` pair. `annotationType()` here is
+                // a real virtual dispatch into a JDK dynamic proxy's
+                // invocation handler, so it can genuinely throw, and swallowing
+                // that turned `AnnotatedType.getAnnotation(X)` into null —
+                // which reads as "no such type-use annotation".
+                //
+                // `ladder_rung` rather than a bare `?` because this is a SCAN,
+                // not a build: unlike the four `Class`/`Field` sites, there is
+                // a next element to try, so a stashed object that has no
+                // `annotationType` at all (`InternalError`) should still be
+                // skipped exactly as it was before. Only a real pending
+                // exception aborts. A non-Class or void return is likewise
+                // still just "not this element".
+                let ann_type = ladder_rung(ctx.invoke_virtual(
+                    proxy,
+                    "annotationType",
+                    "()Ljava/lang/Class;",
+                    &[],
+                ))?;
+                if let Some(Value::Object(Some(tm))) = ann_type {
                     if mirror_class_id(ctx, tm) == Some(want) {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
@@ -20754,24 +20896,28 @@ pub(crate) fn native_annotated_type_get_annotated_owner_type(
         "java/lang/reflect/ParameterizedType"
             | "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"
     ) {
-        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+        // W7-26 — see `ladder_rung`. A null owner is a legitimate answer for a
+        // top-level type, so an exception swallowed here was indistinguishable
+        // from "this type has no owner".
+        if let Some(Value::Object(Some(owner))) = ladder_rung(ctx.invoke_virtual(
             backing_type,
             "getOwnerType",
             "()Ljava/lang/reflect/Type;",
             &[],
-        ) {
+        ))? {
             let at = make_annotated_type(ctx, owner);
             return Ok(Some(Value::Object(Some(at))));
         }
     }
 
     if backing_name == "java/lang/Class" {
-        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+        // W7-26 — same shape, same null-is-legitimate hazard.
+        if let Some(Value::Object(Some(owner))) = ladder_rung(ctx.invoke_virtual(
             backing_type,
             "getDeclaringClass",
             "()Ljava/lang/Class;",
             &[],
-        ) {
+        ))? {
             let at = make_annotated_type(ctx, owner);
             return Ok(Some(Value::Object(Some(at))));
         }
@@ -20826,13 +20972,18 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
         }
     };
 
-    let type_args = match ctx.invoke_virtual(
+    // W7-26 — see `ladder_rung`. The empty-array fallback is the documented
+    // no-side-table behaviour and stays; what changes is that an exception out
+    // of `getActualTypeArguments()` no longer reads as "this parameterized type
+    // has no arguments", which for an `AnnotatedParameterizedType` is a
+    // contradiction a caller cannot detect.
+    let type_args = match ladder_rung(ctx.invoke_virtual(
         backing_type,
         "getActualTypeArguments",
         "()[Ljava/lang/reflect/Type;",
         &[],
-    ) {
-        Ok(Some(Value::Object(Some(arr)))) => arr,
+    ))? {
+        Some(Value::Object(Some(arr))) => arr,
         _ => {
             let comp = ctx
                 .class_id_by_name("java/lang/reflect/AnnotatedType")
