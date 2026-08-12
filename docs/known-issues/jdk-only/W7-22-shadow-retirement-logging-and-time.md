@@ -1,5 +1,12 @@
 # W7-22 — the next shadow-retirement increment: logging and date/time
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** §4's named cause
+> is superseded and its prescribed repair is DEAD — see the marker at the head
+> of that section, and W7-25-jul-getlogger-regression.md for the mechanism that
+> was actually behind it. §4's *observation* stands. The status line below is
+> otherwise as filed: the 7-row `java/io/Print*` retirement is genuinely still
+> unapplied.
+
 **Status:** OPEN. 36 shadow rows resolved out of 36 owned; **7 retirable
 (patch below, not applied), 29 blocked**. Two live defects found on the way,
 one of them a regression in the retirement this lane was told to follow.
@@ -343,6 +350,19 @@ the whole job:
 ---
 
 ## 4. Live defect: the `java/util/logging` retirement broke strict-mode JUL
+
+> **§4's NAMED CAUSE IS WRONG, AND ITS PRESCRIBED REPAIR IS DEAD — DO NOT APPLY.
+> Reconciled 2026-08-12.** The *regression* below is real and was measured
+> correctly. The *cause* named under "What must become real first" is not it, and
+> "build the singleton through its real constructor" was written, measured
+> **INERT IN BOTH MODES**, and reverted. The real mechanism is more general: a
+> retired shadow is silently reinstated by any other registrar holding the same
+> triple under a `NativeKind` the retirement is exempt from. The fix that landed
+> is a category change — `r.with_category(NativeKind::Bridge, …)` at
+> `native-builtins/src/phases_early.rs:20627-20637`, commits `4eaa5d321` and
+> `3b20b83b5`. Full write-up: W7-25-jul-getlogger-regression.md. Index entry:
+> W7-55-record-reconciliation.md §2.4. Kept below unedited for the causal A/B,
+> which is the reusable part.
 
 This is the precedent this lane was told to follow, and it is a regression.
 

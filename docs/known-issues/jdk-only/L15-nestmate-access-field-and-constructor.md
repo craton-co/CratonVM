@@ -32,15 +32,40 @@
   `confirmed_nest_host_name` (`native-builtins/src/lang_reflect.rs:1439`) has no
   hidden-class exemption — contrast `classloading/src/access_control.rs`. This
   fails **closed**, so it over-denies rather than under-denies.
-* **Residual: STILL OPEN — the missing vector.** The targeted probe this record
-  asks for (a nestmate field read with **no** `setAccessible`, inserted before
-  `regression-suite/src/RJdkReflect.java:182`) was never added; `:181-183` still
-  calls `setAccessible(true)` first. The only nestmate-without-`setAccessible`
-  assertion in the corpus is the **method** one at `:160`, so the field
-  narrowing this record landed is **unexercised**.
+* ~~**Residual: STILL OPEN — the missing vector.**~~ **CLOSED 2026-08-12
+  (W7-78-inherited-residual-closeout.md) — the vector is written; it has NOT yet
+  been run against CratonVM.** Four checks added to
+  `regression-suite/src/RJdkReflect.java::accessAndInvoke`, immediately before
+  the first `setAccessible` on a field, exactly where this record asked for
+  them:
+
+  | check | HotSpot 25.0.3.9, measured 2026-08-12 |
+  |---|---|
+  | nestmate private instance field **get**, no `setAccessible` | succeeds |
+  | nestmate private instance field **set**, no `setAccessible` (value restored) | succeeds |
+  | nestmate private **static final** field read, no `setAccessible` | succeeds |
+  | **non**-nestmate private field read, no `setAccessible` | `IllegalAccessException` |
+
+  The fourth is the falsifier for the other three, and it is why this is not a
+  vacuous green: under a gate that admits too much — or no gate at all, which is
+  what `Constructor.newInstance` has today — the three positives still pass and
+  only that one goes red. Its subject is `RJdkReflectOutsider`, a new
+  package-private top-level class in the same compilation unit: **same package,
+  different nest**, which separates the `private` rule from the package rule. It
+  is deliberately not a separate `src/*.java` file, because `run.sh`'s list
+  hygiene requires every one of those to be a listed vector or named in
+  `UNREGISTERED_CLASSES`.
+
+  The vector goes **60 → 64 checks** and passes on HotSpot. **It has never been
+  run on CratonVM** — the lane that wrote it could not build. If `RJdkReflect`
+  goes red at the next suite run, the reading is that the landed
+  `check_field_access` narrowing is inert, which is precisely the question
+  nothing had ever asked.
 * **Cannot adjudicate without a run:** `cargo test -p cratonvm-native-builtins
-  field_access_`; `target/release/cratonvm --real-jdk -cp
-  regression-suite/classes RJdkReflect`; the same with `--jdk-only`.
+  field_access_`; then, with the four new checks in place,
+  `cratonvm --java-home "<jdk-25>" --real-jdk -cp regression-suite/build
+  RJdkReflect` and the same with `--jdk-only`. Expect `PASS RJdkReflect
+  (64 checks)` on both arms; HotSpot 25 is the control and already gives it.
 
 Applies to: **both** `--real-jdk` (Compatible) and `--jdk-only` (JdkOnly).
 Follow-up to `L1-reflect-setaccessible-invoke.md`, which fixed the method half

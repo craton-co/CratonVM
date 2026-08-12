@@ -1,3 +1,19 @@
+> **RETIRED 2026-08-12 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> A measurement record. It closed at **68 passed / 0 failed** on the day it was written, and all four defects it named are fixed in the tree:
+>
+> * `RJdkForkJoin` — the hard-coded JDK-21-era `$DefaultCommonPoolForkJoinWorkerThreadFactory` is gone; `46bb0ad2e` resolves the factory from the image's own public static field (`common_factory_from_image`, `native-builtins/src/phases_late/concurrent.rs:8530`), with both spellings pinned by `t19_k3_safe_factory_class_name_accepts_quarkus` (`:8720-8731`).
+> * `RChmKeySetView` — `NoClassDefFoundError: java/util/HashMap$KeyItr` closed by `8b4443fc6` then `beb8acee7`; receiver readmitted at `native-api/src/no_image_receiver.rs:148` with the reasoning at `:104-110`.
+> * `RJdkJmx` / `RReflect` / `RJdkReflect` — `5266bf8c7` routed the annotation carrier through the VM-internal door (`classloading/src/class_manager.rs:11342`, `:11362`).
+> * `RJdkHandles` — `87ab40daf` mints the ten combinator carriers as VM-internal (`native-builtins/src/lang_invoke.rs:6268`, `:10315`).
+>
+> **Its one quiet row was adjudicated separately, per the counter-rule.** The `cratonvm/internal/Unmodifiable*` link it proposed was a diagnostic conjecture explicitly filed as *"plausible and not yet proven"*; the four closures above name four different, unrelated root causes, so the conjecture was never the cause. The surface it conjectured about has also shrunk — only `cratonvm/internal/UnmodifiableList` survives in `native-api/src/no_image_receiver.rs:433`. Nothing to carry forward.
+>
+> The 68/0 was taken on a binary built 2026-08-11 and HEAD is well past it. That is ordinary drift, not an unfinished item; the strict baseline is re-taken by the suite, not by this record.
+>
+> Previous location: `docs/known-issues/jdk-only/W7-11-strict-baseline-remeasured.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # The strict baseline is 62/6, not 53/1 — and the six are pre-existing
 
 **Status: MEASURED 2026-08-11, then CLOSED the same day at 68/0.** Not a defect

@@ -1,3 +1,23 @@
+> **MOVED OUT of `docs/known-issues/jdk-only/` on 2026-08-12.**
+>
+> As with its sibling W3-6: this record had **already declared itself RETIRED
+> (W7-46)**, and the index already said so, but the `git mv` was never done.
+> Completing the move is all that happened here.
+>
+> Its one remaining index row — `getProcessPids0`'s per-row `OpenProcess` on
+> Windows — is recorded in the index itself as *"a cost, not a defect, ruled
+> **inherent** by W6-10 (`PROCESSENTRY32` carries no creation time)"*, so it is
+> not an unfixed issue. The live successors on this surface are in
+> `docs/known-issues/jdk-only/W7-46-process-cluster.md`.
+>
+> **Consequence for another record:** `W6-10-process-enumeration-syscall-cost.md`
+> carried an inventory row whose target *"was retired out of this directory, so
+> decide where the row belongs first"*. Until today that was false — the target
+> was still here. It is true now, and the row belongs to W7-46.
+>
+> Previous location: `docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # `ProcessHandle.current().info()` was empty, so two `RJdkProcess` checks never ran
 
 <!-- merge: both sides kept; the lane's finding and the reconciliation's commit attribution are complementary -->

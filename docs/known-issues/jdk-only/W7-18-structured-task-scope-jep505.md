@@ -34,7 +34,8 @@
 registered, both in `native-builtins/src/phases_late/concurrent.rs`, on the
 synthetic-JDK path only. The defect that actually breaks JDK 25 code is in a
 different file and is written out below under
-[Out-of-file patch (not applied)](#out-of-file-patch-not-applied).** Nothing was
+[Out-of-file patch — A APPLIED IN FALLBACK FORM; B and C NOT APPLIED](#out-of-file-patch--a-applied-in-fallback-form-b-and-c-not-applied).**
+Nothing was
 rebuilt in this lane: no claim is made that the edited source compiles or that
 the synthetic surface behaves. Every measurement below was taken with HotSpot
 Adoptium 25.0.3.9 and with the pre-change binary at
@@ -471,7 +472,10 @@ would run. No code path added here has an unbounded wait. The cost, stated
 plainly: `isCancelled()` can never be observed mid-flight, and there is no
 parallelism.
 
-## Out-of-file patch (not applied)
+## Out-of-file patch — A APPLIED IN FALLBACK FORM; B and C NOT APPLIED
+
+> **The old heading here read "(not applied)" and covered an applied patch.**
+> Renamed 2026-08-12; the status block above links to this section.
 
 ### A. The defect: `JavaLangAccess.start` drops the ThreadContainer
 
@@ -479,6 +483,18 @@ parallelism.
 `register_java_lang_access`, one on `java/lang/System$1` and one on the
 `jdk/internal/access/JavaLangAccess` interface, both pointing at
 `jla_start_in_container`.
+
+> **DEAD IN THIS FORM — DO NOT APPLY. Reconciled 2026-08-12.** The preferred
+> patch stated immediately below was measured to **HANG**: deleting the shadow
+> lands the container `add` without the `Thread.exit()` `remove` half, so
+> `join()` waits on a counter nothing decrements — the exact failure this
+> section's own *Falsifier* warns about last. What landed instead is this
+> record's **fallback** form, gated: commit `4c9482908`, `jla_start_in_container`
+> reading `args.get(2)` behind `thread_container_registration_enabled()`
+> (`native-builtins/src/shared_secrets_bridge.rs:796-816`, gate at `:757`).
+> **Both registrations survive at `:1558` and `:1675` and must stay.** See
+> W7-23-thread-container-registration.md and W7-55-record-reconciliation.md §2.4.
+> Kept below unedited as the statement of why the shadow was wrong.
 
 **Preferred patch: delete both registrations and the function.** `javap -p
 java.lang.System$1` on JDK 25 shows the method has a real body —

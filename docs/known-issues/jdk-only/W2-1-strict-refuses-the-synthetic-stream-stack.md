@@ -438,7 +438,18 @@ Measured, not assumed — and each is the empty-view failure mode:
    natives stop owning `LinkedList` state, then drop the interception. That is
    a collections-reclassification-wave change, not an iterator change.
 
-2. **`ArrayDeque.stream().count()` answers `0` in BOTH modes** (HotSpot: `2`),
+2. **CLOSED 2026-08-12, AND THE DIAGNOSIS BELOW IS WRONG — DO NOT CHASE
+   `tail`.** Fixed by commit `fddf67650` *fix(collections): give ArrayDeque back
+   the JDK's spare ring-buffer slot*. The cause was the missing spare
+   ring-buffer slot (`ad_ensure_capacity`, `native-collections/src/lib.rs:34232`,
+   rationale at `:34196` — *"The spare slot is the whole of the 2026-08-11
+   `stream()` fix"*), **not** the unwritten `tail`. Corrections carried by
+   W7-16-arraydeque-and-linkedlist-residuals.md and
+   W7-55-record-reconciliation.md §2.4. The heading above this list still says
+   *"open"* and is wrong about this one item. Kept below exactly as filed, as
+   history only:
+
+   **`ArrayDeque.stream().count()` answers `0` in BOTH modes** (HotSpot: `2`),
    and `ad.size()`/`toString()`/`contains()` are all correct beside it — the
    natives answer those. Root cause is the unwritten `tail` above: nothing
    intercepts `stream()` for `ArrayDeque`, so the real `Collection.stream()`

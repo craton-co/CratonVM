@@ -1,3 +1,22 @@
+> **MOVED OUT of `docs/known-issues/jdk-only/` on 2026-08-12.**
+>
+> This record had **already declared itself RETIRED (W7-46)** and the directory
+> index already listed it as retired — but the `git mv` was never done, so it
+> sat in the public known-issues directory contradicting its own status line for
+> a day. Completing the move is all that happened here; nothing was re-litigated.
+>
+> **Its last named live row was re-checked before moving and is closed.** The
+> index said *"only one line survives: route Windows `destroy()`/
+> `destroyForcibly()` through `signal_pid`, which now exists but is still
+> private."* Both land in `native_process_impl_terminate`
+> (`native-io/src/process.rs:1830`) → `destroy_handle(handle, true)` →
+> `signal_pid(pid_for_handle(handle), force)` (`:1029`). The routing is done;
+> `signal_pid` staying private is correct, because both of its callers are in
+> that file. That index row was stale.
+>
+> Previous location: `docs/known-issues/jdk-only/W3-6-processimpl-missing-natives.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260812.md`.
+
 # `java.lang.ProcessImpl` — nine unregistered Windows natives, and a tenth under a descriptor the image never declared
 
 <!-- merge: both sides kept; the lane's finding and the reconciliation's commit attribution are complementary -->

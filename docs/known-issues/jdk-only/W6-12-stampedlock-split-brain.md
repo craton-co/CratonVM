@@ -41,6 +41,52 @@
   `probes/JdkOnlyCollectionViewProbe` are byte-identical across HotSpot,
   `--real-jdk` and `--jdk-only`. It is open only in the sense that **no
   `synthetic-jdk` binary has ever been built to measure it**.
+
+  > **AMENDED 2026-08-12 (W7-78-inherited-residual-closeout.md) — the
+  > confinement is now proved by construction, and the "never built" half of
+  > this bullet is stale.**
+  >
+  > **The confinement is stronger than this record argues.** §1 below reasons
+  > from registration ORDER — that `phases_early`'s identity bindings run after
+  > the essential registrars and so win under `--synthetic-jdk`. Order is not
+  > what confines them. `native-builtins`'
+  > `phases_early::register_collections_extras_natives`
+  > (`native-builtins/src/phases_early.rs:100`, ambient kind **`Intrinsic`** —
+  > note that `Intrinsic` is NOT dropped under `JdkOnly`, so order would not
+  > have saved this) is reached only from `lib::register_synthetic_overrides`
+  > (`native-builtins/src/lib.rs:21412`, call at `:41086`), and that entry point
+  > is replaced by a **`#[cfg(not(feature = "synthetic-jdk"))]` no-op shim** at
+  > `vm/src/native/builtins.rs:29`. In both shipping binaries the identity
+  > bindings are not out-voted, they are **compiled out**, so
+  > `native-collections`' genuine `unmodifiable*` wrappers
+  > (`native-collections/src/lib.rs:50688-50727`, in their own
+  > `set_category(SyntheticStub)` window, plus `unmodifiableList` at `:15381`)
+  > are the only registrations — and being `SyntheticStub`, they are themselves
+  > dropped under `--jdk-only`, leaving real bytecode. That is the mechanism
+  > behind the 37 byte-identical rows.
+  >
+  > **A `--features synthetic-jdk` binary HAS since been built** —
+  > W7-50-synthetic-jdk-strict-six.md, measured **63 passed / 7 failed** on the
+  > strict corpus. What has still never been done is running one in the
+  > `--synthetic-jdk` **runtime mode**, which is the only place this residual
+  > exists. Feature and mode are different things, and W7-50 §0 exists because
+  > conflating them is what produced its six defects.
+  >
+  > **The repair, if the measurement confirms it:** delete the five
+  > `unmodifiable*` identity registrations in
+  > `phases_early::register_collections_extras_natives` and the three in
+  > `phases_early::register_core_stdlib_extras` (`phases_early.rs:2204-2222`),
+  > leaving `native-collections`' wrappers to win. Both shipping modes are
+  > unaffected by construction — the code is not compiled into them.
+  > Deliberately not done in the lane that verified this: `phases_early.rs`'s
+  > collections registrars are in W7-50's blast radius, and an uncompiled edit
+  > to the one arm nobody can build is how the 48/6 figure went stale in the
+  > first place. **This residual is also a vacuous-green trap in the other
+  > direction** — a probe run under `--synthetic-jdk` reports
+  > `class=java.util.HashSet add=SUCCEEDED`, which reads exactly like an
+  > unrelated JCA fix having failed to land; the trap is written into
+  > `native-builtins/src/jca/provider_chain.rs` above `wrap_unmodifiable` and
+  > into W7-63-jca-advertise-vs-serve.md §8.
 * **Cannot adjudicate without a run — two.**
   1. The `Phaser` fix: `cargo build --features synthetic-jdk`, then the 2-party
      arrive/`getUnarrivedParties` race described below. This is still the
