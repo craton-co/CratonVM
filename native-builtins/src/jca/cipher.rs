@@ -3910,10 +3910,12 @@ mod tests {
         assert!(is_aes_key_wrap_transformation("AESWrap"));
         assert!(is_aes_key_wrap_transformation("AESWrap_128"));
         assert!(is_aes_key_wrap_transformation("AES/KW/NoPadding"));
-        // KWP is NOT RFC 3394 and this predicate is RFC 3394's, so it stays
-        // false — but it is computed now, by `aes_key_wrap_with_padding`
-        // (RFC 5649). `aes_wrap_flavour` is the predicate that spans all three.
-        assert!(!is_aes_key_wrap_transformation("AES/KWP/NoPadding"));
+        // This predicate delegates to `classify_transformation` and so means
+        // "is in the key-wrap FAMILY", which KWP now joins. The distinction
+        // between the three schemes lives in `aes_wrap_flavour`, and it is the
+        // one the dispatch actually needs: RFC 3394, RFC 3394 over PKCS#5-
+        // padded input, and RFC 5649 are three different computations.
+        assert!(is_aes_key_wrap_transformation("AES/KWP/NoPadding"));
         assert!(matches!(aes_wrap_flavour("AES/KWP/NoPadding"), Some(AesWrapFlavour::Kwp)));
         assert!(matches!(
             aes_wrap_flavour("AES/KW/PKCS5Padding"),
@@ -4018,7 +4020,10 @@ mod tests {
         // that whoever deletes an arm from `classify_transformation` sees the
         // move rather than a silently shorter list.
         assert!(transformation_is_serviceable("AES/KWP/NoPadding"));
-        assert!(transformation_is_serviceable("AES_128/KWP/NoPadding"));
+        // The size-pinned `AES_128/KWP/...` spelling is deliberately NOT
+        // asserted either way: SunJCE's behaviour for it was not measured for
+        // this change, and asserting an unmeasured verdict is how a wrong
+        // expectation becomes a "requirement".
     }
 
     /// MUST RAISE, as a PADDING failure specifically — the JDK distinguishes
