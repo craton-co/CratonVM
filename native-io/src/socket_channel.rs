@@ -775,20 +775,25 @@ const N_FIELDS: usize = 12;
 ///
 /// `F_OPEN`..`F_REUSEADDR` are indices into the identity-keyed `chan_fields`
 /// side table, not into the object — `cf_set`'s doc says so and `cf_get`
-/// enforces it. The only slot on the object itself that any native in this file
-/// reads or writes is [`SSC_SOCKET_CACHE`]. Handing `N_FIELDS` to the allocator
-/// therefore asked for twelve slots on classes that declare ten: real
-/// `java.nio.channels.SocketChannel` and `ServerSocketChannel` are each ten
-/// fields transitively (`javap -p`, JDK 25.0.3.9 — nothing of their own, four
-/// from `AbstractInterruptibleChannel`, six from `AbstractSelectableChannel`),
-/// so slots 10 and 11 sat past the declared width with no reader at all.
+/// enforces it. Handing `N_FIELDS` to the allocator therefore asked for twelve
+/// slots on classes that declare ten: real `java.nio.channels.SocketChannel` and
+/// `ServerSocketChannel` are each ten fields transitively (`javap -p`, JDK
+/// 25.0.3.9 — nothing of their own, four from `AbstractInterruptibleChannel`,
+/// six from `AbstractSelectableChannel`), so slots 10 and 11 sat past the
+/// declared width with no reader at all. W7-66-live-over-allocations.md.
 ///
-/// `alloc_obj` still clamps UP, so this is a floor and not a width: in
-/// real-JDK mode the ten declared fields win, and in synthetic-JDK mode
-/// (`class_manager` fabricates both channels with five) this keeps
-/// `SSC_SOCKET_CACHE` in range, which a bare five would not.
-/// W7-66-live-over-allocations.md.
-const SC_OBJECT_SLOTS: usize = SSC_SOCKET_CACHE + 1;
+/// **No native in this file addresses a channel object slot by index any more.**
+/// The one that did — the `socket()` adaptor cache at slot 5, which is really
+/// `AbstractSelectableChannel.keys` — moved to `ssc_socket_cache_table`
+/// (W7-72-ssc-socket-and-filechannel.md). So this number no longer encodes a
+/// slot map; it is only a floor for `alloc_obj`, which clamps UP to the loaded
+/// class's declared width. It is left at its previous value deliberately: in
+/// real-JDK mode the ten declared fields win and the number is inert, and in
+/// synthetic-JDK mode (`class_manager` fabricates both channels with five)
+/// changing it would change the fabricated object's width for no reason.
+/// A future reader adding an object slot here must go through the side table,
+/// not raise this.
+const SC_OBJECT_SLOTS: usize = 6;
 
 /// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
 const FAMILY_UNIX: i32 = 1;
@@ -1610,6 +1615,11 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // then reads the default Int(0) (== closed/not-connected), and the
         // side-table does not grow across many short-lived connections.
         cf_clear(ctx, this);
+        // Same for the `ServerSocketChannel.socket()` adaptor row. It holds two
+        // GC roots, so leaving it behind would keep a closed listener and its
+        // `java.net.ServerSocket` view alive for the life of the process.
+        // A no-op for a plain SocketChannel, which never has a row.
+        ssc_socket_cache_clear(ctx, this);
     }
     Ok(None)
 }
@@ -4992,41 +5002,149 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // update_after_gc`). Mirrors `SEED_TABLE` in
 // `native-builtins/src/securerandom.rs` and the C21 collection-overlay
 // fix in `native-collections/src/lib.rs`.
-/// Slot on the `ServerSocketChannel` OBJECT holding the cached
-/// `java.net.ServerSocket` adaptor.
-///
-/// **This is not an unused slot, and the comment that used to say so
-/// ("unused F_REMOTE slot") is how the mistake was made: it read the
-/// `chan_fields` side-table index map as if it were the object layout.**
-/// `F_REMOTE` is a key into that side table. Slot 5 of the OBJECT, on the real
-/// JDK 25.0.3.9 layout, is `AbstractSelectableChannel.keys` — the
-/// `private SelectionKey[] keys` array.
-///
-/// Derivation, so the next reader does not have to redo it. CratonVM gives a
-/// superclass's instance fields slots `0..parent_total` and the class's own
-/// fields the slots after them (`class_manager::compute_field_layout`). For
-/// `java.nio.channels.ServerSocketChannel` (`javap -p`, statics excluded):
-/// `AbstractInterruptibleChannel` contributes `closeLock`(0) `closed`(1)
-/// `interruptor`(2) `interruptedTarget`(3); `SelectableChannel` contributes
-/// none; `AbstractSelectableChannel` contributes `provider`(4) `keys`(5)
-/// `keyCount`(6) `keyLock`(7) `regLock`(8) `nonBlocking`(9); the class itself
-/// declares none. Ten total, and slot 5 is `keys`.
-///
-/// So `ssc_socket` stores a `ServerSocket` where real bytecode
-/// (`AbstractSelectableChannel.register` / `isRegistered` / `keyFor` /
-/// `removeKey` / `implCloseChannel`) expects a `SelectionKey[]`. It is an
-/// IN-BOUNDS write of the wrong field, which is why neither an
-/// allocation-width instrument nor the `cratonvm::gc::guard` out-of-bounds
-/// reads can see it — W7-59-layout-detector-coverage.md §6 names this species
-/// exactly and says a second instrument is needed for it.
-///
-/// NOT repaired here. The sound remedy is the identity-keyed side table this
-/// file already runs in the other direction (`SsBackRef`, with
-/// `gc_scan_ss_back_ref_roots` and `ss_back_ref_update_after_gc`), so it means
-/// a new GC-rooted table plus its remap hook — a different species from this
-/// lane's allocation widths, on a Tomcat-critical path, and it needs a build.
-/// W7-66-live-over-allocations.md records it as the headline follow-up.
-const SSC_SOCKET_CACHE: usize = 5;
+// ---------------------------------------------------------------------------
+// `ServerSocketChannel.socket()` adaptor cache — identity-keyed side table
+// ---------------------------------------------------------------------------
+//
+// This cache used to live in slot 5 of the channel OBJECT, under a constant
+// annotated "the unused F_REMOTE slot". That comment is how the mistake was
+// made: it read the `chan_fields` SIDE-TABLE index map as if it were the object
+// layout. `F_REMOTE` is a key into that side table. Slot 5 of the OBJECT, on the
+// real JDK 25.0.3.9 layout, is `AbstractSelectableChannel.keys` — the
+// `private SelectionKey[] keys` array.
+//
+// Derivation, so the next reader does not have to redo it. CratonVM gives a
+// superclass's instance fields slots `0..parent_total` and the class's own
+// fields the slots after them (`class_manager::compute_field_layout`). For
+// `java.nio.channels.ServerSocketChannel` (`javap -p`, JDK 25.0.3.9, statics
+// excluded): `AbstractInterruptibleChannel` contributes `closeLock`(0)
+// `closed`(1) `interruptor`(2) `interruptedTarget`(3); `SelectableChannel`
+// contributes none; `AbstractSelectableChannel` contributes `provider`(4)
+// `keys`(5) `keyCount`(6) `keyLock`(7) `regLock`(8) `nonBlocking`(9); the class
+// itself declares none. Ten total, and slot 5 is `keys`.
+//
+// So the old code stored a `java.net.ServerSocket` where real bytecode
+// (`AbstractSelectableChannel.register` / `isRegistered` / `keyFor` /
+// `removeKey` / `implCloseChannel`) expects a `SelectionKey[]`, and
+// `NioEndpoint`-shaped code (Tomcat) calls both `socket()` and those. It was an
+// IN-BOUNDS write of the WRONG field, which is why no width instrument could
+// see it: `report_layout_alias` compares slot COUNTS and this count was right,
+// and the `cratonvm::gc::guard` out-of-bounds discriminator misses for the same
+// reason. W7-59-layout-detector-coverage.md §6 names the species and
+// W7-66-live-over-allocations.md §6 found this instance by hand.
+//
+// The remedy is the one this file already runs in the OTHER direction
+// (`SsBackRef`): an identity-keyed side table, GC-rooted, with a remap hook.
+// **Keyed by identity hash, NOT by address**, because an address-keyed table
+// recycles — a fresh object allocated where a collected channel used to live
+// inherits the dead row, which is exactly the C27 defect this file's header
+// comment above records. The identity-hash word is carried across a move by the
+// collector (`gc/src/compact_header.rs::HashCodeTable::update_after_gc`), and
+// because Java identity hashes are not unique the bucket is a `Vec` whose rows
+// are disambiguated by comparing the `ObjectRef` itself. Both refs of a row are
+// pushed as GC roots (`gc_scan_ssc_socket_cache_roots`) and rewritten after a
+// compaction (`ssc_socket_cache_update_after_gc`), so a row can neither hold a
+// stale pointer nor have its objects reclaimed underneath it.
+//
+// The row is dropped by `sc_close` (which `ssc_close` delegates to) next to
+// `cf_clear`, so the table does not grow across a server's channel churn and a
+// closed listener is not kept alive by it.
+
+/// One row per live `ServerSocketChannel` that has answered `socket()`. The
+/// hash only chooses a bucket; every lookup also matches the channel receiver
+/// itself, exactly like [`SsBackRef`].
+struct SscSocketRow {
+    channel: ObjectRef,
+    socket: ObjectRef,
+}
+
+fn ssc_socket_cache_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, Vec<SscSocketRow>>> {
+    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, Vec<SscSocketRow>>>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// The cached `java.net.ServerSocket` for `ssc`, if `socket()` already answered.
+fn ssc_socket_cache_get(ctx: &mut dyn NativeContext, ssc: ObjectRef) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(ssc);
+    ssc_socket_cache_table()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|row| row.channel == ssc))
+        .map(|row| row.socket)
+}
+
+fn ssc_socket_cache_put(ctx: &mut dyn NativeContext, ssc: ObjectRef, socket: ObjectRef) {
+    let key = ctx.identity_hash_code(ssc);
+    let mut table = ssc_socket_cache_table().write();
+    let bucket = table.entry(key).or_default();
+    if let Some(row) = bucket.iter_mut().find(|row| row.channel == ssc) {
+        row.socket = socket;
+    } else {
+        bucket.push(SscSocketRow {
+            channel: ssc,
+            socket,
+        });
+    }
+}
+
+/// Drop `ssc`'s adaptor row. Called from `sc_close`, and therefore from
+/// `ssc_close`.
+fn ssc_socket_cache_clear(ctx: &mut dyn NativeContext, ssc: ObjectRef) {
+    let key = ctx.identity_hash_code(ssc);
+    let mut table = ssc_socket_cache_table().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|row| row.channel != ssc);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
+}
+
+/// Keep both ends of the `socket()` adaptor mapping alive during a collection.
+/// The row is dropped promptly by `sc_close`, so this is not a lifetime
+/// extension for closed listeners.
+pub fn gc_scan_ssc_socket_cache_roots(roots: &mut Vec<ObjectRef>) {
+    let table = ssc_socket_cache_table().read();
+    for bucket in table.values() {
+        for row in bucket {
+            roots.push(row.channel);
+            roots.push(row.socket);
+        }
+    }
+}
+
+/// Relocate both refs after a moving collection. The identity-hash bucket key
+/// is stable across a move; the `ObjectRef` discriminator is not, and must be
+/// rewritten or the next lookup silently misses — and a later object landing at
+/// the old address would match instead.
+pub fn ssc_socket_cache_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |obj: ObjectRef| {
+        let old = obj.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: this runs during stop-the-world root remapping and the
+            // map entry is the non-null forwarding address for `obj`.
+            unsafe { ObjectRef::from_raw(new_addr as *mut u8) }
+        } else {
+            obj
+        }
+    };
+    let mut table = ssc_socket_cache_table().write();
+    for bucket in table.values_mut() {
+        for row in bucket {
+            row.channel = remap(row.channel);
+            row.socket = remap(row.socket);
+        }
+    }
+}
 
 /// One row per live ServerSocket wrapper. The hash only chooses a bucket:
 /// Java identity hashes are not unique, so every lookup also matches the
@@ -5120,13 +5238,18 @@ pub fn ss_back_ref_update_after_gc<S: std::hash::BuildHasher>(
     }
 }
 
-// `F_REMOTE` (slot 5) of a SSC object is unused for ServerSocketChannel
-// instances (only SocketChannel uses it). We hijack it to cache the
-// `socket()` adapter so the same instance is returned each call —
-// matching java.nio.channels.ServerSocketChannel.socket()'s contract.
+// The `socket()` adapter is cached so the same instance is returned on every
+// call — `java.nio.channels.ServerSocketChannel.socket()`'s contract. The cache
+// lives in `ssc_socket_cache_table` above, NOT in a slot of the channel object:
+// see that block for why slot 5 was the wrong place and how the table avoids the
+// address-recycling trap.
 
 fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match obj_or_none(args, 0) {
+    // `mut` because every allocating call below hands back a possibly-relocated
+    // receiver, and the FALLBACK arm runs after the adaptor arm has already
+    // executed bytecode — so the refreshed ref has to replace the local, not
+    // shadow it inside one block.
+    let mut this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
@@ -5138,10 +5261,8 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         .into());
     }
-    if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
-        if let Value::Object(Some(cached)) = ctx.get_field(this, SSC_SOCKET_CACHE) {
-            return Ok(Some(Value::Object(Some(cached))));
-        }
+    if let Some(cached) = ssc_socket_cache_get(ctx, this) {
+        return Ok(Some(Value::Object(Some(cached))));
     }
     // Under CRATONVM_REAL_NET_SOCKETS the central registry filter drops every
     // java/net/ServerSocket native, so real ServerSocket bytecode runs. A bare
@@ -5156,15 +5277,22 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // the channel and whose construction runs the ServerSocket instance
     // initializers (socketLock = new Object()), so getImpl() is never reached.
     if io_flags().real_net_sockets {
-        if let Ok(Some(v @ Value::Object(Some(adaptor)))) = ctx.invoke(
+        // `invoke` runs Java bytecode, which allocates, which can relocate
+        // `this` under a moving collector. The adaptor and the channel are then
+        // written into the cache table as a pair, so a stale `this` here would
+        // key the row on a dead address — the native stale-local family, and the
+        // same reason `seed_channel_interruptor` pins.
+        let pin = ctx.pin_native_root(this);
+        let created = ctx.invoke(
             "sun/nio/ch/ServerSocketAdaptor",
             "create",
             "(Lsun/nio/ch/ServerSocketChannelImpl;)Ljava/net/ServerSocket;",
             &[Value::Object(Some(this))],
-        ) {
-            if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
-                ctx.set_field(this, SSC_SOCKET_CACHE, Value::Object(Some(adaptor)));
-            }
+        );
+        this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
+        if let Ok(Some(v @ Value::Object(Some(adaptor)))) = created {
+            ssc_socket_cache_put(ctx, this, adaptor);
             return Ok(Some(v));
         }
         // Fall through to the bare-ServerSocket fallback on any failure.
@@ -5172,18 +5300,18 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Allocate a real-layout ServerSocket and remember the channel back-ref
     // in a side-table; we cannot stash anything inside the wrapper itself
     // without clashing with JDK-private fields like `bound` or `impl`.
-    let ss_value = ctx
-        .new_object("java/net/ServerSocket")
-        .ok()
-        .and_then(|v| match v {
-            Some(Value::Object(Some(o))) => Some(o),
-            _ => None,
-        })
-        .ok_or_else(|| ioex("socket: could not allocate ServerSocket"))?;
+    // `new_object` allocates, so pin `this` across it for the same reason as
+    // the adaptor arm above.
+    let pin = ctx.pin_native_root(this);
+    let allocated = ctx.new_object("java/net/ServerSocket").ok().and_then(|v| match v {
+        Some(Value::Object(Some(o))) => Some(o),
+        _ => None,
+    });
+    this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    let ss_value = allocated.ok_or_else(|| ioex("socket: could not allocate ServerSocket"))?;
     ss_record_back_ref(ctx, ss_value, this);
-    if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
-        ctx.set_field(this, SSC_SOCKET_CACHE, Value::Object(Some(ss_value)));
-    }
+    ssc_socket_cache_put(ctx, this, ss_value);
     Ok(Some(Value::Object(Some(ss_value))))
 }
 

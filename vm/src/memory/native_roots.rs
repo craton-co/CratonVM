@@ -409,11 +409,18 @@ fn scan_nio(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_io::nio_selector::gc_scan_selector_roots(roots);
     cratonvm_native_io::socket_channel::gc_scan_channel_roots(roots);
     cratonvm_native_io::socket_channel::gc_scan_ss_back_ref_roots(roots);
+    // `ServerSocketChannel.socket()`'s adaptor cache. It used to live in slot 5
+    // of the channel object — really `AbstractSelectableChannel.keys` — so it
+    // needed no roots and corrupted a JDK field instead; moving it to a side
+    // table is what makes these two lines necessary
+    // (W7-72-ssc-socket-and-filechannel.md).
+    cratonvm_native_io::socket_channel::gc_scan_ssc_socket_cache_roots(roots);
 }
 fn remap_nio(_: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(map);
     cratonvm_native_io::socket_channel::channel_fields_update_after_gc(map);
     cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(map);
+    cratonvm_native_io::socket_channel::ssc_socket_cache_update_after_gc(map);
 }
 fn scan_server_ports(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_api::server_socket_ports::gc_scan_roots(roots);
