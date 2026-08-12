@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — two of the three opcodes admitted 2026-08-11; **the test did not move** |
+| **Status** | OPEN — two of the three original opcodes admitted 2026-08-11; **the test did not move**. 2026-08-12: the doc's own recommended cheap experiment run — one method fully unblocked, moved nothing; the other has at least 4 stacked unadmitted opcodes, not 1. **Recommend not pursuing further** — see bottom |
 | **HotSpot** | `OK (1 test)` |
 | **CratonVM** | `testAsyncTiming` fails on timing only — **0 framing failures** |
 | **Discovered** | 2026-08-11, running the check `29-throughput-wall-recurrence-and-unconfirmed` asked for |
@@ -187,3 +187,87 @@ the foil in `protected_instanceof_is_precise_exception_covered`.
   The opt-out was itself proved live first — with it set,
   `rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength` fails on the
   checkcast assertion — so that A/B is not a vacuous green.
+
+---
+
+## 2026-08-12 — the doc's own recommended experiment, run
+
+The "part worth arguing about before spending more" section above asked for
+exactly this: measure the send path with the remaining hot methods compiled,
+via a hand-built binary that admits the blocking opcodes unsafely, before
+doing the real `ldc`/`ldc_w` codegen work. Done, on current `dev`
+(worktree `CratonVM-wsrbc6-20260812`, binary rebuilt fresh — see
+[reference_diagnostic_binary_caveats](#) — not shipped, not committed).
+
+**Method:** `precise_frame_publishing_opcode` (`jit/src/lib.rs`) edited
+locally, four times in sequence, each admitting one more opcode
+unconditionally with **no** frame-publishing fix behind it — a deliberate
+miscompile risk accepted only because this binary runs one local JUnit class
+and is discarded, never shipped: no commit ever carried this change, and the
+worktree it was made in was reverted to a clean diff against `dev` before
+this write-up. Each step rebuilt and reran `TestAsyncMessagesPerformance`
+with `CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1`.
+
+| step | opcode admitted | `startMessage` | `NioOperationState.run` | SEQ0 | SEQ1 | SEQ2 |
+|---|---|---|---|---:|---:|---:|
+| baseline | (none) | bail `pc=167,0x13` ldc_w | bail `pc=44,0x12` ldc | 0 | 9 | 476 |
+| hack 1 | `0x12`/`0x13` ldc/ldc_w | **compiles** | bail `pc=51,0xba` invokedynamic | 0 | 8 | 484 |
+| hack 2 | + `0xba` invokedynamic | compiles | bail `pc=141,0x32` laload | 0 | 8 | 484 |
+| hack 3 | + `0x32` laload | compiles | bail `pc=404,0xbf` **athrow** | 0 | 39 | 480 |
+
+(framing failures: 0 throughout, all four runs — matches every prior
+measurement on this page.)
+
+### Finding 1: `startMessage` compiling changed nothing measurable
+
+The only method that actually went from interpreted to compiled across all
+three hacks is `startMessage` (message framing/queueing) — `endMessage` was
+already fixed on 2026-08-11, `NioOperationState.run` never compiled in any
+variant (see Finding 2). SEQ0 stayed 0 and SEQ1/SEQ2 stayed in baseline's
+rough range in hacks 1 and 2 (8/484 vs baseline's 9/476). This is the same
+"named-lever-moves-nothing" shape the page already flagged for `endMessage`
+— now confirmed for the second of the three original methods too.
+
+### Finding 2: `NioOperationState.run`'s protected range has (at least) 4 stacked unadmitted opcodes, not 1
+
+The doc's earlier read — "blocked by `ldc`" — undercounted. Clearing each
+opcode only exposed the next one already sitting in the same protected
+range: `ldc` (0x12) → `invokedynamic` (0xba) → `laload` (0x32) →
+**`athrow` (0xbf)**. The method never actually compiled in any of the three
+hacks, so its own effect on the timing numbers is still **unmeasured**.
+
+`athrow` is not a bookkeeping gap like `getstatic`/`checkcast` were — this
+same file's own comment on `may_throw_without_precise_frame` already lists
+it alongside `new` and `arraylength` as "still genuinely blocking, because
+their lowerings really do not publish". It is the throw instruction itself;
+admitting it is a materially different (and by the page's own risk model, a
+materially more dangerous) undertaking than the `ldc`/`ldc_w` work this page
+originally scoped, and was never on the table as a "next opcode" to just
+add. There may be more opcodes past it — the search stopped here rather
+than continuing to chase a method whose easiest blocker is already the hard
+kind.
+
+### A caution about this test's noise floor
+
+Hacks 1, 2 and 3 all have the **identical actual compiled-method set** —
+`NioOperationState.run` bailed in all three, so nothing about which code
+ran actually changed between them. Yet SEQ1 reads 8, 8, then 39. That jump
+has no code explanation; it is host contention (this run shared the box
+with 6 concurrently-running full Tomcat-suite shards). Treat any single run
+of this test's SEQ counters as noisy by a factor of several×, matching the
+"host was loaded for both runs" caution the 2026-08-11 update already gave
+— this just puts a number on how noisy.
+
+### Recommendation
+
+**Do not pursue the `ldc`/`ldc_w`/`invokedynamic`/`laload`/`athrow` codegen
+work for this test.** The evidence now points the same direction the
+2026-08-11 update already suspected, from a second independent angle:
+compiling the one method that *could* be cheaply tested (`startMessage`)
+moved nothing, and the method most likely to actually matter
+(`NioOperationState.run`, the NIO write runner) is blocked behind a
+materially harder opcode than originally scoped, with unknown depth beyond
+it. Whoever revisits this should either profile where the inter-chunk gap
+actually goes (the 08-11 update's other suggested next step, still not
+done) or accept this as a known, understood perf wall and move on — not
+resume the opcode-admission whack-a-mole where this session left off.
