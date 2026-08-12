@@ -1,5 +1,29 @@
 # `KeyGenerator` ignored its algorithm, and the "shadowing" twin was shadowed
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — TWO OF THE FOUR
+> "recorded, NOT applied" PATCHES ARE IN THE TREE.**
+>
+> * **Patch A** (`register_keygen_dispatch` reads `keygen_default_bits`) —
+>   **NOT APPLIED.** `native-builtins/src/jca/cipher.rs:3288-3315` still
+>   hardcodes `ctx.set_field(obj, 1, Value::Int(128)); // default key size` in
+>   both 2-arg overloads; `keygen_default_bits` never appears in `cipher.rs`.
+>   **Live.**
+> * **Patch B** (ChaCha20 wired, nonce from `ChaCha20ParameterSpec`) —
+>   **APPLIED**, `native-builtins/src/jca/cipher.rs:536-600` and the family arm
+>   at `:1244`.
+> * **Patch C** (`SecretKeySpec` empty/null key ⇒ `IllegalArgumentException`) —
+>   **NOT APPLIED.** `native-builtins/src/jca/cipher.rs:3936-3949` copies the
+>   array with neither a length nor a null check. **Live.**
+> * **Patch D** (`%02x` losing its zero pad for `0x01`–`0x0f`) — **APPLIED**,
+>   commit `c3f7b2d78`; the zero-pad set at
+>   `native-builtins/src/lang_string.rs:7030-7034` is now explicit and its
+>   comment names the old "ends with an ASCII digit" defect.
+>
+> Other residuals still open: the synthetic `KeyGenerator` serves a wider
+> algorithm set than the real-mode provider seed advertises;
+> `KeyGenerator.init(AlgorithmParameterSpec)` accepts and ignores; and
+> `java/security/Key.getAlgorithm` still hardcodes `"AES"`.
+
 **Status:** FIXED in source 2026-08-11 (lane W7-21). **Nothing was rebuilt** —
 this lane could not run `cargo build`, so every number below is either a
 measurement taken against the *pre-fix* release binary at

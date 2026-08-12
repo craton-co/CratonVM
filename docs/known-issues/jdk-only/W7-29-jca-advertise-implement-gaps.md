@@ -1,5 +1,28 @@
 # The JCA engines that answer names they never advertised
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** The **required
+> companion edit** is **APPLIED**: `vm/src/vm/tests.rs:51208-51213` no longer
+> passes `Value::Object(None)` — it builds `let x509 = create_java_string(&shared,
+> "X.509");` and says so in a comment naming W7-29. The lane's own fix is
+> present at `native-builtins/src/phases_late/ssl_security.rs:5422`/`:5508`/
+> `:5511`, commit `b4e105f65`.
+>
+> **All five recorded residuals are STILL OPEN**, re-grepped 2026-08-12:
+> (1) `MD2` still seeded at `native-builtins/src/jca/provider_chain.rs:1088`;
+> (2) no `SHAKE` service rows — the only mention is a comment at
+> `provider_chain.rs:1299`; (3) neither `security_get_algorithms` nor
+> `provider_get_services_native` wraps its result unmodifiable; (4) the `ML-DSA`
+> umbrella is still advertised at `provider_chain.rs:1092`/`:1098`, though
+> `jca/signature.rs:255-260` now carries an `SIG_MLDSA` arm; (5)
+> `Signature.getInstance` still accepts every name.
+>
+> **These five overlap W4-3's Patches A/B/C/F** — they are the same defects seen
+> from the other end. Fix them once, in one place, and close both records.
+>
+> Note this record's own warning, which is correct and load-bearing: W4-3's
+> Patch E (refuse ChaCha20) is **superseded and must not be applied** — ChaCha20
+> landed for real.
+
 **Status:** one defect FIXED in source 2026-08-11 (lane W7-29) —
 `CertificateFactory.getInstance` served *every* type name with an X.509 parser.
 Five further gaps re-verified as **live against a running binary** and recorded

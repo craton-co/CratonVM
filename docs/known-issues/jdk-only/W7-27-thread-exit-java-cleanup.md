@@ -1,5 +1,25 @@
 # The VM never gave a terminating thread its Java-side cleanup
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** Of section 10's
+> three out-of-file patches: **A** is **APPLIED** — commit `78a0428ef` declared
+> `CRATONVM_THREAD_CONTAINERS` at `types/src/flag_groups.rs:1217` (as a
+> `Group::THREADS` toggle `thread-containers`, not in `SCALARS` as sketched) and
+> moved the read to `cratonvm_types::flags::runtime_var(...)` at
+> `native-builtins/src/shared_secrets_bridge.rs:760`. **B** is **NOT APPLIED,
+> deliberately and correctly** — `CRATONVM_THREAD_EXIT` appears nowhere outside
+> `docs/known-issues/`. **C is NOT APPLIED and is the live item**: the main
+> (primordial) thread still never gets `Thread.exit()` —
+> `run_thread_exit_shared` has exactly two call sites,
+> `vm/src/vm/vm_exec.rs:4630` and `:13234`, both worker-death paths.
+>
+> * **Also open:** `TerminatingThreadLocal.threadTerminated()` and
+>   `StackableScope.popAll()` are now reachable **for the first time** and have
+>   never been exercised; and the container half is still interlocked off at
+>   `shared_secrets_bridge.rs:745`
+>   (`VM_REMOVES_THREADS_FROM_CONTAINERS: bool = false`). With this half landed,
+>   the ordering hazard W7-23 documented is now resolvable — flip the interlock
+>   and measure the pair.
+
 **Status: landed in `vm/src/vm/vm_exec.rs`, unconditional, in every mode.**
 This is the second half of the pair whose first half —
 `jla_start_in_container`'s container registration in

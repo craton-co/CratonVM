@@ -1,5 +1,24 @@
 # Three strict failures, one refusal: `java/lang/annotation/AnnotationProxy`
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "NOT APPLIED" IS
+> FALSE. BOTH HUNKS ARE IN THE TREE.** Commit `5266bf8c7` *fix(jdk-only): route
+> the annotation carrier through the VM-internal door*. Hunk 1:
+> `ctx.ensure_vm_internal_class("java/lang/annotation/AnnotationProxy", ANN_PROXY_FIELDS);`
+> at `native-builtins/src/lang_class.rs:13720`, tagged "W7-12/W7-17" at `:13685`.
+> Hunk 2 landed as `is_vm_annotation_carrier_name`
+> (`classloading/src/class_manager.rs:11261`), consumed by
+> `fabricated_origin_for_name` (doc at `:11281`).
+> W7-17-vm-internal-door-sweep.md section 1 independently confirms both.
+>
+> * **Headline: CLOSED in source.** W7-11-strict-baseline-remeasured.md then
+>   reported the strict suite at 68/0, which is the missing verification.
+> * **Residual: STILL OPEN** — R2, the resolution-1 redesign. R1
+>   (`getAnnotation` swallowing the failure) is partly addressed; R3's other
+>   three W7-11 causes were taken by other lanes.
+> * **Cannot adjudicate without a run:** `--jdk-only-report <FILE>` should no
+>   longer emit a `compatibility-class-requested` row for
+>   `java/lang/annotation/AnnotationProxy`.
+
 **Status: DIAGNOSED and MEASURED 2026-08-11. The fix is specified below but
 NOT APPLIED** — the one line that has to change lives in a file this lane does
 not own, and nothing here was rebuilt. Every number below came out of the

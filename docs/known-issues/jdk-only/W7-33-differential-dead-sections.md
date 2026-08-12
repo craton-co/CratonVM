@@ -1,5 +1,18 @@
 # W7-33 — the two dead probe sections: a null the JDK reads as comodification, and a `modCount` written over a monitor
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** The
+> `## Out-of-file patch (not applied)` is **APPLIED** — commit `aab87e003`
+> *fix(collections): the two W7-33 residuals -- PriorityQueue null refusal,
+> Stack's own exception type*. `RuntimeError::EmptyStackException` at
+> `types/src/error.rs:1088-1098`, mapped at `:1633`, exhaustiveness at `:1720`,
+> raised at `native-collections/src/lib.rs:35632`. No `"Stack is empty"`
+> `NoSuchElementException` remains.
+>
+> * **Headline and out-of-file patch: CLOSED in source, unverified.**
+> * **Residual: STILL OPEN** — the synthetic-mode `EmptyStackException`
+>   follow-up in `classloading/src/class_manager.rs` is recorded but not made;
+>   W7-36-differential-view-families.md confirms.
+
 **Status: BOTH DIAGNOSED AND FIXED IN SOURCE 2026-08-12, NOT REBUILT.**
 
 Every measurement below was taken by running the already-built binary at

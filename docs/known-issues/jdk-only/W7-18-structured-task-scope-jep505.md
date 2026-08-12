@@ -1,5 +1,35 @@
 # StructuredTaskScope is a JEP 505 interface now, and the interesting defect was not the stale names
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md).** Of the three
+> out-of-file patches: **A** is **APPLIED, but in this record's *fallback* form,
+> gated** — commit `4c9482908` made `jla_start_in_container` read `args.get(2)`
+> and call `Thread.start(Ljdk/internal/vm/ThreadContainer;)V` behind
+> `thread_container_registration_enabled()`
+> (`native-builtins/src/shared_secrets_bridge.rs:796-816`). The *preferred*
+> form — delete both registrations and the function — was **not** taken; both
+> registrations survive at `:1558` and `:1675`. W7-23-thread-container-registration.md
+> is why: the preferred form was measured to **hang** when landed without its
+> de-registration half.
+> **B is NOT APPLIED** — 49 `ShutdownOnSuccess`/`ShutdownOnFailure` mentions
+> remain in `native-builtins/src/jdk25_concurrency.rs`, with the address-keyed
+> `SCOPE_OWNERS`/`SCOPE_JOINERS` tables still referenced at `:583` and `:595`.
+> **C is NOT APPLIED** — `classloading/src/class_manager.rs:12594-12597` is
+> still `instance_fields(8)`, and `$Config` (a name no JDK ships) is still at
+> `:12603`.
+>
+> * **Residual: STILL OPEN, and B is the dangerous one.**
+>   `jdk25_concurrency.rs` runs last and owns every shared triple, so it can
+>   silently re-impose the JDK-21 shape over this record's fix.
+>   `allSuccessfulOrThrow`/`allUntil` answer `Void` because slot 8 does not
+>   exist; `allUntil`'s `Predicate` is never consulted; there is no preview
+>   gating in either direction.
+> * **This is the record in the directory most dependent on a run.** See its
+>   verification section: `probes/StructuredTaskScopeProbe` on both arms,
+>   checking `joinWaits.taskFinishedWhenJoinReturned`,
+>   `joinWaits.joinBlockedAtLeast200ms`,
+>   `configuration.default.subtaskThreadKind=virtual`, three consecutive
+>   byte-identical runs, and watching for `join()` hanging.
+
 **Status: the two dead JDK-21 class names are REMOVED and the JEP 505 surface is
 registered, both in `native-builtins/src/phases_late/concurrent.rs`, on the
 synthetic-JDK path only. The defect that actually breaks JDK 25 code is in a

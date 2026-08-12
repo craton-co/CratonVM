@@ -1,6 +1,25 @@
 # W7-2 — `IntStream.summaryStatistics()` killed the run because the whole file
 # that implements it is compiled out of the default binary
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "PARTLY UNWIRED"
+> IS STALE. THE WIRING LANDED.** Section 7.1, the one line marked REQUIRED, is
+> in the tree:
+> `crate::phases_late::register_phase56_primitive_stream_terminals(registry);`
+> at `native-builtins/src/reflect_annotations.rs:548`, commit `4752a00a4` —
+> landed by the W7-5 lane, not this one, which is why this record never learned
+> of it. The section 6 bodies are present too: `p56_int_stream_summary_stats` at
+> `native-builtins/src/phases_late/streams.rs:1764`, `p56_double_stats_store` at
+> `:1909`, registrar at `:469`, commit `1fcbd9060`.
+>
+> * **Headline: CLOSED in source, still unverified against a binary.**
+> * **Residual: STILL OPEN** — section 7.2's `DoubleStream`/`LongStream` holes
+>   (`anyMatch`, `reduce`, `findFirst`/`findAny`, `sorted`, `distinct`,
+>   `spliterator`) were never written, by design. No `distinct` or
+>   `spliterator()` primitive registration exists.
+> * **Cannot adjudicate without a run:** `cargo build --release -p cratonvm-cli`
+>   then `cratonvm --real-jdk ... ShadowDifferentialProbe`; the
+>   `IntStream.rangeClosed(1,5).summaryStatistics()` row must stop dying.
+
 Status: **fix written (unbuilt, unmeasured, and PARTLY UNWIRED)**. Wave 7, lane
 W7-2. Takes the fourth family of
 `W7-1-treemap-views-and-iterator-remove-contract.md` (status OPEN); the other

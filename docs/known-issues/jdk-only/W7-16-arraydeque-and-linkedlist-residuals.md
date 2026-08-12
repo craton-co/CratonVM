@@ -1,5 +1,28 @@
 # W7-16 — `ArrayDeque` streamed empty, and the two gates on `LinkedListSnapshotListItr`
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — THE
+> `LinkedListSnapshotListItr` HALF WAS TAKEN.** Both hunks of the "not applied"
+> patch are in the tree, landed together as this record required ("one commit
+> or neither") by the W7-20 lane, commit `6ae3ca634`: (a) the retag —
+> `"cratonvm/internal/LinkedListSnapshotListItr"` is now in
+> `VM_SERVICE_RECEIVERS` at `native-api/src/no_image_receiver.rs:267`, with the
+> tombstone at `:198`; (b) the VM-internal mint —
+> `ensure_vm_internal_class(..., 3)` at `native-collections/src/lib.rs:31049`
+> and `:31076`.
+>
+> * **`ArrayDeque`: CLOSED in source.** `ad_ensure_capacity` at
+>   `native-collections/src/lib.rs:34020`, commit `fddf67650`.
+> * **Residual: STILL OPEN, and now WORSE than when recorded.** The third
+>   defect — the `jdk_interfaces` arm — was **not** applied:
+>   `classloading/src/class_manager.rs:10824` still goes straight from
+>   `ArrayListSubList` to `java/util/Dictionary`, with zero
+>   `LinkedListSnapshotListItr` hits in that file. So the carrier still
+>   implements no interfaces, `listIterator() instanceof ListIterator` is
+>   `false`, and an erased `(ListIterator) x` throws `ClassCastException` — and
+>   because (a) and (b) landed, that is **now reachable in strict mode too**.
+> * **Also open, and build-blocking:** W7-20's two frozen baselines were never
+>   re-taken; see W7-20-refusal-laundered-into-wrong-answer.md.
+
 **Status: `ArrayDeque` DIAGNOSED and FIXED IN SOURCE 2026-08-11, NOT REBUILT.
 `LinkedListSnapshotListItr` DIAGNOSED, deliberately NOT changed — the
 sufficient patch spans two files and only one of them is this branch's.**

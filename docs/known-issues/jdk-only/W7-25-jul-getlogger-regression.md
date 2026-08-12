@@ -1,5 +1,33 @@
 # W7-25 — the JUL `getLogger` regression: the cause was not the one we recorded
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — BOTH "not applied"
+> OUT-OF-FILE PATCHES ARE APPLIED, AND MOST OF SECTION 7's OPEN TABLE IS NOW
+> CLOSED.**
+>
+> * **6.1** (move the `LogManager` `getLogManager`/`getLogger` pair into
+>   `r.with_category(NativeKind::Bridge, ...)`) — **APPLIED**, commit
+>   `4eaa5d321`, widened by `3b20b83b5`. Site:
+>   `native-builtins/src/phases_early.rs:20627-20637`.
+> * **6.2** (schedule `RJdkLogging` in `JDKONLY_CLASSES`) — **APPLIED**,
+>   `regression-suite/run.sh:110`.
+> * Section 7's table, re-adjudicated: `getLogManager()` fresh-manager —
+>   closed by 6.1. `setUseParentHandlers(false)` — **closed**, commit
+>   `ac7c5a9cd`, `native-builtins/src/logmanager.rs:4206-4226` reading
+>   `jul_logger_use_parent_handlers_table()` (`native-builtins/src/lib.rs:359`).
+>   `Formatter.formatMessage` leaving a raw `{0}` — **closed in both modes**,
+>   commits `a7bed655d` and `8eb60d3c1`, real body at
+>   `native-builtins/src/phases_early.rs:20556-20720`. Missing inferred source
+>   class/method — **closed in Compatible only**, commit `b7a8c37bf`,
+>   `stamp_inferred_caller` at `logmanager.rs:4168`; the strict half is its own
+>   record, jul-logrecord-infercaller-is-inert-under-jdk-only-20260812.md.
+> * **Residual: STILL OPEN** — the `Supplier` convenience overloads evaluate a
+>   suppressed supplier; `LogManager.getLogger` demand-creates for an undemanded
+>   name; `log(LogRecord)` is not level-gated.
+> * **Context for anyone re-measuring:** on 2026-08-12 `RJdkLogging` failed in
+>   Compatible mode on a **control** binary pre-dating that day's merges, with
+>   identical errors. Its Compatible-mode failure is pre-existing, not a
+>   regression from the JUL work above.
+
 **Status:** root cause **found and measured**; the fix is a two-line category
 change in a file this lane does not own (§6.1, not applied). Two adjacent
 `Compatible`-mode defects **fixed** in this lane's files. The missing vector,

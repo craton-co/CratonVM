@@ -1,5 +1,26 @@
 # CratonVM ran a preview class file HotSpot refuses, and the rule is not "minor == 65535"
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "NOT WIRED" IS
+> FALSE. ALL FOUR PARTS OF THE HANDBACK ARE APPLIED.** This was the most
+> misleading status line in the directory. W7-31-enable-preview-wiring.md took
+> the handback and landed it; verified independently here.
+> **A** `--enable-preview` in the CLI — `vm-cli/src/main.rs:443`
+> (`#[arg(long = "enable-preview")]`), applied at `:2940`
+> (`set_preview_enabled(args.enable_preview)`), test at `:7105`, commit
+> `de9bedeef`. **B** `PreviewFeatures.isPreviewEnabled` reads the same bit —
+> `native-builtins/src/lib.rs:4266` and `:14709`, same commit.
+> **C** `UnsupportedClassVersionError` with HotSpot's wording —
+> `types/src/error.rs:843`, arm at `vm/src/runtime/exceptions.rs:2362`, raise
+> site `classloading/src/class_manager.rs:5281`, commit `6ce65f98a`.
+> **D** covered by the same commits; the reader gate is at
+> `reader/src/class_file_version.rs:28`/`:33`, consumed at
+> `reader/src/class_reader.rs:132`.
+>
+> * **Headline: CLOSED in source. Nothing in this record is pending work.**
+> * **Cannot adjudicate without a run:** with `Q.class` stamped to `69.65535`,
+>   `cratonvm --enable-preview -cp . Q` must print `ran-Q` and
+>   `cratonvm -cp . Q` must refuse.
+
 **Status: the refusal is IMPLEMENTED in `reader/src/`, the switch that turns it
 off is NOT WIRED and is written out below under
 [Out-of-file patch (not applied)](#out-of-file-patch-not-applied).** Nothing was
