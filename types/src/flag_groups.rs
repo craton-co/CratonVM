@@ -233,6 +233,7 @@ pub struct E {
 #[rustfmt::skip]
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-census", on_key: Some("CRATONVM_DBG_A5_CENSUS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
     // Declared 2026-08-06: these nine were read by `runtime_var`/`runtime_var_os`
     // but named nowhere, so each was served by a live `getenv` instead of the
