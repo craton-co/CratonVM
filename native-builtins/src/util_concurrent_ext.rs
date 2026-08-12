@@ -1071,9 +1071,9 @@ pub(crate) fn try_alloc_concurrent_synthetic(
 /// objects of one class end up with two different slot maps in one run.
 /// `is_class_synthetic_stub` is stable under that — a stub stays a stub.
 ///
-/// Read `docs/known-issues/jdk-only/W7-49-slot-index-recensus.md` for why the
-/// alternative (guessing the layout from the object's own slot count) cannot
-/// work for a receiver this native did not allocate.
+/// Read W7-49-slot-index-recensus.md for why the alternative — guessing the
+/// layout from the object's own slot count — cannot work for a receiver this
+/// native did not allocate.
 pub(crate) fn appended_slot_base_for_class(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -1118,7 +1118,7 @@ pub(crate) fn try_alloc_with_appended_slots(
 /// `None` means "this object is too narrow to carry the private map" — which is
 /// exactly a real-layout instance that real bytecode (or the JIT) allocated at
 /// the class's declared width. Writing the private map onto it is the
-/// past-the-end write §5 of `docs/architecture/natives-over-real-jdk-classes.md`
+/// past-the-end write §5 of natives-over-real-jdk-classes.md
 /// calls heap corruption, so the caller must refuse rather than write.
 ///
 /// This is the check that FAILS: today those sites write unconditionally and

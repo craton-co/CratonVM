@@ -1,7 +1,42 @@
 # W4-4 — the "synthetic slot index on a real JDK object" species: sweep record
 
-Status: two MISMATCHes fixed, the rest of the lane's surface verified safe with
-a reason per site. Wave 4, lane W4-4.
+Status: two MISMATCHes fixed, the rest of **this lane's enumerated surface**
+verified safe with a reason per site. Wave 4, lane W4-4.
+
+> **2026-08-12 — re-censused against the un-blinded detector; the status line
+> above is narrower than it reads, and three paragraphs below are wrong on the
+> facts.** `W7-49-slot-index-recensus.md` re-derives this census with
+> `report_layout_alias` reporting both directions, and adds the census this one
+> never took: not how wide each object was allocated, but which slot INDICES are
+> written past a class's declared width (174 such writes, 23 classes). Four LIVE
+> sites repaired there. The corrections that land on this document:
+>
+> * **The repair is genuinely present** — verified in source, not taken on
+>   trust — but the census it enables is still partial in a way not recorded
+>   here: it sits on ONE funnel, and **511 direct `alloc_object` call sites in
+>   the native crates never reach it**. The widest LIVE over-allocation in the
+>   workspace (`AsynchronousSocketChannel`, 4 slots against a class declaring 1,
+>   allocated by `native-io/src/async_socket.rs`) is invisible to this
+>   instrument, so the "intersect list 1 with lists 2 and 3" procedure the
+>   closing section prescribes has a list 1 that cannot contain it.
+> * **"Only slots 0 and 1 are ever written"** (the `CompletableFuture` paragraph
+>   under "Visible, not fatal") is false for the workspace:
+>   `phases_late/concurrent.rs` writes slot 2 at 39 sites and `http_client.rs`
+>   wrote slots 2 and 3 on a LIVE essential-path native. The paragraph's
+>   conclusion survives; its premise does not.
+> * **The "Latent, not currently live" `HashSet` paragraph** names four sites.
+>   The population is 20 allocation sites across 14 files, three of them LIVE.
+> * **The `register_p67_async_channels` row** below is a right verdict for a
+>   wrong reason, and it is the fifth row in this document to be that. "The
+>   receiver is always CratonVM-fabricated" does not make a slot write safe — the
+>   object still carries the REAL class's `ClassId`, so slot 0 is `provider`, a
+>   reference the collector scans, whoever allocated it. What actually makes the
+>   row harmless is that seven of its eight triples are **dead**: `native-io`
+>   registers the same class later and registration is last-write-wins. The
+>   surviving eighth uses a slot map that disagrees with its owner's on the
+>   meaning of slots 0, 1 and 2.
+> * `java/util/concurrent/ConcurrentHashMap` is **16 vs 12**, not 16 vs 10 — the
+>   two `java.util.AbstractMap` fields are inherited and count.
 
 > **2026-08-11 — the instrument this record's closing paragraph prescribes was
 > blind in the direction that matters.** `report_layout_alias` was reporting
