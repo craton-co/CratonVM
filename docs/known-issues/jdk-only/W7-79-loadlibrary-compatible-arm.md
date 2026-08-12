@@ -8,6 +8,27 @@ entry in this directory's pile of patches that were already applied.
 
 Branch `fix/runtime-loadlibrary-compatible-arm-20260812`, off dev `87809196b`.
 
+**IN THE TREE — re-read 2026-08-12, second pass, not taken from this record.**
+Rule 1 of the campaign README applies to a record claiming its own fix landed
+just as much as to one claiming a fix did not, and this directory has handed the
+same work out twice before. Checked by reading the fork, not by grepping for a
+token: `native-builtins/src/lang_system.rs` calls `runtime_load_args` at
+**`:1522`** (`loadLibrary0`, strict), **`:1540`** (`load0`, strict),
+**`:1596`** (`loadLibrary0`, `Compatible`) and **`:1615`** (`load0`,
+`Compatible`); the helper is at **`:1717`** and takes the name from
+`args.get(2)` (`:1722`), the `fromClass` mirror from `args.get(1)` (`:1718`).
+Not one `args.get(1)`-as-name read is left on either arm, and the `Compatible`
+bodies carry the two `args[2]` comments this record's patch specified.
+`LoaderScoping::Off` is intact on both `Compatible` bodies (`:1605`, `:1622`),
+so the strict-only cross-loader rule did not leak with the fix. **Nothing to
+apply. Do not re-hand this out.**
+
+**Vector count moved 40 -> 41 on 2026-08-12** by W5-1's second pass, which
+asserted *which* library `libraryLoading()` ends up with rather than only that
+one loaded. The five checks below are unaffected and still sit where this record
+put them; the "Prove-the-RED" transcript further down quotes 40 and is a
+historical measurement, not a current expectation.
+
 ## The recorded diagnosis was checked before it was believed, and it holds
 
 This directory has produced nine records whose prescribed fix was wrong while
@@ -172,8 +193,8 @@ Reverify after the build:
 ```
 cargo build --release -p cratonvm-cli
 javac -d regression-suite/build regression-suite/src/RJdkJni.java
-target/release/cratonvm --real-jdk  -cp regression-suite/build RJdkJni   # must reach 40
-target/release/cratonvm --jdk-only  -cp regression-suite/build RJdkJni   # must reach 40
+target/release/cratonvm --real-jdk  -cp regression-suite/build RJdkJni   # must reach 41
+target/release/cratonvm --jdk-only  -cp regression-suite/build RJdkJni   # must reach 41
 java -cp regression-suite/build RJdkJni                                   # HotSpot oracle
 ```
 

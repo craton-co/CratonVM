@@ -106,8 +106,16 @@ public class RJdkProxy {
         check(s.equals(s), "Object.equals routed to handler");
         check(!s.equals("other"), "Object.equals(other)");
         check(s.toString().equals("RecorderProxy"), "Object.toString routed to handler");
-        // getClass() is final on Object and is NOT routed.
-        check(s.getClass() != null, "getClass is not routed");
+        // getClass() is final on Object and is NOT routed. `!= null` could not
+        // fail -- getClass never returns null on any VM -- so it asserted the
+        // comment above it and nothing else. The routed/not-routed question has
+        // an observable: the handler records every call it receives.
+        int callsBefore = r.calls.size();
+        Class<?> live = s.getClass();
+        check(live != null, "getClass returned null");
+        check(r.calls.size() == callsBefore,
+                "getClass must NOT be routed to the InvocationHandler, but it recorded "
+                        + r.calls.subList(callsBefore, r.calls.size()));
 
         check(r.calls.equals(Arrays.asList(
                 "greet/1", "add/2", "twice/1", "greet/1", "greet/1",

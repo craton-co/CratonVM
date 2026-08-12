@@ -19,6 +19,16 @@ W7-49-slot-index-recensus.md and W7-59-layout-detector-coverage.md. Every Java
 value quoted as "HotSpot says" is a transcript of
 `probes/UnderAllocationProbe.java` run on that image, not a guess.
 
+> **STALE-ROW BANNER — 2026-08-12, later pass.** Exactly one row of this record
+> is dead: **§3.2, `FileChannel`**. It is repaired (W7-72-ssc-socket-and-filechannel.md
+> §2) *and* the reason it gave for refusing the repair is factually inverted. Read
+> the banner on §3.2 before acting on anything in it; §4's tally row and §6 item 3
+> are struck to match. §6 item 2 is closed as an instrument gap by
+> W7-73-short-object-blind-spot.md §4 and measured by its §3.4 — the short-object
+> census this record predicted exists and stands at **12 short of 28**. Every
+> other verdict in this record was re-read on the later pass and holds, including
+> §1's structural finding, which three later records depend on.
+
 ---
 
 ## 1. An `under` row cannot describe a short object, and the proof is two lines apart
@@ -221,7 +231,47 @@ drives a mapped buffer through `force()`, `force(0,8)`, `isLoaded()`,
 `isReadOnly()` and `get(0)`, printing values rather than asserting them, so the
 CratonVM-versus-HotSpot transcripts diff directly.
 
-### 3.2 Mis-mapped, live, and NOT repaired — with the reason
+### 3.2 Mis-mapped, live, and NOT repaired — with the reason — **DEAD ROW, 2026-08-12: REPAIRED, and the reason was inverted**
+
+> **This is the one row of this record that is dead on the shipping path, and it
+> is dead twice over. Do not re-derive it and do not re-fix it.**
+>
+> **The repair landed.** W7-72-ssc-socket-and-filechannel.md §2 moved the private
+> map to the appended-slot idiom, **in one step across both crates** — which is
+> precisely what this section refused to do one-sidedly, and was right to refuse.
+> The new owner is `native-api/src/synthetic_file_channel.rs`; the allocator
+> width and every accessor base come from one function, 19 forwarding call sites
+> in `native-io` and 22 in `native-builtins`, with the foreign-receiver screen
+> moved **inside** the accessors so no call site can forget it.
+>
+> **The factual premise below is inverted.** This section says `isOpen()` is
+> registered twice in `phases_late/nio_file.rs` and *"the one that reads a field
+> reads slot 0 as the fd, agreeing with `native-io`'s map"* — and concludes that
+> renumbering one side would make `isOpen()` return FALSE for every open channel.
+> The copy that reads slot 0 (`register_phase57_file_channel`) is the one that
+> **never runs**: its whole transitive caller chain up to `vm_init.rs` is
+> `#[cfg(feature = "synthetic-jdk")]`, and even inside that build the
+> constant-returning copy in `register_phase57_nio_file` is registered again,
+> later, and wins. It is inert in all four configurations. W7-72 §2.1 traces the
+> chain line by line and states the general rule this section broke: **liveness
+> of a registrar is a property of the call graph from `vm_init`, gated by Cargo
+> features and by a runtime mode flag — not a property of the file the
+> registrations are in.**
+>
+> **What the repair found that this section did not.** The fd landing in
+> `closeLock`, an `L` slot, meant `gc::coerce_field_value_by_descriptor` degraded
+> the `Int` to null and the fd was **never stored at all** in real-JDK mode. And
+> the winning `isOpen()` body was a constant `1`, so `close(); isOpen()` reported
+> the channel open forever. Both are HotSpot-parity gains this census never asked
+> for.
+>
+> **Census consequence.** The site's requested width is now
+> `synthetic_file_channel::alloc_slots` = `base_for_class(…) + 2`, so its
+> `ClassId::new(0)` row can no longer be short in any execution — see
+> W7-74-short-object-repairs.md §1.3 for the argument and
+> W7-73-short-object-blind-spot.md §3.4 for the re-derived table. Expect a new
+> `over` row for `java/nio/channels/FileChannel` at 6 vs 4 under
+> `CRATONVM_DBG_LAYOUT_ALIAS=1`; that is the idiom's signature, not a regression.
 
 **`java/nio/channels/FileChannel` 2 vs 4**, `native-io/src/lib.rs`,
 `native_fc_open` plus 14 accessor sites.
@@ -454,7 +504,7 @@ registrar is synthetic-only however it is reached.
 | verdict | triples | sites |
 |---|---:|---:|
 | repaired (`MappedByteBuffer`) | 1 | 2 |
-| mis-mapped, live, refused with a reason (`FileChannel`) | 1 | 2 |
+| ~~mis-mapped, live, refused with a reason (`FileChannel`)~~ **repaired by W7-72; the refusal's premise was inverted — §3.2** | 1 | 2 |
 | census mis-read a fallback arm — already correct | 3 | 3 |
 | writes go by NAME — no aliasing possible | 3 | 4 |
 | slot map is empty — vacuous row | 1 | 1 |
@@ -529,8 +579,23 @@ are untouched.
    predicate `NativeContext` does not have, and it is a *different* census from
    this one: the interesting rows are allocations that happen before their class
    is loaded, which no current instrument distinguishes from an interface.
-3. **`java/nio/channels/FileChannel`** — §3.2. Two crates, three registrations,
-   a last-write-wins question that needs a build.
+   **CLOSED as an instrument gap 2026-08-12** — `classify` now reports
+   `declared == 0` as a third direction, `undeclared`, and the base allocator
+   observes the `ClassId::new(0)` sentinel *before* it is substituted
+   (W7-73 §4). The dominant producer turned out to be neither of the two this
+   record considered: it is the `Err(_) => ClassId::new(0)` arm, which §2 below
+   examined at four sites and cleared — correctly for the width species, and
+   exactly backwards for the short-object species. The population is bounded by a
+   downward-only ratchet at **28**, of which **12** are short
+   (W7-73 §3.4). What is still open is whether any of those arms is ever taken,
+   which no source read can answer.
+3. ~~**`java/nio/channels/FileChannel`** — §3.2. Two crates, three registrations,
+   a last-write-wins question that needs a build.~~ **CLOSED** by
+   W7-72-ssc-socket-and-filechannel.md §2 — and the last-write-wins question did
+   **not** need a build. It was answered by tracing the call graph from
+   `vm_init.rs` through both `#[cfg]` arms and the `use_synthetic_jdk` flag,
+   which is where the ordering is decided; this record read it from the
+   registration sites and got it backwards. See the banner on §3.2.
 4. **The collections overlay** — §3.5. Five classes, two crates, an
    architectural decision.
 5. **`java/nio/ByteBuffer`'s `bigEndian`** — §3.3. A missing write, not an

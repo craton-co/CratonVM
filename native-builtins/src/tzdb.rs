@@ -747,6 +747,250 @@ pub fn standard_offset_seconds_at_instant(
     get_zone_rules(ctx, zone_id).map(|r| standard_offset_at_instant(&r, epoch_sec))
 }
 
+// ---------------------------------------------------------------------------
+// W7-92 — the HOST's own zone, as an id `TimeZone`/`ZoneId` can resolve.
+// ---------------------------------------------------------------------------
+//
+// This is the missing input, not a missing table: everything above computes
+// offsets correctly *for a zone id it is given*, and both producers of the
+// default zone handed it `"UTC"` on every host. See
+// docs/known-issues/jdk-only/W7-92-system-timezone-answers-utc.md.
+//
+// Two rules govern the code below, both earned by this campaign:
+//
+//   * **Never fabricate a zone.** Every id returned here has been resolved
+//     against the same `tzdb.dat` catalog the offset natives read; anything
+//     the platform does not state, or that the catalog does not know, answers
+//     `None` so the caller keeps its existing UTC/GMT answer. A wrong non-UTC
+//     zone is worse than UTC, which is at least recognisable as a stub.
+//   * **Never hard-code *this* host's zone.** Nothing below names a zone; the
+//     names all come from the OS and from `<java.home>/lib/tzmappings`.
+
+/// `DYNAMIC_TIME_ZONE_INFORMATION` (winbase.h). `SYSTEMTIME` is eight
+/// `WORD`s, so `[u16; 8]` is layout-identical to it and saves declaring a
+/// second struct nothing reads the fields of. Offsets: bias 0, standardName
+/// 4, standardDate 68, standardBias 84, daylightName 88, daylightDate 152,
+/// daylightBias 168, timeZoneKeyName 172, dynamicDaylightTimeDisabled 428;
+/// size 432 with `align(4)` from the `LONG`s.
+#[cfg(windows)]
+#[repr(C)]
+struct DynamicTimeZoneInformation {
+    bias: i32,
+    standard_name: [u16; 32],
+    standard_date: [u16; 8],
+    standard_bias: i32,
+    daylight_name: [u16; 32],
+    daylight_date: [u16; 8],
+    daylight_bias: i32,
+    time_zone_key_name: [u16; 128],
+    dynamic_daylight_time_disabled: u8,
+}
+
+/// `TIME_ZONE_ID_INVALID` — the only failure code
+/// `GetDynamicTimeZoneInformation` returns (0/1/2 all mean success, and say
+/// which of standard/daylight time is in force).
+#[cfg(windows)]
+const TIME_ZONE_ID_INVALID: u32 = 0xFFFF_FFFF;
+
+/// The host's time-zone information, straight from Win32.
+///
+/// Real HotSpot's `TimeZone_md.c` reads
+/// `HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation\TimeZoneKeyName`
+/// out of the registry. `GetDynamicTimeZoneInformation` returns that exact
+/// value in its `TimeZoneKeyName` field — it is the documented API over the
+/// same data — so no registry API is needed and therefore no new crate
+/// dependency. `kernel32` is linked by the Rust standard library on every
+/// `*-pc-windows-*` target, and this entry point exists on Vista and later,
+/// so the import cannot fail to bind on any host that can run the VM at all.
+#[cfg(windows)]
+fn dynamic_time_zone_information() -> Option<DynamicTimeZoneInformation> {
+    unsafe {
+        extern "system" {
+            fn GetDynamicTimeZoneInformation(
+                lpTimeZoneInformation: *mut DynamicTimeZoneInformation,
+            ) -> u32;
+        }
+        let mut tzi: DynamicTimeZoneInformation = std::mem::zeroed();
+        if GetDynamicTimeZoneInformation(&mut tzi) == TIME_ZONE_ID_INVALID {
+            return None;
+        }
+        Some(tzi)
+    }
+}
+
+/// The platform's own name for its zone, in the platform's own namespace —
+/// on Windows a time-zone *key* name ("Argentina Standard Time"), which is
+/// not an IANA id and must go through [`map_windows_zone_key`].
+///
+/// A blank key is a real state, not a read failure: a machine whose zone was
+/// installed with `SetTimeZoneInformation` rather than picked from the
+/// registry's list has no key name, and HotSpot's `getWinTimeZone` gives up
+/// on it too (falling through to its GMT-offset id). `None` here, never a
+/// guess.
+#[cfg(windows)]
+fn platform_zone_key() -> Option<String> {
+    let tzi = dynamic_time_zone_information()?;
+    let key = &tzi.time_zone_key_name;
+    let end = key.iter().position(|&u| u == 0).unwrap_or(key.len());
+    let name = String::from_utf16_lossy(&key[..end]).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_zone_key() -> Option<String> {
+    None
+}
+
+/// `TimeZone_md.c`'s `customZoneName`: a Win32 `Bias` is the number of
+/// minutes to ADD to local time to get UTC, so a *positive* bias is a zone
+/// WEST of Greenwich and the rendered sign is the opposite of the bias's.
+/// The bias used is the zone's STANDARD one, exactly as HotSpot's
+/// `getGMTOffsetID` does — a custom id carries no DST rule, so folding the
+/// current daylight saving into it would misreport the zone for half the
+/// year.
+#[cfg(windows)]
+fn custom_zone_name(bias_minutes: i32) -> String {
+    let sign = if bias_minutes > 0 { '-' } else { '+' };
+    // A hostile/absurd bias must not panic an arithmetic-overflow check in a
+    // debug build; real values are within ±14h.
+    let mins = bias_minutes.unsigned_abs().min(24 * 60);
+    format!("GMT{sign}{:02}:{:02}", mins / 60, mins % 60)
+}
+
+/// The host's standard UTC offset as a custom `"GMT±HH:MM"` id — the body
+/// behind `TimeZone.getSystemGMTOffsetID`.
+///
+/// This is the JDK's own second chance, not a hedge:
+/// `TimeZone.setDefaultZone()` calls it precisely when the named id it just
+/// obtained from `getSystemTimeZoneID` is one `TimeZone.getTimeZone(id,
+/// false)` could not resolve, and uses the result instead. It is what keeps
+/// the host's OFFSET right even where the host's zone NAME cannot be
+/// resolved, and it is the reason this fix does not depend on the Java-side
+/// `ZoneInfoFile`/`tzdb.dat` path being healthy.
+#[cfg(windows)]
+pub fn platform_gmt_offset_id() -> Option<String> {
+    dynamic_time_zone_information().map(|tzi| custom_zone_name(tzi.bias))
+}
+
+#[cfg(not(windows))]
+pub fn platform_gmt_offset_id() -> Option<String> {
+    None
+}
+
+/// Map a Windows time-zone key name to an IANA id through
+/// `<java.home>/lib/tzmappings` — the file real HotSpot's `matchJavaTZ`
+/// reads, and the reason the JDK hands `getSystemTimeZoneID` a `javaHome`
+/// argument at all.
+///
+/// One row per line, no header and no comment lines in the JDK 25 file
+/// (CRLF-terminated, which `str::lines` strips):
+/// `<Windows key>:<region>:<IANA id>:`. `matchJavaTZ` prefers the row whose
+/// region equals the host's ISO-3166 country code and falls back to the row
+/// whose region is `001` — CLDR's "world" default.
+///
+/// **Only the `001` row is consulted here.** Reading the host's country would
+/// mean a second Win32 import (`GetUserDefaultGeoName`, Windows 10 1709+ —
+/// an import that would fail to BIND, killing the whole process, on an older
+/// host), and the rows it would select cannot differ in offset: every row
+/// under one Windows key describes the same Windows zone, i.e. the same
+/// standard offset and the same DST rule, and differs only in which IANA
+/// name (and therefore which pre-modern history) it points at. So this
+/// narrowing can change the id STRING relative to HotSpot in a
+/// country-specific case, never the offset the id computes.
+fn map_windows_zone_key(java_home: &str, key: &str) -> Option<String> {
+    let path = std::path::Path::new(java_home)
+        .join("lib")
+        .join("tzmappings");
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `matchJavaTZ` skips any row with fewer than three fields rather than
+        // giving up on the file, and so does this.
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        if fields[0] == key && fields[1] == "001" && !fields[2].is_empty() {
+            return Some(fields[2].to_string());
+        }
+    }
+    None
+}
+
+/// `/etc/timezone` holds the plain IANA id on Debian/Ubuntu/Arch and most
+/// modern distros. `/etc/localtime` — the symlink RHEL-family and Alpine use
+/// instead — is deliberately not followed, the same choice
+/// `util_time.rs::os_default_zone_id` documents.
+///
+/// `$TZ` is deliberately NOT read here even though it is the POSIX override:
+/// `vm_init` already turns it into the `user.timezone` system property, and
+/// both callers of [`system_zone_id`] consult `user.timezone` FIRST — real
+/// `TimeZone.setDefaultZone()` by its own bytecode, the `getDefault` native
+/// explicitly. Reading it a third time here could only ever disagree with
+/// those two.
+#[cfg(unix)]
+fn unix_zone_id() -> Option<String> {
+    let contents = std::fs::read_to_string("/etc/timezone").ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The host's own zone as an id `java.util.TimeZone.getTimeZone` and
+/// `java.time.ZoneId.of` both resolve, or `None` when the platform does not
+/// say — in which case the caller keeps whatever it answered before.
+///
+/// `java_home` is the argument `TimeZone.getSystemTimeZoneID(String)` was
+/// handed; pass `None` to take it from the `java.home` system property.
+pub fn system_zone_id(ctx: &mut dyn NativeContext, java_home: Option<&str>) -> Option<String> {
+    // `<java.home>/lib` holds both files this needs — `tzmappings` to map the
+    // platform's key, `tzdb.dat` to check the answer — so a VM with no
+    // `java.home` yet cannot resolve anything. It must not TRY, either:
+    // `catalog`'s `OnceLock` latches its first result for the process, so one
+    // premature call would leave every tzdb-backed offset native answering
+    // from an empty catalog for the rest of the run.
+    let java_home = match java_home {
+        Some(home) if !home.is_empty() => home.to_string(),
+        _ => ctx
+            .get_system_property("java.home")
+            .filter(|home| !home.is_empty())?,
+    };
+
+    let mut candidate =
+        platform_zone_key().and_then(|key| map_windows_zone_key(&java_home, &key));
+    #[cfg(unix)]
+    {
+        if candidate.is_none() {
+            candidate = unix_zone_id();
+        }
+    }
+    let id = candidate?;
+
+    // The gate against answering a name nothing downstream can resolve.
+    // `get_zone_rules` follows `tzdb.dat`'s own alias table — which is how
+    // `tzmappings`' "America/Buenos_Aires" reaches the
+    // "America/Argentina/Buenos_Aires" rules — so a hit here means the real
+    // `ZoneId.of(id)` and `TimeZone.getTimeZone(id)` resolve it as well.
+    // The id is returned VERBATIM rather than canonicalised, because the
+    // verbatim `tzmappings` value is what real HotSpot answers and HotSpot is
+    // the oracle.
+    if get_zone_rules(ctx, &id).is_some() {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]

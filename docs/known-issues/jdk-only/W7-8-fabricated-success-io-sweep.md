@@ -5,6 +5,21 @@ of any kind was executed for this record and no CratonVM binary exists carrying
 it. Every claim below is a claim about *source* and about the *JDK 25 oracle*,
 never about observed behaviour.
 
+> **2026-08-12 — read §7 before §3.1, and §8 before either.** The §3.6 residuals
+> were re-opened and four of five settled from source. The one that mattered most
+> was not on that list: **§3.1's entire fix set landed in a registrar that neither
+> shipping mode ever calls.** `register_phase57_file_channel` is reachable only
+> from `register_synthetic_overrides`, while `register_phase57_nio_file` — which
+> `vm_init` calls directly in both shipping arms — carried its own unhardened
+> copies of seven of the same triples. Rows 1, 2 and 19 were therefore LIVE in
+> `--real-jdk` and `--jdk-only`. §7.1 has the chain; §6 item 2 had the decision to
+> take.
+>
+> **§8 (same day, later): the re-aim is APPLIED, and so are §6 items 3–6.** The
+> seven shared triples now point at one body each, registered by BOTH registrars,
+> so rows 1, 2 and 19 are live-fixed in all three configurations. Still not built
+> and still not run.
+
 Scope: `native-io/src/lib.rs` and
 `native-builtins/src/phases_late/nio_file.rs` only. Findings outside those two
 files are recorded under [Out-of-file patch (not applied)](#out-of-file-patch-not-applied).
@@ -103,6 +118,18 @@ running).
 `register_phase57_file_channel`, `native-builtins/src/phases_late/nio_file.rs`.
 `close()` writes `-1` into slot 0, so `fd_id < 0` *is* "closed"; every row below
 answered something else.
+
+> **Reachability correction, 2026-08-12 (§7.1), and its repair (§8).** "DEFAULT"
+> in this heading was wrong for the seven triples both registrars serve — rows
+> 1, 2, 5, 6, 17 (partly) and 19 — because `register_phase57_file_channel` is
+> reached only from `register_synthetic_overrides`. Those seven are now single
+> bodies (`p57_fc_size`, `p57_fc_position`, `p57_fc_position_set`, `p57_fc_read`,
+> `p57_fc_write`, `p57_fc_close`, `p57_fc_is_open`) registered by both
+> registrars, so the heading is true again for them. Rows 3, 4, 7–16 and 18
+> concern triples only this registrar registers and are **synthetic-JDK only** —
+> in a shipping mode real `FileChannelImpl` bytecode serves them. That is not a
+> gap to close by registering more triples on the shipping path: doing so would
+> put a native in front of methods nothing currently intercepts.
 
 | # | site | JDK 25 says | CratonVM answered | verdict |
 |---|---|---|---|---|
@@ -231,13 +258,17 @@ oracle says to leave exactly as it is.
 
 ### 3.6 UNMEASURED — recorded, not fixed
 
+**Every row of this table was re-opened on 2026-08-12 and four of the five are
+now settled. Read §7 before working from any of them.** The table is kept as
+written so the corrections can be read against it.
+
 | site | why it cannot be settled from source |
 |---|---|
-| `FileChannel` natives lack the real-instance guard that `close()`/`isOpen()` carry | `close`/`isOpen` are declared above `FileChannel` and are reachable on a real `sun.nio.ch.FileChannelImpl` through a `FileChannel`-typed call site, which is why they sniff the class name. The rest are `abstract` on `FileChannel` and should always resolve to `FileChannelImpl`'s own override — *should*, on this VM's dispatch. If they do not, rows 1–2 turn a silent `-1` into a thrown `ClosedChannelException` on a healthy real channel. Loud is the right side to fail on, but this needs one run to confirm. **Check this first when the branch is built.** |
-| `RandomAccessFile.writeUTF` writes plain UTF-8, not modified UTF-8 | NUL and supplementary characters encode differently. `readUTF` beside it is symmetric, so a CratonVM round trip works and only cross-VM/on-disk interop diverges. Out of species; a separate defect. |
-| `DatagramChannel.setSoTimeout(int)`'s `.max(0)` (`native-io`, DEFAULT) | not a method `java.nio.channels.DatagramChannel` declares, so there is no javadoc to quote. It belongs to the net lane's surface, not this one. Left untouched. |
-| `WatchService.poll(long, TimeUnit)` timeout `.max(0)` (`native-io`) | the javadoc specifies no exception for a negative timeout, and "do not wait" is a defensible reading. No sentence either way. |
-| `Files.isSameFile` approximating with `Path.equals` | a documented approximation already carrying its own comment, not a swallowed failure |
+| `FileChannel` natives lack the real-instance guard that `close()`/`isOpen()` carry | `close`/`isOpen` are declared above `FileChannel` and are reachable on a real `sun.nio.ch.FileChannelImpl` through a `FileChannel`-typed call site, which is why they sniff the class name. The rest are `abstract` on `FileChannel` and should always resolve to `FileChannelImpl`'s own override — *should*, on this VM's dispatch. If they do not, rows 1–2 turn a silent `-1` into a thrown `ClosedChannelException` on a healthy real channel. Loud is the right side to fail on, but this needs one run to confirm. **Check this first when the branch is built.** — **SUPERSEDED, §7.1: the guard exists, and the real finding underneath it is worse.** |
+| `RandomAccessFile.writeUTF` writes plain UTF-8, not modified UTF-8 | NUL and supplementary characters encode differently. `readUTF` beside it is symmetric, so a CratonVM round trip works and only cross-VM/on-disk interop diverges. Out of species; a separate defect. — **CONFIRMED and half-fixed, §7.2. "readUTF beside it is symmetric" is false in `native-io`.** |
+| `DatagramChannel.setSoTimeout(int)`'s `.max(0)` (`native-io`, DEFAULT) | not a method `java.nio.channels.DatagramChannel` declares, so there is no javadoc to quote. It belongs to the net lane's surface, not this one. Left untouched. — **WRONG FRAMING, FIXED, §7.3.** |
+| `WatchService.poll(long, TimeUnit)` timeout `.max(0)` (`native-io`) | the javadoc specifies no exception for a negative timeout, and "do not wait" is a defensible reading. No sentence either way. — **There IS a sentence, §7.4. The `.max(0)` was right; a sibling in the same crate was not.** |
+| `Files.isSameFile` approximating with `Path.equals` | a documented approximation already carrying its own comment, not a swallowed failure — **the comment misstates the JDK, §7.5.** |
 
 ---
 
@@ -305,8 +336,10 @@ stated is one that is not understood.
 
 ## 6. Out-of-file patch (not applied)
 
-One item only. It is a *documentation* change to another lane's file, so it is
-recorded rather than applied.
+**Item 1 was the only one when this record was written; §7 added five more, all
+in `native-builtins/src/phases_late/nio_file.rs`, and they are listed after it.**
+Item 1 is a *documentation* change to another lane's file, so it is recorded
+rather than applied.
 
 **Add to `W2-7-fabricated-success-where-the-spec-mandates-failure.md`'s
 inventory table** (that record is owned by another lane and was read, not
@@ -329,3 +362,603 @@ from a read, `0` from a transfer, `false` from `File.delete`, and a `void`
 write that returns are four different answers to that question, and only three
 of them are defects.
 ```
+
+### Items 2–6 — all in `native-builtins/src/phases_late/nio_file.rs`
+
+Added 2026-08-12 by the pass recorded in §7. Anchor each on the quoted text, not
+the line number.
+
+> **ALL FIVE APPLIED, 2026-08-12 — see §8.** Item 2 was applied by *sharing*
+> rather than by moving or delegating, and item 5's call site grew a screen the
+> patch text did not have. The text below is kept as written so the differences
+> can be read against it.
+
+**2. Re-aim §3.1 at the registrar that actually ships (§7.1).** This is the
+biggest of the six and it is not a patch so much as a decision. `close()`,
+`isOpen()`, `size()`, `position()`, `position(long)`, `read(ByteBuffer)` and
+`write(ByteBuffer)` are registered TWICE, and in `--real-jdk` / `--jdk-only`
+only `register_phase57_nio_file`'s copies exist. Either move §3.1's hardened
+bodies into that registrar, or have it delegate. Do **not** simply delete the
+duplicate registrations: in `--synthetic-jdk` mode the file-channel registrar is
+the one that wins, so deleting either side changes a different mode than the one
+being fixed. Prove whichever way with a `--dump-native-registry` diff.
+
+**3. The two contradictory ordering comments (§7.1).** `nio_file.rs:6002-6007`
+says `register_phase57_nio_file` wins *"in every build and every mode"* because
+*"even in the synthetic arm `vm_init.rs` calls THIS registrar again
+afterwards"*; `:15322-15334` says its own copy is *"the LOSING copy of this
+triple"*. In the synthetic arm the second is the winner
+(`register_phase57_natives` calls `register_phase57_nio_file` at line 21 and
+`register_phase57_file_channel` at line 36, and `vm_init.rs:1837-1905` calls
+neither again). Correct both comments together or they will re-diverge.
+
+**4. `RandomAccessFile.writeUTF` / `readUTF` — converge on one codec (§7.2).**
+`native-io` now exports the pair, so this is a two-line change plus the length
+check that already exists:
+
+```
+-        let bytes = s.as_bytes();
++        let bytes = cratonvm_native_io::encode_modified_utf8(&s);
+```
+
+and in `readUTF`:
+
+```
+-        let s = String::from_utf8_lossy(&str_buf).to_string();
++        let s = cratonvm_native_io::decode_modified_utf8(&str_buf)
++            .map_err(|e| raf_utf_data_format(ctx, &e))?;
+```
+
+`raf_utf_data_format` is already in that file (`nio_file.rs:9022`) and is the
+right type: `DataInput.readUTF` specifies `UTFDataFormatException` for bytes that
+are not a valid modified UTF-8 encoding, which is exactly what
+`from_utf8_lossy` was silently replacing with `U+FFFD`. Note the existing
+`if bytes.len() > 65535` check must stay where it is and must measure the
+ENCODED buffer — it already does.
+
+While there: `writeChars` at `:12296` does `for ch in s.chars()` and writes
+`ch as u16`, which truncates every supplementary character to one wrong code
+unit. `DataOutput.writeChars` writes UTF-16 code units, i.e. `s.encode_utf16()`.
+Same wire format, same file, one line.
+
+**5. `Files.isSameFile` — use the identity, not the spelling (§7.5).** Replace
+the `Path.equals` body at `nio_file.rs:1267-1286` with `p57_read_path` on both
+arguments and
+
+```rust
+match cratonvm_native_io::file_channel::paths_name_the_same_file(
+    std::path::Path::new(&p1),
+    std::path::Path::new(&p2),
+) {
+    Ok(same) => Ok(Some(Value::Int(i32::from(same)))),
+    Err(e) => Err(p57_io_error(&e)),
+}
+```
+
+and correct the comment above it, which currently states as fact that the
+default provider's check *is* path equality. It is the fast path only. Keep the
+VFS/jar-encoded case in mind: `paths_name_the_same_file` touches the host
+filesystem, so a `vfs_decode`-able path must keep taking the equality answer —
+that screen is not in the helper and must be at this call site.
+
+**6. The option-list scan (§7.6).** Three sites, one species, and landing them
+is what unlocks two more assertions in `regression-suite/src/RNioNoFollow.java`
+— the vector that currently asserts nothing about `NOFOLLOW_LINKS` on Windows:
+
+* `Files.copy(InputStream, Path, CopyOption[])` (`:19572`) — refuse every option
+  but `REPLACE_EXISTING` with `UnsupportedOperationException`. Synthetic-only, so
+  this one changes no shipping measurement; it is here so the three do not
+  diverge.
+* `fsp_new_input_stream` (`:8624`) — refuse `APPEND` and `WRITE` with
+  `UnsupportedOperationException`. **Shipping.**
+* `fsp_new_output_stream` — refuse `READ` with `IllegalArgumentException`
+  (note: a *different* type from its sibling, and the JDK means it).
+  **Shipping.**
+
+`fsp_scan_open_options` already walks the array for `nofollow`; these are
+additional verdicts from the same walk, not a second one.
+
+---
+
+## 7. §3.6 re-opened, 2026-08-12 — four of five settled
+
+Same standing as everything above: **nothing was built, checked, tested or run.**
+The JDK 25 oracle is the same one, and it is on this host —
+`C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot\lib\src.zip`. Every quote below
+is from a file extracted out of it, with the line number in that file.
+
+The five rows were re-opened together because they had one thing in common: each
+was recorded as *unsettleable from source*, and four of them turned out to be
+settleable from source by asking a different question than the one the row asked.
+
+### 7.1 The real-instance guard EXISTS — and the finding under it is that this record fixed the losing registrar
+
+**The row's own question is closed.** The class-name screen it says is missing
+was moved INSIDE the accessors by the wave that followed this record.
+`native-api/src/synthetic_file_channel.rs` now owns the private slot map, and
+`private_base` opens with
+
+```rust
+let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+if class_name.as_deref() != Some(CLASS) {
+    return None;
+}
+```
+
+so `fd_value` answers `Value::Object(None)` and `set_fd_value` drops the write
+for **every** receiver that is not literally `java/nio/channels/FileChannel`.
+The module says why in its own words — *"the screen moved INSIDE the accessors …
+Every call site inherits it, and none can forget it"*. So the "if they do not,
+rows 1–2 turn a silent `-1` into a thrown `ClosedChannelException` on a healthy
+real channel" hazard is gone in the other direction: on a real
+`sun.nio.ch.FileChannelImpl` the accessors are guaranteed to answer "not ours",
+and the surrounding bodies take their not-open arm with certainty rather than by
+luck.
+
+**But the bodies that take that arm are not this record's.** Reachability, from
+the tree:
+
+* `register_phase57_file_channel` — where **every fix in §3.1 landed** — is
+  called from exactly one place, `register_phase57_natives`
+  (`native-builtins/src/phases_late/nio_file.rs:36`), which is called from
+  exactly one place, `native-builtins/src/lib.rs:23938`, which is inside
+  `register_synthetic_overrides`. `vm/src/vm/vm_init.rs` reaches
+  `register_synthetic_overrides` only through `register_builtins`, and calls
+  that only inside `#[cfg(feature = "synthetic-jdk")] { if config.use_synthetic_jdk { … } }`
+  (`vm_init.rs:1835-1839`).
+* `register_phase57_nio_file` is called **directly** by `vm_init.rs` in the two
+  arms that ship — `:2217` (feature-enabled binary running real-JDK) and
+  `:2763` (the default build) — and registers its own bodies for
+  `size()J`, `position()J`, `position(J)Ljava/nio/channels/FileChannel;`,
+  `close()V`, `isOpen()Z`, `write(Ljava/nio/ByteBuffer;)I` and
+  `read(Ljava/nio/ByteBuffer;)I` (`nio_file.rs:5924-6104`).
+
+So in **both shipping runtime modes**, seven FileChannel triples are served by
+`register_phase57_nio_file`'s unhardened bodies and the hardened ones are never
+registered at all. Concretely, rows 1, 2 and 19 of §3.1 are LIVE today:
+`nio_file.rs:6075` still answers `-1` for a `read` it cannot service, and
+`:6039` still raises a bare `IOException("Channel closed")` rather than
+`ClosedChannelException`. Rows 3–18 concern six triples
+(`truncate`, `read`/`write` with an explicit position, `transferTo`,
+`transferFrom`, `force`) that **only** the synthetic registrar registers, so in
+a shipping mode real `FileChannelImpl` bytecode runs and there is nothing to
+fix there.
+
+**A doc row this corrects.** `nio_file.rs:6002-6007` asserts that
+`register_phase57_nio_file`'s `isOpen` is *"THE WINNING REGISTRATION for this
+triple, in every build and every mode"* because *"even in the synthetic arm
+`vm_init.rs` calls THIS registrar again afterwards"*. It does not: the synthetic
+arm is `vm_init.rs:1837-1905` and contains no call to it, while inside
+`register_phase57_natives` the order is `register_phase57_nio_file` at line 21
+and `register_phase57_file_channel` at line 36 — so in **synthetic** mode the
+`isOpen` at `:15334` that calls itself *"the LOSING copy"* is the one that wins.
+The two comments contradict each other and both are half right, which is exactly
+the shape §3 of the directory README warns about. Neither file is this lane's;
+see [Out-of-file patch](#6-out-of-file-patch-not-applied).
+
+**What this does NOT settle**, and no source read can: whether a native
+registered on `java/nio/channels/FileChannel` intercepts a call whose receiver is
+a real `sun.nio.ch.FileChannelImpl`. `close()V` clearly does — the body at
+`nio_file.rs:5965` was written for that case and says so. `read(ByteBuffer)` is
+*declared* abstract on `FileChannel` and *overridden* by `FileChannelImpl`, which
+is a different dispatch shape. That is the one run this row still needs, and it
+is now a much sharper question than "is there a guard".
+
+### 7.2 `writeUTF` — confirmed, and "readUTF beside it is symmetric" is false
+
+The row is right that `RandomAccessFile.writeUTF` writes plain UTF-8:
+`nio_file.rs:12259` is `let bytes = s.as_bytes();` and the length prefix at
+`:12273` is that buffer's length. Its neighbour `readUTF` at `:12112` is
+`String::from_utf8_lossy`, so within that file the round trip does close.
+
+The row's consolation — *"a CratonVM round trip works"* — does not survive
+contact with the second implementation. `native-io/src/lib.rs` registers the
+same class's `readUTF()Ljava/lang/String;` and, until this pass, bound it to
+**`native_raf_read_line`**, with the word `simplified` for a comment. `readLine`
+scans to the next `\n`/`\r`; `readUTF` reads a 2-byte big-endian length and then
+exactly that many bytes. So that binding consumed the length prefix as text,
+stopped at whichever payload byte happened to be `0x0A`, and left the file
+position mid-record — corrupting every later read on the handle, not only its
+own. `writeUTF` had **no** registration in that file at all, which is why no
+round trip existed to fail.
+
+The two encodings differ on exactly two inputs, and it is worth writing them
+down because "UTF-8" is not one thing here: `U+0000` is `C0 80` in modified
+UTF-8 and `00` in plain, and a supplementary character is a **six-byte surrogate
+pair** in modified UTF-8 and one four-byte sequence in plain. Both the count in
+the prefix and the payload are wrong, and `readUTF` cannot tell.
+
+**Fixed in this pass, in `native-io` only.** `encode_modified_utf8` /
+`decode_modified_utf8` (already correct, already unit-tested, already used by
+`DataOutputStream.writeUTF`) are now `pub`, and `native-io` grew
+`native_raf_read_utf` / `native_raf_write_utf` over them plus `raf_read_exact`
+for the `readFully` half of the contract. Both are **FLAG** tier
+(`CRATONVM_SYNTHETIC_RAF=1`), so this changes no shipping measurement; what it
+changes is that the wire format now has one spelling per crate and the export
+exists for the `nio_file.rs` twin to converge onto. That convergence is the
+out-of-file patch below.
+
+### 7.3 `DatagramChannel.setSoTimeout` — the row asked the wrong class. FIXED
+
+*"Not a method `java.nio.channels.DatagramChannel` declares, so there is no
+javadoc to quote"* is true and irrelevant. The comment sitting directly above
+the registration already said which class to quote: this body is reachable only
+as `channel.socket().setSoTimeout(..)`, i.e. from a caller using the
+**DatagramSocket** surface. JDK 25 answers it twice:
+
+* `java/net/DatagramSocket.java:687` — `@throws IllegalArgumentException if
+  {@code timeout} is negative`
+* `sun/nio/ch/DatagramSocketAdaptor.java:231-236`, which is what `socket()`
+  actually returns:
+
+  ```java
+  public void setSoTimeout(int timeout) throws SocketException {
+      if (isClosed()) throw new SocketException("Socket is closed");
+      if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
+      this.timeout = timeout;
+  }
+  ```
+
+`.max(0)` mapped `setSoTimeout(-1)` to `setSoTimeout(0)`, and the very next line
+of the body reads `0` as **no timeout**. So the one input a caller uses to say
+"bound this receive" was turned into "never bound it" — the sharpest possible
+instance of this record's own instrument, because an unbounded receive is
+indistinguishable from a healthy configuration until it hangs.
+
+Fixed in `native-io/src/lib.rs`'s `register_datagram_channel`, which is
+**DEFAULT** tier (`register_io_natives` is called in all three `vm_init` arms).
+The message is HotSpot's. The `isClosed()` refusal that precedes it upstream was
+deliberately NOT added: `dc_fd` answering `None` means "closed OR never bound",
+so raising `SocketException` on it would refuse a channel the JDK accepts. The
+consequence is stated rather than guessed — on a closed channel with a negative
+timeout this now answers `IllegalArgumentException` where HotSpot answers
+`SocketException`, which is one wrong exception type instead of a silent
+success.
+
+Covered by `regression-suite/src/RJdkNet.java::negativeSoTimeout`, which asserts
+the refusal on all four surfaces (`DatagramChannel.socket()`, `DatagramSocket`,
+`Socket`, `ServerSocket`), the acceptance of `0` and of a positive value, and
+the closed-beats-negative ordering on the two that run real JDK bytecode. The
+positive half is not decoration: without it a VM that threw on every timeout
+would satisfy all four refusals.
+
+### 7.4 `WatchService.poll` — there is a sentence, and the `.max(0)` was the side that had it right
+
+The javadoc genuinely says nothing (`java/nio/file/WatchService.java:155-172`
+names only `ClosedWatchServiceException` and `InterruptedException`). But the
+implementation is the sentence: `sun.nio.fs.AbstractWatchService.poll(long,
+TimeUnit)` hands the value to `LinkedBlockingDeque.poll(timeout, unit)`, whose
+loop opens `if (nanos <= 0L) return null;`. A negative wait is a wait that has
+already expired.
+
+So `watch_timeout_millis`'s `if timeout <= 0 { return 0; }` — the `.max(0)` this
+row flagged — is **correct and stays**. What the row did not look at is the
+*other* WatchService surface in the same crate: `native-io/src/watch.rs`'s
+`poll_with_timeout` classified `timeout_ns == i64::MIN || timeout_ns < 0` as
+"block indefinitely", so on that surface every negative timeout was an
+unbounded wait. Two surfaces in one crate disagreeing about the same argument,
+with one of them turning a caller's expired deadline into a hang.
+
+Fixed by splitting the classification into a pure `watch_wait_for(i64) ->
+WatchWait`: `i64::MIN` (this file's own `take()` sentinel, written by
+`take_blocking`) is the only value that means Forever; every other
+non-positive value is Now. Asserted on the classifier rather than by timing,
+deliberately — the pre-fix behaviour of the negative case is *never returns*, so
+a test that told the two apart by waiting would hang on a red tree instead of
+failing it, and any bound that avoided the hang would be a fixed wall-clock
+bound. `wp3_8_take_still_blocks_after_the_negative_timeout_fix` is the guard
+against fixing it backwards by collapsing the sentinel in with the rest, which
+would silently turn every `WatchService.take()` in the process into a busy
+`poll()`.
+
+### 7.5 `Files.isSameFile` — the approximation is fine, the comment justifying it is not
+
+*"A documented approximation already carrying its own comment"* is what the row
+says. The comment is
+`nio_file.rs:1262-1266`: *"The default provider's same-file check is path
+equality (real-path resolution for symlinks omitted); approximate with
+`Path.equals`."*
+
+Path equality is the JDK's **fast path**, not its answer. Both default providers
+return early on `file1.equals(obj2)` and otherwise read the identity of both
+files — `st_dev`/`st_ino` on Unix, volume serial + file index via
+`GetFileInformationByHandle` on Windows — and compare that. So the JDK answers
+`true`, and CratonVM answers `false`, for every pair naming one file by two
+spellings: a hard link, a symlink and its target, `dir/x` and `dir/sub/../x`, an
+absolute and a relative path to the same file, and on Windows two spellings
+differing only in case or in 8.3 shortening. `Files.isSameFile` is how a caller
+asks *"am I about to copy this file onto itself"*, so a `false` there is the
+answer that lets the destructive branch run — which puts it back inside this
+record's species rather than outside it.
+
+The identity half is landed in `native-io/src/file_channel.rs` as
+`paths_name_the_same_file`, next to the fd-keyed `file_identity_triple` it
+reuses the `GetFileInformationByHandle` binding from, with
+`wp3_3_same_file_is_identity_not_path_equality` covering it (the `..` traversal
+is the non-skippable row; the hard link is the one `canonicalize` cannot see and
+is therefore what proves the identity read is doing the work). The **call site**
+is another lane's file and is unchanged — see the out-of-file patch.
+
+### 7.6 One row this pass added rather than closed
+
+`Files.copy(InputStream, Path, CopyOption...)` in JDK 25 refuses **every** option
+but `REPLACE_EXISTING` with `UnsupportedOperationException(opt + " not
+supported")`. CratonVM's copy of it (`register_p71_files_bridge`,
+`nio_file.rs:19572`) reads `REPLACE_EXISTING` and ignores the rest. That
+registrar is reached only from `register_synthetic_overrides`, so **in both
+shipping modes the real bytecode runs and the refusal is the JDK's own** — which
+is why `regression-suite/src/RNioNoFollow.java` can now assert it.
+
+That assertion matters out of proportion to its size, and the reason is
+`RNioNoFollow`'s standing vacuity: `symlinkArms()` bails on Windows because
+`Files.createSymbolicLink` needs a privilege, so **every arm that tests
+`NOFOLLOW_LINKS` against a symlink has never executed on the primary platform**.
+`Files.copy(in, target, NOFOLLOW_LINKS)` is a `NOFOLLOW_LINKS` assertion that
+needs no link and no privilege, because it asks the other half of the same
+question the defect was: *is the option list read at all*. The scanner that
+produced this record's parent defect read `APPEND` and `CREATE_NEW` and nothing
+else, so an unrecognised option was silently accepted — and that is precisely
+what this refusal detects.
+
+Two sibling refusals are the same species and are **not** asserted, because
+they are served by shipping natives that do not implement them:
+
+| call | JDK 25 | CratonVM |
+|---|---|---|
+| `Files.newInputStream(p, StandardOpenOption.WRITE)` | `UnsupportedOperationException` (`FileSystemProvider.newInputStream`: *"All OpenOption values except for APPEND and WRITE are allowed"*) | accepted — `fsp_new_input_stream` (`nio_file.rs:8624`) scans the option list for `nofollow` only |
+| `Files.newOutputStream(p, StandardOpenOption.READ)` | `IllegalArgumentException("READ not allowed")` (`FileSystemProvider.newOutputStream`) | accepted — same shape in `fsp_new_output_stream` |
+
+Both are in `register_phase57_nio_file`, i.e. live in both shipping modes.
+Landing the option scan and promoting these two into `RNioNoFollow` is one
+change and should be done as one; the vector text says so at the site.
+
+---
+
+## 8. §6 items 2–6 APPLIED, 2026-08-12
+
+Same standing as everything above: **nothing was built, checked, tested or run.**
+No `cargo` command of any kind was executed. Every claim here is a claim about
+source and about the JDK 25 oracle.
+
+### 8.1 Item 2 — the re-aim, and why it is neither a move nor a delegation
+
+The patch text offered two shapes ("either move §3.1's hardened bodies into that
+registrar, or have it delegate") and warned against a third (deleting a duplicate
+registration). A fourth was taken, and the reason is what that warning is really
+about:
+
+> **Both registrars now register the SAME function pointer for each of the seven
+> shared triples.** `p57_fc_size`, `p57_fc_position`, `p57_fc_position_set`,
+> `p57_fc_read`, `p57_fc_write`, `p57_fc_close` and `p57_fc_is_open` are
+> top-level `fn`s — `NativeCallback` is a plain `fn` pointer, so a named function
+> registers as directly as a closure — and both `register_phase57_nio_file` and
+> `register_phase57_file_channel` name them.
+
+Moving the bodies would have left `--synthetic-jdk` running whatever the loser
+registered. Delegating would have left one registrar authoritative and the other
+a forwarding stub the next reader has to trace. Sharing makes **last-write-wins
+stop being load-bearing for these seven triples in every mode** — the only
+version of "it does not matter which registrar wins" that is actually true. It
+also makes a future edit's failure mode benign: you cannot now change one mode's
+FileChannel behaviour without changing the other's, which is exactly the property
+whose absence produced this record's headline.
+
+Neither registration was deleted, for the reason the patch text gives.
+
+**What a `--dump-native-registry` diff should show.** The registry holds one slot
+per `(class, method, descriptor)` and a duplicate updates it in place, so the
+**row counts do not move in any of the three configurations**. Check that first:
+
+| configuration | which registrar supplies the seven | rows before → after | callback |
+|---|---|---|---|
+| default build, `--real-jdk` | `register_phase57_nio_file` only (`vm_init.rs:2763`) | unchanged | now `p57_fc_*`; was seven distinct closures |
+| default build, `--jdk-only` | same | unchanged | same |
+| `--features synthetic-jdk`, `--synthetic-jdk` | both; `register_phase57_file_channel` runs last and wins | unchanged | `p57_fc_*` from **both**, so winner and loser are indistinguishable |
+
+A dump printing only class/method/descriptor therefore shows **no diff at all**,
+and that is the correct result — what changed is which code the slots point at,
+not which slots exist. A "the fix did nothing" reading trips exactly here.
+
+**The behavioural diff, per mode.** `Closed` means a synthetic
+`java/nio/channels/FileChannel` whose `close()` has run (private slot holds `-1`).
+
+| triple / condition | shipping modes, before | shipping modes, after | `--synthetic-jdk` |
+|---|---|---|---|
+| `size()J`, closed | `0` | `ClosedChannelException` | unchanged (already hardened) |
+| `size()J`, I/O error | `unwrap_or(0)` | `IOException` | unchanged |
+| `position()J`, closed | `0` | `ClosedChannelException` | unchanged |
+| `position(J)`, negative | seek to 0, returns `this` | `IllegalArgumentException` | unchanged |
+| `position(J)`, closed | returns `this` | `ClosedChannelException` | unchanged |
+| `read(ByteBuffer)`, closed | **`-1`** (row 1) | `ClosedChannelException` | unchanged |
+| `read(ByteBuffer)`, null buffer | `-1` | `NullPointerException` | unchanged |
+| `write(ByteBuffer)`, closed | bare `IOException` (row 19) | `ClosedChannelException` | unchanged |
+| `write(ByteBuffer)`, null buffer | `0` | `NullPointerException` | unchanged |
+| `close()V`, `isOpen()Z` | already equivalent | unchanged | unchanged |
+
+So **synthetic mode is behaviourally unchanged for all seven**, which is what the
+patch text demanded, and the shipping modes gain §3.1's rows 1, 2, 5, 6 and 19.
+
+### 8.2 The third fd state the shared bodies needed and §3.1's did not
+
+§3.6's first row — *"if they do not, rows 1–2 turn a silent `-1` into a thrown
+`ClosedChannelException` on a healthy real channel"* — is still unsettled from
+source, and moving §3.1's bodies onto the shipping path is precisely what would
+have cashed that risk. It is not cashed, and the mechanism was available all
+along:
+
+`synthetic_file_channel::fd_value` answers `Value::Object(None)`, **not an
+`Int`**, for a receiver whose class is not literally
+`java/nio/channels/FileChannel` — §7.1 quotes the screen. The fd slot therefore
+has three states, not two, and the shared bodies match all three:
+
+* `Int(v), v >= 0` — open synthetic channel.
+* `Int(_)` negative — **closed**, and only a synthetic receiver can be, since
+  `-1` is what this file's own `close()` writes. Takes the hardened arm.
+* anything else — **foreign**. Keeps each site's pre-W7-8 answer *verbatim*
+  (`0` for `size`/`position`, `this` for `position(J)`, `-1` for `read`).
+
+§3.1's bodies collapsed the second and third with `.as_int().unwrap_or(-1)`,
+which is safe where they ran (synthetic mode has no real `FileChannelImpl`) and
+would not have been on the shipping path. `write` is the one site where `Foreign`
+shares the hardened arm, and that is sound rather than inconsistent: it already
+raised a bare `IOException` for a foreign receiver, so tightening to
+`ClosedChannelException` — a subclass — cannot turn a success into a failure.
+
+**What this still does not settle**, and no source read can: whether a native on
+`FileChannel` intercepts a receiver that is a real `sun.nio.ch.FileChannelImpl`.
+`close()V` demonstrably does, and has carried a class-name screen for it since
+the H2 file-lock bug. For `read`/`write`/`size`/`position` there is a strong
+*behavioural* argument that it does not — the shipping bodies answered `-1`/`0`
+for a foreign receiver, so interception would mean every real `FileChannel.read`
+in the process reports end-of-file and every `size()` reports 0, which H2's
+MVStore alone would not survive — but that is an inference from the tree working,
+not a measurement, and it is the shape this campaign calls a reach-versus-defect
+confusion. The `Foreign` arm means the answer no longer changes anything.
+
+### 8.3 Item 3 — the two contradictory ordering comments
+
+Both rewritten together, and both now say what is true **per mode** rather than
+asserting a single winner:
+
+* the `isOpen` comment claiming *"THE WINNING REGISTRATION for this triple, in
+  every build and every mode"* because *"even in the synthetic arm `vm_init.rs`
+  calls THIS registrar again afterwards"* — it does not, and the claim is gone;
+* the one calling its own copy *"the LOSING copy … nothing here is reachable"* —
+  true of the two shipping modes, false of `--synthetic-jdk`, where this
+  registrar runs last and wins.
+
+They are replaced by one banner above the shared bodies giving each registrar's
+call chain with its `vm_init.rs` line numbers, and a per-mode table at the
+`register_phase57_nio_file` site. A third comment in the same file (*"vm_init.rs:1788
+and :2273"*) had rotted by ~480 lines and was corrected, with a note not to trust
+either pair without re-reading.
+
+### 8.4 Items 4–6
+
+**`writeUTF` / `readUTF` / `writeChars` (item 4).** Applied as written:
+`encode_modified_utf8` / `decode_modified_utf8`, `raf_utf_data_format` carrying
+the decoder's message, the `> 65535` check left where it was and still measuring
+the *encoded* buffer, and `writeChars` walking `s.encode_utf16()`. One consequence
+the patch text did not state: `readUTF` can now **fail**. `from_utf8_lossy`
+answered `U+FFFD` for exactly the bytes `DataInput.readUTF` specifies
+`UTFDataFormatException` for, so a record written by any other JVM containing a
+NUL or a supplementary character used to come back silently corrupted. All three
+are FLAG tier (`CRATONVM_SYNTHETIC_RAF=1`) *and* synthetic-only, so no shipping
+measurement moves; what moves is that the wire format now has one spelling in the
+tree instead of one per crate.
+
+**`Files.isSameFile` (item 5).** Applied, with the `vfs_decode` screen at the
+call site as required. The screen is load-bearing, not belt-and-braces:
+`paths_name_the_same_file` reads the identity of both files, so a jar/jrt-encoded
+path — which names no host file — would come back `NotFound` and turn a
+legitimate `false` into an exception. Inside an archive there are no links and no
+`..`, so equality *is* the whole answer there rather than a fast path, and the
+comment says so.
+
+One deviation from the patch text's snippet, worth four extra lines: it routed
+every error through `p57_io_error`, i.e. a bare `IOException`. HotSpot throws
+`NoSuchFileException` for an absent path, so `NotFound` now goes to
+`p57_no_such_file` naming whichever path is missing — reachable only for two
+*different* spellings, because equal ones never touch the disk.
+
+**The option-list scan (item 6).** All three sites, each from the walk the
+scanner already performed:
+
+* `fsp_new_input_stream` — `APPEND`/`WRITE` → `UnsupportedOperationException`,
+  message `'APPEND' not allowed`, raised **before** the VFS branch and before any
+  descriptor is reserved, because the JDK's check is the method's first
+  statement. **Shipping.**
+* `fsp_new_output_stream` — `READ` → `IllegalArgumentException("READ not
+  allowed")`, before the open, so a refusal creates and truncates nothing.
+  **Shipping.**
+* `Files.copy(InputStream, Path, CopyOption[])` — every option but
+  `REPLACE_EXISTING` → `UnsupportedOperationException(opt + " not supported")`,
+  raised **before the source stream is drained**: an unsupported option must not
+  consume the caller's stream on its way to throwing. Synthetic-only.
+
+`P57OpenFlags` gained `read` and `write`. The two exception types differ
+**deliberately** and the code says so at both sites — the asymmetry is the JDK's,
+and a caller distinguishing them by `catch` clause sees it. One knowing
+deviation: where both `APPEND` and `WRITE` are present the JDK names whichever
+comes first in the caller's array; this scan has collapsed the order, so it names
+`APPEND`. Only the type and the fact of the refusal are load-bearing.
+
+**The half-fix hazard, stated plainly**, because `run.sh` fails on any `CK`-line
+difference from HotSpot: landing these three refusals *without* the matching
+`RNioNoFollow` assertions is safe — the suite sees no new output. Landing the
+assertions without the refusals reddens it. The Java is in §8.5 and is **not**
+applied; `regression-suite/` is another lane's.
+
+### 8.5 The fixture Java these refusals unlock — NOT applied
+
+For `regression-suite/src/RNioNoFollow.java`, whose `symlinkArms()` bails on
+Windows so that every `NOFOLLOW_LINKS` arm in it has never executed on the
+primary platform. None of this needs a link or a privilege:
+
+```java
+    static void optionListIsRead() throws Exception {
+        Path f = Files.createTempFile("rnio-opt", ".tmp");
+        try {
+            String in = "none";
+            try { Files.newInputStream(f, StandardOpenOption.WRITE).close(); }
+            catch (UnsupportedOperationException e) { in = "UnsupportedOperationException"; }
+            catch (Exception e) { in = e.getClass().getSimpleName(); }
+            System.out.println("CK RNioNoFollow newInputStream.WRITE=" + in);
+
+            String out = "none";
+            try { Files.newOutputStream(f, StandardOpenOption.READ).close(); }
+            catch (IllegalArgumentException e) { out = "IllegalArgumentException"; }
+            catch (Exception e) { out = e.getClass().getSimpleName(); }
+            System.out.println("CK RNioNoFollow newOutputStream.READ=" + out);
+
+            String cp = "none";
+            try (InputStream src = new ByteArrayInputStream(new byte[] { 1, 2, 3 })) {
+                Files.copy(src, f, LinkOption.NOFOLLOW_LINKS);
+            } catch (UnsupportedOperationException e) {
+                cp = "UnsupportedOperationException";
+            } catch (Exception e) {
+                cp = e.getClass().getSimpleName();
+            }
+            System.out.println("CK RNioNoFollow copyStream.NOFOLLOW=" + cp);
+
+            // Anti-vacuity: the LEGAL spellings must still work, or a VM that
+            // refused every option would satisfy all three refusals above.
+            try (InputStream ok = Files.newInputStream(f, StandardOpenOption.READ)) {
+                System.out.println("CK RNioNoFollow newInputStream.READ=ok");
+            }
+            try (OutputStream ok = Files.newOutputStream(f, StandardOpenOption.WRITE)) {
+                System.out.println("CK RNioNoFollow newOutputStream.WRITE=ok");
+            }
+            try (InputStream src = new ByteArrayInputStream(new byte[] { 1, 2, 3 })) {
+                Files.copy(src, f, StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("CK RNioNoFollow copyStream.REPLACE=ok");
+            }
+        } finally {
+            Files.deleteIfExists(f);
+        }
+    }
+```
+
+Expected on HotSpot 25, and on CratonVM only once the refusals land:
+`UnsupportedOperationException`, `IllegalArgumentException`,
+`UnsupportedOperationException`, then three `ok`s. Before the change the first
+three print `none`. Imports: `java.io.ByteArrayInputStream`,
+`java.io.InputStream`, `java.io.OutputStream`, `java.nio.file.LinkOption`,
+`java.nio.file.StandardCopyOption`, `java.nio.file.StandardOpenOption`.
+
+The last three rows are not decoration, and §7.6 already says why: a VM that
+threw on every option would satisfy all three refusals. `copyStream.REPLACE=ok`
+matters most — `REPLACE_EXISTING` is the one option the copy path is supposed to
+accept, and it is what a too-eager refusal would break.
+
+### 8.6 Coverage this pass does NOT have
+
+**The `FileChannel` re-aim itself has no scheduled assertion.** The seven triples
+are reachable from Java only through a `java/nio/channels/FileChannel` that
+CratonVM minted through `newFileChannel`'s legacy fallback, and that fallback
+runs only when constructing a real `FileChannelImpl` fails — which on a healthy
+real-JDK image it does not. So a vector written against `--real-jdk` would
+exercise the real JDK's own bytecode and prove nothing about this change. Stated
+rather than papered over: **rows 1, 2 and 19 are fixed in source on the shipping
+path and are unasserted**, and the vector that would assert them has to run under
+`--synthetic-jdk`.

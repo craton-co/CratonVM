@@ -13,6 +13,24 @@
 > * **Residual: STILL OPEN** — section 8's "what this record does not fix", plus
 >   the optional `fabricated_origin_for_name` arm for `CratonVM$...` names,
 >   which was not added.
+>
+> **2026-08-12 — the `CratonVM$…` arm IS now added, and it was not optional.**
+> `fabricated_origin_for_name` gained an
+> `is_vm_reserved_namespace_name` arm (`classloading/src/class_manager.rs`),
+> routing every `CratonVM$…` name to `ClassOrigin::VmInternal`. The reason it
+> stopped being optional is a **second name this sweep never saw**:
+> `CratonVM$StsForkRunner` (`native-builtins/src/jdk25_concurrency.rs:860`, the
+> JEP 505 `StructuredTaskScope.fork()` worker body) is minted with a bare
+> `try_alloc_concurrent_synthetic` and has **no** `ensure_vm_internal_class`
+> pre-mint of its own — the same door defect §6A fixed for `HttpServerLoop`, in
+> a file §6A never looked at. For that name the arm is not belt-and-braces; it
+> is the only thing covering it. Gate 2 checked per name and not by analogy:
+> neither name appears in any table in `native-api/src/no_image_receiver.rs`,
+> and `receiver_declared_by_no_supported_image` returns `false` for a name on
+> none of them, so nothing re-tags either class's `run()V` — §3's "reviewed VM
+> service" shape, where the door fix is necessary **and** sufficient. Not
+> built, not run. Section 8's other residuals are still open; §8's R1 is
+> partially discharged by `W7-26`'s widened census (2026-08-12).
 
 **Status: two hunks APPLIED IN SOURCE, sweep COMPLETE, 2026-08-11. NOT
 REBUILT.** Every number in this record was taken by running the already-built
@@ -315,6 +333,22 @@ and (now) `AnnotationProxy` have — but only if the §2 argument can be made fo
 this name, and it can: `CratonVM$…` is this VM's reserved namespace and no
 loader defines into it.
 
+**APPLIED 2026-08-12, and "optionally" was wrong.** The arm is
+`is_vm_reserved_namespace_name` in `classloading/src/class_manager.rs`, keyed
+on the `CratonVM$` prefix, carrying the §2 argument in full — including the
+one statement that changes shape (`java/lang/annotation/` is closed by the
+JVM's package rules; `CratonVM$` is closed by convention, so the standing
+instruction is that anything added under the prefix must be a carrier the VM
+invents, never a stand-in for bytes some image declares). It is not
+belt-and-braces because a **second** mint exists that this sweep's corpus
+never reached: `CratonVM$StsForkRunner`, at
+`native-builtins/src/jdk25_concurrency.rs:860`, with a bare
+`try_alloc_concurrent_synthetic` and no pre-mint. §4's own scope limit
+predicted this — the corpus reached one of the two fabrication choke points,
+and `StructuredTaskScope.fork()` is not exercised by any of the 71 vectors or
+321 probes it ran. The prefix arm covers both names and any future one from
+the one place that cannot be forgotten at a new mint site.
+
 ### B — `ForkJoinPool$DefaultCommonPool…`: **no patch. `dev` got there first.**
 
 **This lane's proposed patch is WITHDRAWN, and the withdrawal is the useful
@@ -462,6 +496,9 @@ this change moves.
   was being swallowed; it does not remove the swallowing. Left deliberately:
   changing five error paths in a file nothing can rebuild is how a fix becomes
   two defects.
+  **CLOSED by `W7-26-getannotation-swallowed-exception.md`** (all five sites,
+  source-only), whose own R1 — the loader ladders one layer down — is
+  partially discharged as of 2026-08-12 with a workspace-wide census.
 * **A refusal laundered into a wrong answer.** A concurrent lane found
   `collection_elements_generic` returning `Vec<Value>` with no error channel,
   so a strict `NoClassDefFoundError` out of its `iterator()` call becomes

@@ -2149,6 +2149,64 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `Selector.provider()` — the ninth abstract on `java.nio.channels.Selector`,
+/// and until 2026-08-12 the only one of the nine with no native anywhere in the
+/// tree (docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md §6).
+///
+/// **The blocker W7-9 §8.2 recorded does not exist.** That section says the fix
+/// waits on a `NativeContext::invoke_static`, "which `native-api` does not
+/// have". `NativeContext::invoke(class, method, descriptor, args)` IS that
+/// method — it resolves by name and dispatches with no receiver — and
+/// `native-collections`' `drain_spliterator_via_real_iterator` has been calling
+/// the public static `java.util.Spliterators.iterator(Spliterator)` through it
+/// on the `--jdk-only` path all along. The record's grep was for the name, not
+/// for the capability.
+///
+/// It must answer the SAME provider the real JDK would, which is why this
+/// delegates rather than fabricating: `native-io/src/lib.rs` registers
+/// `openDatagramChannel` against the concrete `sun/nio/ch/SelectorProviderImpl`
+/// and `WEPollSelectorProvider` names, and `socket_channel.rs` registers the
+/// channel factories against the same three, so a fabricated carrier would miss
+/// every one of them. Returning `null` was the other option and is worse than
+/// the `AbstractMethodError` it replaces — `sel.provider().openSocketChannel()`
+/// becomes an NPE at a site that no longer names the cause (W3-7's shape). A
+/// genuine failure inside `SelectorProvider.provider()` therefore PROPAGATES;
+/// swallowing it to `null` would reintroduce exactly that.
+///
+/// Registered on `java/nio/channels/Selector` **and** `sun/nio/ch/SelectorImpl`,
+/// which is the established idiom for every other public `Selector` entry point
+/// in `register_nio_selector_real`, and it is load-bearing for two different
+/// receivers:
+///
+/// * class == `java/nio/channels/Selector` (the `servlet.rs` /
+///   `phases_late/net_channels.rs` synthetic mints): `provider()` is abstract
+///   there, so today the `!has_code` arm raises `AbstractMethodError`. This is
+///   the row W7-9 §6 asked for.
+/// * class == `sun/nio/ch/SelectorImpl` (what `selector_open_native` allocates,
+///   and therefore EVERY selector in a CratonVM process): the walk would find
+///   `AbstractSelector.provider()`'s real, `final` bytecode, which returns the
+///   `provider` field — and `selector_open_native` uses `new_object`, so no
+///   constructor ever set it. `Selector.open().provider()` answers **null**
+///   today, in Compatible mode as well as strict. That half is a live defect
+///   W7-9 did not see, because it reasoned about the abstract declaration and
+///   not about which class the mint actually wears.
+///
+/// The shadow that registering on `sun/nio/ch/SelectorImpl` implies (W7-9 §2's
+/// "registering a concrete method would be found by the walk on a real
+/// `WEPollSelectorImpl`") is bounded: `Selector.open()` and `openSelector()` on
+/// all three provider classes are intercepted above, so no real
+/// `WEPollSelectorImpl` is ever constructed here — and if one were, the default
+/// provider this returns is the same object its own `provider` field would hold,
+/// unless the application installed a custom `SelectorProvider`.
+fn selector_provider_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ctx.invoke(
+        "java/nio/channels/spi/SelectorProvider",
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+        &[],
+    )
+}
+
 /// `SelectorImpl.close0()` — release native state.
 fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(obj))) = args.first().copied() else {
@@ -3828,6 +3886,17 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         );
         r.register(c, "close", "()V", selector_close_native);
         r.register(c, "isOpen", "()Z", selector_is_open_native);
+        // W7-9 §6 / §8.2 — the ninth abstract. See `selector_provider_native`
+        // for why this delegates to the real static factory, why the §8.2
+        // blocker ("no `NativeContext::invoke_static`") was a false negative,
+        // and why the `sun/nio/ch/SelectorImpl` half is the live defect rather
+        // than the `java/nio/channels/Selector` half.
+        r.register(
+            c,
+            "provider",
+            "()Ljava/nio/channels/spi/SelectorProvider;",
+            selector_provider_native,
+        );
         // SelectorImpl.lockAndDoSelect bypass: route directly to our select.
         r.register(
             c,

@@ -3,6 +3,12 @@
 **Status: 19 of 20 assigned observables CHANGED IN SOURCE 2026-08-12, NOT
 REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**
 
+> **Part 5, added later the same day**, discharges two of the three items this
+> record left in "What was NOT changed": the five sorted-container refusals and
+> `native_tm_get_or_default` — whose suspected defect turned out **not to
+> exist**, while a different one at the same native did. Also source only.
+> `stream.reuseThrows` (Part 4) is closed by `W7-65-stream-reuse-throws.md`.
+
 Every "before" number below is an observation, taken by running the
 already-built binary at `C:/craton/CratonVM/target/release/cratonvm.exe`
 against Temurin `jdk-25.0.3.9-hotspot` on windows/x64 — one binary, the same
@@ -463,13 +469,15 @@ that audit is the whole of the work, and it needs a build to be worth anything.
   * `native_tm_get_or_default`. `TreeMap` has its own `getOrDefault` native and
     can hold null values, so it plausibly has the same present-with-null defect
     as `HashMap.getOrDefaultOverNullValue`. Not on the probe, not measured, not
-    touched.
+    touched. **ADJUDICATED 2026-08-12: the hypothesis is WRONG — see Part 5.**
   * The rest of the natural-ordering key surface. `TreeMap.containsKey(null)`,
     `TreeMap.remove(null)`, `TreeSet.contains(null)`, and the single-bound
     `headMap`/`tailMap` type check all still return normally where the JDK
-    refuses. Real, adjacent, and not on the table above.
+    refuses. Real, adjacent, and not on the table above. **CLOSED IN SOURCE
+    2026-08-12 — Part 5.**
   * `TreeSet.subSet(hi, lo)`. The `TreeMap` twin of it is fixed; the `TreeSet`
-    one is not measured and was not widened into.
+    one is not measured and was not widened into. **CLOSED IN SOURCE
+    2026-08-12 — Part 5.**
   * Compatible mode is where all of this lands, and every row is a
     Compatible-mode behaviour change from a wrong value or a missing throw to
     the specified one. No in-tree caller depends on any of the old behaviours:
@@ -478,3 +486,103 @@ that audit is the whole of the work, and it needs a build to be worth anything.
     `Stack`, calls `setValue` on a `firstEntry()`, or passes reversed bounds to
     `subMap`/`subSet` — and `RTreeRangeGc`'s key type implements `Comparable`,
     so the new type check cannot fire on it.
+
+---
+
+## Part 5 — the two handed-over rows, 2026-08-12
+
+Source only. Nothing built, nothing run; the "before" wordings below are read
+off `dev`'s source, not re-measured. `native-collections/src/lib.rs` only.
+
+### 5.1 `native_tm_get_or_default` — the hypothesis was wrong, and there is a
+### different defect at the same native
+
+**Present-with-null is NOT broken here.** Both storage paths read the mapping
+itself rather than the value's nullity: fast mode is
+`bt.get(&tk).copied()` folded with `v.unwrap_or(default)` — a key present with
+`Value::Object(None)` yields `Some(Object(None))` and `unwrap_or` never fires —
+and the array path is `Ok(idx) => get_array_element(data, idx * 2 + 1)`, the
+stored slot. So `TreeMap.getOrDefault(k, d)` over a null value already answers
+`null`, which is what `Map.getOrDefault` specifies. It never needed
+`native_map_get_or_default`'s `containsKey` re-ask, because unlike that one it
+has the node, not just the value.
+
+This is the "a known-issue hypothesis can be wrong, not just stale" case: the
+suspicion came from the shape of the sibling defect, and the shape is where the
+two natives differ.
+
+**What IS wrong at that native is the refusal.** `TreeMap.getOrDefault` is
+`getEntry(key)`, the same null-check-plus-`(Comparable)`-checkcast every other
+`TreeMap` lookup runs, and this native never called
+`tree_natural_order_key_check`. `new TreeMap<String,Integer>().getOrDefault(null, d)`
+answered `d` where HotSpot throws `NullPointerException` — a refusal laundered
+into a plausible value, which is the species this whole record is about, in the
+one place the record predicted a *different* defect.
+
+The check is placed after the pins are taken and unwinds them explicitly on the
+error path rather than through `?`, because the surrounding function holds three.
+
+### 5.2 The five sorted-container refusals
+
+Each is `tree_natural_order_key_check` at one more of the natives that reaches
+the JDK's `compare(key, key)`, with the same `container_is_empty` argument
+`native_tm_get`/`native_tm_put`/`native_ts_add` already pass — plus one new
+`TreeSet` helper.
+
+| native | JDK path | now raises |
+|---|---|---|
+| `native_tm_contains_key` | `containsKey` is `getEntry(key) != null` | NPE / CCE |
+| `native_tm_remove` | `remove` is `getEntry(key)` first | NPE / CCE |
+| `native_ts_contains` | `TreeSet.contains` is `m.containsKey(o)` | NPE / CCE |
+| `native_tm_get_or_default` | `getOrDefault` is `getEntry(key)` | NPE / CCE |
+| `tm_new_range_view`, single bound | `NavigableSubMap` ctor's `else` arm | NPE / CCE |
+| `native_ts_sub_set`, `native_ts_sub_set_inclusive` | `NavigableSubMap` ctor's `if` arm | `IllegalArgumentException` |
+
+Four placement facts that are not interchangeable:
+
+  * **`native_tm_remove`'s check goes BEFORE the view branch**, exactly where
+    `native_tm_put`'s does and for the reason stated there: a descending view
+    carries a `Collections.reverseOrder` comparator so the check no-ops on it
+    and the redirect lets the backing map raise, while an ascending view carries
+    the source's own null comparator and `NavigableSubMap.remove`'s `inRange`
+    raises there too.
+  * **`native_ts_contains`'s check goes BEFORE the `data_opt` early return.** An
+    empty `TreeSet` has no backing array at all, so a check placed after it
+    would answer `false` for `contains(null)` — precisely the row.
+  * **The single-bound view check passes `container_is_empty = true`
+    unconditionally.** `m.compare(hi, hi)` does not consult `root`; the JDK
+    refuses on an empty map as well, and asking the map would under-throw
+    exactly there. It fires only when `lo.is_some() != hi.is_some()`: two bounds
+    take the other arm (already covered by `tm_refuse_reversed_bounds` at the
+    two `subMap` entry points) and `descendingMap` supplies neither.
+  * **`ts_refuse_reversed_bounds` is `tm_refuse_reversed_bounds` transposed**,
+    message verbatim, including the pin-compare-re-read contract — `tree_compare`
+    dispatches a user `Comparator` and all three of receiver and bounds are used
+    afterwards.
+
+### 5.3 What Part 5 did NOT do
+
+  * **`TreeSet.headSet`/`tailSet`'s single-bound type check.** The `TreeMap`
+    half is closed above; the `TreeSet` views are snapshot copies that do not go
+    through `tm_new_range_view`, so they need their own call and were not
+    measured. Same species, one file, still open.
+  * **The `--synthetic-jdk` `EmptyStackException` follow-up in
+    `classloading/src/class_manager.rs`.** Still recorded, still not made — that
+    file belongs to another lane.
+  * The widened `implements_comparable` exposure this creates is **not new**:
+    that predicate has decided every non-first comparison for months, and under
+    `--synthetic-jdk` a fabricated `java/lang/Enum` declares no interfaces and
+    already reads as non-`Comparable`. What changes is that four more entry
+    points now consult it on the FIRST operation. No suite runs
+    `--synthetic-jdk` mode, so nothing in-tree can observe the difference; a
+    lane that turns that mode on should read this paragraph first.
+
+### 5.4 Coverage
+
+`regression-suite/src/RJdkViews.java`, new `sortedContainerRefusals()` section
+(`CORE_CLASSES`, default invocation). Every refusal is paired with the case that
+must NOT refuse — a null-permitting comparator, a valid bound, a valid
+`subSet` — because a container that threw from every key would satisfy the
+positive half on its own, which is `W6-5-vacuous-tests`' shape. The
+present-with-null row is asserted too: it is not a change, it locks 5.1's
+correction so the next reader does not "fix" it.

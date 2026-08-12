@@ -25,10 +25,28 @@
   *"two optional hardening patches … that are still unapplied"*, was already
   false four days before that audit ran. This page's own 2026-08-11 block is the
   correct one.
-* **Residual: CLOSED 2026-08-12 (W7-62-ratchets-and-dead-code.md).** The dead
-  block is deleted and the tests moved to `lang_invoke.rs` aimed at the gate
-  that runs. One line of the prescription was wrong — `lk_public_lookup` is
-  registered and stays. See the patch section below. The old text:
+* **Residual: FULLY CLOSED 2026-08-12 — but W7-62 left two of the same species
+  behind, and they are closed here.** W7-62 deleted the dead block and moved the
+  six tests aimed at `lk_find_*`. It did **not** look at
+  `test_lk_lookup_registered` (`native-builtins/src/classloader.rs`) or
+  `test_lk_public_lookup_registered`, which assert that
+  `MethodHandles$Lookup.lookup()` and `MethodHandles$Lookup.publicLookup()` are
+  registered. **No real JDK declares either method on `Lookup`** — `lookup()`,
+  `publicLookup()` and `privateLookupIn(..)` are all `static` members of
+  `java.lang.invoke.MethodHandles`, and this module's own doc comment on
+  `lk_public_lookup` says so in place: *"This registration sits on
+  `MethodHandles$Lookup`; the live `MethodHandles.publicLookup()` static is
+  `lang_invoke.rs`'s."* So both tests were green over triples no live path can
+  dispatch to — the identical shape as the six W7-62 moved, on the very entry
+  point this record is named for.
+  **W7-62's reason for keeping `lk_public_lookup` was right about the fact and
+  wrong about what it licensed: registered is not reachable.** The function
+  stays (deleting a registration on the strength of a source read is how this
+  campaign has made things worse), but both tests now assert the LIVE
+  `java/lang/invoke/MethodHandles` triple FIRST — the assertion that goes red if
+  `lang_invoke::register_p63_method_handles_lookup` ever stops registering the
+  static — and keep the `LK_CLASS` twin as a second, explicitly labelled
+  `synthetic-jdk`-only row. The older text follows:
 * **Residual: WAS OPEN — one, and it is a deletion, not a behaviour change.**
   The `## Out-of-file patch (not applied)` below is genuinely unapplied. The dead
   block in `native-builtins/src/classloader.rs` survives: `lk_public_lookup`
@@ -174,6 +192,15 @@ asserts the negative too, of a function nothing calls.
 `classloader.rs::lk_public_lookup` is dead for the same reason: it is
 registered on `MethodHandles$Lookup.publicLookup()`, but `publicLookup()` is a
 static on `MethodHandles`. `lang_invoke.rs`'s registration is the live one.
+
+> **This paragraph is correct and outlived the patch block that acted on it.**
+> W7-62's deletion list rejected the `lk_public_lookup` row on the grounds that
+> it *is* registered — true, and beside the point, because the triple it is
+> registered on names no method any real JDK declares. The function is kept; the
+> two unit tests that read as coverage of it were re-pointed on 2026-08-12 (see
+> the status block). The same is true of `lk_lookup` and `lk_private_lookup_in`,
+> which this paragraph does not name and which sit on `LK_CLASS` for the same
+> reason.
 
 ## The fix
 

@@ -11480,7 +11480,22 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// round-tripping surrogate pairs through the matching supplementary
 /// code point. Every error branch identifies a byte offset so the
 /// error message is precise enough for diagnostics.
-fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
+///
+/// # Why this is exported
+///
+/// `readUTF`/`writeUTF` are a **wire format**, not a string conversion, and
+/// this crate is not the only one that implements them: the synthetic
+/// `java.io.RandomAccessFile` in `native-builtins/src/phases_late/nio_file.rs`
+/// has its own pair, and that pair reads and writes **plain** UTF-8
+/// (`String::from_utf8_lossy` / `s.as_bytes()`). Plain and modified UTF-8 differ
+/// on exactly two inputs — `U+0000`, which modified UTF-8 spells `C0 80` and
+/// plain spells `00`, and every supplementary character, which modified UTF-8
+/// spells as a six-byte surrogate PAIR and plain spells as one four-byte
+/// sequence — so a record written by one implementation and read by the other is
+/// silently mis-framed rather than rejected. Exporting the codec is what lets
+/// that second implementation converge onto this one instead of growing a third
+/// spelling. See W7-8-fabricated-success-io-sweep.md.
+pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -11569,7 +11584,12 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
 
 /// Encode a Rust `&str` into modified UTF-8 (JVMS §4.4.7) and return
 /// the byte buffer. Use from `native_dos_write_utf`.
-fn encode_modified_utf8(s: &str) -> Vec<u8> {
+///
+/// Exported for the reason spelled out on [`decode_modified_utf8`]: the length
+/// prefix `DataOutput.writeUTF` writes is the length of THIS encoding, so a
+/// caller that measures `s.as_bytes().len()` and then writes plain UTF-8 is
+/// wrong twice — in the count and in the payload — and `readUTF` cannot tell.
+pub fn encode_modified_utf8(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
         let cp = c as u32;
@@ -13515,8 +13535,18 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             native_raf_read_line,
         );
-        registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line);
-        // simplified
+        // `readUTF` was bound to `native_raf_read_line` with the one-word
+        // comment "simplified". It is not a simplification of `readLine`, it is
+        // a different wire format — see `native_raf_read_utf`, which reads the
+        // 2-byte length prefix and decodes modified UTF-8, and `writeUTF`, which
+        // had no registration here at all and so could not round-trip.
+        registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_utf);
+        registry.register(
+            raf,
+            "writeUTF",
+            "(Ljava/lang/String;)V",
+            native_raf_write_utf,
+        );
     } // end !real_raf_enabled()
 
     // RDR-MIGRATION 2026-06-01: CharArrayReader synthetic natives (3-field
@@ -14019,6 +14049,132 @@ fn native_raf_read_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
         _ => Ok(Some(Value::Object(None))),
     }
+}
+
+/// `RandomAccessFile.readUTF()` — `DataInput`'s framed record, not a line.
+///
+/// # The registration this replaces
+///
+/// `readUTF()Ljava/lang/String;` was bound to [`native_raf_read_line`], with the
+/// word `simplified` for a comment. The two methods do not read the same shape
+/// of data: `readLine` scans to the next `\n`/`\r` and returns everything before
+/// it, while `readUTF` reads a **2-byte big-endian unsigned length** and then
+/// exactly that many bytes of modified UTF-8. So the old binding consumed the
+/// length prefix as though it were text, stopped at whichever payload byte
+/// happened to be `0x0A`, and returned a string that shares no bytes with the
+/// record that was written — and, having left the file position mid-record, it
+/// corrupted every subsequent read on the same handle rather than only its own.
+/// `DataInput.readUTF` is documented to throw `EOFException` "if this input
+/// stream reaches the end before reading all the bytes" and
+/// `UTFDataFormatException` "if the bytes do not represent a valid modified
+/// UTF-8 encoding of a string"; the old binding could produce neither.
+///
+/// The decode is [`decode_modified_utf8`], the same one `DataInputStream.readUTF`
+/// uses in this file — one spelling of the wire format per crate is the whole
+/// point of the export. See W7-8-fabricated-success-io-sweep.md.
+fn native_raf_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
+        Value::Int(v) => v as u32,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut len_buf = [0u8; 2];
+    raf_read_exact(ctx, fd, &mut len_buf)?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    raf_read_exact(ctx, fd, &mut payload)?;
+    let s = decode_modified_utf8(&payload).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
+            message: format!("readUTF: {e}"),
+        }))
+    })?;
+    let obj = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Fill `buf` completely or fail, the way `DataInput.readFully` is specified to.
+///
+/// A short read here is an `EOFException` in the JDK, never a short answer:
+/// `readUTF`'s length prefix has already committed the caller to a record of a
+/// stated size, so returning fewer bytes would hand back a truncated string
+/// indistinguishable from a complete one. `RuntimeError` has no `EOFException`
+/// variant, so this reports the supertype with the JDK's own wording; a caller
+/// catching `IOException` — which is every caller of a `DataInput` — is
+/// unaffected, and one catching `EOFException` specifically was getting a
+/// silently truncated string before, not a narrower exception.
+fn raf_read_exact(
+    ctx: &mut dyn NativeContext,
+    fd: u32,
+    buf: &mut [u8],
+) -> Result<(), MethodCallFailed> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = ctx
+            .fd_table()
+            .read_bytes(fd, &mut buf[filled..])
+            .map_err(io_err)?;
+        if n == 0 {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::IOException {
+                    message: "readUTF: end of file".to_string(),
+                },
+            )));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// `RandomAccessFile.writeUTF(String)` — the encoding half of the same record.
+///
+/// This triple had **no** registration in this file at all while `readUTF` had a
+/// wrong one, which is the asymmetry that let the defect stand: nothing this
+/// crate wrote could be read back through its own reader, so no round trip
+/// existed to fail.
+///
+/// Two things the JDK specifies and a naive body gets wrong, both of which the
+/// `nio_file.rs` twin still gets wrong (recorded, not fixed here — that file
+/// belongs to another lane):
+///
+/// * the payload is **modified** UTF-8, so `U+0000` is `C0 80` and a
+///   supplementary character is a six-byte surrogate pair, not `s.as_bytes()`;
+/// * the 2-byte prefix is the length of THAT encoding, and
+///   `DataOutput.writeUTF` says "If this number is larger than 65535, then a
+///   `UTFDataFormatException` is thrown" — a refusal, never a truncation, since
+///   a truncated record cuts at a byte index and can land mid-sequence.
+fn native_raf_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
+        Value::Int(v) => v as u32,
+        _ => return Ok(None),
+    };
+    let bytes = encode_modified_utf8(&s);
+    if bytes.len() > 65535 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IOException {
+                message: format!(
+                    "writeUTF: encoded string too long ({} bytes, max 65535)",
+                    bytes.len()
+                ),
+            },
+        )));
+    }
+    let len = bytes.len() as u16;
+    ctx.fd_table()
+        .write_bytes(fd, &len.to_be_bytes())
+        .map_err(io_err)?;
+    ctx.fd_table().write_bytes(fd, &bytes).map_err(io_err)?;
+    Ok(None)
 }
 
 // --- CharArrayReader ---
@@ -18364,6 +18520,135 @@ fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
     dc_fds().lock().remove(&dc_key(ctx, channel))
 }
 
+/// One channel's `socket()` answer.
+///
+/// Both members are `add_global_root` HANDLES, not `ObjectRef`s. That is what
+/// keeps this table out of the collector's root-provider list: a global root
+/// is already scanned AND remapped by the moving collector (it is the table
+/// behind JNI `NewGlobalRef`), so a handle stays valid across a compaction
+/// where a stored `ObjectRef` would dangle. The `ssc_socket_cache_*` twin in
+/// `socket_channel.rs` stores raw refs and therefore needs two hand-written
+/// hooks in `vm/src/memory/native_roots.rs`; this one needs none.
+///
+/// `channel` is the row's discriminator, because `DcKey`'s identity hash is
+/// not unique — two live channels may share a bucket.
+struct DcSocketRow {
+    channel: usize,
+    socket: usize,
+}
+
+/// `DatagramChannel.socket()`'s adaptor cache.
+///
+/// # Why a side table and not an object slot
+///
+/// `native_dc_open` allocates `DC_NUM_FIELDS` slots on the REAL
+/// `java.nio.channels.DatagramChannel`, whose low slots belong to
+/// `AbstractSelectableChannel`'s own layout — the same reason
+/// `dc_nonblocking_channels` above is a table. Stashing the adaptor in one of
+/// them is exactly the `ServerSocketChannel.socket()` bug that wrote over
+/// `AbstractSelectableChannel.keys` (W7-72-ssc-socket-and-filechannel.md).
+///
+/// # Why there is a cache at all
+///
+/// `socket()` must answer the SAME object every time or the adaptor's own
+/// state resets under the caller. `sun.nio.ch.DatagramSocketAdaptor` keeps its
+/// SO_TIMEOUT in a private `timeout` field, so a fresh adaptor per call would
+/// make `socket().setSoTimeout(n); socket().getSoTimeout()` read back `0` —
+/// "no timeout" — which is precisely the laundered value
+/// `native_dc_set_so_timeout`'s refusal exists to prevent.
+fn dc_socket_cache() -> &'static Mutex<HashMap<DcKey, Vec<DcSocketRow>>> {
+    static CACHE: OnceLock<Mutex<HashMap<DcKey, Vec<DcSocketRow>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The adaptor `socket()` already answered for `channel`, if any.
+///
+/// The lock is released before any `ctx` call: nothing in `NativeContext`
+/// touches this table, but the handles are copied out anyway so the two never
+/// have to be ordered against each other.
+fn dc_socket_cache_get(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<ObjectRef> {
+    let handles: Vec<(usize, usize)> = {
+        let table = dc_socket_cache().lock();
+        table
+            .get(&dc_key(ctx, channel))?
+            .iter()
+            .map(|row| (row.channel, row.socket))
+            .collect()
+    };
+    for (channel_root, socket_root) in handles {
+        if ctx.resolve_global_root(channel_root) == Some(channel) {
+            return ctx.resolve_global_root(socket_root);
+        }
+    }
+    None
+}
+
+fn dc_socket_cache_put(ctx: &mut dyn NativeContext, channel: ObjectRef, socket: ObjectRef) {
+    let key = dc_key(ctx, channel);
+    let channel_root = ctx.add_global_root(channel);
+    let socket_root = ctx.add_global_root(socket);
+    let existing = dc_socket_cache().lock().remove(&key).unwrap_or_default();
+    let (mut kept, released) = dc_socket_rows_without(ctx, existing, channel);
+    kept.push(DcSocketRow {
+        channel: channel_root,
+        socket: socket_root,
+    });
+    dc_socket_cache().lock().insert(key, kept);
+    for handle in released {
+        ctx.remove_global_root(handle);
+    }
+}
+
+/// Drop `channel`'s adaptor row. Called from `native_dc_close`, so a closed
+/// channel stops pinning its adaptor — and so the identity hash it releases
+/// cannot hand a later channel someone else's socket, which is the same
+/// staleness `dc_set_blocking` is reset for there.
+fn dc_socket_cache_clear(ctx: &mut dyn NativeContext, channel: ObjectRef) {
+    let key = dc_key(ctx, channel);
+    let existing = match dc_socket_cache().lock().remove(&key) {
+        Some(rows) => rows,
+        None => return,
+    };
+    let (kept, released) = dc_socket_rows_without(ctx, existing, channel);
+    if !kept.is_empty() {
+        dc_socket_cache().lock().insert(key, kept);
+    }
+    for handle in released {
+        ctx.remove_global_root(handle);
+    }
+}
+
+/// Split `rows` into the ones to keep and the global-root handles to release.
+///
+/// A row is dropped when it is `channel`'s own — a replacement, or a close —
+/// or when its channel handle does not resolve, which after a
+/// `remove_global_root` race means the row is already dead. A row whose
+/// channel resolves to a DIFFERENT object is kept: `DcKey`'s identity hash
+/// collides, and dropping those would silently evict a live sibling's adaptor.
+///
+/// A global root pins, so a channel abandoned WITHOUT `close()` keeps its
+/// adaptor (and itself) alive until the VM exits. That is the same lifetime
+/// the `ssc_socket_cache_*` twin gives a listener, and the reason
+/// `native_dc_close` clears eagerly rather than relying on the collector.
+fn dc_socket_rows_without(
+    ctx: &dyn NativeContext,
+    rows: Vec<DcSocketRow>,
+    channel: ObjectRef,
+) -> (Vec<DcSocketRow>, Vec<usize>) {
+    let mut kept: Vec<DcSocketRow> = Vec::with_capacity(rows.len());
+    let mut released: Vec<usize> = Vec::new();
+    for row in rows {
+        match ctx.resolve_global_root(row.channel) {
+            Some(other) if other != channel => kept.push(row),
+            _ => {
+                released.push(row.channel);
+                released.push(row.socket);
+            }
+        }
+    }
+    (kept, released)
+}
+
 // The legacy `Selector` / `SelectionKey` slot maps (`SEL_FIELD_*`, `SK_FIELD_*`)
 // were deleted with `register_selector` below; `nio_selector.rs` owns both
 // classes. The `OP_*` bits stay because they are NIO-spec constants, not a
@@ -20334,124 +20619,333 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         native_dc_local_addr,
     );
 
-    // socket() → DatagramSocket (stub for compat)
-    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", |_ctx, args| {
-        // Return self as the socket (simplified)
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    // socket() → DatagramSocket
+    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", native_dc_socket);
 
     // DatagramSocket-surface adaptor methods.
     //
-    // `socket()` (above) returns the channel itself, so callers that do
-    // `datagramChannel.socket().<datagramSocketMethod>()` resolve those
-    // `java/net/DatagramSocket` methods against THIS class. The real abstract
-    // `DatagramChannel` declares none of them, so they reach native lookup
-    // here. Concretely, Tomcat's `NioReceiver.configureDatagramChannel()` calls
+    // These are registered on TWO receivers, and the pair is the point.
+    //
+    //  * `java/nio/channels/DatagramChannel`, because `socket()` used to answer
+    //    the channel itself, so `datagramChannel.socket().<datagramSocketMethod>()`
+    //    resolved these `java/net/DatagramSocket` methods against THIS class.
+    //    The real abstract `DatagramChannel` declares none of them, so they
+    //    reached native lookup here.
+    //  * `sun/nio/ch/DatagramSocketAdaptor`, because `socket()` now answers the
+    //    real adaptor (see `native_dc_socket` for why that had to change). The
+    //    adaptor's own bodies would NOT do: its `setSoTimeout` writes a private
+    //    Java field and nothing else, and its four option setters delegate to
+    //    `DatagramChannelImpl.setOption`, which THIS crate does not register —
+    //    `net_channels`'s `setOption` is backed by a different, unpopulated
+    //    socket registry. Letting the adaptor's bytecode run would therefore
+    //    turn every one of these into a silent no-op against the channel's
+    //    real UDP fd, which is the regression the double registration prevents.
+    //
+    // Concretely, Tomcat's `NioReceiver.configureDatagramChannel()` calls
     // `socket().{setSendBufferSize,setReceiveBufferSize,setReuseAddress,
     // setSoTimeout,setTrafficClass}` and `ReceiverBase.bindUdp()` calls
     // `socket().bind(addr)` — the void `DatagramSocket.bind(SocketAddress)`.
     // Buffer/option setters are best-effort against the channel's UDP fd;
     // `bind(SocketAddress)V` performs the real bind so UDP receive works.
+    // `dc_receiver_channel` is what makes one body serve both receivers.
+    let dsa = "sun/nio/ch/DatagramSocketAdaptor";
 
-    r.register(dc, "setSendBufferSize", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_send_buffer_size(fd, size);
-        }
-        Ok(None)
-    });
-    r.register(dc, "setReceiveBufferSize", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_recv_buffer_size(fd, size);
-        }
-        Ok(None)
-    });
-    r.register(dc, "setReuseAddress", "(Z)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_reuse_address(fd, on);
-        }
-        Ok(None)
-    });
+    r.register(dc, "setSendBufferSize", "(I)V", native_dc_set_send_buffer_size);
+    r.register(
+        dsa,
+        "setSendBufferSize",
+        "(I)V",
+        native_dc_set_send_buffer_size,
+    );
+    r.register(
+        dc,
+        "setReceiveBufferSize",
+        "(I)V",
+        native_dc_set_recv_buffer_size,
+    );
+    r.register(
+        dsa,
+        "setReceiveBufferSize",
+        "(I)V",
+        native_dc_set_recv_buffer_size,
+    );
+    r.register(dc, "setReuseAddress", "(Z)V", native_dc_set_reuse_address);
+    r.register(dsa, "setReuseAddress", "(Z)V", native_dc_set_reuse_address);
+    // `isConnected()Z` is a `DatagramSocket` method whose name and descriptor
+    // happen to match `DatagramChannel`'s, so it worked while `socket()`
+    // answered the channel. The adaptor's own body reads
+    // `DatagramChannelImpl.remoteAddress()`, which is not registered anywhere,
+    // so without this row the swap would turn a working answer into a
+    // NoSuchMethodError.
+    r.register(dsa, "isConnected", "()Z", native_dc_is_connected);
     // Was accepted and discarded on the grounds that a non-blocking channel
     // ignores SO_TIMEOUT — but this method is reached through
     // `channel.socket()`, i.e. by callers using the BLOCKING DatagramSocket
     // surface, where the timeout is the only thing stopping `receive()` from
     // blocking forever. Apply it to the channel's UDP fd like the sibling
     // buffer/reuse setters above.
-    r.register(dc, "setSoTimeout", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as u64;
-        // JDK contract: 0 means "no timeout" (block indefinitely).
-        let timeout = if millis == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(millis))
-        };
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
-        }
-        Ok(None)
-    });
-    // ESCALATED wave 4 (2026-07-28) — this IS implementable, but not from this
-    // crate. `socket2` (already a dependency of `native-api`, `features =
-    // ["all"]`) exposes `SockRef::set_tos(u32)`, which is exactly IP_TOS /
-    // the JDK's `setTrafficClass`. What is missing is the fd-table accessor:
-    // `native-api/src/fd_table.rs` needs
-    //
-    //     pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error>
-    //
-    // written like its neighbour `udp_set_send_buffer_size` (match
-    // `FileEntry::UdpSocket(s)` → `socket2::SockRef::from(s).set_tos(tos)`).
-    // The `FileEntry` enum and `get_entry` are both private to that module and
-    // native-io does not depend on socket2, so the option cannot be reached
-    // from here. Once the accessor lands this becomes the same three lines as
-    // `setSoTimeout` above: `if let Some(fd) = dc_fd(ctx, this) { let _ =
-    // ctx.fd_table().udp_set_tos(fd, (tc & 0xff) as u32); }`.
-    //
-    // Until then, accepting and discarding is spec-legal rather than a silent
-    // failure: `DatagramSocket.setTrafficClass` is documented as advisory
-    // ("the underlying platform may ignore the value"), and the JDK's own
-    // contract only requires an IllegalArgumentException for values outside
-    // 0..=255 — which real callers (Tomcat's `NioReceiver`) never pass.
-    //
-    // IMPLEMENTED wave 4 (2026-07-28): `FdTable::udp_set_tos` was added for
-    // exactly this, so the escalation above is resolved and the body is now
-    // the same shape as `setSoTimeout`. The advisory-ness of IP_TOS is a
-    // statement about the network, not a licence to skip the syscall — "the
-    // platform may ignore it" and "we never asked" are different claims, and
-    // only the second was true before. The spec'd IllegalArgumentException is
-    // now enforced rather than waived on the grounds that today's callers
-    // happen not to trip it.
-    r.register(dc, "setTrafficClass", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let tc = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if !(0..=255).contains(&tc) {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("tc is not in range 0 -- 255: {tc}"),
-            }
-            .into());
-        }
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
-        }
-        Ok(None)
-    });
+    r.register(dc, "setSoTimeout", "(I)V", native_dc_set_so_timeout);
+    r.register(dsa, "setSoTimeout", "(I)V", native_dc_set_so_timeout);
+    r.register(dc, "setTrafficClass", "(I)V", native_dc_set_traffic_class);
+    r.register(dsa, "setTrafficClass", "(I)V", native_dc_set_traffic_class);
 
     // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
     // channel's own real bind (close old fd, open a fresh UDP fd bound to the
     // requested address) and discards the channel return value.
-    r.register(dc, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        native_dc_bind(ctx, args)?;
-        Ok(None)
-    });
+    r.register(
+        dc,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        native_dc_socket_bind,
+    );
+    r.register(
+        dsa,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        native_dc_socket_bind,
+    );
 
     r.set_category(__prev_cat);
+}
+
+/// The `DatagramChannel` a `DatagramSocket`-surface native was reached through.
+///
+/// Since [`native_dc_socket`] answers a real `sun.nio.ch.DatagramSocketAdaptor`
+/// rather than the channel, these bodies see one of two receivers. The adaptor
+/// keeps the channel in its private `dc` field, so one lookup normalises both.
+///
+/// The non-object arm is the CHANNEL arm, not an error path: a channel has no
+/// `dc` field, and `get_field_by_name` answers `Int(0)` for a field the class
+/// does not declare rather than failing. The fallback is therefore "the
+/// receiver already is the channel", which is also what the pre-adaptor
+/// `socket()` handed out and what [`native_dc_socket`]'s own fallback still
+/// returns when the adaptor cannot be built.
+fn dc_receiver_channel(ctx: &dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
+    match ctx.get_field_by_name(receiver, "dc") {
+        Value::Object(Some(channel)) => channel,
+        _ => receiver,
+    }
+}
+
+fn native_dc_set_send_buffer_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_send_buffer_size(fd, size);
+    }
+    Ok(None)
+}
+
+fn native_dc_set_recv_buffer_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_recv_buffer_size(fd, size);
+    }
+    Ok(None)
+}
+
+fn native_dc_set_reuse_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_reuse_address(fd, on);
+    }
+    Ok(None)
+}
+
+/// `DatagramSocket.bind(SocketAddress)`, reached through `socket()`.
+///
+/// Rebuilds the argument list rather than forwarding `args` untouched: slot 0
+/// may be the adaptor, and `native_dc_bind` keys the fd table on the channel.
+fn native_dc_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let channel = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let addr = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_dc_bind(ctx, &[Value::Object(Some(channel)), addr])?;
+    Ok(None)
+}
+
+fn native_dc_set_so_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let receiver = obj_arg92(args, 0)?;
+    let this = dc_receiver_channel(ctx, receiver);
+    let requested = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    // W7-8-fabricated-success-io-sweep.md recorded the `.max(0)` that stood
+    // here as UNMEASURED, on the grounds that "not a method
+    // `java.nio.channels.DatagramChannel` declares, so there is no javadoc to
+    // quote". That framing was wrong, and this method's two registrations are
+    // what refute it: the only way to reach this body is
+    // `channel.socket().setSoTimeout(..)`, i.e. a caller using the
+    // **DatagramSocket** surface, and that class does specify the answer.
+    //
+    // JDK 25 `java.net.DatagramSocket.setSoTimeout(int)`:
+    //     @throws IllegalArgumentException if {@code timeout} is negative
+    // and the implementation `socket()` actually returns,
+    // `sun.nio.ch.DatagramSocketAdaptor.setSoTimeout` (JDK 25 src.zip:231):
+    //     if (isClosed()) throw new SocketException("Socket is closed");
+    //     if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
+    //
+    // `.max(0)` turned `setSoTimeout(-1)` — the usual spelling of a
+    // miscomputed deadline — into `setSoTimeout(0)`, and `0` is not a small
+    // timeout, it is **no timeout**: the next `receive()` blocks forever
+    // where the caller asked it to be bounded. That is the failure the
+    // refusal exists to prevent, laundered into the one value that cannot be
+    // distinguished from a healthy configuration.
+    //
+    // The message is HotSpot's own. NOT added here: the `isClosed()` refusal
+    // that precedes it upstream. `dc_fd` answering `None` covers "closed"
+    // AND "never bound", so raising `SocketException` on it would refuse a
+    // channel the JDK accepts; the ordering consequence is stated rather
+    // than guessed at — on a CLOSED channel with a negative timeout this
+    // raises `IllegalArgumentException` where HotSpot raises
+    // `SocketException`, which is one wrong exception type in place of a
+    // silent success, not a new silence.
+    if requested < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "timeout < 0".to_string(),
+        }
+        .into());
+    }
+    let millis = requested as u64;
+    // JDK contract: 0 means "no timeout" (block indefinitely).
+    let timeout = if millis == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(millis))
+    };
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
+    }
+    // Keep `sun.nio.ch.DatagramSocketAdaptor.timeout` in step when that is the
+    // receiver. Its `getSoTimeout()` is NOT intercepted — it reads that private
+    // field — so without this write an accepted timeout would read back as a
+    // permanent `0`, i.e. "no timeout", which is the exact value this method's
+    // refusal above exists to stop a caller from being handed by accident.
+    if receiver != this {
+        ctx.set_field_by_name(receiver, "timeout", Value::Int(requested));
+    }
+    Ok(None)
+}
+
+// ESCALATED wave 4 (2026-07-28) — this IS implementable, but not from this
+// crate. `socket2` (already a dependency of `native-api`, `features =
+// ["all"]`) exposes `SockRef::set_tos(u32)`, which is exactly IP_TOS /
+// the JDK's `setTrafficClass`. What is missing is the fd-table accessor:
+// `native-api/src/fd_table.rs` needs
+//
+//     pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error>
+//
+// written like its neighbour `udp_set_send_buffer_size` (match
+// `FileEntry::UdpSocket(s)` → `socket2::SockRef::from(s).set_tos(tos)`).
+// The `FileEntry` enum and `get_entry` are both private to that module and
+// native-io does not depend on socket2, so the option cannot be reached
+// from here. Once the accessor lands this becomes the same three lines as
+// `setSoTimeout` above: `if let Some(fd) = dc_fd(ctx, this) { let _ =
+// ctx.fd_table().udp_set_tos(fd, (tc & 0xff) as u32); }`.
+//
+// Until then, accepting and discarding is spec-legal rather than a silent
+// failure: `DatagramSocket.setTrafficClass` is documented as advisory
+// ("the underlying platform may ignore the value"), and the JDK's own
+// contract only requires an IllegalArgumentException for values outside
+// 0..=255 — which real callers (Tomcat's `NioReceiver`) never pass.
+//
+// IMPLEMENTED wave 4 (2026-07-28): `FdTable::udp_set_tos` was added for
+// exactly this, so the escalation above is resolved and the body is now
+// the same shape as `setSoTimeout`. The advisory-ness of IP_TOS is a
+// statement about the network, not a licence to skip the syscall — "the
+// platform may ignore it" and "we never asked" are different claims, and
+// only the second was true before. The spec'd IllegalArgumentException is
+// now enforced rather than waived on the grounds that today's callers
+// happen not to trip it.
+fn native_dc_set_traffic_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let tc = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    if !(0..=255).contains(&tc) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("tc is not in range 0 -- 255: {tc}"),
+        }
+        .into());
+    }
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
+    }
+    Ok(None)
+}
+
+/// `DatagramChannel.socket()`.
+///
+/// # This used to answer the CHANNEL ITSELF, and that was a type error
+///
+/// `socket()` is declared `()Ljava/net/DatagramSocket;` and a
+/// `java.nio.channels.DatagramChannel` is not a `java.net.DatagramSocket`. The
+/// old body returned `this` anyway, and nothing caught it: javac emits NO
+/// checkcast at the call site, because the DECLARED return type already
+/// satisfies the assignment, so the wrong object flowed into
+/// `DatagramSocket`-typed locals silently. What it cost, measured against
+/// HotSpot on the same host:
+///
+/// ```text
+///   ch.socket().getClass().getName()   java.nio.channels.DatagramChannel
+///                            HotSpot:  sun.nio.ch.DatagramSocketAdaptor
+///   ch.socket() instanceof DatagramSocket   false     (HotSpot: true)
+///   ch.socket() == ch                       true      (HotSpot: false)
+///   ch.socket().getSoTimeout()   NoSuchMethodError    (HotSpot: the timeout)
+///   ch.socket().getLocalPort()   NoSuchMethodError    (HotSpot: the port)
+/// ```
+///
+/// Every `java.net.DatagramSocket` method that worked did so only because its
+/// name AND descriptor happened to collide with a `DatagramChannel` native.
+///
+/// # The fix is the one `sc_socket`/`ssc_socket` already use
+///
+/// Mirror the real `DatagramChannelImpl.socket()` → `DatagramSocketAdaptor
+/// .create(this)`. The adaptor is a genuine `java.net.DatagramSocket`
+/// subclass, its construction runs the `DatagramSocket`/`MulticastSocket`
+/// instance initializers, and it keeps the channel in its private `dc` field —
+/// which is what `dc_receiver_channel` reads to keep every native below
+/// working on the channel's real UDP fd.
+///
+/// The adaptor is CACHED, unlike `sc_socket`'s. Two calls to `socket()` must
+/// answer the same object or the adaptor's own state — `timeout`, which
+/// `getSoTimeout()` reads — resets on every call, turning an accepted timeout
+/// into a silent `0`.
+///
+/// # The fallback is the channel, deliberately
+///
+/// `sun.nio.ch.DatagramSocketAdaptor` does not exist under `--jdk-only` /
+/// synthetic-JDK, where there is no class library to build it from. Falling
+/// back to the channel keeps that mode byte-for-byte on its current behaviour
+/// instead of failing `socket()` outright. A bare `new java/net/DatagramSocket`
+/// would be worse than either: JDK 25 routes every method through a `delegate`
+/// field that no `<init>` has filled in.
+fn native_dc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut this = obj_arg92(args, 0)?;
+    if let Some(cached) = dc_socket_cache_get(ctx, this) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
+    // `invoke` runs Java bytecode, which allocates, which can relocate `this`
+    // under a moving collector — and `this` is then written into the cache as
+    // one half of a pair, so a stale local here would key the row on a dead
+    // address. Same reason `ssc_socket` pins.
+    let pin = ctx.pin_native_root(this);
+    let created = ctx.invoke(
+        "sun/nio/ch/DatagramSocketAdaptor",
+        "create",
+        "(Lsun/nio/ch/DatagramChannelImpl;)Ljava/net/DatagramSocket;",
+        &[Value::Object(Some(this))],
+    );
+    this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    if let Ok(Some(v @ Value::Object(Some(adaptor)))) = created {
+        dc_socket_cache_put(ctx, this, adaptor);
+        return Ok(Some(v));
+    }
+    Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -20817,6 +21311,10 @@ fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // releases cannot carry "non-blocking" over to a later channel that
     // happens to be allocated with the same hash.
     dc_set_blocking(ctx, this, true);
+    // ... and the `socket()` adaptor, for the same staleness reason plus one
+    // more: that row holds two heap references and is a GC root, so leaving it
+    // behind keeps a closed channel and its adaptor alive forever.
+    dc_socket_cache_clear(ctx, this);
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }

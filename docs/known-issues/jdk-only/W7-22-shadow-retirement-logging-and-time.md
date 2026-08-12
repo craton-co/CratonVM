@@ -7,9 +7,62 @@
 > otherwise as filed: the 7-row `java/io/Print*` retirement is genuinely still
 > unapplied.
 
-**Status:** OPEN. 36 shadow rows resolved out of 36 owned; **7 retirable
-(patch below, not applied), 29 blocked**. Two live defects found on the way,
-one of them a regression in the retirement this lane was told to follow.
+> ## 2026-08-12 — §2's 7-row patch is STILL NOT APPLIED, and the reason has changed
+>
+> It is no longer "nobody got to it". The patch was re-examined against the
+> mechanism W7-25 found — *a retired shadow is silently reinstated by any other
+> registrar holding the same triple under a `NativeKind` the retirement is exempt
+> from* — and against the three frozen artefacts it moves. Two findings, opposite
+> in sign:
+>
+> **1. The ambient-kind trap does NOT apply here, so the patch would take
+> effect.** This is the check W7-25 says to run before believing any retirement,
+> and it is run here for the first time. All seven `java/io/PrintWriter` triples
+> are registered by `register_printstream_fallback_natives`
+> (`native-builtins/src/logging_shims.rs:115`), whose ambient category is
+> `NativeKind::Bridge` — set at `logging_shims.rs:118` and restored at
+> `logging_shims.rs:419`, with every one of the seven registrations between those
+> two lines. The retag in `NativeMethodRegistry::register` fires exactly on an
+> effective category of `Bridge`, so it would fire. The only other registrar
+> holding any of them is `native-builtins/src/lib.rs:22864-22905`
+> (`println(Ljava/lang/String;)V`, `println()V`, and the `print`/`printf`/
+> `format`/`flush`/`close`/`write(I)V` neighbours), which sits inside
+> `register_synthetic_overrides` under an ambient `Intrinsic` — and that function
+> is `#[cfg(feature = "synthetic-jdk")]`, called only from `register_builtins` on
+> the `use_synthetic_jdk` arm. **It does not register on either shipping mode**,
+> so it cannot reinstate anything under `--jdk-only`. This is the LogRecord
+> `<init>` shape checked and found absent, not assumed absent.
+>
+> **2. It is blocked on three frozen artefacts, and no lane without a Linux
+> build can unblock it.** `java/io/Print*` is Compatible-visible (unlike the
+> `register_synthetic_overrides`-only registrars, which move nothing), so seven
+> rows moving `Bridge` → `SyntheticStub` move: `bridge_shadows_bytecode` in
+> `scripts/baselines/jdk-only-bridge-ratchet.json` (6,066 → 6,059),
+> `BASELINE_SYNTHETIC_STUBS` in `native-builtins/tests/stub_ratchet.rs`, whose
+> `SLACK` is **0**, and the per-row kind freeze
+> `scripts/baselines/jdk-only-kind-map-25-linux.tsv`. Landing the seven entries
+> without re-freezing all three turns three gates red for a change that is
+> otherwise correct — and the artefacts are keyed `25/linux`, so re-freezing them
+> from Windows or from arithmetic is exactly what §2 forbids. §2's own
+> pre-landing condition ("take a Compatible arm of `PwProbe` before landing") is
+> also still untaken.
+>
+> **Disposition: hold, as a one-run work item rather than an open question.**
+> Nothing about the decision remains to be decided; what is missing is a Linux
+> build. **The exact recipe is §2.1, written out on 2026-08-12 so it lands in ONE
+> pass and ONE commit.** The 29 `PrintStream` rows stay blocked on §3's list and
+> were not touched.
+>
+> **DO NOT LAND HALF OF IT.** The two `retired_shadow.rs` edits without the
+> re-freezes turn three gates red for a change that is otherwise correct; a
+> re-freeze without the edits locks in a baseline for a tree that does not
+> produce it. They are one commit or neither.
+
+**Status:** OPEN, blocked on a Linux build only. 36 shadow rows resolved out of
+36 owned; **7 retirable (patch in §2, recipe in §2.1, not applied), 29
+blocked**. Two live defects found on the way, one of them a regression in the
+retirement this lane was told to follow. **A taker with a Linux build should read
+§2.1 and nothing else** — it is the whole change, in order, with the commands.
 
 **What a shadow is.** A `Bridge` native registered on a method whose real class
 has perfectly good bytecode. It runs *instead* of that bytecode, so the VM's
@@ -228,8 +281,15 @@ pub fn triple_is_retired_shadow(class_name: &str, method_name: &str, descriptor:
 into the baselines.** Seven rows move `Bridge` → `SyntheticStub`, so
 `bridge_shadows_bytecode` 6,066 → **6,059** (down 7),
 `bridge_without_acc_native` 8,912 → **8,905** (down 7), and
-`BASELINE_SYNTHETIC_STUBS` (`native-builtins/tests/stub_ratchet.rs`, `SLACK = 0`)
-1,038 → **1,045** (up 7). Both baselines must be re-frozen from one real run on
+~~`BASELINE_SYNTHETIC_STUBS` … 1,038 → 1,045~~ **— that third figure is STALE as
+written and must not be pasted anywhere.** `native-builtins/tests/stub_ratchet.rs`
+no longer holds one constant at 1,038: it holds **two**, split by the
+`management` feature — `BASELINE_SYNTHETIC_STUBS_MANAGEMENT = 1263` and
+`BASELINE_SYNTHETIC_STUBS_NO_MANAGEMENT = 1253`, with `SLACK` still `0`. **Both**
+move, by the same +7, and both must be re-frozen from that configuration's own
+printed recount line (§2.1 step 5). That file's own history is the reason: the
+1,038 it froze on 2026-08-11 was six above what any run of it produced, because
+it was hand-derived. Both baselines must be re-frozen from one real run on
 the platform they are keyed to — `sh regression-suite/bridge-ratchet.sh
 --update-baseline --note "…"`, which the script re-freezes as a pair on
 purpose. The frozen artefact is keyed `25/linux`; this lane measured on
@@ -241,6 +301,82 @@ ratchet. A `SyntheticStub` registers and dispatches normally in `Compatible`
 mode, so `--real-jdk` behaviour is unchanged — but that is a property of the
 mechanism, not of this measurement, and §2's arms did not test Compatible.
 Take a Compatible arm of `PwProbe` before landing.
+
+### 2.1 The landing recipe — one Linux pass, one commit
+
+Written out 2026-08-12 because the blocker is a platform, not a question, and
+because every previous "hold" note left the taker to re-derive the commands.
+**Prerequisite: a Linux host with a JDK 25 image.** All three frozen artefacts
+are keyed `<jdk-feature>/<os>`; the gate scripts derive the OS half from the
+running host, so on Windows they look up `25/windows`, find no baseline and exit
+**2** ("REFUSING") — which is neither a pass nor a fail, and is why re-freezing
+from this host is impossible rather than merely discouraged.
+
+```sh
+# 0. Clean tree at the tip you intend to land on.
+export JAVA_HOME=/path/to/jdk-25            # a real JDK 25 runtime image
+
+# 1. THE TWO SOURCE EDITS, verbatim from §2's "Out-of-file patch" above:
+#      (a) widen `triple_is_retired_shadow`'s prefix discriminator in
+#          native-api/src/retired_shadow.rs to admit `java/io/Print`
+#      (b) insert the seven ("java/io/PrintWriter", …) entries in SORTED
+#          position — they sort BEFORE every `java/util/logging/` row, so at
+#          the HEAD of the table.
+#    Do (a) and (b) together: entries under a prefix the discriminator does not
+#    admit answer `false`, which reads as "not retired" and is invisible.
+
+# 2. The table's own guards, before anything expensive:
+cargo test -p cratonvm-native-api retired_shadow
+#    the_table_is_sorted_and_unique, every_entry_is_reachable_through_the_predicate
+#    and the_table_is_not_empty (floor >= 80; the count becomes 95: 88 + 7).
+
+# 3. Build the binary the census and the probe both use:
+cargo build --release -p cratonvm-cli
+
+# 4. §2's still-untaken pre-landing condition: the COMPATIBLE arm of PwProbe.
+#    §2's four arms were all --jdk-only. Run the same probe with --real-jdk and
+#    require 8/8, with HotSpot as the control:
+#      $JAVA_HOME/bin/java  -cp <dir> PwProbe          # control, must be 8/8
+#      target/release/cratonvm --real-jdk -cp <dir> PwProbe
+#      target/release/cratonvm --jdk-only -cp <dir> PwProbe
+#    A SyntheticStub still dispatches in Compatible, so this arm is expected to
+#    be unchanged — it is a falsifier for that expectation, not a formality.
+
+# 5. Re-freeze the stub ratchet. BOTH configurations, each from its OWN run's
+#    printed `stub-ratchet: const <NAME>: usize = <N>;` line. Do not hand-derive
+#    +7 — that is the exact mistake the 1038 seed was.
+cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture
+cargo test -p cratonvm-native-builtins --features management \
+    --test stub_ratchet -- --nocapture
+#    Paste each printed line over the constant it names in
+#    native-builtins/tests/stub_ratchet.rs. Keep SLACK = 0.
+
+# 6. Re-freeze the bridge ratchet AND the kind map — ONE command, ONE census,
+#    on purpose: they are two readings of one measurement and the script
+#    refuses to let them come from different runs.
+sh regression-suite/bridge-ratchet.sh --update-baseline \
+    --note "W7-22 §2: retire the 7 java/io/PrintWriter shadows (Bridge -> SyntheticStub)"
+#    Rewrites scripts/baselines/jdk-only-bridge-ratchet.json AND
+#    scripts/baselines/jdk-only-kind-map-25-linux.tsv. `--note` is REQUIRED; the
+#    script refuses to freeze without one.
+
+# 7. Confirm green with no --update-baseline, and confirm the corpus:
+sh regression-suite/bridge-ratchet.sh
+CRATONVM_ARGS=--jdk-only SUITE=all bash regression-suite/run.sh
+
+# 8. Commit steps 1, 5 and 6 TOGETHER.
+```
+
+Two things to read before pasting anything in step 6. First, an
+`--update-baseline` run **regenerates the kind-map baseline's header from the
+census**, so check the diff for header fields that existed on the Linux baseline
+and did not survive. Second, this is the moment the four *separate* pre-existing
+drifts on these artefacts come due and they must not be absorbed as one number
+— README §2.1's `W7-20` row enumerates them (its own retag, the four scalar
+`StringBuilder.insert` overloads, the `Formatter.formatMessage` retag of
+`3b20b83b5` that postdates the 12:20 freeze, and whatever else is in the 182
+commits). Attribute each; a single re-freeze that silently swallows all of them
+is how a regression reads as IMPROVED.
 
 ---
 

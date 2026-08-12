@@ -10,7 +10,14 @@
 >   the alternative this record already named as "strictly better".
 > * **Residual 2** (SHAKE) — implemented, then advertised, in that order, with
 >   the alias/service split and the normalisation-agreement assertion this
->   record asked for.
+>   record asked for. **The alias half was still open until a second pass on
+>   2026-08-12.** This record's own measurement — *"`getInstance("SHAKE128")`
+>   and `("SHAKE256")` both resolve on HotSpot and return byte-identical
+>   digests"* — was the half that did not land: the `put_alias` rows went in and
+>   were ratcheted through `get_service_entry`, but `MessageDigest.getInstance`
+>   reads no registry, so both bare spellings still threw. Closed by
+>   `canonical_algorithm` in `native-builtins/src/jca/message_digest.rs`; the
+>   reasoning is in W7-63 §3 #2.
 > * **Residual 3** (mutable set) — applied as written.
 > * **Residual 4** (`ML-DSA` `KeyFactory`) — de-advertised, on this record's
 >   own reasoning. The census also found `SunJCE` `KeyFactory` `ML-KEM`, an
@@ -34,6 +41,19 @@
 > "X.509");` and says so in a comment naming W7-29. The lane's own fix is
 > present at `native-builtins/src/phases_late/ssl_security.rs:5422`/`:5508`/
 > `:5511`, commit `b4e105f65`.
+>
+> ~~**All five recorded residuals are STILL OPEN**~~ — **STRUCK 2026-08-12
+> (second pass).** All five landed with W7-63 later the same day and were
+> re-verified in the tree: `real_md2` (1), the two `SHAKE` arms plus the alias
+> resolution (2), `wrap_unmodifiable` (3), the `ML-DSA` umbrella gone from the
+> `SUN` `KeyFactory` seed (4), and `signature_name_is_offered` (5). The line
+> citations below have rotted with them; they are kept as a picture of the
+> pre-fix tree, not as work. **Nothing in this file is work any more.** The five
+> now have their first coverage in a scheduled vector —
+> `RJdkSecurity.advertisedVersusServed()`, expect `PASS RJdkSecurity (80
+> checks)` — where before they were held only by Rust unit tests and by
+> `probes/JcaAdvertisedVsServedProbe.java`, which `regression-suite/run.sh` does
+> not run. The as-written text follows:
 >
 > **All five recorded residuals are STILL OPEN**, re-grepped 2026-08-12:
 > (1) `MD2` still seeded at `native-builtins/src/jca/provider_chain.rs:1088`;

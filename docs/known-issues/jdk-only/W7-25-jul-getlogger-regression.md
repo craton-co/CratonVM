@@ -19,10 +19,80 @@
 >   `native-builtins/src/phases_early.rs:20556-20720`. Missing inferred source
 >   class/method — **closed in Compatible only**, commit `b7a8c37bf`,
 >   `stamp_inferred_caller` at `logmanager.rs:4168`; the strict half is its own
->   record, jul-logrecord-infercaller-is-inert-under-jdk-only-20260812.md.
+>   record, retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md,
+>   and the strict half is FIXED by W7-56-infercaller-strict.md — NOT by the
+>   accessor retirement alone, but by a shadow CONSTRUCTOR that dropped
+>   `needToInferCaller`, so the real lazy getter never called `inferCaller()`.
 > * **Residual: STILL OPEN** — the `Supplier` convenience overloads evaluate a
 >   suppressed supplier; `LogManager.getLogger` demand-creates for an undemanded
 >   name; `log(LogRecord)` is not level-gated.
+>
+> ## 2026-08-12 — the three residuals, re-adjudicated one at a time
+>
+> | residual | verdict |
+> |---|---|
+> | the `Supplier` convenience overloads evaluate a suppressed supplier | **ALREADY CLOSED — this record's own citation is stale.** |
+> | `log(LogRecord)` is not level-gated | **FIXED**, `native-builtins/src/logmanager.rs`, `native_jul_logger_log_record`. |
+> | `LogManager.getLogger` demand-creates for an undemanded name | **WILL NOT FIX as a patch** — unchanged verdict, reasons sharpened below. |
+>
+> ### The convenience overloads: read the delegation, not the line number
+>
+> §4 closes with *"`finest(Supplier)` and its `info`/`warning`/`fine`/`severe`
+> siblings are registered from `native-builtins/src/lib.rs:17076-17106` — not
+> owned, not fixed, and still evaluate a suppressed supplier."* Both halves are
+> now wrong, and the line band is the reason the first half went unnoticed:
+> `lib.rs:17076-17106` today is `jdk/internal/misc/VM`'s
+> `latestUserDefinedLoader0`/`getuid` block. The fourteen convenience
+> registrations live at `lib.rs:17412-17460`, and every one of them is
+> `|ctx, args| jul_convenience_log(ctx, args, "<LEVEL>", <supplier>)`.
+> `jul_convenience_log` (`lib.rs:24448`) **never resolves the supplier**: it
+> passes `args[1]` through untouched to
+> `ctx.invoke_virtual(this, "log", "(Ljava/util/logging/Level;Ljava/util/function/Supplier;)V", …)`.
+> So the gate is wherever `log(Level, Supplier)` gates — which since §4 is
+> `native_jul_logger_is_loggable`, called **before** `jul_resolve_msg`, in
+> `Compatible`; and under `--jdk-only` all seven convenience triples plus
+> `log(Level,Supplier)` are in `RETIRED_SHADOW_TRIPLES`, so the real bytecode's
+> own gate runs. **§4's fix closed this residual by delegation on the same day
+> it was written, and the record recorded it as open because it cited a line
+> band instead of following the call.** Fixed-line-band citations rot; this is
+> the second cost of that in this campaign
+> (`docs/architecture/natives-over-real-jdk-classes.md` §8).
+>
+> `regression-suite/src/RJdkLogging.java` already asserts both polarities of
+> this in `supplierOverloads()` — `finest(() -> …)` must not appear in the
+> rendered list while `info`/`warning`/`fine` must — so the residual is covered
+> by a scheduled fixture and needs no new one.
+>
+> ### `log(LogRecord)`: fixed, and the reason the section above could not see it
+>
+> JDK 25's body opens `if (!isLoggable(record.getLevel())) return;`.
+> `native_jul_logger_log_record` published unconditionally, making it the one
+> member of the eight-overload `log` family with no gate — §4's split, one
+> overload along. The gate now reads the record's own `level` by name (there is
+> no `Level` argument to forward, so `args` cannot be handed to `is_loggable`
+> the way the `(Level, …)` overloads hand theirs) and shares
+> `native_jul_logger_is_loggable` rather than restating the 60-line threshold
+> walk. A record whose `level` cannot be read is left alone: scoring it as the
+> INFO default could suppress a record whose level we merely failed to decode.
+>
+> **Coverage**, and this is the part that makes it closable: `RJdkLogging`'s
+> `recordPayloads()` ran at `Level.ALL`, where the gate admits everything —
+> which is exactly how a missing gate hides behind a passing delivery check. It
+> now drops to `Level.WARNING` and asserts both polarities (`FINEST` record
+> dropped, `SEVERE` record delivered) before restoring `ALL`. `RJdkLogging` is
+> scheduled in `JDKONLY_CLASSES` (`regression-suite/run.sh:119`).
+>
+> ### `LogManager.getLogger` demand-creation: the verdict is unchanged and the reason is now stated as a dependency
+>
+> HotSpot returns `null` for a name nobody demanded; CratonVM `Compatible`
+> returns a fresh `Logger`. Not patched, for the reason §5 already gives — the
+> JULI/Tomcat shims are **built on** the demand-creation, so making it answer
+> `null` is a design change with a blast radius outside logging, not a fix. Two
+> things are added here rather than left implicit: under `--jdk-only` the triple
+> `LogManager.getLogger(String)` is in `RETIRED_SHADOW_TRIPLES`, so strict mode
+> already gets HotSpot's answer from the real bytecode and the divergence is
+> **Compatible-only**; and `RJdkLogging` deliberately does not assert it, which
+> §5 records and which stays true.
 > * **Context for anyone re-measuring:** on 2026-08-12 `RJdkLogging` failed in
 >   Compatible mode on a **control** binary pre-dating that day's merges, with
 >   identical errors. Its Compatible-mode failure is pre-existing, not a
@@ -269,6 +339,15 @@ run those suites.
 registered from `native-builtins/src/lib.rs:17076-17106` — **not owned, not
 fixed**, and still evaluate a suppressed supplier.
 
+> **Wrong on both counts, corrected 2026-08-12.** The band is stale (it is
+> `jdk/internal/misc/VM` today; the registrations are `lib.rs:17412-17460`), and
+> the fourteen registrations are `|ctx, args| jul_convenience_log(ctx, args,
+> "<LEVEL>", <supplier>)` — a function that hands the supplier OBJECT to
+> `log(Level, Supplier)` through `invoke_virtual` and never resolves it. The fix
+> above therefore closed them the moment it landed. Kept unedited as an instance
+> of the rule: **a line band is not a citation.** Head of this record, §"the
+> convenience overloads".
+
 ---
 
 ## 5. The vector: `regression-suite/src/RJdkLogging.java`
@@ -458,11 +537,11 @@ see the RED note at the end of §5.
 |---|---|---|---|
 | `getLogManager()` mints a fresh unconstructed manager per call | `--jdk-only` | `phases_early.rs` | §1; fix is §6.1 |
 | `setUseParentHandlers(false)` does not stop the publication walk | `Compatible` | the write is `lib.rs`'s side table, the read is `logmanager.rs`'s `jul_use_parent_handlers` | the accessor agrees with itself — `getUseParentHandlers()` returns `false` correctly — while the consumer reads `config.useParentHandlers`, null on a synthetic logger. The clean fix is one visibility change on `jul_logger_use_parent_handlers_table` plus a first-choice read in `jul_use_parent_handlers`; the in-file-only workaround (dispatch `getUseParentHandlers()Z`) puts a Java invoke on every publication and NPEs on a null `config` in strict, so it was not taken |
-| `info`/`warning`/`fine`/`severe`/`finest`(Supplier) evaluate a suppressed supplier | `Compatible` | `lib.rs:17076-17106` | same defect as §4, same shape of fix |
+| ~~`info`/`warning`/`fine`/`severe`/`finest`(Supplier) evaluate a suppressed supplier~~ | `Compatible` | ~~`lib.rs:17076-17106`~~ — **that band is stale**; the registrations are `lib.rs:17412-17460` | **CLOSED BY §4's OWN FIX.** All fourteen delegate through `jul_convenience_log` (`lib.rs:24448`), which passes the supplier object through to `log(Level, Supplier)` without resolving it — so they gate wherever that overload gates. Recorded as open because this row cited a line band instead of following the call. |
 | `Formatter.formatMessage` returns the raw `{0}` pattern | `Compatible` | the `formatMessage` intrinsic | HotSpot `one=A two=B`, CratonVM `one={0} two={1}` — **FIXED both modes 2026-08-12**, W7-43-formatmessage-substitution.md |
 | records carry no inferred `sourceClassName`/`sourceMethodName` | `Compatible` | `logmanager.rs` record construction | `SimpleFormatter` renders the logger name where HotSpot renders `Class method` |
-| `LogManager.getLogger` demand-creates for an undemanded name | `Compatible` | `logmanager.rs` `native_get_logger` | HotSpot `null`; the JULI shims depend on the demand-creation, so this is a design change, not a patch |
-| `log(LogRecord)` is not level-gated | both | `logmanager.rs` | not measured, predicted from the same missing gate as §4; HotSpot drops a record below the logger's level |
+| `LogManager.getLogger` demand-creates for an undemanded name | `Compatible` **only** — the triple is a retired shadow, so `--jdk-only` gets the real bytecode's `null` | `logmanager.rs` `native_get_logger` | HotSpot `null`; the JULI shims depend on the demand-creation, so this is a design change, not a patch. **Verdict re-affirmed 2026-08-12; will not fix as a patch.** |
+| ~~`log(LogRecord)` is not level-gated~~ | both | `logmanager.rs` | **FIXED 2026-08-12** — `native_jul_logger_log_record` now runs `native_jul_logger_is_loggable` on the record's own level first, and `RJdkLogging.recordPayloads()` asserts both polarities at `Level.WARNING`. See the block at the head of this record. |
 
 ---
 

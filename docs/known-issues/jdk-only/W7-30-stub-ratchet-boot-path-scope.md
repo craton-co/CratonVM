@@ -1,9 +1,10 @@
 # W7-30 — the stub ratchet censused 6 of `vm_init`'s 48 registrars
 
-**Status:** FIXED for the scope, 2026-08-11. Two residuals recorded below and
-not fixed here: one registration that is outside this gate by crate boundary
-(§6), and a duplicated boot-path model that a lane owning both test targets
-should collapse (§7).
+**Status:** FIXED for the scope, 2026-08-11. Both residuals taken 2026-08-12 —
+see §6.1 and §7.1 — and **the fix of 2026-08-11 was found to have been INERT
+the whole time**: §9. Nothing was built or run on 2026-08-12; every claim
+added that day is source-verified or derived by reading, and the one number
+that would need a run is not written down.
 
 **Species:** blind instrument. Same family as W7-22 (the
 `CRATONVM_ENFORCE_NATIVE_SHADOW` dial that yields at most once per triple and
@@ -258,23 +259,67 @@ to `vm/tests/`, where the whole arm including its inline registrations is
 reachable. That is a cross-crate move touching CI wiring and is not this lane's
 scope.
 
-### Out-of-file patch (not applied)
+### 6.1 What was taken, 2026-08-12 — the half that needs no census
 
-Nothing in `native-builtins/src/` or `vm/src/` needs to change for the fix in
-this record. The two follow-ups both move test targets:
+**(a) is HALF DONE, and the half that is done is the half that needed no
+measurement.** `vm/tests/stub_ratchet.rs` now exists. It is deliberately **not**
+a second stub census — two count-ratchets over "the same" VM is the exact
+configuration `bridge-ratchet.sh`'s header records as having cost weeks, and
+seeding a second baseline was impossible in a session that could not run
+`cargo`. It closes the part of this section that is settled by reading:
 
-**(a) Move the gate to `vm/tests/stub_ratchet.rs`.** This is the only change
-that makes the census total rather than scoped. It would subsume
-`UNMODELLED_VM_CRATE_REGISTRARS` (both `crate::runtime::instrument::*`
-registrars become reachable), pick up the inline registrations including the
-`RunnerClassLoader.close` stub above, and let the replay call `vm_init`'s own
-helper instead of mirroring it — at which point the source witness in §4 can be
-deleted rather than maintained. Cost: the baselines shift by the inline
-registrations and must be re-taken in both configurations; CI must run the gate
-from `cratonvm-vm`, whose default features include `management`, so the
-`management` constant becomes the CI-adjudicated one.
+* **`the_vm_crate_registrars_add_no_synthetic_stub`** replays the two
+  `crate::runtime::instrument::*` registrars and asserts they contribute zero
+  `SyntheticStub` rows and zero *unscoped* registrations. That turns
+  `UNMODELLED_VM_CRATE_REGISTRARS = 2` from an unbounded admission into a
+  bounded one: **the two registrars outside the census cost the frozen number
+  nothing.**
+* It is not self-evident. `register_instrumentation_natives` makes fourteen
+  plain `r.register(...)` calls and `register_self_attach_natives` four, none of
+  which states a kind. `effective_category` is
+  `current_category.unwrap_or(NativeKind::SyntheticStub)`, and every registrar
+  in the sequence restores its own category, so at `vm_init`'s top level the
+  ambient is the constructor's `None`. Called bare, those eighteen would land as
+  unscoped `SyntheticStub` and `--jdk-only` would refuse the whole
+  `java.lang.instrument` and self-attach surface **by accident**. They do not,
+  because `vm_init` wraps both calls in `set_category(NativeKind::Bridge)` and
+  restores afterwards.
+* That scope lives in a file neither gate replays and nothing asserted it.
+  **`the_instrument_registrars_run_under_a_bridge_scope`** is the source witness
+  for it — without it, the replay above would keep passing (it applies the scope
+  itself) while the shipping boot silently lost eighteen bridges.
 
-**(b) Collapse the duplicated boot-path model.** See §7.
+**What (a) still does not do, and what it needs.** The inline registrations —
+and therefore the floor-by-one — are still outside every census. Counting them
+means *running* the arm, and the arm is 666 lines in the middle of
+`SharedVm::new`; there is no registration-only entry point to call. Completing
+the move is blocked on extracting one from `vm/src/vm/vm_init.rs`:
+
+```rust
+pub(crate) fn register_real_jdk_boot_natives(
+    native_methods: &mut NativeMethodRegistry,
+    shim_selection: cratonvm_native_builtins::app_shims::ShimSelection,
+)
+```
+
+with the `#[cfg(not(feature = "synthetic-jdk"))]` arm reduced to a call to it.
+That is a `vm/src` change with a real review surface — the arm interleaves
+registration with VM state the extraction must not capture — and it has to land
+together with a re-freeze of both stub baselines from **one** real run, because
+the count grows by the inline registrations. Owner: whoever owns
+`vm/src/vm/vm_init.rs`.
+
+**Meanwhile the floor is ratcheted rather than merely documented.**
+`the_inline_registrations_in_vm_init_are_enumerated`
+(`native-builtins/tests/common/vm_init_boot_path.rs`) scans the arm and fails if
+more than `INLINE_SYNTHETIC_STUBS_IN_VM_INIT = 1` inline registrations state or
+scope `NativeKind::SyntheticStub`. Source-verified on 2026-08-12: eight inline
+`native_methods.register*` calls in the arm, exactly one of them
+`register_with_kind(..., NativeKind::SyntheticStub)` for
+`io/quarkus/bootstrap/runner/RunnerClassLoader.close()V`. A floor by one that
+nothing checks becomes a floor by two.
+
+**(b) is DONE.** See §7.1.
 
 ## 7. Residual: the boot-path model now exists twice
 
@@ -302,6 +347,30 @@ unmodelled registrars in the default resolve.
 
 If (a) above lands first, this residual disappears with it.
 
+### 7.1 DONE, 2026-08-12 — and the paragraph above was wrong about the cost
+
+`native-builtins/tests/common/vm_init_boot_path.rs` exists and holds the one
+model: `VM_INIT_SEQUENCE`, `UNMODELLED_VM_CRATE_REGISTRARS`, the replay
+(`vm_init_real_jdk_boot_path`), the arm locator, and both source witnesses.
+`stub_ratchet.rs` and `duplicate_registration_gate.rs` each carry
+`#[path = "common/vm_init_boot_path.rs"] mod boot_path;` and a `use` of the
+replay, so every call site is unchanged; `essential_wiring_ratchet.rs` (new, see
+W7-5-registrars-that-never-shipped.md §6.3) includes it too, for its
+"survives the whole boot" assertion. The `cfg` advice above was followed
+exactly: the list is ungated, the ten `jmx::*` calls in the replay are not.
+
+**The cost estimate in §7 was wrong, and the error is the interesting part.**
+It said the duplication's failure mode was *redundant maintenance, not silent
+disagreement*, "strictly better than one shared model with one witness". That is
+true of the MODEL and false of the INSTRUMENT, and both copies shared one
+instrument bug — §9. Two witnesses reading the same source file with the same
+broken locator do not disagree. They agree, and they are both wrong.
+
+One consequence worth stating: the witnesses are compiled into every including
+binary, so they run once per test target rather than once per crate. That is the
+intended cost of sharing a module between integration-test targets; each reads
+one file and scans it once.
+
 ## 8. What the widened gate did NOT reveal
 
 Stated because a widened gate that goes green everywhere invites the suspicion
@@ -325,7 +394,76 @@ is not a floor): `MIN_TOTAL_REGISTRATIONS` 11,000 -> 11,800 and
 `STRICT_MIN_TOTAL_REGISTRATIONS` 10,200 -> 10,900, the latter keeping the ~300
 rows of headroom its own comment justifies.
 
-## 9. The generalisation
+## 9. The witness §4 added was BLIND from the day it landed — found 2026-08-12
+
+This is the finding of the 2026-08-12 pass, and it is the same species one level
+up. §4 says the load-bearing change is not the wider number but the source
+witness, "the difference between a scope that is documented and a scope that is
+checked". **The witness was not checking it.** It located `vm_init`'s real-JDK
+arm with
+
+```rust
+lines.iter().position(|l| l.contains("cfg(not(feature = \"synthetic-jdk\"))"))
+```
+
+and the first line of `vm/src/vm/vm_init.rs` matching that substring is a
+**comment** — the W7-50 tombstone inside the `#[cfg(feature = "synthetic-jdk")]`
+arm's own real-JDK `else` branch, which quotes the attribute in prose: *"'The
+branch below' was read as the `#[cfg(not(feature = "synthetic-jdk"))]` block, but
+the relevant fork is `if config.use_synthetic_jdk`"*. The real attribute is 44
+lines below it.
+
+So the brace scan isolated a 39-line window in the **wrong arm**. Measured by
+replaying the witness's own algorithm against the tree, both before and after:
+
+| | broken locator | fixed locator |
+|---|---:|---:|
+| registrars observed | 8 | 48 |
+| of those, modelled by `VM_INIT_SEQUENCE` | 8 | 46 |
+| unmodelled (ratcheted `<= 2`) | 0 | 2 |
+| names in `VM_INIT_SEQUENCE` never observed | 38 | 0 |
+| verdict | **PASS** | **PASS** |
+
+The 8 it saw are the `jmx::*` calls, which both arms make in the same relative
+order — so every one was in the list, `unmodelled` was zero, and the order check
+ran over a sequence it could not fail on. **A green line, a plausible number, and
+no assertion about the arm the test is named after.** The same code, and
+therefore the same blindness, sat in `duplicate_registration_gate.rs`'s copy:
+one locator defect, two files, neither able to notice it by disagreeing with the
+other.
+
+**The fix, and the assertion that would have caught it.** The locator now
+requires the *trimmed* line to `starts_with` the attribute — a comment can
+contain an attribute, but a comment cannot start with one. And the witness now
+asserts the direction nobody had: **every name in `VM_INIT_SEQUENCE` must
+actually be OBSERVED**. Under the broken locator that assertion fails with 38
+names, immediately and unambiguously; under the fixed one it holds at 46/46.
+An unmodelled-registrar ratchet is a bound on what the scan found and says
+nothing at all when the scan found the wrong thing.
+
+**The model was never stale; only the instrument was.** With the locator fixed,
+all 46 modelled registrars are observed in `VM_INIT_SEQUENCE` order and the two
+unmodelled ones are exactly the `crate::runtime::instrument::*` pair §3 names.
+Nothing in §3, §4 or §5 needs revising — which is why this went undetected: the
+gate agreed with the truth for a reason unrelated to the gate.
+
+Two further population holes in the same scan, both derived by reading and
+neither fixed here, because fixing either changes a slack-free count nobody has
+re-taken:
+
+* **The scan is NAME-SHAPED.** It matches bare callees beginning with
+  `register_`. `vm_init` also calls `init_service_loader_bootstrap` — a `pub fn`
+  in `vm_init.rs` that wraps
+  `cratonvm_native_builtins::service_loader::register_service_loader_natives` —
+  and it is invisible to both the observation and the unmodelled ratchet. Benign
+  for the KIND (that registrar states `SyntheticStub` explicitly, and its other
+  caller `jdbc::register_jdbc_driver_natives` is on the replayed path), but a
+  real hole in the POSITION: whether the replay holds those 11 triples where the
+  shipping VM holds them is a question for a registry dump, not a grep.
+* **The inline registrations** — eight, one of them a stated `SyntheticStub` —
+  are now ratcheted (§6.1) but still not counted.
+
+## 10. The generalisation
 
 Every gate in this campaign is a predicate over a population. Reviewers argue
 about the predicate, which is visible in the assertion, and the campaign has

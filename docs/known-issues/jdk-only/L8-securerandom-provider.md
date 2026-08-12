@@ -13,16 +13,37 @@
   2026-08-12 against the dev binary at `ba65f1a19`: `RJdkSecurity` runs to
   `PASS RJdkSecurity (61 checks)` in **both** `--jdk-only` and `--real-jdk`.
   That is this record's own falsifier, and it is green.
-* **Residual: STILL OPEN.** The `## Out-of-file patch (not applied)` at the foot
-  of this record is genuinely **not** applied — re-grepped 2026-08-12. All three
-  shadowing registrations are live in `native-builtins/src/crypto_impl.rs`:
-  `setSeed(J)V` at `:1408`, `setSeed([B)V` at `:1414`, `<init>([B)V` at `:1420`,
-  with their three no-op bodies at `:1309`, `:1326`, `:1347`, and the stale
-  registration-order comment at `:1389-1395`. Its scope is unchanged and narrow:
-  the block is reachable only through `register_synthetic_overrides`
-  (`native-builtins/src/lib.rs:21151`, `#[cfg(feature = "synthetic-jdk")]`,
-  called from `lib.rs:23845`), so it is absent from a default binary and cannot
-  move either shipping mode.
+* **Residual: APPLIED 2026-08-12 (lane W7-92-L8, this wave). Nothing was
+  rebuilt.** The three shadowing registrations in
+  `native-builtins/src/crypto_impl.rs::register_crypto_impl_natives` —
+  `setSeed(J)V`, `setSeed([B)V`, `<init>([B)V` — are deleted, together with
+  their three now-dead no-op bodies `native_secure_random_set_seed_long`,
+  `native_secure_random_set_seed_bytes` and
+  `native_secure_random_init_seed_bytes`. `nextBytes([B)V` and
+  `generateSeed(I)[B` stay, as this record prescribed: both draw from the OS
+  CSPRNG in either file, so the shadowing is behaviour-neutral and the
+  `VULN(secrand)` / `VULN(secrand-collision)` block comment above them stays
+  attached to live registrations. The stale registration-order comment is
+  replaced with the text at the foot of this record.
+
+  **The scope claim was re-derived before acting, not inherited.** README §2.1
+  called this "synthetic-jdk only"; the registrars agree.
+  `register_crypto_impl_natives` has **exactly one call site tree-wide** —
+  `native-builtins/src/lib.rs:24167` — and it is inside
+  `pub fn register_synthetic_overrides` (`lib.rs:21449`, attribute
+  `#[cfg(feature = "synthetic-jdk")]` at `:21448`). Within that function
+  `register_security_natives` (`:23877` → `securerandom::
+  register_random_and_securerandom_natives` at `:36051`) is called **before**
+  `register_crypto_impl_natives`, which is what made the deleted bodies win
+  there — a same-function call ordering, not the phase ordering the old comment
+  claimed. `securerandom.rs` registers all three deleted triples
+  (`<init>([B)V` at `:1580`, `setSeed(J)V` at `:1581`, `setSeed([B)V` at
+  `:1590`), so the surviving surface is a strict superset and nothing is left
+  unserved in any mode.
+
+  Line citations that had rotted are re-anchored above. The previous pass read
+  `register_synthetic_overrides` at `lib.rs:21151` and its call site at
+  `lib.rs:23845`; both moved again.
 * **The residual's stated REASON was wrong, and the 2026-08-11 pass already
   corrected it — do not re-derive it a third time.** The defect is *not* the
   discarded constructor seed; that discard matches HotSpot and is deliberate
@@ -410,13 +431,17 @@ construction that is not there. `RJdkSecurity` asserts only that the name is
 non-null and non-empty. Recorded so that nobody "fixes" `getAlgorithm()` to say
 `DRBG` while `nextBytes` still goes straight to the OS.
 
-## Out-of-file patch (not applied)
+## Out-of-file patch — APPLIED 2026-08-12
 
-`native-builtins/src/crypto_impl.rs` is not owned by this lane. The fix is a
-deletion, and it is the one this record's *Out of scope* section already
-prescribed — widened to the two `setSeed` rows, which it did not cover.
+> **This section is kept as the record of what was deleted and why. It is no
+> longer a prescription.** The lane that opened this record did not own
+> `native-builtins/src/crypto_impl.rs`; the 2026-08-12 lane did, and applied it
+> verbatim. Nothing was rebuilt.
 
-In `register_crypto_impl_natives`, delete these three registrations:
+The fix is a deletion, and it is the one this record's *Out of scope* section
+already prescribed — widened to the two `setSeed` rows, which it did not cover.
+
+In `register_crypto_impl_natives`, these three registrations were deleted:
 
 ```rust
     r.register(
@@ -441,7 +466,10 @@ In `register_crypto_impl_natives`, delete these three registrations:
 
 and, once nothing references them, the three now-dead bodies
 `native_secure_random_set_seed_long`, `native_secure_random_set_seed_bytes` and
-`native_secure_random_init_seed_bytes`.
+`native_secure_random_init_seed_bytes`. All six deletions landed together;
+`dead_code` is `allow` workspace-wide, so leaving the bodies would have compiled
+and left the trap in place, which is the failure mode this record's Result 1
+argues against.
 
 `nextBytes([B)V` and `generateSeed(I)[B` should **stay**. Both draw from the OS
 CSPRNG in either file, so the shadowing is behaviour-neutral, and the block

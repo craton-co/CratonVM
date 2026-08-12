@@ -132,6 +132,61 @@
 //! leaves no `java.util.logging.Logger` frame to trip its latch. Compatible is
 //! correct only via the eager stamp. W7-56-infercaller-strict.md
 //!
+//! # `java/io/PrintWriter` — measured retirable, HELD, and why the hold is not a doubt
+//!
+//! Seven `java/io/PrintWriter` triples (`<init>(Ljava/io/OutputStream;)V`,
+//! `println` ×4, `write` ×2) were measured verdict-neutral in
+//! W7-22-shadow-retirement-logging-and-time.md §2 — including the arm that
+//! matters, a NATIVE-built receiver meeting retired methods — because
+//! `native_printwriter_init_outputstream` chains into the real
+//! `PrintWriter(OutputStream, boolean)` bytecode and leaves `lock`, `out`,
+//! `charOut` and `textOut` populated. Its `java/io/PrintStream` sibling does
+//! not, which is the whole verdict split between §2 and §3 of that record.
+//!
+//! **The reinstatement check has been run and comes back clean**, which is the
+//! part a future lane should not have to redo. All seven registrations sit in
+//! `register_printstream_fallback_natives`
+//! (`native-builtins/src/logging_shims.rs`) between its
+//! `set_category(NativeKind::Bridge)` and the matching restore, so the retag
+//! below would fire on them. The only other registrar holding any of the seven
+//! is in `register_synthetic_overrides` under an ambient `Intrinsic` — and that
+//! function is `#[cfg(feature = "synthetic-jdk")]` and reached only from
+//! `register_builtins` on the `use_synthetic_jdk` arm, so it registers nothing
+//! on either shipping mode and cannot hand the triple back the way
+//! `phases_early.rs` handed back `LogManager.getLogManager()`
+//! (W7-25-jul-getlogger-regression.md §1).
+//!
+//! **What holds it is arithmetic on frozen artefacts, not the verdict.**
+//! `java/io/Print*` is Compatible-visible, so seven rows moving
+//! `Bridge` → `SyntheticStub` move `bridge_shadows_bytecode`
+//! (`scripts/baselines/jdk-only-bridge-ratchet.json`), `BASELINE_SYNTHETIC_STUBS`
+//! (`native-builtins/tests/stub_ratchet.rs`, `SLACK = 0`) and the per-row kind
+//! freeze (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`). All three are
+//! keyed `25/linux` and must be re-frozen from one real run on that platform in
+//! the same commit as the seven entries. Adding the entries alone turns three
+//! gates red for a change that is otherwise correct. **Land them together or
+//! not at all.**
+//!
+//! **The ordered recipe is W7-22-shadow-retirement-logging-and-time.md §2.1** —
+//! eight steps with the exact commands, including the two the arithmetic cannot
+//! give you: `stub_ratchet.rs` now holds **two** baselines (`…_MANAGEMENT` and
+//! `…_NO_MANAGEMENT`), each of which must be pasted from its own configuration's
+//! printed recount line rather than derived as +7, and
+//! `sh regression-suite/bridge-ratchet.sh --update-baseline --note "…"` re-freezes
+//! the bridge ratchet AND the kind map from ONE census because they are two
+//! readings of one measurement. On a non-Linux host both gate scripts exit **2**
+//! ("REFUSING") rather than failing, so a Windows lane cannot even discover
+//! whether it got the numbers right — which is why this is held rather than
+//! attempted.
+//!
+//! Two edits, not one, and they only work together: the seven entries go in
+//! SORTED position (`java/io/…` sorts before every `java/util/…` row, so at the
+//! HEAD of the table) **and** [`triple_is_retired_shadow`]'s prefix
+//! discriminator has to admit `java/io/Print`. An entry under a prefix the
+//! discriminator rejects answers `false`, which reads as "not retired" and is
+//! invisible; `every_entry_is_reachable_through_the_predicate` is the test that
+//! catches exactly that.
+//!
 //! # Why this is applied centrally
 //!
 //! Same reason as [`crate::no_image_receiver`]: the property is a MEASUREMENT

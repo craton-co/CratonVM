@@ -1,6 +1,27 @@
 # The ThreadContainer was dropped on start, and the JDK never takes it back off on exit
 
-**Status: the registration half is written in
+> **INTERLOCK FLIPPED 2026-08-12, UNRUN.**
+> `native-builtins/src/shared_secrets_bridge.rs`'s
+> `VM_REMOVES_THREADS_FROM_CONTAINERS` is now **`true`**. The blocker is gone:
+> the de-registration half landed as `run_thread_exit_shared` in
+> `vm/src/vm/vm_exec.rs`, invoked on both worker-death paths
+> (docs/known-issues/jdk-only/W7-27-thread-exit-java-cleanup.md). So the
+> registration half is live in every mode, and §4's "the add lands, the remove
+> does not" measurement is now the thing to re-take rather than the reason to
+> stay off.
+>
+> **This is a flip-and-measure, and the failure mode is a HANG.** Read
+> §10 *"Reading a wrong flip out of a suite transcript"* before the run — it is
+> written for whoever is looking at the output, not for whoever writes the fix.
+> The one-line summary: a vector that stops mid-transcript with no `FAIL` and no
+> `PASS` is this, and `CRATONVM_THREAD_CONTAINERS=0` restores the old behaviour
+> in the same binary without a rebuild.
+>
+> Nothing in the flip was built or run. What is claimed is that the blocker no
+> longer exists and that the constant now states the VM's actual behaviour;
+> what is NOT claimed is that the pair works.
+
+**Status (before the flip): the registration half is written in
 `native-builtins/src/shared_secrets_bridge.rs` and is interlocked OFF, because
 the de-registration half does not exist in this VM and landing the two out of
 order is measurably a hang.** Nothing was rebuilt in this lane. Every number
@@ -293,7 +314,7 @@ it cannot see the difference.
   enabled, invokes `Thread.start(Ljdk/internal/vm/ThreadContainer;)V` — the JDK
   body, i.e. `setThreadContainer` + `container.add(this)` + `start0()`, with the
   JDK's own `finally { container.remove(this); }` covering failed-to-start.
-* Registration is **off** by default, via one named constant
+* Registration was **off** by default, via one named constant
   `VM_REMOVES_THREADS_FROM_CONTAINERS`, whose doc comment carries §4's table and
   says what flipping it requires. `CRATONVM_THREAD_CONTAINERS=1`/`=0` overrides
   it at runtime so the two arms can be compared in **one** binary once the pair
@@ -301,12 +322,29 @@ it cannot see the difference.
 * When a non-null container is dropped, one `tracing::warn!` per process names
   what will not see the thread.
 
-**Observable change, precisely.** In every mode — `Compatible`, `--real-jdk`,
-`--jdk-only`, synthetic — the threads started are the same threads started the
-same way, byte-for-byte, because the enabled branch is not taken. The only new
-output is a single WARN line per process, and only in a run that actually starts
-a thread through a non-null container (Jetty's pool, any `StructuredTaskScope`
-fork). A run that starts no such thread is unchanged including its stderr.
+**2026-08-12: the constant is now `true`.** The clause above — "because the
+enabled branch is not taken" — no longer holds, and the paragraph below is kept
+as the record of what the *interlocked* state was. `CRATONVM_THREAD_CONTAINERS=0`
+selects it in the same binary.
+
+**Observable change while the interlock was off, precisely.** In every mode —
+`Compatible`, `--real-jdk`, `--jdk-only`, synthetic — the threads started are the
+same threads started the same way, byte-for-byte, because the enabled branch is
+not taken. The only new output is a single WARN line per process, and only in a
+run that actually starts a thread through a non-null container (Jetty's pool, any
+`StructuredTaskScope` fork). A run that starts no such thread is unchanged
+including its stderr.
+
+**Observable change now that it is `true`.** In every mode, a thread started
+through `JavaLangAccess.start(Thread, ThreadContainer)` with a **non-null**
+container now runs the JDK's own `Thread.start(ThreadContainer)` body:
+`setThreadContainer(container)` + `container.add(this)` + `start0()`. `start0()V`
+is still CratonVM's own spawn, so the thread is created the same way; what is new
+is the bookkeeping and its consumers waking up. A thread started through
+`Thread.start()` — every ordinary thread, every `Executors` pool thread — is
+untouched, because that is a different triple and this bridge is not on it. The
+WARN line disappears from runs that used to emit it, which is itself the cheapest
+positive signal that the flip took effect.
 
 The constant is deliberately a lever and not `#[cfg]`: a default-off inner
 `#[cfg]` gate is the shape this campaign has already found eleven times as
@@ -314,9 +352,25 @@ The constant is deliberately a lever and not `#[cfg]`: a default-off inner
 (docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md censuses the
 same failure). The warning is what keeps this one from reading as absence.
 
-## Out-of-file patch (not applied)
+## Out-of-file patch — A APPLIED (as W7-27); B is a note
 
 ### A. `vm/src/vm/vm_exec.rs` — call `Thread.exit()` on the terminating thread
+
+> **APPLIED. Do not re-apply.** This landed as
+> `run_thread_exit_shared` in `vm/src/vm/vm_exec.rs`, called from both
+> worker-death paths, unconditional, in every mode — see
+> docs/known-issues/jdk-only/W7-27-thread-exit-java-cleanup.md §4 for what the
+> landed form does differently from the sketch below (`get_loaded_class_id` +
+> `invoke_special_shared_on_class` rather than the `find_class_id` /
+> `invoke_on_class_shared` shape written here, and a presence check on `exit()V`
+> so a stub `java/lang/Thread` is a no-op rather than a warning per thread
+> death). All three properties this section required hold. **Its one gap is the
+> primordial thread** — W7-27 §10C — which is not a blocker for this record: a
+> container the main thread never leaves has no observer left to see it, because
+> the process is ending.
+>
+> The sketch is kept below unedited, because the *reasoning* about the insertion
+> point is what the landed form was checked against.
 
 This is the blocker, and it is worth more than the container fix on its own:
 `Thread.exit()` also drives `TerminatingThreadLocal.threadTerminated()` and
@@ -456,6 +510,75 @@ container, wait for it to die, and call `scope.join()`. HotSpot returns in 0–1
 ms; the current binary does not return. The `pair` section deliberately never
 calls `join()` or `close()` — both spin on `threadCount > 0`, so on a leaking VM
 they are the hang this probe exists to *predict* rather than to demonstrate.
+
+## 10. Reading a wrong flip out of a suite transcript
+
+Written for whoever is looking at the run, not for whoever wrote the fix. The
+flip's failure mode is a **hang**, so it does not produce a `FAIL` line, and the
+thing that makes it hard to recognise is that the transcript simply stops being
+about the vector that is stuck.
+
+**Signature 1 — the one to expect.** A vector that opens a
+`StructuredTaskScope`, or reaches `jdk.internal.misc.ThreadFlock` any other way,
+stops mid-transcript: its `CK` lines up to some point, then no `PASS`, no `FAIL`,
+and the harness eventually times out or the whole run is killed. The owner thread
+is parked in `LockSupport.park()` inside `awaitAll()` on a `threadCount` that
+never fell. **Distinguish it from the other shape first**, because in this tree a
+vector that produces no result line is more often a crash than a wait: this one
+leaves the process alive and parked, with no exit code and no stack. One look at
+whether the process is still running settles it, and it costs nothing.
+
+**What to do about it, in order, without a rebuild.**
+
+1. Re-run the same vector with `CRATONVM_THREAD_CONTAINERS=0`. If it passes, the
+   flip is the cause and nothing else in the wave is implicated. That single
+   comparison is the whole diagnosis; it is why the lever exists.
+2. Re-run with `-ea` (assertions on). If `ThreadFlock.onExit`'s
+   `assert removed` fires, the failure is the **opposite** regression — a thread
+   removed twice, or removed from a container it was never added to — which is a
+   defect in the pairing rather than in the count.
+3. Look for `WARN … Thread.exit() failed on terminating thread …`. One line per
+   thread death means `exit()` is being reached and throwing inside real JDK
+   bytecode; the error text names which call. The container is then still held,
+   so signature 1 follows from it and this is the earlier, more informative
+   symptom.
+
+**Signature 2 — the silent one.** A `ThreadContainers.root()` count that used to
+be right becomes wrong. §5 records why: `platformThreads()` filters on
+`JLA.threadContainer(t) == null`, so a thread that IS bound to a container drops
+out of root enumeration. Registration therefore moves this consumer in the
+opposite direction from the one it fixes, and it does so with no error. Anything
+reading a thread dump or `getAllStackTraces` is where this shows.
+
+**What is NOT evidence either way.** Jetty and Tomcat pools use
+`SharedThreadContainer`, which never waits on a count — `close()` just
+deregisters and `threads()` filters on `isAlive`. A green Jetty or Tomcat arm
+says nothing about this flip in either direction (§5's last row). Likewise, a run
+that starts no thread through a non-null container is byte-identical to the
+pre-flip run, so a green suite is only informative for the vectors that
+actually reach a container.
+
+**Coverage, stated plainly: there is none, and it is not for want of trying.**
+No scheduled `regression-suite` vector exercises a `ThreadContainer`, and one
+cannot be written in the ordinary way: naming `StructuredTaskScope` in Java
+source mints a `69.65535` class file HotSpot refuses without `--enable-preview`
+and CratonVM has no flag for (W7-18 §2), so the vector has to be reflection-only
+*and* needs `--add-opens java.base/jdk.internal.misc=ALL-UNNAMED` plus
+`java.base/jdk.internal.vm`, which `regression-suite/run.sh`'s `class_args` does
+not supply for any class. **Scheduling need, for whoever owns `run.sh`:** a
+`class_args` entry granting those two opens to one new reflection-only vector is
+the minimum that would let `ExitPairingProbe`'s two load-bearing lines
+(`pair.count.afterTermination`, `hang.join.returnedAfterMs`) become a scheduled
+assertion instead of a probe nobody runs. Until then this record's falsifier is a
+hand-run, and `probes/` is never run by `run.sh`.
+
+The one thing that IS scheduled and does move on the pair is the *other* half:
+`regression-suite/src/RJdkExecutors.java`'s `threadExitCleanup()` asserts that a
+terminated thread no longer reports the uncaught handler installed on it, which
+is `Thread.exit()`'s `clearReferences()` observed through public API with no
+opens at all. It covers W7-27, not this record — but a red there means the
+decrement's *driver* is not running, which is the first thing to rule out before
+reading any hang here as a container defect.
 
 ## What is not claimed
 

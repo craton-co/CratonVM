@@ -494,6 +494,10 @@ run it.
    The probe's oracle is measured on HotSpot; its CratonVM column has still
    never been produced — for this lane or for W7-58 or W7-68. That column is the
    single highest-value next step and it is one command in each mode.
+   **Partly discharged 2026-08-12 by §10.1**: the `ord` and `win` sections are
+   now asserted by a SCHEDULED fixture, so the next suite run produces that much
+   of the column without anyone remembering to run a probe. §10 is what asking
+   the question found.
 2. **Whether the three predicted `wrong-field` rows actually print.**
    Source-level, and blocked on §8.3.
 3. **Whether `register_nio_natives` should overwrite the s2 family in synthetic
@@ -510,3 +514,92 @@ run it.
    `native_bb_is_read_only`'s constant `0`, both named by W7-58 §6 and still
    there. The probe's `*.slice.aliasesParent` and `*.readOnly.isReadOnly` rows
    are the discriminators and are expected red.
+
+---
+
+## 10. §4.3's oracle was measured; the CODE it judges was not (2026-08-12)
+
+§4.3 is this record's best paragraph and it stops one step short. It measured
+HotSpot on all four derivations, found the handed-in premise half wrong —
+`slice()` / `slice(int,int)` / `duplicate()` / `asReadOnlyBuffer()` preserve
+CONTENT and do **not** preserve ORDER — and wrote that down as "free, and only
+because the measurement was taken first". What it never did was ask what
+CratonVM's own derivations do with the order.
+
+**They propagate it.** Four sites, all in `native-builtins/src/servlet.rs`, all
+in the block whose own comment (`// slice / slice(II) / duplicate /
+asReadOnlyBuffer — ALIASING views.`) describes the storage sharing and says
+nothing about the order:
+
+| registration | the line |
+|---|---|
+| `slice ()Ljava/nio/ByteBuffer;` | `let ord = s2_bb_order(ctx, this);`, then `ord` passed to `s2_bb_new_heap_view` / `s2_bb_new_direct_view` and `s2_bb_set_order(ctx, buf, ord)` on the synthetic arm |
+| `slice (II)Ljava/nio/ByteBuffer;` | same |
+| `duplicate ()Ljava/nio/ByteBuffer;` | same, plus `ctx.set_field(buf, BB_ORDER, Value::Int(ord))` on the synthetic arm |
+| `asReadOnlyBuffer ()Ljava/nio/ByteBuffer;` | same |
+
+`s2_bb_set_order`'s helper doc even names the behaviour as intended — *"Used by
+the `order(ByteOrder)` native **and by slice/view creation when propagating the
+source buffer's order**"* — so this is a deliberate choice made against an
+un-measured belief, which is exactly the shape §4.3 congratulated itself for
+avoiding one level up. `s2` is the registrar that **wins in Compatible mode**
+(§2) and all four descriptors are on the forced-native list for
+`java/nio/ByteBuffer`, so this is live in the shipping mode:
+
+```java
+ByteBuffer b = ByteBuffer.allocate(16);
+b.order(ByteOrder.LITTLE_ENDIAN);
+b.slice().order();      // HotSpot: BIG_ENDIAN   CratonVM: LITTLE_ENDIAN
+b.duplicate().order();  // HotSpot: BIG_ENDIAN   CratonVM: LITTLE_ENDIAN
+```
+
+and every typed read through such a view is byteswapped relative to HotSpot —
+the same failure mode, in the same helper family, as the Lucene
+`CorruptIndexException` the comment on `s2_bb_order` records.
+
+**Why this is a Compatible-mode carve-out and not a frozen-behaviour change.**
+The value is wrong against HotSpot at every size, on both storage kinds, through
+four entry points, and §4.3's own transcript is the oracle:
+`{direct,heap}.ord.{slice,sliceRange,duplicate,readOnly}.order = BIG_ENDIAN`,
+38 measured rows. Nothing legitimate can depend on the divergence, because real
+JDK bytecode compiled against `ByteBuffer` cannot observe order propagation on a
+real JVM.
+
+**The prescription** is four lines and no new helper: replace each
+`let ord = s2_bb_order(ctx, this);` with a literal `0` (this family's encoding is
+`0 = BIG_ENDIAN`, `1 = LITTLE_ENDIAN` — `s2_bb_order`'s `_ => 0` default and the
+`order(ByteOrder)` decode's `Some("LITTLE_ENDIAN") => 1` both pin it), and state
+the reason once at the block comment. Out-of-file for the lane that found it.
+
+`as<T>Buffer()` must **not** be changed with them: it is the one derivation that
+*does* carry the order, for the reason §4.3 gives, and it reaches the order
+through `s2_bb_order`'s `java/nio/ByteBufferAs…{B,L}` class-name arm rather than
+through any of these four sites.
+
+### 10.1 Where the assertions live, and what §4's own fix does NOT get
+
+`RDirectBufferElem.derivedViewOrderIsReset()` — group 6 of
+`regression-suite/src/RDirectBufferElem.java`, already in `CORE_CLASSES`, so no
+`run.sh` change. 36 checks (18 per arm), every value from
+`probes/DirectByteBufferStateProbe.expected.txt`: the four `.order` rows are the
+RED, the `.get5` / `.getIntBE` / `.capacity` rows beside them are the guard
+against a "fix" that resets the order by rebuilding the view from a fresh copy
+(which would lose the aliasing §2 of W7-58 restored), and the two closing rows —
+the source keeps LITTLE_ENDIAN and can be set back afterwards — are the guard
+against a fix that hard-codes BIG_ENDIAN everywhere.
+
+**§4's `bigEndian` seed is NOT covered by any scheduled fixture, and cannot be.**
+Its own §4.1 says why without drawing the conclusion: the seed is in
+`native-io`'s `alloc_byte_buffer`, whose only Compatible-mode entry is
+`native-io/src/stream_decoder.rs`'s `Channels.newReader(ReadableByteChannel, …)`
+branch. `ByteBuffer.allocate`/`wrap`/`slice`/`duplicate` do **not** reach that
+allocator in Compatible mode — `register_nio_natives` is skipped there (§2) — so
+`ByteBuffer.allocate(8).order()` measures `s2_bb_alloc` + `bb_write_hb`, which
+has seeded the pair correctly since long before this record. The fixture's
+`a fresh buffer is BIG_ENDIAN` rows are therefore a **guard**, not the
+discriminator for §4; the discriminator needs a `ReadableByteChannel` and a
+`Channels.newReader`, which is a different vector and a different lane.
+
+`asIntBuffer` is also absent from the fixture, deliberately: `asLongBuffer` and
+friends are not on the forced-native list, so on a real receiver those rows
+measure the JDK's own bytecode rather than anything this campaign changed.

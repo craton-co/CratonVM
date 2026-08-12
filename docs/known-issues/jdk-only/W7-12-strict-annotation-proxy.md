@@ -378,10 +378,131 @@ believing either half.
   `--jdk-only` shows the generated-`$ProxyN` half already works in strict mode.
   Retiring the carrier in favour of the real handler is a real option; it is a
   `Compatible`-mode redesign with its own gate and soak, not this fix.
+  **Sized and designed 2026-08-12 — see §R2 below. Verdict: NOT ONE LANE, and
+  nothing behavioural was landed for it.**
 * **R3 — the other three of W7-11's six are untouched.** `RChmKeySetView`,
   `RJdkForkJoin` and `RJdkHandles` are separate causes;
   `__mh_insert_wrapper__` is the only other VM-minted name among the six and is
   worth re-reading against §1 item 6 with this record's taxonomy in hand.
+
+## §R2 — retiring the carrier for the real handler: the design, and the decision points
+
+**Written 2026-08-12 by the lane this row was handed to. Nothing behavioural was
+landed. The verdict is NOT ONE LANE, and the sizing below is why — it is a
+measurement of the tree, not an estimate.**
+
+### R2.1 The premise did not rot. Two thirds of it is already true.
+
+Re-checked against this worktree rather than carried forward:
+
+| premise | state 2026-08-12 |
+|---|---|
+| annotations are already real `$ProxyN` proxies by default | **TRUE.** `real_annotations_enabled()` (`native-builtins/src/lang_class.rs:12980`) is `!nbflags().synthetic_annotations && nbflags().real_annotations`, i.e. on unless a flag turns it off, and `native_class_get_annotation`'s success path calls `wrap_annotation_in_real_proxy` behind `ctx.supports_real_proxy_generation() && real_annotations_enabled()` (`:14146`). |
+| the generated-proxy half works in strict mode | **UNCHANGED** — `RJdkProxy` passes under `--jdk-only`, which is what the record measured. |
+| what is NOT real is the invocation HANDLER | **TRUE.** `wrap_annotation_in_real_proxy` hands the synthetic `AnnotationProxy` to `define_or_get_proxy_class` **as the handler** and returns the `$ProxyN`; its own doc says so ("The synthetic `AnnotationProxy` still carries the member data and acts as the proxy's `InvocationHandler`"). |
+| `AnnotationInvocationHandler` / `annotationForMap` exist on JDK 25 | **not re-verified** — this lane ran no `javap`; the record's verification stands and no source read can contradict it. |
+
+So R2 is not a stale prescription. It is a live option whose cost is what this
+section measures.
+
+### R2.2 The sizing, which is the whole verdict
+
+The record's argument against resolution 1 was *"every consumer keys on the
+carrier class"* and it listed eight consumers. The tree has more than eight:
+**134 references to `AnnotationProxy` across 14 files.**
+
+| file | refs | owned by a natives lane? |
+|---|---|---|
+| `vm/src/vm/vm_exec.rs` | 43 | no |
+| `native-builtins/src/lang_class.rs` | 30 | yes |
+| `native-builtins/src/reflect_annotations.rs` | 16 | yes |
+| `vm/src/runtime/interpreter/typecheck.rs` | 8 | no |
+| `classloading/src/class_manager.rs` | 9 | no |
+| `vm/src/runtime/interpreter/dispatch_virtual.rs` | 5 | no |
+| `vm/src/runtime/interpreter.rs` | 3 | no |
+| `native-builtins/src/lib.rs` | 3 | yes |
+| `vm/src/jit/helpers.rs` | 2 | no |
+| `vm/src/runtime/interpreter/invoke.rs` | 2 | no |
+| `native-api/src/registry.rs` | 1 | no |
+| `vm/tests/wp2_7_annotation_proxy.rs` | 10 | test |
+| `classloading/tests/wp2_7_annotation_proxy.rs` | 1 | test |
+| `vm/tests/probe_fixture_census.rs` | 1 | test |
+
+**Eleven of the fourteen files are outside any natives lane's ownership, and they
+include the interpreter's virtual dispatch, its type checker, the JIT and the
+class manager.** A change that retires the carrier has to move all of them in one
+commit, because the carrier's identity is what those arms test. That is the
+verdict: this is a feature with a design doc, a gate and a soak — the shape the
+proxy half of this was landed in — and not a residual a lane closes on the side.
+
+### R2.3 The design, so the next lane does not re-derive it
+
+Four decision points. Each is a real fork, and the record's §"two resolutions"
+answers none of them.
+
+1. **`annotationForMap` or a constructed `AnnotationInvocationHandler`?**
+   `sun.reflect.annotation.AnnotationParser.annotationForMap(Class, Map)` is
+   public and does the whole job — it builds the handler AND the proxy. Taking it
+   means giving up `wrap_annotation_in_real_proxy`'s loader-namespace caching
+   (`proxy_loader_namespace`), which exists because a hardcoded `0` put every
+   real-annotation proxy in the bootstrap bucket and broke `getClass()`-equality
+   against Spring's own `synthesize()`-built proxies. Constructing the handler
+   directly keeps that caching and costs a `Map` build plus a package-private
+   constructor call. **Recommendation: `annotationForMap`, and re-measure the
+   Spring `synthesize()` equality case first — it is the one thing the cheaper
+   route is known to have broken before.**
+
+2. **What replaces the carrier as the DISPATCH key?** Every arm listed in R2.2
+   asks "is this object an `AnnotationProxy`?" to route member access. With a real
+   handler, the answer becomes "is this a `$ProxyN` whose single interface is an
+   annotation type", which is a different question with a different cost — and
+   `typecheck.rs`'s eight references and `execute_invoke_kind`'s array-component
+   guard are shape tests, not dispatch. **The array-component edge is the sharp
+   one:** `jdk_interfaces` currently makes `AnnotationProxy[]` an `Annotation[]`,
+   and `Class.getAnnotations()` returns `Annotation[]`. Retiring the carrier
+   without replacing that edge turns every `getAnnotations()` result into an array
+   whose component type no longer satisfies `Annotation[]`.
+
+3. **Does the carrier go, or does it stop being the handler?** The cheaper
+   subset — keep `AnnotationProxy` as the VM's own member-data record, but make
+   the `InvocationHandler` real — moves the 43 `vm_exec.rs` references not at all,
+   because they key on the object the VM still mints. That is a genuinely smaller
+   change than "retire the carrier", and it is what the record's own phrase
+   *"making the handler real"* literally asks for. **This is the subset a first
+   lane should scope to.**
+
+4. **Which gate, and what does it default to?** The existing pair
+   (`CRATONVM_SYNTHETIC_ANNOTATIONS`, `CRATONVM_REAL_ANNOTATIONS`) already selects
+   between the bare carrier and the real-`$ProxyN` representation, so the handler
+   question wants a **third** state rather than a reinterpretation of either —
+   which is a flag declaration, four files, and not this lane's to make (no new
+   flag name is proposed here on purpose). Default OFF, per the standing rule that
+   features land default-off, and the soak is a Spring Boot run plus `RReflect` /
+   `RJdkReflect` / `RJdkJmx` / `RJdkProxy` in **both** modes.
+
+### R2.4 What was landed for R2: nothing, and no vector row
+
+No fixture assertion is possible for R2 in either direction, and this is not a
+coverage gap that can be closed early. The whole point of resolution 1 is that
+the OBSERVABLE behaviour does not change — `annotation.getClass()` is already the
+generated `$ProxyN`, `equals`/`hashCode`/`toString` already match HotSpot through
+`annotation_proxy_dispatch_impl`, and `RJdkProxy` is already green in both modes.
+A check that could tell the two implementations apart would have to observe the
+handler's own class, which is not reachable from Java: `Proxy.getInvocationHandler`
+is the only door and it is exactly what a correct implementation of either design
+answers differently — so a check on it would be a check on the *choice*, i.e. it
+would go red the day the flag flips. **The instrument for R2 is a Spring Boot soak
+in both modes, not a vector**, and that belongs in the design's own acceptance
+criteria.
+
+**R1 is a different matter and needs no work: it is FIXED.** Every
+`create_annotation_proxy_with_type` call site in
+`native-builtins/src/lang_class.rs` now propagates with `?` — `:12808`, `:13798`,
+`:15084`, `:15604`, `:15686` — and a grep for the swallow shape
+`if let Ok(Some(proxy))` finds it in exactly one place: the comment at `:13850`,
+which records that it *was* the shape and that R1 landed under W7-26. The index's
+*"R1 is partly addressed"* is stale in the conservative direction; the swallow
+this record filed is gone.
 
 ## Not a hole: the proxy shim's fallback arms
 

@@ -258,11 +258,151 @@ public class RJdkStrict {
         System.out.println("CK RJdkStrict generated=array,lambda,proxy,hidden,accessor");
     }
 
+    /**
+     * P0 "Native <clinit> over a real enum": a real JDK enum's constants must be
+     * whatever its OWN declared fields say they are. CratonVM registers a native
+     * <clinit> for java.lang.StackWalker$Option, and a registered native beats
+     * real bytecode, so that native — not javac's initialiser — decides what the
+     * constants are. W7-93.
+     *
+     * Deliberately NOT written as "Option has 4 constants": DROP_METHOD_INFO
+     * arrived in JDK 22 and a hard-coded count is the exact mistake being
+     * asserted against. Every check below is a SELF-CONSISTENCY check between
+     * the class's declared static fields and what values()/valueOf()/
+     * getEnumConstants() report, so it holds on any JDK and on HotSpot.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    static void realEnumsAreSelfConsistent() throws Throwable {
+        for (Class<?> k : new Class<?>[] {
+            java.lang.StackWalker.Option.class,
+            java.time.DayOfWeek.class,
+            java.nio.file.StandardOpenOption.class,
+            java.lang.annotation.RetentionPolicy.class,
+            java.util.concurrent.TimeUnit.class,
+            Thread.State.class,
+        }) {
+            check(k.isEnum(), k.getName() + " must be an enum");
+
+            // The declared constants, in declaration order == ordinal order.
+            List<String> declared = new ArrayList<>();
+            for (java.lang.reflect.Field f : k.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers()) && f.getType() == k) {
+                    declared.add(f.getName());
+                }
+            }
+            check(!declared.isEmpty(), k.getName() + " declares no enum constants");
+
+            Object[] values = (Object[]) k.getMethod("values").invoke(null);
+            check(values.length == declared.size(), k.getName() + ".values() has "
+                    + values.length + " entries but the class declares "
+                    + declared.size() + " constants " + declared);
+
+            Object[] shared = k.getEnumConstants();
+            check(shared != null && shared.length == declared.size(),
+                    k.getName() + ".getEnumConstants() disagrees with the declared fields");
+
+            java.lang.reflect.Method valueOf = k.getMethod("valueOf", String.class);
+            for (int i = 0; i < declared.size(); i++) {
+                String n = declared.get(i);
+                java.lang.reflect.Field f = k.getDeclaredField(n);
+                f.setAccessible(true);
+                Object c = f.get(null);
+                check(c != null, k.getName() + "." + n + " reads back null");
+                // A non-null constant that never ran Enum.<init>(String,int) is
+                // the harder half of this defect: every null-check passes while
+                // name() is null and ordinal() is 0 for every constant.
+                check(n.equals(((Enum<?>) c).name()),
+                        k.getName() + "." + n + " has name() = " + ((Enum<?>) c).name());
+                check(((Enum<?>) c).ordinal() == i,
+                        k.getName() + "." + n + " has ordinal() = " + ((Enum<?>) c).ordinal()
+                                + ", expected " + i);
+                check(values[i] == c, k.getName() + ".values()[" + i + "] is not == " + n);
+                check(shared[i] == c, k.getName() + ".getEnumConstants()[" + i
+                        + "] is not == " + n);
+                check(valueOf.invoke(null, n) == c,
+                        k.getName() + ".valueOf(\"" + n + "\") is not == the constant");
+                check(c.toString() != null,
+                        k.getName() + "." + n + ".toString() must not be null");
+            }
+
+            // The shape that took down the real JCA: JceSecurityManager.<clinit>
+            // ends in Set.of(Option.DROP_METHOD_INFO, Option.RETAIN_CLASS_REFERENCE),
+            // and ImmutableCollections$Set12.<init> NPEs on a null element.
+            check(java.util.Set.of(values).size() == declared.size(),
+                    "Set.of(" + k.getName() + ".values()) must hold every constant");
+            java.util.EnumSet<?> es = java.util.EnumSet.allOf(k.asSubclass(Enum.class));
+            check(es.size() == declared.size(),
+                    "EnumSet.allOf(" + k.getName() + ") = " + es.size()
+                            + ", expected " + declared.size());
+        }
+
+        // StackWalker.getInstance(Set) is the call the JCA path actually makes.
+        check(StackWalker.getInstance(java.util.Set.of(
+                StackWalker.Option.RETAIN_CLASS_REFERENCE)) != null,
+                "StackWalker.getInstance(Set) must return a walker");
+
+        // A SECOND, different producer of the same defect: Thread$State's
+        // values()/valueOf() are shadowed by natives that ran on the real-JDK
+        // boot path (unlike Option, whose <clinit> is the shadowed method), so
+        // the class's own constants were correct while values() handed back a
+        // fresh instance per call. The loop above catches that, but only these
+        // three shapes say WHY it matters, and each is independently green on
+        // HotSpot.
+        //
+        // 1. values() is a defensive copy of $VALUES: a FRESH array whose
+        //    ELEMENTS are stable. Minting fails the second half only.
+        Thread.State[] v1 = Thread.State.values();
+        Thread.State[] v2 = Thread.State.values();
+        check(v1 != v2, "Thread.State.values() must return a fresh array per call");
+        for (int i = 0; i < v1.length; i++) {
+            check(v1[i] == v2[i],
+                    "Thread.State.values()[" + i + "] must be the same object across calls");
+        }
+        // 2. The live producer: a native computes the current thread's state
+        //    from the VM thread registry. It must return the class's own
+        //    constant, because `getState() == State.RUNNABLE` is what every
+        //    caller writes.
+        Thread.State self = Thread.currentThread().getState();
+        check(self == Thread.State.RUNNABLE,
+                "Thread.currentThread().getState() must be == Thread.State.RUNNABLE, got " + self);
+        check(Arrays.asList(Thread.State.values()).contains(self),
+                "getState() must return one of Thread.State.values()");
+        check(Thread.State.valueOf(self.name()) == self,
+                "Thread.State.valueOf(getState().name()) must be == getState()");
+        // 3. The ordinal half, kept honest about what it can see: MEASURED, an
+        //    enum switch still selects the right arm for a MINTED constant,
+        //    because javac's $SwitchMap is indexed by ordinal(), not identity.
+        //    So this is a guard on ordinal/declaration agreement, NOT a second
+        //    detector for the identity defect — checks 1 and 2 are the ones
+        //    that fail when values() mints.
+        check("NEW".equals(stateName(Thread.State.values()[0])),
+                "switch over Thread.State.values()[0] must select NEW, got "
+                        + stateName(Thread.State.values()[0]));
+        check("TERMINATED".equals(stateName(Thread.State.valueOf("TERMINATED"))),
+                "switch over Thread.State.valueOf(\"TERMINATED\") must select TERMINATED, got "
+                        + stateName(Thread.State.valueOf("TERMINATED")));
+        System.out.println("CK RJdkStrict enumSelfConsistent=6");
+    }
+
+    /** Forces the compiler to emit an enum switch (a $SwitchMap + tableswitch). */
+    static String stateName(Thread.State s) {
+        switch (s) {
+            case NEW: return "NEW";
+            case RUNNABLE: return "RUNNABLE";
+            case BLOCKED: return "BLOCKED";
+            case WAITING: return "WAITING";
+            case TIMED_WAITING: return "TIMED_WAITING";
+            case TERMINATED: return "TERMINATED";
+            default: return "?";
+        }
+    }
+
     public static void main(String[] args) throws Throwable {
         noFabricatedEnterpriseClasses();
         functionIdentityIsNotAStandIn();
         processHandleHasRealBytes();
         concreteBytecodeWins();
+        realEnumsAreSelfConsistent();
         generatedClassesStillAllowed();
         System.out.println("CK RJdkStrict checks=" + checks);
         System.out.println("PASS RJdkStrict (" + checks + " checks)");

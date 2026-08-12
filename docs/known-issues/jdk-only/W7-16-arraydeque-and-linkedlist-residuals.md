@@ -40,6 +40,39 @@
 >   before/after CratonVM rows stated there. It carries a red calibration (three
 >   rows whose expected answer is the ClassCastException) because every other
 >   row passes when a cast SUCCEEDS.
+> * **ADJUDICATED 2026-08-12 — the source claim above is CORRECT, re-verified
+>   from the tree rather than from W7-62's word, and the run that closes it is
+>   NOT a suite run.**
+>   * The `jdk_interfaces` arm is present at
+>     `classloading/src/class_manager.rs:10979` and reads
+>     `&["java/util/ListIterator", "java/util/Iterator"]`, sitting between the
+>     `cratonvm/internal/ArrayListSubList` entry (`:10931`) and
+>     `"java/util/Dictionary"` (`:10982`) — exactly the position this record's
+>     out-of-file patch named.
+>   * The mechanism claim holds and is in fact wider than stated:
+>     `jdk_interfaces` is read at **two** sites, `fabricate_class`
+>     (`:3757`, read at `:3977`) and `create_synthetic_stub` (`:8963`, read at
+>     `:9023`), so the arm reaches the `ClassOrigin::VmInternal` door **and**
+>     the compatibility-stub door.
+>   * The paired halves are in the tree: the retag at
+>     `native-api/src/no_image_receiver.rs:267` with the tombstone at `:198`,
+>     and the mint through `ensure_vm_internal_class(..., 3)` in both
+>     `native_ll_list_iterator` and `native_ll_list_iterator_idx`. **Those two
+>     line numbers have DRIFTED** — they are `native-collections/src/lib.rs:32001`
+>     and `:32028` today, not `:31049`/`:31076`; anchor on the function names.
+>   * **What closes it.** `probes/ListItrInterfaceProbe.java` and
+>     `probes/ListItrInterfaceProbe.expected.txt` both exist, and
+>     `regression-suite/run.sh` names **no path under `probes/` at any `SUITE=`
+>     value** — grepped. So this record cannot be discharged by a suite run,
+>     however green, and the entry in README §2.6 is the right home for it. The
+>     only two fixtures that touch `listIterator` — `RJdkCollections.java:66`
+>     and `RJdkViews.java:209` — assign it straight into a declared
+>     `ListIterator<String>`, so javac emits no `checkcast`, which is the exact
+>     reason this record gives for the family working at all. **They could not
+>     see this defect even in principle.** A scheduled vector would have to
+>     erase the type — `Object o = ll.listIterator();` then
+>     `o instanceof ListIterator` and `(ListIterator<?>) o` — in a fixture
+>     `run.sh` runs, in both arms.
 > * **Also open, and PARTLY settled:** W7-20's two frozen baselines. The
 >   kind-map one is re-frozen (twelve rows, by hand, disclosed in its header);
 >   the bridge-ratchet JSON needs a census. See

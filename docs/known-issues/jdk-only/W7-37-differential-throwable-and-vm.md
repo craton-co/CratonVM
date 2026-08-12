@@ -13,6 +13,22 @@ Branch: `fix/differential-throwable-and-vm-20260812`.
 Files changed: `native-builtins/src/lang_misc.rs`,
 `vm/src/runtime/exceptions.rs`, and this record.
 
+> **Part 3 added 2026-08-12** (see the bottom of this file): the four out-of-file
+> items are adjudicated — one applied and found to be **two** sites rather than
+> one, one declined, one reported with a 30-site/13-file blast radius, one
+> confirmed as needing nothing. Part 3 also **corrects this record's own claim**
+> that the funnel covers the JIT cast helper: it did not, and after Part 2 landed
+> the interpreter and the JIT printed different text for the same refusal. Also
+> new: the four scheduled assertions this record had none of.
+
+> **Part 4 added 2026-08-12** (see below): one of those new assertions is **RED**.
+> The `ArrayStoreException` tier-parity check reads `cold=[java.lang.Integer]
+> hot=[no-throw]` — the JIT-compiled `aastore` does not refuse the store at all,
+> because `jit/src/x64/bytecode_walk.rs` lowers `aastore` inline and **never calls
+> `jit_aastore`**, the helper Part 3 routed through the funnel. `VM.arrayStore`'s
+> "after" cell in the table below therefore holds only for the interpreter. The
+> `ClassCastException` rows are unaffected — `checkcast` does call its helper.
+
 Predecessor: W7-32-round-2-differential-run (the run these eight rows come
 from), W7-33-differential-dead-sections (the same probe's two dead sections,
 whose lesson — a refusal can be *correct* code reading state we corrupted —
@@ -341,6 +357,221 @@ These are correct-but-not-mine and are left for the owning lanes:
    *registrations* (the implementations are in `lang_misc.rs`, which is where
    this wave's changes are). No registration change was needed; noted only so
    the next reader does not go looking for the natives in one file.
+
+---
+
+## Part 3 — the four out-of-file items, adjudicated 2026-08-12 (unbuilt, unrun)
+
+Taken by the lane that owns `vm/src/jit/helpers.rs`. Item 2 is applied, item 3
+is declined with a reason, item 1 is reported with its blast radius, and item 4
+needed nothing. **Two of the record's own claims are corrected below.**
+
+### Item 2 — APPLIED, and it was TWO sites, not one
+
+`jit_aastore` now raises `RuntimeError::ArrayStoreException { message: elem_cls }`
+through `throw_runtime_error` instead of calling `create_exception_object`
+directly, so the funnel converts `java/lang/Integer` to `java.lang.Integer`
+exactly as it does for the interpreter's `aastore`. The failure behaviour is
+unchanged: if no thread is available, or the funnel degrades to an
+`InternalError`, the code falls through and performs the store rather than
+corrupting VM state, which is what the pre-existing comment there promises.
+
+**The correction.** §"Which paths newly print a different string" above lists
+*"the JIT cast helper's `class … cannot be cast to class …`"* among the paths the
+funnel newly covers. **It did not cover it.** `jit_checkcast`
+(`vm/src/jit/helpers.rs`, the `class {} cannot be cast to class {}` `format!`)
+builds its `ClassCastException` with `create_exception_object` too, so it never
+reached `throw_runtime_error` and never acquired the module/loader parenthetical.
+The interpreter's `checkcast` raises a `RuntimeError` and did acquire it — so
+after Part 2 landed, the same cast refusal printed **different text depending on
+whether the enclosing method had tiered up**, which is strictly worse than
+either wording alone. That site is now routed through the funnel as well. Its
+`msg` is already in the exact two-operand shape `split_cast_operands` requires,
+and the rewrite fails open, so a user-defined loader keeps today's wording on
+both tiers rather than on one.
+
+Both routings are in one file and neither adds a lock: in both functions the
+`class_manager.read()` guard is a temporary inside the `let` that computes the
+name and is dropped before the call.
+
+### Item 3 — DECLINED, and the reason is now stronger than "not urgent"
+
+The record's own words for it are *"functionally equivalent, so not urgent"*.
+Declined outright, on two grounds. First, item 2 above **removes the premise**:
+with the two JIT helpers routed through the funnel, all four raise sites now
+reach one message builder, and having them call it directly instead of feeding
+it text is a spelling change with zero observable difference. Second, the
+refactor spans `runtime/interpreter/opcodes.rs` — a file several concurrent
+lanes touch — for no behaviour, which is exactly the trade this campaign has
+learned not to make.
+
+### Item 1 — REPORTED, not applied. The blast radius is 30 sites in 13 files
+
+`RuntimeError` lives in `types/src/error.rs`, which no natives/VM lane owns, and
+changing `ClassCastException`'s payload from `{ message: String }` to two
+`ClassId`s reaches every construction site and every match arm. Counted
+2026-08-12 (`RuntimeError::ClassCastException` and `ClassCastException {`
+tree-wide, excluding `target/`):
+
+| file | sites |
+|---|---|
+| `native-collections/src/lib.rs` | 7 |
+| `vm/src/runtime/exceptions.rs` | 5 |
+| `native-builtins/src/phases_late/nio_file.rs` | 4 |
+| `types/src/error.rs` | 3 (declaration, `as_java_throwable` arm, one test) |
+| `native-builtins/src/lang_class.rs` | 2 |
+| `native-builtins/src/atomic_updater.rs` | 2 |
+| `vm/src/vm/vm_util.rs` · `runtime/interpreter/opcodes.rs` · `interpreter/lambda.rs` · `interpreter/jit_bridge.rs` | 1 each |
+| `native-collections/tests/mock_arraylist.rs` | 1 |
+| `native-builtins/src/xnio_async.rs` | 1 |
+| `native-builtins/src/phases_late/collections.rs` | 1 |
+
+Eight of the thirteen files are outside any one lane's ownership, and **most of
+the thirty are not casts at all** — the checked-collection refusals, the
+`AtomicReferenceFieldUpdater` type gate, `nio_file`'s attribute-view refusals
+and `xnio_async`'s helper all raise free text with no two-operand structure, so
+they have no two `ClassId`s to carry. A `ClassCastException { from: ClassId, to:
+ClassId }` variant therefore cannot replace the existing one; it has to be a
+**second, additive variant** used only by the four VM-minted cast sites, with the
+string variant kept for everything else. That is a different and much smaller
+change than the record prescribed, and it is the form a taker should scope.
+Recorded, not half-landed.
+
+### Item 4 — nothing needed, confirmed
+
+Re-checked: the `java/lang/Throwable` registrations are still in
+`native-builtins/src/lib.rs` and still point at the `lang_misc.rs` bodies. No
+registration moved.
+
+### Coverage — the instrument this record did not have
+
+§"In-tree callers asserting the old wording" established that **nothing** in the
+tree asserted either message, which is why eight measured divergences could be
+fixed in source with no scheduled witness at all. `regression-suite/src/RExceptions.java`
+(`CORE_CLASSES`, default invocation) now carries five — the file moves **13 → 25**
+counting L16's and W7-33's checks from the same pass:
+
+* `ArrayStoreException`'s message is exactly `java.lang.Integer` — fails on the
+  slashed internal name.
+* `ClassCastException`'s message `startsWith("class java.lang.String cannot be
+  cast to class java.lang.Integer (")` — the half that fails on the bare
+  two-operand form, and is robust to the parenthetical's own wording.
+* `ClassCastException`'s message is exactly HotSpot's measured string, joint
+  module/loader clause included. **Split from the check above on purpose so a
+  red localises:** if only this one fails, the divergence is in the
+  parenthetical (most likely `class.module_name` reading unnamed where HotSpot
+  says `java.base`), not in the rewrite firing at all.
+* Each of `ArrayStoreException` and `ClassCastException`, re-asserted after
+  **1200** calls to the helper that raises it — past the default JIT invocation
+  threshold of 500. Those two checks are the only ones in the file that can see
+  a JIT/interpreter split, and they are trivially true on HotSpot, so they
+  cannot flake on the oracle arm.
+
+The equality check is deliberately exact rather than `contains`, because a
+partial match on a message whose whole point is byte parity reads as good news
+while measuring a fraction of it.
+
+The two warm-up assertions also cover a second thing the funnel cannot: whether
+JIT and interpreter agree that a refusal happens **at all**.
+`aastore_element_assignable` fails open on imprecise type info, so a JIT arm that
+declined to throw where the interpreter throws would now be a red rather than a
+silent heap-type-confusion.
+
+---
+
+## Part 4 — the assertion in the paragraph above fired, and it is not a wording drift
+
+**Measured 2026-08-12** on the frozen wave binary
+(`scratchpad/bin/cratonvm-wave-full.exe`, `--jdk-only`, same JDK 25 on both
+sides). `RExceptions` is RED at the ASE tier-parity assertion; HotSpot is
+`PASS RExceptions (25 checks)` on the same class file.
+
+| reading | value |
+|---|---|
+| interpreted (`aseCold`) | `java.lang.Integer` |
+| JIT-compiled, i=500 (`aseHot`) | `no-throw` |
+| interpreted **and** JIT-compiled CCE | HotSpot's string, byte-identical, stable across 1200 iterations |
+
+`no-throw` is the fixture's own sentinel for "the store completed". So the two
+tiers do not print different text for the same refusal — **the compiled tier does
+not refuse.** Part 3's item-2 conclusion (both mint sites now reach
+`throw_runtime_error`) is correct and is *not* the residual; the residual is that
+one of those two sites is unreachable.
+
+### Why the funnel fix could not have covered it
+
+`jit/src/x64/bytecode_walk.rs:1778` (`0x53`) lowers `aastore` **inline** — null
+check, bounds check, `jit_satb_pre_write_barrier`, `MOV QWORD [array + index*8 +
+HEADER_SIZE], val`, card mark — and never calls `self.helpers.aastore`. The
+`jit_aastore` function in `vm/src/jit/helpers.rs` is dead code on x64. Part 3
+routed its ASE through the funnel; nothing routes anything through
+`jit_aastore`.
+
+The arm says why, in a comment written at R20 / HIGH-5:
+
+> ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
+> the ASE check (the interpreter does it via `set_array_element`). This inline
+> path matches the helper's behavior exactly — no regression.
+
+That was true the day it was written. The JVMS §aastore covariance check was
+later added to `jit_aastore`, in a different crate, and the "matches exactly"
+premise was falsified with nothing to notice: **a premise stated in a comment is
+not a compile-time link**, so the two paths diverged silently and stayed diverged
+until a fixture asked. The CCE half survives only because `checkcast` (0xc0)
+*does* call its helper — `self.helpers.checkcast` — which is exactly why one of
+the two moved and the other did not.
+
+Second-order consequence, worse than the message: with the check skipped, a
+JIT-compiled `String[] ← Integer` store **succeeds**, so a heap slot the class
+declares as `String` now holds an `Integer`. That is a type confusion the GC's
+reference-array invariants and every later `aaload`/`checkcast` inherit. The
+message parity this record is about is the cheap half of the bug.
+
+### The codegen change (OUT OF FILE — `jit/` is not this lane's)
+
+Keep the inline null and bounds checks: the null-check dataflow elision and BCE
+key on them, and they guard the helper's own header reads. Move everything from
+the covariance check down into `jit_aastore`, which already performs the check,
+the SATB pre-write barrier, the store and the write barrier in the right order.
+`jit_aastore` returns **void**, so RAX carries no `i64::MIN` sentinel;
+`jit_dispatch_threw` (`self.helpers.dispatch_threw`) peeks the out-of-band signal
+non-destructively and `SHL RAX, 63` maps its `0`/`1` onto the sentinel
+convention `emit_post_invoke_exception_check` already routes — via a **reason-9
+precise frame** when the store sits inside a protected range, which is what puts
+the ASE into the compiled method's *own* `catch` rather than its caller's. No new
+helper, no new helper-table slot: `aastore` is already a populated field
+(`jit-api/src/lib.rs:757`, wired at `vm/src/jit/helpers.rs`'s table literal) and
+has simply had no caller since R20.
+
+`emitted_checkcast_throw = true` forces `has_dispatch` (`jit/src/x64/driver.rs`),
+which is what sets the `JIT_THREAD` TLS `jit_thread_mut()` needs; without it
+`jit_aastore` takes its documented "no thread available" arm and **performs the
+store anyway**, reproducing today's `no-throw` through a second route. The flag
+is shared with `checkcast` deliberately — `checkcast` and `aastore` are one JVMS
+type-check rule, and the flag's job ("this compile can stash a VM-minted
+type-error throwable and bail via the sentinel") is the same for both. A taker
+who prefers a distinct `emitted_aastore_throw` must add it in three places
+(the struct in `jit/src/x64` and its two constructors) plus the `has_dispatch`
+disjunction.
+
+**Cost, stated plainly and unmeasured:** this puts a Rust-boundary call back on
+the hottest reference-store path in the VM (`ArrayList.add`, every hash-table
+`put`), and `aastore_element_assignable` walks the class hierarchy on each one.
+It trades R20 / HIGH-5's throughput win for JVMS conformance. The perf-preserving
+form is a per-site monomorphic inline cache — guard `class_id_of(array)` and
+`class_id_of(val)` against the pair the helper last accepted, and call only on a
+miss — which is the "type-narrowing infrastructure (not yet tracked in this JIT)"
+the R20 comment already named. That is a separate piece of work; do not let it
+hold the correctness fix, and do not land the correctness fix without an A/B on
+a store-heavy benchmark.
+
+### The reflective twin, checked
+
+`Array.set` and `aastore` are one JVMS rule implemented twice, so the native was
+measured too. Both VMs agree — `Array.set(String[], 0, Integer.valueOf(1))`
+throws `IllegalArgumentException` (argument type mismatch), *not*
+`ArrayStoreException`, on HotSpot 25 and on CratonVM, interpreted and past the
+JIT threshold. The reflective side needs nothing.
 
 ---
 

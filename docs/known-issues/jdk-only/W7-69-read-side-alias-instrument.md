@@ -1,5 +1,42 @@
 # W7-69 — the read-side slot-alias instrument, and its first census
 
+> **READ W7-77-guarded-slot-maps.md BEFORE THIS RECORD, NEVER AFTER.**
+> Adjudicated 2026-08-12. The instrument is real and landed; the **census below
+> is corrected in three places by W7-77 §3, which re-derived all four guarded
+> rows from `javap` before touching them**, and §4.3's table still carries the
+> uncorrected claims. In this record's own words:
+>
+> 1. **§6's `java/time/Month` sentence — "a bogus pointer for the collector to
+>    mark and move" — is WRONG on BOTH layouts.** W7-77 §4: under the default
+>    compact layout `write_compact_field`'s `Reference` arm takes `_ => 0` for a
+>    `Value::Int`, so the Int is dropped and the slot reads back null; under
+>    legacy, `for_each_ref_slot` matches `Value::Object(Some(_))` and never
+>    visits an `Int` cell. It is a wrong **answer** — a nulled `Enum.name`
+>    making `getValue()` answer January for every month — not heap corruption.
+> 2. **§4.3's `java/lang/Thread` row is UNDERSTATED**: it lists
+>    `SYNTHETIC_THREAD_VIRTUAL_SLOT`(5) alone, but the adjacent `THREAD_FIELD_*`
+>    run is a separate `const` run the comment-scraper never reached, and
+>    **four of five slots disagree** (`name`→`eetop`, `priority`→`tid`,
+>    `target`→`interrupted`, `isVirtual`→`holder`; only slot 4 agrees, and that
+>    agreement is deliberate). W7-77 §3.1.
+> 3. **§4.3's `java/time/Month` row is INCOMPLETE and §4.3's "Nothing is dead in
+>    this population" is FALSE.** There are **two** identically named
+>    `MONTH_FIELD_VALUE` slot maps in the same crate; `util_time.rs`'s is dead —
+>    all five of its triples are overwritten by `register_phase52_time_enums` —
+>    and it is dead by call **order**, which nothing gates. W7-77 §2.1 and §7.3.
+>
+> Also treat every `native-builtins/src/lib.rs` line number in this record as
+> **stale** — W7-77 §3.2 measured the drift as a per-file constant and the
+> function names are the durable part.
+>
+> **And nobody has ever run this census.** Both entry points gate on
+> `layout_alias::enabled()`, i.e. on `CRATONVM_DBG_LAYOUT_ALIAS`, and that name
+> appears **nowhere** under `regression-suite/` or `ci/` — grepped 2026-08-12,
+> zero hits in either tree. §7.1 says the first real product of this instrument
+> will be a flagged run over a suite; that is still true, and no scheduled job
+> can produce it. §4's numbers are a source-level classification and must not be
+> quoted as a transcript.
+
 Status: the second instrument W7-59-layout-detector-coverage.md §6 specified and
 deliberately did not build now exists, is calibrated against the one defect of
 this species known to be real, and is gated by six tests in

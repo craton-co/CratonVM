@@ -138,7 +138,12 @@ behind. Rather than add an eighth:
   `net_poll_stream` as `poll_stream_readable` with `NET_POLLOUT`.
 * `net_phase_e.rs`'s single binding grew a direction parameter;
   `re1_socket_poll_readable` keeps its name and contract, so `available()` is
-  untouched.
+  untouched. **Superseded 2026-08-12: that binding is now GONE.** W2-2's collapse
+  landed — `re1_socket_poll_readable` / `re1_socket_poll_writable` are one-line
+  calls into `cratonvm_native_io::net`, so the crate is down one poll binding
+  rather than holding one that had to be kept in agreement by hand. The seven-way
+  count in the row below drops by one; `servlet.rs` and `xnio_conduits.rs` still
+  hold theirs.
 * `servlet.rs` used its own existing `selector_poll`/`PollReq` abstraction.
 * `async_socket.rs` and `net_channels.rs` call into the above.
 
@@ -301,6 +306,79 @@ written down rather than quietly counted.
 `probes/AsyncCloseProbe.java`, with its HotSpot oracle transcript at
 `probes/AsyncCloseProbe.expected.txt`.
 
+> **It has never run in any suite, and it cannot.** `regression-suite/run.sh`
+> compiles `"$HERE"/src/*.java` and runs a hand-maintained word list
+> (`CORE_CLASSES` / `JDKONLY_CLASSES`); nothing in it reads `probes/` at all. So
+> this instrument is in exactly the position `run.sh`'s own comment describes —
+> *"a `src/*.java` vector named in no list … looks like coverage and is not"* —
+> one step worse, because it is not even in `src/`. Everything the section below
+> says about it is true of a hand invocation; **none of it is scheduled**, and
+> the standing rule for this campaign is that an assertion outside a scheduled
+> fixture cannot close a record.
+>
+> Scheduling it is a two-part edit neither of which belongs to a
+> `native-io`/`native-builtins` lane: move the file to
+> `regression-suite/src/RAsyncClose.java` (the glob then compiles it) and add
+> that name to `CORE_CLASSES` — **core, not `JDKONLY_CLASSES`**, because this
+> family is a Compatible-mode defect that strict merely inherits, as the
+> Classification section above states. Two things to check when doing it: the
+> probe calls `System.exit`, which run.sh's `PASS <Class>` grep tolerates but
+> which must still emit the `PASS RAsyncClose (N checks)` banner the harness
+> guards look for; and its `-Dprobe.*` properties must have safe defaults,
+> because the suite passes no `-D` of its own.
+
+### Two of the thirteen shapes are now SCHEDULED — 2026-08-12
+
+The move-and-schedule above is still not done, and the coverage rule ("an
+assertion outside a scheduled fixture cannot close a record") therefore still
+holds against this record. What changed is that the two shapes with **no**
+scheduled assertion anywhere and a fix in this wave now have one, inside a
+fixture `run.sh` already names: `regression-suite/src/RJdkNet.java`, new section
+`asyncCloseWriteAndAccept()`, 8 checks (72 → **80**).
+
+* **write** — a writer parked in `Socket.getOutputStream().write(..)` behind a
+  peer that never reads, woken by `Socket.close()` on another thread. This is
+  row 5/6 of the fixed table (`net_write0` / `net_write_close_aware`, landed in
+  this wave) and it **fails on the pre-fix behaviour**: before it, the writer
+  stayed in `send` and the row's bounded `await` expires.
+* **accept** — an acceptor parked in `ServerSocket.accept()`, woken by
+  `ServerSocket.close()`. `net_accept_close_aware` has carried this since
+  2026-05-17 and nothing scheduled has ever asserted it; it is a ratchet, not a
+  new fix.
+
+Three things about the pair that are the same discipline the probe uses, and one
+that is new:
+
+* the surface is the **shipping** one — `real_net_sockets` is default-ON, so both
+  rows run real JDK bytecode down to `sun/nio/ch/SocketDispatcher.write0` and
+  `sun/nio/ch/Net.accept`, both `register_with_kind(.., NativeKind::Bridge)` in
+  `native-io`'s `net::register_sun_nio_ch_net` ←
+  `nio_native::register_t16_channel_overrides` ← `register_io_natives`, which
+  `vm_init` calls on **all three** boot arms. `Bridge` is not a kind `JdkOnly`
+  drops, so strict inherits the same bodies;
+* the park is **proved before the close** (`...WasBlocked`, from the latch count)
+  and reported as its own failure, so a row whose worker had already returned
+  cannot pass;
+* every wait is bounded by the file's own `T`, so an unfixed native yields a
+  **FAIL, not a suite timeout**;
+* and, new: the write row closes the **accepted** end in a `finally` *before* it
+  asserts. That releases the writer through the peer's reset even on a VM where
+  the close is invisible to it, so a red row cannot leave a thread parked in the
+  kernel at exit. `AsyncCloseProbe` solves the same problem with `System.exit`,
+  which a suite vector must not call.
+
+`SocketException` is the assertion on both VMs and it does not depend on which
+error the native picks: JDK 25's `NioSocketImpl.implWrite` catches every
+`IOException` from the dispatcher and rethrows `asSocketException(ioe)` ("throw
+SocketException to maintain compatibility"), and `endWrite`/`endAccept` throw
+`SocketException("Socket closed")` from their `finally` whenever the call did not
+complete and the impl is `>= ST_CLOSING` (read from `src.zip`, JDK 25.0.3.9). What
+the native must do is **return**; the type is the JDK's.
+
+**No TLS row was added to `RJdkNet` and one must not be**: the four TLS sites'
+Windows half is open, so a TLS row would be a scheduled RED on this host. The
+place for it is `AsyncCloseProbe`'s `tlsRead`/`tlsWrite`, which W7-61 added.
+
 W2-2 records a 2026-08-11 measurement taken with an instrument it calls
 `AsyncCloseProbe`. **That file was never in the repository** — not in `probes/`,
 not in `regression-suite/src/`. The measurement is real; the instrument is not
@@ -432,11 +510,308 @@ The single observation is the probe's `outcome` column, per row, per arm.
 | what | where | why not here |
 |---|---|---|
 | `DatagramChannel.receive` close-awareness | `native-builtins/src/phases_late/net_channels.rs` | The lock half is the census branch's edit (`fix/w2-stream-stack-blocked-reader-moduledesc-20260812`), not yet on dev. Re-doing it here would only produce a conflict. Once it lands, add the same `s2_wait_ready_close_aware` call this branch added to `DatagramChannel.read` twenty lines below it — the helper is already `pub(crate)` |
-| Windows pipe sink write | `native-io/src/pipe.rs` | Needs `CreateNamedPipe(FILE_FLAG_OVERLAPPED)` + a bounded `GetOverlappedResultEx`, i.e. a change to how the pipe is created. Not landable on inspection |
-| `s2_tls_read_direct`, `s2_tls_write` | `native-builtins/src/servlet.rs` | TLS record layer. A close-aware loop must not abandon a read mid-record, so the wakeup has to be expressed against the *underlying* socket while the record assembler keeps its state. Genuinely a different problem, and not one to solve without a build |
-| `rustls_stream_read`, `rustls_stream_write` | `native-builtins/src/t27_tls.rs` | as above. Both already have the correct lock discipline; it is only close-awareness they lack |
+| Windows pipe sink write | `native-io/src/pipe.rs` | Needs `CreateNamedPipe(FILE_FLAG_OVERLAPPED)` + a bounded `GetOverlappedResultEx`, i.e. a change to how the pipe is created. Not landable on inspection. **NARROWED 2026-08-12, still open — see "The Windows pipe sink write, narrowed" below** |
+| `s2_tls_read_direct`, `s2_tls_write` | `native-builtins/src/servlet.rs` | TLS record layer. A close-aware loop must not abandon a read mid-record, so the wakeup has to be expressed against the *underlying* socket while the record assembler keeps its state. Genuinely a different problem, and not one to solve without a build. **Designed 2026-08-12 — see "The four TLS sites" below; the design is written down and NOT applied.** Two halves of it DID land (W7-61: a `shutdown` on the registry-held duplicate, which is the whole wakeup on Unix, plus an after-the-call classifier); what is open is the **Windows** arm, and on the third pass the remaining design was found unsound as written — "Third pass" below, trap 5 |
+| `rustls_stream_read`, `rustls_stream_write` | `native-builtins/src/t27_tls.rs` | as above. Both already have the correct lock discipline; it is only close-awareness they lack. **Same design; the "no poll binding of its own" obstacle is GONE** — `cratonvm_native_io::net::poll_stream_readable` is `pub`. `rustls_stream_read`'s CLIENT arm is the **pilot** the third pass recommends: no `cfg` arms, one exact screen (`conn.wants_read()`), and its reading decides the other three. `rustls_stream_write` must get NO loop — W7-61 measured HotSpot NOT waking a parked TLS write |
 | multi-acceptor race in `s2_blocking_accept` | `native-builtins/src/servlet.rs` | With two threads accepting one listener, the loser of the race between the poll and the `accept()` parks again, not close-aware. Not closed by flipping the clone non-blocking: `try_clone` shares the blocking mode with the registry's listener on both platforms. Every accept parked before; at most one loser parks after |
-| the seven-way poll-binding consolidation | tree-wide | W7-47's correction stands and this lane did not take it on. No eighth binding was added, and three of the seven grew parameters instead |
+| the seven-way poll-binding consolidation | tree-wide | W7-47's correction stands and this lane did not take it on. No eighth binding was added, and three of the seven grew parameters instead. **Two of the seven became callable across the crate boundary on 2026-08-12** — `net::poll_stream_readable` and `net::poll_stream_writable` are now `pub`, which is the precondition W2-2's collapse was blocked on |
+
+---
+
+## The four TLS sites — the design, written down and NOT applied
+
+**Nothing in this section is applied. No file named here was edited.** All four
+sites are outside the lane that wrote it, and the whole point of writing it down
+is that the record already says *"do not fabricate a wakeup that does not wake
+anything"* — so the alternative to a design is a design someone else invents
+under time pressure.
+
+### The one structural fact that makes it tractable
+
+The reason this row reads as "genuinely a different problem" is the assembler:
+`rustls::StreamOwned<Connection, TcpStream>` and
+`native_tls::TlsStream<TcpStream>` both **own the socket inside them**, and both
+are behind a per-stream `Mutex` that the blocked thread holds for the whole
+syscall. So the parked thread cannot be interrupted, and no other thread can
+reach the socket through the stream — which is what "the wakeup has to be
+expressed against the underlying socket" means.
+
+**It is already expressed there.** Every registry entry carries a second,
+independent handle beside the assembler:
+
+| table | entry field |
+|---|---|
+| `servlet::s2_registry().tls_streams` | `TlsEntry.raw: Option<TcpStream>` — a `try_clone`d duplicate |
+| `t27_tls::sreg().client_streams` | `TlsClientStreamEntry.raw: Option<TcpStream>` |
+| `t27_tls::sreg().server_streams` | `TlsServerStreamEntry.raw: Option<TcpStream>` |
+
+`raw` is reachable under the **registry** lock alone — not the stream mutex —
+and `s2_tls_close` / `rustls_stream_close` already use it for their
+`shutdown(Both)`. That is exactly the handle a readiness probe needs, and it
+already exists. The design is therefore not "find a way to reach the socket";
+it is "probe it *before* taking the stream mutex".
+
+### The shape
+
+Per site, and it is the same shape all four times:
+
+1. Under the registry lock, clone the `Arc` (already done) **and** `try_clone`
+   the `raw` handle, or snapshot its raw fd. Release the lock (already done).
+2. Loop: re-ask the registry whether the id is still present; then poll the raw
+   handle for the direction this site wants, with a bounded slice; then, only
+   once ready, take the stream mutex and issue the one TLS op.
+3. `ErrorKind::Interrupted` once the id is gone, which each site's existing
+   `*_classify_after_block` already knows how to turn into the right Java type.
+
+`servlet.rs` needs no new primitive: `s2_wait_ready_close_aware(fd, want_write,
+&still_registered)` is already `pub(crate)` in that file, already used by
+`s2_blocking_accept` and the plain stream read/write, and already carries
+`S2_CLOSE_POLL_MS = 25`. `t27_tls.rs` has **no** poll binding at all and must
+borrow one rather than add an eighth — either `servlet::s2_poll_ready`
+(`pub(crate)`, same crate) or, now that it is `pub`,
+`cratonvm_native_io::net::poll_stream_readable`.
+
+### The four traps, in the order they will be hit
+
+1. **`read_eof_tolerant` swallows the carrier.** `t27_tls::rustls_stream_read`'s
+   *client* arm goes through
+   `http_url_connection::read_eof_tolerant`, which is a retry loop over
+   `ErrorKind::Interrupted`. `Interrupted` is this family's close carrier
+   everywhere else. Raise the close **outside** that call — i.e. from the
+   registry re-ask in step 2, before the read is issued — or the wakeup is
+   swallowed by the very function it is routed through. This one is not
+   theoretical: it compiles, it looks right, and it produces the pre-fix
+   behaviour.
+2. **Do not abandon a read mid-record.** The assembler keeps its state behind
+   its own mutex and the loop above never touches it until the socket is ready,
+   so this is satisfied by construction — but only because the probe is on
+   `raw` and not on the stream. A probe that took the stream mutex to reach
+   `get_ref()` would serialise against the parked thread and deadlock.
+3. **`raw` is an owned `TcpStream`, not an `Arc`.** `s2_tls_close` /
+   `rustls_stream_close` **remove** the entry, which drops that handle. A raw fd
+   integer snapshotted before the close is a use-after-close the instant the OS
+   recycles the number — the same defect `pipe.rs` had and needed
+   `in_flight`/`close_pending` to fix. Either `try_clone()` the handle so the
+   poller owns one (cheapest, and it is what the parked thread already does for
+   the assembler), or give these entries the same in-flight discipline. Do not
+   snapshot the integer.
+4. **A 30 s timeout is already masking the row.** Accepted server sockets and
+   client dials both get `set_read_timeout(Some(30s))`/`set_write_timeout`, so a
+   parked TLS read today unwedges after ~30 s with a **timeout error**, not a
+   close classification. Two consequences: a probe that waits less than 30 s
+   sees the defect and one that waits longer does not, and any deadline arm
+   added must be derived from that existing socket timeout rather than invented
+   — the `SO_RCVTIMEO` rule this record already states per regime.
+
+**A fifth trap was found on the third pass, it is not implied by any of the four
+above, and it is the one that makes the shape as written WRONG rather than
+merely unverified — see "Third pass" below before implementing step 2.**
+
+### Still NOT applied, 2026-08-12 — a second lane read the design and declined
+
+The lane that landed W2-2's poll collapse and W7-8 §6 owns all four files and had
+the budget question put to it explicitly. It declined, and the reasons are
+additive to the ones below rather than a restatement:
+
+* **Trap 1 is worse than "hit first"; it is hit *silently*.**
+  `http_url_connection::read_eof_tolerant` retries on `ErrorKind::Interrupted`,
+  which is this family's close carrier at every one of the other nineteen sites.
+  A wakeup routed through it does not fail loudly — it produces the pre-fix
+  behaviour, on a code path that now *looks* close-aware. The correct placement
+  (raise from the registry re-ask, before the read is issued) is stated in the
+  design and is not hard; what makes it a refusal is that **nothing in the tree
+  would catch getting it wrong.** `probes/AsyncCloseProbe.java` has no TLS row,
+  and it is itself unscheduled.
+* **Trap 3 is a use-after-close, and the cheap fix has a cost this lane could not
+  price.** `try_clone()`ing `raw` under the registry lock is right, and it is
+  what the parked thread already does for the assembler — but it duplicates a
+  descriptor per blocking operation on a path that Tomcat/WildFly drive at
+  request rate. Whether that is free or a descriptor leak under load is a
+  measurement, and the alternative (in-flight/close-pending discipline, as
+  `pipe.rs` needed) is a larger change to three registries.
+* **Trap 4 means the row is currently *masked*, not *hanging*.** The existing
+  30 s `set_read_timeout` unwedges a parked TLS read with a timeout error. That
+  is the wrong classification, but it is not a hang, so the cost of leaving this
+  open is bounded in a way the pre-fix `pipe.rs` and `SocketInputStream` rows
+  were not. Ordering the work by that difference is deliberate.
+
+One thing that did change in this lane's favour and is worth recording, because
+it removes an obstacle the design named: `t27_tls.rs` no longer has to choose
+between `servlet::s2_poll_ready` and adding a binding —
+`cratonvm_native_io::net::poll_stream_readable` and `poll_stream_writable` are
+`pub`, and `net_phase_e.rs` has just demonstrated the call across the crate
+boundary. The remaining work is the `raw` lifetime and the placement of the
+raise, not the primitive.
+
+### Why it was still not applied here
+
+Three of the four traps are invisible to a compiler, the fourth (`raw` lifetime)
+is a use-after-close, and the row's own instrument — `probes/AsyncCloseProbe.java`
+— has **no TLS row**. Landing a wakeup whose only evidence is that it compiles is
+the thing this record refused to do for the Windows pipe write, and the same
+refusal applies here. What is now different from "not one to solve without a
+build" is that the build has something specific to run: the design above, plus
+two new `AsyncCloseProbe` rows (`tlsRead`, `tlsWrite`) built the way the
+existing twelve are — prove the park first, bound every wait, `INCONCLUSIVE`
+rather than `PASS` for a row that returned early.
+
+### Third pass, 2026-08-12 — the shape above is UNSOUND AS WRITTEN
+
+A third lane owning all four files re-derived the design against the two TLS
+crates' own sources (`native-tls 0.2.18` and `rustls 0.23.42`, both present in
+this host's cargo registry and quoted below) and found a **fifth trap that none
+of the four implies**. It is worse than all of them, because the four are reasons
+the fix is hard to *verify* and this one is a reason the fix as written is
+*wrong*:
+
+> **Socket readiness is not stream readiness.** Step 2 — *"poll the raw handle
+> for the direction this site wants … then, only once ready, take the stream
+> mutex and issue the one TLS op"* — **parks a read that would have returned
+> immediately.**
+
+TLS decrypts a whole record at a time: one fragment carries up to 16 KiB of
+plaintext, and several fragments can arrive in a single segment. A caller that
+asks for fewer bytes than the assembler has already decrypted leaves the
+remainder buffered **inside the assembler**, and the next read must hand those
+bytes back with **no socket I/O at all**. rustls says so in its own source —
+`Stream::prepare_read` (`rustls-0.23.42/src/stream.rs`) touches the transport
+only `while self.conn.wants_read()`, and `wants_read`
+(`rustls-0.23.42/src/common_state.rs`) is
+
+```rust
+self.received_plaintext.is_empty()
+    && !self.has_received_close_notify
+    && (self.may_send_application_data || self.sendable_tls.is_empty())
+```
+
+so buffered plaintext means no `read_tls`, no `recv`, and an immediate return.
+Gate that on socket readability and the reader waits for an edge that will never
+arrive: the peer has already sent everything it intends to send until it gets a
+reply this reader is now never going to produce. That is a **deadlock introduced
+on the most ordinary HTTP-over-TLS shape**, not on an edge case, and
+`servlet.rs`'s 32 KiB readahead does not screen it — four maximal fragments in
+one segment leave more than 32 KiB behind.
+
+This is the same species as the refusal this record already made for the Windows
+pipe sink write, one step further along: there, answering `Some(Ok(false))` would
+have spun a loop that could never report readiness. Here, polling a socket for a
+byte the record layer does not need would park a reader that had its answer in
+hand. **The standing rule gains a second clause: do not fabricate a readiness
+question the layer above does not answer.**
+
+#### The screen exists on both stacks, and it is behind the wrong lock
+
+The gate is only sound if it is preceded by a question to the **assembler**, not
+to the socket. Both stacks can answer it:
+
+| site | screen | meaning |
+|---|---|---|
+| `t27_tls`'s client arm, `StreamOwned<ClientConnection, TcpStream>` | `conn.wants_read()` | `false` ⇒ this read will do no socket I/O |
+| `t27_tls`'s server arm / `servlet.rs`, `native_tls::TlsStream<TcpStream>` | `buffered_read_size()` (`native-tls-0.2.18/src/lib.rs`) | `> 0` ⇒ readable without touching the network |
+| `t27_tls`'s `LegacyDsa` arm, `openssl::ssl::SslStream` | openssl's own pending-bytes query, `#[cfg(unix)]` | **not writable from this host** — see below |
+
+The `wants_read()` direction is exact rather than approximate, which is why it is
+usable: when it is `false`, `prepare_read` does not loop at all and
+`reader().read(buf)` returns from the buffer; when it is `true`, `complete_io`
+runs and the call can park. So the correct order is **screen under the stream
+mutex → release it → poll `raw` on a bounded slice with the registry re-ask →
+retake the mutex → read**. Taking the mutex first is not a new hazard: every one
+of these four sites already takes it for the whole call, so a second reader
+already queues behind a parked one today.
+
+#### Trap 3 is retired, and the fix is cheaper than the design assumed
+
+`try_clone()`ing `raw` per blocking operation was the cost the second lane could
+not price. **It is not needed.** The nineteen fixed sites do not `try_clone`
+anything: they park holding an `Arc<TcpStream>` cloned out of a registry, and it
+is the `Arc` — not a duplicated descriptor — that stops the handle being freed
+under a parked thread. Give these three registries the same discipline:
+
+| table | today | should be |
+|---|---|---|
+| `servlet::TlsEntry.raw` | `Option<TcpStream>` | `Option<Arc<TcpStream>>` |
+| `t27_tls::TlsClientStreamEntry.raw` | `Option<TcpStream>` | `Option<Arc<TcpStream>>` |
+| `t27_tls::TlsServerStreamEntry.raw` | `Option<TcpStream>` | `Option<Arc<TcpStream>>` |
+
+`shutdown` takes `&self`, so both closes keep working through the `Arc`
+unchanged; `cratonvm_native_io::net::poll_stream_readable(&TcpStream, i32)` takes
+`&TcpStream`, which an `Arc` derefs to. A reader then clones an `Arc` (no
+syscall) instead of duplicating a descriptor (two syscalls and a handle) per
+read, and the use-after-close trap 3 names cannot occur because the handle
+outlives every holder. The remaining cost is **one `poll` on a read that was
+going to go to the socket anyway** — the same price
+`net::net_read_close_aware` already accepted in this family ("it costs one extra
+syscall on a read that would have blocked anyway").
+
+#### The residual that survives even the correct fix
+
+A maximal TLS record is ~16 KiB and a TCP segment is ~1.5 KiB, so
+`prepare_read`'s `while wants_read()` loop calls `complete_io` repeatedly and
+**parks inside it** between the segments of one record. The screened design makes
+a reader close-aware while the record layer is at rest — which is where the hang
+matters, an idle keep-alive connection waiting for the next request — and leaves
+it unwakeable mid-record. That is not a hole in the design; it is the same
+statement the design already makes about not abandoning a read mid-record, priced
+honestly. Anyone counting this row closed must count that residual with it.
+
+#### Why this lane did not land it either
+
+1. **The whole benefit is on Windows, and every arm of the evidence is
+   unavailable here.** On Unix the `raw` shutdown W7-61 landed already delivers
+   the wakeup. This adds the Windows arm — on a host with no build, against an
+   instrument (`probes/AsyncCloseProbe.java`) that is still not scheduled.
+2. **The blast radius is every TLS read in the VM.** These two functions carry
+   Tomcat, WildFly, the Spring TLS slices and H2-over-TLS. A screen that is
+   wrong in the `false` direction is a hang on every read, and the failure mode
+   is indistinguishable from the defect being fixed.
+3. **The `LegacyDsa` arm cannot be written from this host at all.** It is
+   `#[cfg(unix)]`, nothing here type-checks it, and its screen would be an API
+   guess — exactly the shape this record refused for the pipe write.
+4. **Trap 4 still bounds the cost of waiting.** The row is masked by a 30 s
+   socket timeout, not hanging, so the asymmetry is between a bounded wrong
+   classification and an unbounded hang.
+
+**The pilot a build lane should take first, because it needs none of the above.**
+`t27_tls::rustls_stream_read`'s **client arm only**: one struct (`raw` to
+`Option<Arc<TcpStream>>`, two construction sites), one screen (`conn.wants_read()`,
+proved exact above), no enum variants, and **no platform-specific code of any
+kind** — `StreamOwned<ClientConnection, TcpStream>` has no `cfg` arms. It is the
+one site where the entire mechanism is expressible in safe, portable, compilable
+Rust, and running `AsyncCloseProbe`'s `tlsRead` + `tlsReadIntegrity` rows against
+it decides the design for the other three. Do the pilot; do not do all four at
+once.
+
+## The Windows pipe sink write, narrowed — the row stays OPEN
+
+`native-io/src/pipe.rs` is in the lane that wrote this update, so this one was
+edited. **It is not fixed and the row above still says open.** What changed:
+
+`poll_pipe(raw, /* want_write */ true, …)` still answers `None` on Windows, for
+all the reasons already given, and `pipe_write_close_aware`'s `None` arm still
+routes to a plain blocking `WriteFile`. It used to hand that write **the entire
+remainder** in one call, so a close arriving during a large payload was
+unobservable for the whole payload: the generation check ran once and the thread
+was then gone for the duration. The `None` arm now slices at
+`PIPE_WRITE_SLICE_MAX` (4 KiB, the `CreatePipe` default buffer size, and the same
+constant the `Some(Ok(true))` arm already used), so `pipe_still_open` is re-asked
+between slices.
+
+Stated exactly, because this is the kind of change that gets miscounted as a
+close: the blind window is now **one slice** — as long as the reader takes to
+drain 4 KiB — instead of as long as it takes to drain everything. Against a
+reader that has stopped entirely, the first slice still parks forever. That is
+the residual, it is the same residual, and the named follow-up
+(`CreateNamedPipe(FILE_FLAG_OVERLAPPED)` + a bounded `GetOverlappedResultEx`) is
+unchanged. The argument for slicing is not new either: it is `net.rs`'s
+`NET_WRITE_SLICE_MAX`, *"a single unsliced `send` parks for an unbounded time and
+observes no close"*, applied to the one site in this family that had not taken
+it.
+
+One behavioural detail worth knowing before reading the diff: the `None` arm used
+to `return` after one write, so it could report a short count; it now loops to
+completion like the polled arm, and answers a partial count only when a write
+accepts nothing without reporting an error. Looping there rather than spinning
+matters because that arm has no poll to bound a retry.
 
 ---
 
@@ -477,3 +852,9 @@ None added. `probe.skipClose`, `probe.settleMs`, `probe.wakeMs` and
 
 No existing test was weakened. Three were added, in `native-io/src/pipe.rs`,
 covering the mechanism this lane invented rather than reused.
+
+Added 2026-08-12, and it is the first **scheduled** cover this family has ever
+had beyond the single read row: `regression-suite/src/RJdkNet.java`'s
+`asyncCloseWriteAndAccept()`, 8 checks, 72 → **80**. See "Two of the thirteen
+shapes are now SCHEDULED" above for what each row proves, why neither can hang,
+and why there is no TLS row.

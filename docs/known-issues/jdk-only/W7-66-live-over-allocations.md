@@ -12,6 +12,36 @@ is HotSpot, which is the oracle, not the subject.
 
 Branch `fix/layout-over-allocation-live-defects-20260812`.
 
+> **STATUS BANNER — 2026-08-12, later pass.** Two changes to what is open here,
+> and one census consequence this record did not state.
+>
+> 1. **§6's slot-5 `keys` clobber is REPAIRED**, by
+>    W7-72-ssc-socket-and-filechannel.md §1 — an identity-hash-keyed, GC-rooted,
+>    remapped, close-evicted side table, with the receiver pinned across both
+>    allocating calls. §11 item 4 is struck.
+> 2. **§4.3's narrowing moved a site into the OTHER census, and nobody noticed on
+>    the day.** `alloc_obj`'s four callers went from 12 to `SC_OBJECT_SLOTS` = 6,
+>    and `SocketChannel`/`ServerSocketChannel` declare **10** — so
+>    `native-io/src/socket_channel.rs:637`'s `Err(_) => alloc_object(ClassId::new(0),
+>    nfields)` arm, which W7-73-short-object-blind-spot.md §3.2 filed as
+>    *"12 against 10 — over"*, is now **short by 4**. It is not a defect
+>    (it is an `Err(_)` arm, latent by construction — W7-74-short-object-repairs.md
+>    §2.1), and the repair itself is sound: on the live `Ok` arm the request is
+>    `real.max(6)` = 10. It is a **census reclassification**, carried in
+>    W7-73 §3.4. The general lesson is worth more than the row: a repair that
+>    narrows a request toward the declared width can push its own fallback arm
+>    below it, and the `over` and `under` censuses are the same measurement read
+>    from two sides.
+> 3. §11 item 6's *"`phases_late/net_channels.rs` … still allocate `SocketChannel`
+>    at 4 and 5"* should be read alongside W7-88-net-channels-dead-registration.md,
+>    which found that file's losing `ServerSocketChannel.socket()` never registered
+>    at all in any of the four configurations.
+>
+> §1's correction — that `over` is not on its own a defect predicate — is the
+> most-cited thing in this record and is re-read and holds. So does §2's
+> superclass-fields-take-the-low-slots rule, which W7-72 §1.1 re-derived
+> independently.
+
 ## 1. The correction this record exists for
 
 **The `over` direction is not, on its own, a defect predicate — and W7-49's own
@@ -250,7 +280,8 @@ Real bytecode that reads `keys`: `AbstractSelectableChannel.register`,
 channel whose `socket()` has been called gets a `ServerSocket` where a
 `SelectionKey[]` is expected — and `NioEndpoint`-shaped code calls both.
 
-**Not repaired here**, and the reason is not scope alone: the sound remedy is
+~~**Not repaired here**~~ **— REPAIRED 2026-08-12 by W7-72-ssc-socket-and-filechannel.md
+§1**, and along exactly the line this paragraph predicted: the sound remedy is
 the identity-keyed side table this same file already runs in the *other*
 direction (`SsBackRef`, with `gc_scan_ss_back_ref_roots` and
 `ss_back_ref_update_after_gc`), so it means a new GC-rooted table plus its remap
@@ -258,6 +289,17 @@ hook, on a Tomcat-critical path, unbuildable here. The derivation is written out
 at the constant so the next lane starts from the answer. The probe already has
 the reads that expose it (`ssc.keyFor.afterSocket`, `ssc.socket.stable`), with
 the HotSpot values measured.
+
+What the repair added beyond the prediction: the table is keyed on the
+**GC-stable identity hash**, not the address (an address-keyed table recycles a
+dead row onto a fresh object at the same address), each bucket disambiguates by
+`ObjectRef` because identity hashes are not unique, both ends are GC-rooted and
+remapped through `vm/src/memory/native_roots.rs`, and the row is evicted on
+`close` so two roots per row do not pin a dead listener for the process
+lifetime. `SC_OBJECT_SLOTS` keeps its numeric value deliberately, so **no
+allocation width and no `CRATONVM_DBG_LAYOUT_ALIAS` row moves for these
+classes** — which is also why the reclassification in the status banner is a
+consequence of §4.3 and not of the `keys` repair.
 
 A second, smaller stale-comment finding, recorded and not acted on:
 `class_manager.rs` comments `java/nio/channels/{Server,}SocketChannel = 1
@@ -366,8 +408,12 @@ the `javap` oracle, so the width cannot drift back up unremarked.
    reasons a blind fix is worse, and a named remedy that is its own lane.
 3. **`AsynchronousServerSocketChannel`** — §5. The only true aliasing defect in
    the census, blocked behind a shared slot map and an excluded sibling.
-4. **The slot-5 `keys` clobber** — §6. Newly found, worse than anything the
-   census listed, and of a species no existing instrument can see.
+4. ~~**The slot-5 `keys` clobber** — §6. Newly found, worse than anything the
+   census listed, and of a species no existing instrument can see.~~ **CLOSED**
+   by W7-72-ssc-socket-and-filechannel.md §1. The species claim stands: no
+   allocation-width detector and no out-of-bounds discriminator could have found
+   it, and the descriptor coercion passes a reference into a reference slot
+   unchanged. It was found by hand and it is still the one confirmed instance.
 5. **The TreeSet null backing map** — §4.1. Repairing the width does not touch
    it; the probe measures the reds.
 6. **Whether any of these classes is allocated at BOTH widths in one run.**

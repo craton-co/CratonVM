@@ -384,12 +384,157 @@ public class RLoaderChurnDefine {
         System.out.println("CK RLoaderChurnDefine isolatingLoader=ok");
     }
 
+    /**
+     * A parent loader whose {@code loadClass(String,boolean)} raises something
+     * other than {@code ClassNotFoundException}.
+     *
+     * {@code loadClass(String,boolean)} is the canonical override point — it is
+     * the one Spring's {@code OverridingClassLoader}, Tomcat's
+     * {@code WebappClassLoaderBase} and every OSGi-shaped loader override — and
+     * it is also the form both VMs reach: HotSpot's
+     * {@code ClassLoader.loadClass} calls {@code parent.loadClass(name, false)}
+     * directly, and CratonVM's parent-delegation native calls the one-argument
+     * form, which routes into this override through
+     * {@code receiver_overrides_load_class_resolve}. Overriding the two-argument
+     * form therefore exercises the same body on both.
+     */
+    static final class HostileParent extends ClassLoader {
+        /** Raises an unchecked exception — NOT a {@code ClassNotFoundException}. */
+        static final String BOOM = "no.such.pkg.ParentBoom";
+        /** Raises the exception the JDK's own {@code catch} names. */
+        static final String ABSENT = "RLoaderChurnDefine$Echo";
+
+        int boomCalls;
+        int absentCalls;
+
+        HostileParent(ClassLoader parent) {
+            super(parent);
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (BOOM.equals(name)) {
+                boomCalls++;
+                throw new IllegalStateException("parent-boom");
+            }
+            if (ABSENT.equals(name)) {
+                absentCalls++;
+                throw new ClassNotFoundException(name);
+            }
+            return super.loadClass(name, resolve);
+        }
+    }
+
+    /**
+     * W7-26 R1 — a parent loader's FAILURE is not the same fact as its MISS.
+     *
+     * JDK 25 {@code ClassLoader.loadClass(String,boolean)} delegates inside
+     * exactly one {@code catch}:
+     *
+     * <pre>
+     *   try { c = parent.loadClass(name, false); }
+     *   catch (ClassNotFoundException e) { }
+     * </pre>
+     *
+     * — so a {@code ClassNotFoundException} from the parent means "keep going"
+     * and everything else leaves {@code loadClass}. CratonVM's real-mode
+     * parent-delegation native matched the first half of that on a bare
+     * {@code _ =>} arm which also caught the second: an
+     * {@code IllegalStateException}, a {@code LinkageError}, or an
+     * {@code ExceptionInInitializerError} out of the parent's own loader code
+     * was recorded as "the parent does not have this class", and the caller
+     * received a {@code ClassNotFoundException} naming the class instead. The
+     * exception's identity was gone and the real cause was unnameable from
+     * Java — a diagnosable failure turned into a wrong answer.
+     *
+     * ANTI-VACUITY, and both directions of it. Asserting only that something
+     * throws would pass on the old behaviour, which threw too — just the wrong
+     * class — so the FIRST check asserts the exception's TYPE and explicitly
+     * fails on {@code ClassNotFoundException}. The over-correction is the
+     * mirror image and is checked on the same call sites: a parent raising the
+     * exception the JDK's {@code catch} DOES name must still be absorbed, the
+     * child must still reach its own URL search afterwards, and a parent that
+     * simply answers must still be the answer. A fix that propagated everything
+     * would fail all three.
+     *
+     * The parent counts its own calls, so a run in which delegation never
+     * happened at all cannot read green.
+     */
+    static void aParentsFailureIsNotAMiss() {
+        String cp = System.getProperty("java.class.path");
+        check(cp != null && !cp.isEmpty(),
+                "java.class.path must be set, or this section tests nothing");
+        String[] entries = cp.split(java.io.File.pathSeparator);
+        java.net.URL[] urls = new java.net.URL[entries.length];
+        for (int i = 0; i < entries.length; i++) {
+            try {
+                urls[i] = new java.io.File(entries[i]).toURI().toURL();
+            } catch (java.net.MalformedURLException e) {
+                throw new AssertionError("RLoaderChurnDefine: bad classpath entry " + entries[i]);
+            }
+        }
+
+        // The shape a real application builds: a bare java.net.URLClassLoader
+        // over its own URLs, wrapping a custom parent. Spring Boot's
+        // PropertiesLauncher.wrapWithCustomClassLoader is this exact topology,
+        // and it is named in the delegation native's own comment as the reason
+        // that branch exists.
+        HostileParent parent = new HostileParent(RLoaderChurnDefine.class.getClassLoader());
+        java.net.URLClassLoader child = new java.net.URLClassLoader(urls, parent);
+
+        // (1) The repair. A non-ClassNotFoundException failure from the parent
+        //     must arrive at the caller as ITSELF.
+        try {
+            Class<?> wrong = child.loadClass(HostileParent.BOOM);
+            throw new AssertionError("RLoaderChurnDefine: loadClass(" + HostileParent.BOOM
+                    + ") must not answer at all; got " + wrong);
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: the parent raised IllegalStateException "
+                    + "and the child reported ClassNotFoundException. A parent's FAILURE was "
+                    + "recorded as a MISS, so the cause is unnameable from Java. (W7-26 R1)");
+        } catch (IllegalStateException expected) {
+            check("parent-boom".equals(expected.getMessage()),
+                    "the parent's own exception object must arrive, not a rebuilt one");
+        }
+        check(parent.boomCalls == 1,
+                "the parent must have been consulted exactly once, or this check measured nothing");
+
+        // (2) Over-correction guard, half one: the exception the JDK's catch
+        //     names is still absorbed, and the child still reaches its own URL
+        //     search afterwards and defines its own copy.
+        Class<?> own;
+        try {
+            own = child.loadClass(HostileParent.ABSENT);
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: over-correction -- the parent raised "
+                    + "ClassNotFoundException, which ClassLoader.loadClass absorbs, and the child "
+                    + "failed instead of searching its own URLs: " + e);
+        }
+        check(parent.absentCalls == 1, "the parent was consulted for the absorbed case too");
+        check(HostileParent.ABSENT.equals(own.getName()), "the child answered with the right name");
+        check(own.getClassLoader() == child,
+                "...from its OWN URL search, after absorbing the parent's ClassNotFoundException");
+
+        // (3) Over-correction guard, half two: a parent that simply answers is
+        //     still the answer, through the same child instance.
+        try {
+            Class<?> viaParent = child.loadClass("RLoaderChurnDefine$Sealed");
+            check(viaParent == Sealed.class,
+                    "a parent that resolves normally still supplies the class object");
+        } catch (ClassNotFoundException e) {
+            throw new AssertionError("RLoaderChurnDefine: over-correction -- ordinary parent-first "
+                    + "delegation through a custom parent broke: " + e);
+        }
+        System.out.println("CK RLoaderChurnDefine parentFailure=ok");
+    }
+
     public static void main(String[] args) {
         manyLoadersOneName();
         churnWithSeveralNames();
         aSurvivorKeepsItsClass();
         repeatLookupIsACacheHit();
         anIsolatingLoaderCannotSeeTheAppLoadersClass();
+        aParentsFailureIsNotAMiss();
         System.out.println("CK RLoaderChurnDefine checks=" + checks);
         System.out.println("PASS RLoaderChurnDefine (" + checks + " checks)");
     }

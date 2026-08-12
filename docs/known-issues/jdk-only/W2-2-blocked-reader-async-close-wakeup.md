@@ -16,32 +16,114 @@
   `re1_socket_poll_readable` contract is at `:4494`/`:4535`/`:4574` with the
   timeout-0 wrapper at `:4596`. **Surface 3 is still unverified against a
   binary** — that is the one open piece of the headline.
-* **Residual: STILL OPEN — the idiom collapse.** The
-  `## Out-of-file patch (not applied)` below is genuinely not applied.
-  `poll_stream_readable` is still `pub(crate)` at `native-io/src/net.rs:2421`,
-  and all three `re1_socket_poll_readable` arms are still duplicated. Re-grepped
-  2026-08-12. This is a duplicate-idiom cleanup, not a defect.
-* **Finding for another lane — a FOURTH surface of this species, PLAUSIBLE not
-  confirmed.** `native-builtins/src/phases_early.rs:18236-18320` registers
-  `java/net/SocketInputStream` `read()I` and `read([BII)I` against the same
-  `s2_registry()`. Both clone the `Arc` out, drop the lock, and park in a bare
-  `read_retry_eintr` with **no** close-awareness and no registry re-ask, mapping
-  `Ok(0)` to `-1` (clean EOF) where `Socket.close()` mandates an exception —
-  the exact pre-fix `re1_socket_read_stream` shape. It is only *plausible*
-  because the class name is the pre-JDK-13 spelling that JDK 25 does not
-  declare, and it is absent from `native-api/src/no_image_receiver.rs`, so it
-  is probably reachable only in a `synthetic-jdk` build. The fixed registrations
-  use the different name `java/net/Socket$SocketInputStream`
-  (`net_phase_e.rs:5254`). Settling it needs one run — see *Cannot adjudicate*
-  below.
-* **Cannot adjudicate without a run** — two things, both cheap:
+* **Residual: FULLY APPLIED 2026-08-12.** The export landed first
+  (`poll_stream_readable` **and** `poll_stream_writable` are `pub` in
+  `native-io/src/net.rs`; the pair was needed because `net_phase_e.rs`'s
+  duplicate had grown a *direction* parameter, and exporting only the readable
+  one would have forced that file to keep a copy for the write direction). The
+  collapse then landed in `net_phase_e.rs`: **all three `#[cfg]` arms of the
+  local `re1_socket_poll` binding are deleted**, and `re1_socket_poll_readable` /
+  `re1_socket_poll_writable` are now one-line calls into
+  `cratonvm_native_io::net`. `re1_socket_read_ready` survives unchanged as the
+  timeout-0 wrapper `available()` calls; the `None` arm, the `rc > 0` readiness
+  rule and the EINTR-is-not-ready rule all survive inside the `native-io`
+  primitive and are re-stated in the doc comment that replaced the binding.
+  **Idiom cleanup with no behaviour change intended** — the two implementations
+  were already required to agree, and this removes the requirement rather than
+  restating it. Two of the crate's poll bindings remain (`servlet.rs`'s
+  `selector_poll` over a `PollReq` slice, which is a genuinely different shape,
+  and `xnio_conduits.rs`'s).
+* **Finding for another lane — the FOURTH surface is SETTLED, 2026-08-12:
+  synthetic-jdk-only, and doubly gated.** It is not reachable in either shipping
+  mode, so it is not a defect either mode inherits. The chain, each hop read
+  rather than inferred:
+
+  | hop | where |
+  |---|---|
+  | `register(sis, "read", …)` ×3 | `native-builtins/src/phases_early.rs:18514`, `:18552`, `:18600` |
+  | enclosing registrar | `register_synthetic_socket_stubs`, `phases_early.rs:18029`, ambient kind `NativeKind::Bridge` |
+  | its only non-test caller | `register_phase53_socket_stubs`, `phases_early.rs:18007`, which **early-returns** at `:18013` on `crate::vmflags().io.real_net_sockets` |
+  | → | `register_phase53_natives` (`phases_early.rs:14312`) → `native-builtins/src/lib.rs:23940` |
+  | → | `register_synthetic_overrides` (`lib.rs:21480`, `#[cfg(feature = "synthetic-jdk")]`) → `register_builtins` → `vm/src/vm/vm_init.rs:1839`, inside `if config.use_synthetic_jdk` |
+
+  `io.real_net_sockets` defaults to **true** (`types/src/flags.rs:1219`), so even
+  a `--synthetic-jdk` run skips this registrar unless
+  `CRATONVM_SYNTHETIC_NET_SOCKETS` is set. In a default build the symbol is not
+  compiled at all — `vm/src/native/builtins.rs:24,29` supply
+  `#[cfg(not(feature = "synthetic-jdk"))]` no-op shims for both roots.
+
+  **Two corrections to the row this replaces.** The line band was wrong:
+  `18236-18320` is the `java/net/Socket` accessor block, and the
+  `SocketInputStream` reads are at `18512-18682` — the standing "anchor on the
+  marker, not the number" rule, earning itself again. And there is **no
+  last-write-wins contest**: `java/net/SocketInputStream` has exactly these
+  three registrations tree-wide, while the fixed surface uses the different
+  class name `java/net/Socket$SocketInputStream` (`net_phase_e.rs:5383-5399`,
+  `register_re1_socket`, which carries the *same* `real_net_sockets` early
+  return). Distinct names, so neither shadows the other — and the trap worth
+  writing down is the inverse of the usual one: **editing `phases_early.rs`
+  cannot affect the real-JDK surface at all.**
+
+  Neither name appears in `native-api/src/no_image_receiver.rs`, and neither is
+  in the `CRATONVM_REAL_NET_SOCKETS` drop filter in
+  `native-api/src/registry.rs` (which lists `java/net/Socket`,
+  `java/net/ServerSocket`, `javax/net/SocketFactory` and a `SyntheticStub`-only
+  `javax/net/ssl/SSLSocketFactory`). They are excluded upstream by the two
+  registrar-level early returns, not by the registry.
+
+  What was left was a **decision, not an investigation**: this surface had the
+  pre-fix shape and is dead in both shipping modes, so it could be fixed to match
+  `re1_read_close_aware` or deleted, and either was defensible. No run was needed
+  to choose.
+
+  **DECIDED AND APPLIED 2026-08-12: fixed, not deleted.** All three
+  `java/net/SocketInputStream` reads now call
+  `net_phase_e::re1_read_close_aware` (made `pub(crate)` for this) and map its
+  `ErrorKind::Interrupted` close carrier through
+  `net_phase_e::re1_socket_exception` to `SocketException("Socket closed")`. The
+  local `read_retry_eintr` went with its last caller.
+
+  Three things decided the shape, each of them a fact rather than a preference:
+
+  1. **The mechanism transfers with no adaptation.** Both surfaces key the SAME
+     `s2_registry().streams` map with the same `sid`, so the registry re-ask that
+     ends the park is the identical question. That is why this is a call and not
+     a fifth copy of the loop.
+  2. **Deleting would trade an unwakeable read for an `UnsatisfiedLinkError`.**
+     These are the only registrations of `java/net/SocketInputStream` in the
+     tree and its methods have no bytecode to fall back to. Removing a surface
+     in a configuration this lane cannot run is not a repair, and "it is dead in
+     both shipping modes" is an argument for the change being cheap, not for it
+     being a deletion.
+  3. **The deadline had to be re-derived, or the fix would have introduced a new
+     hang.** The close-aware loop does not issue the `read` until the socket is
+     ready, so `SO_RCVTIMEO` can never fire — W7-53's rule stated per regime.
+     Passing `None` would have turned every `setSoTimeout` reader into an
+     unbounded park. `sis_read_deadline` reads the timeout back off the socket
+     with `TcpStream::read_timeout()`; `None` there means the socket genuinely
+     has none, and inventing one would be the "`SocketTimeoutException` on a
+     socket with no timeout set" regression this record names as its own
+     falsifier.
+
+  One behavioural change beyond close-awareness, and it is a fix in its own
+  right: the old `Interrupted` arms answered `0`, which
+  `InputStream.read()` / `read(byte[], int, int)` may never return for a non-zero
+  length. That `0` is now the `SocketException`.
+
+  **Unverified**, like everything else on this surface: nothing was built or run,
+  and the configuration that reaches it (`--synthetic-jdk` plus
+  `CRATONVM_SYNTHETIC_NET_SOCKETS`) has no scheduled fixture.
+* **Cannot adjudicate without a run** — one thing, down from two:
   1. Surface 3's fix: the `AsyncCloseProbe` across three arms (`java`,
      `cratonvm.exe`, `CRATONVM_REAL=-net-sockets cratonvm.exe`), plus
      `cargo test -p cratonvm-native-io --lib net::tests socket_channel::tests`
      and `vm/tests/socket_input_stream_timeout.rs`.
-  2. The fourth surface: `cratonvm --dump-native-registry` to name the surviving
-     owner of `java/net/SocketInputStream.read`, plus `AsyncCloseProbe` on a
-     `synthetic-jdk` binary.
+  2. ~~The fourth surface~~ — **settled from source 2026-08-12, no run needed.**
+     The `--dump-native-registry` this asked for would have answered a question
+     the registrar chain already answers: in a default build the registration
+     does not exist, and in a feature build it is skipped unless
+     `CRATONVM_SYNTHETIC_NET_SOCKETS` is set. Kept struck rather than deleted
+     because "one run settles it" was the reason nobody took it for four days.
 
 Lane W2-2 of the jdk-wave2 pool.
 
@@ -422,26 +504,59 @@ above was measured on the unmodified binary for the same reason.
 so it has no reader that could park. Its `socketAccept` already carries the
 close-aware poll loop.
 
-### Out-of-file patch (not applied)
+### Out-of-file patch — the export HALF IS APPLIED (2026-08-12); the deletion is not
 
 **Not required to compile** — the fix above is self-contained in
 `net_phase_e.rs`. This is the consolidation that would leave one poll primitive
 in the tree instead of two, and it touches a file this lane does not own.
 
-`native-io/src/net.rs`, line 2421:
+**APPLIED.** `native-io/src/net.rs`:
 
 ```rust
 -pub(crate) fn poll_stream_readable(
 +pub fn poll_stream_readable(
+-pub(crate) fn poll_stream_writable(
++pub fn poll_stream_writable(
 ```
 
-With that, `net_phase_e.rs` can delete all three `re1_socket_poll_readable` arms
-and call `cratonvm_native_io::net::poll_stream_readable` directly —
-`native-builtins` already depends on the crate and already calls
-`cratonvm_native_io::net::take_stream_for_tls`, so no new dependency edge is
-created. Worth doing only together with the same collapse in `servlet.rs` and
+Both, not just the first. `poll_stream_writable` did not exist when this patch
+was written; `net_phase_e.rs`'s duplicate has since grown a **direction**
+parameter, so the collapse needs the pair. Exporting the readable one alone
+would have left that file no choice but to keep its own copy for the write
+direction — one site of a two-direction idiom converted, which is the shape this
+paragraph already warned about.
+
+**APPLIED 2026-08-12 — the half that lives in `net_phase_e.rs`.** The three
+`#[cfg]` arms are gone and the two wrappers delegate; the three "things to keep
+while deleting" below were all kept, and the doc comment that replaced the
+binding re-states each of them so the next reader does not have to find this
+record to know why. Original instruction, unedited: delete all three `#[cfg]`
+arms of `re1_socket_poll_readable` and call
+`cratonvm_native_io::net::poll_stream_readable` /
+`::poll_stream_writable` directly. `native-builtins` already depends on the
+crate and already calls `cratonvm_native_io::net::take_stream_for_tls`
+(`net_phase_e.rs:600`), so no new dependency edge is created.
+
+Three things to keep while deleting, each of which is a real difference and not
+noise:
+
+* `re1_socket_read_ready` is a **timeout-0 wrapper** over the primitive and is
+  what `available()` calls. Keep the wrapper; only its body changes.
+* The three-state contract must survive verbatim: `Some(Ok(true))` ready,
+  `Some(Ok(false))` timed out, `None` **no primitive on this target — fall back
+  to one plain blocking read rather than spin on a stub**. The `None` arm is the
+  one a "simplification" deletes and it is the one that prevents a livelock.
+* `net_poll_raw` answers `Ok(count > 0)`, i.e. `POLLERR`/`POLLHUP`/`POLLNVAL`
+  count as READY. That is deliberate and matches what
+  `re1_socket_poll_readable` was changed to do in this record's own fix; do not
+  "restore" a `revents & POLLIN` mask test on either side.
+
+Worth doing only together with the same collapse in `servlet.rs` and
 `xnio_conduits.rs`, which hold the crate's other two `WSAPoll` bindings;
-converting one site of a four-site idiom is how these grow back.
+converting one site of a four-site idiom is how these grow back. Note
+`servlet.rs`'s binding is not a bare duplicate — it is `selector_poll` over a
+`PollReq` **slice**, which the selector needs and the two-argument primitive
+cannot express, so that one is a genuine third shape rather than a fourth copy.
 
 ## How to prove the wakeup lands
 

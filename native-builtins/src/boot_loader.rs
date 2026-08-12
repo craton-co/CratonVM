@@ -23,6 +23,31 @@
 //! `BootLoader.INSTANCE` (e.g. `URLClassPath.<clinit>`,
 //! `ClassLoader.getResources`) then NPEs, which breaks every
 //! `ServiceLoader` user (SLF4J, JDBC autodetection, etc).
+//!
+//! # This is NOT the only file that registers `BootLoader` natives
+//!
+//! Three more live in `lib.rs`, and one of them carries a constraint that is
+//! easy to break from here — retagging "the `BootLoader` natives" is exactly
+//! the shape of change that would do it:
+//!
+//! * `loadLibrary(Ljava/lang/String;)V` — a deliberate `Ok(None)` no-op, in
+//!   `register_essential_natives_with_shims`. Its `NativeKind` is **AMBIENT**
+//!   (a bare `register`, taking the enclosing `set_category(Bridge)`) and it
+//!   **must stay `Bridge`**: `NativeKind::allowed_in` drops `SyntheticStub`
+//!   and only `SyntheticStub` under `JdkOnly`, so a `SyntheticStub` there
+//!   deletes the no-op in strict mode, runs real `NativeLibraries` bytecode in
+//!   its place, and restores the JDK native-library lock the short-circuit
+//!   exists to avoid during Linux boot-class `<clinit>`. Measured, one row:
+//!   `scripts/baselines/jdk-only-kind-map-25-linux.tsv` — `bridge`,
+//!   `kind_stated=0`. Records: W6-6-nativelibraries-load-fabricated-success.md
+//!   and W5-1-loadlibrary-allowlist-too-wide.md in docs/known-issues/jdk-only.
+//! * `setBootLoaderUnnamedModule0` is registered **twice** — here and in
+//!   `lib.rs` — and `register()` is last-write-wins, so the two bodies must
+//!   stay interchangeable. Both are no-ops today, and both state `Bridge`.
+//! * `findResourceAsStream` (`lib.rs`, delegating to `classloader`).
+//!
+//! The five registrations in this file all state their kind explicitly AND sit
+//! inside a `set_category(Bridge)` scope, so nothing here is ambient.
 
 use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
