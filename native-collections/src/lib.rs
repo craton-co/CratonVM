@@ -59040,45 +59040,98 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // `values_equal` — call the PRODUCTION function, not a copy of its `match`.
+    //
+    // These four tests used to build a `Value` literal and then assert a
+    // `matches!` pattern against that same literal two lines later, e.g.
+    // `matches!((&Value::Int(42), &Value::Int(42)), (Value::Int(x), Value::Int(y)) if x == y)`.
+    // That is a tautology over constants: `values_equal` was never on the call
+    // path, so rewriting its body to `return true` — or deleting it outright —
+    // left all four green. None of these cases needs any heap state, so a bare
+    // `MockCtx` (no classes, no objects) is enough to reach the real function:
+    // the wrapper-class guard at the top of `values_equal` only fires for
+    // `Object(Some(_))` on both sides, and `normalize_for_compare` passes raw
+    // primitives and `Object(None)` through without touching the context.
+    // -----------------------------------------------------------------------
+
     #[test]
     fn values_equal_null_null() {
-        // Two null objects should be equal (tested via the public helper)
-        let a = Value::Object(None);
-        let b = Value::Object(None);
-        // We cannot call values_equal without a NativeContext, but we can
-        // check the pattern match logic directly.
-        assert!(matches!(
-            (&a, &b),
-            (Value::Object(None), Value::Object(None))
-        ));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // Java `null.equals`-free contract: `List.of(a).contains(null)` finds a
+        // stored null, and a null map value matches a null probe.
+        assert!(
+            values_equal(&ctx, &Value::Object(None), &Value::Object(None)),
+            "two null references must compare equal"
+        );
+        // A null must NOT match anything else, or `contains(null)` reports true
+        // for a list holding only real elements.
+        assert!(
+            !values_equal(&ctx, &Value::Object(None), &Value::Int(0)),
+            "null must not equal Int(0)"
+        );
+        assert!(
+            !values_equal(&ctx, &Value::Int(0), &Value::Object(None)),
+            "Int(0) must not equal null (symmetry)"
+        );
     }
 
     #[test]
     fn values_equal_ints() {
-        let a = Value::Int(42);
-        let b = Value::Int(42);
-        let c = Value::Int(99);
-        // Direct pattern checks matching values_equal logic
-        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&a, &c), (Value::Int(x), Value::Int(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(&ctx, &Value::Int(42), &Value::Int(42)));
+        assert!(!values_equal(&ctx, &Value::Int(42), &Value::Int(99)));
+        // Boundaries: a truncating or unsigned comparison would collapse these.
+        assert!(values_equal(&ctx, &Value::Int(i32::MIN), &Value::Int(i32::MIN)));
+        assert!(!values_equal(&ctx, &Value::Int(i32::MIN), &Value::Int(i32::MAX)));
+        assert!(!values_equal(&ctx, &Value::Int(0), &Value::Int(-1)));
     }
 
     #[test]
     fn values_equal_long() {
-        let a = Value::Long(123456789);
-        let b = Value::Long(123456789);
-        let c = Value::Long(0);
-        assert!(matches!((&a, &b), (Value::Long(x), Value::Long(y)) if x == y));
-        assert!(!matches!((&a, &c), (Value::Long(x), Value::Long(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(
+            &ctx,
+            &Value::Long(123_456_789),
+            &Value::Long(123_456_789)
+        ));
+        assert!(!values_equal(&ctx, &Value::Long(123_456_789), &Value::Long(0)));
+        // A 32-bit-narrowing comparison would call these two equal.
+        assert!(!values_equal(
+            &ctx,
+            &Value::Long(1),
+            &Value::Long((1_i64 << 32) | 1)
+        ));
+        assert!(values_equal(&ctx, &Value::Long(i64::MIN), &Value::Long(i64::MIN)));
+        assert!(!values_equal(&ctx, &Value::Long(i64::MIN), &Value::Long(i64::MAX)));
     }
 
     #[test]
     fn values_equal_mixed_types() {
-        let int_val = Value::Int(42);
-        let long_val = Value::Long(42);
-        // Different types should not match
-        assert!(!matches!((&int_val, &long_val), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&int_val, &long_val), (Value::Long(x), Value::Long(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // The OLD body asserted that an Int and a Long "should not match".
+        // That is not what `values_equal` promises and not what it does: a RAW
+        // `Value::Int`/`Value::Long` is a VM-level representation choice with no
+        // Java wrapper class behind it, so the cross-type numeric arms are
+        // deliberately in force (see the comment on the wrapper-class guard).
+        // `values_equal_rejects_cross_wrapper_boxes` covers the BOXED case,
+        // which is the one that must answer false.
+        assert!(
+            values_equal(&ctx, &Value::Int(42), &Value::Long(42)),
+            "raw Int(42) and raw Long(42) are the same VM value"
+        );
+        assert!(
+            values_equal(&ctx, &Value::Long(42), &Value::Int(42)),
+            "cross-type numeric comparison is symmetric"
+        );
+        // Sign extension, not zero extension: Int(-1) is Long(-1), not
+        // Long(0xFFFF_FFFF).
+        assert!(values_equal(&ctx, &Value::Int(-1), &Value::Long(-1)));
+        assert!(!values_equal(&ctx, &Value::Int(-1), &Value::Long(0xFFFF_FFFF)));
+        // Different values of different types stay unequal.
+        assert!(!values_equal(&ctx, &Value::Int(42), &Value::Long(43)));
+        // A numeric value never equals a reference.
+        assert!(!values_equal(&ctx, &Value::Int(0), &Value::Object(None)));
     }
 
     #[test]
@@ -59633,41 +59686,103 @@ mod tests {
     // values_equal edge cases
     // -----------------------------------------------------------------------
 
+    // Same species as the four repaired above: each of these used to assert a
+    // `matches!` pattern against a `Value` literal built in the line before it,
+    // so `values_equal` was never called. They now go through the production
+    // function; the cases below are the ones the four above do NOT cover.
+
     #[test]
     fn values_equal_int_boundaries() {
-        let min = Value::Int(i32::MIN);
-        let max = Value::Int(i32::MAX);
-        let min2 = Value::Int(i32::MIN);
-        assert!(matches!((&min, &min2), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!((&min, &max), (Value::Int(x), Value::Int(y)) if x == y));
-    }
-
-    #[test]
-    fn values_equal_long_boundaries() {
-        let min = Value::Long(i64::MIN);
-        let max = Value::Long(i64::MAX);
-        let min2 = Value::Long(i64::MIN);
-        assert!(matches!((&min, &min2), (Value::Long(x), Value::Long(y)) if x == y));
-        assert!(!matches!((&min, &max), (Value::Long(x), Value::Long(y)) if x == y));
-    }
-
-    #[test]
-    fn values_equal_null_vs_some() {
-        let null = Value::Object(None);
-        let int = Value::Int(0);
-        // Null and Int should never match in the values_equal logic
-        assert!(!matches!((&null, &int), (Value::Int(x), Value::Int(y)) if x == y));
-        assert!(!matches!(
-            (&null, &int),
-            (Value::Object(None), Value::Object(None))
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // i32::MIN is the value `-x == x` fixed point; a comparison written as
+        // `a.abs() == b.abs()` or via a widening-to-u32 cast would confuse the
+        // two extremes.
+        assert!(values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Int(i32::MIN)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Int(i32::MAX)
+        ));
+        // i32::MIN widened to i64 is NOT 0x8000_0000.
+        assert!(values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Long(i32::MIN as i64)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Int(i32::MIN),
+            &Value::Long(0x8000_0000)
         ));
     }
 
     #[test]
+    fn values_equal_long_boundaries() {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(
+            &ctx,
+            &Value::Long(i64::MIN),
+            &Value::Long(i64::MIN)
+        ));
+        assert!(!values_equal(
+            &ctx,
+            &Value::Long(i64::MIN),
+            &Value::Long(i64::MAX)
+        ));
+        // A Long outside int range never equals an Int, however it is narrowed:
+        // `i64::MAX as i32` is -1, so an `as i32` comparison would say true.
+        assert!(!values_equal(&ctx, &Value::Long(i64::MAX), &Value::Int(-1)));
+        assert!(!values_equal(&ctx, &Value::Long(i64::MIN), &Value::Int(0)));
+    }
+
+    #[test]
+    fn values_equal_null_vs_some() {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        // A null reference matches no primitive, in either order — otherwise
+        // `list.contains(null)` answers true for a list of boxed zeroes.
+        for other in [
+            Value::Int(0),
+            Value::Long(0),
+            Value::Float(0.0),
+            Value::Double(0.0),
+        ] {
+            assert!(
+                !values_equal(&ctx, &Value::Object(None), &other),
+                "null must not equal {other:?}"
+            );
+            assert!(
+                !values_equal(&ctx, &other, &Value::Object(None)),
+                "{other:?} must not equal null (symmetry)"
+            );
+        }
+    }
+
+    #[test]
     fn values_equal_zero_int() {
-        let a = Value::Int(0);
-        let b = Value::Int(0);
-        assert!(matches!((&a, &b), (Value::Int(x), Value::Int(y)) if x == y));
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        assert!(values_equal(&ctx, &Value::Int(0), &Value::Int(0)));
+        // Java `Float.equals`/`Double.equals` use bit patterns: +0.0 and -0.0
+        // are DISTINCT, and NaN equals itself. A plain `==` inverts both.
+        assert!(!values_equal(
+            &ctx,
+            &Value::Double(0.0),
+            &Value::Double(-0.0)
+        ));
+        assert!(!values_equal(&ctx, &Value::Float(0.0), &Value::Float(-0.0)));
+        assert!(values_equal(
+            &ctx,
+            &Value::Double(f64::NAN),
+            &Value::Double(f64::NAN)
+        ));
+        assert!(values_equal(
+            &ctx,
+            &Value::Float(f32::NAN),
+            &Value::Float(f32::NAN)
+        ));
     }
 
     // -----------------------------------------------------------------------

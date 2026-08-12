@@ -3254,13 +3254,41 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
 /// `s2_typed_buffer_view_fns!`/`s2_view_buf_fn!` stash there (see
 /// `s2_bb_arr`'s `BB_SEGMENT_SLOT` fallback), so every value read through a
 /// typed-buffer view came back zero regardless of what was written.
+///
+/// **This predicate is NARROWER than "the indexed `BB_*` convention applies",
+/// and callers must not read it as the wider claim.** A `--synthetic-jdk`
+/// `java.nio.ByteBuffer` is 10 fields wide (`class_manager::synthetic_stub_fields`
+/// gives `java/nio/ByteBuffer` `instance_fields(6)` over a `java/nio/Buffer`
+/// with `instance_fields(4)`), so it fails the `== 6` screen while its slots
+/// 0..5 still mean array/pos/limit/cap/mark/order. Reading `false` here as
+/// "real JDK layout, so a name-keyed write is safe" is exactly the 2026-08-12
+/// defect in [`s2_bb_set_order`]. Use [`s2_buf_stub_layout`] for the wider
+/// question; the count screen is kept because several call sites below key an
+/// aliasing-vs-copying decision on it, and widening it there would be a
+/// behaviour change unrelated to byte order.
 #[inline]
 fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     if ctx.object_num_fields(buf) != 6 {
         return false;
     }
+    !s2_is_typed_buffer_view(ctx, buf)
+}
+
+/// The five abstract typed-buffer classes `s2_typed_buffer_view_fns!` /
+/// `s2_view_buf_fn!` stamp on a view built by `ByteBuffer.as<T>Buffer()`.
+///
+/// These are the ONE family whose byte order lives in the indexed `BB_ARRAY`
+/// slot: the view's backing array is stashed at [`BB_SEGMENT_SLOT`] (the only
+/// Object-typed field `java.nio.Buffer` declares), which leaves slot 0 — real
+/// `Buffer.mark`, an `int` — genuinely free for an order flag. Written down
+/// once, here, so the reader (`s2_bb_order`), the writer (`s2_bb_set_order`)
+/// and the layout screen (`s2_bb_synthetic_layout`) cannot drift apart on
+/// which classes they mean; they used to carry three copies of this list
+/// between them, and the discriminator each copy keyed on was different.
+#[inline]
+fn s2_is_typed_buffer_view(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(buf);
-    !matches!(
+    matches!(
         ctx.class_name_arc_of_id(cid).as_deref(),
         Some(
             "java/nio/IntBuffer"
@@ -3270,6 +3298,49 @@ fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
                 | "java/nio/DoubleBuffer"
         )
     )
+}
+
+/// True when `buf`'s class carries **no real `java.nio.Buffer` field
+/// metadata** — i.e. the receiver is a fabricated synthetic-JDK stub (fields
+/// `_f0.._fN`, all `Ljava/lang/Object;`) or a bare synthetic carrier, and its
+/// slots therefore mean what the indexed `BB_*` constants say rather than what
+/// a real JDK layout says.
+///
+/// **This is not the same question as [`s2_bb_synthetic_layout`], and that is
+/// the whole point.** That predicate screens on `object_num_fields == 6`, and
+/// a `--synthetic-jdk` `java.nio.ByteBuffer` is **10 fields wide**: the
+/// fabricated `java/nio/ByteBuffer` stub declares `_f0.._f5` and its
+/// fabricated `java/nio/Buffer` superclass declares `_f0.._f3`. Measured, not
+/// inferred — `Class.forName("java.nio.ByteBuffer").getDeclaredFields()` under
+/// `cratonvm --synthetic-jdk` prints exactly those ten, and the object's slots
+/// 0..5 are the subclass's, so `native-io`'s `alloc_byte_buffer` parks the
+/// backing array in slot 0 and the indexed `BB_*` convention holds unchanged.
+/// The count screen reads that object as REAL-layout, which is how an `int`
+/// order flag came to be written over the backing array (see
+/// [`s2_bb_set_order`]).
+///
+/// The witness is CLASS-SIDE (`resolve_field_index_by_class_id`), the same
+/// idiom `classloader::cl_has_synthetic_layout` uses, and deliberately not a
+/// value-side `get_field_by_name(..) == Object(None)` probe: an absent name's
+/// by-name READ is `Int(0)` under `MockNativeContext`, so a value-side witness
+/// would answer "real layout" for every bare synthetic carrier under test and
+/// the predicate would be untestable in the direction that matters.
+///
+/// `position` is the witness field because `java.nio.Buffer` declares it, so
+/// every real buffer class in the hierarchy inherits it — `ByteBuffer`'s own
+/// `bigEndian` would answer "synthetic" for a real `java.nio.CharBuffer`,
+/// which is a real layout with no `bigEndian` of its own.
+///
+/// The width guard is not belt-and-braces: `native-io`'s `alloc_byte_buffer`
+/// falls back to `alloc_object(ClassId(0), BB_NUM_FIELDS /* = 5 */)` when the
+/// class will not resolve at all, and slot [`BB_ORDER`] is past the end of
+/// that object.
+#[inline]
+fn s2_buf_stub_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    ctx.object_num_fields(buf) > BB_ORDER
+        && ctx
+            .resolve_field_index_by_class_id(ctx.class_id_of_object(buf), "position")
+            .is_none()
 }
 
 #[inline]
@@ -3316,20 +3387,37 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
                 1
             }
         }
-        // Unresolvable / non-Int on this non-synthetic buffer object: for a
-        // typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/
-        // DoubleBuffer — no `bigEndian` field to resolve, unlike ByteBuffer)
-        // the order flag is instead stashed by `s2_bb_set_order` below in
-        // the real `mark: int` slot (index 0 — genuinely free for these
-        // views once the array moved to `BB_SEGMENT_SLOT`; `Int`-into-`int`
-        // is not subject to the descriptor-coercion trap that broke slot 0
-        // as Object storage). Any other non-Int value there (a stray -1
-        // default, or a genuine "no order set yet") falls back to the JDK
-        // default BIG_ENDIAN.
-        _ => match ctx.get_field(buf, BB_ARRAY) {
-            Value::Int(1) => 1,
-            _ => 0,
-        },
+        // Unresolvable / non-Int on this non-synthetic buffer object. Three
+        // distinct shapes land here and they do NOT share a storage slot —
+        // see `s2_bb_set_order`, which must stay the exact mirror of this.
+        _ => {
+            if s2_is_typed_buffer_view(ctx, buf) {
+                // Typed-buffer view: the order flag is stashed in the real
+                // `mark: int` slot (index 0 — genuinely free for these views
+                // once the array moved to `BB_SEGMENT_SLOT`; `Int`-into-`int`
+                // is not subject to the descriptor-coercion trap that broke
+                // slot 0 as Object storage). Any other value there (a stray
+                // -1 default, or a genuine "no order set yet") falls back to
+                // the JDK default BIG_ENDIAN.
+                match ctx.get_field(buf, BB_ARRAY) {
+                    Value::Int(1) => 1,
+                    _ => 0,
+                }
+            } else if s2_buf_stub_layout(ctx, buf) {
+                // Synthetic-JDK stub ByteBuffer/HeapByteBuffer/CharBuffer:
+                // wider than 6 slots (so `s2_bb_synthetic_layout` above said
+                // "real"), no `bigEndian` field to resolve, and slot 0 is the
+                // BACKING ARRAY. The order goes where the name says it goes.
+                ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
+            } else {
+                // A real JDK layout with neither a `bigEndian` field nor a
+                // `ByteBufferAs…{B,L}` class name — e.g. a real
+                // `java.nio.CharBuffer`. Reading slot 0 here would decode
+                // whatever `Buffer.mark` happens to hold as a byte order. The
+                // JDK default is the honest answer.
+                0
+            }
+        }
     }
 }
 
@@ -3337,19 +3425,36 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 /// `s2_bb_order`, with the same layout discrimination. Used by the
 /// `order(ByteOrder)` native and by slice/view creation when propagating
 /// the source buffer's order.
+///
+/// BUG (found 2026-08-12, `--synthetic-jdk`): the last branch used to be an
+/// UNCONDITIONAL `set_field(buf, BB_ARRAY, Int(ord))`, and its comment stated
+/// the premise it rested on — *"a genuine ByteBuffer … already round-trips
+/// correctly by name"*. That premise is true of the real JDK class and FALSE
+/// of the fabricated one: a synthetic-JDK `java.nio.ByteBuffer` is 10 fields
+/// wide (`_f0.._f5` + `java/nio/Buffer._f0.._f3`, measured), so
+/// `s2_bb_synthetic_layout`'s `== 6` screen called it real-layout, it has no
+/// `bigEndian` field to resolve, and the write landed on slot 0 — the BACKING
+/// ARRAY. `ByteBuffer.allocate(8).order(nativeOrder())` then took the VM down
+/// with `internal error: ByteBuffer missing backing storage (… field 0
+/// returned Int(1) …)`, exit 1, no Java exception.
+///
+/// It was invisible to the obvious probe because the corruption is
+/// SELF-CONSISTENT: `s2_bb_order` read the same slot back, so `order()` still
+/// reported `LITTLE_ENDIAN` over the destroyed buffer. Only the CONTENTS show
+/// it. Assert bytes, never the reported order.
+///
+/// The three storage sites below are now named explicitly and each one is
+/// gated on the shape that owns it, so no configuration reaches a slot whose
+/// meaning it has not established. The unrecognised case REFUSES rather than
+/// guessing: a byte order that silently fails to stick is a wrong value, and a
+/// wrong value is recoverable; a scalar written over a reference slot is not.
 fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
     if s2_bb_synthetic_layout(ctx, buf) {
         ctx.set_field(buf, BB_ORDER, Value::Int(ord));
         return;
     }
     // Real ByteBuffer (has a genuine `bigEndian` field): write it by name,
-    // as before. Typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/
-    // FloatBuffer/DoubleBuffer — no `bigEndian` field to resolve): the
-    // by-name write is a no-op, so stash the flag in the real `mark: int`
-    // slot instead (index 0 — genuinely free for these views once the
-    // array moved to `BB_SEGMENT_SLOT`). Gated on whether `bigEndian`
-    // actually resolves so this NEVER touches slot 0 — real `mark` — on a
-    // genuine ByteBuffer, which already round-trips correctly by name.
+    // as before.
     let has_big_endian_field =
         !matches!(ctx.get_field_by_name(buf, "bigEndian"), Value::Object(None));
     if has_big_endian_field {
@@ -3361,9 +3466,29 @@ fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
             "nativeByteOrder",
             Value::Int(if ord == 1 { 1 } else { 0 }),
         );
-    } else {
+    } else if s2_is_typed_buffer_view(ctx, buf) {
+        // Typed-buffer view (IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/
+        // DoubleBuffer — no `bigEndian` field to resolve, unlike ByteBuffer):
+        // the by-name write is a no-op, so stash the flag in the real
+        // `mark: int` slot instead (index 0 — genuinely free for these views
+        // once the array moved to `BB_SEGMENT_SLOT`). This is the ONLY shape
+        // for which slot 0 is not the backing store, which is why it is now
+        // gated on the class name rather than reached by falling through.
         ctx.set_field(buf, BB_ARRAY, Value::Int(ord));
+    } else if s2_buf_stub_layout(ctx, buf) {
+        // Synthetic-JDK stub ByteBuffer/HeapByteBuffer/CharBuffer. Slot 0 is
+        // the backing array (`native-io`'s `alloc_byte_buffer` and
+        // `s2_bb_alloc_direct` both put it there); [`BB_ORDER`] is the slot
+        // this layout reserves for the flag, and it is free — `s2_bb_arr`
+        // never reads it, and `native-io`'s `bb_resolve_heap_array` probes it
+        // only for an `ObjectKind::Array` and falls through on an `Int`.
+        ctx.set_field(buf, BB_ORDER, Value::Int(ord));
     }
+    // Otherwise REFUSE. A real JDK layout with no `bigEndian` (a real
+    // `java.nio.CharBuffer`, or a `ByteBufferAs…{B,L}` whose order is fixed by
+    // its CLASS and cannot be reassigned at all) has no slot here that means
+    // "byte order", and every candidate index aliases a field the real class
+    // declares. Writing one would be the defect above with a different victim.
 }
 #[inline]
 fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
@@ -8770,5 +8895,238 @@ mod tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let (le, _, _) = make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsIntBufferL", 0);
         assert_eq!(s2_bb_order(&ctx, le), 1, "…BufferL is LITTLE_ENDIAN");
+    }
+
+    // =======================================================================
+    // `order(ByteOrder)` must never write a scalar over the backing array
+    // (2026-08-12).
+    //
+    // Measured on `cratonvm --synthetic-jdk` before the fix:
+    //
+    //     P8 order-after=LITTLE_ENDIAN
+    //     [cratonvm] main-vm run() returned Err: internal error: ByteBuffer
+    //       missing backing storage (hb/slot5/address absent; field 0 returned
+    //       Int(1), address Object(None))
+    //
+    // — exit 1, no Java exception, on a plain
+    // `ByteBuffer.allocate(8).order(ByteOrder.nativeOrder())`. The corruption
+    // is SELF-CONSISTENT (the reader read the same slot back), so `order()`
+    // still reported LITTLE_ENDIAN over the destroyed buffer. Every assertion
+    // below is therefore about the STORAGE, never about the reported order
+    // alone.
+    // =======================================================================
+
+    /// A `--synthetic-jdk` buffer carrier, as production actually builds one:
+    /// wider than the 6 slots `s2_bb_synthetic_layout` screens for, no real
+    /// `java.nio.Buffer` field metadata, backing array in slot 0.
+    ///
+    /// The class is deliberately NOT named `java/nio/ByteBuffer`, and that is a
+    /// property of the harness rather than of production:
+    /// `MockNativeContext`'s `mock_buffer_field_slot` answers `position` for
+    /// any `java/nio/*ByteBuffer`, so under the mock that name can never
+    /// present as a stub layout. In the VM it does —
+    /// `class_manager::synthetic_stub_fields` gives `java/nio/ByteBuffer`
+    /// `instance_fields(6)` (`_f0.._f5`, all `Ljava/lang/Object;`) over a
+    /// `java/nio/Buffer` with `instance_fields(4)`, which is the ten fields
+    /// `Class.getDeclaredFields()` prints under `--synthetic-jdk`.
+    fn make_stub_layout_buffer(
+        ctx: &mut crate::test_utils::MockNativeContext,
+    ) -> (ObjectRef, ObjectRef) {
+        // Faithful "no such field" answer, so `bigEndian` reports absent the
+        // way `vm_exec.rs` reports it rather than the mock's default `Int(0)`.
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("craton/test/SyntheticStubByteBuffer")
+            .expect("class init");
+        let buf = ctx.alloc_object(class_id, 10);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        // Exactly what `native-io`'s `alloc_byte_buffer` writes.
+        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(8));
+        ctx.set_field(buf, BB_CAP, Value::Int(8));
+        ctx.set_field(buf, BB_MARK, Value::Int(-1));
+        (buf, arr)
+    }
+
+    /// THE DEFECT, stated as the storage question. Not `order()`, which lied.
+    #[test]
+    fn setting_the_order_on_a_stub_layout_bytebuffer_keeps_the_backing_array() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (buf, arr) = make_stub_layout_buffer(&mut ctx);
+        assert!(
+            s2_buf_stub_layout(&ctx, buf),
+            "premise: a 10-field carrier with no real `Buffer` field metadata is a \
+             stub layout, even though `s2_bb_synthetic_layout` (== 6) says otherwise"
+        );
+        assert!(
+            !s2_bb_synthetic_layout(&ctx, buf),
+            "and the narrow screen genuinely does NOT catch it — without this the \
+             test would pass for the wrong reason"
+        );
+
+        s2_bb_set_order(&mut ctx, buf, 1);
+
+        assert_eq!(
+            ctx.get_field(buf, BB_ARRAY),
+            Value::Object(Some(arr)),
+            "slot 0 is the BACKING ARRAY on this layout; an Int written here is the \
+             `ByteBuffer missing backing storage` VM abort"
+        );
+        assert_eq!(
+            s2_bb_arr(&ctx, buf),
+            Some(arr),
+            "and it must still resolve as the buffer's storage, by identity"
+        );
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            1,
+            "reader and writer must agree: the order is stored where BB_ORDER says"
+        );
+        assert_eq!(
+            ctx.get_field(buf, BB_ORDER),
+            Value::Int(1),
+            "and that slot is the one named for it, not an incidental free slot"
+        );
+    }
+
+    /// The round trip in both directions, and the default. A one-way check
+    /// would pass against a writer that had simply stopped writing.
+    #[test]
+    fn stub_layout_bytebuffer_order_round_trips_both_ways() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (buf, arr) = make_stub_layout_buffer(&mut ctx);
+
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "a fresh buffer is BIG_ENDIAN — the JDK field initialiser"
+        );
+        s2_bb_set_order(&mut ctx, buf, 1);
+        assert_eq!(s2_bb_order(&ctx, buf), 1);
+        s2_bb_set_order(&mut ctx, buf, 0);
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "LITTLE_ENDIAN must be reversible; a writer that only ever set the flag \
+             would pass the forward check alone"
+        );
+        assert_eq!(
+            s2_bb_arr(&ctx, buf),
+            Some(arr),
+            "the storage survives every transition, not just the first"
+        );
+    }
+
+    /// The ONE family for which slot 0 is the right home — and the reason the
+    /// fix is a class-name gate rather than a deletion. A typed view parks its
+    /// backing array in `BB_SEGMENT_SLOT`, leaving real `mark` free.
+    #[test]
+    fn a_typed_buffer_view_still_stores_its_order_in_the_mark_slot() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/IntBuffer")
+            .expect("class init");
+        let view = ctx.alloc_object(class_id, 6);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        // `s2_view_buf_fn!`'s layout: array at slot 5, byte-start marker at 4.
+        ctx.set_field(view, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+        ctx.set_field(view, BB_MARK, Value::Int(-1));
+
+        s2_bb_set_order(&mut ctx, view, 1);
+
+        assert_eq!(
+            ctx.get_field(view, BB_SEGMENT_SLOT),
+            Value::Object(Some(arr)),
+            "the view's backing array lives at BB_SEGMENT_SLOT and must be untouched"
+        );
+        assert_eq!(
+            ctx.get_field(view, BB_ARRAY),
+            Value::Int(1),
+            "slot 0 is real `mark: int` and genuinely free on this shape"
+        );
+        assert_eq!(s2_bb_order(&ctx, view), 1);
+        s2_bb_set_order(&mut ctx, view, 0);
+        assert_eq!(s2_bb_order(&ctx, view), 0);
+    }
+
+    /// A REAL JDK layout that declares no `bigEndian` — `java.nio.CharBuffer`
+    /// is one — must be refused, not guessed at. Every index this function
+    /// could reach for aliases a field the real class declares, so the old
+    /// unconditional fallback wrote an `int` order flag over real
+    /// `Buffer.mark`. Refusing leaves the JDK default, which is a recoverable
+    /// wrong value rather than a corrupted object.
+    #[test]
+    fn a_real_layout_buffer_without_big_endian_refuses_rather_than_writing_slot_zero() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        ctx.set_absent_field_answers_null(true);
+        let class_id = ctx
+            .ensure_class_initialized("java/nio/CharBuffer")
+            .expect("class init");
+        let names = [
+            ("mark", "I"),
+            ("position", "I"),
+            ("limit", "I"),
+            ("capacity", "I"),
+            ("address", "J"),
+            ("segment", "Ljava/lang/foreign/MemorySegment;"),
+            ("hb", "[C"),
+            ("offset", "I"),
+            ("isReadOnly", "Z"),
+        ];
+        ctx.set_declared_fields(
+            class_id,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, (name, descriptor))| FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index: i,
+                    declaring_class_id: class_id,
+                    is_static: false,
+                })
+                .collect(),
+        );
+        let buf = ctx.alloc_object(class_id, 9);
+        let chars = ctx.new_array(cratonvm_types::ArrayElementType::Char, 8);
+        let sentinel = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1);
+        ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+        ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars)));
+        // A reference parked in the slot `BB_ORDER` aliases on a real layout,
+        // so the refusal is checked by IDENTITY rather than by "still non-null".
+        ctx.set_field_by_name(buf, "segment", Value::Object(Some(sentinel)));
+
+        assert!(
+            !s2_buf_stub_layout(&ctx, buf),
+            "premise: `position` resolves, so this is a real layout"
+        );
+
+        s2_bb_set_order(&mut ctx, buf, 1);
+
+        assert_eq!(
+            ctx.get_field_by_name(buf, "mark"),
+            Value::Int(-1),
+            "real `Buffer.mark` must not become a byte-order flag"
+        );
+        assert_eq!(
+            ctx.get_field_by_name(buf, "segment"),
+            Value::Object(Some(sentinel)),
+            "and neither may the reference-typed `segment` slot that BB_ORDER \
+             aliases on a real layout"
+        );
+        assert_eq!(
+            ctx.get_field_by_name(buf, "hb"),
+            Value::Object(Some(chars)),
+            "the backing store is still the same array object"
+        );
+        assert_eq!(
+            s2_bb_order(&ctx, buf),
+            0,
+            "the reader agrees with the refusal instead of decoding `mark` as an order"
+        );
     }
 }

@@ -966,11 +966,155 @@ public class RJdkStrictMath {
         System.out.println("CK RJdkStrictMath exactConversions=6");
     }
 
+    // Raw bit patterns of the two zeros, named so the assertions below read as
+    // what they are. `-0.0 == 0.0` is TRUE in Java, so an equality-shaped
+    // check on a signed zero passes against the defect; only the bits can see
+    // the sign.
+    private static final long NEG_ZERO_D = 0x8000000000000000L;
+    private static final long POS_ZERO_D = 0x0000000000000000L;
+    private static final int NEG_ZERO_F = 0x80000000;
+    private static final int POS_ZERO_F = 0x00000000;
+
+    // Read through arrays so javac cannot treat the operands as compile-time
+    // constants and so a JIT that constant-folds `Math.min` has a second,
+    // non-foldable route to get wrong. Element order: -0.0, +0.0, NaN, 1.0.
+    private static final double[] OPAQUE_D = { -0.0, 0.0, Double.NaN, 1.0 };
+    private static final float[] OPAQUE_F = { -0.0f, 0.0f, Float.NaN, 1.0f };
+
+    /**
+     * {@code min}/{@code max} on the two arguments the naive implementation
+     * cannot see: {@code NaN} and the sign of zero.
+     *
+     * <p>Java fixes both exactly ({@code Math.min(double, double)}: "If either
+     * value is NaN, then the result is NaN... if one argument is positive zero
+     * and the other is negative zero, the result is negative zero"). Rust's
+     * {@code f64::min} is IEEE {@code minNum}, which RETURNS THE NON-NaN
+     * OPERAND, and {@code a < b} cannot distinguish {@code -0.0} from
+     * {@code +0.0} — so a natural Rust transcription is wrong on exactly these
+     * inputs and right everywhere else. Measured before the 2026-08-12 fix:
+     * {@code Math.min(1.0, NaN)} was {@code 1.0} and {@code Math.min(-0.0,
+     * 0.0)} was {@code +0.0}.
+     *
+     * <p><b>The zero rows compare RAW BITS, never {@code ==}.</b> {@code -0.0
+     * == 0.0} is {@code true} in Java, so {@code min(-0.0, 0.0) == -0.0} is
+     * true against the broken implementation too — an equality-shaped check
+     * here is not a weak test, it is a vacuous one.
+     *
+     * <p><b>The pass/fail boundary is per descriptor.</b> One class name does
+     * not cover another and one descriptor does not cover another: the defect
+     * hit {@code Math}, {@code StrictMath}, {@code Float.min}/{@code max} (by
+     * inheritance from the same registration) and {@code Double.min}/{@code
+     * max} (a THIRD copy), while {@code min(II)I} and {@code min(JJ)J} were
+     * correct throughout. So this block walks every class name and both
+     * floating-point widths, and keeps the integral overloads as negative
+     * controls — if those ever go red the cause is not this defect.
+     *
+     * <p>Registration is why nothing caught it: the {@code Math} registrar
+     * opens with an ambient {@code NativeKind::Intrinsic}, which is exempt
+     * from shadow retirement and is not the census's
+     * {@code native-shadows-bytecode} kind, so a {@code --jdk-only-report} run
+     * of a program calling {@code Math.min} yields zero {@code java/lang/Math}
+     * rows. The census would not have found this; a vector is the only
+     * instrument.
+     */
+    static void minMaxSpecialValues() {
+        // --- NaN poisons both operand positions, double. `isNaN`, not a bit
+        //     comparison: which NaN is unspecified (see this file's header).
+        check(Double.isNaN(Math.min(1.0, Double.NaN)), "Math.min(1.0, NaN) must be NaN");
+        check(Double.isNaN(Math.min(Double.NaN, 1.0)), "Math.min(NaN, 1.0) must be NaN");
+        check(Double.isNaN(Math.max(1.0, Double.NaN)), "Math.max(1.0, NaN) must be NaN");
+        check(Double.isNaN(Math.max(Double.NaN, 1.0)), "Math.max(NaN, 1.0) must be NaN");
+
+        // --- NaN poisons both operand positions, float. A separate descriptor
+        //     is a separate registration and cannot be inferred from the
+        //     double rows above.
+        check(Float.isNaN(Math.min(1.0f, Float.NaN)), "Math.min(1.0f, NaN) must be NaN");
+        check(Float.isNaN(Math.min(Float.NaN, 1.0f)), "Math.min(NaN, 1.0f) must be NaN");
+        check(Float.isNaN(Math.max(1.0f, Float.NaN)), "Math.max(1.0f, NaN) must be NaN");
+        check(Float.isNaN(Math.max(Float.NaN, 1.0f)), "Math.max(NaN, 1.0f) must be NaN");
+
+        // --- Signed zero, double, BY BITS. Both argument orders: a `<`-based
+        //     body returns whichever operand the comparison happened to leave
+        //     standing, so the two orders can disagree.
+        check(Double.doubleToRawLongBits(Math.min(-0.0, 0.0)) == NEG_ZERO_D,
+                "Math.min(-0.0, 0.0) must be -0.0 (bits 0x8000000000000000)");
+        check(Double.doubleToRawLongBits(Math.min(0.0, -0.0)) == NEG_ZERO_D,
+                "Math.min(0.0, -0.0) must be -0.0 (bits 0x8000000000000000)");
+        check(Double.doubleToRawLongBits(Math.max(-0.0, 0.0)) == POS_ZERO_D,
+                "Math.max(-0.0, 0.0) must be +0.0 (bits 0x0)");
+        check(Double.doubleToRawLongBits(Math.max(0.0, -0.0)) == POS_ZERO_D,
+                "Math.max(0.0, -0.0) must be +0.0 (bits 0x0)");
+
+        // --- Signed zero, float, BY BITS.
+        check(Float.floatToRawIntBits(Math.min(-0.0f, 0.0f)) == NEG_ZERO_F,
+                "Math.min(-0.0f, 0.0f) must be -0.0f (bits 0x80000000)");
+        check(Float.floatToRawIntBits(Math.min(0.0f, -0.0f)) == NEG_ZERO_F,
+                "Math.min(0.0f, -0.0f) must be -0.0f (bits 0x80000000)");
+        check(Float.floatToRawIntBits(Math.max(-0.0f, 0.0f)) == POS_ZERO_F,
+                "Math.max(-0.0f, 0.0f) must be +0.0f (bits 0x0)");
+        check(Float.floatToRawIntBits(Math.max(0.0f, -0.0f)) == POS_ZERO_F,
+                "Math.max(0.0f, -0.0f) must be +0.0f (bits 0x0)");
+
+        // --- `StrictMath` is a SECOND class name over the same contract; its
+        //     min/max are specified identically to Math's, so a fix applied to
+        //     one registrar and not the other shows up here and nowhere else.
+        check(Double.isNaN(StrictMath.min(1.0, Double.NaN)),
+                "StrictMath.min(1.0, NaN) must be NaN");
+        check(Double.doubleToRawLongBits(StrictMath.min(-0.0, 0.0)) == NEG_ZERO_D,
+                "StrictMath.min(-0.0, 0.0) must be -0.0");
+        check(Float.isNaN(StrictMath.max(Float.NaN, 1.0f)),
+                "StrictMath.max(NaN, 1.0f) must be NaN");
+        check(Float.floatToRawIntBits(StrictMath.max(-0.0f, 0.0f)) == POS_ZERO_F,
+                "StrictMath.max(-0.0f, 0.0f) must be +0.0f");
+
+        // --- `Double.min`/`max` are a THIRD copy of the same body, reached by
+        //     a different owner class, and were wrong independently.
+        check(Double.isNaN(Double.min(1.0, Double.NaN)),
+                "Double.min(1.0, NaN) must be NaN");
+        check(Double.doubleToRawLongBits(Double.min(-0.0, 0.0)) == NEG_ZERO_D,
+                "Double.min(-0.0, 0.0) must be -0.0");
+        check(Double.doubleToRawLongBits(Double.max(-0.0, 0.0)) == POS_ZERO_D,
+                "Double.max(-0.0, 0.0) must be +0.0");
+
+        // --- `Float.min`/`max`, the fourth owner.
+        check(Float.isNaN(Float.min(1.0f, Float.NaN)),
+                "Float.min(1.0f, NaN) must be NaN");
+        check(Float.floatToRawIntBits(Float.min(-0.0f, 0.0f)) == NEG_ZERO_F,
+                "Float.min(-0.0f, 0.0f) must be -0.0f");
+
+        // --- Non-constant operands. Everything above is a literal pair, which
+        //     a constant-folding JIT may answer without ever entering the
+        //     implementation under test; these come out of an array.
+        double negZeroD = OPAQUE_D[0];
+        double posZeroD = OPAQUE_D[1];
+        double nanD = OPAQUE_D[2];
+        double oneD = OPAQUE_D[3];
+        check(Double.doubleToRawLongBits(Math.min(negZeroD, posZeroD)) == NEG_ZERO_D,
+                "Math.min(-0.0, 0.0) must be -0.0 for non-constant operands");
+        check(Double.doubleToRawLongBits(Math.max(negZeroD, posZeroD)) == POS_ZERO_D,
+                "Math.max(-0.0, 0.0) must be +0.0 for non-constant operands");
+        check(Double.isNaN(Math.min(oneD, nanD)),
+                "Math.min(1.0, NaN) must be NaN for non-constant operands");
+        check(Float.floatToRawIntBits(Math.min(OPAQUE_F[0], OPAQUE_F[1])) == NEG_ZERO_F,
+                "Math.min(-0.0f, 0.0f) must be -0.0f for non-constant operands");
+
+        // --- NEGATIVE CONTROLS. The integral descriptors were correct before
+        //     the fix and must stay correct after it; a failure here is a
+        //     different defect wearing this block's name.
+        check(Math.min(1, 2) == 1, "Math.min(1, 2) must be 1");
+        check(Math.max(1, 2) == 2, "Math.max(1, 2) must be 2");
+        check(Math.min(-3L, 2L) == -3L, "Math.min(-3L, 2L) must be -3");
+        check(Math.max(-3L, 2L) == 2L, "Math.max(-3L, 2L) must be 2");
+
+        System.out.println("CK RJdkStrictMath minMax=33");
+    }
+
     public static void main(String[] args) {
         fdlibmFamily();
         namedDiscriminators();
         mathAgreesWhereTheSpecIsExact();
         exactConversions();
+        minMaxSpecialValues();
         System.out.println("CK RJdkStrictMath checks=" + checks);
         System.out.println("PASS RJdkStrictMath (" + checks + " checks)");
     }

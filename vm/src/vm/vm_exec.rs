@@ -19479,7 +19479,27 @@ fn adapt_annotation_value_for_map(
 
 /// Read element-name + element-value parallel arrays from an annotation proxy.
 /// Returns `(name, value)` pairs in the order they were stored at proxy build
-/// time (which is the source-declaration order from the .class file).
+/// time.
+///
+/// **That order is the class file's `element_value_pairs` order, and this is
+/// load-bearing** — `annotation_proxy_to_string` prints it verbatim rather
+/// than sorting, because HotSpot does. Established twice, 2026-08-12:
+///
+/// * by reading the whole pipeline, which is `Vec`-to-`Vec` with no map or set
+///   anywhere — `decode_annotation_depth` (`reader/src/attribute.rs`) pushes
+///   the pairs in file order, `convert_annotation` (this file) re-pushes them
+///   in that order, `create_annotation_proxy_with_type`
+///   (`native-builtins/src/lang_class.rs`) clones them into `all_elements`,
+///   appends any `AnnotationDefault` members AFTER them, and writes both
+///   parallel arrays by `enumerate()` index. That function holds the only
+///   write to `ANN_PROXY_ELEM_NAMES` in the tree;
+/// * by running it. `CRATONVM_IAE_TRACE2=1` makes that builder emit one
+///   `ANN-ELEM` line per element as it stores them. A use site written
+///   `mike, yankee, alpha, bravo, zulu` against an interface declaring
+///   `zulu, alpha, mike, bravo, yankee` traced in USE-SITE order, which is
+///   what HotSpot prints for it.
+///
+/// Do not introduce a `HashMap` anywhere on that path.
 fn annotation_proxy_elements(shared: &SharedVm, proxy: ObjectRef) -> Vec<(String, Value)> {
     let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
@@ -19538,16 +19558,120 @@ fn internal_to_dotted(name: &str) -> String {
     name.replace('/', ".")
 }
 
-/// Format an annotation member value the way HotSpot's
-/// `AnnotationInvocationHandler.toString()` does:
+/// The annotation type's CANONICAL name (JLS 6.7) — what HotSpot's
+/// `AnnotationInvocationHandler.toString()` prints. It formats
+/// `annotationType().getCanonicalName()`, not `getName()`, so a member
+/// annotation type renders with `.` where the binary name has `$`. Measured
+/// on JDK 25.0.3.9: HotSpot prints `@AnnToString.Multi(...)` for the type
+/// whose binary name is `AnnToString$Multi`.
 ///
-/// * `String` в†’ `"text"` (Java-string-literal-escaped quoted form)
-/// * `Class` в†’ `TypeName.class`
-/// * Annotation proxy в†’ recursive `@TypeName(...)`
-/// * Reference array в†’ `[a, b, c]`
-/// * Primitive array в†’ element-list joined by `, ` inside `[ ... ]`
-/// * boxed Integer/Long/etc. (from element-value pairs) в†’ underlying numeric
-/// * Enum в†’ constant name (annotation enum element renders without type qualifier)
+/// Resolved from the annotation type's own `InnerClasses` attribute
+/// (JVMS §4.7.6), **not** by rewriting every `$` in the binary name: `$` is a
+/// legal Java identifier character, so a top-level `@interface A$B` has
+/// canonical name `A$B`, and a member type may legally be named `Inner$Class`
+/// — the same distinction `native_class_get_canonical_name` /
+/// `own_inner_class_entry` draw in `native-builtins/src/lang_class.rs`, and
+/// the one its `class_get_canonical_name_preserves_literal_dollar_in_member_name`
+/// test pins. javac records the whole nesting chain in the nested type's own
+/// attribute, so one class lookup resolves an arbitrarily deep `A$B$C`.
+///
+/// Total for an annotation type, with no `null` case to render: JLS 9.6 admits
+/// only top-level and member annotation types — never local, never anonymous
+/// — so the "has no canonical name" branch is unreachable here. It is still
+/// written, and falls back to the dotted binary name rather than inventing a
+/// `null` this caller has no rendering for. Every other miss (no mirror, no
+/// class id, class not loaded) takes the same fallback, which is exactly the
+/// string this function used to return unconditionally.
+fn annotation_type_canonical_name(shared: &SharedVm, proxy: ObjectRef, internal: &str) -> String {
+    let dotted_binary = internal_to_dotted(internal);
+    // Slot 1 is `ANN_PROXY_TYPE_MIRROR` (see the `annotationType` arm of
+    // `annotation_proxy_dispatch_impl`, which returns this same field). The
+    // builder can never leave it null — `create_annotation_proxy_with_type`
+    // falls back to the admitted `ClassId` precisely so that callers may
+    // dereference it without a null check — so a miss means a proxy minted by
+    // some other route, and the binary name is the honest answer for it.
+    let mirror = match shared.mem.heap.get_field(proxy, 1) {
+        Value::Object(Some(m)) => m,
+        _ => return dotted_binary,
+    };
+    let class_id = match super::class_id_from_mirror(shared, mirror) {
+        Some(id) => id,
+        None => return dotted_binary,
+    };
+    let guard = shared.classes.class_manager.read();
+    let class = match guard.get_class(class_id) {
+        Some(c) => c,
+        None => return dotted_binary,
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    let mut name: &str = internal;
+    // Bounded walk: a real nesting chain is short, and the bound stops a
+    // malformed `InnerClasses` table whose entries cycle from spinning here.
+    for _ in 0..64 {
+        let entry = match class.inner_classes.iter().find(|e| e.inner_class == name) {
+            Some(e) => e,
+            // No entry under this name: a top-level type. Its dotted binary
+            // name IS its canonical name, `$` characters included.
+            None => {
+                let mut out = internal_to_dotted(name);
+                for seg in segments.iter().rev() {
+                    out.push('.');
+                    out.push_str(seg);
+                }
+                return out;
+            }
+        };
+        // The JVMS §4.7.6 index-0 cases arrive as empty strings: an empty
+        // `inner_name` is an ANONYMOUS class, an empty `outer_class` a LOCAL
+        // one. Neither has a canonical name, and neither can be an annotation
+        // type.
+        if entry.inner_name.is_empty() || entry.outer_class.is_empty() {
+            return dotted_binary;
+        }
+        segments.push(&entry.inner_name);
+        name = &entry.outer_class;
+    }
+    dotted_binary
+}
+
+/// Format an annotation member value:
+///
+/// * `String` -> `"text"` (Java-string-literal-escaped quoted form)
+/// * `Class` -> `TypeName.class`
+/// * Annotation proxy -> recursive `@TypeName(...)`
+/// * Reference array -> `[a, b, c]`
+/// * Primitive array -> element-list joined by `, ` inside `[ ... ]`
+/// * boxed Integer/Long/etc. (from element-value pairs) -> underlying numeric
+/// * Enum -> constant name (annotation enum element renders without type qualifier)
+///
+/// **This is NOT yet HotSpot's rendering, and this comment used to say it
+/// was.** `sun/reflect/annotation/AnnotationInvocationHandler.memberValueToString`
+/// was diffed against it on 2026-08-12 (Microsoft OpenJDK 25.0.3.9, same class
+/// file, same session). Six members render differently, `want` being HotSpot:
+///
+/// ```text
+///   boolean        got off=0                  want off=false
+///   char           got ch=113                 want ch='q'
+///   byte           got b=3                    want b=(byte)0x03
+///   any array      got [a, b]                 want {a, b}
+///   String         got the non-ASCII chars    want them as \\uXXXX escapes
+///   nested @Ann    got $Proxy0                want @Outer.Inner(n=5)
+/// ```
+///
+/// The JDK's rules, for whoever closes these: `toSourceString(byte)` is
+/// `String.format("(byte)0x%02x", b)`; `toSourceString(char)` quotes with
+/// `\b \f \n \r \t \' \\` and `\\u%04x` for anything outside printable ASCII
+/// (`' '..'~'`), and the String form is the same escape set with `"` escaped
+/// and `'` not; arrays are `Collectors.joining(", ", "{", "}")`; a `Class`
+/// member is `getCanonicalName() + ".class"`, so a `Class[]` member should
+/// print `java.lang.String[].class`, not `[Ljava.lang.String;.class`.
+///
+/// The nested-annotation row is the severe one and is a different shape from
+/// the rest: with real annotation proxies enabled (the default) a nested
+/// member's value is a generated `$ProxyN`, not an `AnnotationProxy`, so the
+/// carrier-class test below misses it and the whole nested annotation is lost.
+/// Closing it needs the proxy's invocation handler, which this function has no
+/// route to today.
 fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
     match val {
         Value::Object(None) => "null".to_string(),
@@ -19633,15 +19757,42 @@ fn format_annotation_array(shared: &SharedVm, arr: ObjectRef) -> String {
 
 /// Recursive `Annotation.toString()` helper.
 ///
-/// Members are emitted in alphabetical order by element name, matching
-/// HotSpot's `AnnotationInvocationHandler.toString()` reference output
-/// (where multi-member annotations render with members sorted by name).
+/// Members are emitted in **class-file `element_value_pairs` order** — the
+/// order they were parsed in, which is the order `annotation_proxy_elements`
+/// hands back. They are NOT sorted.
+///
+/// This used to sort them alphabetically, and this comment used to claim the
+/// sort matched HotSpot. It does not. Measured 2026-08-12 against Microsoft
+/// OpenJDK 25.0.3.9, same class file, same session:
+///
+/// ```text
+/// HotSpot   @AnnToString.Multi(zeta="Z", mid="M", alpha=9)
+/// was       @AnnToString$Multi(alpha=9, mid="M", zeta="Z")
+/// ```
+///
+/// HotSpot's `AnnotationInvocationHandler` iterates `memberValues`, the
+/// `LinkedHashMap` `AnnotationParser.parseAnnotation2` fills by `put`-ing each
+/// `element_value_pair` in file order (`sun/reflect/annotation/
+/// AnnotationParser.java:268-287`), so declaration order in the class file is
+/// what it prints. That was confirmed by scrambling the use site relative to
+/// the interface's declaration order and watching the rendering follow the use
+/// site, not the interface and not the alphabet.
+///
+/// **The one case that still diverges, and why it is not chased here.** For a
+/// member left at its `AnnotationDefault`, HotSpot seeds that same map from
+/// `AnnotationType.memberDefaults()`, which is a plain `java.util.HashMap`
+/// (`AnnotationType.java:111`) — so defaulted members print FIRST, in String
+/// hash order. Measured: five all-defaulted members declared
+/// `zulu, alpha, mike, bravo, yankee` print `bravo, yankee, mike, zulu,
+/// alpha`. That is `HashMap` bucket order, not a contract, and it is not
+/// reproducible from this side; this VM appends its defaults after the
+/// explicit members instead. The alphabetical sort did not match it either,
+/// so nothing that was right is being given up.
 pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) -> String {
     let desc = annotation_proxy_type_descriptor(shared, proxy);
     let class_name = descriptor_to_class_name(&desc);
-    let dotted = internal_to_dotted(&class_name);
-    let mut elems = annotation_proxy_elements(shared, proxy);
-    elems.sort_by(|a, b| a.0.cmp(&b.0));
+    let dotted = annotation_type_canonical_name(shared, proxy, &class_name);
+    let elems = annotation_proxy_elements(shared, proxy);
     let mut s = String::with_capacity(64);
     s.push('@');
     s.push_str(&dotted);
