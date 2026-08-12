@@ -100,6 +100,9 @@ time they run, the entry point has already checked.
   round 1 on the next run — intermittent, which is why it read as flakiness.
 * `org.hibernate.reactive.BatchFetchTest` under the suite harness: **4/4 PASS at
   ~10 s wall**. Before: 240 s timeout, `rc=124`, container leaked.
+* The first 30 classes of the suite's `testlist.txt`, one VM per class:
+  **30/30 classes, 241/241 tests, 0 failed, 0 timed out.** The same 30 on the
+  binary immediately before this fix: 14 timed out.
 
 ## Related
 

@@ -186,6 +186,18 @@ nonce, matches byte-for-byte after the fix (`clientProof`, `serverSignature`, an
 the complete `client-final-message`); before the fix it threw at
 `saltedPassword`.
 
+End to end under the suite's own harness, with Testcontainers auto-detecting
+Docker and **no `DOCKER_HOST` workaround**: the first 30 classes of
+`testlist.txt`, one VM per class.
+
+| | classes | tests run | failed | timed out | classes carrying the SASL signature |
+|---|---|---|---|---|---|
+| before (filed run, sampled) | 28 attempted | — | 14 FAIL | 9 HANG | every sampled FAIL |
+| after | 30 | 241 | **0** | **0** | **0** |
+
+(Reaching 0 timed-out also required the separate teardown fix below; the SASL fix
+alone turned the FAILs into HANGs.)
+
 ## What this fix did NOT cover
 
 With the SASL blocker gone, about half the DB-required classes still timed out —
