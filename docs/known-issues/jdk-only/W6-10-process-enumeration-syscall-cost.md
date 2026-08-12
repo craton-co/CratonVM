@@ -1,8 +1,37 @@
 # Windows process enumeration: one snapshot per tree node, and one `OpenProcess` too many per `info()`
 
-**Status:** FIXED. The two structural costs on 2026-08-07; finding 4 — the last
-open item, a snapshot failure indistinguishable from an empty machine — on
-2026-08-11. Lane W6-10 of the jdk-wave2 pool.
+**Status: FINDINGS 1, 2 AND 4 CONFIRMED PRESENT 2026-08-12 (W7-46). One
+follow-up, and it is finding 2's own shape one native along.**
+
+`collect_descendant_pids` takes one snapshot and indexes it by parent;
+`start_time_and_cpu` fetches both halves from one `win_process_times`; every
+enumeration primitive returns `Result` and the three natives that reach them
+throw. All three are in the tree and readable.
+
+**Finding 2 was not swept far enough.** `native_proc_handle_is_alive0` had the
+identical double-`OpenProcess` shape — `foreign_pid_is_alive(pid)` and then
+`start_time_or_any(pid)`, two handle opens for one question — in the one native
+whose return value exists so that `ProcessHandleImpl.isAlive()` and `destroy0`
+can detect a **recycled pid**. A probe that hunts pid recycles must not itself
+straddle one, which is this record's own argument for `info0` applied to its
+neighbour. Merged into `win_liveness_and_start_time`: one handle,
+`GetExitCodeProcess` + `GetProcessTimes`, same desired-access mask, every arm
+unchanged. Windows only; the non-Windows arm is the old two-step verbatim,
+because there the two probes read two different `/proc` files and merging them is
+a change on an arm this host cannot compile.
+
+Finding 3's conclusion stands unchanged — `PROCESSENTRY32` carries no creation
+time, so the per-row `OpenProcess` in `getProcessPids0` is inherent. Its *free*
+half was taken: the three `array_length` probes were loop-invariant and are now
+hoisted, and the walk stops once every array is full.
+
+**Still no measurement.** Costs are stated in `OpenProcess` counts, as in the
+rest of this record. What the orchestrator must run to confirm, and what is
+explicitly not being claimed, is in W7-46-process-cluster.md.
+
+The two structural costs landed 2026-08-07; finding 4 — a snapshot failure
+indistinguishable from an empty machine — on 2026-08-11. Lane W6-10 of the
+jdk-wave2 pool.
 **Files changed:** `native-io/src/process.rs`.
 
 **Not verified.** Nothing has been built or run for the 2026-08-11 change: it is

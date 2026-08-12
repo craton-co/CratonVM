@@ -1,6 +1,6 @@
 # JDK-only mode — open defects
 
-**Status:** OPEN, **22 records**, reduced 2026-08-04, 2026-08-06, and
+**Status:** OPEN, **21 records** (W3-6 and W5-2 retired 2026-08-12 by W7-46, W7-46 filed), reduced 2026-08-04, 2026-08-06, and
 **2026-08-11** (thirty records retired — see `RETIREMENT-20260811.md`). Filed
 2026-07-31 from wave-1 implementation findings.
 
@@ -84,9 +84,10 @@ the record says so and says why. Take these when you are already in the file.
 | `W4-2-unnamed-accessor-bypasses-encapsulation.md` | `ServiceLoader` + an encapsulated module-path provider: the caller-sensitive `setAccessible` is refused, so `newInstance` is too. Also `is_package_exported_to` fails closed where `check_module_access` allows. |
 | `W5-1-loadlibrary-allowlist-too-wide.md` · `W6-6-nativelibraries-load-fabricated-success.md` | The same residual from two roads: there is **no class-loader-scoped `loadedLibraryNames` bookkeeping in this VM**, so the JDK's dynamic "already loaded elsewhere" rule cannot fire. A static allowlist cannot model it. |
 | `W4-3-security-getalgorithms-short-list.md` | `Security.getAlgorithms(type)` answers a plain `HashSet`, not `Collections.unmodifiableSet` — a caller asserting `UnsupportedOperationException` sees the divergence. Two real SHAKE digests are deliberately not advertised, because `message_digest::algorithm_supported` does not implement them. |
-| `W5-2-two-silently-skipped-process-checks.md` | `Info.user` is null on both platforms; `Info.totalTime` is `-1` on Linux. No vector guards either. |
+| ~~`W5-2-two-silently-skipped-process-checks.md`~~ | **RETIRED 2026-08-12 (W7-46).** Both residuals were closed 08-11, and the *detector* — a `checks=` count nothing asserted — was converted into an assertion plus a printed `skipped=` list. See `W7-46-process-cluster.md`. |
 | `W6-2-module-serviceloader-provider-factory.md` | The constructor-form provider **subtype** check is absent — adding it could hard-fail every module-declared service in the JDK's own boot modules, and that was unmeasurable from the lane. |
 | `W6-12-stampedlock-split-brain.md` | `java/util/Collections` is served by two registrars at different fidelities, so `unmodifiableSet(s).add(x)` throws while `unmodifiableList(l).add(x)` succeeds. Synthetic-jdk only. |
+| `W7-46-process-cluster.md` | Two recorded-not-fixed, both stated rather than deferred: on **Linux**, one `isAlive0` still reads `/proc/<pid>` and then `/proc/<pid>/stat` — the same two-probe pid-recycle attribution hole the Windows arm just lost, on an arm this host cannot compile; and the four `java/lang/ProcessBuilder` triples registered by BOTH `register_phase57_process` (as `SyntheticStub`) and an untagged block in `register_enterprise_natives`, which collide only in **synthetic-jdk** mode. |
 
 ### 2.2 Whole surfaces that are still wrong
 
@@ -94,7 +95,7 @@ the record says so and says why. Take these when you are already in the file.
 |---|---|
 | `W6-8-method-invoke-exports-gate.md` | Two live **OPEN** rows in its own inventory: `Field.get`/`Field.set` ask the `opens` question unconditionally and so **over-deny** public fields of exported-but-not-opened packages; and the entire `Lookup.unreflect*` / `find*` family has no module check of any kind. HotSpot throws there — measured. |
 | `W2-3-module-descriptor-answers-empty-sets.md` | `ModuleDescriptor.modifiers()`, `Requires.compiledVersion()`, `version()`, `rawVersionString()` and `mainClass()` still have **no data source**: the bits are dropped at parse time or never surfaced through `NativeContext`. `RJdkModule` asserts none of them, which is exactly why the green corpus does not close this. |
-| `W3-6-processimpl-missing-natives.md` | `os_process_start_time` and `info0` stay empty on Windows (deliberate, argued). Separately: `children()`, `descendants()` and `parent()` are registered on the `java/lang/ProcessHandle` **interface** returning empty streams and "every process's parent is this VM" — inert in both JDK modes, live in synthetic-jdk. |
+| ~~`W3-6-processimpl-missing-natives.md`~~ | **RETIRED 2026-08-12 (W7-46).** Both stated residuals were already false: Windows `start_time`/`info0` were filled 08-11, and the `ProcessHandle` interface stubs were rerouted at a real measurement by W7-10. All ten `ProcessImpl` natives are registered, none is shadowed by a second registrar. The live successors are in `W7-46-process-cluster.md`. |
 | `W2-1-strict-refuses-the-synthetic-stream-stack.md` | The stream stack is **SPLIT**: some sources divert into the `cratonvm/*` synthetic model, some run real `java.util.stream` bytecode. The record carries the inventory and a four-step staged path to a real `java.util.stream`; step 1 (the real path's own `ForkJoinTask.invoke()` defect) has since landed, so the path is now walkable. |
 
 ### 2.3 The slot-index species — swept, with a live tail
@@ -122,7 +123,6 @@ Fixes are being written for these right now; treat them as owned.
 
 `W3-4-forkjointask-status-flags-and-the-eager-default.md`,
 `W6-5-vacuous-tests.md`, `W6-9-complete-erases-the-abnormal-record.md`,
-`W6-10-process-enumeration-syscall-cost.md`,
 `W7-1-treemap-views-and-iterator-remove-contract.md`, and the `W7-2` … `W7-6`
 records.
 

@@ -1,7 +1,42 @@
 # `java.lang.ProcessImpl` — nine unregistered Windows natives, and a tenth under a descriptor the image never declared
 
-**Status:** FIX LANDED, UNVALIDATED (no build run in this lane). Filed 2026-08-07
-by wave-3 lane W3-6. Source of truth for the census below is
+**Status: RETIRED 2026-08-12 (W7-46).** Every row of the census below is
+registered in `native-io/src/process.rs::register_process_natives`, under the
+corrected `create` descriptor, inside the `#[cfg(windows)]` block, and each one
+states `NativeKind::Bridge` at its own call site through `register_with_kind`
+rather than inheriting the ambient category — so the ambient-`NativeKind`
+hazard this campaign has hit elsewhere cannot reach them. Re-verified two ways
+on 2026-08-12, not inferred:
+
+* **Missing vs merely overwritten.** Every `java/lang/ProcessImpl` and
+  `java/lang/ProcessHandleImpl` triple was grepped across the whole tree for a
+  second registrar, because `register()` is last-write-wins and an overwritten
+  native is indistinguishable from a missing one from the outside. There is
+  exactly one other `ProcessImpl` registration anywhere —
+  `init()V` in `native-builtins/src/lib.rs` — and it is a different method
+  name. **No ProcessImpl or ProcessHandleImpl native is shadowed by a second
+  registrar.** The ten were genuinely missing, and they are genuinely there now.
+* **The out-of-file patch below has LANDED**, as W7-10, not as written here:
+  `children()`, `descendants()`, `parent()` and `info()` on the
+  `java/lang/ProcessHandle` interface delegate to the real `ProcessHandleImpl`
+  instead of answering constants, `commandLine()` is registered, and the whole
+  block is retagged `SyntheticStub`. See
+  W7-10-processhandle-interface-stub-bodies.md.
+
+What this record does NOT cover, and what W7-46 found on the same surface: the
+`java/lang/Process` half of the registration loop. `Process.descendants()` is
+concrete on the image, is NOT overridden by `java.lang.ProcessImpl`, and had no
+`is_vm_process` guard — so under `--jdk-only` it read a pid slot off a JDK-layout
+receiver and answered an empty stream. And `ProcessImpl.create` itself answered
+a handle of `0` for a command line it could not parse. Both are in
+W7-46-process-cluster.md.
+
+**Nothing below has changed. Kept, not deleted, for the same reason its own
+struck sections were: a retired record that is deleted gets rediscovered.**
+
+---
+
+Filed 2026-08-07 by wave-3 lane W3-6. Source of truth for the census below is
 `javap -p -s` against `C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot`.
 
 **AMENDED 2026-08-11** (jdk-only process-natives residual lane, also unbuilt).
