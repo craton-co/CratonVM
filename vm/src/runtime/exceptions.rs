@@ -1705,7 +1705,9 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
     static CLASS: AtomicU32 = AtomicU32::new(UNRESOLVED);
     static INDEX: AtomicUsize = AtomicUsize::new(0);
 
-    let cached = CLASS.load(Ordering::Relaxed);
+    // `CLASS` is the publication flag: it is stored last, with `Release`, so a
+    // thread that sees a resolved class id also sees the matching `INDEX`.
+    let cached = CLASS.load(Ordering::Acquire);
     let (class_id, index) = if cached != UNRESOLVED {
         (ClassId::new(cached), INDEX.load(Ordering::Relaxed))
     } else {
@@ -1727,7 +1729,7 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
         let index = found?;
         drop(cm);
         INDEX.store(index, Ordering::Relaxed);
-        CLASS.store(class_id.as_u32(), Ordering::Relaxed);
+        CLASS.store(class_id.as_u32(), Ordering::Release);
         (class_id, index)
     };
     match crate::vm::get_static_shared(shared, class_id, index) {
