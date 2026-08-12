@@ -91,9 +91,16 @@ Two consequences:
   Matching HotSpot's property set today would take netty from mostly-green to
   mostly-red. The property is not just a `StackWalker` workaround any more; it
   is what keeps netty off an unimplemented path.
-* Arm B being **7× faster** on identical Java work is its own finding about
-  CratonVM's Unsafe natives →
-  [adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md).
+* ~~Arm B being **7× faster** on identical Java work is its own finding about
+  CratonVM's Unsafe natives.~~ **RETRACTED 2026-08-12.** The two arms do not do
+  the same work: 109 of arm B's 127 tests fail early on
+  `MemorySegment.asByteBuffer()`, so it exits the work rather than doing it
+  faster — and a native-invocation census shows it issues *more* native calls
+  than arm A while taking a sixth of the time. The arm is a good
+  `MemorySegment` reproducer and worthless as a throughput instrument. See
+  [adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md),
+  which re-measured this properly and also refutes the Unsafe natives as the
+  cost (0.086% of native invocations).
 
 ## Impact
 
@@ -109,6 +116,30 @@ same code — that is worth knowing before triaging any further batch page.
 
 It also means CratonVM's Unsafe implementation is on the hot path for every
 netty buffer operation, so a defect there shows up as a netty buffer bug.
+
+## Working around it while triaging: give HotSpot the same flag
+
+Some netty classes gate every test on `assumeTrue(PlatformDependent.hasUnsafe())`
+or on `isDirectMemoryCacheAlignmentSupported()`. On stock HotSpot 25 those
+predicates are false, so the baseline reports `aborted=<all>` or `started=0` and
+gives you **no oracle at all** for tests CratonVM does run.
+
+Put HotSpot on CratonVM's code path instead:
+
+```bash
+java --sun-misc-unsafe-memory-access=allow -cp "$CP" CratonRunner <class>
+```
+
+That sets the very property CratonVM pins, so netty's `hasUnsafe()` is true on
+both sides and the comparison is like-for-like. Used on batch-02's
+`BigEndianUnsafeDirectByteBufTest`, `LittleEndianUnsafeDirectByteBufTest` and
+`PooledAlignedBigEndianDirectByteBufTest`: HotSpot went from "413 aborted / 412
+aborted / 0 started" to 413/413, 412/412, 417/417 passing, and CratonVM matched
+all three exactly. Without the flag all three would have been recorded as
+untestable.
+
+Note this is a **triage instrument, not a target state** — it makes the two VMs
+comparable, it does not make CratonVM match a default HotSpot run.
 
 ## Suggested fix — ordered, and the order matters
 

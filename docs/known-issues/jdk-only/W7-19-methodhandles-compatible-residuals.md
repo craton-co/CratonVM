@@ -515,7 +515,23 @@ out-of-bounds read on all three:
 * `native-builtins/src/panama.rs` uses a compact layout whose field 0 is the
   native function address, which `asType`'s own comment names;
 * `classloader.rs`'s `alloc_method_handle` allocates 21 with a **different field
-  order** (see W7-13's note on the second slot map).
+  order**. Stated here in full 2026-08-12, because the record that found it —
+  the retired `W7-13-strict-mh-insert-wrapper` write-up — has left this
+  directory and this is now the live home for the row.
+  `classloader.rs:9084-9090` declares `MH_BASE = 16` with `MH_KIND`(16),
+  `MH_TARGET_CLASS`(17), `MH_NAME`(18), `MH_TYPE`(19), `MH_CLASS_ID`(20), and a
+  comment claiming it *"matches the layout used by
+  `lang_invoke::alloc_method_handle`"* — it does not: `lang_invoke`'s map is
+  `MH_CLASS`(16), `MH_NAME`(17), `MH_DESC`(18), `MH_KIND`(19), `MH_BOUND`(20).
+  Only the base matches, so slot 16 holds a `String` reference in one map and an
+  `Int` in the other, and slot 20 a reference in one and a `ClassId` `Int` in
+  the other. Its only allocator is `classloader::alloc_method_handle`, whose only
+  callers are `lk_unreflect`/`lk_unreflect_special`, and §3.3's census answers
+  which of the two `unreflect` registrations wins — `type()` reads `(H,int)int`,
+  which is `lang_invoke`'s shape, so **the disagreeing map is very probably
+  UNREACHED**. That is why it has never corrupted anything, and it is exactly
+  the shape that stops being harmless the moment registrar order changes. It
+  wants a `--dump-native-registry` diff and then a deletion, not a repair.
 
 That is precisely the defect `MH_KIND_ARRAY_GET`'s doc comment records — `invokeExact`
 read `MH_DESC`(18) and `MH_KIND`(19) off the end of a 17-slot object, and the GC

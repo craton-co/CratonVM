@@ -1,5 +1,18 @@
 # W7-38 — the three crypto defects, measured fixed
 
+> # RETIRED-FIXED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.6. What actually closed is this
+> record's own **live residual — the instrument.** `RChaCha20Cipher.java` is now
+> tracked (17,950 bytes), is in `CORE_CLASSES` (`run.sh:106`) so `prune_missing`
+> no longer drops it, and **PASSES in both arms** (close-strict.log:43,
+> close-compat.log:43) without being flagged by the harness's check-count gate.
+> The RFC 8439 §2.5.2 vector this record named as the deliverable is
+> `native-builtins/src/chacha20.rs:459`, `fn rfc8439_2_5_2_poly1305()`. The four
+> remaining refusing rows (Blowfish, RC4/ARCFOUR, HmacSHA224, keygen.Blowfish)
+> are closed by W7-39-jca-missing-algorithms.md through the real SunJCE SPI, and
+> W7-39 is live.
+
 **Status: VERIFIED BY EXECUTION 2026-08-12.** `probes/CryptoTrioProbe.java`, HotSpot 25.0.3.9
 vs CratonVM `--real-jdk`, one binary (dev after the wave), same class files.
 

@@ -94,8 +94,11 @@ skipped · ⏱ wall-clock only, passes solo
 * [`adaptive-bytebuf-allocator-throughput-20260812.md`](adaptive-bytebuf-allocator-throughput-20260812.md)
   — the remaining not-green results are wall-clock only, no assertion failure.
   10× broadly across `io.netty.buffer`, ~90× through `AdaptivePoolingAllocator`,
-  with an A/B that localises the extra ~9× to CratonVM's `sun.misc.Unsafe`
-  natives.
+  — but note that page was **substantially corrected on 2026-08-12**: the
+  `-Dio.netty.noUnsafe=true` A/B this batch used was confounded (arm B exits
+  early on a different defect), and `AdaptivePoolingAllocator` carries no
+  penalty of its own — it is the same per-call cost at 23× the call density.
+  Read the corrected page, not this summary.
 * [`unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md`](unsafe-memory-access-property-flips-netty-to-unsafe-paths-20260812.md)
   — CratonVM pins `sun.misc.unsafe.memory.access=allow`, so netty takes its
   Unsafe fast paths on CratonVM and its safe paths on HotSpot 25. **Read this
