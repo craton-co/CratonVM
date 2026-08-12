@@ -469,8 +469,12 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result
     let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
     // Leave slot 0 as `null` — a properly-initialized `Properties` would
     // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
-    // code reads it via accessors we no-op, so null is safe. TRUE ONLY IN
-    // COMPATIBLE MODE since the shadow retirement; see the doc comment.
+    // code reads it via accessors we no-op, so null is safe. That argument
+    // holds because this object is only ever reached in COMPATIBLE mode,
+    // where every accessor is still a native; under `--jdk-only` this
+    // function is not on the path at all. See the doc comment — the
+    // difference matters, because "run `<init>` here" reads like the fix and
+    // was measured to change nothing.
     ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_LOGGER_REGISTRY, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
