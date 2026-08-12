@@ -100,6 +100,11 @@
 //! `Compatible` is untouched, and not by argument: a `SyntheticStub` registers
 //! and dispatches normally in `Compatible`, so all four natives still answer
 //! there exactly as they did, over records the JUL bridge already stamped.
+//! Retiring them in BOTH modes would have been a regression, and that is
+//! measured too: probes/SrcProbe4.java runs `CallerFinder` at `inferCaller`'s
+//! real depth and gets `EMPTY` under `--real-jdk`, because the native chain
+//! leaves no `java.util.logging.Logger` frame to trip its latch. Compatible is
+//! correct only via the eager stamp. W7-56-infercaller-strict.md
 //!
 //! # Why this is applied centrally
 //!
