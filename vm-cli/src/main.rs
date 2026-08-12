@@ -6013,6 +6013,89 @@ mod tests {
         );
     }
 
+    /// Both spellings of every JPMS `--add-*` flag must parse, and must not
+    /// swallow the following argument.
+    ///
+    /// HotSpot accepts `--add-opens M/P=T` and `--add-opens=M/P=T` alike. A
+    /// launcher that consumed the NEXT token as part of a space-separated
+    /// value would eat `-cp` and its directory, and the symptom would be
+    /// `Could not find or load main class` — which reads as a broken program
+    /// or a bad classpath, not as a mis-parsed flag. That misreading is not
+    /// hypothetical: W7-56-infercaller-strict.md reported exactly this defect
+    /// and told readers to prefer the `=` spelling on CratonVM. It was wrong;
+    /// re-measured 2026-08-12, all eight combinations below already worked, on
+    /// the then-current binary AND on the pre-merge control. These assertions
+    /// exist so the claim can be settled by running the tests rather than by
+    /// re-deriving it, and so a future arg-parsing change cannot make it true.
+    ///
+    /// The `-cp` and main-class assertions are the load-bearing half: a test
+    /// that only checked the flag's own value would pass against a launcher
+    /// that swallowed the classpath.
+    ///
+    /// Parsed through `normalize_java_launcher_argv`, which is what the real
+    /// launcher does before clap sees anything. Calling `Args::try_parse_from`
+    /// directly is NOT equivalent and would test the wrong thing: clap reads a
+    /// bare `-cp /tmp/cp` as short `-c` with the attached value `p`, so the
+    /// assertion below fails for a reason that has nothing to do with the flag
+    /// under test. Measured while writing this test.
+    #[test]
+    fn add_star_flags_accept_both_spellings_without_eating_the_next_arg() {
+        // (flag, value, accessor label) — one row per JPMS add-* flag.
+        let cases: &[(&str, &str)] = &[
+            ("--add-opens", "java.logging/java.util.logging=ALL-UNNAMED"),
+            ("--add-exports", "java.base/java.lang=ALL-UNNAMED"),
+            ("--add-reads", "java.logging=ALL-UNNAMED"),
+            ("--add-modules", "java.logging"),
+        ];
+        for (flag, value) in cases {
+            // Space-separated: `--flag VALUE -cp DIR Main`
+            let spaced = Args::try_parse_from(normalize_java_launcher_argv(tokens(&[
+                "cratonvm", flag, value, "-cp", "/tmp/cp", "Main",
+            ])))
+            .unwrap_or_else(|e| panic!("clap must accept `{flag} {value}`: {e}"));
+
+            // Joined: `--flag=VALUE -cp DIR Main`
+            let joined_flag = format!("{flag}={value}");
+            let joined = Args::try_parse_from(normalize_java_launcher_argv(tokens(&[
+                "cratonvm",
+                &joined_flag,
+                "-cp",
+                "/tmp/cp",
+                "Main",
+            ])))
+            .unwrap_or_else(|e| panic!("clap must accept `{joined_flag}`: {e}"));
+
+            for (spelling, parsed) in [("space", &spaced), ("equals", &joined)] {
+                // The flag's own value survived.
+                let got: &[String] = match *flag {
+                    "--add-opens" => &parsed.add_opens,
+                    "--add-exports" => &parsed.add_exports,
+                    "--add-reads" => &parsed.add_reads,
+                    "--add-modules" => &parsed.add_modules,
+                    other => unreachable!("unlisted flag {other}"),
+                };
+                assert_eq!(
+                    got,
+                    &[value.to_string()],
+                    "{flag} ({spelling}) lost or mangled its own value"
+                );
+
+                // ...and, the half that actually catches the reported defect,
+                // the FOLLOWING option was not consumed as part of it.
+                assert_eq!(
+                    parsed.classpath.as_deref(),
+                    Some("/tmp/cp"),
+                    "{flag} ({spelling}) swallowed -cp; this is the defect that                      surfaces as `Could not find or load main class`"
+                );
+                assert_eq!(
+                    parsed.class_name.as_deref(),
+                    Some("Main"),
+                    "{flag} ({spelling}) swallowed the main class"
+                );
+            }
+        }
+    }
+
     /// clap must reject the two mode flags together rather than letting one
     /// silently win.
     #[test]

@@ -98,11 +98,26 @@ JDK 25's constructor ends `needToInferCaller = true` and assigns
 `sequenceNumber = globalSequenceNumber.getAndIncrement()`. The shadow in
 `register_phase54_logging_extras` writes neither.
 
-**Use the `=` spelling on CratonVM.** `--add-opens M/P=T -cp DIR Main` makes the
-launcher swallow the `-cp`, and the run dies with "Could not find or load main
-class" — which reads as a broken probe, not a mis-parsed flag. That cost this
-investigation its first pass: the reflective section fell back to
-`InaccessibleObjectException` and A4 never printed.
+**CORRECTED 2026-08-12 — the launcher parses BOTH spellings correctly.** This
+record originally said `--add-opens M/P=T -cp DIR Main` made the launcher
+swallow the `-cp`, and told readers to prefer the `=` spelling. That is wrong.
+Re-measured on the then-current binary AND on the pre-merge control
+`7d4d545e0`: all eight combinations of {`--add-opens`, `--add-exports`,
+`--add-reads`, `--add-modules`} x {space, `=`} run the main class, and neither
+spelling ever produced "Could not find or load main class" on either binary.
+`normalize_java_launcher_argv` rewrites `-cp` to `--classpath` before clap sees
+it, and every `--add-*` flag is in `VALUE_TAKING_OPTS`.
+
+What almost certainly happened is the ordinary one: the classpath directory did
+not yet hold the compiled probe when that first pass ran, and "Could not find or
+load main class" — which is exactly what an empty classpath produces — was
+attributed to the flag spelling standing next to it. The investigation did lose
+a pass; the cause was not the launcher.
+
+Pinned by `add_star_flags_accept_both_spellings_without_eating_the_next_arg` in
+`vm-cli/src/main.rs`, which asserts the flag's own value AND that `-cp` and the
+main class survive. Mutation-checked: injecting a `--add-opens` arm that
+swallows the following token turns it red.
 
 ## Why the table entry for the constructor was inert
 
@@ -203,6 +218,8 @@ which reaches the same flag through the shadow. That fallback is strictly worse
   `phases_early.rs`, exactly like the constructor was. They are not retired here
   because they currently answer correctly and this vector does not implicate
   them — but the table says something about them that is not true today.
-* CratonVM's launcher mis-parses the space-separated `--add-opens M/P=T` form,
-  swallowing the following argument. Reproduced above; not this vector's
-  business.
+* ~~CratonVM's launcher mis-parses the space-separated `--add-opens M/P=T`
+  form, swallowing the following argument.~~ **RETRACTED 2026-08-12.** It does
+  not; see the correction above. Both spellings were re-measured on this binary
+  and on the pre-merge control, for all four `--add-*` flags, and a regression
+  test now pins it.
