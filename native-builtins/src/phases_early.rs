@@ -7551,20 +7551,21 @@ pub(crate) fn register_currency_natives(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(digits)))
     });
+    // W7-80: the real body is
+    // `getSymbol(Locale.getDefault(Locale.Category.DISPLAY))`, so this answer is
+    // locale-sensitive — `RUB` renders `₽` on a ru host and the bare code `RUB`
+    // on an en one. It used to be a locale-INDEPENDENT four-entry table: right
+    // for USD/EUR/GBP/JPY in every locale, and the bare ISO code for everything
+    // else in every locale. Shares `cldr_currency_symbol` with the 1-arg
+    // overload in `locale_resources`, so the two call forms cannot drift.
     r.register(c, "getSymbol", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let code = match ctx.get_field(this, 0) {
             Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
             _ => String::new(),
         };
-        let sym = match code.as_str() {
-            "USD" => "$",
-            "EUR" => "\u{20AC}",
-            "GBP" => "\u{00A3}",
-            "JPY" => "\u{00A5}",
-            _ => &code,
-        };
-        let s = ctx.create_string(sym);
+        let sym = crate::locale_resources::currency_symbol_for_default_locale(ctx, &code);
+        let s = ctx.create_string(&sym);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(c, "getDisplayName", "()Ljava/lang/String;", |ctx, args| {
