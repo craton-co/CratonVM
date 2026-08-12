@@ -561,6 +561,7 @@ fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry
         Vec::new(),
         method_key,
         Vec::new(),
+        None, // elidable_init_pcs: no constant pool, so nothing is proven empty
     )?;
     compiled
         .oop_maps
@@ -4609,6 +4610,7 @@ fn trusted_oop_receiver_substitution_requires_live_bounds() {
             vec![(2usize, 0u32, true)],
             "T.setRef:(Ljava/lang/Object;)V", // non-empty ⇒ trusted-oop eligible
             Vec::new(),
+            None, // elidable_init_pcs: no constant pool, so nothing is proven empty
         )
         .expect("reference putfield must compile")
     };

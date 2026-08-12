@@ -55,7 +55,7 @@ HotSpot either, so "green" was never the target for them.
 | `AutoScalingEventExecutorChooserFactoryTest` | **1 FAIL** | 7/7 | 7/7 | CratonVM better than the oracle |
 | `DefaultPromiseTest` | 20/20 | 18/20 | 18/20 | JIT-only, not root-caused — see below |
 | `DefaultThreadFactoryTest` | 3 ok, **2 aborted** | 1 fail | 1 fail | accepted divergence — see below |
-| `FastThreadLocalTest` | 13 ok, 3 skipped | HANG | HANG | filed: JIT drops ctor side effects |
+| `FastThreadLocalTest` | 13 ok, 3 skipped | HANG | HANG | JIT ctor-elision **fixed**; throughput wall remains |
 | `NonStickyEventExecutorGroupTest` | 10/10 | 10/10 | 10/10 | flaky under host load only |
 | `PromiseAggregatorTest` | 6/6 | 2/6 | **6/6** | `StackWalker$Option` (fixed) |
 | `PromiseCombinerTest` | 12/12 | 2/12 | **12/12** | `StackWalker$Option` (fixed) |
@@ -114,7 +114,15 @@ HotSpot either, so "green" was never the target for them.
 
 ### Filed separately
 
-4. **`FastThreadLocalTest` — the JIT discards constructor side effects.** See
+4. **`FastThreadLocalTest` — the JIT discards constructor side effects.**
+   **The JIT defect is now FIXED** (2026-08-12, branch
+   `fix/jit-ctor-side-effects-20260812`): the elidable-`<init>` decision is
+   taken from the constant-pool resolver that checks the constructor BODY
+   rather than from its descriptor, across all three compile doors. The netty
+   counter now advances correctly (1 000 000 of 1 000 000 constructor calls,
+   was 11 000). **The class still times out**, exactly as predicted below — its
+   loop is ~2.1 billion iterations by construction, so what is left is a
+   throughput item, not a correctness one. Full write-up in
    [jit-elided-constructor-side-effects-20260812.md](jit-elided-constructor-side-effects-20260812.md).
    `is_trivial_void_init` in `jit/src/x64/driver.rs` is computed from the
    constructor's *signature* alone, so any no-arg `()V` constructor is treated

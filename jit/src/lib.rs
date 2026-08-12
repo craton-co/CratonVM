@@ -18515,6 +18515,25 @@ fn try_compile_inner(
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
+    // The single-pass backend may elide an `<init>` only where the constant-pool
+    // resolver PROVED the constructor body empty — the same
+    // `cp_elidable_init_resolver` the IR builder uses for its `trivial_init_pcs`
+    // (see `set_new_info` above). Without a resolver the set is `None` and the
+    // backend elides nothing, which is the safe direction.
+    //
+    // Deriving it from the descriptor instead is the miscompile fixed here: a
+    // no-arg constructor that writes global state had that write dropped once
+    // the method was compiled. See
+    // `docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md`.
+    let elidable_init_pcs: Option<std::collections::HashSet<usize>> =
+        cp_elidable_init_resolver.map(|resolver| {
+            scan.invoke_ops
+                .iter()
+                .filter(|&&(_, _, opcode)| opcode == 0xb7)
+                .filter(|&&(_, cp_idx, _)| resolver(cp_idx))
+                .map(|&(pc, _, _)| pc)
+                .collect()
+        });
     note_jit_pipeline_stage(JIT_STAGE_SINGLE_PASS);
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
@@ -18554,6 +18573,7 @@ fn try_compile_inner(
         compact_field_info,
         &despec_method_key,
         indy_info,
+        elidable_init_pcs,
     )?;
     drop(metrics_single_pass);
 

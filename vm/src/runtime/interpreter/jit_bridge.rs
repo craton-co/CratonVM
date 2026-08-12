@@ -983,6 +983,13 @@ pub(super) fn compile_osr_artifact(
             // elidable `C.<init>()V` AS `java/lang/Object.<init>` so the codegen
             // elision drops the per-object dispatch; else the real dispatch info.
             // (See the `execute` path for the soundness argument.)
+            // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+            // backend may elide only these; a no-arg constructor that is NOT proven empty
+            // keeps both its allocation and its call, because eliding it would drop
+            // whatever the body writes to global state (see
+            // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+            let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
                 let elidable = shared
                     .load_class_concurrent(&tclass)
@@ -992,6 +999,9 @@ pub(super) fn compile_osr_artifact(
                         is_elidable_construction(shared, &cm2, tid)
                     })
                     .unwrap_or(false);
+                if elidable {
+                    elidable_init_pcs.insert(pc);
+                }
                 let info_class: &str = if elidable {
                     "java/lang/Object"
                 } else {
@@ -1332,6 +1342,7 @@ pub(super) fn compile_osr_artifact(
                 // inert in production (empty registry).
                 &format!("{class_name}.{method_name}:{method_descriptor}"),
                 indy_info,
+                Some(elidable_init_pcs),
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
