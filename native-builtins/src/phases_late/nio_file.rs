@@ -5891,8 +5891,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
             // Legacy synthetic fallback (only if the real FileChannelImpl
             // construction is unavailable — keeps prior behavior intact).
-            let fc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1)?;
-            ctx.set_field(fc, 0, Value::Int(fd_id as i32));
+            //
+            // This is the ONE producer of a literal `java/nio/channels/FileChannel`
+            // that is live in real-JDK mode: `native_fc_open` is dropped there by
+            // the `drop_real_layout_synthetic` filter in `native-api`'s registry,
+            // scoped to `open` by name. The width and the slot both come from
+            // `synthetic_file_channel` so this fallback and every accessor in both
+            // crates share one map — W7-72-ssc-socket-and-filechannel.md. Writing
+            // the fd into slot 0 here used to put an `Int` in the real `closeLock`
+            // reference, where the descriptor coercion degraded it to null and the
+            // fd was lost outright.
+            let fc_slots = cratonvm_native_api::synthetic_file_channel::alloc_slots(ctx);
+            let fc =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", fc_slots)?;
+            cratonvm_native_api::synthetic_file_channel::set_fd_value(
+                ctx,
+                fc,
+                Value::Int(fd_id as i32),
+            );
             Ok(Some(Value::Object(Some(fc))))
         },
     );
@@ -5907,7 +5923,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let fc_cls = "java/nio/channels/FileChannel";
     r.register(fc_cls, "size", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
+        let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
             Value::Int(v) if v >= 0 => v as u32,
             _ => return Ok(Some(Value::Long(0))),
         };
@@ -5916,7 +5932,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(fc_cls, "position", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
+        let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
             Value::Int(v) if v >= 0 => v as u32,
             _ => return Ok(Some(Value::Long(0))),
         };
@@ -5936,7 +5952,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let fd_id = match ctx.get_field(this, 0) {
+            let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
                 Value::Int(v) if v >= 0 => v as u32,
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
@@ -5967,26 +5983,49 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
             return Ok(None);
         }
-        if let Value::Int(v) = ctx.get_field(this, 0) {
+        if let Value::Int(v) = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
             if v >= 0 {
                 let _ = ctx.fd_table().close(v as u32);
             }
         }
+        // Mark the REAL `AbstractInterruptibleChannel.closed` field, exactly as
+        // the foreign-receiver arm above does. It is the field `isOpen()` — ours
+        // and the JDK's — reads, and it is now free to hold the truth: the file
+        // position used to occupy it (W7-72-ssc-socket-and-filechannel.md), which
+        // is why the old body could not use it and answered a constant instead.
+        // A no-op on a fabricated stub that declares no such field, which is the
+        // synthetic-JDK arm's previous behaviour unchanged.
+        cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, this, Value::Int(-1));
+        ctx.set_field_by_name(this, "closed", Value::Int(1));
         Ok(None)
     });
+    // isOpen()Z — THE WINNING REGISTRATION for this triple, in every build and
+    // every mode. `register_phase57_file_channel` registers it too, later within
+    // `register_phase57_natives`, but that registrar is reachable only from
+    // `register_synthetic_overrides` (`#[cfg(feature = "synthetic-jdk")]`), and
+    // even in the synthetic arm `vm_init.rs` calls THIS registrar again
+    // afterwards. Ordering derivation: W7-72-ssc-socket-and-filechannel.md.
+    //
+    // One body for both receiver kinds, deliberately. `!closed` is what the real
+    // `AbstractInterruptibleChannel.isOpen()` bytecode answers, and now that no
+    // native writes the file position into `closed` the synthetic channel can be
+    // asked the same question as a real one. The old literal-class arm returned a
+    // constant `1`, so `close(); isOpen()` reported the channel open forever.
+    //
+    // Safe in BOTH directions, which is the property to preserve if this is ever
+    // touched again: an ordinary open channel has `closed` unset and answers
+    // TRUE (nothing writes that field except `close()`), and a closed one answers
+    // FALSE. It does NOT consult the fd, so a channel minted without one cannot
+    // be reported closed by mistake.
     r.register(fc_cls, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                    0
-                } else {
-                    1
-                },
-            )));
-        }
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                0
+            } else {
+                1
+            },
+        )))
     });
     // write(ByteBuffer)I — `FileChannel.write` is abstract; cassandra's
     // BufferedDataOutputStreamPlus.doFlush drives a synthetic FileChannel
@@ -5994,7 +6033,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // field 0 = backing array, 1 = position, 2 = limit.
     r.register(fc_cls, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
+        let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
             Value::Int(v) if v >= 0 => v as u32,
             _ => {
                 return Err(RuntimeError::IOException {
@@ -6031,7 +6070,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // read(ByteBuffer)I — counterpart of write above.
     r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
+        let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
             Value::Int(v) if v >= 0 => v as u32,
             _ => return Ok(Some(Value::Int(-1))),
         };
@@ -14596,7 +14635,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // position()J
     r.register(fc, "position", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         if fd_id < 0 {
             return Err(p57_closed_channel(ctx));
         }
@@ -14616,7 +14655,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(J)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let pos = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
@@ -14649,7 +14688,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // size()J
     r.register(fc, "size", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         if fd_id < 0 {
             return Err(p57_closed_channel(ctx));
         }
@@ -14669,7 +14708,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(J)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let new_len = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
@@ -14701,7 +14740,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // read(ByteBuffer)I
     r.register(fc, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         // Was `Ok(Int(-1))`. `-1` from a channel read is the end-of-file
         // indication, so a read of a CLOSED channel was reported as a clean,
         // complete end of stream: every copy loop of the form
@@ -14751,7 +14790,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // write(ByteBuffer)I
     r.register(fc, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         if fd_id < 0 {
             return Err(p57_closed_channel(ctx));
         }
@@ -14791,7 +14830,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // read(ByteBuffer, long position)I — positional read
     r.register(fc, "read", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         let position = match args.get(2) {
             Some(Value::Long(v)) => *v,
             _ => 0,
@@ -14850,7 +14889,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // write(ByteBuffer, long position)I — positional write
     r.register(fc, "write", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         let position = match args.get(2) {
             Some(Value::Long(v)) => *v,
             _ => 0,
@@ -14907,7 +14946,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(JJLjava/nio/channels/WritableByteChannel;)J",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let position = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
@@ -15054,7 +15093,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/channels/ReadableByteChannel;JJ)J",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let src = match args.get(1) {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
@@ -15181,7 +15220,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // force(boolean metadata)V
     r.register(fc, "force", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         // FIX (finding 2): honor durability instead of being a silent no-op.
         // `clone_file` flushes any buffered writer for the fd and hands back a
         // std::fs::File referring to the same kernel file; sync_data/sync_all then
@@ -15238,29 +15277,38 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
             return Ok(None);
         }
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this)
+            .as_int()
+            .unwrap_or(-1);
         if fd_id >= 0 {
             let _ = ctx.fd_table().close(fd_id as u32);
-            ctx.set_field(this, 0, Value::Int(-1));
+            cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, this, Value::Int(-1));
         }
+        ctx.set_field_by_name(this, "closed", Value::Int(1));
         Ok(None)
     });
 
-    // isOpen()Z
+    // isOpen()Z — the LOSING copy of this triple. `register_phase57_nio_file`
+    // registers it too and runs LAST in every configuration
+    // (W7-72-ssc-socket-and-filechannel.md), so nothing here is reachable.
+    //
+    // It is kept in step with the winner rather than left to rot, and that is
+    // the point: the two bodies used to DISAGREE — this one answered `fd >= 0`
+    // and the winner answered a constant `1` — which is how a reader could
+    // conclude that moving the private slot map would make `isOpen()` false for
+    // every open channel. Now both answer `!closed`, so the last-write-wins
+    // outcome for this triple is no longer load-bearing at all. An inert
+    // registration that disagrees with the live one is a trap for the next
+    // reader, not a saving.
     r.register(fc, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                    0
-                } else {
-                    1
-                },
-            )));
-        }
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                0
+            } else {
+                1
+            },
+        )))
     });
     r.set_category(__prev_cat);
 }
