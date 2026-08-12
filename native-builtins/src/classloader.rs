@@ -2548,7 +2548,11 @@ pub(crate) fn proxy_hidden_from(
 /// NEVER a class some OTHER loader happens to have loaded. Does NOT trigger
 /// loading.
 ///
-/// For a built-in loader the global loaded-class set is the right answer. For a
+/// For a built-in loader the global loaded-class set is the right answer —
+/// EXCEPT for a bare `java.net.URLClassLoader`, which is a JDK class but a
+/// user-defined loader and takes the user-defined path below for every
+/// non-proxy name (W7-82 / W7-87; see the long comment in
+/// `find_loaded_class_for_loader_inner`). For a
 /// user-defined loader, a class counts as "loaded by this loader" if either:
 ///   1. it lives in this loader's own namespace (a distinct copy this loader
 ///      defined — the override-first redefinition case), or
@@ -2642,58 +2646,66 @@ fn find_loaded_class_for_loader_inner(
     internal_name: &str,
     is_user_defined: bool,
 ) -> Option<ObjectRef> {
-    if !is_user_defined {
-        // W7-82. `is_user_defined_loader` answers "is the loader's CLASS a JDK
-        // loader class", and `is_builtin_loader_class` lists
-        // `java/net/URLClassLoader` among them. But `URLClassLoader` is the one
-        // entry on that list with a PUBLIC constructor — `java/lang/ClassLoader`
-        // is abstract and `java/security/SecureClassLoader`'s constructors are
-        // protected, so an instance of either is necessarily a user subclass
-        // with a user class name. A bare `new URLClassLoader(urls, parent)` is
-        // therefore a JDK class but a genuinely USER-DEFINED loader, and the
-        // namespace allocator already says so: `loader_namespace_id_at` and
-        // `peek_loader_namespace_id` both spell their guard
-        // `!is_user_defined_loader(..) && !is_bare_url_class_loader(..)`, so a
-        // bare `URLClassLoader` DEFINES into its own namespace id (>= 3).
-        //
-        // Only this function was left out of that carve-out, and the two halves
-        // then disagreed: the loader defined into namespace 3 and the built-in
-        // branch below hid namespace-3 classes from it ("JVMS 5.3: a built-in
-        // loader never counts as having loaded a class a user-defined loader
-        // defined") — from the very loader that had defined them. The class was
-        // never re-defined; the CACHE PROBE went blind, so every later lookup
-        // re-drove `define_class_full`, which correctly rejected the duplicate
-        // with `IncompatibleClassChangeError: class X already defined by
-        // user-defined(3) loader`. `ucl_try_define_local_class` calls this
-        // function at FOUR sites — the pre-check, the double-checked probe under
-        // the define lock, and both post-define "we merely lost the race, return
-        // the winner's class" recovery arms — so one blind probe defeated four
-        // correct recoveries, and a second `Class.forName(name, true, loader)`
-        // through a bare `URLClassLoader` surfaced as `ClassFormatError` out of
-        // `URLClassLoader.findClass`. HotSpot returns the cached class.
-        //
-        // Answered here as a strictly ADDITIVE probe rather than by flipping the
-        // branch: both questions below are "did THIS loader define it", the
-        // strongest identity statement available, and neither can return some
-        // other loader's copy. A `None` from either still falls through to the
-        // built-in branch exactly as before, so no answer this function used to
-        // give changes — only answers it used to withhold from a loader asking
-        // about its own class. (The branch's OTHER half — a bare
-        // `URLClassLoader` seeing app-namespace classes through the global
-        // fallback below, where HotSpot's `findLoadedClass` would report null
-        // until this loader had initiated the load — is a separate axis and is
-        // deliberately left alone; see the named residual in
-        // W7-82-forname-duplicate-define.md.)
-        if is_bare_url_class_loader(ctx, this) {
-            if let Some(id) = peek_loader_namespace_id(ctx, this) {
-                if let Some(cid) = ctx.class_id_defined_by_loader_exact(internal_name, id) {
-                    return Some(ctx.get_class_mirror(cid));
-                }
-            }
-            if let Some(cid) = class_defined_by_this_loader_object(ctx, this, internal_name) {
-                return Some(ctx.get_class_mirror(cid));
-            }
-        }
+    // W7-82 / W7-87 — the bare-`URLClassLoader` carve-out, both halves.
+    //
+    // `is_user_defined_loader` answers "is the loader's CLASS a JDK loader
+    // class", and `is_builtin_loader_class` lists `java/net/URLClassLoader`
+    // among them. But `URLClassLoader` is the one entry on that list with a
+    // PUBLIC constructor — `java/lang/ClassLoader` is abstract and
+    // `java/security/SecureClassLoader`'s constructors are protected, so an
+    // instance of either is necessarily a user subclass carrying a user class
+    // name. A bare `new URLClassLoader(urls, parent)` is therefore a JDK class
+    // but a genuinely USER-DEFINED loader, and the namespace allocator already
+    // says so: `loader_namespace_id_at` and `peek_loader_namespace_id` both
+    // spell their guard `!is_user_defined_loader(..) &&
+    // !is_bare_url_class_loader(..)`, so a bare `URLClassLoader` DEFINES into
+    // its own namespace id (>= 3).
+    //
+    // This function was the one site left out of that carve-out, and the two
+    // halves then disagreed in BOTH directions.
+    //
+    // W7-82 closed the first. The built-in branch's "a built-in loader never
+    // counts as having loaded a class a user-defined loader defined" clause
+    // (`loader_id_of_class(cid) > 2 -> None`) hid namespace-3 classes from the
+    // very loader that had defined them, so the cache probe went blind, every
+    // later lookup re-drove `define_class_full`, and a second
+    // `Class.forName(name, true, loader)` surfaced as `ClassFormatError: ...
+    // already defined by user-defined(3) loader` where HotSpot returns the
+    // cached class.
+    //
+    // W7-87 closes the second — this branch's OTHER half. The GLOBAL FALLBACK
+    // below also answered a bare `URLClassLoader` with any APPLICATION-namespace
+    // class of that name: one it never defined and was never asked to load.
+    // Measured against HotSpot 25: `new URLClassLoader(urls, null)
+    // .loadClass("SomeAppClass")` returned the application loader's class where
+    // HotSpot raises `ClassNotFoundException`, and `findLoadedClass` reported it
+    // where HotSpot reports null. `new URLClassLoader(urls, null)` is THE
+    // isolating-loader idiom, so the fallback silently defeated the isolation
+    // the loader was constructed for — and `ucl_try_define_local_class`'s own
+    // doc comment already named the rule it was breaking ("would let a
+    // `URLClassLoader(urls, null)` resolve application classes its own (failed)
+    // URL search should have hidden from it"). A `URLClassLoader` SUBCLASS was
+    // correct throughout, on both arms: one line of `extends` decided it.
+    //
+    // So a bare `URLClassLoader` now takes the USER-DEFINED branch below
+    // outright — exactly the predicate the namespace allocator uses. That
+    // branch's steps 1 and 2 ARE W7-82's two additive probes, verbatim, so
+    // nothing that half fixed is given up; what changes is that a miss now ends
+    // in `None` instead of the global fallback. Unlike W7-82 this direction is
+    // a NARROWING, with real blast radius — see
+    // W7-87-urlclassloader-namespace-asymmetry.md.
+    //
+    // ONE case stays on the built-in branch: a GENERATED PROXY name. That arm is
+    // already loader-identity- and delegation-aware (`proxy_hidden_from` ->
+    // `loader_can_see_defining`), so it is not a leak, and
+    // `classloader_real::load_class_visible_to` short-circuits proxy resolution
+    // to this function BEFORE parent delegation runs — dropping it here would
+    // turn a proxy a bare `URLClassLoader` can legitimately see through its
+    // parent into a `ClassNotFoundException`. One axis at a time; proxy
+    // visibility is not this lane's.
+    let takes_builtin_branch = !is_user_defined
+        && (is_generated_proxy_name(internal_name) || !is_bare_url_class_loader(ctx, this));
+    if takes_builtin_branch {
         return ctx.class_id_by_name(internal_name).and_then(|cid| {
             // A generated proxy is checked via `proxy_hidden_from` — loader-identity
             // and delegation aware — REGARDLESS of `loader_id_of_class(cid)`. Proxy
@@ -11735,6 +11747,55 @@ mod classloader_tests {
             find_loaded_class_for_loader(&mut ctx, loader, "aux/Foreign").is_none(),
             "a bare URLClassLoader must NOT see a user-namespace class another \
              loader defined"
+        );
+    }
+
+    /// W7-87 — the NARROWING half. `loader_id_of_class(cid) > 2 -> hide` only
+    /// ever hid USER-namespace classes; the built-in branch's global fallback
+    /// still handed a bare `URLClassLoader` any APPLICATION-namespace class of
+    /// that name, one it never defined and was never asked to load. HotSpot 25
+    /// answers `null` (`findLoadedClass`) / `ClassNotFoundException`
+    /// (`loadClass`) — measured, not assumed. A bare `new URLClassLoader(urls,
+    /// null)` is THE isolating-loader idiom, so this fallback defeated the
+    /// isolation it was constructed for.
+    ///
+    /// The receiver here is a BARE `java/net/URLClassLoader` on purpose: the
+    /// 2026-07-01 commit that produced W7-82 shipped two tests that instantiate
+    /// `java/lang/ClassLoader`, and that is exactly why the case went unseen for
+    /// six weeks. A `URLClassLoader` SUBCLASS was always correct — it is
+    /// `is_user_defined_loader` and has no global fallback — so a test written
+    /// against a subclass cannot fail here.
+    #[test]
+    fn test_bare_url_class_loader_does_not_see_an_app_namespace_class_it_never_loaded() {
+        let mut ctx = MockNativeContext::new();
+        let loader = match ctx.new_object("java/net/URLClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected classloader object, got {other:?}"),
+        };
+        let cid = ctx.ensure_class_initialized("app/Ordinary").unwrap();
+        // Application namespace, no registered defining loader: an ordinary
+        // classpath class the application loader owns. `> 2` never fired for
+        // this, so the global fallback used to return it.
+        ctx.set_loader_id_override(cid, 2);
+
+        assert!(
+            find_loaded_class_for_loader(&mut ctx, loader, "app/Ordinary").is_none(),
+            "a bare URLClassLoader must NOT see an application-namespace class \
+             it neither defined nor was asked to load; HotSpot's findLoadedClass \
+             reports null and its loadClass raises ClassNotFoundException"
+        );
+        // The CONTROL, in the same shape: a genuine built-in loader still sees
+        // it. `test_builtin_find_loaded_class_keeps_application_namespace_hit`
+        // asserts this independently and is deliberately left untouched; if the
+        // narrowing had escaped its carve-out, that test would go red too.
+        let builtin = match ctx.new_object("java/lang/ClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected classloader object, got {other:?}"),
+        };
+        assert!(
+            find_loaded_class_for_loader(&mut ctx, builtin, "app/Ordinary").is_some(),
+            "the narrowing is scoped to java/net/URLClassLoader; a genuine \
+             built-in loader must keep its global fallback"
         );
     }
 

@@ -19,13 +19,30 @@ import java.nio.file.Files;
  * object of the same name passes "did not throw" while being just as broken.
  * Every repeat check here asserts {@code ==}.
  *
- * The last group is the OVER-CORRECTION guard: a genuine duplicate
+ * Group 7 is the OVER-CORRECTION guard: a genuine duplicate
  * {@code defineClass} of one name into one loader must STILL raise a
  * {@code LinkageError}. Without it, "fix" the repeat-lookup bug by deleting the
  * duplicate-define check and everything else here still passes.
  *
+ * <p>W7-87 added the OTHER half of the same predicate asymmetry, and it points
+ * the opposite way: a bare {@code URLClassLoader} must NOT see an
+ * application-namespace class it neither defined nor was ever asked to load.
+ * Group 6 used to pin only the delegating {@code forName} answer (which is
+ * HotSpot-correct and unchanged); it now also pins what {@code findLoadedClass}
+ * reports there, and group 8 drives the isolating shape —
+ * {@code new URLClassLoader(urls, null)} — end to end. Both were measured
+ * against HotSpot 25 before being written down.
+ *
  * Usage: {@code ForNameCacheProbe <auxDir>} where {@code auxDir} holds only
  * {@code ForNameCacheProbeTarget.class} and is OFF the application classpath.
+ *
+ * <p>REQUIRES {@code --add-opens java.base/java.lang=ALL-UNNAMED}.
+ * {@code ClassLoader.findLoadedClass} is {@code protected}, and the whole point
+ * of groups 6 and 8 is that a bare {@code java.net.URLClassLoader} behaves
+ * differently from a SUBCLASS — so exposing it through a subclass would test the
+ * arm that was never broken. Reflection keeps the receiver bare. If the flag is
+ * missing the probe FAILS rather than skipping: a silent skip is a vacuous
+ * green, and this is exactly the check that has to be able to fail.
  */
 public final class ForNameCacheProbe {
 
@@ -97,10 +114,29 @@ public final class ForNameCacheProbe {
         // rather than to bootstrap. The class is then an INITIATED (not defined)
         // class of the child, which is the record HotSpot's forName consults.
         URLClassLoader l3 = new URLClassLoader("l3", new URL[0], app);
+        // W7-87. BEFORE any load: `findLoadedClass` must report NOTHING. This
+        // loader has defined nothing and has never been asked for anything, so
+        // on HotSpot 25 it is neither a defining nor an initiating loader of any
+        // name — MEASURED, both for an already-loaded application class and for
+        // an already-loaded bootstrap class. CratonVM answered both of them with
+        // the application/bootstrap class through the built-in branch's global
+        // fallback, because `is_builtin_loader_class` lists
+        // `java/net/URLClassLoader`. This group PINNED that wrong answer while
+        // W7-82 settled the other half; these two lines are the pin, flipped to
+        // HotSpot's value. See W7-87-urlclassloader-namespace-asymmetry.md.
+        flcIsNull("group6", l3, "ForNameCacheProbe", "an app class it never initiated");
+        flcIsNull("group6", l3, "java.lang.String", "a boot class it never initiated");
         Class<?> f1 = forName("ForNameCacheProbe", l3, "group6.delegating.first");
         Class<?> f2 = forName("ForNameCacheProbe", l3, "group6.delegating.second");
         identical("group6", "forName x2 / delegating child loader", f1, f2);
         identical("group6", "delegating child returns the parent's class", f1, ForNameCacheProbe.class);
+        // The OBVIOUS over-correction: hiding the app class from the cache probe
+        // must not stop parent-first delegation from finding it. `loadClass` is
+        // asserted separately from `forName` because they reach the VM by
+        // different roads.
+        Class<?> f3 = loadClass(l3, "ForNameCacheProbe", "group6.delegating.loadClass");
+        identical("group6", "loadClass through the delegating child agrees",
+                f3, ForNameCacheProbe.class);
 
         // ---- Group 7: OVER-CORRECTION GUARD. A genuine duplicate defineClass
         // of the same name into one loader is a LinkageError, still.
@@ -135,10 +171,140 @@ public final class ForNameCacheProbe {
                     g1, g3);
         }
 
+        // ---- Group 8: W7-87. THE ISOLATING LOADER.
+        // `new URLClassLoader(urls, null)` — a private URL search path and a
+        // BOOTSTRAP parent — is the standard idiom for building a loader that
+        // deliberately cannot see the application classpath (Spring Boot's
+        // ModifiedClassPathClassLoader, javax.tools test harnesses, plugin
+        // containers). On HotSpot 25 it raises ClassNotFoundException for an
+        // application class, whatever the application loader has already loaded.
+        // CratonVM answered with the application loader's class, so the
+        // isolation the loader was constructed for did not exist.
+        //
+        // The name asked for below is `ForNameCacheProbe` itself, which the
+        // application loader is certainly holding — that is the point. Asking
+        // for a never-loaded name would pass on a leaky VM too, which is why the
+        // "app loader has it" side is asserted first.
+        URLClassLoader iso = new URLClassLoader("iso", new URL[] { auxUrl }, null);
+        check("group8", "the app loader really does hold this class",
+                ForNameCacheProbe.class.getClassLoader() == app);
+        flcIsNull("group8", iso, "ForNameCacheProbe", "an app class it never initiated");
+        throwsCnfe("group8", "loadClass of an app class through an isolating loader",
+                () -> iso.loadClass("ForNameCacheProbe"));
+        throwsCnfe("group8", "forName of an app class through an isolating loader",
+                () -> Class.forName("ForNameCacheProbe", false, iso));
+
+        // ANTI-VACUITY for the three above: the loader is isolated, not broken.
+        // Bootstrap delegation is NOT narrowed, and its own URL path still works.
+        Class<?> h1 = loadClass(iso, "java.util.zip.CRC32", "group8.bootDelegation");
+        check("group8", "an isolating loader still delegates to bootstrap",
+                h1 != null && h1.getClassLoader() == null);
+        Class<?> h2 = forName(TARGET, iso, "group8.ownUrlPath.first");
+        Class<?> h3 = forName(TARGET, iso, "group8.ownUrlPath.second");
+        identical("group8", "an isolating loader still defines from its OWN urls", h2, h3);
+        check("group8", "...and owns the result", h2 != null && h2.getClassLoader() == iso);
+        // W7-82's half, restated as a regression guard against the OBVIOUS
+        // over-correction: narrowing the global fallback must not re-hide the
+        // loader's OWN class from it.
+        flcIs("group8", iso, TARGET, h2, "its own defined class");
+
+        // The DISCRIMINATOR, now inverted into an invariant. Before W7-87 a
+        // `URLClassLoader` SUBCLASS answered all four of these correctly and a
+        // BARE instance did not — one line of `extends` decided it. They must
+        // now agree. (A test written against the subclass alone cannot fail
+        // here, which is precisely how the bare case survived six weeks.)
+        URLClassLoader isoSub = new SubLoader("isoSub", new URL[] { auxUrl }, null);
+        flcIsNull("group8", isoSub, "ForNameCacheProbe", "subclass control");
+        throwsCnfe("group8", "loadClass of an app class through an isolating SUBCLASS",
+                () -> isoSub.loadClass("ForNameCacheProbe"));
+        Class<?> h4 = forName(TARGET, isoSub, "group8.subclass.ownUrlPath");
+        check("group8", "the subclass defines its own copy too",
+                h4 != null && h4.getClassLoader() == isoSub);
+        distinct("group8", "bare and subclass isolating loaders stay distinct", h2, h4);
+
         System.out.println("PROBE result=" + (failures == 0 ? "OK" : "FAILED(" + failures + ")"));
         if (failures != 0) {
             System.exit(1);
         }
+    }
+
+    /**
+     * A plain {@code URLClassLoader} SUBCLASS. It adds nothing — the single
+     * {@code extends} is the whole experiment (W7-82's discriminator, W7-87's
+     * control).
+     */
+    private static final class SubLoader extends URLClassLoader {
+        SubLoader(String name, URL[] urls, ClassLoader parent) {
+            super(name, urls, parent);
+        }
+    }
+
+    @FunctionalInterface
+    private interface Thrower {
+        Object run() throws Exception;
+    }
+
+    /**
+     * {@code ClassLoader.findLoadedClass} on an arbitrary receiver. Resolved
+     * reflectively and ONCE; a failure here is reported as a failed check on
+     * every call site rather than silently skipped, because "the probe could not
+     * ask the question" and "the VM gave the right answer" must never look alike.
+     */
+    private static Method findLoadedClass;
+    private static String findLoadedClassError;
+
+    static {
+        try {
+            findLoadedClass = ClassLoader.class.getDeclaredMethod("findLoadedClass", String.class);
+            findLoadedClass.setAccessible(true);
+        } catch (Throwable t) {
+            findLoadedClass = null;
+            findLoadedClassError = t.getClass().getName() + ": " + t.getMessage()
+                    + " (rerun with --add-opens java.base/java.lang=ALL-UNNAMED)";
+        }
+    }
+
+    private static Object flc(String group, ClassLoader cl, String name) {
+        if (findLoadedClass == null) {
+            fail(group, "findLoadedClass is not reachable: " + findLoadedClassError);
+            return Boolean.FALSE; // a value no assertion below can accept
+        }
+        try {
+            return findLoadedClass.invoke(cl, name);
+        } catch (Throwable t) {
+            fail(group, "findLoadedClass(" + name + ") threw " + t);
+            return Boolean.FALSE;
+        }
+    }
+
+    /** HotSpot: {@code null} unless this loader defined or initiated {@code name}. */
+    private static void flcIsNull(String group, ClassLoader cl, String name, String what) {
+        Object r = flc(group, cl, name);
+        check(group, cl.getName() + ".findLoadedClass(" + name + ") is null -- " + what
+                + (r instanceof Class ? " [got " + idOf((Class<?>) r) + "]" : ""), r == null);
+    }
+
+    private static void flcIs(String group, ClassLoader cl, String name, Class<?> expected,
+            String what) {
+        Object r = flc(group, cl, name);
+        check(group, cl.getName() + ".findLoadedClass(" + name + ") == " + what,
+                expected != null && r == expected);
+    }
+
+    private static void throwsCnfe(String group, String what, Thrower t) {
+        Object got;
+        try {
+            got = t.run();
+        } catch (ClassNotFoundException expected) {
+            pass(group, what + " raised ClassNotFoundException");
+            return;
+        } catch (Throwable other) {
+            fail(group, what + " raised " + other.getClass().getName()
+                    + " (must be ClassNotFoundException): " + other.getMessage());
+            return;
+        }
+        fail(group, what + " must raise ClassNotFoundException, returned "
+                + (got instanceof Class ? idOf((Class<?>) got) : String.valueOf(got)));
     }
 
     /** A loader that defines exactly what it is told to, twice on demand. */
