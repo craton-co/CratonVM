@@ -675,8 +675,35 @@ fn spawn_child(
     redirects: &ProcessRedirects,
 ) -> Result<SpawnedChild, MethodCallFailed> {
     if program.is_empty() {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "ProcessBuilder: empty program".to_string(),
+        // HotSpot does NOT pre-validate the program name here. `ProcessBuilder.start`
+        // hands `command[0]` straight to `ProcessImpl.create`, the OS refuses it, and
+        // the failure surfaces as an `IOException` naming the empty program:
+        //
+        //   HotSpot 25 (Windows): java.io.IOException: Cannot run program "":
+        //                         CreateProcess error=87, <localized>
+        //   HotSpot 25 (Unix):    java.io.IOException: Cannot run program "":
+        //                         error=2, No such file or directory
+        //
+        // We refused with `IllegalArgumentException`, which is not an `IOException`,
+        // so a caller writing the JDK's own `catch (IOException)` around a spawn --
+        // the only checked exception `start()` declares -- did not catch it and the
+        // error escaped as an unchecked throw. Measured on this host:
+        //   HotSpot  : java.io.IOException: Cannot run program ""...
+        //   CratonVM : java.lang.IllegalArgumentException: ProcessBuilder: empty program
+        //
+        // Both modes were wrong; this is a HotSpot-parity fix, not a mode-keyed one.
+        // regression-suite/src/RJdkProcess.java asserts the TYPE only, because the
+        // OS half of the message is localized and the errno differs per platform.
+        // The OS half is platform-specific: HotSpot reports whatever the spawn
+        // syscall returned. Emitting the Windows text on Unix would be a fresh
+        // divergence in place of the old one, so it is selected per platform.
+        let os_detail = if cfg!(windows) {
+            "CreateProcess error=87, The parameter is incorrect"
+        } else {
+            "error=2, No such file or directory"
+        };
+        return Err(RuntimeError::IOException {
+            message: format!("Cannot run program \"\": {os_detail}"),
         }
         .into());
     }
