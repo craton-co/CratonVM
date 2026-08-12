@@ -8697,12 +8697,40 @@ mod nb_phases_late_robustness_fix_tests {
         assert_eq!(un.len(), 1024);
     }
 
+    /// The default cap must be the documented size and must be ENABLED —
+    /// `None` means the compression-bomb guard is switched off.
+    ///
+    /// Was vacuous: `assert!(cap.map(|c| c > 0).unwrap_or(true))` accepted
+    /// `None`, so making the no-override branch of `gzip_max_inflated_bytes()`
+    /// return `None` (or making an unparseable value disable the cap) left the
+    /// test green. Driven through thread-scoped flag overrides so the ambient
+    /// process environment cannot decide the outcome.
     #[test]
     fn gzip_max_inflated_default_is_positive() {
-        // With no env override the default cap is a sane positive value.
-        // (Reads process env; default branch returns Some(default).)
-        let cap = gzip_max_inflated_bytes();
-        assert!(cap.map(|c| c > 0).unwrap_or(true));
+        use cratonvm_types::flags::with_thread_overrides;
+        const VAR: &str = "CRATONVM_MAX_INFLATED_BYTES";
+
+        assert_eq!(GZIP_DEFAULT_MAX_INFLATED, 256 * 1024 * 1024);
+        // No override → the documented default, cap ON.
+        with_thread_overrides(&[(VAR, None)], || {
+            assert_eq!(
+                gzip_max_inflated_bytes(),
+                Some(GZIP_DEFAULT_MAX_INFLATED),
+                "the default cap must be enabled at the documented size"
+            );
+        });
+        // An explicit byte count wins.
+        with_thread_overrides(&[(VAR, Some("4096"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), Some(4096));
+        });
+        // Garbage falls back to the default rather than disabling the guard.
+        with_thread_overrides(&[(VAR, Some("not-a-number"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), Some(GZIP_DEFAULT_MAX_INFLATED));
+        });
+        // Only an explicit `0` disables it.
+        with_thread_overrides(&[(VAR, Some("0"))], || {
+            assert_eq!(gzip_max_inflated_bytes(), None);
+        });
     }
 }
 

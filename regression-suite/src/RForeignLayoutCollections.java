@@ -54,9 +54,21 @@ import java.util.Set;
  * natives on these classes have no such escape, and this probe is aimed at them.
  *
  * Shape follows `UserImplementorInterceptProbe` / `UserProcessInterceptProbe`:
- * every observable is printed as `key=value` so a run diffs byte-for-byte
- * against real HotSpot, and each subclass counts the calls that reach it, since
- * the previous two probes both found defects the return values alone hid.
+ * every observable is printed as `CK RForeignLayoutCollections key=value` so a
+ * run diffs byte-for-byte against real HotSpot, and each subclass counts the
+ * calls that reach it, since the previous two probes both found defects the
+ * return values alone hid.
+ *
+ * THE PREFIX IS LOAD-BEARING. run.sh's cross-VM extractor is
+ * `grep -aE '^(PASS|CK) '`, so a bare `key=value` line is DELETED before the
+ * diff ever sees it. This vector printed all 42 of its observables that way and
+ * held zero `check()` calls, which reduced it to the constant string
+ * `PASS RForeignLayoutCollections` — a green that survived every possible
+ * answer, including the silent-empty one it exists to catch. Every observable
+ * now carries the prefix AND is asserted locally against the value measured on
+ * HotSpot 25, because run.sh skips the diff outright when no HotSpot is present
+ * (it says so out loud) and a vector that can only fail through the diff is
+ * half-armed on such a host.
  *
  * The subclasses deliberately implement ONLY what the abstract class leaves
  * abstract, and hold their data in a field CratonVM cannot recognise — a
@@ -68,6 +80,14 @@ import java.util.Set;
  *   cratonvm --real-jdk --java-home $JDK -cp out RForeignLayoutCollections
  */
 public class RForeignLayoutCollections {
+    static int checks;
+
+    static void check(boolean c, String m) {
+        checks++;
+        if (!c) {
+            throw new AssertionError("RForeignLayoutCollections: " + m);
+        }
+    }
 
     /** Elements live in a `String`, not in any array CratonVM models. */
     static final class ForeignCollection extends AbstractCollection<String> {
@@ -133,89 +153,109 @@ public class RForeignLayoutCollections {
         }
     }
 
+    /**
+     * Print one observable on a line run.sh's `^(PASS|CK) ` extractor keeps.
+     * The value is always whatever the call under test produced — including the
+     * `EXC:` token `safe` builds from a thrown Throwable, which used to be
+     * filtered away along with everything else.
+     */
+    private static void ck(String key, String value) {
+        System.out.println("CK RForeignLayoutCollections " + key + "=" + value);
+    }
+
+    /**
+     * Run one observable, print it, and assert it equals `want` — the value
+     * MEASURED on HotSpot 25 (Adoptium 25.0.3.9), never a guess. The print is
+     * for the cross-VM diff; the assertion is what keeps the vector armed on a
+     * host with no HotSpot, where run.sh skips the diff entirely.
+     */
+    private static void ckEq(String key, String want, java.util.function.Supplier<String> f) {
+        String got = safe(f);
+        ck(key, got);
+        check(want.equals(got), key + " = " + got + ", want " + want);
+    }
+
     public static void main(String[] args) {
         // ---- AbstractCollection: every method below is inherited concrete ----
         ForeignCollection c = new ForeignCollection("a,b,c");
-        System.out.println("coll.size=" + safe(() -> String.valueOf(c.size())));
-        System.out.println("coll.isEmpty=" + safe(() -> String.valueOf(c.isEmpty())));
-        System.out.println("coll.contains.b=" + safe(() -> String.valueOf(c.contains("b"))));
-        System.out.println("coll.contains.zz=" + safe(() -> String.valueOf(c.contains("zz"))));
-        System.out.println("coll.containsAll.ab="
-                + safe(() -> String.valueOf(c.containsAll(Arrays.asList("a", "b")))));
-        System.out.println("coll.containsAll.zz="
-                + safe(() -> String.valueOf(c.containsAll(Arrays.asList("zz")))));
-        System.out.println("coll.toArray.len="
-                + safe(() -> String.valueOf(c.toArray().length)));
-        System.out.println("coll.toArray.join="
-                + safe(() -> String.join("|", Arrays.stream(c.toArray())
-                        .map(String::valueOf).toArray(String[]::new))));
-        System.out.println("coll.toString=" + safe(c::toString));
-        System.out.println("coll.stream.count="
-                + safe(() -> String.valueOf(c.stream().count())));
+        ckEq("coll.size", "3", () -> String.valueOf(c.size()));
+        ckEq("coll.isEmpty", "false", () -> String.valueOf(c.isEmpty()));
+        ckEq("coll.contains.b", "true", () -> String.valueOf(c.contains("b")));
+        ckEq("coll.contains.zz", "false", () -> String.valueOf(c.contains("zz")));
+        ckEq("coll.containsAll.ab", "true",
+                () -> String.valueOf(c.containsAll(Arrays.asList("a", "b"))));
+        ckEq("coll.containsAll.zz", "false",
+                () -> String.valueOf(c.containsAll(Arrays.asList("zz"))));
+        ckEq("coll.toArray.len", "3", () -> String.valueOf(c.toArray().length));
+        ckEq("coll.toArray.join", "a|b|c",
+                () -> String.join("|", Arrays.stream(c.toArray())
+                        .map(String::valueOf).toArray(String[]::new)));
+        ckEq("coll.toString", "[a, b, c]", c::toString);
+        ckEq("coll.stream.count", "3", () -> String.valueOf(c.stream().count()));
 
         // ---- AbstractSet: adds hashCode/equals over AbstractCollection ------
         ForeignSet s = new ForeignSet("a,b,c");
         ForeignSet s2 = new ForeignSet("a,b,c");
-        System.out.println("set.size=" + safe(() -> String.valueOf(s.size())));
-        System.out.println("set.contains.b=" + safe(() -> String.valueOf(s.contains("b"))));
-        System.out.println("set.hashCode.isZero="
-                + safe(() -> String.valueOf(s.hashCode() == 0)));
+        ckEq("set.size", "3", () -> String.valueOf(s.size()));
+        ckEq("set.contains.b", "true", () -> String.valueOf(s.contains("b")));
+        ckEq("set.hashCode.isZero", "false", () -> String.valueOf(s.hashCode() == 0));
         // The specified value: the sum of the elements' hashes.
-        System.out.println("set.hashCode.matchesSpec=" + safe(() -> {
+        ckEq("set.hashCode.matchesSpec", "true",
+                () -> {
             int want = "a".hashCode() + "b".hashCode() + "c".hashCode();
             return String.valueOf(s.hashCode() == want);
-        }));
-        System.out.println("set.equalsSameContents="
-                + safe(() -> String.valueOf(s.equals(s2))));
-        System.out.println("set.equalsRealSet="
-                + safe(() -> String.valueOf(s.equals(Set.of("a", "b", "c")))));
-        System.out.println("set.toString=" + safe(s::toString));
+        });
+        ckEq("set.equalsSameContents", "true", () -> String.valueOf(s.equals(s2)));
+        ckEq("set.equalsRealSet", "true", () -> String.valueOf(s.equals(Set.of("a", "b", "c"))));
+        ckEq("set.toString", "[a, b, c]", s::toString);
 
         // ---- AbstractList: adds indexOf/equals/hashCode/subList ------------
         ForeignList l = new ForeignList("a,b,c");
-        System.out.println("list.size=" + safe(() -> String.valueOf(l.size())));
-        System.out.println("list.get1=" + safe(() -> l.get(1)));
-        System.out.println("list.indexOf.b=" + safe(() -> String.valueOf(l.indexOf("b"))));
-        System.out.println("list.indexOf.zz=" + safe(() -> String.valueOf(l.indexOf("zz"))));
-        System.out.println("list.contains.c=" + safe(() -> String.valueOf(l.contains("c"))));
-        System.out.println("list.equalsRealList="
-                + safe(() -> String.valueOf(l.equals(Arrays.asList("a", "b", "c")))));
-        System.out.println("list.hashCode.matchesSpec=" + safe(() -> {
+        ckEq("list.size", "3", () -> String.valueOf(l.size()));
+        ckEq("list.get1", "b", () -> l.get(1));
+        ckEq("list.indexOf.b", "1", () -> String.valueOf(l.indexOf("b")));
+        ckEq("list.indexOf.zz", "-1", () -> String.valueOf(l.indexOf("zz")));
+        ckEq("list.contains.c", "true", () -> String.valueOf(l.contains("c")));
+        ckEq("list.equalsRealList", "true",
+                () -> String.valueOf(l.equals(Arrays.asList("a", "b", "c"))));
+        ckEq("list.hashCode.matchesSpec", "true",
+                () -> {
             int want = Arrays.asList("a", "b", "c").hashCode();
             return String.valueOf(l.hashCode() == want);
-        }));
-        System.out.println("list.subList.size="
-                + safe(() -> String.valueOf(l.subList(1, 3).size())));
-        System.out.println("list.toArray.len=" + safe(() -> String.valueOf(l.toArray().length)));
-        System.out.println("list.toString=" + safe(l::toString));
+        });
+        ckEq("list.subList.size", "2", () -> String.valueOf(l.subList(1, 3).size()));
+        ckEq("list.toArray.len", "3", () -> String.valueOf(l.toArray().length));
+        ckEq("list.toString", "[a, b, c]", l::toString);
 
         // ---- AbstractMap ---------------------------------------------------
         ForeignMap m = new ForeignMap("k1=v1,k2=v2");
-        System.out.println("map.size=" + safe(() -> String.valueOf(m.size())));
-        System.out.println("map.isEmpty=" + safe(() -> String.valueOf(m.isEmpty())));
-        System.out.println("map.get.k1=" + safe(() -> String.valueOf(m.get("k1"))));
-        System.out.println("map.get.zz=" + safe(() -> String.valueOf(m.get("zz"))));
-        System.out.println("map.containsKey.k2="
-                + safe(() -> String.valueOf(m.containsKey("k2"))));
-        System.out.println("map.containsValue.v1="
-                + safe(() -> String.valueOf(m.containsValue("v1"))));
-        System.out.println("map.keySet.size="
-                + safe(() -> String.valueOf(m.keySet().size())));
-        System.out.println("map.values.size="
-                + safe(() -> String.valueOf(m.values().size())));
-        System.out.println("map.equalsRealMap="
-                + safe(() -> String.valueOf(m.equals(Map.of("k1", "v1", "k2", "v2")))));
-        System.out.println("map.toString=" + safe(m::toString));
+        ckEq("map.size", "2", () -> String.valueOf(m.size()));
+        ckEq("map.isEmpty", "false", () -> String.valueOf(m.isEmpty()));
+        ckEq("map.get.k1", "v1", () -> String.valueOf(m.get("k1")));
+        ckEq("map.get.zz", "null", () -> String.valueOf(m.get("zz")));
+        ckEq("map.containsKey.k2", "true", () -> String.valueOf(m.containsKey("k2")));
+        ckEq("map.containsValue.v1", "true", () -> String.valueOf(m.containsValue("v1")));
+        ckEq("map.keySet.size", "2", () -> String.valueOf(m.keySet().size()));
+        ckEq("map.values.size", "2", () -> String.valueOf(m.values().size()));
+        ckEq("map.equalsRealMap", "true",
+                () -> String.valueOf(m.equals(Map.of("k1", "v1", "k2", "v2"))));
+        ckEq("map.toString", "{k1=v1, k2=v2}", m::toString);
 
         // ---- did the calls reach the application's own bodies? -------------
+        // Booleans, not raw call counts. "Did the native ask the object" is
+        // the property; HOW MANY times a concrete AbstractCollection method
+        // happens to call iterator() is an implementation detail, and pinning
+        // it byte-for-byte in the cross-VM diff would fail a CratonVM that is
+        // correct but reaches the same answer differently.
         // Zeroes here with plausible answers above is the silent-empty failure:
         // a native answered from a layout it invented for a class it has never
         // seen, instead of asking the object.
-        System.out.println("count.coll.iterator=" + c.iterators);
-        System.out.println("count.coll.size=" + (c.sizes > 0));
-        System.out.println("count.set.iterator=" + s.iterators);
-        System.out.println("count.list.get=" + (l.gets > 0));
-        System.out.println("count.map.entrySet=" + m.entrySets);
-        System.out.println("PASS RForeignLayoutCollections");
+        ckEq("count.coll.iterator", "true", () -> String.valueOf(c.iterators > 0));
+        ckEq("count.coll.size", "true", () -> String.valueOf((c.sizes > 0)));
+        ckEq("count.set.iterator", "true", () -> String.valueOf(s.iterators > 0));
+        ckEq("count.list.get", "true", () -> String.valueOf((l.gets > 0)));
+        ckEq("count.map.entrySet", "true", () -> String.valueOf(m.entrySets > 0));
+        System.out.println("CK RForeignLayoutCollections checks=" + checks);
+        System.out.println("PASS RForeignLayoutCollections (" + checks + " checks)");
     }
 }

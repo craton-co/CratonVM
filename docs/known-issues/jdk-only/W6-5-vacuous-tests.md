@@ -7,11 +7,35 @@ HotSpot 25.0.3 and mutation-checked. **Two further findings reported, not fixed*
 
 > **2026-08-11 — §3.1 is CLOSED.** `RPriorityQueueGc` and `RTreeRangeGc` are in
 > `CORE_CLASSES`, with the `class_cv_args` hook they are inert without already
-> in place; §4's proposed patch has fully landed. §3.2 (`apps/` is gitignored,
-> eleven missing probe fixtures) and §3.3 (`CRATONVM_REQUIRE_E2E` is set by no
-> workflow) **remain open** and are still the larger findings by count.
-> Neither the registration nor the new vector added in §3.4 has been run under
-> CratonVM.
+> in place; §4's proposed patch has fully landed.
+>
+> **2026-08-12 — §3.2 and §3.3 are CLOSED; see `W7-51-vacuous-sweep-round-2.md`,
+> which also widens this record into a measured sweep.** Short form:
+>
+> * **§3.2.** The count here was **low by half**: 23 of 27 referenced fixtures
+>   were missing, not eleven of twelve — this section's census matched only the
+>   single-line `.join("apps").join(<probe>)` spelling and missed the multi-line
+>   builder form most harnesses use. **Two entries in the table below are also
+>   wrong**: `scanner_probe` and `xml_probe` are annotated "self-generates its
+>   source — likely OK" and neither does. Both read their `.java` off disk and
+>   skip when it is absent; `wave1_d`'s `write_fixture()` writes the XML *data*,
+>   not the probe source. Seven fixtures are rebuilt and force-added, and
+>   `vm/tests/probe_fixture_census.rs` now fails a default `cargo test
+>   --workspace` when a fixture is missing and unbaselined, when a baselined one
+>   is restored without its row being deleted, or when a new `apps/`-reaching
+>   test appears in neither table. 16 remain, each with its reason; two of those
+>   need third-party jars and are not reconstructible.
+> * **§3.3.** `.github/workflows/ci.yml` now sets `CRATONVM_REQUIRE_E2E` on a
+>   step that runs three fixture-gated targets, and `vm/tests/require_e2e_gate.rs`
+>   asserts both ends — that the harness branches on the variable (with a
+>   positive control, so an unconditionally-panicking helper cannot pass it) and
+>   that a workflow sets it (a mention inside a comment does not count). The
+>   workflow-side predicate is mutation-checked. The same defect was then found
+>   a second time, in `STRICT_COVERAGE`, and armed.
+> * **§3.4.** `RJdkViews` is scheduled in `CORE_CLASSES` and is **proved capable
+>   of failing** — five mutants, one per defect family plus the negative
+>   control, each producing a named `AssertionError` and rc=1 on HotSpot 25.
+>   It has still **never been run under CratonVM**; that remains ahead.
 
 Predecessors: `L10-rjdkprocess-vector-overassertion.md` (the opposite failure —
 an over-asserting vector), `W3-4-forkjointask-status-flags-and-the-eager-default.md`

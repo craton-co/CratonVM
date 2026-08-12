@@ -2229,7 +2229,7 @@ mod tests {
         let cv = CompactValue::float(3.14f32);
         assert_eq!(cv.tag(), CompactTag::Float);
         let f = cv.as_float().unwrap();
-        assert!((f - 3.14f32).abs() < 1e-6);
+        assert_eq!(f.to_bits(), 3.14f32.to_bits());
     }
 
     #[test]
@@ -2257,7 +2257,8 @@ mod tests {
         let cv = CompactValue::double(2.718_281_828_459_045);
         assert_eq!(cv.tag(), CompactTag::Double);
         let d = cv.as_double().unwrap();
-        assert!((d - 2.718_281_828_459_045).abs() < 1e-12);
+        // Bit equality: a stored value that is read back has been through NO rounding step, so the round trip is bit-exact or the slot corrupted it.
+        assert_eq!(d.to_bits(), 2.718_281_828_459_045f64.to_bits());
     }
 
     #[test]
@@ -3040,7 +3041,7 @@ mod tests {
     fn decode_by_descriptor_f_on_float_roundtrips() {
         let cv = CompactValue::float(std::f32::consts::E);
         match cv.decode_by_descriptor(b'F') {
-            Value::Float(f) => assert!((f - std::f32::consts::E).abs() < 1e-6),
+            Value::Float(f) => assert_eq!(f.to_bits(), std::f32::consts::E.to_bits()),
             other => panic!("expected Float(E), got {other:?}"),
         }
     }

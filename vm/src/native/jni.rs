@@ -10519,7 +10519,9 @@ mod tests {
             }
             assert_eq!((a, b, c), (11, 22, 33), "named args");
             assert_eq!(i1, 40, "first variadic integer");
-            assert!((d - 1.5).abs() < f64::EPSILON, "variadic double: {d}");
+            // Bit equality: this asserts a varargs ABI round trip, so any
+            // difference at all is a marshalling defect.
+            assert_eq!(d.to_bits(), 1.5f64.to_bits(), "variadic double: {d}");
             assert_eq!(tail, 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8, "spilled integers");
         }
         42
@@ -10534,7 +10536,7 @@ mod tests {
             let i2 = cur.next(false);
             assert_eq!((a, b, c, d), (11, 22, 33, 44), "named args");
             assert_eq!((i1, i2), (40, 2), "variadic integers");
-            assert!((f - 2.5).abs() < f64::EPSILON, "variadic double: {f}");
+            assert_eq!(f.to_bits(), 2.5f64.to_bits(), "variadic double: {f}");
         }
         43
     }

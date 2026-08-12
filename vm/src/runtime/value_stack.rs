@@ -1876,8 +1876,11 @@ mod tests {
 
         assert_eq!(stack.pop().unwrap(), Value::Uninitialized);
         assert!(stack.pop().unwrap().is_null());
-        assert!((stack.pop_double().unwrap() - 2.719).abs() < 1e-9);
-        assert!((stack.pop_float().unwrap() - 3.15).abs() < 1e-6);
+        // Bit equality: a value read back out of a stack slot has been
+        // through no rounding step, so the round trip is exact or the slot
+        // corrupted it. A tolerance here can only hide the second case.
+        assert_eq!(stack.pop_double().unwrap().to_bits(), 2.719f64.to_bits());
+        assert_eq!(stack.pop_float().unwrap().to_bits(), 3.15f32.to_bits());
         assert_eq!(stack.pop_long().unwrap(), 999999999999);
         assert_eq!(stack.pop_int().unwrap(), 42);
     }
@@ -2405,8 +2408,8 @@ mod tests {
         stack.push(Value::Long(100)).unwrap();
         stack.push(Value::Float(1.5)).unwrap();
         stack.push(Value::Double(2.5)).unwrap();
-        assert!((stack.pop_double().unwrap() - 2.5).abs() < 1e-9);
-        assert!((stack.pop_float().unwrap() - 1.5).abs() < 1e-6);
+        assert_eq!(stack.pop_double().unwrap().to_bits(), 2.5f64.to_bits());
+        assert_eq!(stack.pop_float().unwrap().to_bits(), 1.5f32.to_bits());
         assert_eq!(stack.pop_long().unwrap(), 100);
         assert!(stack.is_empty());
 
@@ -2661,7 +2664,7 @@ mod tests {
         let mut stack = ValueStack::new(4);
         stack.push_float(1.5).unwrap();
         assert_eq!(stack.peek_compact().as_float(), Some(1.5f32));
-        assert!((stack.pop_float().unwrap() - 1.5f32).abs() < 1e-6);
+        assert_eq!(stack.pop_float().unwrap().to_bits(), 1.5f32.to_bits());
     }
 
     #[test]
@@ -2669,7 +2672,11 @@ mod tests {
         let mut stack = ValueStack::new(4);
         stack.push_double(std::f64::consts::PI).unwrap();
         assert_eq!(stack.peek_compact().as_double(), Some(std::f64::consts::PI));
-        assert!((stack.pop_double().unwrap() - std::f64::consts::PI).abs() < 1e-12);
+        // Bit equality: a stored value that is read back has been through NO rounding step, so the round trip is bit-exact or the slot corrupted it.
+        assert_eq!(
+            stack.pop_double().unwrap().to_bits(),
+            std::f64::consts::PI.to_bits()
+        );
     }
 
     #[test]
