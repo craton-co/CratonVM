@@ -384,7 +384,12 @@ pub fn observe_read_on_class(
     }
     let answer = field_name_at(ctx, class_id, slot);
     let finding = classify_read(expected_field, &answer)?;
-    let class = SlotOracle::name_of(ctx, class_id)
+    // `ctx.class_name_of_id`, not `SlotOracle::name_of`: the two answer the
+    // same thing (the blanket impl forwards), and calling the inherent
+    // `NativeContext` method leaves no room for the two traits' methods to be
+    // ambiguous at this call site.
+    let class = ctx
+        .class_name_of_id(class_id)
         .unwrap_or_else(|| format!("<class#{}>", class_id.as_u32()));
     if already_reported((
         class.clone(),
