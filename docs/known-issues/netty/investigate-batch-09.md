@@ -10,7 +10,7 @@ zlib **preset dictionaries** — which SPDY relies on — did nothing. The state
 reason for the no-op ("flate2's `set_dictionary` is gated behind a zlib backend
 feature we don't enable") was false: flate2 has been built with
 `features = ["zlib"]` all along. See
-[inflater-preset-dictionary-was-a-no-op-20260812.md](inflater-preset-dictionary-was-a-no-op-20260812.md).
+[netty-inflater-preset-dictionary-no-op-FIXED-20260812.md](../../internal/fixed-suite-bugs/netty-inflater-preset-dictionary-no-op-FIXED-20260812.md).
 The reach goes well past SPDY — any format using a zlib preset dictionary was
 unreadable *and* unwritable.
 

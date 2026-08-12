@@ -109,9 +109,12 @@ skipped · ⏱ wall-clock only, passes solo
   netty's HotSpot-25-default allocator (`CleanerJava25`, FFM-`Arena`-backed)
   cannot allocate at all on CratonVM, and why the property above cannot simply
   be removed.
-* [`cyclicbarrier-native-drops-barrier-action-20260812.md`](cyclicbarrier-native-drops-barrier-action-20260812.md)
-  — `new CyclicBarrier(parties, Runnable)` never runs the Runnable. Found in
-  the same native; not a batch-01 failure.
+* [`netty-cyclicbarrier-synthetic-action-generation-and-mode-gate-FIXED-20260812.md`](../../internal/fixed-suite-bugs/netty-cyclicbarrier-synthetic-action-generation-and-mode-gate-FIXED-20260812.md)
+  — `new CyclicBarrier(parties, Runnable)` never ran the Runnable. Found in
+  the same native; not a batch-01 failure. **Fixed 2026-08-12**, along with two
+  more defects in the same native that the first record did not name: no
+  generation (so reuse deadlocked) and a flag-not-mode registration gate that
+  had left synthetic-JDK mode with no `CyclicBarrier` constructor at all.
 * [`threadmxbean-not-com-sun-extension-20260812.md`](threadmxbean-not-com-sun-extension-20260812.md)
   — `ManagementFactory.getThreadMXBean()` / `getOperatingSystemMXBean()` do not
   implement their `com.sun.management` extensions, so feature-detecting callers

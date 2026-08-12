@@ -1903,6 +1903,21 @@ impl SharedVm {
                 cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(
                     &mut native_methods,
                 );
+                // Same shape, same reason, one class further on: the
+                // `CyclicBarrier` natives are gated on `CRATONVM_SYNTHETIC_AQS`
+                // inside `register_concurrent_natives` because the default
+                // real-JDK build should run the real class. Synthetic mode has
+                // no real class — `CyclicBarrier` is a 3-field compatibility
+                // stub with no method bodies — so that gate left `new
+                // CyclicBarrier(2)` at `NoSuchMethodError: <init>(I)V` and all
+                // four `JucComplete` barrier fixtures red, with the TCK table
+                // still listing them as passing. Runtime-gated on
+                // `use_synthetic_jdk` (this arm), not on the flag and not on
+                // the Cargo feature, so a feature-enabled binary running
+                // real-JDK mode is unaffected.
+                cratonvm_native_builtins::util_concurrent_ext::register_cyclic_barrier_natives(
+                    &mut native_methods,
+                );
             } else {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field
@@ -3815,6 +3830,7 @@ impl SharedVm {
                 jit_cache: JitCache::new(),
                 profile_store: ProfileStore::new(),
                 jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                jit_gate_pass: parking_lot::RwLock::new(FxHashMap::default()),
                 // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.

@@ -1107,6 +1107,55 @@ pub(crate) fn refused_class(
     }
 }
 
+/// The synthetic `java.util.concurrent.CyclicBarrier` surface.
+///
+/// Registered from TWO places, because two different conditions need it and
+/// neither can see the other:
+///
+///  * [`register_concurrent_natives`], when `CRATONVM_SYNTHETIC_AQS` is set —
+///    the real `CyclicBarrier` bytecode is present but its `ReentrantLock` /
+///    `Condition` are being served synthetically, so the barrier is served
+///    synthetically too;
+///  * `vm_init`'s synthetic-JDK arm, where there IS no real bytecode. This one
+///    was missing. `67c5e048c` narrowed the whole surface to the env flag, on
+///    the reasoning that the default real-JDK build should run the real class —
+///    correct for that build, but synthetic-JDK mode has only a 3-field
+///    compatibility STUB for `CyclicBarrier` (`class_manager`'s
+///    `synthetic_stub_fields`) and no method bodies at all, so it lost the
+///    constructor outright: all four `JucComplete` barrier fixtures went to
+///    `NoSuchMethodError: java.util.concurrent.CyclicBarrier.<init>(I)V` while
+///    the TCK table still listed them as passing. A flag is not a mode
+///    ([`crate::nbflags`] cannot see the JDK mode; `vm_init` can), which is
+///    exactly why the call lives there and not behind another `nbflags` test.
+///
+/// Deleting these natives instead — the standing preference for synthetic
+/// shadows of pure-Java JDK classes — is not available for the same reason:
+/// synthetic-JDK mode has nothing to fall back to.
+pub fn register_cyclic_barrier_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let cb = "java/util/concurrent/CyclicBarrier";
+    registry.register(cb, "<init>", "(I)V", native_cb_init);
+    registry.register(
+        cb,
+        "<init>",
+        "(ILjava/lang/Runnable;)V",
+        native_cb_init_action,
+    );
+    registry.register(cb, "await", "()I", native_cb_await);
+    registry.register(
+        cb,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)I",
+        native_cb_await_timeout,
+    );
+    registry.register(cb, "getParties", "()I", native_cb_get_parties);
+    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
+    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
+    registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
+}
+
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // Real AQS is now the DEFAULT: skip the synthetic ReentrantLock/Lock/
     // Condition natives so the REAL java.util.concurrent AQS bytecode runs
@@ -1172,45 +1221,19 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
 
     // --- CyclicBarrier ---
     //
-    // Synthetic-AQS mode only. The synthetic barrier has NO GENERATION: a trip
-    // resets one shared `count` to 0 and notifies, and every waiter decides it
-    // was released by re-reading `count == 0`. That test is only valid while
-    // nobody re-enters the barrier. Under a tight loop (worker calls `await()`
-    // again immediately) a released waiter can be preempted before it re-reads;
-    // by then a faster party has bumped `count` back to 1.. so the waiter
-    // concludes it was NOT released and waits again — with its wake-up already
-    // spent. The barrier is then permanently one party short and every
-    // subsequent trip deadlocks. Reproduced 100% (10/10 runs, JIT on AND
-    // `--nojit`) by a 4-party/20-round barrier; the same loop over the real JDK
-    // bytecode passes. It is what hangs `io.netty.util.NettyRuntimeTests`
-    // (`testRacingGetAndGet`), `DefaultPromiseTest` and `FastThreadLocalTest`.
+    // Synthetic-AQS mode only HERE. With real AQS (the default) the real JDK
+    // `CyclicBarrier` — ReentrantLock + Condition + an identity-compared
+    // `Generation` — is correct and needs no help, exactly as for
+    // ReentrantLock/Lock/Condition and Semaphore above. The constructors are
+    // gated with the rest, not separately: `native_cb_init` stores its state
+    // holder in the receiver's slot 0, which is the real layout's `lock` field,
+    // so registering only the constructors while `await()` runs real bytecode
+    // would hand that bytecode a barrier whose `lock` is an array.
     //
-    // With real AQS (the default) the real JDK `CyclicBarrier` — ReentrantLock
-    // + Condition + an identity-compared `Generation` — is correct and needs no
-    // help, exactly as for ReentrantLock/Lock/Condition and Semaphore above.
-    // The constructors are gated with it, not separately: `native_cb_init`
-    // stores its int[3] holder in the receiver's slot 0, which is the real
-    // layout's `lock` field.
+    // Synthetic-JDK mode registers the same set from `vm_init`, where the mode
+    // is known — see [`register_cyclic_barrier_natives`].
     if !real_aqs {
-        let cb = "java/util/concurrent/CyclicBarrier";
-        registry.register(cb, "<init>", "(I)V", native_cb_init);
-        registry.register(
-            cb,
-            "<init>",
-            "(ILjava/lang/Runnable;)V",
-            native_cb_init_action,
-        );
-        registry.register(cb, "await", "()I", native_cb_await);
-        registry.register(
-            cb,
-            "await",
-            "(JLjava/util/concurrent/TimeUnit;)I",
-            native_cb_await_timeout,
-        );
-        registry.register(cb, "getParties", "()I", native_cb_get_parties);
-        registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
-        registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
-        registry.register(cb, "reset", "()V", native_cb_reset);
+        register_cyclic_barrier_natives(registry);
     }
     registry.set_category(__prev_cat);
 
