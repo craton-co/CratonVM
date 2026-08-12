@@ -70,6 +70,15 @@ TIMEOUT="${TIMEOUT:-120}"
 # so ServiceLoader discovery goes through ClassLoader.getResources rather than
 # a fabricated shortcut.
 MODSRC="$HERE/modules"
+# Sources recompiled OVER $MODBUILD once the module itself has been compiled,
+# with no module context. This is how the suite expresses a provider shape javac
+# REFUSES in a `provides` clause (a `provider()` whose return type is not a
+# subtype of the service): javac enforces that only while compiling
+# module-info.java, and `ServiceLoader.loadProvider` carries the same rule as a
+# RUNTIME gate precisely for modules that were not assembled by javac. Dropping
+# this pass leaves a module that passes its own NEGATIVE test, so
+# `compile_modules` fails loudly rather than skipping it.
+MODOVERLAY="$HERE/modules-overlay"
 RESOURCES="$HERE/resources"
 JDKONLY_MODULE="cratonvm.jdkonly.svc"
 
@@ -252,6 +261,36 @@ compile_modules() {
     "$JAVAC" --release "$REL" --module-source-path "$MODSRC" -d "$MODBUILD" --module "$JDKONLY_MODULE" || return 1
   else
     "$JAVAC" --module-source-path "$MODSRC" -d "$MODBUILD" --module "$JDKONLY_MODULE" || return 1
+  fi
+  # Second pass: recompile $MODOVERLAY over the class files just produced, on a
+  # PLAIN CLASSPATH so javac never sees the `provides` clause it would reject.
+  # See $MODOVERLAY's own sources for why the shape cannot be written directly.
+  if [ -d "$MODOVERLAY/$JDKONLY_MODULE" ]; then
+    ovl=$(find "$MODOVERLAY/$JDKONLY_MODULE" -name '*.java' | tr '\n' ' ')
+    if [ -n "$ovl" ]; then
+      # Unquoted on purpose: a source-file word list, and the suite tree carries
+      # no spaces. `-classpath` is the already-compiled module output so the
+      # overlay can still reference the module's own types.
+      if [ -n "$REL" ]; then
+        "$JAVAC" --release "$REL" -classpath "$MODBUILD/$JDKONLY_MODULE" \
+            -d "$MODBUILD/$JDKONLY_MODULE" $ovl || return 1
+      else
+        "$JAVAC" -classpath "$MODBUILD/$JDKONLY_MODULE" \
+            -d "$MODBUILD/$JDKONLY_MODULE" $ovl || return 1
+      fi
+    fi
+  fi
+  # Ground-truth the overlay instead of trusting that it landed. If the second
+  # pass silently did nothing, RJdkModule's negative ServiceLoader checks would
+  # fail on BOTH VMs — a harness error wearing a VM defect's clothes, which is
+  # the exact misclassification this vector's record warns about.
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/WrongFactory.class" ]; then
+    if ! "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.WrongFactory 2>/dev/null \
+        | grep -q 'public static java.lang.Object provider()'; then
+      echo "ERROR: modules-overlay did not land — WrongFactory.provider() must return Object"
+      return 1
+    fi
   fi
   copy_tree "$MODSRC/$JDKONLY_MODULE" "$MODBUILD/$JDKONLY_MODULE"
   HAVE_MODULE=1

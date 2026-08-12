@@ -21,4 +21,14 @@ module cratonvm.jdkonly.svc {
     provides com.cratonvm.jdkonly.svc.Greeter
             with com.cratonvm.jdkonly.svc.internal.EnGreeter,
                  com.cratonvm.jdkonly.svc.internal.FactoryGreeter;
+
+    // The NEGATIVE half of the factory form. WrongFactory's `provider()` is
+    // compiled TWICE: the `modules/` source returns Rejected (so javac accepts
+    // this clause -- it refuses the illegal shape outright), and
+    // `modules-overlay/` recompiles it returning Object over the same class
+    // file. What the VM loads is the overlay's, so every traversal of
+    // ServiceLoader.load(Rejected.class) -- iterator() AND stream() -- must
+    // raise ServiceConfigurationError. Do not "fix" WrongFactory.
+    provides com.cratonvm.jdkonly.svc.Rejected
+            with com.cratonvm.jdkonly.svc.internal.WrongFactory;
 }
