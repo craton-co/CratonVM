@@ -7622,6 +7622,44 @@ const METHOD_EXTRA_TRUSTED_MARKER: i32 = 0x4d45_5448; // "METH"
 // Legacy synthetic Method mirror slots used when `java/lang/reflect/Method`
 // has no real JDK field metadata (synthetic-JDK mode). These mirror the
 // MockNativeContext mapping in `test_utils.rs`.
+//
+// W7-77-guarded-slot-maps.md re-derived the real layout and confirms 11 of the
+// 12 constants below name a different field than JDK 25.0.3.9 has at that
+// index. `javap -p` over the chain `AccessibleObject` -> `Executable` ->
+// `Method`, static excluded, superclass-first:
+//
+//      0 override             1 accessCheckCache      2 parameterData
+//      3 declaredAnnotations  4 clazz                 5 slot
+//      6 name                 7 returnType            8 parameterTypes
+//      9 exceptionTypes      10 modifiers            11 signature
+//     12 annotations         13 parameterAnnotations 14 annotationDefault
+//     15 root                16 genericInfo          17 methodAccessor
+//     18 hash                19 callerSensitive
+//
+// Only `EXCEPTION_TYPES` (9) agrees. `CLAZZ`(0) is `override`, a boolean;
+// `NAME`(1) is `accessCheckCache`; `SLOT`(4) is `clazz`; `OVERRIDE`(6) is
+// `name`. So on a real `Method` this map would put the return type where the
+// declaring class belongs -- the exact Byte Buddy failure the `has_named_layout`
+// gate exists for, whose story is told in `create_method_object` below.
+//
+// THE GUARD IS CORRECT AND IS THE STANDING REMEDY.
+// `method_class_has_named_layout` asks
+// `resolve_field_index_by_class_id(class_id, "clazz")` -- a CLASS-side witness,
+// and the right question ("does this class HAVE a named field table") rather
+// than the wrong one ("did the named writes land"), which its own comment
+// records as having been a corruption bug. Every write is inside
+// `if !has_named_layout`; every read goes through
+// `method_object_field_value_or_legacy` / `method_int_field_value_or_legacy`,
+// which consult the same witness before falling back.
+//
+// NOTHING HERE IS RENUMBERED, deliberately. A renumber fixes nothing reachable
+// -- the guard means these indices are only ever applied to the fabricated
+// mirror, where they ARE the layout -- and it would break `test_utils.rs`'s
+// `MockNativeContext`, which maps field names onto exactly these slots and is
+// the oracle for the synthetic-mode tests. That is the failure mode W7-77 was
+// told to avoid: a renumber that fixes one reader and breaks another that
+// agreed with the old map. The row leaves the census when the legacy mirror
+// does, not before.
 const METHOD_LEGACY_SLOT_CLAZZ: usize = 0;
 const METHOD_LEGACY_SLOT_NAME: usize = 1;
 const METHOD_LEGACY_SLOT_RETURN_TYPE: usize = 2;
@@ -7634,6 +7672,36 @@ const METHOD_LEGACY_SLOT_EXCEPTION_TYPES: usize = 9;
 const METHOD_LEGACY_SLOT_ANNOTATIONS: usize = 10;
 const METHOD_LEGACY_SLOT_PARAMETER_ANNOTATIONS: usize = 11;
 const METHOD_LEGACY_SLOT_ANNOTATION_DEFAULT: usize = 12;
+
+/// What the legacy Method mirror believes, published for
+/// `read_alias::verify_declared_slot_maps` (W7-77).
+///
+/// States the BELIEF, not JDK 25's layout. Declared from
+/// `lang_reflect::register_wp2_1_natives`, which
+/// `register_annotation_overrides` -> `register_essential_natives_with_shims`
+/// reaches in BOTH modes, so the sweep has this map whichever arm booted.
+pub(crate) static METHOD_LEGACY_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/lang/reflect/Method",
+        slots: &[
+            (METHOD_LEGACY_SLOT_CLAZZ, "clazz"),
+            (METHOD_LEGACY_SLOT_NAME, "name"),
+            (METHOD_LEGACY_SLOT_RETURN_TYPE, "returnType"),
+            (METHOD_LEGACY_SLOT_MODIFIERS, "modifiers"),
+            (METHOD_LEGACY_SLOT_SLOT, "slot"),
+            (METHOD_LEGACY_SLOT_OVERRIDE, "override"),
+            (METHOD_LEGACY_SLOT_PARAMETER_TYPES, "parameterTypes"),
+            (METHOD_LEGACY_SLOT_CALLER_SENSITIVE, "callerSensitive"),
+            (METHOD_LEGACY_SLOT_EXCEPTION_TYPES, "exceptionTypes"),
+            (METHOD_LEGACY_SLOT_ANNOTATIONS, "annotations"),
+            (
+                METHOD_LEGACY_SLOT_PARAMETER_ANNOTATIONS,
+                "parameterAnnotations",
+            ),
+            (METHOD_LEGACY_SLOT_ANNOTATION_DEFAULT, "annotationDefault"),
+        ],
+        origin: "native-builtins/src/lang_class.rs METHOD_LEGACY_SLOT_*",
+    };
 
 /// Legacy synthetic Method width вЂ” kept as a floor so the allocated
 /// object is always large enough to host the synthetic writes made by

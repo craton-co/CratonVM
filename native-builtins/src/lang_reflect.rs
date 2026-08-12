@@ -1980,6 +1980,12 @@ fn generic_array_component(
 pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-77: publish the legacy `java/lang/reflect/Method` mirror map so the
+    // read-side sweep names the row instead of leaving it as a comment. This
+    // registrar is reached in BOTH modes (via `register_annotation_overrides`
+    // <- `register_essential_natives_with_shims`). Unconditional and
+    // idempotent-by-pointer, for the reason `declare_slot_map`'s own doc gives.
+    cratonvm_native_api::read_alias::declare_slot_map(&crate::lang_class::METHOD_LEGACY_SLOT_MAP);
     // --- Method.invoke return-boxing safety net (overrides the historical
     // registration in lib.rs::register_essential_natives because
     // register_wp2_1_natives is called AFTER it). See the comment on
