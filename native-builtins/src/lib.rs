@@ -26378,9 +26378,12 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
     }
     if let Some(fd) = stream_fd(ctx, args) {
         let ok = with_stdio_print_lock(|| {
-            ctx.fd_table()
-                .write_string(fd, text)
-                .and_then(|()| ctx.fd_table().write_string(fd, &sep))
+            // Both writes are attempted regardless, as before — `and` keeps
+            // the first failure without turning the pair into a short-circuit
+            // that would drop the separator after a partial text write.
+            let text_written = ctx.fd_table().write_string(fd, text);
+            let sep_written = ctx.fd_table().write_string(fd, &sep);
+            text_written.and(sep_written)
         });
         // RECORDED since W7-64 — see `stream_write`.
         if let Some(Value::Object(Some(this))) = args.first().copied() {

@@ -143,9 +143,9 @@ pub fn absorb_write_exception_recording(
     let Some(thrown) = take_absorbed(&*ctx, result, "java/io/IOException")? else {
         return Ok(None);
     };
-    let interrupted = ctx
-        .class_id_by_name("java/io/InterruptedIOException")
-        .is_some_and(|root| ctx.is_subclass(ctx.class_id_of_object(thrown), root));
+    let thrown_class = ctx.class_id_of_object(thrown);
+    let interrupted_root = ctx.class_id_by_name("java/io/InterruptedIOException");
+    let interrupted = interrupted_root.is_some_and(|root| ctx.is_subclass(thrown_class, root));
     if interrupted {
         let current = ctx.current_thread_object();
         ctx.thread_interrupt(current);

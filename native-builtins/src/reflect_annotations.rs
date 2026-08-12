@@ -335,8 +335,9 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
         // and drop it into a `set_field_by_name` that is documented to no-op.
         // The synthetic arm gets its `ErrorManager` from
         // `register_p61_handler_error_manager` instead.
+        let handler_class = ctx.class_id_of_object(*this);
         let has_error_manager_field = ctx
-            .resolve_field_index_by_class_id(ctx.class_id_of_object(*this), "errorManager")
+            .resolve_field_index_by_class_id(handler_class, "errorManager")
             .is_some();
         if has_error_manager_field
             && matches!(

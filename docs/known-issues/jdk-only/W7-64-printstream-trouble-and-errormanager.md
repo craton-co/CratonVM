@@ -245,10 +245,13 @@ null — its javadoc promises a default is installed, and the probe asserts
 third initializer, guarded on the field **existing** and being null so neither
 a real constructor nor a prior `setErrorManager` is clobbered.
 
-This is the shape
-`reference_a_formatter_fallback_hides_a_null_record_field` names: a library's
-own fallback (`catch (Exception ex2)`) turning a null field into a
-formatting-shaped symptom.
+The shape is one the JUL lanes have hit repeatedly this week: a library's own
+fallback — here `reportError`'s `catch (Exception ex2)` — turning a null field
+into a symptom that looks like something else entirely. It is also the second
+time in this record that a native `<init>` reconstructing *some* of a class's
+field initializers is the defect, which is worth stating as a rule: a native
+constructor owes the class every initializer, not the ones the feature that
+prompted it happened to need.
 
 ## Measured, on HotSpot 25.0.3.9
 
