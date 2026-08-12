@@ -51,6 +51,16 @@ pub mod print_error_state;
 // that no registration site can know.
 pub mod retired_shadow;
 pub mod plain_server_socket;
+/// The READ-side half of the slot-index census: a native reading slot `k` of a
+/// real JDK object it did not allocate, where slot `k` on the loaded class
+/// means a different field.
+///
+/// Sibling of `layout_alias`, not an extension of it, and deliberately so:
+/// that instrument's whole vocabulary is a slot COUNT, so it cannot say "slot 0
+/// is `mark`, not `hb`" — see W7-59-layout-detector-coverage.md section 6 and
+/// W7-69-read-side-alias-instrument.md. It reuses `layout_alias`'s flag,
+/// because the two are two halves of one species.
+pub mod read_alias;
 pub mod registry;
 pub mod server_socket_ports;
 pub mod socket_input_stream_read;
