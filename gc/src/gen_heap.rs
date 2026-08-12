@@ -3627,16 +3627,25 @@ impl GenerationalHeap {
             // primitive into a reference-declared slot) was boxed into a
             // 1-field wrapper by set_field. Mirror get_array_element_unboxing so
             // the value round-trips and the wrapper never escapes to Java.
-            if let Value::Object(Some(r)) = v {
-                if self.is_object_address(r.as_ptr() as usize).is_some() {
+            //
+            // Shared with `zgc`, `g1` and `heap` through `crate::autobox` since
+            // 2026-08-12 (W7-84-primitive-in-reference-store.md). Note what the
+            // shared form BUYS here and not just what it standardises: this
+            // check used to run unconditionally, so every compact
+            // reference-field read on the tree's long-time default collector
+            // paid an `is_object_address` probe. It is now behind a monotone
+            // relaxed latch that no process which never boxes ever arms, so
+            // this path got CHEAPER while three other heaps gained it.
+            return crate::autobox::unbox_reference_slot(
+                v,
+                |r| {
+                    self.is_object_address(r.as_ptr() as usize)?;
                     // SAFETY: address validated as a live heap object.
                     let h = unsafe { &*(r.as_ptr() as *const ObjectHeader) };
-                    if h.class_id == AUTOBOX_CLASS_ID {
-                        return self.get_field(r, 0);
-                    }
-                }
-            }
-            return v;
+                    Some(h.class_id)
+                },
+                |r| self.get_field(r, 0),
+            );
         }
         // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_field_slot` answers
         // `None` for TWO different reasons, and only the first licenses the
@@ -3936,24 +3945,38 @@ impl GenerationalHeap {
             // SAFETY: `index < num_slots` (checked above) ⇒ `off` within body.
             let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
             if storage.is_reference() {
-                match value {
-                    Value::Object(_) => {
-                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, value) };
-                        self.write_barrier(obj_ref, value);
-                    }
-                    // A non-reference value written into a reference slot
-                    // (typeless `Unsafe.put*`): box it into a 1-field wrapper,
-                    // exactly as compact reference *arrays* do (AUTOBOX_CLASS_ID).
-                    _ => {
+                // A non-reference value written into a reference slot (a
+                // type-punning native, or a typeless `Unsafe.put*`): box it
+                // into a 1-field `AUTOBOX_CLASS_ID` wrapper, exactly as
+                // compact reference *arrays* do. Shared with `zgc`, `g1` and
+                // `heap` through `crate::autobox` since 2026-08-12 — those
+                // three used to drop the write to null instead, so which
+                // answer a program got depended on the collector flag
+                // (W7-84-primitive-in-reference-store.md).
+                let value = crate::autobox::box_for_reference_slot(
+                    value,
+                    header.class_id,
+                    index,
+                    |v| {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
-                        self.set_field(wrapper, 0, value);
-                        let wv = Value::Object(Some(wrapper));
-                        // SAFETY: `base` is the in-bounds reference slot validated above (`index < num_slots` so `off` is
-                        // within the body); writing a reference element there is sound.
-                        unsafe { write_prim_element(base, 0, ArrayElementType::Reference, wv) };
-                        self.write_barrier(obj_ref, wv);
-                    }
-                }
+                        self.set_field(wrapper, 0, v);
+                        wrapper
+                    },
+                );
+                // Recompute the slot pointer AFTER the boxing closure: it may
+                // have allocated, and this is a copying heap. `obj_ref` itself
+                // is the caller's handle and is out of our hands either way,
+                // but `base` was derived before the allocation and is the one
+                // thing this function can honestly refresh.
+                //
+                // SAFETY: `base` is the in-bounds reference slot validated
+                // above (`index < num_slots` so `off` is within the body);
+                // writing a reference element there is sound. `value` is a
+                // reference by construction — `box_for_reference_slot` returns
+                // either the caller's `Value::Object(_)` or a fresh wrapper.
+                let base = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + off) };
+                unsafe { write_prim_element(base, 0, ArrayElementType::Reference, value) };
+                self.write_barrier(obj_ref, value);
             } else {
                 // SAFETY: class layout guarantees natural alignment and bounds.
                 unsafe {
@@ -4395,6 +4418,12 @@ impl GenerationalHeap {
                     _ => {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
+                        // Arm the process-wide wrapper latch: `Heap::
+                        // get_array_element` does NOT unbox, so a wrapper can
+                        // be laundered out of an array and stored into a
+                        // reference field, and the field read side has to be
+                        // able to find it (`crate::autobox`).
+                        crate::autobox::note_wrapper_created();
                         let wrapper_val = Value::Object(Some(wrapper));
                         write_prim_element(base, index, header.element_type(), wrapper_val);
                         // Write barrier: track the wrapper reference for gen GC
