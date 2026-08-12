@@ -54,9 +54,21 @@ import java.util.Set;
  * natives on these classes have no such escape, and this probe is aimed at them.
  *
  * Shape follows `UserImplementorInterceptProbe` / `UserProcessInterceptProbe`:
- * every observable is printed as `key=value` so a run diffs byte-for-byte
- * against real HotSpot, and each subclass counts the calls that reach it, since
- * the previous two probes both found defects the return values alone hid.
+ * every observable is printed as `CK RForeignLayoutCollections key=value` so a
+ * run diffs byte-for-byte against real HotSpot, and each subclass counts the
+ * calls that reach it, since the previous two probes both found defects the
+ * return values alone hid.
+ *
+ * THE PREFIX IS LOAD-BEARING. run.sh's cross-VM extractor is
+ * `grep -aE '^(PASS|CK) '`, so a bare `key=value` line is DELETED before the
+ * diff ever sees it. This vector printed all 42 of its observables that way and
+ * held zero `check()` calls, which reduced it to the constant string
+ * `PASS RForeignLayoutCollections` — a green that survived every possible
+ * answer, including the silent-empty one it exists to catch. Every observable
+ * now carries the prefix AND is asserted locally against the value measured on
+ * HotSpot 25, because run.sh skips the diff outright when no HotSpot is present
+ * (it says so out loud) and a vector that can only fail through the diff is
+ * half-armed on such a host.
  *
  * The subclasses deliberately implement ONLY what the abstract class leaves
  * abstract, and hold their data in a field CratonVM cannot recognise — a

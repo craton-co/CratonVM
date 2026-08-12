@@ -2424,18 +2424,43 @@ mod tests {
         assert_eq!(heap.identity_hash_code(obj), hash, "must be stable");
     }
 
+    /// `alloc_object` allocates through `alloc_zeroed`, and an all-zero slot
+    /// decodes as `Value::Int(0)` (the discriminant-0 variant of `Value`; see
+    /// `alloc_object_with_descriptors`, which exists precisely because that is
+    /// NOT `Object(None)`). Every field of a fresh object must read back as
+    /// that zero, including one carved out of arena bytes a previous object
+    /// has already written to.
+    ///
+    /// Was vacuous: three `let _ = heap.get_field(obj, n);` and "just verify no
+    /// crash". Swapping `alloc_zeroed` for a non-zeroing bump in
+    /// `alloc_object`, so a recycled/dirty slot is handed back as-is, stayed
+    /// green.
     #[test]
     fn alloc_object_fields_zero_initialized() {
         let heap = Heap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
 
-        // All fields should read as zero (which is Value::Uninitialized from zeroed memory,
-        // or more precisely, whatever zero bits represent for Value).
-        // In practice, we set fields before reading in real code.
-        // Just verify no crash.
-        let _ = heap.get_field(obj, 0);
-        let _ = heap.get_field(obj, 1);
-        let _ = heap.get_field(obj, 2);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj, i),
+                Value::Int(0),
+                "field {i} of a fresh object must read as the zeroed slot"
+            );
+        }
+
+        // Dirty this object, then allocate another: the new one's slots must
+        // still be zero rather than whatever the arena last held.
+        heap.set_field(obj, 0, Value::Long(-1));
+        heap.set_field(obj, 1, Value::Double(1.5));
+        heap.set_field(obj, 2, Value::Object(Some(obj)));
+        let obj2 = heap.alloc_object(ClassId::new(0), 3);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj2, i),
+                Value::Int(0),
+                "field {i} of a later object must be zeroed too"
+            );
+        }
     }
 
     #[test]
