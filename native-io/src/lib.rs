@@ -9450,7 +9450,7 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Int(-1))),
     };
     let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -9496,7 +9496,7 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(0))),
     };
     let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(0))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -9557,7 +9557,7 @@ fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Long(0))),
     };
     let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
     // Simplified: return 0 (a full impl would query the underlying file)
@@ -17050,7 +17050,7 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         .into());
     }
     let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) if v >= 0 => v as u32,
         _ => {
             return Err(RuntimeError::IOException {
                 message: "FileChannel.map: invalid fd".into(),
@@ -17215,7 +17215,7 @@ fn native_fc_force_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
     let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
-        Value::Int(v) => v as u32,
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(None),
     };
     let _ = ctx.fd_table().flush(fd_id);
