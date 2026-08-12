@@ -2130,7 +2130,13 @@ fn note_site_identity(info_key: JitSiteKey, info: &JitInvokeInfo) {
 
 fn site_alias_detect_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
+    // `runtime_var_os`, not `std::env::var_os`: this name IS declared
+    // (`CRATONVM_DBG=site-alias`), and a raw read on a declared name is served
+    // by a live `getenv` instead of the latched snapshot — so the grouped
+    // spelling silently did nothing here, and `flags::with_thread_overrides`
+    // could not arrange the probe in a test. Check 4 of
+    // `tools/flag-census/check-surface.sh` names exactly this call site.
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SITE_ALIAS").is_some())
 }
 
 /// May a callee that declares an exception table be published into the
@@ -2467,6 +2473,7 @@ unsafe fn resolve_callee_cached(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -3267,6 +3274,7 @@ unsafe fn try_resume_trapped_callee(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

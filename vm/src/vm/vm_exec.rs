@@ -5233,7 +5233,21 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(exc) = self.thread.pending_async_exception {
             snapshot.push(exc);
         }
-        let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+        // COLLECTOR FIRST. `moving_young_enabled()` ANDs a JIT-side gate with
+        // `flags().gc.moving_young` and consults the collector in neither, so
+        // under G1 and ZGC this whole question is inert — and answering it is
+        // not free: `refresh_moving_young_coverage_for_current_thread` ends in
+        // an UNMEMOISED `native_stack_has_jit_frame` over the full band, on
+        // every blocked-region entry.
+        //
+        // Measured on `DefaultCatalogAndSchemaTest` under the default (ZGC)
+        // collector, 240 s: the probe ran 1,139,842 times reading 35.2 BILLION
+        // stack words. With the moving-young term forced off
+        // (`CRATONVM_NO_MOVING_YOUNG=1`) it ran 494,968 times reading 15.3
+        // billion — exactly one probe per blocked deposit instead of two, and
+        // 20 billion fewer words, for a decision no non-moving collector reads.
+        let moving_young_precise_only = self.shared.mem.heap.is_generational()
+            && crate::jit::conservative_roots::moving_young_enabled()
             && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
             && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
 
@@ -5267,6 +5281,7 @@ impl<'a> NativeContextImpl<'a> {
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
             let jit_scan_start = snapshot.len();
+            crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.mem.heap,
                 &mut snapshot,

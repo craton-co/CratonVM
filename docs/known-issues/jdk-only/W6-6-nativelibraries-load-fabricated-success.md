@@ -3,6 +3,15 @@
 **Status:** FIXED in source 2026-08-07 (lane W6-6, JDK-only wave 2). Not yet
 verified against a binary — see *How to verify* below.
 
+Its named residual — no loader-scoped `loadedLibraryNames` — is fixed as of
+2026-08-11, **in strict mode only, and not on this road**. The distinction
+matters and §4 below already had it right: on *this* road the JDK's own
+`ClassLoader.loadLibrary` bytecode enforces the rule above this native, so
+nothing changed here. The fix landed on the road W5-1 owns, where CratonVM
+intercepts that bytecode. See *Known residual*, rewritten below, and
+W5-1-loadlibrary-allowlist-too-wide.md for the mechanism. Nothing has been
+built or run for it.
+
 ## The hole, and why it was worth a lane on its own
 
 A sibling lane narrowed `System.loadLibrary`'s allowlist
@@ -149,17 +158,48 @@ anyway, because the *next* caller may well arrive by the bytecode road.
 | `ClassLoader.findLibrary(String)` | **NOT INTERCEPTED, and should not be.** Not `ACC_NATIVE` in the real JDK — a `protected` Java method returning `null`. Real bytecode already gives the right answer. |
 | `RawNativeLibraries.load0` (panama.rs) | **ALREADY TRUTHFUL.** Returns `Int(0)` on failure and does not throw, which is that native's actual contract (`RawNativeLibraryImpl.open()` maps `false` to `null`). Different road, different libraries — FFM downcalls into genuine third-party `.so`s CratonVM does not reimplement. |
 
-## Known residual (not introduced here, and not closable from this file)
+## Known residual — closed 2026-08-11, on the other road
 
-There is no class-loader-scoped `loadedLibraryNames` bookkeeping anywhere in this
-VM, and `BootLoader.loadLibrary` is a no-op, so the JDK's *dynamic* rule — a
-second load of the same file from a different class loader is an
-`UnsatisfiedLinkError` — can only fire when the JDK's own bytecode has populated
-that set within a single run. A program that uses `java.util.zip` (or
-`java.net`, `java.nio`, `java.util.prefs`) and then loads the matching library by
-name gets a success here where HotSpot throws. That residual is inherited
-verbatim from the `System.loadLibrary` list's documented caveat; branch 2 does
-not widen it, and closing it needs loader-scoped bookkeeping, not a bigger list.
+The residual as filed: there is no class-loader-scoped `loadedLibraryNames`
+bookkeeping anywhere in this VM, and `BootLoader.loadLibrary` is a no-op, so the
+JDK's *dynamic* rule — a second load of the same file from a different class
+loader is an `UnsatisfiedLinkError` — can only fire when the JDK's own bytecode
+has populated that set within a single run.
+
+**It was still live when checked on 2026-08-11**, against dev `95b693f2d`, and
+this record's own §4 is what said where the fix does *not* go. `grep
+loadedLibraryNames` over the tree found five hits and every one was a comment
+saying the state does not exist — this record, W5-1, the campaign README, and
+two comments in `native-builtins/src/lib.rs`. No table, no loader key, no call
+site.
+
+**Nothing on this road changed, and that is the correct outcome.** §4 above
+states the rule for this native — the "already loaded in another classloader"
+error is raised by `NativeLibraries.loadLibrary` bytecode before `load` is
+entered, so it is not this body's job and must not be duplicated here. That
+reading survived the re-reading of the JDK source: `loadLibrary(Class,String,
+boolean)` does the per-instance `libraries.get(name)` and the static
+`loadedLibraryNames.contains(name)` checks, in that order, under
+`acquireNativeLibraryLock(name)`, and only then constructs the
+`NativeLibraryImpl` whose `open()` calls this native.
+
+The fix went where the JDK's bytecode is *replaced* rather than run: CratonVM
+intercepts `System.load`, `System.loadLibrary`, `Runtime.load0` and
+`Runtime.loadLibrary0`, so for those four `ClassLoader.loadLibrary` ->
+`NativeLibraries.loadLibrary` never executes and nobody consults or populates
+the set. `native-builtins/src/lang_system.rs` now keeps a per-VM
+`loader id -> library keys` table (`LOADED_LIBRARIES`, a `VmScoped` — not a
+process global, contract §2) and applies the same two-step rule, under
+`--jdk-only` only. Mechanism, the quoted specification, and the loader-identity
+resolution are in W5-1-loadlibrary-allowlist-too-wide.md.
+
+**What still cannot fire, on either road, is the boot-loader case this
+paragraph opened with**, and the reason is the `BootLoader.loadLibrary` no-op
+listed in the sibling-surfaces table above. `lang_system::record_boot_loader_library`
+is written and deliberately unarmed; the one-line patch to that registration,
+and the measurement that has to precede arming it (it can flip `RJdkJni`'s
+`net` probe), are in W5-1. Branch 2 of this native does not widen the residual
+and closing it is still not a bigger list.
 
 ## Risk: this is a behaviour change for real callers
 

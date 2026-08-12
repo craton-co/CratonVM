@@ -3934,6 +3934,33 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
             }
             "?".to_string()
         }
+        // Same rendering for the REAL reifier impl, which is what
+        // `generics::real_wildcard_type` actually builds — the positional arm
+        // above only covers the bare-interface synthetic. Without this the
+        // fall-through arm below asked a `WildcardTypeImpl` for
+        // `getTypeName()`, which it does not have, so `List<? extends Number>`
+        // rendered as
+        // `java.util.List<sun.reflect.generics.reflectiveObjects.WildcardTypeImpl@6>`
+        // and logged a `NoSuchMethodError` on the way. Reads by name, matching
+        // how that builder populates the object.
+        "sun/reflect/generics/reflectiveObjects/WildcardTypeImpl" => {
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(obj, "lowerBounds") {
+                if ctx.array_length(arr) > 0 {
+                    let el = ctx.get_array_element(arr, 0);
+                    return format!("? super {}", render_type_name(ctx, &el));
+                }
+            }
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(obj, "upperBounds") {
+                if ctx.array_length(arr) > 0 {
+                    let el = ctx.get_array_element(arr, 0);
+                    let s = render_type_name(ctx, &el);
+                    if s != "java.lang.Object" {
+                        return format!("? extends {s}");
+                    }
+                }
+            }
+            "?".to_string()
+        }
         // Class mirror or a real reifier impl: ask the VM for getTypeName(),
         // falling back to toString() and finally the dotted class name.
         _ => {

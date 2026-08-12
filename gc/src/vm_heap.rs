@@ -1913,6 +1913,20 @@ impl VmHeap {
         matches!(self, VmHeap::G1(_))
     }
 
+    /// Returns whether this heap is the Generational collector — the only
+    /// backend with a MOVING YOUNG generation.
+    ///
+    /// Exists because "does moving-young apply here?" was being answered by
+    /// `conservative_roots::moving_young_enabled()`, which ANDs a JIT-side gate
+    /// with `flags().gc.moving_young` and consults the collector in neither. G1
+    /// evacuates by region and ZGC never moves anything, so on both of them the
+    /// precise-moving-young question — and the unmemoised full-stack probe that
+    /// answers it — is inert work. See the two `moving_young_precise_only`
+    /// sites.
+    pub fn is_generational(&self) -> bool {
+        matches!(self, VmHeap::Generational(_))
+    }
+
     /// Check if G1 should start concurrent marking (IHOP threshold crossed).
     pub fn g1_should_start_marking(&self) -> bool {
         match self {

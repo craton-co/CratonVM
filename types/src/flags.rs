@@ -2482,6 +2482,43 @@ mod tests {
         assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
     }
 
+    /// `synthetic_memoryusage_tostring` is served by the snapshot, and reads
+    /// the same three truth words its siblings do.
+    ///
+    /// `native-builtins`' `memoryusage_tostring_shim_enabled` read this name
+    /// with a raw `std::env::var` and a bespoke `Ok("1") | Ok("true")` table
+    /// when it landed, so the value the VM acted on came from the live process
+    /// environment — invisible to `with_thread_overrides`, unreachable from
+    /// `CRATONVM_REAL=-memoryusage-tostring`, and silently the developer's
+    /// ambient environment in any test that tried to arrange it. This pins the
+    /// parse; `flag_groups::tests::the_20260811_declarations_expand_from_their_group_spelling`
+    /// pins the grouped spelling that feeds it.
+    #[test]
+    fn synthetic_memoryusage_tostring_is_snapshot_backed_and_reads_one_true_yes() {
+        assert!(
+            !VmFlags::from_source(&MapSource::empty())
+                .natives
+                .synthetic_memoryusage_tostring,
+            "the real JDK bytecode is the default",
+        );
+        for word in ["1", "true", "yes"] {
+            assert!(
+                VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must turn the shim back on",
+            );
+        }
+        for word in ["0", "false", "no", ""] {
+            assert!(
+                !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
+                    .natives
+                    .synthetic_memoryusage_tostring,
+                "`{word}` must leave the default alone",
+            );
+        }
+    }
+
     #[test]
     fn undeclared_process_values_keep_live_standard_environment_semantics() {
         let key = if cfg!(windows) { "PATH" } else { "HOME" };

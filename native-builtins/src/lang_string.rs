@@ -1751,6 +1751,13 @@ pub(crate) fn native_sb_repeat_charsequence(
 /// Register a native so the synthetic layout stays consistent.  Without
 /// this, `BufferedReader.readLine()` (which appends into a fresh
 /// `StringBuilder` via this overload) silently produces empty strings.
+///
+/// The window check is `String.checkRange(offset, offset + len, str.length)` —
+/// the IOOBE_FORMATTER sibling of the one `insert(int, char[], int, int)` uses,
+/// so this overload's javadoc names the plain `IndexOutOfBoundsException` and
+/// not the String one. Clamping instead (what this did) appended a SHORT slice
+/// for a window that runs off the array, which reads as a successful append of
+/// the wrong text.
 pub(crate) fn native_sb_append_char_array_off_len(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1763,18 +1770,29 @@ pub(crate) fn native_sb_append_char_array_off_len(
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i32 = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i32 = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let arr_len = ctx.array_length(arr);
-    let end = off.saturating_add(len).min(arr_len);
-    let start = off.min(arr_len);
-    let copy_len = end.saturating_sub(start);
+    // i64 so a wrapped `offset + len` cannot read as in-range.
+    let end_i64 = i64::from(off_i32) + i64::from(len_i32);
+    if off_i32 < 0 || len_i32 < 0 || end_i64 > arr_len as i64 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(
+            cratonvm_types::error::out_of_bounds_message::check_from_to_index(
+                i64::from(off_i32),
+                end_i64,
+                arr_len as i64,
+            ),
+        )
+        .into());
+    }
+    let start = off_i32 as usize;
+    let copy_len = len_i32 as usize;
     // audit-round5 fix #6 (HIGH): both sides are Java `char[]` — go
     // through `bulk_array_copy` (single `copy_nonoverlapping` in the VM
     // override) instead of materialising a per-element Rust `Vec<u16>`.
@@ -2508,6 +2526,10 @@ pub(crate) fn native_sb_code_point_before(
 
 /// `AbstractStringBuilder.codePointCount(int beginIndex, int endIndex)` —
 /// same layout-mismatch rationale as [`native_sb_code_point_at`].
+///
+/// It opens with `checkRangeSIOOBE(beginIndex, endIndex, count)`; unlike
+/// `delete`/`replace` there is no clamp before it, so an over-long `endIndex`
+/// throws rather than counting to the end (which is what clamping here did).
 pub(crate) fn native_sb_code_point_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2516,16 +2538,20 @@ pub(crate) fn native_sb_code_point_count(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let begin = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let begin_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let end = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+    let end_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    let end = end.min(chars.len());
+    if let Some(failure) = sb_check_from_to_index(begin_i32, end_i32, chars.len() as i32) {
+        return Err(failure);
+    }
+    let begin = begin_i32 as usize;
+    let end = end_i32 as usize;
     let mut count = 0;
     let mut i = begin;
     while i < end {
@@ -2641,7 +2667,11 @@ pub(crate) fn sb_write_chars(
     this
 }
 
-/// insert(int, String) — insert string at offset
+/// `insert(int, String)` — insert a string at `offset`.
+///
+/// `checkOffset(offset, count)` first (see [`sb_check_offset`]); the null
+/// substitution is second, and unlike `replace` this overload really does
+/// substitute "null" rather than throwing.
 pub(crate) fn native_sb_insert_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2651,7 +2681,7 @@ pub(crate) fn native_sb_insert_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let insert_str = match args.get(2) {
@@ -2661,7 +2691,10 @@ pub(crate) fn native_sb_insert_string(
     let insert_chars: Vec<u16> = insert_str.encode_utf16().collect();
 
     let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -2670,7 +2703,7 @@ pub(crate) fn native_sb_insert_string(
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// insert(int, char) — insert single char
+/// `insert(int, char)` — insert a single char. `checkOffset(offset, count)`.
 pub(crate) fn native_sb_insert_char(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2680,7 +2713,7 @@ pub(crate) fn native_sb_insert_char(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let ch = match args.get(2) {
@@ -2688,7 +2721,10 @@ pub(crate) fn native_sb_insert_char(
         _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + 1);
     result.extend_from_slice(&chars[..offset]);
     result.push(ch);
@@ -2697,7 +2733,7 @@ pub(crate) fn native_sb_insert_char(
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// insert(int, int) — insert int as string
+/// `insert(int, int)` — insert an int as its string. `checkOffset(offset, count)`.
 pub(crate) fn native_sb_insert_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2707,7 +2743,7 @@ pub(crate) fn native_sb_insert_int(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let val = match args.get(2) {
@@ -2716,7 +2752,10 @@ pub(crate) fn native_sb_insert_int(
     };
     let insert_chars: Vec<u16> = val.encode_utf16().collect();
     let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -2725,7 +2764,8 @@ pub(crate) fn native_sb_insert_int(
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// insert(int, Object) — insert Object via toString
+/// `insert(int, Object)` — insert an Object via toString.
+/// `checkOffset(offset, count)`.
 pub(crate) fn native_sb_insert_object(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2735,7 +2775,7 @@ pub(crate) fn native_sb_insert_object(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let text = match args.get(2) {
@@ -2749,7 +2789,10 @@ pub(crate) fn native_sb_insert_object(
     };
     let insert_chars: Vec<u16> = text.encode_utf16().collect();
     let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -2773,6 +2816,13 @@ pub(crate) fn native_sb_insert_object(
 /// padding a partially-built line (`sbuf.insert(fieldStart, spaces, 0, n)`
 /// with `fieldStart > 0`), producing "An exception occurred processing
 /// Appender STDOUT" and the log line never reaching `System.out`.
+///
+/// It takes TWO bounds checks, both `StringIndexOutOfBoundsException` per the
+/// `StringBuilder.insert(int, char[], int, int)` javadoc:
+/// `checkOffset(index, count)` for the destination and
+/// `checkRangeSIOOBE(offset, offset + len, str.length)` for the source. Both
+/// used to be silent clamps, so an out-of-range source window inserted a SHORT
+/// slice and an out-of-range destination appended at the end.
 pub(crate) fn native_sb_insert_char_array_off_len(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2782,7 +2832,7 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let arr = match args.get(2) {
@@ -2790,17 +2840,36 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let src_off = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let src_len = match args.get(4) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let arr_len = ctx.array_length(arr);
-    let src_start = src_off.min(arr_len);
-    let src_end = src_off.saturating_add(src_len).min(arr_len);
-    let mut insert_chars = Vec::with_capacity(src_end.saturating_sub(src_start));
+    // Destination first, source second — the JDK's order, and it is observable:
+    // `insert(99, str, -1, 2)` on a short builder reports the destination.
+    let chars = sb_read_chars(ctx, this);
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
+
+    let arr_len = ctx.array_length(arr) as i32;
+    // `offset + len` is computed in i64 because a wrapped i32 sum would read as
+    // in-range for a large enough pair — the same reason the JDK's own
+    // `checkFromToIndex` does not evaluate it in int.
+    let src_end = i64::from(src_off) + i64::from(src_len);
+    if src_off < 0 || src_len < 0 || src_end > i64::from(arr_len) {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_range(
+            src_off,
+            src_end.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            arr_len,
+        )
+        .into());
+    }
+    let (src_start, src_end) = (src_off as usize, src_end as usize);
+    let mut insert_chars = Vec::with_capacity(src_end - src_start);
     for i in src_start..src_end {
         insert_chars.push(match ctx.get_array_element(arr, i) {
             Value::Int(c) => c as u16,
@@ -2808,8 +2877,6 @@ pub(crate) fn native_sb_insert_char_array_off_len(
         });
     }
 
-    let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -2824,6 +2891,7 @@ pub(crate) fn native_sb_insert_char_array_off_len(
 /// with real (non-`native`) bytecode, which — without a native override —
 /// reads the real-layout `count` field (absent from our synthetic char[]/int
 /// layout) and throws `ArrayIndexOutOfBoundsException` from `checkOffset`.
+/// The one bounds check it owns is `checkOffset(offset, count)`.
 pub(crate) fn native_sb_insert_char_array(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2833,7 +2901,7 @@ pub(crate) fn native_sb_insert_char_array(
         _ => return Ok(Some(Value::Object(None))),
     };
     let offset = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let arr = match args.get(2) {
@@ -2850,7 +2918,10 @@ pub(crate) fn native_sb_insert_char_array(
     }
 
     let chars = sb_read_chars(ctx, this);
-    let offset = std::cmp::min(offset, chars.len());
+    if let Some(failure) = sb_check_offset(offset, chars.len() as i32) {
+        return Err(failure);
+    }
+    let offset = offset as usize;
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
@@ -2859,23 +2930,36 @@ pub(crate) fn native_sb_insert_char_array(
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// delete(int, int) — remove range [start, end)
+/// `delete(int, int)` — remove the range `[start, end)`.
+///
+/// `AbstractStringBuilder.delete` clamps `end` DOWN to the length and only then
+/// runs `checkRangeSIOOBE(start, end, count)`, so an over-long `end` alone is
+/// legal (`delete(0, 100)` empties the builder) while a `start` past the length
+/// is not: `new StringBuilder("ab").delete(5, 6)` is a
+/// `StringIndexOutOfBoundsException`, because after the clamp `start 5 > end 2`.
+/// Clamping BOTH ends — what this did — turned that into a silent no-op, the
+/// fabricated-success shape `docs/known-issues/jdk-only/W2-7-fabricated-success-where-the-spec-mandates-failure.md`
+/// inventories. A caller that guards a loop with the exception never leaves it.
 pub(crate) fn native_sb_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
     let start = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let end = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let mut chars = sb_read_chars(ctx, this);
-    let start = std::cmp::min(start, chars.len());
-    let end = std::cmp::min(end, chars.len());
+    let count = chars.len() as i32;
+    let end = std::cmp::min(end, count);
+    if let Some(failure) = sb_check_from_to_index(start, end, count) {
+        return Err(failure);
+    }
+    let (start, end) = (start as usize, end as usize);
     if start < end {
         chars.drain(start..end);
     }
@@ -2883,7 +2967,11 @@ pub(crate) fn native_sb_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// deleteCharAt(int) — remove single char
+/// `deleteCharAt(int)` — remove a single char.
+///
+/// `checkIndex(index, count)`: the index is EXCLUSIVE of the length, unlike
+/// `insert`'s offset. Returning the builder untouched for an out-of-range index
+/// — what this did — is the same fabricated success as `delete` above.
 pub(crate) fn native_sb_delete_char_at(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2893,51 +2981,70 @@ pub(crate) fn native_sb_delete_char_at(
         _ => return Ok(Some(Value::Object(None))),
     };
     let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
-        _ => return Ok(Some(Value::Object(Some(this)))),
+        Some(Value::Int(i)) => *i,
+        _ => 0,
     };
     let chars = sb_read_chars(ctx, this);
-    let this = if index < chars.len() {
-        let mut result = Vec::with_capacity(chars.len() - 1);
-        result.extend_from_slice(&chars[..index]);
-        result.extend_from_slice(&chars[index + 1..]);
-        sb_write_chars(ctx, this, &result)
-    } else {
-        this
-    };
+    let count = chars.len() as i32;
+    if index < 0 || index >= count {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
+    }
+    let index = index as usize;
+    let mut result = Vec::with_capacity(chars.len() - 1);
+    result.extend_from_slice(&chars[..index]);
+    result.extend_from_slice(&chars[index + 1..]);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// replace(int, int, String) — replace range with string
+/// `replace(int, int, String)` — replace a range with a string.
+///
+/// Same shape as `delete`: `end` is clamped to the length, then
+/// `checkRangeSIOOBE(start, end, count)`. The null replacement is NOT the same
+/// as `insert(int, String)`'s — `replace` reads `str.length()` with no guard, so
+/// it is a NullPointerException, and it is raised only AFTER the range check.
 pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
     let start = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let end = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
+    let mut chars = sb_read_chars(ctx, this);
+    let count = chars.len() as i32;
+    let end = std::cmp::min(end, count);
+    if let Some(failure) = sb_check_from_to_index(start, end, count) {
+        return Err(failure);
+    }
     let replacement = match args.get(3) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+        Some(Value::Object(None)) => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"String.length()\" because \"str\" is null".to_string(),
+                ),
+            }
+            .into())
+        }
         _ => String::new(),
     };
     let repl_chars: Vec<u16> = replacement.encode_utf16().collect();
-    let mut chars = sb_read_chars(ctx, this);
-    let start = std::cmp::min(start, chars.len());
-    let end = std::cmp::min(end, chars.len());
-    if start <= end {
-        chars.splice(start..end, repl_chars);
-    }
+    chars.splice(start as usize..end as usize, repl_chars);
     let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// setCharAt(int, char) — set char at index
+/// `setCharAt(int, char)` — set the char at `index`.
+///
+/// `checkIndex(index, count)`. Dropping the store for an out-of-range index —
+/// what the `if index < count` guard did — is a WRITE that silently did not
+/// happen, the worst reading of the fabricated-success species.
 pub(crate) fn native_sb_set_char_at(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2947,7 +3054,7 @@ pub(crate) fn native_sb_set_char_at(
         _ => return Ok(None),
     };
     let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
     let ch = match args.get(2) {
@@ -2955,15 +3062,25 @@ pub(crate) fn native_sb_set_char_at(
         _ => return Ok(None),
     };
     let (buf, count) = sb_state(ctx, this);
+    if index < 0 || index >= count {
+        return Err(cratonvm_types::error::RuntimeError::sioobe_index(index, count).into());
+    }
     if let Some(buf) = buf {
-        if index < count as usize {
-            ctx.set_array_element(buf, index, Value::Int(ch as i32));
-        }
+        ctx.set_array_element(buf, index as usize, Value::Int(ch as i32));
     }
     Ok(None)
 }
 
-/// setLength(int) — truncate or extend with null chars
+/// `setLength(int)` — truncate, or extend with NUL chars.
+///
+/// A negative length is the one thing `AbstractStringBuilder.setLength` rejects,
+/// and it does so before touching the buffer; clamping it to 0 (what this did)
+/// silently emptied the builder instead.
+///
+/// The message is `StringIndexOutOfBoundsException(int)`'s own wording rather
+/// than one of the `Preconditions` shapes, because this check is hand-rolled in
+/// the JDK and not routed through a formatter. UNVERIFIED against JDK 25: only
+/// the exception CLASS is pinned by the javadoc.
 pub(crate) fn native_sb_set_length(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2973,9 +3090,19 @@ pub(crate) fn native_sb_set_length(
         _ => return Ok(None),
     };
     let new_len = match args.get(1) {
-        Some(Value::Int(i)) => std::cmp::max(0, *i) as usize,
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
+    if new_len < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                index: new_len,
+                message: Some(format!("String index out of range: {new_len}")),
+            }
+            .into(),
+        );
+    }
+    let new_len = new_len as usize;
     let (buf, count) = sb_state(ctx, this);
     let count = count as usize;
     if new_len > count {
@@ -3151,7 +3278,9 @@ pub(crate) fn native_sb_substring(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 /// `Preconditions.checkFromToIndex(start, end, count, SIOOBE_FORMATTER)` — the
-/// range check `AbstractStringBuilder.substring`/`subSequence` open with.
+/// range check `AbstractStringBuilder.substring`/`subSequence` open with, and
+/// the body of `String.checkRangeSIOOBE`, which `delete`/`replace`/
+/// `codePointCount` open with in turn.
 ///
 /// Returns the failure to raise, or `None` when the range is valid.
 fn sb_check_from_to_index(
@@ -3163,6 +3292,17 @@ fn sb_check_from_to_index(
         return None;
     }
     Some(cratonvm_types::error::RuntimeError::sioobe_range(start, end, count).into())
+}
+
+/// `String.checkOffset(offset, count)` — the check every `insert` overload
+/// opens with.
+///
+/// Unlike `checkIndex` the upper bound is INCLUSIVE: inserting at `count`
+/// appends, which is why this cannot just be `sioobe_index`. The JDK spells it
+/// `Preconditions.checkFromToIndex(offset, length, length, SIOOBE_FORMATTER)`,
+/// so the message names a range and not an index.
+fn sb_check_offset(offset: i32, count: i32) -> Option<cratonvm_types::error::MethodCallFailed> {
+    sb_check_from_to_index(offset, count, count)
 }
 
 /// substring(int, int) — substring [start, end)
@@ -5441,6 +5581,366 @@ fn format_temporal_field(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// java.util.Formatter's floating-point conversions: %f %e %E %g %G %a %A
+//
+// These are NOT Rust's, and delegating to Rust's was the W7-1 divergence
+// `probes/ShadowDifferentialProbe` measured against HotSpot 25:
+//
+//   String.format("%.3f|%e|%g", 1.0/3, 1234.5, 0.0001)
+//     HotSpot   0.333|1.234500e+03|0.000100000
+//     CratonVM  0.333|1.2345e3|1.0E-4
+//
+// Three separate reasons, one per conversion:
+//
+//   * `%e` went to Rust's `{:e}`, which writes the exponent bare (`e3`).
+//     Formatter's is always signed and at least two digits (`e+03`), and its
+//     default precision is 6 — the no-precision path did not even reach the
+//     precision handling, so it printed the shortest round-trip mantissa.
+//   * `%g` went to `{:.prec$}`, i.e. fixed notation, and with no precision it
+//     fell through to `Double.toString` (hence `1.0E-4`). Formatter's %g is a
+//     third algorithm: it picks scientific or fixed by the exponent of the
+//     ROUNDED magnitude against the precision, and — unlike C's %g — never
+//     strips trailing zeros, which is why 1e-4 prints as `0.000100000`.
+//   * `%a` had no arm at all and fell through to `Double.toString`.
+//
+// Rounding is the fourth reason and it is not visible in that one probe line.
+// Rust rounds ties to EVEN; java.util.Formatter specifies HALF_UP for
+// %f/%e/%g, so `%.1f` of 0.25 is Java "0.3" against Rust's "0.2". Rather than
+// correct that per call site, everything below rounds the value's EXACT
+// decimal expansion with its own digit arithmetic (see `fmt_exact_decimal`),
+// where HALF_UP is one comparison. %a is the exception: the JDK rounds it in
+// BINARY, half to even, inside `Formatter.hexDouble`, and `fmt_hex_float`
+// reproduces that rather than the decimal rule.
+//
+// `Double.toString`'s own 10^-3..10^7 scientific threshold (`format_double`,
+// `cratonvm_types::java_double_to_string`) is a DIFFERENT set of rules and is
+// deliberately not shared with any of this: %g at default precision switches
+// to scientific below 10^-4, not below 10^-3.
+// ---------------------------------------------------------------------------
+
+/// The number of digits in the EXACT decimal expansion of a finite `f64`'s
+/// fractional part.
+///
+/// Every finite double is `m * 2^k` for integers `m`, `k`. Once `m` is odd,
+/// `2^k` with `k < 0` is `5^-k / 10^-k`, so the expansion terminates after
+/// exactly `-k` fractional digits — at most 1074, for the smallest subnormal.
+/// That termination is what lets [`fmt_exact_decimal`] ask Rust for a digit
+/// count it can answer without rounding.
+fn fmt_exact_fraction_digits(v: f64) -> usize {
+    let bits = v.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    let raw_frac = bits & ((1u64 << 52) - 1);
+    // Subnormals have no implicit leading 1 and a fixed exponent; normals carry
+    // the implicit bit and a significand scaled by 2^-52.
+    let (mut sig, mut e2) = if raw_exp == 0 {
+        (raw_frac, -1074i32)
+    } else {
+        (raw_frac | (1u64 << 52), raw_exp - 1075)
+    };
+    if sig == 0 {
+        return 0;
+    }
+    while sig & 1 == 0 {
+        sig >>= 1;
+        e2 += 1;
+    }
+    usize::try_from(-e2).unwrap_or(0)
+}
+
+/// A finite, non-negative `f64` as its EXACT decimal digits — most significant
+/// first, no leading and no trailing zeros — plus the base-10 exponent of the
+/// leading digit: `v == d0.d1d2… × 10^exp`. Zero answers `([0], 0)`.
+///
+/// `format!("{:.*}", n, v)` is exact in Rust (flt2dec's exact mode, not a
+/// shortest-representation approximation), so asking it for precisely the
+/// number of fractional digits the value really has rounds nothing at all.
+/// Every rounding decision downstream is then plain digit arithmetic, which is
+/// the only way to get HALF_UP out of a formatter that only offers half-even.
+fn fmt_exact_decimal(v: f64) -> (Vec<u8>, i32) {
+    let nfrac = fmt_exact_fraction_digits(v);
+    let s = format!("{:.*}", nfrac, v);
+    let (int_str, frac_str) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let mut digits: Vec<u8> = int_str
+        .bytes()
+        .chain(frac_str.bytes())
+        .map(|b| b - b'0')
+        .collect();
+    // `exp` starts at the exponent of the first INTEGER-part digit and drops by
+    // one for every leading zero skipped.
+    let mut exp = int_str.len() as i32 - 1;
+    match digits.iter().position(|&d| d != 0) {
+        None => (vec![0], 0),
+        Some(lead) => {
+            digits.drain(..lead);
+            exp -= lead as i32;
+            while digits.len() > 1 && digits[digits.len() - 1] == 0 {
+                digits.pop();
+            }
+            (digits, exp)
+        }
+    }
+}
+
+/// Round an exact digit string to `n` significant digits, HALF_UP — ties away
+/// from zero, which is the rule `java.util.Formatter` names for %e/%f/%g.
+///
+/// Answers exactly `n` digits plus the exponent the caller must now use: 9.99
+/// rounded to two digits carries into 10., i.e. gains a leading digit.
+fn fmt_round_significant(digits: &[u8], exp: i32, n: usize) -> (Vec<u8>, i32) {
+    let n = n.max(1);
+    let mut out: Vec<u8> = digits.iter().copied().take(n).collect();
+    out.resize(n, 0);
+    // The discarded tail is >= half an ulp of the kept part exactly when its
+    // first digit is >= 5 — including the "5 followed by nothing" tie, which is
+    // the single case where half-even would round the other way.
+    if digits.get(n).is_some_and(|&d| d >= 5) {
+        let mut i = n;
+        loop {
+            if i == 0 {
+                // Every kept digit was a 9: 999 -> 1000, one digit wider.
+                out.insert(0, 1);
+                out.pop();
+                return (out, exp + 1);
+            }
+            i -= 1;
+            if out[i] == 9 {
+                out[i] = 0;
+            } else {
+                out[i] += 1;
+                break;
+            }
+        }
+    }
+    (out, exp)
+}
+
+/// Round at a FRACTION-digit position rather than a significant-digit one —
+/// what %f asks for, where the precision counts digits after the point.
+fn fmt_round_at_fraction(digits: &[u8], exp: i32, frac: usize) -> (Vec<u8>, i32) {
+    // The digit at 10^-frac is significant digit number `exp + 1 + frac`.
+    let nsig = exp + 1 + frac as i32;
+    if nsig >= 1 {
+        fmt_round_significant(digits, exp, nsig as usize)
+    } else if nsig == 0 {
+        // Nothing survives but a possible carry: the leading digit IS the
+        // rounding digit, so the answer is either zero or one unit in the last
+        // place (0.06 at %.1f is 0.1).
+        if digits.first().copied().unwrap_or(0) >= 5 {
+            (vec![1], -(frac as i32))
+        } else {
+            (vec![0], 0)
+        }
+    } else {
+        // |v| < 0.5 × 10^-frac: it rounds away entirely.
+        (vec![0], 0)
+    }
+}
+
+/// `digits × 10^exp` in plain decimal with exactly `frac` fraction digits.
+/// Trailing zeros are WRITTEN, not trimmed — %f and %g both pad to the
+/// precision.
+fn fmt_render_fixed(digits: &[u8], exp: i32, frac: usize) -> String {
+    let mut out = String::with_capacity(frac + 8);
+    if exp < 0 {
+        out.push('0');
+    } else {
+        for i in 0..=exp {
+            out.push(char::from(
+                b'0' + digits.get(i as usize).copied().unwrap_or(0),
+            ));
+        }
+    }
+    if frac > 0 {
+        out.push('.');
+        // Fraction digit j (1-based) sits at 10^-j, i.e. index `exp + j` into
+        // `digits`; a negative index is one of the zeros after the point.
+        for j in 1..=frac as i32 {
+            let idx = exp + j;
+            let d = if idx < 0 {
+                0
+            } else {
+                digits.get(idx as usize).copied().unwrap_or(0)
+            };
+            out.push(char::from(b'0' + d));
+        }
+    }
+    out
+}
+
+/// `digits × 10^exp` in Formatter's scientific form: one digit before the
+/// point, `frac` after, then `e`/`E`, an ALWAYS-explicit sign, and at least two
+/// exponent digits. Rust's `{:e}` writes neither the sign nor the padding,
+/// which is the whole of the `1.2345e3` vs `1.234500e+03` divergence.
+fn fmt_render_scientific(digits: &[u8], exp: i32, frac: usize, upper: bool) -> String {
+    let mut out = String::with_capacity(frac + 8);
+    out.push(char::from(b'0' + digits.first().copied().unwrap_or(0)));
+    if frac > 0 {
+        out.push('.');
+        for j in 1..=frac {
+            out.push(char::from(b'0' + digits.get(j).copied().unwrap_or(0)));
+        }
+    }
+    out.push(if upper { 'E' } else { 'e' });
+    out.push(if exp < 0 { '-' } else { '+' });
+    out.push_str(&format!("{:02}", exp.unsigned_abs()));
+    out
+}
+
+/// `Double.toHexString`'s digits for a finite, non-negative `v`, WITHOUT the
+/// `0x` prefix that `Formatter` writes for itself: `1.0p0`, `0.0p0`,
+/// `1.a36e2eb1c432dp-14`, or a subnormal's `0.<digits>p-1022`.
+fn fmt_hex_digits(v: f64) -> String {
+    if v == 0.0 {
+        return "0.0p0".to_string();
+    }
+    let bits = v.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    // 52 significand bits are exactly 13 hex digits. `Double.toHexString` drops
+    // trailing zeros but always keeps at least one digit ("0x1.0p0", not
+    // "0x1.p0").
+    let mut hex = format!("{frac:013x}");
+    while hex.len() > 1 && hex.ends_with('0') {
+        hex.pop();
+    }
+    if raw_exp == 0 {
+        // Subnormal: no implicit leading 1, and the exponent is pinned.
+        format!("0.{hex}p-1022")
+    } else {
+        format!("1.{hex}p{}", raw_exp - 1023)
+    }
+}
+
+/// `java.util.Formatter.hexDouble` — %a's magnitude for a finite, non-negative
+/// `v`, without the `0x` prefix.
+///
+/// `prec` is the JDK's already-normalised precision: 0 means "every digit"
+/// (Formatter maps a MISSING precision to 0 and an explicit `%.0a` to 1), and
+/// >= 13 is likewise every digit, because 13 hex digits is all a double has.
+///
+/// This is the one member of the family that is not HALF_UP. The JDK rounds
+/// the SIGNIFICAND in binary, half to even — the round/sticky/least-significant
+/// test below is `hexDouble`'s — and then re-renders the rounded double through
+/// `Double.toHexString`. That is why `%.4a` of 1.0 is `0x1.0p0` and not
+/// `0x1.0000p0`: nothing pads the digits back out afterwards.
+fn fmt_hex_float(v: f64, prec: usize) -> String {
+    if v == 0.0 || prec == 0 || prec >= 13 {
+        return fmt_hex_digits(v);
+    }
+    // Subnormals carry no implicit leading 1, so normalise by 2^54 first and put
+    // the exponent back afterwards — what `hexDouble` does for the same reason.
+    let subnormal = (v.to_bits() >> 52) & 0x7ff == 0;
+    let scaled = if subnormal { v * 2.0f64.powi(54) } else { v };
+
+    // 1 implicit bit + 4 bits per hex digit kept, out of SIGNIFICAND_WIDTH = 53.
+    // prec is 1..=12 here, so `shift` is 4..=48 and `shift - 1` is in range.
+    let precision_bits = 1 + prec * 4;
+    let shift = 53 - precision_bits as u32;
+    let doppel = scaled.to_bits();
+    // Exponent and significand together, sign masked off (v >= 0 anyway).
+    let mut new_signif = (doppel & 0x7fff_ffff_ffff_ffff) >> shift;
+    let rounding_bits = doppel & !(!0u64 << shift);
+    let least_zero = new_signif & 1 == 0;
+    let round = ((1u64 << (shift - 1)) & rounding_bits) != 0;
+    let sticky = shift > 1 && (!(1u64 << (shift - 1)) & rounding_bits) != 0;
+    if (least_zero && round && sticky) || (!least_zero && round) {
+        new_signif += 1;
+    }
+    let rounded = f64::from_bits(new_signif << shift);
+    if rounded.is_infinite() {
+        // The carry ran out of the exponent field; `hexDouble` hard-codes this.
+        return "1.0p1024".to_string();
+    }
+    let res = fmt_hex_digits(rounded);
+    if !subnormal {
+        return res;
+    }
+    // Undo the 2^54 normalisation in the printed exponent.
+    match res.find('p') {
+        Some(idx) => {
+            let e = res[idx + 1..].parse::<i32>().unwrap_or(0) - 54;
+            format!("{}p{e}", &res[..idx])
+        }
+        None => res,
+    }
+}
+
+/// One value through `java.util.Formatter`'s floating-point conversions.
+///
+/// `precision` is the spec's precision if it carried one. The DEFAULTS live
+/// here rather than at the call sites because the no-precision path used to
+/// bypass precision handling entirely and answer Rust's `{:e}` /
+/// `Double.toString`; a default that only exists on the with-precision branch
+/// is not a default.
+pub(crate) fn java_float_conversion(v: f64, spec: char, precision: Option<usize>) -> String {
+    let upper = matches!(spec, 'E' | 'G' | 'A');
+    // Formatter tests NaN before it reads the sign, so a NaN never prints one.
+    if v.is_nan() {
+        return if upper { "NAN" } else { "NaN" }.to_string();
+    }
+    // The sign test is `Double.compare(value, 0.0) == -1`, so -0.0 DOES print
+    // its sign: `%f` of -0.0 is "-0.000000".
+    let sign = if v.is_sign_negative() { "-" } else { "" };
+    if v.is_infinite() {
+        return format!("{sign}{}", if upper { "INFINITY" } else { "Infinity" });
+    }
+    let mag = v.abs();
+    let body = match spec {
+        'a' | 'A' => {
+            // Formatter emits the prefix itself and upper-cases the digits and
+            // the 'p' for %A; the exponent is decimal either way.
+            let digits = fmt_hex_float(mag, precision.map_or(0, |p| p.max(1)));
+            if upper {
+                format!("0X{}", digits.to_uppercase())
+            } else {
+                format!("0x{digits}")
+            }
+        }
+        'e' | 'E' => {
+            let prec = precision.unwrap_or(6);
+            let (digits, exp) = fmt_exact_decimal(mag);
+            // One digit before the point plus `prec` after it.
+            let (digits, exp) = fmt_round_significant(&digits, exp, prec + 1);
+            fmt_render_scientific(&digits, exp, prec, upper)
+        }
+        'g' | 'G' => {
+            // Javadoc: the precision defaults to 6, a precision of 0 is taken to
+            // be 1, and it counts SIGNIFICANT digits rather than fraction ones.
+            let prec = match precision {
+                None => 6,
+                Some(0) => 1,
+                Some(p) => p,
+            };
+            if mag == 0.0 {
+                // Formatter special-cases zero to mantissa "0" with a rounded
+                // exponent of 0, which lands in the decimal branch: `%g` of 0.0
+                // is "0.00000", never "0.000000e+00".
+                fmt_render_fixed(&[0], 0, prec - 1)
+            } else {
+                let (digits, exp) = fmt_exact_decimal(mag);
+                // The branch is decided by the magnitude AFTER rounding, which
+                // is why 999999.5 at `%g` prints 1.00000e+06 and not 1000000.
+                let (digits, exp) = fmt_round_significant(&digits, exp, prec);
+                if exp >= -4 && exp < prec as i32 {
+                    fmt_render_fixed(&digits, exp, (prec as i32 - 1 - exp) as usize)
+                } else {
+                    fmt_render_scientific(&digits, exp, prec - 1, upper)
+                }
+            }
+        }
+        // 'f', and any other spec routed here by a caller that already decided
+        // this argument is a float.
+        _ => {
+            let prec = precision.unwrap_or(6);
+            let (digits, exp) = fmt_exact_decimal(mag);
+            let (digits, exp) = fmt_round_at_fraction(&digits, exp, prec);
+            fmt_render_fixed(&digits, exp, prec)
+        }
+    };
+    format!("{sign}{body}")
+}
+
 /// Format a single argument with flags, width, and precision support.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn format_arg_full(
@@ -5469,17 +5969,19 @@ pub(crate) fn format_arg_full(
     // Get the raw formatted value first
     let raw = format_arg(ctx, val, spec)?;
 
-    // Apply precision for %f/%e/%g — override default
+    // Apply the spec's own precision for the floating-point conversions,
+    // overriding the default `format_arg` just applied. Every one of them goes
+    // through the same `java_float_conversion` the no-precision path uses — the
+    // arm this replaced sent %e to Rust's `{:.prec$e}` (bare exponent) and
+    // %g/%a to `{:.prec$}` (fixed notation), which is W7-1's float row.
     let raw = match spec {
-        'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' if precision.is_some() => {
-            let prec = precision.unwrap();
-            let fval = extract_float_value(ctx, val);
-            match spec {
-                'f' => format!("{:.prec$}", fval),
-                'e' => format!("{:.prec$e}", fval),
-                'E' => format!("{:.prec$E}", fval),
-                _ => format!("{:.prec$}", fval),
-            }
+        // A null argument never reaches the conversion at all: Formatter's
+        // `printFloat` prints "null" before it looks at the spec, and
+        // `extract_float_value` would have answered 0.0.
+        'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A'
+            if precision.is_some() && !matches!(val, Value::Object(None)) =>
+        {
+            java_float_conversion(extract_float_value(ctx, val), spec, precision)
         }
         's' if precision.is_some() => {
             let prec = precision.unwrap();
@@ -5506,8 +6008,12 @@ pub(crate) fn format_arg_full(
         formatted = group_thousands(&formatted);
     }
 
-    // Add sign for numeric types
-    if plus_sign && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') && !formatted.starts_with('-')
+    // Add sign for numeric types. %a takes the '+' flag too, and Formatter puts
+    // the sign OUTSIDE the "0x" prefix ("+0x1.0p0"), which is where prepending
+    // to the whole conversion lands it.
+    if plus_sign
+        && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A')
+        && !formatted.starts_with('-')
     {
         formatted = format!("+{formatted}");
     }
@@ -5518,7 +6024,18 @@ pub(crate) fn format_arg_full(
             let pad = w - formatted.len();
             if left_justify {
                 formatted = format!("{formatted}{}", " ".repeat(pad));
-            } else if zero_pad && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'x' | 'X' | 'o') {
+            }
+            // %g/%G were missing from the zero-pad set even though Formatter
+            // accepts '0' for them. %a/%A stay out deliberately: their zeros go
+            // AFTER the "0x" prefix, which this generic insert cannot do.
+            //
+            // The trailing-digit test stands in for Formatter's structure,
+            // where zero padding happens only inside the FINITE branch —
+            // "Infinity"/"NaN" reach the width justifier and get spaces.
+            else if zero_pad
+                && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o')
+                && formatted.ends_with(|c: char| c.is_ascii_digit())
+            {
                 if formatted.starts_with('-') || formatted.starts_with('+') {
                     let (sign, rest) = formatted.split_at(1);
                     formatted = format!("{sign}{}{rest}", "0".repeat(pad));
@@ -5736,6 +6253,12 @@ pub(crate) fn format_arg(
                 _ => return format_arg(ctx, &inner, spec),
             }
         }
+        // The float family is routed through `java_float_conversion` with NO
+        // precision, so its Formatter defaults (6 for %f/%e/%g, every digit for
+        // %a) apply here. This is the path a bare `%e` takes, and it used to
+        // answer Rust's `{:e}` — `1.2345e3` where HotSpot writes
+        // `1.234500e+03`. A Float argument widens to double first, as
+        // `Formatter.print(float, Locale)` does.
         Value::Int(v) => match spec {
             'd' => v.to_string(),
             'x' => format!("{:x}", *v as u32),
@@ -5743,9 +6266,9 @@ pub(crate) fn format_arg(
             'o' => format!("{:o}", *v as u32),
             'c' => char::from_u32(*v as u32).unwrap_or('?').to_string(),
             'b' => ((*v) != 0).to_string(),
-            'f' => format!("{:.6}", *v as f64),
-            'e' => format!("{:e}", *v as f64),
-            'E' => format!("{:E}", *v as f64),
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
+                java_float_conversion(*v as f64, spec, None)
+            }
             _ => v.to_string(),
         },
         Value::Long(v) => match spec {
@@ -5753,22 +6276,20 @@ pub(crate) fn format_arg(
             'x' => format!("{:x}", *v as u64),
             'X' => format!("{:X}", *v as u64),
             'o' => format!("{:o}", *v as u64),
-            'f' => format!("{:.6}", *v as f64),
-            'e' => format!("{:e}", *v as f64),
-            'E' => format!("{:E}", *v as f64),
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
+                java_float_conversion(*v as f64, spec, None)
+            }
             _ => v.to_string(),
         },
         Value::Float(v) => match spec {
-            'f' => format!("{:.6}", v),
-            'e' => format!("{:e}", *v as f64),
-            'E' => format!("{:E}", *v as f64),
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
+                java_float_conversion(*v as f64, spec, None)
+            }
             // `%s`/no-spec of a float -> Java Double.toString form, not raw `{}`.
             _ => format_float(*v),
         },
         Value::Double(v) => match spec {
-            'f' => format!("{:.6}", v),
-            'e' => format!("{:e}", v),
-            'E' => format!("{:E}", v),
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => java_float_conversion(*v, spec, None),
             // `%s`/no-spec of a double -> Java Double.toString form, not raw `{}`.
             _ => format_double(*v),
         },
