@@ -1130,9 +1130,12 @@ fn seed_direct_native_engine_services() {
     // are one set, walked in both directions.
     //
     // Four names came OUT of this list in the W7-15 lane, each measured against
-    // jdk-25.0.3.9-hotspot before removal:
+    // jdk-25.0.3.9-hotspot before removal — and all four went back IN on
+    // 2026-08-11 once they were implemented. Removing them was the correct
+    // answer to "advertised but not computable"; it was never the preferred
+    // one, and the preferred one is now available:
     //
-    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation is
+    //   * `ChaCha20` and `ChaCha20-Poly1305` — no ChaCha20 implementation was
     //     reachable from `Cipher` at all. Advertising them was not an
     //     aspiration, it was wrong crypto: the engine's mode-only dispatch
     //     turned both into AES-256-ECB, byte-identically to
@@ -1140,10 +1143,16 @@ fn seed_direct_native_engine_services() {
     //     producing no tag, so a tampered ciphertext decrypted without an
     //     authentication failure. An AEAD that cannot fail on a bad tag is
     //     worse than no AEAD, because callers build integrity guarantees on it.
-    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implements
+    //     **RFC 8439 is now implemented in `native-builtins/src/chacha20.rs`**,
+    //     pinned by the RFC's own vectors and a differential test against the
+    //     `chacha20poly1305` crate, and `regression-suite/src/RChaCha20Cipher.java`
+    //     matches HotSpot byte-for-byte in both modes.
+    //   * `AES/KW/PKCS5Padding` and `AES/KWP/NoPadding` — no path implemented
     //     either. KWP is RFC 5649, a different padded-wrap scheme with its own
     //     ICV and length prefix, not RFC 3394 with a padding bolted on;
-    //     `aes_key_wrap` computes RFC 3394 only.
+    //     `aes_key_wrap` computed RFC 3394 only. **Both are now implemented**
+    //     (`aes_key_wrap_with_padding` for RFC 5649, PKCS#5 at an eight-byte
+    //     block size for the other), against SunJCE's own wrap vectors.
     //
     // What went IN is the other direction of the same census — code that works
     // and was never advertised, which is the quieter half of the same defect:
@@ -1156,6 +1165,10 @@ fn seed_direct_native_engine_services() {
         "AES",
         "AES/GCM/NoPadding",
         "AES/KW/NoPadding",
+        "AES/KW/PKCS5Padding",
+        "AES/KWP/NoPadding",
+        "ChaCha20",
+        "ChaCha20-Poly1305",
         // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
         // carries the mode set in a `SupportedModes` attribute. The divergence
         // is deliberate: this engine routes only CBC to the real SunJCE SPI, and
@@ -3983,22 +3996,25 @@ mod tests {
                  advertising an algorithm the engine cannot compute is the defect W7-15 closed"
             );
         }
-        // And the reverse direction for the names that were the actual bug:
-        // refused now, so they must NOT be back in the advertised set.
-        for gone in [
+        // And the reverse direction for the names that were the actual bug.
+        // They were removed on 2026-08-11 while unimplemented and put back the
+        // same day once implemented, so what this asserts is the INVARIANT —
+        // advertised and computable are one set — rather than a fixed verdict
+        // about these four names. The loop above already proves each is
+        // serviceable; this proves the seed did not quietly drop them.
+        for implemented in [
             "ChaCha20",
             "ChaCha20-Poly1305",
             "AES/KW/PKCS5Padding",
             "AES/KWP/NoPadding",
         ] {
             assert!(
-                get_service_entry("SunJCE", "Cipher", gone).is_none(),
-                "{gone} is advertised again, but nothing computes it"
+                get_service_entry("SunJCE", "Cipher", implemented).is_some(),
+                "{implemented} is implemented but no longer advertised: the two lists have drifted, which is the defect this test exists for"
             );
             assert!(
-                !crate::jca::cipher::transformation_is_serviceable(gone),
-                "{gone} is serviceable again — if a real implementation landed, advertise it \
-                 here too and delete this arm"
+                crate::jca::cipher::transformation_is_serviceable(implemented),
+                "{implemented} is advertised but Cipher.getInstance refuses it"
             );
         }
     }
