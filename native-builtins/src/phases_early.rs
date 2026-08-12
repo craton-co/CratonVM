@@ -11381,6 +11381,20 @@ pub(crate) fn register_phase52_natives(registry: &mut NativeMethodRegistry) {
 // `Object(None)`, whose `.as_int()` is `None`, so `unwrap_or(1)` answers
 // JANUARY for every month of the year.
 //
+// UPDATED 2026-08-12 — W7-84-primitive-in-reference-store.md. The compact
+// bullet above was true of `zgc`, `g1` and `heap` and NOT of `gen_heap`, which
+// boxed the value into an `AUTOBOX_CLASS_ID` wrapper and un-boxed it on read;
+// that three-way disagreement was itself the defect, and all four have now
+// converged on boxing. An escape therefore no longer nulls `Enum.name` on any
+// collector, and JANUARY-for-every-month is no longer the failure mode.
+//
+// It has not become harmless, and the witness below is exactly as necessary as
+// it was. The slot now holds a wrapper, so `getValue()` reads its `Int` back
+// correctly while `Enum.name()` — real JDK bytecode reading the same slot as a
+// `String` — gets an object with no class name and no methods. Only the SHAPE
+// of what the guard prevents changed. This note exists so the next reader does
+// not conclude from a green `getValue()` that the witness can go.
+//
 // `month_slot0_is_synthetic` keeps that hypothetical hypothetical. It is the
 // same remedy shape as `vm_exec.rs`'s `eetop` witness for `Thread` and
 // `lang_class.rs`'s `has_named_layout` for `Method`: ask for a field NAME the
