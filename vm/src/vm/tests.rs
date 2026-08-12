@@ -39986,6 +39986,15 @@ use std::sync::Arc;
             crate::memory::heap::ArrayElementType::Byte,
             16,
         );
+        // Distinguishable material, for the same reason as
+        // `secret_key_spec_basics`: a zeroed array cannot tell a copy from an
+        // alias.
+        for i in 0..16 {
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(i as i32 + 1));
+        }
         shared.mem.heap.set_field(key, 0, Value::Object(Some(arr)));
         let enc = call_native(
             &shared,
@@ -39997,7 +40006,25 @@ use std::sync::Arc;
         )
         .unwrap()
         .unwrap();
-        assert_eq!(enc, Value::Object(Some(arr)));
+        // `Key.getEncoded()` returns a fresh array — every JCA key
+        // implementation ends `return this.<field>.clone()`, and callers build
+        // key hygiene on that (the JDK's own providers scrub what they get
+        // back). This used to assert the opposite, by identity; the same stale
+        // aliasing assertion as `secret_key_spec_basics`, where it was pinning
+        // a live all-zero-key defect.
+        let enc_ref = enc.as_object().expect("getEncoded() must return a byte[]");
+        assert_ne!(
+            enc_ref, arr,
+            "getEncoded() must not hand back the key's own backing array"
+        );
+        assert_eq!(shared.mem.heap.array_length(enc_ref), 16);
+        for i in 0..16 {
+            assert_eq!(
+                shared.mem.heap.get_array_element(enc_ref, i).unwrap(),
+                Value::Int(i as i32 + 1),
+                "encoded byte {i} does not match the key material"
+            );
+        }
         let algo = call_native(
             &shared,
             &mut thread,
@@ -51190,7 +51217,10 @@ use std::sync::Arc;
             cf,
             "getInstance",
             "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
-            &[x509],
+            // `create_java_string` hands back an `ObjectRef`; `call_native`
+            // takes `&[Value]`. Landed as a bare `&[x509]` (E0308) because this
+            // module still did not compile when it went in.
+            &[Value::Object(Some(x509))],
         )
         .unwrap()
         .unwrap();

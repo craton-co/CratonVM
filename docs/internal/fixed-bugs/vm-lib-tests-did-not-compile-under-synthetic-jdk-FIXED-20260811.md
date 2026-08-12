@@ -160,10 +160,25 @@ The mutations matter more than the greens: this module's whole failure mode is
 assertions nobody has run, and a green that cannot go red is the same thing
 again.
 
-**Expect more of these.** Eight stale fixtures surfaced across three dev merges
-during this one branch, two of them in the last two merges — the rate is a
+**Expect more of these.** Ten stale fixtures surfaced across four dev merges
+during this one branch, and the last merge brought a fresh **compile** error
+too — `&[x509]` where `call_native` takes `&[Value]` (E0308), landed by a
+commit that edited this very file while it still did not build. The rate is a
 direct function of how much has landed on natives this module covers while it
 was unrunnable. That is the fix working, not a problem with it: each one is a
-change that landed unmeasured and is now visible. The one thing that must not
-happen is the module going dark again, so a compile failure here should be
-treated as a broken build, not a broken test.
+change that went in unmeasured and is now visible. The one thing that must not
+happen is the module going dark again, so a compile failure here is a broken
+build, not a broken test.
+
+The last two of the ten are the same defect twice — `SecretKeySpec.getEncoded`
+and `Key.getEncoded` both had an identity assertion requiring the caller's own
+array back. Worth grepping for the third.
+
+**Left red deliberately, and not this branch's to touch:**
+`runtime::resolve::guard::no_unallowlisted_metadata_table_bypass_exists` and
+`the_allowlist_has_no_dead_rows` fail on `vm/src/vm/vm_exec.rs` /
+`find_method_recursive(` — 10 sites where the allowlist permits 9. Both files
+are untouched by this branch, and the counts are the same at `origin/dev`
+itself, so the ratchet is firing on someone else's in-flight migration. Raising
+the number would grant permission for a site nobody here added or reviewed,
+which is precisely what that test's own message warns against.
