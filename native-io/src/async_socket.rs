@@ -43,7 +43,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -100,6 +100,225 @@ fn aio_remove(id: i32) {
     aio_registry().write().remove(&id);
 }
 
+// ---------------------------------------------------------------------------
+// Close-awareness for worker-thread blocking I/O (2026-08-12, W7-53)
+// ---------------------------------------------------------------------------
+//
+// Two of the five worker arms below can re-ask `aio_registry` directly, because
+// they carry the registry `id`: `Job::Accept` and `Job::Write`.
+//
+// The other three cannot, and their own comment says why — "the clone is
+// private to this worker". `Job::ReadFd`, `Job::ReadFutureFd` and
+// `Job::WriteFutureFd` hold a `try_clone()`d `TcpStream` with no id attached,
+// so there is no registry question for them to ask.
+//
+// The file already had a mechanism aimed at exactly this, and it is only half a
+// mechanism: `aio_shutdown_stream` / `aio_shutdown_fd_table_stream` issue
+// `shutdown(Both)` on the shared socket before removing the entry, and their
+// doc comments state without qualification that this "unblocks *every* fd that
+// still references the same open-file-description". That is true on Linux,
+// where `SHUT_RD` wakes a parked `recv` with EOF. It is **false on Windows**,
+// where no `shutdown` aborts a pending blocking call — only `closesocket` does,
+// and this code cannot close a handle a worker is mid-syscall on. The claim is
+// load-bearing: it is why nothing else was ever added. So the shutdown stays
+// (it is the cheaper wakeup where it works) and a cancellation flag is added
+// beside it for where it does not.
+//
+// The flag is a per-channel `Arc<AtomicBool>` handed to the job at queue time.
+// Close sets it and REMOVES the map entry; the worker still holds its `Arc` and
+// sees the `true`. That keeps the map sized by live channels rather than by
+// every channel the VM has ever closed, which a set of cancelled keys would
+// not.
+
+/// Cancellation key for a channel living in [`aio_registry`].
+fn aio_cancel_key_registry(id: i32) -> i64 {
+    i64::from(id)
+}
+
+/// Cancellation key for a channel whose connection is an `fd_table` fd (the
+/// Future-form `connect` path — see `aio_shutdown_fd_table_stream`). Negated so
+/// the two id spaces cannot collide.
+fn aio_cancel_key_fd(fd: u32) -> i64 {
+    -(i64::from(fd) + 1)
+}
+
+/// Cancellation key for whatever `F_REG_ID` holds. The two id spaces are told
+/// apart exactly as every other consumer in this file tells them apart: a value
+/// below `AIO_REG_BASE` is an `fd_table` fd, at or above it an `aio_registry`
+/// id. Getting this wrong would hand a worker a flag nobody ever sets, which is
+/// the vacuous shape -- a site that looks fixed and cannot wake.
+fn aio_cancel_key_for_reg_id(v: i32) -> i64 {
+    if (v as i64) < AIO_REG_BASE {
+        aio_cancel_key_fd(v as u32)
+    } else {
+        aio_cancel_key_registry(v)
+    }
+}
+
+fn aio_cancel_flags() -> &'static RwLock<HashMap<i64, Arc<AtomicBool>>> {
+    static FLAGS: OnceLock<RwLock<HashMap<i64, Arc<AtomicBool>>>> = OnceLock::new();
+    FLAGS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// The cancellation flag for `key`, creating it if this is the first in-flight
+/// operation on that channel. Called on the VM thread at queue time, never from
+/// a worker.
+fn aio_cancel_flag(key: i64) -> Arc<AtomicBool> {
+    if let Some(existing) = aio_cancel_flags().read().get(&key) {
+        return Arc::clone(existing);
+    }
+    let mut map = aio_cancel_flags().write();
+    Arc::clone(
+        map.entry(key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+    )
+}
+
+/// Signal every worker parked on `key` that its channel has been closed, and
+/// drop the map entry. Workers keep their own `Arc` clone, so the signal
+/// survives the removal.
+fn aio_mark_cancelled(key: i64) {
+    if let Some(flag) = aio_cancel_flags().write().remove(&key) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// How long a worker parks inside one poll before re-asking whether its channel
+/// was closed under it. Same value and same role as
+/// `net.rs::NET_READ_CLOSE_POLL_MS`.
+const AIO_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked worker reports once its channel has been closed.
+///
+/// `ErrorKind::Interrupted` is the carrier every close-aware path in this tree
+/// uses. The three read arms translate it into their existing EOF completion
+/// rather than a new outcome type, because that is what the close already
+/// produced on Linux via the `shutdown` above and what the `CompletionHandler`
+/// contract expects for a channel that went away.
+fn aio_closed_err() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Interrupted, "channel closed")
+}
+
+/// The deadline a close-aware worker loop must honour, or `None` for none.
+///
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` bound the *syscall*, and a syscall we no longer
+/// issue until the socket is ready is one they can never bound. The timed
+/// overload of `AsynchronousSocketChannel.read` sets a real read timeout on the
+/// worker's private clone (`aio_asc_read_handler`), so the loop reads it back
+/// and enforces it itself. Without this a wakeup fix would have removed one
+/// hang and introduced another on every timed read.
+fn aio_deadline(timeout: std::io::Result<Option<Duration>>) -> Option<std::time::Instant> {
+    timeout.ok().flatten().map(|t| std::time::Instant::now() + t)
+}
+
+/// The poll slice for this pass: `AIO_CLOSE_POLL_MS`, clamped to the time left
+/// before `deadline`. `Err(TimedOut)` once it has passed, so the wait actually
+/// ends rather than merely declining to poll again.
+fn aio_poll_slice(deadline: Option<std::time::Instant>) -> std::io::Result<i32> {
+    match deadline {
+        None => Ok(AIO_CLOSE_POLL_MS),
+        Some(end) => {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "timed out"));
+            }
+            // Floor of 1 ms so a sub-millisecond remainder polls once more
+            // rather than spinning on a 0 ms timeout.
+            Ok(left.as_millis().clamp(1, AIO_CLOSE_POLL_MS as u128) as i32)
+        }
+    }
+}
+
+/// A blocking worker read that observes a close of the channel it is reading.
+///
+/// # On expiry
+///
+/// The per-pass `AIO_CLOSE_POLL_MS` slice expiring is not an outcome — it is
+/// the point at which the cancellation flag is re-read, and the loop continues.
+/// The socket's own read timeout, where one is set, IS an outcome and ends the
+/// wait with `TimedOut`; see [`aio_deadline`].
+fn aio_read_close_aware(
+    stream: &TcpStream,
+    buf: &mut [u8],
+    cancel: &AtomicBool,
+) -> std::io::Result<usize> {
+    let deadline = aio_deadline(stream.read_timeout());
+    loop {
+        let slice = aio_poll_slice(deadline)?;
+        let ready = match crate::net::poll_stream_readable(stream, slice) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-12 blocking
+            // read, which sees only the `shutdown` wakeup.
+            None => return crate::eintr::EintrIo::new(&mut &*stream).read(buf),
+        };
+        // Asked AFTER the poll so a close landing while we are parked is seen
+        // on the very next pass.
+        if cancel.load(Ordering::SeqCst) {
+            return Err(aio_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        return crate::eintr::EintrIo::new(&mut &*stream).read(buf);
+    }
+}
+
+/// Largest payload handed to one `send` while a worker write is sliced. See
+/// `socket_channel::WRITE_SLICE_MAX` for the measured reason a blocking write
+/// has to be sliced at all.
+const AIO_WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// A blocking worker write that observes a close of the channel it is writing.
+/// The write twin of [`aio_read_close_aware`]; returns the bytes transferred so
+/// far when the close lands mid-write, which is what the existing partial-write
+/// error path already reports to the handler.
+fn aio_write_close_aware(
+    stream: &TcpStream,
+    data: &[u8],
+    cancel: &AtomicBool,
+) -> std::io::Result<usize> {
+    let deadline = aio_deadline(stream.write_timeout());
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written);
+        }
+        let slice = match aio_poll_slice(deadline) {
+            Ok(slice) => slice,
+            // A timeout after a partial transfer answers the partial count,
+            // matching the pre-existing partial-write reporting on this path.
+            Err(_) if written > 0 => return Ok(written),
+            Err(e) => return Err(e),
+        };
+        let ready = match crate::net::poll_stream_writable(stream, slice) {
+            Some(result) => result?,
+            None => {
+                let mut w = stream;
+                w.write_all(&data[written..])?;
+                return Ok(data.len());
+            }
+        };
+        if cancel.load(Ordering::SeqCst) {
+            if written > 0 {
+                return Ok(written);
+            }
+            return Err(aio_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        let end = (written + AIO_WRITE_SLICE_MAX).min(data.len());
+        let mut w = stream;
+        match w.write(&data[written..end]) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero)),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// BUG FIX (2026-07-17, found while investigating `WebSocketIntegrationTests`
 /// `TomcatWebSocketClient` timeouts — see `
 /// CRATONVM-SPRING-GENUINE-BUGLIST`): `aio_asc_close`/`aio_assc_close`
@@ -139,6 +358,10 @@ fn aio_shutdown_stream(id: i32) {
     if let Some(AioHandle::Stream(s)) = aio_registry().read().get(&id) {
         let _ = s.lock().shutdown(Shutdown::Both);
     }
+    // 2026-08-12: the `shutdown` above is the wakeup on Linux and NOT on
+    // Windows, where no `shutdown` aborts a pending blocking call. The flag is
+    // what reaches a worker parked on a private `try_clone`d duplicate there.
+    aio_mark_cancelled(aio_cancel_key_registry(id));
 }
 
 /// Same fix as `aio_shutdown_stream`, for the *other* id space: channels
@@ -158,6 +381,9 @@ fn aio_shutdown_fd_table_stream(ctx: &mut dyn NativeContext, fd: u32) {
         let _ = stream.shutdown(Shutdown::Both);
     }
     let _ = ctx.fd_table().close(fd);
+    // See `aio_shutdown_stream`: the shutdown is the Linux wakeup, the flag is
+    // the one that reaches a worker parked on a duplicate handle on Windows.
+    aio_mark_cancelled(aio_cancel_key_fd(fd));
 }
 
 /// Opt-in diagnostic (`CRATONVM_DBG_AIO=1`), added 2026-07-17 while
@@ -1072,6 +1298,9 @@ enum Job {
     ReadFd {
         stream: Arc<Mutex<TcpStream>>,
         len: usize,
+        /// Set by this channel's close so the worker's poll loop can end a park
+        /// the `shutdown` cannot reach. See `aio_cancel_flag`.
+        cancel: Arc<AtomicBool>,
         handler_gref: usize,
         attachment_gref: usize,
         buffer_gref: usize,
@@ -1087,6 +1316,8 @@ enum Job {
     ReadFutureFd {
         stream: Arc<Mutex<TcpStream>>,
         len: usize,
+        /// See `Job::ReadFd::cancel`.
+        cancel: Arc<AtomicBool>,
         future_gref: usize,
         buffer_gref: usize,
     },
@@ -1096,6 +1327,8 @@ enum Job {
     WriteFutureFd {
         stream: Arc<Mutex<TcpStream>>,
         data: Vec<u8>,
+        /// See `Job::ReadFd::cancel`.
+        cancel: Arc<AtomicBool>,
         future_gref: usize,
         buffer_gref: usize,
     },
@@ -1226,6 +1459,11 @@ fn handle_job(job: Job) -> Result<(), String> {
             bb_gref,
             roots,
         } => {
+            // This arm carries the registry `id`, so its close question is the
+            // ordinary one every other close-aware site asks. The flag is
+            // obtained here rather than passed in because this job's queueing
+            // side predates the plumbing; `aio_cancel_flag` is idempotent.
+            let cancel = aio_cancel_flag(aio_cancel_key_registry(id));
             let stream = {
                 let map = aio_registry().read();
                 match map.get(&id) {
@@ -1244,30 +1482,14 @@ fn handle_job(job: Job) -> Result<(), String> {
                     }
                 }
             };
-            let total = data.len();
-            let mut written = 0;
+            // ASYNCHRONOUS CLOSE 2026-08-12: the loop this replaces parked
+            // inside a blocking `send` behind peer backpressure and observed
+            // nothing when the channel was closed. `aio_write_close_aware`
+            // polls for writability, re-reads the cancellation flag, and slices
+            // -- the same loop as every other write in this family.
             let res = {
                 let s = stream.lock();
-                let mut w = &*s;
-                let mut e_outer = None;
-                while written < total {
-                    match w.write(&data[written..]) {
-                        Ok(0) => {
-                            e_outer = Some(std::io::Error::from(ErrorKind::WriteZero));
-                            break;
-                        }
-                        Ok(n) => written += n,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            e_outer = Some(e);
-                            break;
-                        }
-                    }
-                }
-                match e_outer {
-                    Some(e) => Err(e),
-                    None => Ok(written),
-                }
+                aio_write_close_aware(&s, &data, &cancel)
             };
             match res {
                 Ok(n) => {
@@ -1324,11 +1546,44 @@ fn handle_job(job: Job) -> Result<(), String> {
                     }
                 }
             };
+            // ASYNCHRONOUS CLOSE 2026-08-12: a bare `accept()` here parked
+            // until somebody connected, and closing the channel removed the
+            // registry entry without ever waking the worker -- so the
+            // `CompletionHandler` never fired and the pool thread was consumed
+            // permanently. Same shape as `net::net_accept_close_aware`: flip
+            // the listener non-blocking and re-ask the registry on every pass.
+            // Safe to flip here, unlike on the shared surfaces, because this
+            // listener is reachable only through `aio_registry` and only this
+            // arm accepts on it.
             let res = {
                 let l = listener.lock();
-                // EINTR on a parked accept is a transient interruption, not a
-                // failed accept — see `crate::eintr`.
-                crate::eintr::retry_eintr(|| l.accept())
+                if l.set_nonblocking(true).is_err() {
+                    // No non-blocking mode on this handle: the pre-2026-08-12
+                    // blocking accept, which cannot see the close.
+                    crate::eintr::retry_eintr(|| l.accept())
+                } else {
+                    loop {
+                        match l.accept() {
+                            Ok(pair) => break Ok(pair),
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                if !matches!(
+                                    aio_registry().read().get(&id),
+                                    Some(AioHandle::Listener(_, _))
+                                ) {
+                                    break Err(aio_closed_err());
+                                }
+                                std::thread::sleep(Duration::from_millis(
+                                    AIO_CLOSE_POLL_MS as u64,
+                                ));
+                            }
+                            // EINTR on a parked accept is a transient
+                            // interruption, not a failed accept -- see
+                            // `crate::eintr`.
+                            Err(e) if crate::eintr::is_eintr(&e) => continue,
+                            Err(e) => break Err(e),
+                        }
+                    }
+                }
             };
             match res {
                 Ok((stream, _peer)) => {
@@ -1357,6 +1612,7 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::ReadFd {
             stream,
             len,
+            cancel,
             handler_gref,
             attachment_gref,
             buffer_gref,
@@ -1380,10 +1636,11 @@ fn handle_job(job: Job) -> Result<(), String> {
             let blocked_from = aio_inline_dbg_enabled().then(std::time::Instant::now);
             let read_res = {
                 let s = stream.lock();
-                // `EintrIo`: this worker thread is signalled like any other by
-                // the cross-thread JIT root scan, and a bare EINTR here reaches
-                // the application's `CompletionHandler.failed`.
-                crate::eintr::EintrIo::new(&mut &*s).read(&mut buf)
+                // `EintrIo` (inside `aio_read_close_aware`): this worker thread
+                // is signalled like any other by the cross-thread JIT root
+                // scan, and a bare EINTR here reaches the application's
+                // `CompletionHandler.failed`.
+                aio_read_close_aware(&s, &mut buf, &cancel)
             };
             let ready_at = blocked_from.map(|started| {
                 let now = std::time::Instant::now();
@@ -1419,6 +1676,7 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::ReadFutureFd {
             stream,
             len,
+            cancel,
             future_gref,
             buffer_gref,
         } => {
@@ -1430,7 +1688,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             let read_res = {
                 let s = stream.lock();
                 // Same as the handler-form arm above.
-                crate::eintr::EintrIo::new(&mut &*s).read(&mut buf)
+                aio_read_close_aware(&s, &mut buf, &cancel)
             };
             dbg_aio!(
                 "READ  worker result future_gref={future_gref} result={:?} thread={:?}",
@@ -1457,6 +1715,7 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::WriteFutureFd {
             stream,
             data,
+            cancel,
             future_gref,
             buffer_gref,
         } => {
@@ -1465,27 +1724,10 @@ fn handle_job(job: Job) -> Result<(), String> {
                 data.len(),
                 std::thread::current().id()
             );
-            let total = data.len();
-            let mut written = 0;
+            // Same close-aware write as the `Job::Write` arm above.
             let write_res = {
                 let s = stream.lock();
-                let mut w = &*s;
-                let mut failure = None;
-                while written < total {
-                    match w.write(&data[written..]) {
-                        Ok(0) => {
-                            failure = Some(std::io::Error::from(ErrorKind::WriteZero));
-                            break;
-                        }
-                        Ok(n) => written += n,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            failure = Some(e);
-                            break;
-                        }
-                    }
-                }
-                failure.map_or(Ok(written), Err)
+                aio_write_close_aware(&s, &data, &cancel)
             };
             dbg_aio!(
                 "WRITE worker result future_gref={future_gref} result={:?} thread={:?}",
@@ -2379,6 +2621,7 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .send(Job::ReadFutureFd {
             stream: Arc::new(Mutex::new(stream)),
             len: length as usize,
+            cancel: aio_cancel_flag(aio_cancel_key_for_reg_id(fd)),
             future_gref,
             buffer_gref,
         })
@@ -2610,6 +2853,7 @@ fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .send(Job::WriteFutureFd {
             stream: Arc::new(Mutex::new(stream)),
             data,
+            cancel: aio_cancel_flag(aio_cancel_key_for_reg_id(fd)),
             future_gref,
             buffer_gref,
         })
@@ -2733,6 +2977,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         .send(Job::ReadFd {
             stream: Arc::new(Mutex::new(stream)),
             len: length as usize,
+            cancel: aio_cancel_flag(aio_cancel_key_for_reg_id(slot2)),
             handler_gref,
             attachment_gref,
             buffer_gref,
