@@ -7370,6 +7370,40 @@ fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
     -1
 }
 
+/// Read `capacity`, preferring real JDK slot when present.
+///
+/// This same two-step name-then-slot fallback existed inline in three places
+/// (`bb_state`, `bb_storage_view`, `native_bb_set_limit`). Named once so a
+/// future layout correction has one place to land instead of three.
+fn buf_read_capacity(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    if let Value::Int(v) = ctx.get_field_by_name(obj, "capacity") {
+        return v;
+    }
+    if let Value::Int(v) = ctx.get_field(obj, BB_FIELD_CAPACITY) {
+        return v;
+    }
+    0
+}
+
+/// `(position, limit, capacity)` for any buffer, **without requiring backing
+/// storage**.
+///
+/// This is the half of `bb_state` that `remaining()`, `hasRemaining()` and the
+/// typed `toString()` actually wanted. All three asked for the whole state
+/// tuple, discarded the array with `_`, and inherited its refusal — so
+/// `remaining()` on a `ByteBuffer.allocateDirect(n)` raised
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// while computing `limit - position`, two fields it had already read
+/// correctly. The `-1` is `java.nio.Buffer.mark`, which is what slot 0 is on
+/// the real layout; see `bb_state` for the species.
+fn buf_metadata(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32) {
+    (
+        buf_read_position(ctx, this),
+        buf_read_limit(ctx, this),
+        buf_read_capacity(ctx, this),
+    )
+}
+
 fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
@@ -7387,40 +7421,218 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     obj
 }
 
-fn bb_state(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
-    // Prefer the real-JDK `hb` field. Some real heap-buffer subclasses land
-    // here without superclass by-name field resolution, so fall back to the
-    // real-JDK HeapByteBuffer slot (`hb` @ 5) before synthetic slot 0.
-    let arr = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => a,
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => a,
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => a,
-                other => {
-                    return Err(MethodCallFailed::InternalError(VmError::Internal {
-                        message: format!(
-                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY, other, this
-                    ),
-                    }))
-                }
+/// Element-indexed storage view of a typed NIO buffer — `bb_storage_view`'s
+/// twin for the `CharBuffer` / `IntBuffer` / `LongBuffer` / `FloatBuffer` /
+/// `DoubleBuffer` / `ShortBuffer` families, **and the direct-buffer arm this
+/// function spent its whole life without**.
+///
+/// ## What it used to be, and why that was a defect
+///
+/// It returned `(backing_array, pos, lim, cap)` and resolved the array as
+/// `hb`-by-name → slot 5 → slot 0, with no fourth arm. A buffer that has no
+/// backing array — every `ByteBuffer.allocateDirect` result, and every typed
+/// view over one — therefore fell through to slot 0, which on the real
+/// `java.nio.Buffer` layout is
+///
+/// ```text
+///   mark(0) position(1) limit(2) capacity(3) address(4) segment(5)
+///     then ByteBuffer's own:  hb(6) offset(7) isReadOnly(8) bigEndian(9) nativeByteOrder(10)
+/// ```
+///
+/// i.e. `mark`, initialised to `-1`. That produced
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// — a CratonVM slot index applied to a real JDK object, landing on a field
+/// with an unrelated meaning. Note in passing that the old comment's "real-JDK
+/// HeapByteBuffer slot (`hb` @ 5)" was wrong twice over: on JDK 25 `hb` is
+/// index 6 and index 5 is `Buffer.segment`. The slot-5 probe is kept anyway,
+/// with its real justification: `segment` is the only Object-typed field
+/// `Buffer` declares, so it is where `native-builtins`' typed-buffer views
+/// (`s2_view_buf_fn!`, `BB_SEGMENT_SLOT`) deliberately stash their backing
+/// array. Reading it as "maybe an array" is right for that population and
+/// harmless for a real buffer, where `segment` is null.
+///
+/// ## What it is now
+///
+/// The same three-arm array resolution, then a **direct arm** reading
+/// `address` (by name, else slot 4) exactly as `bb_storage_view` does, and
+/// only then the refusal. The result is element-indexed: a heap receiver's
+/// array already is, and a direct receiver's byte-addressed block is scaled by
+/// [`TbView::elem`]'s width.
+///
+/// The return type changed from a tuple to `TbView` deliberately. This is the
+/// second migration of this family — the first
+/// (spring-bytebuffer-backing-storage-FIXED.md) moved the byte-oriented half
+/// to `bb_storage_view` and left the rest behind, and a partial migration is
+/// invisible until a non-heap buffer reaches one of the stragglers. A changed
+/// return type means any site left behind fails the BUILD instead.
+fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<TbView, MethodCallFailed> {
+    let (pos, lim, cap) = buf_metadata(ctx, this);
+
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
             },
-        },
-    };
-    let pos = buf_read_position(ctx, this);
-    let lim = buf_read_limit(ctx, this);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v
+            // The backing array knows its own element kind, so a HEAP receiver
+            // never has to be asked what class it is stamped with.
+            elem: ctx.heap_element_type_of(arr),
+            big_endian: true, // unused: a heap element read is not byte-decoded
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    if let Some(addr) = bb_resolve_direct_address(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Direct { addr },
+            elem: tb_direct_element_kind(ctx, this),
+            big_endian: tb_receiver_is_big_endian(ctx, this),
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    Err(MethodCallFailed::InternalError(VmError::Internal {
+        message: format!(
+            "Buffer has no backing storage: hb/slot{BB_SEGMENT_SLOT}/slot{BB_FIELD_ARRAY} \
+             resolved no array and address/slot{BB_FIELD_MARK} no native block \
+             (slot{BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+            ctx.get_field(this, BB_FIELD_ARRAY),
+            ctx.get_field_by_name(this, "address"),
+        ),
+    }))
+}
+
+/// Real `java.nio.Buffer.segment` — the only Object-typed field `Buffer`
+/// declares, and therefore the slot `native-builtins`' typed-buffer views use
+/// to carry a backing array that has no `hb` field to go in. Same constant as
+/// `native-builtins/src/servlet.rs`'s `BB_SEGMENT_SLOT`, restated here rather
+/// than shared because the two crates do not depend on each other; if one
+/// moves, the census in W7-58-bytebuffer-direct-arm.md names both.
+const BB_SEGMENT_SLOT: usize = 5;
+
+/// `hb`-by-name → `segment` slot → synthetic slot 0. Extracted from the two
+/// independent copies in `bb_state` and `bb_storage_view` so the two cannot
+/// drift; they had already drifted in their error messages.
+fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
+        return Some(a);
+    }
+    if let Value::Object(Some(a)) = ctx.get_field(this, BB_SEGMENT_SLOT) {
+        return Some(a);
+    }
+    match ctx.get_field(this, BB_FIELD_ARRAY) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// `ByteBuffer.offset` — the element index of logical element 0 inside the
+/// backing array, non-zero only for an aliasing view. Layouts with no such
+/// field (bare synthetics, typed views) answer 0.
+fn bb_resolve_heap_offset(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    if let Value::Int(v) = ctx.get_field_by_name(this, "offset") {
+        if v >= 0 {
+            return v as usize;
+        }
+    }
+    match ctx.get_field(this, 6) {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// A `Buffer.address` below the first mappable page is never a process
+/// pointer: Linux refuses to map below `vm.mmap_min_addr` (65536 by default)
+/// and Windows reserves the low 64 KiB of every address space. What DOES live
+/// down there is an array-relative `Unsafe` offset — `ARRAY_BYTE_BASE_OFFSET +
+/// offset` — which is exactly what `alloc_byte_buffer` seeds into every HEAP
+/// buffer it mints (`Value::Long(16)`), and what the real `HeapByteBuffer`
+/// constructor seeds too.
+///
+/// So this is not defensive padding. Without it, any heap buffer whose array
+/// failed to resolve — the precise condition that brings control here — hands
+/// `16` to `copy_from_native_memory` as a pointer. `addr=0x10` was 51 of the
+/// 53 crashes in the 2026-08-10 three-GC-variant H2 sweep; refusing the read
+/// degrades instead to this module's "no backing storage" error, which a
+/// caller can see and report. `native-builtins/src/servlet.rs`'s
+/// `is_plausible_native_addr` is the same guard for the same reason; this
+/// family did not have it.
+fn is_plausible_native_addr(v: i64) -> bool {
+    v >= 0x1_0000
+}
+
+/// `address`-by-name → slot 4, screened by [`is_plausible_native_addr`].
+fn bb_resolve_direct_address(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i64> {
+    if let Value::Long(v) = ctx.get_field_by_name(this, "address") {
+        if is_plausible_native_addr(v) {
+            return Some(v);
+        }
+    }
+    match ctx.get_field(this, BB_FIELD_MARK) {
+        Value::Long(v) if is_plausible_native_addr(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Element kind of a DIRECT typed buffer.
+///
+/// Only a direct receiver needs this — a heap one is asked through
+/// `heap_element_type_of`, which is the object's own truth. A direct block is
+/// untyped bytes, so the element width has to come from somewhere else, and
+/// the JDK itself puts it in the class: `DirectIntBufferU`,
+/// `ByteBufferAsIntBufferL`, `HeapIntBuffer`. This reads the receiver's class
+/// to decide how wide its elements are — it does NOT pick which native to run
+/// by name, which is the defect this codebase keeps re-finding.
+///
+/// Unknown names answer `Byte` (width 1), which is what a bare
+/// `java/nio/ByteBuffer` receiver is and the only safe default: it can never
+/// scale an index past the end of a block that a wider guess would.
+fn tb_direct_element_kind(ctx: &dyn NativeContext, this: ObjectRef) -> ArrayElementType {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.contains("CharBuffer") {
+        ArrayElementType::Char
+    } else if name.contains("ShortBuffer") {
+        ArrayElementType::Short
+    } else if name.contains("IntBuffer") {
+        ArrayElementType::Int
+    } else if name.contains("LongBuffer") {
+        ArrayElementType::Long
+    } else if name.contains("FloatBuffer") {
+        ArrayElementType::Float
+    } else if name.contains("DoubleBuffer") {
+        ArrayElementType::Double
     } else {
-        0
-    };
-    Ok((arr, pos, lim, cap))
+        ArrayElementType::Byte
+    }
+}
+
+/// Byte order of a DIRECT typed buffer's elements.
+///
+/// Same source the already-registered `order()` native for these classes uses
+/// (`tb_abstract_view_fns!`'s `$order_fn`): real JDK 25 compiles one concrete
+/// view class per endianness — `ByteBufferAsIntBufferB` / `...L`,
+/// `DirectIntBufferU` (native order) — so the class name IS where the order
+/// lives for a view buffer, there being no field to hold it. Factored out so
+/// the accessor and the reported `order()` cannot disagree; before the direct
+/// arm existed there was no accessor that could.
+///
+/// Every CratonVM target is little-endian, so the unsuffixed "native order"
+/// case answers little-endian.
+fn tb_receiver_is_big_endian(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.ends_with('B') || name.ends_with("RB") {
+        return true;
+    }
+    if name.ends_with('L') || name.ends_with("RL") {
+        return false;
+    }
+    cfg!(target_endian = "big")
 }
 
 #[derive(Clone, Copy)]
@@ -7437,57 +7649,172 @@ struct BbView {
     cap: i32,
 }
 
+/// Element-indexed view returned by [`bb_state`]: `pos`/`lim`/`cap` are in
+/// ELEMENTS (as every typed-buffer accessor uses them), and `storage` is
+/// whichever of the two kinds the receiver actually has.
+#[derive(Clone, Copy)]
+struct TbView {
+    storage: BbStorage,
+    /// Element kind, so a DIRECT read knows both how many bytes to move and
+    /// which `Value` variant to produce. Read from the backing array for a
+    /// heap receiver; from the receiver's class for a direct one.
+    elem: ArrayElementType,
+    /// Element byte order — consulted only on the direct arm. A heap element
+    /// read goes through `get_array_element`, which is not byte-decoded.
+    big_endian: bool,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+}
+
+/// Bytes per element of `elem`. `Reference` cannot occur in a typed NIO buffer
+/// and answers 1 rather than panicking; a wrong-but-narrow scale mis-reads,
+/// where a panic takes the VM down.
+fn tb_elem_width(elem: ArrayElementType) -> usize {
+    match elem {
+        ArrayElementType::Boolean | ArrayElementType::Byte | ArrayElementType::Reference => 1,
+        ArrayElementType::Char | ArrayElementType::Short => 2,
+        ArrayElementType::Int | ArrayElementType::Float => 4,
+        ArrayElementType::Long | ArrayElementType::Double => 8,
+    }
+}
+
+/// Read element `index` (an ELEMENT index, not a byte offset) from either
+/// storage kind, in the `Value` variant the element's kind calls for — the
+/// same variant `ctx.get_array_element` yields for a heap array of that kind,
+/// so a caller cannot tell the two arms apart.
+fn tb_read_elem(
+    ctx: &dyn NativeContext,
+    view: TbView,
+    index: usize,
+) -> Result<Value, MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => Ok(ctx.get_array_element(arr, offset + index)),
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let mut raw = [0u8; 8];
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if !ctx.copy_from_native_memory(addr.saturating_add(byte_off), &mut raw[..width]) {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element read failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }));
+            }
+            let bits: u64 = if view.big_endian {
+                raw[..width].iter().fold(0u64, |a, &b| (a << 8) | b as u64)
+            } else {
+                raw[..width]
+                    .iter()
+                    .rev()
+                    .fold(0u64, |a, &b| (a << 8) | b as u64)
+            };
+            Ok(match view.elem {
+                ArrayElementType::Long => Value::Long(bits as i64),
+                ArrayElementType::Double => Value::Double(f64::from_bits(bits)),
+                ArrayElementType::Float => Value::Float(f32::from_bits(bits as u32)),
+                // Char is UNSIGNED and Short is SIGNED — the two differ only
+                // here, and getting it wrong is invisible until a value with
+                // the high bit set goes through.
+                ArrayElementType::Char => Value::Int(bits as u16 as i32),
+                ArrayElementType::Short => Value::Int(bits as u16 as i16 as i32),
+                ArrayElementType::Int => Value::Int(bits as u32 as i32),
+                _ => Value::Int(bits as u8 as i8 as i32),
+            })
+        }
+    }
+}
+
+/// Write element `index` through either storage kind. The inverse of
+/// [`tb_read_elem`], and deliberately tolerant of the `Value` variant a caller
+/// hands over (`Int` where a `Float` was expected, etc.) because the typed
+/// natives forward whatever the interpreter pushed.
+fn tb_write_elem(
+    ctx: &mut dyn NativeContext,
+    view: TbView,
+    index: usize,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            ctx.set_array_element(arr, offset + index, value);
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let bits: u64 = match value {
+                Value::Long(v) => v as u64,
+                Value::Double(v) => v.to_bits(),
+                Value::Float(v) => v.to_bits() as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let mut raw = [0u8; 8];
+            for i in 0..width {
+                let shift = if view.big_endian {
+                    8 * (width - 1 - i)
+                } else {
+                    8 * i
+                };
+                raw[i] = (bits >> shift) as u8;
+            }
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if ctx.copy_to_native_memory(addr.saturating_add(byte_off), &raw[..width]) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element write failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }))
+            }
+        }
+    }
+}
+
+/// Byte-indexed storage view — the `ByteBuffer` half of the same resolution
+/// [`bb_state`] does for the typed families. Both now share
+/// `bb_resolve_heap_array` / `bb_resolve_heap_offset` /
+/// `bb_resolve_direct_address` rather than each carrying its own copy; the two
+/// copies had already drifted apart in their error text, and one of them
+/// (`bb_state`'s) had no direct arm at all.
+///
+/// The one behaviour change here is the address screen: this used to accept
+/// any non-zero `address`, including the `16` that `alloc_byte_buffer` seeds
+/// into every HEAP buffer as `ARRAY_BYTE_BASE_OFFSET`. See
+/// [`is_plausible_native_addr`] for why dereferencing that is not a wrong
+/// answer but a SIGSEGV.
 fn bb_storage_view(ctx: &dyn NativeContext, this: ObjectRef) -> Result<BbView, MethodCallFailed> {
     let pos = buf_read_position(ctx, this).max(0);
     let lim = buf_read_limit(ctx, this).max(pos);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v.max(0)
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v.max(0)
-    } else {
-        lim
+    let cap = match buf_read_capacity(ctx, this) {
+        0 => lim,
+        v => v.max(0),
     };
 
-    if let Some(arr) = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => Some(a),
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => Some(a),
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => Some(a),
-                _ => None,
-            },
-        },
-    } {
-        let offset = match ctx.get_field_by_name(this, "offset") {
-            Value::Int(v) if v >= 0 => v as usize,
-            _ => match ctx.get_field(this, 6) {
-                Value::Int(v) if v >= 0 => v as usize,
-                _ => 0,
-            },
-        };
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
         return Ok(BbView {
-            storage: BbStorage::Heap { arr, offset },
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
+            },
             pos,
             lim,
             cap,
         });
     }
 
-    let addr = match ctx.get_field_by_name(this, "address") {
-        Value::Long(v) if v != 0 => v,
-        _ => match ctx.get_field(this, 4) {
-            Value::Long(v) if v != 0 => v,
-            _ => {
-                return Err(MethodCallFailed::InternalError(VmError::Internal {
-                    message: format!(
-                        "ByteBuffer missing backing storage (hb/slot5/address absent; field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY,
-                        ctx.get_field(this, BB_FIELD_ARRAY),
-                        this
-                    ),
-                }))
-            }
-        },
+    let Some(addr) = bb_resolve_direct_address(ctx, this) else {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!(
+                "ByteBuffer missing backing storage (hb/slot{BB_SEGMENT_SLOT}/address absent; \
+                 field {BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+                ctx.get_field(this, BB_FIELD_ARRAY),
+                ctx.get_field_by_name(this, "address"),
+            ),
+        }));
     };
     Ok(BbView {
         storage: BbStorage::Direct { addr },
