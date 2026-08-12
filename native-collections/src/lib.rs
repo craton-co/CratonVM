@@ -5905,6 +5905,122 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
     ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
     ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    // Explicit, not left to whatever `alloc_object` zero-initialises a slot of
+    // an undeclared shape to: W7-1's `lastRet` was exactly this hazard, an
+    // int-zero read as a meaningful value. `this` is a real `ArrayList` here,
+    // so there is no enclosing view to propagate to.
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// The enclosing view of a nested `subList`, or `None` for a view carved
+/// directly out of an `ArrayList`. Guards on the field count so a view built by
+/// some other path with the older four-field shape simply reports "no enclosing
+/// view" (it degrades to the pre-existing behaviour) rather than reading past
+/// the object.
+fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) <= ASL_FIELD_VIEW_PARENT {
+        return None;
+    }
+    match ctx.get_field(this, ASL_FIELD_VIEW_PARENT) {
+        Value::Object(Some(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// `subList` ON a sublist — a real nested view, not a view of a snapshot.
+///
+/// This was registered as `asl_delegate_snapshot`, which materialised the
+/// slice into a fresh `ArrayList` and returned a view of THAT. Reads were
+/// right; every write went into the throwaway. Measured:
+///
+/// ```text
+/// subList.nestedClearWritesThroughToBase  HotSpot [a, B, e]  CratonVM [a, B, c, d, e]
+/// subList.afterNestedClear                HotSpot [B]        CratonVM [B, c, d]
+/// ```
+///
+/// The composition is on the ROOT: the nested view points at the same backing
+/// `ArrayList` with `offset = enclosing.offset + fromIndex`, so it needs no
+/// interval arithmetic at read time and every existing `asl_*` native works on
+/// it unchanged. The enclosing view is recorded separately, in
+/// [`ASL_FIELD_VIEW_PARENT`], only so a structural mutation can walk back up.
+///
+/// Range check is against the ENCLOSING VIEW's size, not the root's, and uses
+/// `AbstractList.subListRangeCheck`'s wording — the same three arms as
+/// `native_al_sub_list`, and note the `fromIndex > toIndex` case is an
+/// `IllegalArgumentException` rather than a bounds exception at all.
+fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let to_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (parent, _, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    if from_i32 < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("fromIndex = {from_i32}")).into(),
+        );
+    }
+    if to_i32 > size {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("toIndex = {to_i32}")).into(),
+        );
+    }
+    if from_i32 > size || to_i32 < 0 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "fromIndex = {from_i32}, toIndex = {to_i32}"
+        ))
+        .into());
+    }
+    if from_i32 > to_i32 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("fromIndex({from_i32}) > toIndex({to_i32})"),
+            }
+            .into(),
+        );
+    }
+    // GC-SAFETY: the allocation below can move `this` and the root list, and
+    // both are STORED in the new view's fields. Re-read the whole enclosing
+    // state through the pin afterwards rather than reusing the pre-allocation
+    // copies — a from-space `parent` recorded here would be what every later
+    // read of the nested view indexes into.
+    let this_pin = ctx.pin_native_root(this);
+    let view = match try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (parent, offset, _, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(parent)));
+    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
+    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
+    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(expected));
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
 }
 
@@ -5932,7 +6048,23 @@ const ASL_FIELD_PARENT: usize = 0;
 const ASL_FIELD_OFFSET: usize = 1;
 const ASL_FIELD_SIZE: usize = 2;
 const ASL_FIELD_EXPECTED: usize = 3;
-const ASL_NUM_FIELDS: usize = 4;
+/// The view this view was carved out of — `null` when `subList` was called on a
+/// real `ArrayList`, and the enclosing `ArrayListSubList` when it was called on
+/// another view.
+///
+/// [`ASL_FIELD_PARENT`] deliberately stays the ROOT list with an ABSOLUTE
+/// offset, so every existing `asl_*` native keeps working on a nested view
+/// without being edited. This field exists for the one thing that cannot be
+/// derived from the root: a structural mutation through a nested view has to
+/// adjust the ENCLOSING views' `size`/`expected` too, or they immediately read
+/// as comodified. The JDK does the same walk, up its own `SubList.parent`
+/// chain, in `updateSizeAndModCount`.
+///
+/// It is an object field and therefore GC-scanned, unlike a side table — the
+/// same reason `TmViewSpec`'s three references had to be wired into all four
+/// overlay GC hooks and this one does not.
+const ASL_FIELD_VIEW_PARENT: usize = 4;
+const ASL_NUM_FIELDS: usize = 5;
 
 /// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
 fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
@@ -6082,9 +6214,9 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/ListIterator;",
         |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;"),
     );
-    r.register(c, "subList", "(II)Ljava/util/List;", |ctx, args| {
-        asl_delegate_snapshot(ctx, args, "subList", "(II)Ljava/util/List;")
-    });
+    // NOT `asl_delegate_snapshot`: a view of a snapshot reads correctly and
+    // writes nowhere. See `native_asl_sub_list`.
+    r.register(c, "subList", "(II)Ljava/util/List;", native_asl_sub_list);
     r.register(
         c,
         "spliterator",
@@ -6122,6 +6254,17 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
             asl_delegate_mutating(ctx, args, "removeIf", "(Ljava/util/function/Predicate;)Z")
         },
     );
+    // `List.sort` is a MUTATOR of the view's range, and `subList.sortWritesThrough`
+    // measured `base.subList(1,4).sort(naturalOrder())` leaving `base` at
+    // `[9, 5, 1, 7, 3]` where HotSpot has `[9, 1, 5, 7, 3]`. It had no
+    // registration here at all, so the call reached an interface-level native
+    // that read the ASL receiver through the `ArrayList` layout — the sorted
+    // result landed nowhere. `asl_delegate_mutating` is exactly right for it:
+    // the snapshot's real `sort` reorders in place, the element count does not
+    // change, and the slice is written back over `[offset, offset+size)`.
+    r.register(c, "sort", "(Ljava/util/Comparator;)V", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "sort", "(Ljava/util/Comparator;)V")
+    });
     r.set_category(__prev_cat);
 }
 
@@ -6392,6 +6535,31 @@ fn asl_delegate_mutating(
     al_set_size(ctx, parent, w as i32);
     ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
     ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    // Ripple the element-count change up the enclosing views, the way the JDK's
+    // `SubList.updateSizeAndModCount` walks its own `parent` chain. Without
+    // this, `sub.subList(1,3).clear()` leaves `sub` holding the pre-mutation
+    // `expected`, so the very next read of `sub` raises
+    // `ConcurrentModificationException` — where HotSpot answers `[B]`
+    // (`subList.afterNestedClear`). Only ANCESTORS are updated: a SIBLING view
+    // over the same parent is genuinely comodified and must keep failing, which
+    // is what its now-stale `expected` does.
+    //
+    // No allocation in this loop, so the refs stay valid without pinning. The
+    // hop cap is the same defensive bound `implements_comparable` uses: a cycle
+    // is impossible by construction (a view's enclosing view is always older
+    // than it), and a cap costs nothing to be sure.
+    let delta = new_size - size;
+    let mut cursor = asl_view_parent(ctx, this);
+    for _ in 0..64 {
+        let Some(v) = cursor else { break };
+        let vs = match ctx.get_field(v, ASL_FIELD_SIZE) {
+            Value::Int(s) => s,
+            _ => break,
+        };
+        ctx.set_field(v, ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
+        ctx.set_field(v, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+        cursor = asl_view_parent(ctx, v);
+    }
     ctx.unpin_native_roots(pin);
     Ok(ret)
 }
@@ -12156,6 +12324,27 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
         }
     }
     None
+}
+
+/// Write a removal back to whatever a [`ts_view_source`] marker names.
+///
+/// Two kinds of source reach that marker now. A `TreeMap` keySet view names a
+/// MAP, whose removal is `remove(Object)Object`; a `descendingSet` view names
+/// another `TreeSet`, whose removal is `remove(Object)Z`. Dispatching by
+/// descriptor is not optional — `source_map_remove`'s
+/// `(Ljava/lang/Object;)Ljava/lang/Object;` does not exist on `TreeSet` at all,
+/// so calling it on a set source raises `NoSuchMethodError` rather than
+/// removing anything.
+fn ts_source_remove(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    elem: Value,
+) -> Result<(), MethodCallFailed> {
+    if is_tree_map_receiver(ctx, source) {
+        return source_map_remove(ctx, source, elem);
+    }
+    ctx.invoke_virtual(source, "remove", "(Ljava/lang/Object;)Z", &[elem])?;
+    Ok(())
 }
 
 /// Get the backing HashMap from a HashSet.
@@ -39601,7 +39790,21 @@ fn ts_ensure_capacity(
     data: ObjectRef,
 ) -> ObjectRef {
     let arr_len = ctx.array_length(data);
-    let needed = (size + 1) as usize;
+    // A live-view marker lives in the LAST capacity slot (see `ts_view_source`),
+    // so a view must keep one slot free beyond its logical size or the next
+    // `ts_insert_at` writes over the marker and the view silently stops writing
+    // through — the "silently stale view" failure this file's other view code
+    // is careful about. Reserve the slot, and carry the marker across a grow.
+    //
+    // Detected exactly as `ts_view_source` detects it, so the two cannot
+    // disagree: `length > size` AND a non-null trailing slot. A plain TreeSet's
+    // spare capacity is all null, so this is `false` for every non-view.
+    let has_marker = (arr_len as i32) > size
+        && matches!(
+            ctx.get_array_element(data, arr_len - 1),
+            Value::Object(Some(_))
+        );
+    let needed = (size + 1) as usize + usize::from(has_marker);
     if needed <= arr_len {
         return data;
     }
@@ -39622,6 +39825,13 @@ fn ts_ensure_capacity(
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
+    }
+    if has_marker {
+        // Read the marker through the pinned `data` rather than carrying it in a
+        // Rust local across `alloc_ref_array` above: a source recorded here as a
+        // from-space address is a use-after-free on the first write-through.
+        let marker = ctx.get_array_element(data, arr_len - 1);
+        ctx.set_array_element(new_arr, new_cap - 1, marker);
     }
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
     let new_arr = ctx.read_native_pin(new_pin, new_arr);
@@ -41785,12 +41995,35 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     match search {
         Ok(_) => Ok(Some(Value::Int(0))), // already present
         Err(pos) => {
+            // `this` is pinned as well as `elem` now: `ts_ensure_capacity`
+            // allocates, and both are used after it — `this` by the size store
+            // and, below, by the write-through.
+            let this_pin = ctx.pin_native_root(this);
             let elem_pin = pin_value(ctx, elem);
             let data = ts_ensure_capacity(ctx, this, size, data);
+            let this = ctx.read_native_pin(this_pin, this);
             let elem = read_pinned_elem(ctx, elem_pin, elem);
-            ctx.unpin_native_roots(elem_pin);
             ts_insert_at(ctx, data, size, pos, elem);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size + 1));
+            // Live `descendingSet()` view: an add through the view is an add to
+            // the backing set. `TreeSet.descendingWriteThrough` measured
+            // `ts.descendingSet().add(9)` leaving `ts` at `[1, 2, 3]` where
+            // HotSpot has `[1, 2, 9]` — the view's own contents were already
+            // right, so this is the one direction that was missing.
+            //
+            // A MAP source is a `TreeMap.keySet()` view, and `keySet().add` is
+            // `UnsupportedOperationException` in the JDK, not a write-through.
+            // That refusal is a separate, unmeasured row and is deliberately not
+            // added here; what matters for this one is that a map source must
+            // NOT be handed an add, which is what the predicate says.
+            let propagated = match ts_view_source(ctx, this) {
+                Some(source) if !is_tree_map_receiver(ctx, source) => ctx
+                    .invoke_virtual(source, "add", "(Ljava/lang/Object;)Z", &[elem])
+                    .map(|_| ()),
+                _ => Ok(()),
+            };
+            ctx.unpin_native_roots(this_pin);
+            propagated?;
             Ok(Some(Value::Int(1)))
         }
     }
@@ -41816,8 +42049,10 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
             // Live TreeMap keySet view: delete the key from the source TreeMap.
+            // Live view: propagate the removal to whatever the marker names —
+            // a `TreeMap` for a keySet view, a `TreeSet` for a descendingSet.
             if let Some(source) = ts_view_source(ctx, this) {
-                source_map_remove(ctx, source, elem)?;
+                ts_source_remove(ctx, source, elem)?;
             }
             Ok(Some(Value::Int(1)))
         }
@@ -42345,7 +42580,7 @@ fn ts_remove_element(
     // Live TreeMap keySet view: the element is a key, so delete it from the
     // source TreeMap as well.
     if let Some(source) = ts_view_source(ctx, owner) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(None)
 }
@@ -42875,50 +43110,111 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// TreeSet holding the same elements ordered by the reversed comparator
 /// (`Collections.reverseOrder`), so `iterator`/`first`/`last`/`contains` on the
 /// result are all consistent with descending order.
+///
+/// It is also a WRITE-THROUGH view. `TreeSet.descendingWriteThrough` measured
+///
+/// ```text
+/// HotSpot   3:[9, 2, 1]:[1, 2, 9]
+/// CratonVM  3:[9, 2, 1]:[1, 2, 3]
+/// ```
+///
+/// — `ds.pollFirst()` and `ds.add(9)` both answered correctly *on the view* and
+/// left the backing set untouched. The mechanism is the source marker in the
+/// trailing capacity slot that `ts_view_source` already defines for `TreeMap`
+/// keySet views: `pollFirst`, `pollLast`, `remove`, `clear` and the iterator's
+/// `remove` all consult it, so installing it here is most of the fix; only the
+/// add direction and the map-vs-set removal descriptor
+/// ([`ts_source_remove`]) had to be added.
+///
+/// The marker goes on AFTER the population loop, deliberately: installed first,
+/// every `native_ts_add` below would write each element straight back into the
+/// set it was copied from.
+///
+/// **This makes the view live in one direction only.** A write through `ds`
+/// reaches `ts`; a later write to `ts` is NOT visible in `ds`, which remains
+/// the snapshot it always was. The JDK's is live both ways. Closing the other
+/// direction needs a rebuild-before-read funnel like `tm_sync_native_state`,
+/// and `TreeSet` has no such funnel — every one of its ~40 natives reads
+/// `ts_state` directly. Recorded in W7-36-differential-view-families rather
+/// than half-built here.
 fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let rev = match comparator {
-        Value::Object(Some(c)) => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "(Ljava/util/Comparator;)Ljava/util/Comparator;",
-            &[Value::Object(Some(c))],
-        )?,
-        _ => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "()Ljava/util/Comparator;",
-            &[],
-        )?,
-    }
-    .unwrap_or(Value::Object(None));
-    let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
-        // (it grows the destination array and can dispatch a Comparator), so
-        // both the source array and the result move under this loop.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut result = result;
-        for i in 0..(size as usize) {
-            let e = ctx.get_array_element(data, i);
-            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
+    // GC-SAFETY: `this` is now needed at the very END of this function (it is
+    // the source stored in the view marker), across a `Collections.reverseOrder`
+    // dispatch, two allocations and a whole population loop. It was previously
+    // dead after the first read and so was never pinned.
+    let this_pin = ctx.pin_native_root(this);
+    // Single-exit through a closure so no `?` can unwind past the pin above and
+    // strand it (and everything pinned on top of it) — the shape
+    // `native_map_put_if_absent` uses for the same reason.
+    let outcome = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let (data_opt, size, comparator) = ts_state(ctx, this);
+        let rev = match comparator {
+            Value::Object(Some(c)) => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+                &[Value::Object(Some(c))],
+            )?,
+            _ => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "()Ljava/util/Comparator;",
+                &[],
+            )?,
         }
-        ctx.unpin_native_roots(data_pin);
-        return Ok(Some(Value::Object(Some(result))));
-    }
-    Ok(Some(Value::Object(Some(result))))
+        .unwrap_or(Value::Object(None));
+        // `rev` is a freshly allocated comparator held in a bare Rust local
+        // across the two allocations below and then STORED — the same
+        // stale-at-store shape the Family-1 notes throughout this file describe.
+        let rev_pin = pin_value(ctx, rev);
+        let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+        let result_pin = ctx.pin_native_root(result);
+        // One slot beyond the elements, for the source marker installed after
+        // the population loop. Sized so `ts_ensure_capacity` never has to grow
+        // during that loop — when the marker is not there yet to be carried.
+        let cap = std::cmp::max(size as usize, TS_DEFAULT_CAPACITY) + 1;
+        let buf = alloc_ref_array(ctx, cap);
+        let mut result = ctx.read_native_pin(result_pin, result);
+        let rev = read_pinned_elem(ctx, rev_pin, rev);
+        ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+        ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+        ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
+        if let Some(data) = data_opt {
+            // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
+            // (it grows the destination array and can dispatch a Comparator), so
+            // both the source array and the result move under this loop.
+            let data_pin = ctx.pin_native_root(data);
+            let mut data = data;
+            for i in 0..(size as usize) {
+                let e = ctx.get_array_element(data, i);
+                native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+            }
+            // Left pinned: the caller's `unpin_native_roots(this_pin)` releases
+            // this frame's whole pin range, and unpinning `data_pin` here would
+            // drop `result_pin` with it (it sits above).
+        }
+        // Install the live-view marker last. Nothing allocates from here to the
+        // return, so both refs read through their pins stay valid.
+        let this = ctx.read_native_pin(this_pin, this);
+        let result = ctx.read_native_pin(result_pin, result);
+        let (rdata, rsize, _) = ts_state(ctx, result);
+        if let Some(rd) = rdata {
+            let dlen = ctx.array_length(rd);
+            if (dlen as i32) > rsize {
+                ctx.set_array_element(rd, dlen - 1, Value::Object(Some(this)));
+            }
+        }
+        Ok(Some(Value::Object(Some(result))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    outcome
 }
 
 /// `TreeSet.pollFirst()` — remove and return the lowest element (null if empty).
@@ -42938,7 +43234,7 @@ fn native_ts_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     // Live TreeMap keySet view: delete the key from the source TreeMap too.
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, first)?;
+        ts_source_remove(ctx, source, first)?;
     }
     Ok(Some(first))
 }
@@ -42960,7 +43256,7 @@ fn native_ts_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ts_remove_at(ctx, data, size, idx);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(Some(last))
 }
