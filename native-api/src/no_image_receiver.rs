@@ -316,25 +316,27 @@ pub const VM_SERVICE_RECEIVERS: &[&str] = &[
 /// two readings.
 pub const STRICT_STILL_FABRICATES: &[&str] = &[];
 
-/// Whether a registration on `class_name` can possibly bind to an `ACC_NATIVE`
-/// method on any supported JDK image.
-///
-/// `false` for every name in [`NO_IMAGE_JDK_RECEIVERS`] or
-/// [`VM_MINTED_STAND_IN_RECEIVERS`]. Linear scans over a 49- and a 9-entry
-/// table: this runs once per registration during `SharedVm::new`
-/// (~11,900 times, at boot, off every hot path) and a hash set would cost more
-/// to build than the scans cost to run.
 /// Whether a registration on `class_name` should be re-tagged
 /// [`NativeKind::SyntheticStub`](crate::registry::NativeKind::SyntheticStub)
 /// because no supported JDK image declares the receiver.
 ///
-/// `false` for the reviewed VM services and for the four receivers strict mode
-/// still fabricates — both exclusions are listed and reasoned in
-/// [`VM_SERVICE_RECEIVERS`] and [`STRICT_STILL_FABRICATES`].
+/// `false` for the reviewed VM services and for any receivers strict mode still
+/// fabricates — the latter table is EMPTY today — both exclusions being listed
+/// and reasoned in [`VM_SERVICE_RECEIVERS`] and [`STRICT_STILL_FABRICATES`].
 ///
-/// Linear-ish: two binary searches over 49- and 9-entry tables plus one over
-/// the 4-entry exclusion. This runs once per registration during
+/// Linear-ish: two binary searches over 49- and 8-entry tables plus one over the
+/// currently-empty exclusion. This runs once per registration during
 /// `SharedVm::new` (~11,900 times, at boot, off every hot path).
+///
+/// The table sizes above were 9 and 4 until 2026-08-12 and were wrong in a way
+/// that propagated: a campaign document copied the "9" from here into a census
+/// and reported 49 + 9 fabricated classes. The total it printed (57) happened to
+/// be right — the tables are 49 / 8 / 9, the last being [`VM_SERVICE_RECEIVERS`]
+/// — so the error survived because the number it produced was correct. A stale
+/// duplicate of this doc comment sat immediately above, describing the
+/// linear-scan implementation this function has not used for some time; it is
+/// deleted rather than corrected, since two doc blocks on one item render as one
+/// and disagreeing halves are worse than a missing half.
 #[must_use]
 pub fn receiver_declared_by_no_supported_image(class_name: &str) -> bool {
     // The exclusion is checked first and unconditionally. Ordering it after the
