@@ -2693,6 +2693,26 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
             crate::phases_early::pbkdf2_generate_secret,
         );
+        // `getAlgorithm`/`getProvider` must be registered HERE, not only beside
+        // the identical trio in `phases_early::register_phase53_natives`: that
+        // registrar is reached only from `register_synthetic_overrides`, which
+        // is `#[cfg(feature = "synthetic-jdk")]`. THIS module is the copy that
+        // runs in the default real-JDK mode — which is why the phase-53 pair
+        // alone left `getProvider()` still throwing `NullPointerException:
+        // Cannot enter synchronized block because "this.lock" is null` on a
+        // real-JDK run. An inert registration looks exactly like a missing one.
+        r.register(
+            skf,
+            "getAlgorithm",
+            "()Ljava/lang/String;",
+            crate::phases_early::pbkdf2_get_algorithm,
+        );
+        r.register(
+            skf,
+            "getProvider",
+            "()Ljava/security/Provider;",
+            crate::phases_early::pbkdf2_get_provider,
+        );
     }
 
     r.register(
