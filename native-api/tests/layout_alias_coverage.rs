@@ -640,9 +640,9 @@ fn the_undeclared_direction_reaches_the_wire() {
 ///
 /// **How it fails.** Add `if some_fast_path { return obj; }` anywhere above the
 /// first `layout_alias::enabled()` in `NativeContextImpl::alloc_object` and this
-/// prints the offending line. (Verified red against a mutated copy carrying an
-/// early `return self.heap_alloc_object(class_id, num_fields);` at the top of the
-/// method: the assertion fired and quoted it.)
+/// prints the offending line. (Verified red against a mutated copy carrying
+/// `if num_fields == 0 { return self.heap_alloc_object(class_id, 0); }` as the
+/// method's first statement: the assertion fired and quoted that line.)
 #[test]
 fn no_allocation_door_opens_before_the_census() {
     let src = read("vm/src/vm/vm_exec.rs");
@@ -700,6 +700,8 @@ fn no_allocation_door_opens_before_the_census() {
 /// observe-before-clamp check, one substitution earlier, and it fails the same
 /// way: a well-meaning tidy-up that hoists the class fixup to the top of the
 /// method leaves a census that still compiles, still runs, and reports clean.
+/// (Verified red against a mutated copy with an `ensure_generated_class` call
+/// moved above the observation.)
 #[test]
 fn the_unresolved_class_sentinel_is_observed_before_it_is_substituted() {
     let src = read("vm/src/vm/vm_exec.rs");

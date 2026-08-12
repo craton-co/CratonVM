@@ -83,7 +83,7 @@
 //! `NativeContextImpl::alloc_object` clamps `slots = num_fields.max(real_fields)`
 //! **two lines after** it calls this module. So:
 //!
-//! * whenever `declared > 0`, an [`Direction::Under`] row describes an object
+//! * whenever `declared > 0`, a [`Direction::Under`] row describes an object
 //!   the clamp has already widened to its full declared width — a *mis-request*,
 //!   never a short object;
 //! * whenever `declared == 0` the clamp is the identity (`n.max(0) == n`), the
