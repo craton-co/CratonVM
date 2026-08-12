@@ -7286,7 +7286,45 @@ const BB_FIELD_CAPACITY: usize = 3; // Int capacity
 const BB_FIELD_MARK: usize = 4; // Int mark (-1 = not set)
 const BB_NUM_FIELDS: usize = 5;
 
-/// FileChannel layout: 2-field synthetic
+// FileChannel layout: 2-field synthetic, on a class that declares FOUR.
+//
+// MEASURED AND DELIBERATELY LEFT — W7-68-live-under-allocations.md. Recorded
+// here rather than only in that record, so the next reader does not redo the
+// analysis and, in particular, does not "fix" it the obvious way and break the
+// live path.
+//
+// `javap -p java.nio.channels.FileChannel` on JDK 25.0.3.9 gives the
+// transitive order
+//
+//     0 closeLock (Object, final)   1 closed (boolean, volatile)
+//     2 interruptor (Interruptible) 3 interruptedTarget (Object, volatile)
+//
+// all four inherited from `java.nio.channels.spi.AbstractInterruptibleChannel`.
+// So the fd is an `Int` in `closeLock` and the file position is a `Long` in
+// `closed`. The object is NOT short — the base allocator clamps
+// `slots = requested.max(declared)` — it is mis-mapped.
+//
+// It is nevertheless not live corruption, and the reason is registration, not
+// luck: every reader of those two fields on this class is a native.
+// `AbstractInterruptibleChannel.isOpen()` — the one that would otherwise read
+// `closed` and report a channel CLOSED as soon as its position moved off zero
+// — is registered TWICE in `native-builtins/src/phases_late/nio_file.rs`, and
+// both copies screen on the exact class name; the surviving one then reads
+// slot 0 as the fd, agreeing with this map. `close()` is registered here
+// (`native_fc_close`, which screens the same way). `begin()`/`end()` are
+// `protected final` and are only called by an implementation subclass, which
+// this object is not. `sun.nio.ch.FileChannelImpl` declares every other
+// registered method itself with `Code`, so a real channel never resolves here.
+//
+// **That agreement is exactly why this is not repaired.** Moving these two onto
+// the appended-slot idiom — the fix `java/nio/MappedByteBuffer` got in the same
+// lane — would silently break `nio_file.rs`'s `isOpen`, which reads
+// `get_field(this, 0)` and answers `fd_id >= 0`: after the move slot 0 is
+// `closeLock`, `as_int()` gives `None`, and `isOpen()` would start answering
+// FALSE for every open channel. Two crates share this map, so it has to move in
+// one step, and which of the three registrations wins is a last-write-wins
+// question that needs a build. This is W7-49 §5's rule in the live direction: a
+// one-sided renumber only moves the disagreement.
 const FC_FIELD_FD: usize = 0; // Int file descriptor id
 const FC_FIELD_POS: usize = 1; // Long position in file
 
@@ -16436,12 +16474,57 @@ fn fd_from_file_channel(ctx: &dyn NativeContext, fc: ObjectRef) -> i64 {
     }
 }
 
-// --- MappedByteBuffer: uses BB layout + extra fields ---
-// Field 10 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
-// Field 11 = Int: 1 = writable (read-write or private), 0 = read-only
-const MBB_FIELD_MAPPED_ADDR: usize = 10;
-const MBB_FIELD_WRITABLE: usize = 11;
-const MBB_NUM_FIELDS: usize = 12;
+/// The class `alloc_mapped_byte_buffer` allocates and every `native_mbb_*` and
+/// `native_fc_map` native reads.
+const MBB_CLASS: &str = "java/nio/MappedByteBuffer";
+
+// --- MappedByteBuffer PRIVATE state: two slots, indexed from `mbb_base` ---
+//
+// Offset 0 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
+// Offset 1 = Int:  1 = writable (read-write or private), 0 = read-only
+//
+// W7-68-live-under-allocations.md. These were the ABSOLUTE indices 10 and 11
+// against a request of 12, on a class that declares THIRTEEN fields.
+// `javap -p java.nio.MappedByteBuffer` on JDK 25.0.3.9, transitively:
+//
+//     0 mark      1 position  2 limit    3 capacity  4 address  5 segment
+//     6 hb        7 offset    8 isReadOnly  9 bigEndian  10 nativeByteOrder
+//    11 fd        12 isSync
+//
+// so the mapping id landed on `nativeByteOrder` and the writable flag landed
+// on `fd` — a `java.io.FileDescriptor` reference. Unlike this census's other
+// `under` rows, that field HAS a real-JDK-bytecode reader that CratonVM does
+// not intercept: `MappedByteBuffer.force(int,int)` is `public final`, is not
+// registered by any crate here (only the no-arg `force()` is), and its body
+// short-circuits on `fd == null` before touching `MappedMemoryUtils`. With an
+// `Int` sitting in `fd` that guard does not fire, and the call proceeds into
+// the mapped-memory path with a non-`FileDescriptor` in hand. Measured on
+// HotSpot 25.0.3.9 (`probes/UnderAllocationProbe.java` §3): `force(0,8)`
+// returns the buffer.
+//
+// The remedy is the appended-slot idiom (W7-49 §8): start the private map
+// ABOVE every field the real class declares, and collapse the base to 0 when
+// the class is a fabricated stub, where the private map IS the layout. No
+// other crate reads these two slots — grepped `"java/nio/MappedByteBuffer"`
+// across `native-builtins`, `native-collections` and `vm`: the only other
+// mentions register `session()`/`checkSession()` over a buffer-class list and
+// name the class in a `toString` test — so unlike
+// `java/nio/channels/FileChannel` (same census, NOT repaired) this map has a
+// single owner and can move in one step.
+const MBB_PRIVATE_MAPPED_ADDR: usize = 0;
+const MBB_PRIVATE_WRITABLE: usize = 1;
+const MBB_PRIVATE_WIDTH: usize = 2;
+
+// The base is `cratonvm_native_api::appended_slots::base_for_class(ctx,
+// MBB_CLASS)`, bound to a local at each site rather than wrapped in a helper
+// that takes `&dyn`: one base function, called the same way by the allocator
+// and by every accessor, is what keeps the two from ever disagreeing.
+//
+// Sound as a per-CLASS base — rather than per-receiver, which W7-49 §8 shows is
+// unanswerable — because every receiver reaching these slots is one
+// `alloc_mapped_byte_buffer` produced: `native_fc_map` is its only caller, and
+// the real image's mapped buffers are `java.nio.DirectByteBuffer`, a different
+// class that never resolves to `MBB_CLASS`'s registrations.
 
 // ---------------------------------------------------------------------------
 // mmap registry (T2.4.5 / T2.4.6)
@@ -16449,11 +16532,11 @@ const MBB_NUM_FIELDS: usize = 12;
 // Real `mmap`/`MapViewOfFile` is provided by memmap2. Because the JVM heap
 // cannot hold Rust smart pointers, we maintain a process-wide registry
 // keyed by a stable 64-bit id and store that id in the MappedByteBuffer's
-// `MBB_FIELD_MAPPED_ADDR` slot. Dropping the registry entry calls
+// `MBB_PRIVATE_MAPPED_ADDR` slot. Dropping the registry entry calls
 // `munmap` / `UnmapViewOfFile` via `memmap2::Mmap`'s Drop impl.
 //
 // Invariants:
-//   - Every alive `MappedByteBuffer` whose `MBB_FIELD_MAPPED_ADDR != 0` has a
+//   - Every alive `MappedByteBuffer` whose mapping-id slot is non-zero has a
 //     corresponding registry entry.
 //   - The registry outlives the JVM heap objects that reference it: the
 //     Java-level `unmap0` native removes the entry before the MBB is
@@ -16510,9 +16593,17 @@ fn alloc_file_lock(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
-    let obj = match ctx.ensure_class_initialized("java/nio/MappedByteBuffer") {
-        Ok(cid) => ctx.alloc_object(cid, MBB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), MBB_NUM_FIELDS),
+    // W7-68: `base + MBB_PRIVATE_WIDTH`, not a flat 12. Asking for 12 on a
+    // class declaring 13 put the mapping id in `nativeByteOrder` and the
+    // writable flag in `fd`, which real `MappedByteBuffer.force(int,int)`
+    // bytecode dereferences.
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let obj = match ctx.ensure_class_initialized(MBB_CLASS) {
+        Ok(cid) => ctx.alloc_object(cid, mbb_base + MBB_PRIVATE_WIDTH),
+        Err(_) => ctx.alloc_object(
+            cratonvm_types::ClassId::new(0),
+            mbb_base + MBB_PRIVATE_WIDTH,
+        ),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -16521,10 +16612,10 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
     // Same as `alloc_byte_buffer`: this stand-in is heap-backed (`hb` is a real
     // byte[]), so `Buffer.address` must be the array base offset, not the mark
     // that the indexed slot-4 write would otherwise leave behind. The separate
-    // `MBB_FIELD_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
+    // `MBB_PRIVATE_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
     // NOT the JDK's `address` field.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
-    ctx.set_field(obj, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+    ctx.set_field(obj, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     obj
 }
 
@@ -16668,11 +16759,16 @@ fn native_file_lock_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// may have swapped pages out, but they are still "loaded" in the JLS
 /// sense — `java.nio.MappedByteBuffer.isLoaded` is explicitly a hint).
 fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // The base FIRST, before any ObjectRef is in a bare local: it goes
+    // through `ensure_class_initialized`, which is GC-capable in principle
+    // even though the class is loaded by construction on every path that
+    // can reach here (you cannot hold a MappedByteBuffer otherwise).
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16695,11 +16791,12 @@ fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// both POSIX and Windows; the compiler-fence prevents the read from
 /// being elided.
 fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16737,17 +16834,18 @@ fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `FlushViewOfFile` (memmap2 abstracts both). No-op for read-only
 /// mappings and for the array-backed fallback.
 fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
     if id != 0 {
         // 1. Sync Java byte[] → kernel mapping for writable maps.
-        mmap_sync_back_from_java(ctx, this).map_err(|e| RuntimeError::IOException {
+        mmap_sync_back_from_java(ctx, this, mbb_base).map_err(|e| RuntimeError::IOException {
             message: format!("MappedByteBuffer.force: sync back: {e}"),
         })?;
         // 2. Flush kernel mapping to disk.
@@ -16764,6 +16862,7 @@ fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// FileChannel.unmap0(MappedByteBuffer) — drops the kernel mapping.
 /// Safe to call more than once.
 fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     // Accept either (this, mbb) from instance form or (mbb) from static form.
     let target = match args.iter().rev().find_map(|v| match v {
         Value::Object(Some(o)) => Some(*o),
@@ -16772,7 +16871,7 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(None),
     };
-    let id = match ctx.get_field(target, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(None),
     };
@@ -16780,7 +16879,7 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let mut registry = mmap_registry().lock();
         // Drop the MmapEntry, which calls munmap / UnmapViewOfFile.
         let _ = registry.remove(&id);
-        ctx.set_field(target, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+        ctx.set_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     }
     Ok(None)
 }
@@ -16895,7 +16994,7 @@ enum FcMapMode {
 /// Real `mmap` / `MapViewOfFile` via memmap2. The resulting
 /// MappedByteBuffer is still backed by a Java `byte[]` so existing
 /// `ByteBuffer.get(i)` / `put(i, v)` opcodes keep working unchanged —
-/// but a sentinel id in `MBB_FIELD_MAPPED_ADDR` keeps the real kernel
+/// but a sentinel id in `MBB_PRIVATE_MAPPED_ADDR` keeps the real kernel
 /// mapping alive in `MMAP_REGISTRY` so `force()`, `load()`, `isLoaded()`
 /// and `unmap0()` see the real mapping.
 ///
@@ -17030,11 +17129,12 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     mmap_registry().lock().insert(id, entry);
 
     let writable = matches!(mode, FcMapMode::ReadWrite | FcMapMode::Private);
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let mbb = alloc_mapped_byte_buffer(ctx, size);
-    ctx.set_field(mbb, MBB_FIELD_MAPPED_ADDR, Value::Long(id));
+    ctx.set_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(id));
     ctx.set_field(
         mbb,
-        MBB_FIELD_WRITABLE,
+        mbb_base + MBB_PRIVATE_WRITABLE,
         Value::Int(if writable { 1 } else { 0 }),
     );
     let arr = match ctx.get_field(mbb, BB_FIELD_ARRAY) {
@@ -17052,15 +17152,24 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 /// Synchronize the Java byte[] view into the kernel mapping for
 /// read-write / private mappings. Invoked by `force` prior to msync.
-fn mmap_sync_back_from_java(ctx: &mut dyn NativeContext, mbb: ObjectRef) -> std::io::Result<()> {
-    let id = match ctx.get_field(mbb, MBB_FIELD_MAPPED_ADDR) {
+///
+/// `mbb_base` is passed in rather than resolved here: resolving it would put a
+/// GC-capable `ensure_class_initialized` between this function's entry and its
+/// first read of `mbb`, which arrives as a bare `ObjectRef` local from the
+/// caller. The caller already has the base.
+fn mmap_sync_back_from_java(
+    ctx: &mut dyn NativeContext,
+    mbb: ObjectRef,
+    mbb_base: usize,
+) -> std::io::Result<()> {
+    let id = match ctx.get_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(()),
     };
     if id == 0 {
         return Ok(());
     }
-    let writable = matches!(ctx.get_field(mbb, MBB_FIELD_WRITABLE), Value::Int(1));
+    let writable = matches!(ctx.get_field(mbb, mbb_base + MBB_PRIVATE_WRITABLE), Value::Int(1));
     if !writable {
         return Ok(());
     }
@@ -17697,10 +17806,29 @@ const WE_FIELD_KIND: usize = 0;
 const WE_FIELD_CONTEXT: usize = 1;
 const WE_NUM_FIELDS: usize = 2;
 
-/// DatagramChannel layout: 3 fields
-/// [0] = fd (Int) — UDP socket fd in fd_table
-/// [1] = bound_addr (Object — String local address)
-/// [2] = open (Int) — 1=open, 0=closed
+/// DatagramChannel allocation width — and a slot map that no longer exists.
+///
+/// The three-slot comment this replaces described `[0] = fd, [1] = bound_addr,
+/// [2] = open`. **Nothing writes any of them.** Every piece of
+/// `DatagramChannel` state moved into the identity-keyed side tables below
+/// (`dc_fds`, `dc_nonblocking_channels`, `dc_connected`), which is the remedy
+/// W7-49 §8 names as the sound one for state that must not sit in a real
+/// class's declared fields. `native_dc_open` allocates and then calls
+/// `dc_set_blocking` / `set_dc_fd`; neither touches a slot.
+///
+/// So the `3` was a vestigial number, and the layout-alias census
+/// (W7-59 §5.2) read it as a live 3-vs-10 `under` row against
+/// `java.nio.channels.DatagramChannel`, which declares ten fields transitively
+/// (`javap -p`, JDK 25.0.3.9). It is the emptiest kind of finding this census
+/// produces: a narrow request with an empty slot map cannot alias anything, and
+/// the base allocator clamps the object up to the declared width anyway.
+///
+/// Left at 3 rather than raised to 10: `try_alloc_synthetic` needs *some*
+/// count, and in synthetic-JDK mode — the only mode where the number decides
+/// anything — the class is a fabricated stub and 3 IS its declared width.
+/// Raising it would allocate seven dead slots per channel in that mode to
+/// silence one census row in the other, which is paying in the wrong currency.
+/// The row is real; it is just empty.
 const DC_NUM_FIELDS: usize = 3;
 
 /// Key for the `DatagramChannel` side tables below.

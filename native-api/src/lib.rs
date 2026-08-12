@@ -6,6 +6,11 @@
 //! Provides the NativeContext trait, NativeMethodRegistry, FFI types,
 //! and FileDescriptorTable used by all native method crates.
 
+/// Where a native's PRIVATE slot map may start on a real JDK class, so that no
+/// private slot collides with a field the class declares. One implementation;
+/// `native-builtins` forwards to it. See W7-68-live-under-allocations.md and
+/// W7-49-slot-index-recensus.md §8.
+pub mod appended_slots;
 pub mod capability;
 pub mod charset;
 /// Class-identity answers a native can act on: the ambiguous-vs-absent
