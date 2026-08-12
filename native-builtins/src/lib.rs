@@ -35507,7 +35507,15 @@ fn native_random_next_gaussian(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let v = (((s2 >> 16) as u32 as f64) / (u32::MAX as f64)) * 2.0 - 1.0;
         let s = u * u + v * v;
         if s > 0.0 && s < 1.0 {
-            let mult = (-2.0 * s.ln() / s).sqrt();
+            // fdlibm, matching the other two copies — see the note in
+            // `securerandom::native_random_next_gaussian`. This body is not
+            // currently reachable from the registry (the `securerandom` module
+            // supersedes it, per the comment above `register_random_and_
+            // securerandom_natives` in this file), but it is still compiled and
+            // still exercised by an in-crate test, and a superseded copy left on
+            // `f64::ln` is exactly what a future re-registration would silently
+            // reinstate. W7-54-strictmath-fdlibm-family.md.
+            let mult = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return Ok(Some(Value::Double(u * mult)));
         }
     }
