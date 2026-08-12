@@ -1471,6 +1471,14 @@ pub(crate) struct TlsClientStreamEntry {
     /// TLS connection must never hold the process-wide registry lock — see
     /// `rustls_stream_read`'s doc comment.
     pub(crate) stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
+    /// A `try_clone`d handle on the same socket, reachable WITHOUT `stream`'s
+    /// mutex. Added 2026-08-12 (W7-61), modelled exactly on
+    /// `servlet::TlsEntry::raw`, which already existed for this purpose on the
+    /// native-tls table. It is the only way `rustls_stream_close` can reach the
+    /// socket while another thread is parked in a read on it — that thread
+    /// holds both the mutex and an `Arc`, so neither `try_lock` nor dropping
+    /// our own `Arc` touches the connection. `None` only if `try_clone` failed.
+    pub(crate) raw: Option<TcpStream>,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     pub(crate) negotiated_protocol: String,
@@ -1481,6 +1489,8 @@ pub(crate) struct TlsClientStreamEntry {
 pub(crate) struct TlsServerStreamEntry {
     /// Per-stream mutex — see `TlsClientStreamEntry::stream`.
     pub(crate) stream: Arc<Mutex<TlsServerStream>>,
+    /// See `TlsClientStreamEntry::raw`.
+    pub(crate) raw: Option<TcpStream>,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
@@ -1492,6 +1502,20 @@ pub(crate) enum TlsServerStream {
     Native(native_tls::TlsStream<TcpStream>),
     #[cfg(unix)]
     LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+}
+
+impl TlsServerStream {
+    /// The underlying TCP socket, borrowed. Used only to `try_clone` a
+    /// registry-held duplicate at registration time — see
+    /// `TlsClientStreamEntry::raw`.
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            TlsServerStream::Rustls(s) => &s.sock,
+            TlsServerStream::Native(s) => s.get_ref(),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.get_ref(),
+        }
+    }
 }
 
 impl Default for ServerRegistry {
@@ -3234,8 +3258,12 @@ pub(crate) fn rustls_client_connect(
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
 
+    // W7-61: registry-held duplicate, taken BEFORE `stream` moves into the
+    // mutex. See `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let entry = TlsClientStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -3422,8 +3450,11 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
             }
         };
 
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.tcp().try_clone().ok();
     let entry = TlsServerStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         sni_hostname,
         negotiated_protocol,
         negotiated_cipher,
@@ -3573,12 +3604,15 @@ pub(crate) fn rustls_server_handshake_over_stream(
         .conn
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let mut reg = sreg().lock();
     let id = alloc_server_id(&mut reg);
     reg.server_streams.insert(
         id,
         TlsServerStreamEntry {
             stream: Arc::new(Mutex::new(TlsServerStream::Rustls(stream))),
+            raw,
             sni_hostname,
             negotiated_protocol,
             negotiated_cipher,
@@ -3645,8 +3679,11 @@ pub(crate) fn rustls_client_handshake_over_stream(
         .conn
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let entry = TlsClientStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         peer_host: host.to_string(),
         peer_port: 0,
         negotiated_protocol,
@@ -3934,6 +3971,44 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
     }
 }
 
+/// Re-ask the registry AFTER a blocking rustls call has returned, and report a
+/// concurrent `close()` as a close rather than as EOF or as a peer error.
+///
+/// The twin of `servlet::s2_tls_classify_after_block`, and it exists for the
+/// same reason: W7-53's close-aware loop parks in `poll` on a bounded slice and
+/// ABANDONS the wait when the registry entry disappears, which a TLS record
+/// layer cannot survive — a reader that returns between two of the `recv`s that
+/// make up one record leaves the caller with a fragment and the stream
+/// desynchronised. Classifying a call that has already returned has no such
+/// hazard: at that instant the record layer is at rest, either with a whole
+/// record delivered or with a failure of its own.
+///
+/// Note this is genuinely NOT the same as making the read close-aware. It
+/// converts a wakeup into the RIGHT answer; something else still has to
+/// produce the wakeup, and on Windows nothing can — see `rustls_stream_close`.
+fn rustls_classify_after_block(
+    id: i32,
+    result: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    {
+        let reg = sreg().lock();
+        if reg.client_streams.contains_key(&id) || reg.server_streams.contains_key(&id) {
+            return result;
+        }
+    }
+    match result {
+        // Bytes that arrived before the close are still delivered; the NEXT
+        // call reports the close. Dropping them would lose data the peer
+        // really sent, and a TLS record already fully decrypted into `buf` is
+        // not something a close can retract.
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "socket closed",
+        )),
+    }
+}
+
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
     // LOCK DISCIPLINE (stw-takeover / accept-close-deadlock family): resolve
@@ -3964,7 +4039,12 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         // Reuse the same EOF-tolerant read already established for the
         // native HTTP client bridge (`http_url_connection::
         // read_eof_tolerant`) instead of duplicating the tolerance logic.
-        return crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
+        let result = crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
+        drop(e);
+        // W7-61: an unclean peer close and a close from ANOTHER THREAD OF THIS
+        // VM both arrive here as `Ok(0)`. Only the registry can tell them
+        // apart, and only after the call — see `rustls_classify_after_block`.
+        return rustls_classify_after_block(id, result);
     }
     if let Some(stream) = server {
         let mut e = stream.lock();
@@ -3993,7 +4073,8 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
                 id, result
             );
         }
-        return result;
+        drop(e);
+        return rustls_classify_after_block(id, result);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -4014,7 +4095,10 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
     };
     if let Some(stream) = client {
         let mut e = stream.lock();
-        return EintrIo::new(&mut *e).write(data);
+        let result = EintrIo::new(&mut *e).write(data);
+        drop(e);
+        // W7-61 — see `rustls_classify_after_block`.
+        return rustls_classify_after_block(id, result);
     }
     if let Some(stream) = server {
         let mut e = stream.lock();
@@ -4037,7 +4121,8 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
                 id, result
             );
         }
-        return result;
+        drop(e);
+        return rustls_classify_after_block(id, result);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -4055,17 +4140,54 @@ pub(crate) fn rustls_stream_close(id: i32) {
             reg.server_streams.remove(&id),
         )
     };
+    // ─── WAKE THE PARKED PEER FIRST (W7-61) ──────────────────────────────────
+    //
+    // The sentence that used to stand here — "the entry is already
+    // unregistered, so dropping our handle is sufficient — the socket closes
+    // when the last `Arc` goes" — is precisely wrong in the case it was written
+    // for. A thread parked in `rustls_stream_read` HOLDS an `Arc` on this
+    // stream, so the last `Arc` does not go, the socket does not close, the
+    // `try_lock` below always fails, and the reader waits forever. That is
+    // W7-53's "four TLS sites" row, of which these two are half.
+    //
+    // `entry.raw` is a duplicate handle reachable without the stream mutex.
+    // Shutting it down ends the underlying byte stream without freeing the
+    // handle the parked thread is mid-syscall on (so it is not a
+    // use-after-close) and without cutting a TLS record in half (the record
+    // layer already has to handle a truncated connection; what it cannot
+    // handle is a reader that returns mid-record and is then re-entered).
+    //
+    // PLATFORM, a contract rather than a measurement — no Linux arm was run:
+    //   * Unix — `shutdown(SHUT_RDWR)` wakes a parked `recv` with EOF, and
+    //     `rustls_classify_after_block` then reports the close instead of a
+    //     spurious end-of-stream.
+    //   * Windows — Winsock has no `shutdown` that aborts a pending blocking
+    //     call, so for a reader ALREADY parked this is a no-op and that half of
+    //     the row stays OPEN. Named, not quietly counted: the same reason
+    //     W7-53 left the Windows pipe sink write open. A close that has not yet
+    //     been raced into is still observed, because the classification runs on
+    //     every return.
+    for raw in [
+        client.as_ref().and_then(|e| e.raw.as_ref()),
+        server.as_ref().and_then(|e| e.raw.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = raw.shutdown(std::net::Shutdown::Both);
+    }
     // `try_lock`: a peer parked in a blocking read on this SAME stream holds
     // the per-stream mutex, and waiting for it here would just relocate the
-    // old global-lock stall. The entry is already unregistered, so dropping
-    // our handle is sufficient — the socket closes when the last `Arc` goes.
-    if let Some(e) = client {
+    // old global-lock stall. The graceful `close_notify` below is the nicety;
+    // the `raw` shutdown above is the liveness guarantee and does not depend on
+    // winning this lock.
+    if let Some(e) = client.as_ref() {
         if let Some(mut s) = e.stream.try_lock() {
             s.conn.send_close_notify();
             let _ = s.flush();
         }
     }
-    if let Some(e) = server {
+    if let Some(e) = server.as_ref() {
         if let Some(mut guard) = e.stream.try_lock() {
             match &mut *guard {
                 TlsServerStream::Rustls(s) => {
