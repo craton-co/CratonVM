@@ -2186,15 +2186,23 @@ fn aes_key_wrap_do_final(
         // SunJCE reports a length it cannot wrap as a CHECKED
         // IllegalBlockSizeException (measured: `AES/KW/NoPadding` on 20 bytes
         // -> "data should be at least 16 bytes and multiples of 8"), and an
-        // integrity failure on unwrap is likewise checked. An unchecked
-        // IllegalStateException here is what the caller could not catch.
+        // integrity failure on unwrap AS THE SAME CLASS — measured on Temurin
+        // 25.0.3+9, `javax.crypto.IllegalBlockSizeException: Integrity check
+        // failed` for a wrapped key with one bit flipped, on `AES/KW`,
+        // `AES/KWP` and `AESWrapPad` alike. An unchecked IllegalStateException
+        // here is what the caller could not catch.
+        //
+        // This arm used to answer `BadPaddingException` on the unwrap side.
+        // Both are checked so a `catch (GeneralSecurityException)` was
+        // unaffected, but the two are siblings and not a hierarchy — a `catch
+        // (IllegalBlockSizeException)` written against the JDK did not run —
+        // and it made the SAME failure report two different classes depending
+        // on which of this file's two RFC-3394 arms served it: the `"KW"` arm
+        // of the block dispatch already answers IllegalBlockSizeException.
+        // One algorithm, one answer.
         Err(msg) => Err(crate::phases_early::throw_jca_exc(
             ctx,
-            if encrypt {
-                "javax/crypto/IllegalBlockSizeException"
-            } else {
-                "javax/crypto/BadPaddingException"
-            },
+            "javax/crypto/IllegalBlockSizeException",
             &msg,
         )),
     }
@@ -2528,6 +2536,10 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             }
         };
         if rsa_n.is_empty() || rsa_exp.is_empty() {
+            // Genuinely a VM-state failure and not a data one: `init` ran and
+            // captured nothing, so there is no key to fail against. HotSpot's
+            // own answer to "doFinal on a Cipher that is not usable" is the
+            // unchecked `IllegalStateException` (measured), so this one stays.
             return Err(RuntimeError::IllegalStateException {
                 message:
                     "RSA cipher: key components unavailable (init did not capture modulus/exponent)"
@@ -2544,7 +2556,26 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         };
         return match result {
             Ok(bytes) => finish_cipher_bytes(ctx, key, &bytes),
-            Err(msg) => Err(RuntimeError::IllegalStateException { message: msg }.into()),
+            // THE FIX. Every RSA failure used to arrive here as an `Err(String)`
+            // and leave as an UNCHECKED `IllegalStateException`, so the JDK's
+            // own `catch (BadPaddingException e)` around an RSA decrypt did not
+            // run and the failure escaped through code that believed it had
+            // handled it. `RsaCipherError` carries the class SunJCE raises —
+            // `BadPaddingException` for a padding/integrity failure,
+            // `IllegalBlockSizeException` for a length one — and all three names
+            // are real JDK classes, so `throw_jca_exc` resolves them rather than
+            // degrading a wrong-exception defect into a `NoClassDefFoundError`.
+            //
+            // Raising a CHECKED exception where an unchecked one was raised
+            // cannot break a caller that compiles today: `doFinal` already
+            // declares both of these, so any `catch` for them is already
+            // written and was simply dead. This can only make a dead handler
+            // start working.
+            Err(e) => Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                e.jca_class(),
+                e.message(),
+            )),
         };
     }
 
@@ -2739,10 +2770,25 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let result_bytes: Result<Vec<u8>, String> = match mode_str.as_str() {
         "GCM" => {
             if iv_bytes.len() != 12 {
-                Err(format!(
-                    "AES-GCM requires a 12-byte IV, got {}",
-                    iv_bytes.len()
-                ))
+                // A GAP, not a data failure: SunJCE derives J0 by GHASH for any
+                // IV length and this engine implements only the 12-byte case.
+                // The class still matters — the `Err(String)` tail below made
+                // this an UNCHECKED `IllegalStateException`, so a caller could
+                // not catch it at all, whereas
+                // `InvalidAlgorithmParameterException` is a checked
+                // `GeneralSecurityException` and is what SunJCE raises for a
+                // GCM parameter it will not accept. The right eventual fix is
+                // to implement the general J0 derivation; until then this fails
+                // closed and catchably rather than closed and not.
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "java/security/InvalidAlgorithmParameterException",
+                    &format!(
+                        "this engine implements AES-GCM for a 12-byte IV only, got {} \
+                         (SunJCE derives J0 by GHASH for other lengths)",
+                        iv_bytes.len()
+                    ),
+                ));
             } else {
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(&iv_bytes);
@@ -3752,6 +3798,30 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         };
         let output = ctx.read_native_pin(opin, output);
         ctx.unpin_native_roots(opin);
+        // The caller's buffer has to be able to hold the result. This loop used
+        // to write `out_bytes.len()` elements into `output` with NO bounds
+        // check at all — a 32-byte ciphertext into a 1-byte array — so the
+        // census answer for `ShortBufferException` on this overload was
+        // "raises NOTHING of its own"; what a caller saw was whatever
+        // `set_array_element` did past the end, which is an
+        // `ArrayIndexOutOfBoundsException` at best and is unchecked either way.
+        //
+        // SunJCE measured on Temurin 25.0.3+9:
+        // `ShortBufferException: Output buffer must be (at least) 32 bytes long`
+        // — checked, and the exception `doFinal(byte[],int,int,byte[])`
+        // declares. The check is made against the ACTUAL output length rather
+        // than `getOutputSize`, which is documented one screen down as an UPPER
+        // bound: refusing on the estimate would reject buffers that fit.
+        if ctx.array_length(output) < out_bytes.len() {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/crypto/ShortBufferException",
+                &format!(
+                    "Output buffer must be (at least) {} bytes long",
+                    out_bytes.len()
+                ),
+            ));
+        }
         for (i, &b) in out_bytes.iter().enumerate() {
             ctx.set_array_element(output, i, Value::Int(b as i8 as i32));
         }

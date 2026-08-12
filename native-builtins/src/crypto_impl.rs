@@ -2514,6 +2514,92 @@ impl RsaCipherPadding {
             _ => 32,
         }
     }
+
+    /// The largest plaintext this padding can carry under a `k`-byte modulus —
+    /// SunJCE's `RSAPadding.getMaxDataSize()`: `k - 11` for PKCS#1 v1.5,
+    /// `k - 2*hLen - 2` for OAEP. `None` when the modulus is too small to hold
+    /// the padding at all, which SunJCE reports from `RSAPadding.getInstance`
+    /// as an `InvalidKeyException` rather than as a data failure.
+    ///
+    /// This is the number the LENGTH refusal has to be measured against, and
+    /// keeping it here rather than inside `rsa_pkcs1_type2_pad` /
+    /// `rsa_oaep_pad` is deliberate: those two decide padding VALIDITY and
+    /// their error strings are held to a single opaque constant so they cannot
+    /// become a Bleichenbacher/Manger oracle. A length that does not fit is not
+    /// secret — the caller chose it — and it is a different JCA exception, so
+    /// it is decided before either of them is entered.
+    fn max_data_size(self, k: usize) -> Option<usize> {
+        let overhead = match self {
+            RsaCipherPadding::Pkcs1 => 11,
+            _ => 2 * self.hlen() + 2,
+        };
+        k.checked_sub(overhead).filter(|_| k > overhead)
+    }
+}
+
+/// Which JCA exception an RSA `Cipher` failure has to be raised as.
+///
+/// The two `Cipher.doFinal` DECLARES are both CHECKED members of
+/// `java.security.GeneralSecurityException`, and the class is the only thing a
+/// caller's `catch` selects on. `rsa_cipher_encrypt`/`rsa_cipher_decrypt`
+/// returned `Result<_, String>` and every caller collapsed the whole set into
+/// an unchecked `IllegalStateException`, so a caller who wrote the JDK's own
+/// `catch (BadPaddingException e)` around an RSA decrypt did NOT catch it: the
+/// failure escaped as an unchecked throw through code that believed it had
+/// handled it. This is the same species as `W7-41`'s `IllegalFormatException`
+/// subclasses and `W7-46`'s `ProcessBuilder("").start()`.
+///
+/// Measured on Temurin 25.0.3+9 (`probes/JcaExceptionTypeProbe.java`):
+///
+/// ```text
+/// OAEP / PKCS1 decrypt under the wrong private key   BadPaddingException: Padding error in decryption
+/// OAEP / PKCS1 decrypt of a corrupted ciphertext     BadPaddingException: Padding error in decryption
+/// PKCS1 decrypt of a SHORTER-than-modulus ciphertext BadPaddingException: Padding error in decryption
+/// PKCS1 decrypt of a LONGER-than-modulus ciphertext  IllegalBlockSizeException: Data must not be longer than 256 bytes
+/// PKCS1 encrypt of 246 bytes under RSA-2048          IllegalBlockSizeException: Data must not be longer than 245 bytes
+/// OAEP-SHA-256 encrypt of 191 bytes under RSA-2048   IllegalBlockSizeException: Data must not be longer than 190 bytes
+/// NoPadding encrypt of a value >= the modulus        BadPaddingException: Message is larger than modulus
+/// ```
+///
+/// Note the short-vs-long asymmetry, which is the row a length check written
+/// as `ct.len() != k` gets wrong in both directions at once: SunJCE's
+/// `RSACipher.doFinal` refuses only `bufOfs > buffer.length`, and a SHORTER
+/// ciphertext is simply a smaller integer that goes through the modexp and
+/// fails to unpad.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RsaCipherError {
+    /// A LENGTH failure — `javax.crypto.IllegalBlockSizeException`.
+    BlockSize(String),
+    /// A PADDING or integrity failure — `javax.crypto.BadPaddingException`.
+    Padding(String),
+    /// An unusable KEY — `java.security.InvalidKeyException`. SunJCE raises
+    /// this at `init`; this engine captures the key components at `init` and
+    /// can only discover an unusable one here, so the class is kept truthful
+    /// even though the point differs.
+    Key(String),
+}
+
+impl RsaCipherError {
+    /// The internal-form JCA class name to raise. Every one of the three is a
+    /// class the real JDK carries, so `throw_jca_exc` resolves it — raising a
+    /// name that does not resolve would convert a wrong-exception defect into a
+    /// `NoClassDefFoundError`, which is worse.
+    pub fn jca_class(&self) -> &'static str {
+        match self {
+            RsaCipherError::BlockSize(_) => "javax/crypto/IllegalBlockSizeException",
+            RsaCipherError::Padding(_) => "javax/crypto/BadPaddingException",
+            RsaCipherError::Key(_) => "java/security/InvalidKeyException",
+        }
+    }
+
+    /// The detail text.
+    pub fn message(&self) -> &str {
+        match self {
+            RsaCipherError::BlockSize(m)
+            | RsaCipherError::Padding(m)
+            | RsaCipherError::Key(m) => m,
+        }
+    }
 }
 
 /// Hash `data` with the OAEP padding's digest (SHA-1 or SHA-256).
@@ -2593,7 +2679,14 @@ fn rsa_pkcs1_type2_pad(msg: &[u8], k: usize) -> Result<Vec<u8>, String> {
 /// timing learns *which* structural check failed and can recover plaintext one
 /// query at a time. All padding failures now collapse to this one message and
 /// are decided by a single branch over a bitwise-accumulated failure mask.
-const RSA_PADDING_ERROR: &str = "RSA: decryption error";
+///
+/// The text is SunJCE's own, measured on Temurin 25.0.3+9 — `RSACipher.doFinal`
+/// raises `BadPaddingException("Padding error in decryption")` for the wrong
+/// key, for a corrupted ciphertext and for a short one alike. Matching it costs
+/// nothing (it is still exactly one constant, so it still distinguishes
+/// nothing) and it removes a second-order tell: an attacker who can see the
+/// message at all should not be able to tell which VM produced it.
+const RSA_PADDING_ERROR: &str = "Padding error in decryption";
 
 /// Constant-time non-zero test: returns `0xFF` if `x != 0`, else `0x00`,
 /// without a data-dependent branch.
@@ -2798,22 +2891,41 @@ fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// RSA public-key encryption (ENCRYPT/WRAP): pad then `m^e mod n`.
+///
+/// The error type is `RsaCipherError`, not `String`: see that enum for why the
+/// CLASS is the whole point and what each variant was measured against.
 pub fn rsa_cipher_encrypt(
     n: &[u8],
     e: &[u8],
     pad: RsaCipherPadding,
     msg: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let e_big = BigUint::from_bytes_be(e);
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
-        return Err("RSA: invalid (zero) modulus".into());
+        return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
+    }
+    // The length refusal, decided here and in HotSpot's own words. SunJCE sizes
+    // the encrypt buffer to `getMaxDataSize()` and reports an overflow of it as
+    // `IllegalBlockSizeException("Data must not be longer than N bytes")` — a
+    // CHECKED exception, and one a caller distinguishes from a padding failure
+    // because it means "re-chunk", not "this ciphertext is not for you".
+    let Some(max) = pad.max_data_size(k) else {
+        return Err(RsaCipherError::Key(format!(
+            "Key is too short for encryption using {pad:?} (modulus {k} bytes)"
+        )));
+    };
+    if msg.len() > max {
+        return Err(RsaCipherError::BlockSize(format!(
+            "Data must not be longer than {max} bytes"
+        )));
     }
     let em = match pad {
-        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_pad(msg, k)?,
-        _ => rsa_oaep_pad(pad, msg, k)?,
-    };
+        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_pad(msg, k),
+        _ => rsa_oaep_pad(pad, msg, k),
+    }
+    .map_err(RsaCipherError::Padding)?;
     let m = BigUint::from_bytes_be(&em);
     let c = m.modpow(&e_big, &n_big);
     Ok(c.to_bytes_be_padded(k))
@@ -2825,31 +2937,52 @@ pub fn rsa_cipher_decrypt(
     d: &[u8],
     pad: RsaCipherPadding,
     ct: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RsaCipherError> {
     let n_big = BigUint::from_bytes_be(n);
     let d_big = BigUint::from_bytes_be(d);
     let k = (n_big.bit_length() + 7) / 8;
     if k == 0 {
-        return Err("RSA: invalid (zero) modulus".into());
+        return Err(RsaCipherError::Key("RSA: invalid (zero) modulus".into()));
     }
-    if ct.len() != k {
-        return Err(format!(
-            "RSA decrypt: ciphertext length {} != modulus size {}",
-            ct.len(),
-            k
-        ));
+    // ONE-SIDED, and the asymmetry is HotSpot's. `RSACipher.doFinal` refuses
+    // only `bufOfs > buffer.length`; a ciphertext SHORTER than the modulus is a
+    // smaller integer, goes through the modexp, and fails to unpad — measured
+    // `BadPaddingException: Padding error in decryption` for a 200-byte input
+    // to an RSA-2048 decrypt. The `ct.len() != k` check this replaced refused
+    // both directions with one unchecked `IllegalStateException`, so it got the
+    // class wrong on both and the side wrong on one.
+    if ct.len() > k {
+        return Err(RsaCipherError::BlockSize(format!(
+            "Data must not be longer than {k} bytes"
+        )));
     }
     let c = BigUint::from_bytes_be(ct);
+    // `RSACore.parseMsg`: a ciphertext numerically at or above the modulus is
+    // not a decryptable representative and SunJCE says so with a checked
+    // `BadPaddingException("Message is larger than modulus")`. Reachable only
+    // through `NoPadding`, where the caller supplies the integer directly.
+    if c.cmp(&n_big) != std::cmp::Ordering::Less {
+        return Err(RsaCipherError::Padding(
+            "Message is larger than modulus".into(),
+        ));
+    }
     // Blinded private exponentiation (VULN(2)): the `Cipher` decrypt path only
     // carries `(n, d)` — the public exponent `e` is not threaded here — so use
     // the no-`e` two-modpow blinding to remove the message-dependent (adaptive
     // ciphertext) timing channel that an RSA decryption-timing attacker probes.
     let m = rsa_private_modpow_blinded_no_e(&c, &d_big, &n_big);
     let em = m.to_bytes_be_padded(k);
+    // Every padding failure — wrong key, flipped byte, short ciphertext — has
+    // already been collapsed to the single opaque `RSA_PADDING_ERROR` string by
+    // `rsa_pkcs1_type2_unpad` / `rsa_oaep_unpad` (VULN(1)). Mapping the whole
+    // set to one variant preserves that: the CLASS a caller catches is the same
+    // for all of them, so widening the exception surface does not reopen the
+    // Bleichenbacher/Manger oracle those functions were rewritten to close.
     match pad {
         RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_unpad(&em),
         _ => rsa_oaep_unpad(pad, &em),
     }
+    .map_err(RsaCipherError::Padding)
 }
 
 /// Resolve a synthetic key's `crypto_impl` private components `(n, d)`.
