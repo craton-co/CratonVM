@@ -311,12 +311,14 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         map_pin,
         map,
         "NumberPatterns",
-        &[
-            "#,##0.###",
-            "\u{00A4}#,##0.00;(\u{00A4}#,##0.00)",
-            "#,##0%",
-            "#E0",
-        ],
+        // Slot 1 must NOT carry a `;(¤#,##0.00)` negative subpattern: that is
+        // the CLDR *accounting* form, no locale uses it as the standard
+        // currency pattern, and its presence stops `DecimalFormat` prefixing a
+        // minus sign. Kept byte-identical to the `getNumberPatterns()` override
+        // below — this is the FormatData bundle copy of the same table, and the
+        // accounting pattern was wrong in both. Grep the pattern STRING, not
+        // the function name, before deciding a table like this has one home.
+        &["#,##0.###", "\u{00A4}#,##0.00", "#,##0%", "#E0"],
     );
     put_arr(
         ctx,

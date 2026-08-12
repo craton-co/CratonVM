@@ -16158,6 +16158,10 @@ pub fn register_essential_natives_with_shims(
             // Companion fix to `native_class_get_enum_constants`, which had the
             // same defect one call deeper.
             let mut scope = NativeHandleScope::new(ctx);
+            // The enum's own mirror is rooted for the same reason the array is:
+            // the refusal path below reads its canonical name AFTER the
+            // `name()` calls in the loop, any one of which can move it.
+            let enum_class_h = scope.root(enum_class);
             let constants_h = scope.root(constants);
             let constants_cur = scope.get(&constants_h);
             let len = scope.array_length(constants_cur);
@@ -16179,10 +16183,19 @@ pub fn register_essential_natives_with_shims(
                     return Ok(Some(Value::Object(Some(scope.get(&candidate_h)))));
                 }
             }
-            Err(RuntimeError::IllegalArgumentException {
-                message: format!("No enum constant {}", wanted),
-            }
-            .into())
+            // HotSpot: `"No enum constant " + enumType.getCanonicalName() + "."
+            // + name`. This used to omit the type entirely (`No enum constant
+            // MAUVE`), which is both a divergence and a message that never
+            // names the enum that refused. `enum_class` is the mirror this
+            // native was handed, so the type is always in hand here — no call
+            // site has to guess.
+            let enum_class_cur = scope.get(&enum_class_h);
+            let message = lang_class::no_enum_constant_message_for_mirror(
+                &mut *scope,
+                enum_class_cur,
+                &wanted,
+            );
+            Err(RuntimeError::IllegalArgumentException { message }.into())
         },
     );
     // Spring Boot 2 launcher: avoid ctor-side ClassCastException in
