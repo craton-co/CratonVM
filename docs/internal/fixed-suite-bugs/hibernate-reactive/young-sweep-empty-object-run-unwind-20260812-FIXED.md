@@ -169,3 +169,58 @@ benign shape as corruption; two of them are measurable on this same repro
 (`sweep_chunk` aborts the parallel prefix, `clear_all_mark_bits_in_arena`
 leaves stale mark bits behind). They are throughput and over-retention costs,
 not the hang, and are deliberately out of this change.
+
+---
+
+## Wave 2 (2026-08-12, same day): the parallel sweep and the mark-clearing walk
+
+The residual filed above was worked immediately. A per-site census on the same
+repro settled which of the seven siblings actually fire — and it did not agree
+with the filing:
+
+| site | anomaly hits over 4 young cycles |
+|---|---|
+| `sweep_chunk` (parallel prefix walker) | 5, and `par_attempts=5 par_fails=5` |
+| `clear_all_mark_bits_in_arena` | 2 498 |
+| selective-promotion evacuation pre-pass | **0** |
+| second pre-pass walk | **0** |
+| `mark_young_to_old_refs` | **0** |
+| `fixup_young_old_refs` | **0** |
+| `walk_young_objects` | **0** |
+
+So the filing's claim that selective promotion was being suppressed was wrong —
+a plausible reading of identical code that the measurement does not support.
+
+The two that fire are now fixed with the same predicate plus the `vouched_live`
+escape each was also missing. The `clear_all_mark_bits_in_arena` one is the more
+interesting of the two: re-anchoring there **leaves the mark bits in the skipped
+stretch set**, and the next non-moving sweep treats a set `GC_FLAG_MARKED` as
+live regardless of reachability, so the false positive fed itself. It now takes
+the live set from its single caller, which had it in hand all along.
+
+**`PAR_SWEEP_ATTEMPTS` / `PAR_SWEEP_ACCEPTS` have existed since H2-CID0 with a
+doc comment saying "a large abort count means chunks routinely disagree with the
+grid" — and no reader.** They now print from `print_gc_summary` under
+`--verbose:gc` / `CRATONVM_GC_STATS`, which is how the before/after was taken:
+
+| ABBA, 8 runs per arm | before | after |
+|---|---|---|
+| parallel sweep accepted | 0 of 26 attempts | 17 of 23 |
+| `phantom_extents` / `live_in_dead` | 0 / 0 | 0 / 0 |
+| wall clock (median) | 10.94 s | 10.83 s |
+
+The wall-clock columns are indistinguishable: this restores a path that was 100%
+dead on every JIT-warm workload, it does not measurably speed this class up on
+this host. Both corruption guards stayed silent with the parallel path live.
+
+Batch-01 re-validated on the new binary: 12/12 under Generational, G1 and ZGC;
+under the default 10/12 in-batch with both failures re-run 3/3 green after
+sweeping 8 leaked Testcontainers Postgres containers — the
+`HR000092: Unable to open a connection` / `ClosedConnectionException` shape,
+which is host pressure and not a VM defect. `cargo test -p cratonvm-gc` 1488/0.
+A 60-class h2database slice: PASS=50, same as both earlier arms, with the only
+deviations from `baseline.tsv` inside the already-failing set.
+
+The five zero rows are left alone deliberately, and the remaining 26% of
+parallel aborts is the open residual — both in
+`docs/known-issues/hibernate-reactive/young-walk-zero-run-sibling-sites.md`.
