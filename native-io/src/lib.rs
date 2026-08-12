@@ -16409,12 +16409,57 @@ fn fd_from_file_channel(ctx: &dyn NativeContext, fc: ObjectRef) -> i64 {
     }
 }
 
-// --- MappedByteBuffer: uses BB layout + extra fields ---
-// Field 10 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
-// Field 11 = Int: 1 = writable (read-write or private), 0 = read-only
-const MBB_FIELD_MAPPED_ADDR: usize = 10;
-const MBB_FIELD_WRITABLE: usize = 11;
-const MBB_NUM_FIELDS: usize = 12;
+/// The class `alloc_mapped_byte_buffer` allocates and every `native_mbb_*` and
+/// `native_fc_map` native reads.
+const MBB_CLASS: &str = "java/nio/MappedByteBuffer";
+
+// --- MappedByteBuffer PRIVATE state: two slots, indexed from `mbb_base` ---
+//
+// Offset 0 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
+// Offset 1 = Int:  1 = writable (read-write or private), 0 = read-only
+//
+// W7-68-live-under-allocations.md. These were the ABSOLUTE indices 10 and 11
+// against a request of 12, on a class that declares THIRTEEN fields.
+// `javap -p java.nio.MappedByteBuffer` on JDK 25.0.3.9, transitively:
+//
+//     0 mark      1 position  2 limit    3 capacity  4 address  5 segment
+//     6 hb        7 offset    8 isReadOnly  9 bigEndian  10 nativeByteOrder
+//    11 fd        12 isSync
+//
+// so the mapping id landed on `nativeByteOrder` and the writable flag landed
+// on `fd` — a `java.io.FileDescriptor` reference. Unlike this census's other
+// `under` rows, that field HAS a real-JDK-bytecode reader that CratonVM does
+// not intercept: `MappedByteBuffer.force(int,int)` is `public final`, is not
+// registered by any crate here (only the no-arg `force()` is), and its body
+// short-circuits on `fd == null` before touching `MappedMemoryUtils`. With an
+// `Int` sitting in `fd` that guard does not fire, and the call proceeds into
+// the mapped-memory path with a non-`FileDescriptor` in hand. Measured on
+// HotSpot 25.0.3.9 (`probes/UnderAllocationProbe.java` §3): `force(0,8)`
+// returns the buffer.
+//
+// The remedy is the appended-slot idiom (W7-49 §8): start the private map
+// ABOVE every field the real class declares, and collapse the base to 0 when
+// the class is a fabricated stub, where the private map IS the layout. No
+// other crate reads these two slots — grepped `"java/nio/MappedByteBuffer"`
+// across `native-builtins`, `native-collections` and `vm`: the only other
+// mentions register `session()`/`checkSession()` over a buffer-class list and
+// name the class in a `toString` test — so unlike
+// `java/nio/channels/FileChannel` (same census, NOT repaired) this map has a
+// single owner and can move in one step.
+const MBB_PRIVATE_MAPPED_ADDR: usize = 0;
+const MBB_PRIVATE_WRITABLE: usize = 1;
+const MBB_PRIVATE_WIDTH: usize = 2;
+
+// The base is `cratonvm_native_api::appended_slots::base_for_class(ctx,
+// MBB_CLASS)`, bound to a local at each site rather than wrapped in a helper
+// that takes `&dyn`: one base function, called the same way by the allocator
+// and by every accessor, is what keeps the two from ever disagreeing.
+//
+// Sound as a per-CLASS base — rather than per-receiver, which W7-49 §8 shows is
+// unanswerable — because every receiver reaching these slots is one
+// `alloc_mapped_byte_buffer` produced: `native_fc_map` is its only caller, and
+// the real image's mapped buffers are `java.nio.DirectByteBuffer`, a different
+// class that never resolves to `MBB_CLASS`'s registrations.
 
 // ---------------------------------------------------------------------------
 // mmap registry (T2.4.5 / T2.4.6)
@@ -16422,11 +16467,11 @@ const MBB_NUM_FIELDS: usize = 12;
 // Real `mmap`/`MapViewOfFile` is provided by memmap2. Because the JVM heap
 // cannot hold Rust smart pointers, we maintain a process-wide registry
 // keyed by a stable 64-bit id and store that id in the MappedByteBuffer's
-// `MBB_FIELD_MAPPED_ADDR` slot. Dropping the registry entry calls
+// `MBB_PRIVATE_MAPPED_ADDR` slot. Dropping the registry entry calls
 // `munmap` / `UnmapViewOfFile` via `memmap2::Mmap`'s Drop impl.
 //
 // Invariants:
-//   - Every alive `MappedByteBuffer` whose `MBB_FIELD_MAPPED_ADDR != 0` has a
+//   - Every alive `MappedByteBuffer` whose mapping-id slot is non-zero has a
 //     corresponding registry entry.
 //   - The registry outlives the JVM heap objects that reference it: the
 //     Java-level `unmap0` native removes the entry before the MBB is
@@ -16483,9 +16528,17 @@ fn alloc_file_lock(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
-    let obj = match ctx.ensure_class_initialized("java/nio/MappedByteBuffer") {
-        Ok(cid) => ctx.alloc_object(cid, MBB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), MBB_NUM_FIELDS),
+    // W7-68: `base + MBB_PRIVATE_WIDTH`, not a flat 12. Asking for 12 on a
+    // class declaring 13 put the mapping id in `nativeByteOrder` and the
+    // writable flag in `fd`, which real `MappedByteBuffer.force(int,int)`
+    // bytecode dereferences.
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let obj = match ctx.ensure_class_initialized(MBB_CLASS) {
+        Ok(cid) => ctx.alloc_object(cid, mbb_base + MBB_PRIVATE_WIDTH),
+        Err(_) => ctx.alloc_object(
+            cratonvm_types::ClassId::new(0),
+            mbb_base + MBB_PRIVATE_WIDTH,
+        ),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -16494,10 +16547,10 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
     // Same as `alloc_byte_buffer`: this stand-in is heap-backed (`hb` is a real
     // byte[]), so `Buffer.address` must be the array base offset, not the mark
     // that the indexed slot-4 write would otherwise leave behind. The separate
-    // `MBB_FIELD_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
+    // `MBB_PRIVATE_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
     // NOT the JDK's `address` field.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
-    ctx.set_field(obj, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+    ctx.set_field(obj, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     obj
 }
 
@@ -16645,7 +16698,8 @@ fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16672,7 +16726,8 @@ fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16714,7 +16769,8 @@ fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16745,7 +16801,8 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(None),
     };
-    let id = match ctx.get_field(target, MBB_FIELD_MAPPED_ADDR) {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let id = match ctx.get_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(None),
     };
@@ -16753,7 +16810,7 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let mut registry = mmap_registry().lock();
         // Drop the MmapEntry, which calls munmap / UnmapViewOfFile.
         let _ = registry.remove(&id);
-        ctx.set_field(target, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+        ctx.set_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     }
     Ok(None)
 }
@@ -16868,7 +16925,7 @@ enum FcMapMode {
 /// Real `mmap` / `MapViewOfFile` via memmap2. The resulting
 /// MappedByteBuffer is still backed by a Java `byte[]` so existing
 /// `ByteBuffer.get(i)` / `put(i, v)` opcodes keep working unchanged —
-/// but a sentinel id in `MBB_FIELD_MAPPED_ADDR` keeps the real kernel
+/// but a sentinel id in `MBB_PRIVATE_MAPPED_ADDR` keeps the real kernel
 /// mapping alive in `MMAP_REGISTRY` so `force()`, `load()`, `isLoaded()`
 /// and `unmap0()` see the real mapping.
 ///
@@ -17004,10 +17061,11 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
     let writable = matches!(mode, FcMapMode::ReadWrite | FcMapMode::Private);
     let mbb = alloc_mapped_byte_buffer(ctx, size);
-    ctx.set_field(mbb, MBB_FIELD_MAPPED_ADDR, Value::Long(id));
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    ctx.set_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(id));
     ctx.set_field(
         mbb,
-        MBB_FIELD_WRITABLE,
+        mbb_base + MBB_PRIVATE_WRITABLE,
         Value::Int(if writable { 1 } else { 0 }),
     );
     let arr = match ctx.get_field(mbb, BB_FIELD_ARRAY) {
@@ -17026,14 +17084,15 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Synchronize the Java byte[] view into the kernel mapping for
 /// read-write / private mappings. Invoked by `force` prior to msync.
 fn mmap_sync_back_from_java(ctx: &mut dyn NativeContext, mbb: ObjectRef) -> std::io::Result<()> {
-    let id = match ctx.get_field(mbb, MBB_FIELD_MAPPED_ADDR) {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let id = match ctx.get_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(()),
     };
     if id == 0 {
         return Ok(());
     }
-    let writable = matches!(ctx.get_field(mbb, MBB_FIELD_WRITABLE), Value::Int(1));
+    let writable = matches!(ctx.get_field(mbb, mbb_base + MBB_PRIVATE_WRITABLE), Value::Int(1));
     if !writable {
         return Ok(());
     }

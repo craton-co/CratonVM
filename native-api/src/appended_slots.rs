@@ -57,32 +57,24 @@
 
 use crate::registry::NativeContext;
 
-/// The private-slot base for `class_name`, for a caller that only holds `&dyn`.
-///
-/// Answers from the class as currently loaded and does **not** load it. Use
-/// this on the accessor paths, where the object in hand was allocated by a
-/// sibling native that already loaded the class; use [`base_for_class`] on the
-/// allocation path, where it may not be loaded yet.
-///
-/// Returns 0 for a fabricated stub (the private map IS the layout) and 0 for a
-/// class that is not loaded — the same answer the allocation path would have
-/// reached, so an accessor and its allocator cannot disagree.
-#[must_use]
-pub fn base_for_loaded_class(ctx: &dyn NativeContext, class_name: &str) -> usize {
-    if ctx.is_class_synthetic_stub(class_name) {
-        return 0;
-    }
-    match ctx.class_id_by_name(class_name) {
-        Some(cid) => ctx.class_num_total_fields(cid),
-        None => 0,
-    }
-}
-
 /// The private-slot base for `class_name`, loading and initialising it first.
 ///
-/// The allocation-path form: the width a caller then asks for is
-/// `base + width`, which is what makes the private slots both in bounds and
+/// Zero when the class is a fabricated stub — its fields are `_f0.._fN` and the
+/// private map IS the layout — and otherwise the real class's transitive
+/// declared field count, so `base + i` for every private `i` lands above every
+/// field the class declares. The width a caller then asks the allocator for is
+/// `base + width`, which is what makes those slots both in bounds and
 /// non-aliasing.
+///
+/// # There is deliberately only ONE of these
+///
+/// A `&dyn`-taking sibling that answered from `class_id_by_name` instead of
+/// `ensure_class_initialized` was written first and removed: an accessor and
+/// its allocator that can disagree about the base — which those two can, on any
+/// class whose by-name lookup is ambiguous across loaders — is *exactly* the
+/// two-layouts-on-one-class condition this module exists to prevent, arrived at
+/// from the other direction. Every accessor pays one already-warm
+/// `ensure_class_initialized` instead, and no call site can pick the wrong one.
 #[must_use]
 pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
     if ctx.is_class_synthetic_stub(class_name) {
@@ -98,17 +90,14 @@ pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
 mod tests {
     use super::*;
 
-    /// The two forms must agree, because an allocator and an accessor that
-    /// disagree about the base is precisely the two-layouts-on-one-class
-    /// condition this module exists to prevent. `MockNativeContext` reports no
-    /// classes and no stubs, so both answer 0 — the assertion worth having here
-    /// is that neither has an arm the other lacks.
+    /// A class that cannot be resolved carries no known real fields, so the
+    /// base collapses to 0 and the private map is the layout — the same answer
+    /// the stub arm gives. Both arms must reach it, because a base that
+    /// silently became non-zero for an unresolvable class would push every
+    /// private slot past the object.
     #[test]
-    fn the_immutable_and_loading_forms_agree_on_an_unknown_class() {
+    fn an_unresolvable_class_has_a_zero_base() {
         let mut ctx = crate::test_mock::MockNativeContext::new();
-        let immutable = base_for_loaded_class(&ctx, "does/not/Exist");
-        let loading = base_for_class(&mut ctx, "does/not/Exist");
-        assert_eq!(immutable, loading);
-        assert_eq!(immutable, 0, "an unloadable class carries no real fields");
+        assert_eq!(base_for_class(&mut ctx, "does/not/Exist"), 0);
     }
 }
