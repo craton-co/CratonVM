@@ -1167,6 +1167,23 @@ fn seed_direct_native_engine_services() {
         "AES/KW/NoPadding",
         "AES/KW/PKCS5Padding",
         "AES/KWP/NoPadding",
+        // W7-39, 2026-08-12. Both were removed from this list on 2026-08-11
+        // while `Cipher.getInstance` served them as AES-128-ECB — the right
+        // move then, because a wrong cipher is worse than a missing one. They
+        // are back because they are now COMPUTED, by the real SunJCE
+        // `BlowfishCipher` / `ARCFOURCipher` SPI (`jca::cipher::
+        // drive_real_ecb_cipher`), byte-identically to HotSpot 25. `ARCFOUR` is
+        // the service and `RC4` its alias, which is HotSpot's own arrangement
+        // and the reason `Security.getAlgorithms("Cipher")` names only one.
+        //
+        // RC4 is broken cryptography and nothing here recommends it. It is
+        // advertised for the same reason DES is: a workload that asks for it on
+        // HotSpot gets bytes, and on this VM it got a hard failure. Refusing an
+        // algorithm the platform implements is a portability defect, not a
+        // security control — a caller who must not use RC4 is not stopped by
+        // this VM lacking it.
+        "ARCFOUR",
+        "Blowfish",
         "ChaCha20",
         "ChaCha20-Poly1305",
         // Spelled in full, where HotSpot lists the bare `DES` / `DESede` and
@@ -1218,6 +1235,11 @@ fn seed_direct_native_engine_services() {
     put_alias(JCE, "Cipher", "AESWrap_192", "AES_192/KW/NoPadding");
     put_alias(JCE, "Cipher", "AESWrap_256", "AES_256/KW/NoPadding");
     put_alias(JCE, "Cipher", "TripleDES", "DESede/CBC/PKCS5Padding");
+    // `Alg.Alias.Cipher.RC4 = ARCFOUR` on SunJCE. Measured on HotSpot 25: both
+    // spellings resolve, both answer `getProvider()=SunJCE`, and both encrypt
+    // the same 16-byte plaintext to `27ca482b161e3ab93f812659b904df95` — while
+    // `Security.getAlgorithms("Cipher")` lists ARCFOUR alone.
+    put_alias(JCE, "Cipher", "RC4", "ARCFOUR");
 
     // Windows only — the provider itself is absent from the seed chain on
     // every other platform (see `provider_chain`), and seeding its services
@@ -1280,25 +1302,85 @@ fn seed_direct_native_engine_services() {
 ///     than a 13-name list.
 fn seed_retired_getalgorithms_literals() {
     const JCE: &str = "SunJCE";
+    // Every class name below is MEASURED — `getServices()` enumerated per
+    // provider on jdk-25.0.3.9-hotspot and printed as
+    // `type|algorithm|className`, not read off a javap of the provider's
+    // `<clinit>` and not recalled. `Mac.getInstance` is natively intercepted
+    // (`phases_late::ssl_security`), so for this type the class name is
+    // documentation rather than a load target; it is still worth being right,
+    // because the same row answers `Provider.Service.getClassName()`.
     for (algorithm, class_name) in [
         ("HmacMD5", "com.sun.crypto.provider.HmacMD5"),
         ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1"),
+        // W7-39: `HmacSHA224` is implemented by `ssl_security::mac_compute_hmac`
+        // as of 2026-08-12 and must be advertised in the same commit. The
+        // reverse drift — implemented but unadvertised — is the quiet half of
+        // this defect species, because nothing asks for a name nobody publishes.
+        ("HmacSHA224", "com.sun.crypto.provider.HmacCore$HmacSHA224"),
         ("HmacSHA256", "com.sun.crypto.provider.HmacCore$HmacSHA256"),
         ("HmacSHA384", "com.sun.crypto.provider.HmacCore$HmacSHA384"),
         ("HmacSHA512", "com.sun.crypto.provider.HmacCore$HmacSHA512"),
     ] {
         put_service(JCE, "Mac", algorithm, class_name);
     }
+    // `KeyGenerator` is NOT natively intercepted in `--real-jdk` mode: the real
+    // `KeyGenerator.getInstance` reaches `sun.security.jca.GetInstance`, which
+    // this module answers from the registry below and then INSTANTIATES the
+    // named class. So every row here has to be a class the real image really
+    // ships with a public no-arg ctor — the SunJCE key generators all are,
+    // being reflectively constructed by the provider itself — and the bytes a
+    // caller gets are the JDK's own, not a reimplementation.
+    //
+    // The list was `[AES, DESede, HmacSHA256]` until 2026-08-12, which made
+    // `KeyGenerator.getInstance("Blowfish")` — and `DES`, `ChaCha20`, and every
+    // Hmac name but one — answer `NoSuchAlgorithmException: <name> KeyGenerator
+    // not available` (measured) where HotSpot hands back a key. That was the
+    // advertised-vs-implemented gap in its quiet direction twice over:
+    // `phases_early::keygen_default_bits` (the `--synthetic-jdk` path) already
+    // implemented all of these, and the real image implements all of them too;
+    // only the registry the two modes share disagreed.
     for (algorithm, class_name) in [
         ("AES", "com.sun.crypto.provider.AESKeyGenerator"),
+        ("ARCFOUR", "com.sun.crypto.provider.KeyGeneratorCore$ARCFOURKeyGenerator"),
+        ("Blowfish", "com.sun.crypto.provider.BlowfishKeyGenerator"),
+        ("ChaCha20", "com.sun.crypto.provider.KeyGeneratorCore$ChaCha20KeyGenerator"),
+        ("DES", "com.sun.crypto.provider.DESKeyGenerator"),
         ("DESede", "com.sun.crypto.provider.DESedeKeyGenerator"),
+        ("HmacMD5", "com.sun.crypto.provider.HmacMD5KeyGenerator"),
+        ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1KeyGenerator"),
+        (
+            "HmacSHA224",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA224",
+        ),
         (
             "HmacSHA256",
             "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
         ),
+        (
+            "HmacSHA384",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA384",
+        ),
+        (
+            "HmacSHA512",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA512",
+        ),
+        ("RC2", "com.sun.crypto.provider.KeyGeneratorCore$RC2KeyGenerator"),
     ] {
         put_service(JCE, "KeyGenerator", algorithm, class_name);
     }
+    // SunJCE's own `KeyGenerator` alias, and the reason `keygen_default_bits`
+    // spells both: `RC4` is not a service, it is
+    // `Alg.Alias.KeyGenerator.RC4 = ARCFOUR`. Aliases stay out of
+    // `Security.getAlgorithms` (their property key is `Alg.Alias.…`), which is
+    // why HotSpot's own list names ARCFOUR and not RC4.
+    put_alias(JCE, "KeyGenerator", "RC4", "ARCFOUR");
+    // Deliberately NOT seeded, and each for a checkable reason rather than an
+    // oversight: `HmacSHA3-{224,256,384,512}` and `HmacSHA512/{224,256}`,
+    // because `keygen_default_bits` has no arm for them and the
+    // `--synthetic-jdk` path would refuse a name this list published; and the
+    // five `SunTls*` generators, which are TLS-internal KDFs driven by
+    // `sun.security.ssl` and take `TlsKeyMaterialParameterSpec`-family specs
+    // this engine's `init` surface does not carry.
     put_service(
         "SunRsaSign",
         "KeyPairGenerator",

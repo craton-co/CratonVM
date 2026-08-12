@@ -41,9 +41,9 @@ pub(crate) fn p68_signature_failure(ctx: &mut dyn NativeContext, msg: &str) -> M
 }
 
 // =============================================================================
-// javax.crypto.Mac — real HMAC over the five algorithms `mac_compute_hmac`
-// implements (HmacMD5 / HmacSHA1 / HmacSHA256 / HmacSHA384 / HmacSHA512),
-// and a NoSuchAlgorithmException for every other name. The header used to read
+// javax.crypto.Mac — real HMAC over the six algorithms `mac_compute_hmac`
+// implements (HmacMD5 / HmacSHA1 / HmacSHA224 / HmacSHA256 / HmacSHA384 /
+// HmacSHA512), and a NoSuchAlgorithmException for every other name. The header used to read
 // "Real HMAC support using SHA-256", which was accurate in a way nobody meant:
 // SHA-256 was the fallback for every algorithm the engine did not implement,
 // so a caller asking for HmacSHA3-256 got HMAC-SHA-256 bytes with no error.
@@ -553,27 +553,42 @@ fn mac_normalise(algo: &str) -> String {
 /// as "the crypto is wrong" — it presents as an interop bug against everyone
 /// running a real JDK, if it presents at all.
 ///
-/// ## Why exactly these five, and no more
+/// ## Why exactly these six, and no more
 ///
-/// These are the five names `jca::provider_chain::seed_retired_getalgorithms_literals`
+/// These are the six names `jca::provider_chain::seed_retired_getalgorithms_literals`
 /// registers as `SunJCE` `Mac` services, so `Security.getAlgorithms("Mac")` and
 /// `Mac.getInstance` now answer the SAME set. That agreement is the property
 /// W4-3 exists to establish for `MessageDigest`; this engine was violating it
-/// in the more dangerous direction — serving what it never advertised.
+/// in the more dangerous direction — serving what it never advertised. It is a
+/// ratchet, not a census: `mac_supported_set_matches_the_advertised_sunjce_services`
+/// derives the advertised list from the registry rather than restating it, so
+/// adding a row on either side without the other reds the test.
 ///
-/// HotSpot 25 advertises 28 `Mac` names. Under-advertising 23 of them is
-/// truthful precisely because `getInstance` refuses all 23. Widening the set
-/// means implementing RFC 2104 over the digests `crate::compute_digest`
-/// already supplies (SHA-224, SHA-512/224, SHA-512/256, SHA3-*), and each
-/// needs its own HMAC block size — 64 for SHA-224, 128 for the SHA-512
-/// truncations, 144/136/104/72 for SHA3-224/256/384/512. Those are exactly the
-/// sort of per-algorithm constants that cannot be defaulted, and this lane
-/// could neither build nor run; landing unverified HMAC would be the same
-/// class of mistake as the fallback being removed.
+/// `HmacSHA224` joined the set on 2026-08-12 (W7-39). The note this replaces
+/// said widening "means implementing RFC 2104 over the digests
+/// `crate::compute_digest` already supplies … and each needs its own HMAC block
+/// size — 64 for SHA-224, 128 for the SHA-512 truncations …", and that the lane
+/// "could neither build nor run". The block size is the part worth not
+/// hand-writing: `hmac::Hmac<D>` takes it from `D::BlockSize`, so it is right by
+/// construction rather than by a constant somebody typed. The crate is already
+/// a dependency (`phases_early::pbkdf2_derive_wide_impl`, `t27_tls_cbc`), and
+/// `sha2::Sha224` is the same crate `compute_digest` uses for `MessageDigest.
+/// SHA-224`. The KAT in `mac_kats_match_hotspot_25` is a HotSpot 25 run, not a
+/// recollection.
+///
+/// HotSpot 25 advertises 28 `Mac` names. Under-advertising 22 of them is
+/// truthful precisely because `getInstance` refuses all 22. The remaining
+/// families are deliberately still refused, each for a reason a caller could
+/// check: `HmacSHA512/224` and `HmacSHA512/256` are FIPS 180-4 §5.3.6
+/// truncations with their OWN initial values (`mac_normalise` keeps their names
+/// distinct so the day one lands it cannot be served for the other); `HmacSHA3-*`
+/// need the SHA-3 rate as the HMAC block (144/136/104/72), which is not the
+/// digest's output size and not a family default; and `HmacPBESHA*` /
+/// `PBEWithHmac*` are PKCS#12 / PBMAC1 constructions, not raw HMAC at all.
 fn mac_algorithm_supported(algo: &str) -> bool {
     matches!(
         mac_normalise(algo).as_str(),
-        "HMACMD5" | "HMACSHA1" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512"
+        "HMACMD5" | "HMACSHA1" | "HMACSHA224" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512"
     )
 }
 
@@ -614,9 +629,41 @@ pub(crate) fn mac_compute_hmac(algo: &str, key: &[u8], data: &[u8]) -> Option<Ve
         "HMACSHA512" => Some(hmac_sha512(key, data)),
         "HMACSHA1" => Some(hmac_sha1(key, data)),
         "HMACMD5" => Some(hmac_md5(key, data)),
+        "HMACSHA224" => Some(hmac_sha224(key, data)),
         "HMACSHA256" => Some(hmac_sha256(key, data)),
         _ => None,
     }
+}
+
+/// HMAC-SHA-224 (RFC 2104 over FIPS 180-4 SHA-224).
+///
+/// The other five arms of `mac_compute_hmac` route to `crate::hmac_*`, which
+/// pass a hand-written `block_size` to `crate::hmac_generic`. This one does not,
+/// and the difference is the point: SHA-224's HMAC block is 64 bytes — its
+/// *input* block — not 28, its digest size, and not 128, which SHA-384/512 use.
+/// Every wrong answer there is plausible, and a wrong block size produces a MAC
+/// that is self-consistent and interoperates with nothing. `hmac::Hmac<D>` reads
+/// it from `D::BlockSize`, so the constant is never written down here at all.
+///
+/// `crate::compute_digest` already reaches for `sha2::Sha224` for
+/// `MessageDigest.getInstance("SHA-224")` for the same reason its comment gives:
+/// the hand-rolled `crypto_impl` SHA-256 code does not cover the 224-bit
+/// variant. Using the same crate keeps `MessageDigest.SHA-224` and
+/// `Mac.HmacSHA224` on one implementation of one primitive.
+///
+/// Measured on jdk-25.0.3.9-hotspot, not recalled — see the vectors in
+/// `mac_kats_match_hotspot_25`, including a 200-byte key, which is the case that
+/// exercises the "key longer than the block gets hashed first" branch where a
+/// wrong block size first shows up.
+fn hmac_sha224(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::Mac as _;
+    // `new_from_slice` is infallible for HMAC (any key length is legal — RFC
+    // 2104 hashes an over-long key and zero-pads a short one), so the error type
+    // is uninhabited in practice; SunJCE's `HmacCore` accepts any length too.
+    let mut mac = hmac::Hmac::<sha2::Sha224>::new_from_slice(key)
+        .expect("HMAC accepts a key of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// Return the output length in bytes for the given HMAC algorithm, or `None`
@@ -633,6 +680,11 @@ pub(crate) fn mac_output_length(algo: &str) -> Option<usize> {
         "HMACSHA512" => Some(64),
         "HMACSHA1" => Some(20),
         "HMACMD5" => Some(16),
+        // 28, not 32. The retired `_ => 32` arm answered 32 here while
+        // `mac_compute_hmac` returned 32 SHA-256 bytes, so the two agreed with
+        // each other and with nothing else — measured on HotSpot,
+        // `Mac.getInstance("HmacSHA224").getMacLength()` is 28.
+        "HMACSHA224" => Some(28),
         "HMACSHA256" => Some(32),
         _ => None,
     }
