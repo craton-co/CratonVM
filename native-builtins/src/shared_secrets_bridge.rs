@@ -693,27 +693,157 @@ fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     crate::lang_class::native_class_get_constant_pool(ctx, &[class_obj])
 }
 
+/// Whether this VM takes a terminating thread back out of its `ThreadContainer`.
+///
+/// This is the other half of container registration and it is not optional.
+/// `jdk.internal.misc.ThreadFlock.awaitAll()` is
+///
+/// ```java
+///     if (threadCount == 0) return true;
+///     while (threadCount > 0 && !permit) { ... LockSupport.park(); }
+/// ```
+///
+/// so a container that is only ever added to does not leak quietly — it hangs
+/// every `join()`/`close()` built on it. HotSpot gets the decrement from
+/// `Thread.exit()`, which the VM calls on the terminating thread (JDK 25
+/// `Thread.java`, `private void exit()`):
+///
+/// ```java
+///     ThreadContainer container = threadContainer();
+///     if (container != null) {
+///         container.remove(this);
+///     }
+/// ```
+///
+/// CratonVM never invokes `Thread.exit()V`. Its thread-termination path runs
+/// `run()`, dispatches the uncaught-exception handler, retires the TLAB and
+/// notifies the VM-level termination monitor; no Java-level cleanup runs at
+/// all, on either the normal or the abnormal path.
+///
+/// MEASURED against `target/release/cratonvm.exe` (2026-08-11) under
+/// `--real-jdk`, by invoking the JDK's own package-private
+/// `Thread.start(ThreadContainer)` reflectively — the exact body the enabled
+/// branch below reaches — on a live `StructuredTaskScope`'s flock:
+///
+/// ```text
+///                                       HotSpot 25    cratonvm --real-jdk
+///   flock threads after start                1              1
+///   flock threads after the worker died      0              1   <- not removed
+///   join() called after the worker died   0-1 ms        never returned (3/3)
+/// ```
+///
+/// Registering without the pair therefore turns today's "join() waits for
+/// nothing" into "join() waits forever", which is strictly worse: this tree
+/// already carries eight recorded hangs from three causes. So the registration
+/// stays off until the decrement exists. Flip this constant in the same change
+/// that makes the VM invoke `Thread.exit()V` on both termination paths; the
+/// patch is written out in
+/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
+///
+/// `CRATONVM_THREAD_CONTAINERS=1` overrides it at runtime, so the two arms can
+/// be A/B'd in one binary once that patch lands.
+const VM_REMOVES_THREADS_FROM_CONTAINERS: bool = false;
+
+/// Read once per process: the constant above, overridable by
+/// `CRATONVM_THREAD_CONTAINERS` (`1` on, `0` off).
+///
+/// Read through `flags::runtime_var`, not `std::env::var`. A raw `getenv` is
+/// served live and is therefore invisible to `flags::with_thread_overrides`,
+/// so a test selecting an arm through the supported hook would silently have
+/// measured the developer's ambient environment instead — which is exactly the
+/// A/B this pair prescribes. The token is declared `THREADS/thread-containers`
+/// in `types/src/flag_groups.rs`; `flag_declaration_guard.rs` fails the build
+/// for any `CRATONVM_*` name that is read but declared nowhere.
+fn thread_container_registration_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_THREAD_CONTAINERS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => VM_REMOVES_THREADS_FROM_CONTAINERS,
+        },
+    )
+}
+
 /// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
 ///
-/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (structured-
-/// concurrency / virtual-thread executor plumbing — e.g. Jetty's thread
-/// pool) calls this via `invokeinterface JavaLangAccess` to start a thread
-/// while registering it with a container that tracks its children. Without
-/// it, `NoSuchMethodError` here aborted every thread-pool-backed HTTP
-/// client (Jetty) at startup. CratonVM does not model thread containers
-/// (no structured-concurrency introspection), so — like the
-/// `defineUnnamedModule`/`addEnableNativeAccess` bridges above — this is a
-/// behavioral passthrough: just start the thread for real.
+/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (Jetty's thread pool)
+/// and `jdk.internal.misc.ThreadFlock.start(Thread)` (every structured-
+/// concurrency `fork`) call this via `invokeinterface JavaLangAccess` to start
+/// a thread *and register it with the container that tracks it*. Without the
+/// registration at all, `NoSuchMethodError` here aborted every thread-pool-
+/// backed HTTP client (Jetty) at startup, which is why the bridge exists.
+///
+/// The container is not introspection. `ThreadFlock.awaitAll()` returns
+/// immediately while `threadCount == 0`, and `StructuredTaskScopeImpl.join()`
+/// is `flock.awaitAll()`, so dropping `args[2]` is what makes JEP 505's
+/// `join()` wait for nothing —
+/// docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md measured 15
+/// divergent lines, and three CratonVM runs re-taken today disagreed with each
+/// other on eight — all downstream of this one dropped argument, because a
+/// `join()` that does not wait turns the whole API into a race. The registry has
+/// several other consumers (`ThreadContainers.root()` enumeration, thread
+/// dumps, JFR), and they are enumerated in
+/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md.
+///
+/// It is still dropped by default, and that is a deliberate interlock rather
+/// than an oversight: see `VM_REMOVES_THREADS_FROM_CONTAINERS` for the measured
+/// hang that landing the add half on its own produces. The drop is announced
+/// once per process so the wrong answer is at least not silent.
 ///
 /// INSTANCE method: args[0] = receiver (System$1), args[1] = Thread,
-/// args[2] = ThreadContainer (ignored).
+/// args[2] = ThreadContainer.
 fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let thread_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    let container = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    if matches!(container, Value::Object(Some(_))) {
+        if thread_container_registration_enabled() {
+            // `Thread.start(Ljdk/internal/vm/ThreadContainer;)V` is a DIFFERENT
+            // triple from `Thread.start()V` (which `lib.rs` shadows with
+            // `native_thread_start0`), and nothing registers a native on it, so
+            // this reaches the JDK's own bytecode: `setThreadContainer(container)`
+            // + `container.add(this)` + `start0()`. `start0()V` *is* registered
+            // on the real-JDK path, so the spawn is still CratonVM's own — this
+            // adds the bookkeeping the passthrough skipped, it does not move the
+            // thread onto a different spawn mechanism. Measured to land the
+            // registration: the flock's thread set goes 0 -> 1 across this call.
+            //
+            // Real-JDK bytecode only. In synthetic mode `java/lang/Thread` has a
+            // fabricated layout with no such method, and the synthetic
+            // `StructuredTaskScope` runs `fork` on the forking thread anyway
+            // (W7-18 §6), so there is no flock to keep a count in.
+            ctx.invoke_virtual(
+                thread_obj,
+                "start",
+                "(Ljdk/internal/vm/ThreadContainer;)V",
+                &[container],
+            )?;
+            return Ok(None);
+        }
+        warn_thread_container_dropped_once();
+    }
+
     ctx.invoke_virtual(thread_obj, "start", "()V", &[])?;
     Ok(None)
+}
+
+/// One line per process, not per thread: Jetty starts hundreds of pool threads
+/// through this bridge and a per-call warning would bury the run it is trying
+/// to explain.
+fn warn_thread_container_dropped_once() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "JavaLangAccess.start: thread started WITHOUT registering it with its \
+             jdk.internal.vm.ThreadContainer. StructuredTaskScope.join(), \
+             ThreadFlock.awaitAll() and ThreadContainers.root() enumeration will \
+             not see it (see W7-23-thread-container-registration)."
+        );
+    });
 }
 
 /// `JavaLangAccess.join(String prefix, String suffix, String delimiter,

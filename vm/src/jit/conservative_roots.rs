@@ -1555,6 +1555,22 @@ impl UnregMemo {
         // A new compilation invalidates the verdict outright: a slot that held
         // a plain value at the last scan can now sit where a new JIT code range
         // claims to start.
+        //
+        // MEASURED 2026-08-11, and left alone deliberately. This rule can be
+        // argued away — the band is frozen (nothing above the current stack
+        // pointer changes while the thread is nested below it) and a genuine
+        // return address into range R requires R to have existed when the CALL
+        // wrote it, so a range registered after the verdict can only produce a
+        // FALSE positive. Removing the check was implemented, unit-tested and
+        // measured on `DefaultCatalogAndSchemaTest`, which compiles
+        // continuously across 132 SessionFactory bootstraps and so keeps this
+        // memo permanently cold: `native_stack_has_jit_frame` read 35.2 BILLION
+        // stack words with the check and 35.2 billion without it — byte for
+        // byte no change, because the probes that dominate this workload come
+        // from `refresh_moving_young_coverage_for_current_thread`, which
+        // consults no memo at all. So the rule is a real inefficiency and it is
+        // NOT the binding one; it stays until something measures it binding,
+        // rather than trading heap-safety-critical behaviour for nothing.
         UnregScan::Detect { hi: None }
     }
 
@@ -1675,6 +1691,13 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
         let mut addr = (lo + 7) & !7usize;
         const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
         let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+        // Counted per CALL — see `rootprof::note_jit_probe`. Recorded up front
+        // so an early `return Some(..)` (a hit, which stops the walk) still
+        // reports the band this probe was ASKED for, which is the quantity the
+        // memo's incremental-band logic is supposed to be shrinking.
+        crate::memory::native_roots::rootprof::note_jit_probe(
+            (hi.saturating_sub(addr) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        );
         while addr + 8 <= hi {
             // SAFETY: aligned read inside the calling thread's own live stack
             // band between two known stack pointers (same contract as
@@ -4401,6 +4424,7 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     // before.
     let span = heap.conservative_addr_span();
     let mut addr = aligned_low;
+    let hits_before = out.len();
     while addr + 8 <= aligned_high {
         let qword = unsafe { (addr as *const usize).read() };
         addr += 8;
@@ -4413,6 +4437,13 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
             out.push(obj);
         }
     }
+    // Counted per CALL, never per word — see `rootprof::note_stack_scan` for
+    // why these exist. Free when `CRATONVM_DBG_ROOTPROF` is unset (one
+    // already-resolved `OnceLock` load).
+    crate::memory::native_roots::rootprof::note_stack_scan(
+        ((aligned_high - aligned_low) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        (out.len() - hits_before) as u64,          // Widening: a Vec length
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4531,6 +4562,9 @@ mod tests {
 
     /// A new compilation invalidates the verdict regardless of depth — a slot
     /// that held a plain value can now sit inside a brand-new code range.
+    ///
+    /// The rule is conservative and was measured non-binding on 2026-08-11 —
+    /// see `UnregMemo::observe` for the numbers and why it stays anyway.
     #[test]
     fn unreg_memo_new_code_range_forces_a_full_rescan() {
         let mut m = UnregMemo::new();

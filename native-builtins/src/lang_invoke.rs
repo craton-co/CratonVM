@@ -444,6 +444,51 @@ fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
     Some((params, desc[i + 1..].to_string()))
 }
 
+/// The heap array kind an array whose COMPONENT descriptor is `comp` must have.
+///
+/// Anything that is not one of the eight primitive tokens — including `[…` and
+/// `L…;` — is a reference array, which is also the safe default for a token
+/// this function does not recognise.
+fn array_element_type_of_descriptor(comp: &str) -> cratonvm_types::ArrayElementType {
+    use cratonvm_types::ArrayElementType as A;
+    match comp {
+        DESC_BOOLEAN => A::Boolean,
+        DESC_BYTE => A::Byte,
+        DESC_CHAR => A::Char,
+        DESC_SHORT => A::Short,
+        DESC_INT => A::Int,
+        DESC_LONG => A::Long,
+        DESC_FLOAT => A::Float,
+        DESC_DOUBLE => A::Double,
+        _ => A::Reference,
+    }
+}
+
+/// Apply JLS 5.3 method-invocation widening to one argument that is about to be
+/// stored into a primitive array slot whose component descriptor is `comp`.
+///
+/// This exists because CratonVM's `MethodHandle.asType` is a passthrough shim.
+/// On HotSpot the widening a collector needs is done by the `asType` the
+/// combinator installs, so `asCollector(long[].class, 3).invoke(1, 2, 3)`
+/// reaches the target with three `long`s; here the raw `int`s arrive at the
+/// array store, and `write_prim_element`'s `Long` arm matches only
+/// `Value::Long` and writes 0 for anything else. Narrowing is deliberately NOT
+/// performed: `Z`/`B`/`C`/`S`/`I` all travel as `Value::Int` and
+/// `write_prim_element` already truncates on the store, and a `long` handed to
+/// an `int[]` collector is a type error the JDK refuses rather than silently
+/// truncates.
+fn widen_primitive_to_descriptor(v: Value, comp: &str) -> Value {
+    match (comp, v) {
+        (DESC_LONG, Value::Int(i)) => Value::Long(i as i64),
+        (DESC_FLOAT, Value::Int(i)) => Value::Float(i as f32),
+        (DESC_FLOAT, Value::Long(l)) => Value::Float(l as f32),
+        (DESC_DOUBLE, Value::Int(i)) => Value::Double(i as f64),
+        (DESC_DOUBLE, Value::Long(l)) => Value::Double(l as f64),
+        (DESC_DOUBLE, Value::Float(f)) => Value::Double(f as f64),
+        _ => v,
+    }
+}
+
 /// Read a MethodType object's effective JVM descriptor by converting its
 /// `ptypes` (Class[]) and `rtype` (Class) mirrors back to descriptor tokens.
 fn methodtype_to_descriptor(ctx: &mut dyn NativeContext, mt: ObjectRef) -> Option<String> {
@@ -6216,7 +6261,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 _ => 0,
             };
             let values = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, values);
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -6263,9 +6308,24 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2)?;
+            // Slot 2 is the `arrayType` Class mirror, and it is the whole of
+            // W7-19's `asCollector` fix. Without it the `MH_KIND_COLLECT` arm
+            // has no way to learn the collector's ARRAY TYPE — the carrier
+            // held only (target, count) and the arm therefore gathered into an
+            // `Object[]` for every collector, so `sumAll(int[])
+            // .asCollector(int[].class, 3).invoke(1,2,3)` handed `sumAll` a
+            // reference array and answered 0 where HotSpot 25 answers 6.
+            // A mirror is a REFERENCE, so it goes in a carrier slot without
+            // the int-in-an-oop-slot hazard §5 is about; the alternative
+            // (an encoded element-type tag) would be exactly that hazard.
+            let arr_cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            let wrapper = alloc_mh_carrier(ctx, "__mh_collect_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
+            ctx.set_field(wrapper, 2, Value::Object(arr_cls));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter =
                 alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT)?;
@@ -6315,7 +6375,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_spread_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
@@ -6854,6 +6914,81 @@ const MH_NAME: usize = MH_BASE + 1;
 const MH_DESC: usize = MH_BASE + 2;
 const MH_KIND: usize = MH_BASE + 3;
 const MH_BOUND: usize = MH_BASE + 4;
+
+/// Mint one of the `__mh_*_wrapper__` combinator carriers that `MH_BOUND`
+/// points at.
+///
+/// Ten of them exist (`insert`, `collect`, `collect_args`, `spread`, `fold`,
+/// `filter`, `retfilter`, `catch`, `permute`, `guard`) and not one is a
+/// stand-in for anything. Each is a 2- or 3-slot tuple holding the state one
+/// `MethodHandles` combinator captured — the target handle, a filter/guard
+/// handle or `MethodHandle[]`, and an `int` position or count — so the matching
+/// `MH_KIND_*` arm of `mh_dispatch` can apply the combinator at invoke time.
+/// No native is registered on any of these names, no bytecode ever names one,
+/// and no entry in the JDK 25 module image declares one (checked with `javap`
+/// and against the full `jimage list`, 2026-08-11).
+///
+/// # Why this is not `try_alloc_concurrent_synthetic`
+///
+/// That funnel is the **compatibility stand-in** door: it asks
+/// `try_ensure_synthetic_class`, which stamps `ClassOrigin::CompatibilityStub`,
+/// and a stand-in is the one thing `--jdk-only` forbids. Every carrier site
+/// used it, so a strict run recorded ten `compatibility-class-requested`
+/// violations reading *"VM-requested stand-in: ensure_synthetic_class called
+/// with no class file on any classpath entry"* and then threw
+/// `NoClassDefFoundError: __mh_insert_wrapper__` out of
+/// `MethodHandles.insertArguments`. The `NoClassDefFoundError` is only the
+/// FIRST carrier the workload reaches, never the only one: a probe that reaches
+/// each combinator independently, catching per step, named all ten on one run
+/// (2026-08-11) while `dropArguments` and `asVarargsCollector` — the two whose
+/// state is a single reference and which therefore need no carrier at all —
+/// passed.
+///
+/// The classification was simply wrong, and the census says so in its own
+/// `reason` string: there is no class file for these names on any classpath
+/// because there is no class. Contract §1 item 6 makes a class the VM creates
+/// without any class file legitimate in **both** modes, and
+/// `ensure_vm_internal_class` is its door — the same one
+/// `vm_exec::heap_alloc_object` takes for `cratonvm/synthetic/AnonymousObject$N`
+/// on word-for-word this reasoning ("a VM bookkeeping type, not a compatibility
+/// substitution"). That door is demonstrably open in strict mode rather than
+/// merely declared to be: a `--jdk-only` run of the shipped binary under
+/// `CRATONVM_DBG_ANONALLOC=1` minted 16 `AnonymousObject$N` and its census
+/// recorded a violation for none of them.
+///
+/// This is not a way around the policy. The question the trait declaration
+/// poses is whether the JVM specification says a class file must exist for the
+/// name; for a carrier CratonVM invented to hold its own combinator state, it
+/// does not.
+///
+/// # What each mode sees
+///
+/// * `JdkOnly` — the refusal disappears and the ten violations leave the
+///   census. This is the whole change.
+/// * `Compatible` — unchanged; that mode fabricates through either door. The
+///   two second-order differences both run the safe way: `fabricate_class`
+///   stops running a full-classpath rescan per carrier looking for real bytes
+///   that cannot exist, and the carriers stop being counted against a
+///   zero-stub census they were never evidence for.
+///
+/// Infallible because `ensure_vm_internal_class` is — the door that never
+/// refuses is the point — so the call sites drop the `?` they carried for a
+/// refusal that was never theirs to propagate.
+#[track_caller]
+fn alloc_mh_carrier(ctx: &mut dyn NativeContext, name: &str, num_fields: usize) -> ObjectRef {
+    let cid = ctx.ensure_vm_internal_class(name, num_fields);
+    // The width clamp is `try_alloc_concurrent_synthetic`'s, kept verbatim: if
+    // the resolved class declares MORE slots than this site asks for,
+    // allocating the smaller number leaves every carrier write past the
+    // requested width silently discarded. The carriers have no
+    // `synthetic_stub_fields` arm, so the class declares 0 and `max` is the
+    // caller's own number — the same arithmetic the old funnel performed for
+    // them, kept rather than simplified away because the day someone adds that
+    // arm is the day dropping it becomes a truncating write.
+    let n = num_fields.max(ctx.class_num_total_fields(cid));
+    ctx.try_alloc_object_gc_safe(cid, n)
+        .unwrap_or_else(|| ctx.alloc_object(cid, n))
+}
 
 /// Returns true if a method descriptor has exactly two parameters.
 /// Used to distinguish instance setters "(Lowner;value)V" (2 params)
@@ -7822,7 +7957,7 @@ fn make_fold_adapter(
     // before each use.
     let target_pin = ctx.pin_native_root(target);
     let combiner_pin = ctx.pin_native_root(combiner_ref);
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_fold_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
@@ -7916,7 +8051,7 @@ fn make_collect_args_adapter(
     // each use.
     let target_pin = ctx.pin_native_root(target);
     let filter_pin = ctx.pin_native_root(filter_ref);
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_collect_args_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
@@ -8754,8 +8889,22 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_COLLECT => {
             // asCollector(arrayType, count): collect the trailing `count`
-            // incoming args into a fresh Object[] and append to the leading
-            // args, then dispatch target (whose last param is that array).
+            // incoming args into a fresh array OF THE COLLECTOR'S OWN ARRAY
+            // TYPE and append to the leading args, then dispatch target (whose
+            // last param is that array).
+            //
+            // W7-19: "of the collector's own array type" is the fix. This arm
+            // built an `Object[]` unconditionally, so every primitive-array
+            // collector handed its target a reference array where the target's
+            // bytecode expects `int[]`/`long[]`/… — `iaload` then read an oop
+            // as an int. Measured on the shipped `dev` binary under
+            // `--real-jdk`: `int[]`→0, `byte[]`/`short[]`/`char[]`/
+            // `boolean[]`→0, `float[]`→0.0, `double[]`→NaN, and `long[]`→
+            // -2527743864898872 (a raw heap pointer read as a `long`), against
+            // HotSpot 25's 6/6/60/131/2/3.75/7.0/6. `Object[]` and `String[]`
+            // were already right, which is why the one probe that reached this
+            // combinator did not see it — the same four-of-nine shape as the
+            // FFM carrier defect: one reachable carrier is not the surface.
             let wrapper = match bound {
                 Value::Object(Some(w)) => w,
                 _ => return Ok(Some(Value::Object(None))),
@@ -8769,33 +8918,100 @@ pub(crate) fn mh_dispatch(
                 _ => 0,
             };
             let leading = extra_args.len() - count;
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+            // Slot 2 is the `arrayType` Class mirror the `asCollector` native
+            // captured. Absent (a carrier written before this field existed, or
+            // an `asCollector` call whose Class argument was not an object) the
+            // component descriptor stays `Ljava/lang/Object;` and this arm
+            // behaves exactly as it did before — the pre-existing `Object[]`
+            // path is the fallback, never a new failure mode.
+            let arr_mirror = match ctx.get_field(wrapper, 2) {
+                Value::Object(Some(m)) => Some(m),
+                _ => None,
+            };
+            let comp = match arr_mirror {
+                Some(m) => {
+                    let ad = mirror_to_descriptor(ctx, m);
+                    match ad.strip_prefix('[') {
+                        Some(rest) => rest.to_string(),
+                        // Not an array mirror at all. `asCollector` on a
+                        // non-array type is an `IllegalArgumentException` on
+                        // HotSpot and never reaches dispatch there; here it
+                        // keeps the old container rather than inventing a new
+                        // refusal at invoke time, which would be the wrong
+                        // place for it.
+                        None => DESC_OBJECT.to_string(),
+                    }
+                }
+                None => DESC_OBJECT.to_string(),
+            };
+            let elem_type = array_element_type_of_descriptor(&comp);
+            let arr = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                // A typed reference array where the component class resolves
+                // (`String[]`, not `Object[]`), because the target's parameter
+                // is `String[]` and an `aastore`-checked or reflective consumer
+                // can tell the difference. `Object[]` remains the fallback.
+                let arr_cid = match arr_mirror {
+                    Some(m) => ctx.class_id_from_mirror(m),
+                    None => None,
+                };
+                let comp_cid = match arr_cid {
+                    Some(acid) => ctx.array_component_class_id(acid),
+                    None => None,
+                };
+                match comp_cid {
+                    Some(cid) => ctx.new_ref_array(cid, count),
+                    None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, count),
+                }
+            } else {
+                ctx.new_array(elem_type, count)
+            };
             // GC-safety: `box_value` inside the loop below can trigger a
             // collection that relocates `arr` (created once, before the
             // loop, then written into on every iteration) and `target`
             // (captured earlier, dispatched only after the loop finishes).
             // Pin both and re-read the forwarded references before each use.
+            // The primitive branch allocates nothing per element, but it shares
+            // the loop and the pin costs a forwarding read, not a collection.
             let arr_pin = ctx.pin_native_root(arr);
             let target_pin = ctx.pin_native_root(target);
             for i in 0..count {
-                // Box primitive values into their wrappers — the collector
-                // gathers into an `Object[]`. The indy call site passes raw
-                // primitives (Groovy's `3 * 2` is `invoke(II)Object`), and the
-                // real JDK boxes them via the trailing `asType`; our `asType`
-                // shim is a passthrough, so box here. Without this, `selectMethod`
-                // receives raw `int`s in its `Object[] args` and Groovy's
-                // `args[0].getClass()` (Selector.setGuards) dereferences a raw
-                // int as an object → NPE.
                 let v = extra_args[leading + i];
-                let boxed = match v {
-                    Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
-                    Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
-                    Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
-                    Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
-                    other => other,
+                let elem = if elem_type == cratonvm_types::ArrayElementType::Reference {
+                    // Box primitive values into their wrappers — a reference
+                    // collector gathers into an `Object[]`. The indy call site
+                    // passes raw primitives (Groovy's `3 * 2` is
+                    // `invoke(II)Object`), and the real JDK boxes them via the
+                    // trailing `asType`; our `asType` shim is a passthrough, so
+                    // box here. Without this, `selectMethod` receives raw
+                    // `int`s in its `Object[] args` and Groovy's
+                    // `args[0].getClass()` (Selector.setGuards) dereferences a
+                    // raw int as an object → NPE.
+                    match v {
+                        Value::Int(_) => crate::lang_class::box_value(ctx, v, "I"),
+                        Value::Long(_) => crate::lang_class::box_value(ctx, v, "J"),
+                        Value::Float(_) => crate::lang_class::box_value(ctx, v, "F"),
+                        Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
+                        other => other,
+                    }
+                } else {
+                    // The mirror image, for the same reason: a primitive
+                    // collector's element slot is raw, and an argument that
+                    // arrived boxed (`invokeWithArguments`, or an adapter chain
+                    // that spread an `Object[]`) must be unwrapped or
+                    // `write_prim_element` would see a `Value::Object` and
+                    // store the type's zero. Then apply the widening the JDK's
+                    // trailing `asType` would have applied — `asCollector
+                    // (long[], 3).invoke(1, 2, 3)` passes `int`s and HotSpot
+                    // widens them; our `asType` is a passthrough, so this is
+                    // the only place it can happen.
+                    let raw = match v {
+                        Value::Object(Some(o)) => crate::lang_class::unbox_value(ctx, o),
+                        other => other,
+                    };
+                    widen_primitive_to_descriptor(raw, &comp)
                 };
                 let arr = ctx.read_native_pin(arr_pin, arr);
-                ctx.set_array_element(arr, i, boxed);
+                ctx.set_array_element(arr, i, elem);
             }
             let arr = ctx.read_native_pin(arr_pin, arr);
             let target = ctx.read_native_pin(target_pin, target);
@@ -10029,6 +10245,46 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let recv = args.get(1).copied().unwrap_or(Value::Object(None));
+            // W7-19: `bindTo` must REFUSE a target with no leading reference
+            // parameter. `MethodHandle.bindTo`'s javadoc: "@throws
+            // IllegalArgumentException if the target does not have a leading
+            // parameter type that is a reference type", implemented in
+            // `MethodType.leadingReferenceParameter()` as
+            //   if (ptypes.length == 0 || ptypes[0].isPrimitive())
+            //       throw newIllegalArgumentException("no leading reference parameter");
+            // — so the test is arity-and-primitiveness, nothing else, and the
+            // message is verbatim. Measured on the shipped binary under
+            // `--real-jdk`: `findStatic(…(String,int)int).bindTo("abc")
+            // .bindTo(2)` was ACCEPTED and answered 6, and `(int)int`
+            // .bindTo(3) was accepted too; HotSpot 25 raises
+            // `IllegalArgumentException: no leading reference parameter` for
+            // both. A missing refusal, not a wrong value.
+            //
+            // The parameter list is read from the `type` field ONLY, never
+            // from `mh_type_descriptor`'s `MH_DESC` fallback. That distinction
+            // is the whole safety of this check: `MH_DESC` on a
+            // virtual/special handle omits the receiver `alloc_method_handle`
+            // prepends to `type`, so `Holder.pub`'s `(I)I` would read as a
+            // primitive leading parameter and this would refuse a bind that
+            // HotSpot accepts. No `type` MethodType, or one whose mirrors do
+            // not render, means the leading parameter is UNKNOWN and the bind
+            // is allowed through — a refusal is only ever raised on a positive
+            // reading.
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(this, "type") {
+                if let Some(tdesc) = methodtype_to_descriptor(ctx, mt) {
+                    if let Some((params, _)) = split_descriptor_params(&tdesc) {
+                        let leading_is_reference = params
+                            .first()
+                            .is_some_and(|p| p.starts_with('L') || p.starts_with('['));
+                        if !leading_is_reference {
+                            return Err(RuntimeError::IllegalArgumentException {
+                                message: "no leading reference parameter".to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
             // Clone the MH and set BOUND field
             let class = mh_read_class(ctx, this).unwrap_or_default();
             let name = mh_read_name(ctx, this).unwrap_or_default();
@@ -10052,7 +10308,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             {
                 let values = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                 ctx.set_array_element(values, 0, recv);
-                let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
+                let wrapper = alloc_mh_carrier(ctx, "__mh_insert_wrapper__", 3);
                 ctx.set_field(wrapper, 0, Value::Object(Some(this)));
                 ctx.set_field(wrapper, 1, Value::Object(Some(values)));
                 ctx.set_field(wrapper, 2, Value::Int(0));
@@ -10591,7 +10847,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filters → behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_filter_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filters)));
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -10625,7 +10881,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filter -> behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_retfilter_wrapper__", 2);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
             // The adapter's parameter types match the target's; its return
@@ -10691,7 +10947,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             };
             let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
             let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3)?;
+            let wrapper = alloc_mh_carrier(ctx, "__mh_catch_wrapper__", 3);
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, catch_type);
             ctx.set_field(wrapper, 2, handler);
@@ -11190,7 +11446,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let target_pin = ctx.pin_native_root(target_mh);
     let reorder_pin = ctx.pin_native_root(reorder_arr);
     // Create a wrapper synthetic to hold (target_mh, reorder_arr)
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_permute_wrapper__", 2);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
     let reorder_arr = ctx.read_native_pin(reorder_pin, reorder_arr);
@@ -11279,7 +11535,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let target_pin = ctx.pin_native_root(target_mh);
     let fallback_pin = ctx.pin_native_root(fallback_mh);
     // Create a wrapper synthetic to hold (test, target, fallback)
-    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3)?;
+    let wrapper = alloc_mh_carrier(ctx, "__mh_guard_wrapper__", 3);
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let test_mh = ctx.read_native_pin(test_pin, test_mh);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);

@@ -783,6 +783,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
     if !moving_young_precise_only {
+        crate::memory::native_roots::rootprof::note_scan_caller(0); // gc-roots
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
