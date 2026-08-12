@@ -12034,8 +12034,56 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         ],
         "java/io/DataInputStream" | "java/io/DataOutputStream" => instance_fields(1),
         "java/io/FileDescriptor" => instance_fields(4),
-        // PrintStream/PrintWriter = 1 field (fd)
-        "java/io/PrintStream" | "java/io/PrintWriter" => instance_fields(1),
+        // ── PrintStream / PrintWriter ────────────────────────────────────────
+        //
+        // `_f0` is the fd tag (declared slot 0; ABSOLUTE slot 1 for
+        // `PrintStream`, which inherits `FilterOutputStream.out` at absolute
+        // 0 — the print natives read the fd through `out`/raw slot 0, so the
+        // comment this replaces, "= 1 field (fd)", named the wrong slot).
+        //
+        // `trouble` is the JDK's own field, not a VM-internal one, so it is
+        // spelled with its real name rather than `_vmN`: it is what
+        // `checkError()` returns, and `PrintStream`/`PrintWriter`'s
+        // `catch (IOException x) { trouble = true; }` bodies are the only
+        // things that set it. Without a slot for it, a synthetic-mode
+        // `checkError()` has nothing to read and the absorbed failure is
+        // unobservable rather than merely unthrown.
+        // W7-64-printstream-trouble-and-errormanager.md
+        //
+        // Its INDEX is not the real image's — the real `java.io.PrintStream`
+        // declares `trouble` at absolute 4, behind `out`/`closed`/`closeLock`/
+        // `autoFlush`. That divergence is real and `shadow_layout`'s
+        // `diff_against_model` is right to report it under
+        // `CRATONVM_DBG_OVERLAY`; it is harmless because nothing addresses
+        // `trouble` positionally. Every reader and writer goes through
+        // `native-api`'s `print_error_state`, which resolves it BY NAME —
+        // landing on the real slot in Compatible mode and on this one in
+        // synthetic mode, with no `#[cfg]` at the call sites.
+        //
+        // `closing` is `PrintStream`'s and only `PrintStream`'s: the real
+        // class declares `private boolean closing` ("to avoid recursive
+        // closing") and `java.io.PrintWriter` declares no such field — it uses
+        // `out == null` as its closed marker instead. So the one arm the two
+        // classes used to share is split here rather than growing a field one
+        // of them does not have: `print_error_state::is_closing` would then
+        // answer for a `PrintWriter` too, while `native_printwriter_close`
+        // deliberately latches nothing. `closing` carries the JDK's own name
+        // for the same reason `trouble` does, and is likewise resolved BY NAME
+        // at every reader and writer, so its index here diverging from the
+        // real image's is a true report for `diff_against_model` to make and
+        // harmless in fact.
+        // W7-70-printstream-close-noop.md
+        "java/io/PrintStream" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields.push(named_field("closing", "Z"));
+            fields
+        }
+        "java/io/PrintWriter" => {
+            let mut fields = instance_fields(1);
+            fields.push(named_field("trouble", "Z"));
+            fields
+        }
         // T1.10 — corrected StringReader/StringWriter shapes to match
         // the real native init code in `native-io/src/lib.rs`:
         //   StringReader = 3 fields (content, pos, length) per

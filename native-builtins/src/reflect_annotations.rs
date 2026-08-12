@@ -310,6 +310,47 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             );
         }
         ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        // `java.util.logging.Handler`'s third field initializer is
+        // `private volatile ErrorManager errorManager = new ErrorManager();`
+        // — and a native `<init>` replaces the real constructor wholesale, so
+        // NONE of the JDK's field initializers run. Two of the three were
+        // already reconstructed above; this one was not, which left
+        // `errorManager` null on every `Handler` in Compatible mode. HotSpot's
+        // is never null (its own javadoc: "there is a default ErrorManager
+        // installed"), and `Handler.reportError` — the destination of every
+        // absorbed `Exception` in the whole `Handler` family — dereferences it
+        // unguarded, so an absorbed flush/close failure NPE'd inside the
+        // reporting path and came out as `reportError`'s own
+        // `catch (Exception ex2)` message instead of the failure.
+        //
+        // COMPATIBLE-MODE PARITY, not a behaviour change: it converges on what
+        // HotSpot's constructor does. Guarded on null so a real ctor that DID
+        // run (or a `setErrorManager` that already landed) is never clobbered.
+        // W7-64-printstream-trouble-and-errormanager.md
+        //
+        // The `resolve_field_index_by_class_id` guard is not belt-and-braces:
+        // `get_field_by_name` answers `Object(None)` for "null" and for "no
+        // such field" alike, and a SYNTHETIC `Handler` has no such field — so
+        // without it this would allocate one dead `ErrorManager` per handler
+        // and drop it into a `set_field_by_name` that is documented to no-op.
+        // The synthetic arm gets its `ErrorManager` from
+        // `register_p61_handler_error_manager` instead.
+        let handler_class = ctx.class_id_of_object(*this);
+        let has_error_manager_field = ctx
+            .resolve_field_index_by_class_id(handler_class, "errorManager")
+            .is_some();
+        if has_error_manager_field
+            && matches!(
+                ctx.get_field_by_name(*this, "errorManager"),
+                Value::Object(None)
+            )
+        {
+            if let Ok(Some(Value::Object(Some(em)))) =
+                ctx.new_object("java/util/logging/ErrorManager")
+            {
+                ctx.set_field_by_name(*this, "errorManager", Value::Object(Some(em)));
+            }
+        }
         Ok(None)
     });
     registry.register(
