@@ -28711,8 +28711,22 @@ fn native_classloader_find_bootstrap_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // args[0]=this ClassLoader, args[1]=name String
-    let name = match args.get(1) {
+    // W7-86. `findBootstrapClass` is **`private static native`** on JDK 25's
+    // `ClassLoader` (`javap -p --module java.base java.lang.ClassLoader`,
+    // Adoptium 25.0.3.9), so `args[0]` IS the name and there is no receiver
+    // slot. The comment this replaces described its neighbour
+    // `findLoadedClass0`, which really is `private final native` — an INSTANCE
+    // method — and whose `args[1]` indexing below is correct. Copying it here
+    // made this native read one past the end of a one-element `args`, take the
+    // `_` arm and answer **null for every name**, on every call, since it was
+    // written. The registration owns its slot and the real method is
+    // `acc_native: true, has_code: false` (`--dump-native-registry`), so no
+    // bytecode was answering behind it.
+    //
+    // Mode: Compatible (`--real-jdk`, the default). This is a HotSpot-parity
+    // fix — HotSpot resolves the bootstrap class — but note it wakes a code
+    // path that has been inert, so it is committed on its own.
+    let name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
