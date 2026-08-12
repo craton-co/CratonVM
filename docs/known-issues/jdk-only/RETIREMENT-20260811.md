@@ -1,5 +1,38 @@
 # 2026-08-11 — retirement audit: 30 records moved out, 22 kept
 
+> **CORRECTION, 2026-08-12 (W7-55-record-reconciliation.md) — three of the
+> "kept" rows give a reason that was already false when this audit ran.** The
+> *reasons for keeping* are what put a record in front of the next reader, so a
+> wrong one costs a run. The moves themselves were not re-audited and are not in
+> question; only these three reasons are.
+>
+> * **`W4-1`** (row at the "Kept — 22" table): *"two optional hardening patches
+>   on `lk_drop_lookup_mode` / `lk_in_method` that are still unapplied"*. **Both
+>   landed on 2026-08-07 in commit `dcfe77cb8`**, four days before this audit —
+>   `native-builtins/src/classloader.rs:9571` and `:9543` — and W4-1's own text
+>   already said so. W4-1's only live item is a deletion-only cleanup of the dead
+>   `classloader.rs` lookup block, plus four unit tests aimed at it.
+> * **`W4-2`**: *"the `ServiceLoader` + encapsulated-provider interaction and
+>   `is_package_exported_to` failing closed … are both still open"*. The first
+>   landed in `b3aca74c8` (`grant_reflective_override`,
+>   `native-builtins/src/service_loader.rs:1564`); the second is adjudicated
+>   **unreachable**, by W4-2's own three-writer argument. W4-2's actual live item
+>   — array classes reporting module `java.base` regardless of component type,
+>   `classloading/src/class_manager.rs:9568` — is not mentioned in this audit at
+>   all.
+> * **`W6-8`**: *"`Field.get`/`Field.set` ask the `opens` question
+>   unconditionally … and the whole `Lookup.unreflect*`/`find*` family has no
+>   module check of any kind"*. First half wrong — `dcfe77cb8` dissolved the
+>   `is_public` split at `native-builtins/src/lang_class.rs:1337`. Second half
+>   half-wrong — the *mode* check landed in `3644142d5`
+>   (`lk_enforce_unreflect_access`, `native-builtins/src/lang_invoke.rs:4452`,
+>   six call sites); only the *module* half remains, deliberately.
+>
+> The rest of this audit's own findings — in particular its table of fourteen
+> records that claimed a hand-off patch was never applied when it was in the
+> tree — were confirmed and extended by the 2026-08-12 pass, which found
+> **eighteen more**.
+
 **What this is.** A per-record read of every record that was in
 `docs/known-issues/jdk-only/` on 2026-08-11, against the rule stated at the
 bottom of the README — *this directory holds **unfixed** issues only* — and
