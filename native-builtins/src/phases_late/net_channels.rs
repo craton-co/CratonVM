@@ -18,6 +18,42 @@ use super::*;
 // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
 // =============================================================================
 
+/// Real `java.nio.channels.AsynchronousSocketChannel` (JDK 25.0.3.9, `javap -p`)
+/// declares exactly ONE instance field — `private final AsynchronousChannelProvider
+/// provider` — and inherits none. This file's model needs four values that have no
+/// counterpart there, so they are appended ABOVE it rather than laid over it.
+///
+/// Until 2026-08-12 the model started at slot 0: `connected` (an `Int`) was
+/// written straight into `provider`, a slot the real class declares as a
+/// reference and the collector scans as an oop, and slots 1-3 sat past the end
+/// of the real layout entirely. That is the species
+/// `docs/known-issues/jdk-only/W4-4-slot-index-species-sweep.md` names and the
+/// direction §5 of `docs/architecture/natives-over-real-jdk-classes.md` calls
+/// heap corruption. Re-censused in `W7-49-slot-index-recensus.md`.
+pub(crate) const ASC_CLASS: &str = "java/nio/channels/AsynchronousSocketChannel";
+pub(crate) const ASC_WIDTH: usize = 4;
+pub(crate) const ASC_CONNECTED: usize = 0;
+pub(crate) const ASC_OPEN: usize = 1;
+pub(crate) const ASC_FD: usize = 2;
+pub(crate) const ASC_REMOTE: usize = 3;
+
+/// Base of this file's private `AsynchronousSocketChannel` map on `this`.
+///
+/// Errors when the receiver is too narrow to carry it — i.e. a real-layout
+/// instance somebody else allocated. The old code wrote the map onto such a
+/// receiver unconditionally and nothing observed it; this is where that stops.
+fn asc_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<usize, MethodCallFailed> {
+    match appended_slot_base_of(ctx, this, ASC_CLASS, ASC_WIDTH) {
+        Some(base) => Ok(base),
+        None => Err(RuntimeError::IllegalStateException {
+            message: "AsynchronousSocketChannel was not allocated by CratonVM's \
+                      async-channel model; its slot map does not apply to this receiver"
+                .into(),
+        }
+        .into()),
+    }
+}
+
 pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1464,19 +1500,20 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 1)))
     });
 
-    // AsynchronousSocketChannel = 4-field (connected=0, open=1, fd_id=2, remote_addr=3)
-    let asc = "java/nio/channels/AsynchronousSocketChannel";
+    // AsynchronousSocketChannel = 4 PRIVATE slots (connected, open, fd_id,
+    // remote_addr) appended ABOVE every field the real class declares — see
+    // `asc_base` / `ASC_*` below for why they no longer start at slot 0.
+    let asc = ASC_CLASS;
     r.register(
         asc,
         "open",
         "()Ljava/nio/channels/AsynchronousSocketChannel;",
         |ctx, _args| {
-            let ch =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousSocketChannel", 4)?;
-            ctx.set_field(ch, 0, Value::Int(0)); // not connected
-            ctx.set_field(ch, 1, Value::Int(1)); // open
-            ctx.set_field(ch, 2, Value::Int(-1)); // no fd
-            ctx.set_field(ch, 3, Value::Object(None)); // remote addr
+            let (ch, base) = try_alloc_with_appended_slots(ctx, ASC_CLASS, ASC_WIDTH)?;
+            ctx.set_field(ch, base + ASC_CONNECTED, Value::Int(0)); // not connected
+            ctx.set_field(ch, base + ASC_OPEN, Value::Int(1)); // open
+            ctx.set_field(ch, base + ASC_FD, Value::Int(-1)); // no fd
+            ctx.set_field(ch, base + ASC_REMOTE, Value::Object(None)); // remote addr
             Ok(Some(Value::Object(Some(ch))))
         },
     );
@@ -1485,12 +1522,11 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "open",
         "(Ljava/nio/channels/AsynchronousChannelGroup;)Ljava/nio/channels/AsynchronousSocketChannel;",
         |ctx, _args| {
-            let ch =
-                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/AsynchronousSocketChannel", 4)?;
-            ctx.set_field(ch, 0, Value::Int(0));
-            ctx.set_field(ch, 1, Value::Int(1));
-            ctx.set_field(ch, 2, Value::Int(-1));
-            ctx.set_field(ch, 3, Value::Object(None));
+            let (ch, base) = try_alloc_with_appended_slots(ctx, ASC_CLASS, ASC_WIDTH)?;
+            ctx.set_field(ch, base + ASC_CONNECTED, Value::Int(0));
+            ctx.set_field(ch, base + ASC_OPEN, Value::Int(1));
+            ctx.set_field(ch, base + ASC_FD, Value::Int(-1));
+            ctx.set_field(ch, base + ASC_REMOTE, Value::Object(None));
             Ok(Some(Value::Object(Some(ch))))
         },
     );
@@ -1518,9 +1554,14 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
                         format!("connect failed: {io}")
                     })
                 })?;
-            ctx.set_field(this, 0, Value::Int(1)); // connected
-            ctx.set_field(this, 2, Value::Int(fd_id as i32));
-            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let base = asc_base(ctx, this)?;
+            ctx.set_field(this, base + ASC_CONNECTED, Value::Int(1)); // connected
+            ctx.set_field(this, base + ASC_FD, Value::Int(fd_id as i32));
+            ctx.set_field(
+                this,
+                base + ASC_REMOTE,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
             // DF07: completed Future<Void> via real CompletableFuture (see helper).
             aio_completed_future(ctx, Value::Object(None))
         },
@@ -1531,7 +1572,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+            let base = asc_base(ctx, this)?;
+            let fd_id = ctx.get_field(this, base + ASC_FD).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: decode the destination buffer via the real-or-synthetic
             // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
@@ -1600,7 +1642,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+            let base = asc_base(ctx, this)?;
+            let fd_id = ctx.get_field(this, base + ASC_FD).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: source the bytes via the real-or-synthetic accessor (see read).
             //
@@ -1668,17 +1711,19 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     );
     r.register(asc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
+        let base = asc_base(ctx, this)?;
+        let fd_id = ctx.get_field(this, base + ASC_FD).as_int().unwrap_or(-1);
         if fd_id >= 0 {
             let _ = ctx.fd_table().close(fd_id as u32);
         }
-        ctx.set_field(this, 1, Value::Int(0)); // closed
-        ctx.set_field(this, 2, Value::Int(-1));
+        ctx.set_field(this, base + ASC_OPEN, Value::Int(0)); // closed
+        ctx.set_field(this, base + ASC_FD, Value::Int(-1));
         Ok(None)
     });
     r.register(asc, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let base = asc_base(ctx, this)?;
+        Ok(Some(ctx.get_field(this, base + ASC_OPEN)))
     });
     r.register(
         asc,
@@ -1686,7 +1731,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
+            let base = asc_base(ctx, this)?;
+            Ok(Some(ctx.get_field(this, base + ASC_REMOTE)))
         },
     );
 

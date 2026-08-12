@@ -1059,6 +1059,90 @@ pub(crate) fn try_alloc_concurrent_synthetic(
     }
 }
 
+/// Where a native's PRIVATE slot map starts on an instance of `class_name`.
+///
+/// Zero when the class is a fabricated stub (its fields are `_f0.._fN` and the
+/// synthetic map IS the layout); otherwise the real class's transitive declared
+/// field count, so every private slot lands ABOVE every field the real layout
+/// declares. This is the idiom `jca/kem.rs::synthetic_base_offset` uses, with
+/// the stub arm added: without it the base RATCHETS in synthetic-JDK mode,
+/// because the first allocation fabricates a class declaring `base + width`
+/// fields and the next call reads that number back as the new base, so two
+/// objects of one class end up with two different slot maps in one run.
+/// `is_class_synthetic_stub` is stable under that — a stub stays a stub.
+///
+/// Read `docs/known-issues/jdk-only/W7-49-slot-index-recensus.md` for why the
+/// alternative (guessing the layout from the object's own slot count) cannot
+/// work for a receiver this native did not allocate.
+pub(crate) fn appended_slot_base_for_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> usize {
+    if ctx.is_class_synthetic_stub(class_name) {
+        return 0;
+    }
+    match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => ctx.class_num_total_fields(cid),
+        Err(_) => 0,
+    }
+}
+
+/// Allocate `class_name` carrying `width` private slots appended above the real
+/// layout, and hand back the base those slots start at.
+///
+/// The pair (object, base) is what makes the write in-bounds AND non-aliasing:
+/// the object is `base + width` slots wide, so `base + i` for `i < width` is
+/// inside it, and no `base + i` collides with a field the real class declares.
+/// Contrast the shape this replaces — allocate `width` slots on a class that
+/// declares `real > 0` fields and write `0..width`, which puts the native's
+/// `Int` into whatever reference the real layout declares at slot 0.
+#[track_caller]
+pub(crate) fn try_alloc_with_appended_slots(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    width: usize,
+) -> Result<(ObjectRef, usize), MethodCallFailed> {
+    let base = appended_slot_base_for_class(ctx, class_name);
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, base + width)?;
+    debug_assert!(
+        ctx.object_num_fields(obj) >= base + width,
+        "appended-slot allocation of {class_name} came back with {} slots, \
+         needed base {base} + width {width}",
+        ctx.object_num_fields(obj)
+    );
+    Ok((obj, base))
+}
+
+/// The base for a RECEIVER this native may not have allocated.
+///
+/// `None` means "this object is too narrow to carry the private map" — which is
+/// exactly a real-layout instance that real bytecode (or the JIT) allocated at
+/// the class's declared width. Writing the private map onto it is the
+/// past-the-end write §5 of `docs/architecture/natives-over-real-jdk-classes.md`
+/// calls heap corruption, so the caller must refuse rather than write.
+///
+/// This is the check that FAILS: today those sites write unconditionally and
+/// nothing observes it; with this the narrow receiver takes the refusal arm and
+/// a debug build trips the assertion at the exact native.
+pub(crate) fn appended_slot_base_of(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    class_name: &str,
+    width: usize,
+) -> Option<usize> {
+    let base = appended_slot_base_for_class(ctx, class_name);
+    if ctx.object_num_fields(obj) < base + width {
+        debug_assert!(
+            false,
+            "native applied a {width}-slot private map at base {base} to a \
+             {}-slot {class_name} it did not allocate",
+            ctx.object_num_fields(obj)
+        );
+        return None;
+    }
+    Some(base)
+}
+
 /// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
 /// Java throwable.
 ///
