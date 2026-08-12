@@ -5219,10 +5219,15 @@ fn fmt_exception_class_available(ctx: &mut dyn NativeContext, class_name: &str) 
     };
     match ctx.class_id_by_name("java/lang/IllegalArgumentException") {
         Some(base) => ctx.is_subclass(class_id, base),
-        // No base class to check against means this VM has no exception
-        // hierarchy worth the name; the fallback's `RuntimeError` variant
-        // still knows how to raise one.
-        None => false,
+        // ACCEPT on an unanswerable screen, do not refuse. `class_id_by_name`
+        // is `find_unique_class_by_name`, which returns `None` for an
+        // AMBIGUOUS name as well as an absent one — and refusing on that would
+        // re-create the exact defect this function exists to fix, silently, on
+        // whatever configuration defines `IllegalArgumentException` twice.
+        // Nothing is lost by accepting: the stub screen above has already run,
+        // so what is being accepted here is a real loaded class named by the
+        // javadoc, which is a better answer than the base class either way.
+        None => true,
     }
 }
 
