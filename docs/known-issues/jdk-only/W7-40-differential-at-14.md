@@ -1,5 +1,21 @@
 # W7-40 — the differential at 14, and two instrument holes
 
+> **SUPERSEDED 2026-08-12 by W7-42-differential-instrument-holes.md. The
+> number below is 14 only because five of the rows are the instrument.**
+>
+> The "same class files" claim in the next paragraph is false. The CratonVM
+> side was compiled from the scratchpad copy W7-33 Part 3 made with five
+> `line(..)` statements excised; HotSpot was compiled from the tree. The five
+> absent rows (`ArrayDeque.addNull`, `addFirstNull`, `offerNull`,
+> `sizeAfterRefusedNulls`, `COW.addAllAbsent`) are statements one side never
+> executed, not values CratonVM got wrong — run from one compile they match
+> HotSpot exactly. The seven `[SUREFIRE-NPE]` lines were never on stdout
+> either: the emitter is `eprintln!` and the capture merged the streams.
+>
+> **The differential is at 9.** Everything under "the genuine value
+> divergences" below still stands; nothing else here should be read as a
+> property of the VM.
+
 **Status: MEASURED 2026-08-12** on the 50-branch binary. HotSpot 25.0.3.9 vs CratonVM
 `--real-jdk`, same class files, both sides pinned to UTF-8 / en-US.
 
