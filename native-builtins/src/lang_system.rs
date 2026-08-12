@@ -110,6 +110,36 @@ fn invoke_pre_exit_hook(code: i32) {
     }
 }
 
+/// W7-90: the read-side slot-map sweep's **exit-path** trigger.
+///
+/// The launcher sweeps immediately after `main(String[])` returns, which is the
+/// point in the process with the most classes loaded. Nothing on that path is
+/// reached when the application terminates itself — and the fixtures this
+/// instrument is aimed at (SbRunner, Surefire, every Spring Boot app) end in
+/// `System.exit`, `Runtime.exit` or `Runtime.halt`. A sweep wired only to the
+/// return path would report nothing on exactly the runs that matter, which is
+/// the same "detector that never runs" shape W7-69 §7.2 filed and this lane is
+/// closing. All three natives call this immediately before
+/// `std::process::exit`, after their soft-return escape hatches, so a
+/// soft-returned exit does not consume the census the launcher would print
+/// later.
+///
+/// Gated with **no `else`** and observation-only: the report is printed by the
+/// sweep and dropped here. With the flag off it is one `OnceLock` load and a
+/// branch, on a path that runs once per process.
+///
+/// One limit, stated rather than hidden: the per-slot rows go through
+/// `tracing::warn!` and `std::process::exit` does not unwind or flush a
+/// subscriber, so a hard exit can print the stderr summary and lose the rows.
+/// The fix is not a second emitter — two detectors on one primitive drift and
+/// then disagree — it is to prefer the launcher's post-`main` trigger when a
+/// workload can be made to return.
+fn sweep_declared_slot_maps_before_exit(ctx: &dyn NativeContext, trigger: &str) {
+    if cratonvm_native_api::layout_alias::enabled() {
+        let _ = cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(ctx, trigger);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // java.lang.System natives
 // ---------------------------------------------------------------------------
@@ -1321,6 +1351,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
     eprintln!("[cratonvm] System.exit({code}) called вЂ” process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "System.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -2594,6 +2625,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.exit");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -2607,7 +2639,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// dump-on-exit) still fires — it is not a Java shutdown hook, and its own
 /// comment already claims to cover `Runtime.halt`.
 pub(crate) fn native_shutdown_halt0(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let code = match args.first() {
@@ -2629,6 +2661,7 @@ pub(crate) fn native_shutdown_halt0(
     // Plain ASCII dash on purpose: the neighbouring exit messages carry a
     // mojibake em-dash from an old encoding mishap and print as garbage.
     eprintln!("[cratonvm] Runtime.halt({code}) called - process terminating");
+    sweep_declared_slot_maps_before_exit(&*ctx, "Runtime.halt");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }

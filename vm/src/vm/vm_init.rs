@@ -7946,6 +7946,33 @@ impl Vm {
             .set_vm_state("vm-main:blocking-region-returned");
     }
 
+    /// Sweep every published `read_alias::SlotMap` against the class the loader
+    /// actually has, and print the one-line summary. W7-90-slot-map-sweep-caller.md.
+    ///
+    /// **Why here and not at registration.** W7-69-read-side-alias-instrument.md
+    /// settled that: at registration time most of these classes are not loaded,
+    /// and `declared_fields` returning empty is indistinguishable from "the
+    /// class has no fields" — `java.nio.DirectByteBuffer` is package-private and
+    /// is not among the 323 classes `bootstrap_core_classes` names. The sweep
+    /// has to run at a point where the workload has already caused the loads,
+    /// and this method exists so the launcher has one call rather than a
+    /// hand-rolled `NativeContextImpl` at the call site.
+    ///
+    /// Self-gated: with the flag off `verify_declared_slot_maps` returns before
+    /// touching a class, a name or a lock, so this costs one `OnceLock` load and
+    /// a branch — once, on a teardown path. It is observation-only in every
+    /// mode; the returned report is printed and dropped.
+    pub fn sweep_declared_slot_maps(
+        &mut self,
+        trigger: &str,
+    ) -> cratonvm_native_api::read_alias::SweepReport {
+        let ctx = crate::vm::vm_exec::NativeContextImpl {
+            shared: &self.shared,
+            thread: &mut self.main_thread,
+        };
+        cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(&ctx, trigger)
+    }
+
     /// Create a new VM with the given configuration.
     pub fn new(config: VmConfig) -> Self {
         let shared = Arc::new(SharedVm::new(config));

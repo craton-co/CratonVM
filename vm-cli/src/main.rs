@@ -4252,6 +4252,36 @@ fn run() -> Result<()> {
     // too.
     let _phase_shutdown = phase::enter(phase::Category::VmShutdown);
     tracing::info!("main() completed in {:.2}s", main_elapsed.as_secs_f64());
+
+    // W7-90: the read-side slot-map sweep's PRIMARY trigger.
+    //
+    // `read_alias::verify_declared_slot_maps` had no caller at all until this
+    // line, which is indistinguishable from a detector that reports all-clear —
+    // the species this whole campaign is about, sitting inside the instrument
+    // built to detect it. Seven `SlotMap`s were published to a sweep that never
+    // ran (W7-69 §7.2, W7-75 §7, W7-77 §7).
+    //
+    // Here rather than at registration because the sweep's one hard requirement
+    // is that the class be LOADED, and W7-69 established that at registration
+    // time most are not: `java.nio.DirectByteBuffer` is package-private and is
+    // not among the 323 classes `bootstrap_core_classes` names, so its
+    // `declared_fields` comes back empty and "not loaded" is indistinguishable
+    // from "no fields". Immediately after `main` returns is the point in the
+    // process with the most classes loaded, and it is where every other
+    // self-gated census in this launcher already prints.
+    //
+    // ABOVE the `match result` deliberately, so a workload that PANICKED out of
+    // `main` still produces its census — the same argument the missing-natives
+    // dump below makes for being unconditional. `System.exit` never reaches
+    // this line; `lang_system::native_system_exit` carries the second trigger
+    // for that path.
+    //
+    // Gated with no `else`: observation only, and the report is printed and
+    // dropped. With the flag off this is one `OnceLock` load and a branch, once.
+    if cratonvm_native_api::layout_alias::enabled() {
+        let _ = vm.sweep_declared_slot_maps("main-returned");
+    }
+
     let result = match result {
         Ok(r) => r,
         Err(panic) => {
