@@ -214,6 +214,15 @@ pub fn absorb_write_exception_recording(
 /// own dispatch above all — is absorbed here where HotSpot lets it out, and it
 /// does NOT set `trouble` (HotSpot's `catch` never sees it, so a `trouble`
 /// that HotSpot would not set would be fresh invented state, not parity).
+///
+/// W7-70 measured why that residual is not a signature problem: the `false`
+/// this returns on a failure is what makes `route_write_through_out` report
+/// "not routed", which is what sends the text to the console fast path — and
+/// that fallback is the picocli / JUnit-console `NoSuchMethodError` survival
+/// path. Propagating the `Error` deletes the fallback on exactly the case it
+/// exists for. The arity is 23 call sites, not the "dozen" this comment used
+/// to say, but the arity was never the blocker.
+/// W7-70-printstream-close-noop.md
 pub fn record_write_failure(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,

@@ -26251,19 +26251,35 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
     // `PrintWriter` receivers, and the `trouble` field is on both classes, so
     // the record is by field name on `this`.
     //
-    // Two residuals, both unchanged and both deliberate:
+    // Two residuals, both unchanged and both deliberate — and W7-70 measured
+    // that they are ONE mechanism, not two independent ones:
     //   * an `Error` is still absorbed here where HotSpot lets it out.
-    //     `route_write_through_out` returns `bool` into helpers that return
-    //     `()` across ten call sites; propagating is a signature change, not a
-    //     one-line fix. See `record_write_failure`'s doc comment.
     //   * the `bool` this returns still reports a FAILED write as "not routed",
     //     which sends the caller to the fd fast path and prints the text to
-    //     the console. HotSpot writes nowhere in that case. Left as-is: the
-    //     console fallback is what keeps output flowing when `out` is a
-    //     `Writer` shape this helper cannot address (the picocli /
-    //     JUnit-console `NoSuchMethodError` case above), and separating those
-    //     two reasons is a different lane's measurement.
-    // W7-64-printstream-trouble-and-errormanager.md
+    //     the console. HotSpot writes nowhere in that case.
+    //
+    // The second IS the first: `record_write_failure` answering `false` is
+    // exactly what makes the caller fall back, and that fallback is what keeps
+    // output flowing when the sink cannot take the call at all — the picocli /
+    // JUnit-console `NoSuchMethodError` case named above, which arrives as an
+    // `Error`. Propagating the `Error` with `?` therefore does not merely
+    // change signatures; it DELETES that fallback on the one path it exists
+    // for. Any repair has to decide what replaces it first.
+    //
+    // The signature cost is also larger than the earlier note said: `stream_write`
+    // has 12 call sites and `stream_writeln` 11 (counted on this branch —
+    // "ten" was a sample, the same way W7-57's 9 and W7-64's 52 were), all 23
+    // in native bodies that already return `MethodCallResult`, plus
+    // `stream_writeln_inner`, `printwriter_autoflush_if_needed` and this
+    // helper's own `bool`.
+    //
+    // Note also that the two branches of this function do not currently agree:
+    // the `sink_is_writer` branch above returns `false` on a failure (so it
+    // falls back) and the byte branch below returns `true` unconditionally (so
+    // it does not). Whichever way that is reconciled is a behaviour change on
+    // the hottest path in the VM and needs its own measurement.
+    // W7-64-printstream-trouble-and-errormanager.md,
+    // W7-70-printstream-close-noop.md
     let written = ctx.invoke_virtual(
         out,
         "write",
@@ -26351,9 +26367,13 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     //
     // Residual: an `Error` from that dispatch is absorbed here where HotSpot
     // would let it out. This helper and its caller `stream_writeln` both
-    // return `()` across ten call sites, so propagating is a signature change
-    // rather than a one-line fix. Recorded, not silently kept.
-    // W7-57-close-flush-swallow-sweep.md
+    // return `()`; `stream_writeln` has 11 call sites and its sibling
+    // `stream_write` 12, all 23 in native bodies that already return
+    // `MethodCallResult` — "ten" in the note this replaces was a sample,
+    // counted on W7-70's branch. The reason this is not done is not the arity:
+    // it is that the same absorption is what produces the console fallback,
+    // which is load-bearing. See `route_write_through_out`.
+    // W7-57-close-flush-swallow-sweep.md, W7-70-printstream-close-noop.md
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
 }
 
