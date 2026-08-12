@@ -206,11 +206,15 @@ tier1_tests --features synthetic-jdk` (58, including the
 `cratonvm-types --test doc_citation_paths`; and a default-feature
 `cratonvm-cli` build, since the real-JDK path must be untouched.
 
-**Not fixed here, and not caused here:** `cargo test -p cratonvm-vm --lib`
-does not compile on dev — `MonomorphicInlineCache::update` (`jit/src/lib.rs`)
-grew a fifth `jdk_only: bool` parameter and the ten call sites in
-`vm/src/vm/tests.rs` were not updated (E0061). Confirmed against a pristine
-checkout; this branch touches neither file.
+**Not fixed here, and not caused here** — closed separately the same day, see
+fixed-bugs/vm-lib-tests-did-not-compile-under-synthetic-jdk-FIXED-20260811.md:
+`cargo test -p cratonvm-vm --lib --features synthetic-jdk` did not compile on
+dev. `MonomorphicInlineCache::update` (`jit/src/lib.rs`) grew a fifth
+`jdk_only: bool` parameter and the ten call sites in `vm/src/vm/tests.rs` were
+not updated (E0061). The feature flag is load-bearing in that sentence: the
+module is `#[cfg(all(test, feature = "synthetic-jdk"))]`, so a DEFAULT `--lib`
+run compiles and passes 2,487 tests without ever seeing it. Confirmed against a
+pristine checkout; this branch touches neither file.
 
 Plus a `--synthetic-jdk` probe (`GapProbe`) covering all nine observations,
 run against Temurin 25.0.4 and against CratonVM before and after, so each
