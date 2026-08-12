@@ -6815,17 +6815,36 @@ pub(crate) fn alloc_carrier_thread_mirror(
     // Real image. No `target`: the carrier's body is Rust, and a non-null
     // Runnable here would make `Thread.run()` execute it on whichever thread
     // called `start()`.
-    let _ = ctx.invoke(
-        "java/lang/Thread",
-        "<init>",
-        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
-        &[
-            Value::Object(Some(mirror)),
-            Value::Object(None),
-            Value::Object(None),
-            Value::Object(Some(name_obj)),
-        ],
-    );
+    //
+    // The constructor's result is CHECKED, not discarded. It used to be
+    // `let _ =`, and the failure that shape produced is the one this whole
+    // repair exists to remove: allocation succeeded, so `mirror` is a
+    // full-width `java.lang.Thread`, but nothing ran, so `holder` is null,
+    // `name` is null and `tid` is 0 -- and the callers then PUBLISH it to the
+    // thread registry. That is byte-for-byte the `Unsafe.allocateInstance`
+    // shape W7-74 measured as RED against HotSpot 25 (`getName() == null`,
+    // `threadId() == 0`, and `getPriority`/`isDaemon`/`getThreadGroup`/
+    // `getState` all NPE on the null `holder`). Answering `None` instead lets
+    // the caller register no mirror and `current_thread_object` build a
+    // correct one lazily, which W7-74 section 3.2 item 5 already names as the
+    // better outcome. W7-74-short-object-repairs.md
+    if ctx
+        .invoke(
+            "java/lang/Thread",
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(mirror)),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(name_obj)),
+            ],
+        )
+        .is_err()
+    {
+        ctx.unpin_native_roots(pin);
+        return None;
+    }
     let mirror = ctx.read_native_pin(pin, mirror);
     if daemon {
         // Through the registered native, for the same last-write-wins reason:
