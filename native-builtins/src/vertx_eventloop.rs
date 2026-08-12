@@ -121,19 +121,14 @@ pub const STATE_STARTED: i32 = 1;
 pub const STATE_SHUTTING_DOWN: i32 = 2;
 pub const STATE_TERMINATED: i32 = 3;
 
-// T19_K4 — synthetic `java.lang.Thread` mirror layout. Mirrored from
-// `classloading::class_manager::synthetic_field_count` for the
-// "java/lang/Thread" arm: 5 slots, `name=0, priority=1, tid=2, target=3,
-// virtualFlag=4`.
-//
-// These two are the SYNTHETIC-image map only. The width that used to live
-// beside them (`THREAD_MIRROR_SLOTS = 5`) was deleted on 2026-08-12: it was
-// being passed to `alloc_object(ClassId::new(0), …)` on every image, including
-// real ones where `java.lang.Thread` declares 19. The allocation now goes
-// through `crate::alloc_carrier_thread_mirror`, which asks the class.
-// W7-74-short-object-repairs.md.
-const THREAD_MIRROR_NAME_SLOT: usize = 0;
-const THREAD_MIRROR_TID_SLOT: usize = 2;
+// T19_K4 — the synthetic `java.lang.Thread` mirror layout used to be declared
+// here (`THREAD_MIRROR_SLOTS/NAME_SLOT/TID_SLOT`). It moved to
+// `crate::SYNTHETIC_THREAD_MIRROR_*` on 2026-08-12
+// (W7-74-short-object-repairs.md) with the allocation itself: the width was
+// being handed to `alloc_object(ClassId::new(0), …)` on EVERY image, including
+// real ones where `java.lang.Thread` declares 19, and `xnio_io_thread.rs`
+// carried an open-coded copy of the same three numbers. One declaration, one
+// allocator (`crate::alloc_carrier_thread_mirror`), which asks the class.
 
 // ---------------------------------------------------------------------------
 // Resource caps
@@ -2475,7 +2470,7 @@ mod tests {
         let mirror_ptr_usize = ctx.native_thread_java_obj_ptr(vm_tid);
         assert_ne!(mirror_ptr_usize, 0);
         let mirror = unsafe { ObjectRef::from_raw(mirror_ptr_usize as *mut u8) };
-        let name_obj = match ctx.get_field(mirror, THREAD_MIRROR_NAME_SLOT) {
+        let name_obj = match ctx.get_field(mirror, crate::SYNTHETIC_THREAD_MIRROR_NAME_SLOT) {
             Value::Object(Some(o)) => o,
             other => panic!("name slot must hold a String ref, got {other:?}"),
         };
@@ -2500,7 +2495,7 @@ mod tests {
         assert_ne!(vm_tid, 0);
         let mirror_ptr = ctx.native_thread_java_obj_ptr(vm_tid);
         let mirror = unsafe { ObjectRef::from_raw(mirror_ptr as *mut u8) };
-        match ctx.get_field(mirror, THREAD_MIRROR_TID_SLOT) {
+        match ctx.get_field(mirror, crate::SYNTHETIC_THREAD_MIRROR_TID_SLOT) {
             Value::Long(t) => assert_eq!(t as u64, vm_tid, "tid slot must equal vm_thread_id"),
             other => panic!("tid slot must hold a Long, got {other:?}"),
         }

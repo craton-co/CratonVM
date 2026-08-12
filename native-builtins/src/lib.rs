@@ -6680,6 +6680,11 @@ fn populate_real_thread_holder(
 /// image the class declares 19 (`javap -p java.lang.Thread`, JDK 25.0.3.9,
 /// counted transitively with `static` excluded) and the funnel widens to that.
 pub(crate) const SYNTHETIC_THREAD_MIRROR_SLOTS: usize = 5;
+/// `name` on the synthetic layout. On the REAL layout slot 0 is `eetop`.
+pub(crate) const SYNTHETIC_THREAD_MIRROR_NAME_SLOT: usize = 0;
+/// `tid` on the synthetic layout. On the REAL layout slot 2 is `name` — which
+/// is why writing a `Long` here on a real image was never merely "short".
+pub(crate) const SYNTHETIC_THREAD_MIRROR_TID_SLOT: usize = 2;
 
 /// Does an object this crate JUST ALLOCATED for `java/lang/Thread` carry the
 /// synthetic five-slot layout rather than the real JDK one?
@@ -6793,8 +6798,16 @@ pub(crate) fn alloc_carrier_thread_mirror(
         // the synthetic class's real layout, and `MockNativeContext` reports
         // `class_num_total_fields == 0`, so this is also the arm the T19_K4
         // tests exercise.
-        ctx.set_field(mirror, 0, Value::Object(Some(name_obj)));
-        ctx.set_field(mirror, 2, Value::Long(vm_tid as i64));
+        ctx.set_field(
+            mirror,
+            SYNTHETIC_THREAD_MIRROR_NAME_SLOT,
+            Value::Object(Some(name_obj)),
+        );
+        ctx.set_field(
+            mirror,
+            SYNTHETIC_THREAD_MIRROR_TID_SLOT,
+            Value::Long(vm_tid as i64),
+        );
         ctx.unpin_native_roots(pin);
         return Some(mirror);
     }
