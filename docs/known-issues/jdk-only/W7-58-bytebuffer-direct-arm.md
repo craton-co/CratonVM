@@ -452,3 +452,21 @@ and renaming it would lose the trail.
 * **Whether `register_nio_natives` should overwrite the s2 family in synthetic
   mode at all** (§7). The losers are the better code. That is the question this
   lane surfaced and did not answer.
+
+Two pre-existing hazards seen while migrating, neither introduced nor fixed
+here, both recorded so the next reader does not have to re-find them:
+
+* **The typed `slice`/`slice(int,int)`/`duplicate` macro holds a resolved
+  `ObjectRef` across an allocation.** `bb_state` is called on `this`, then
+  `alloc_typed_buffer` runs — a collection point — and the earlier view's
+  array reference is used afterwards. The old tuple form had exactly the same
+  shape (`let (arr, …) = bb_state(…)` … `alloc_typed_buffer` … `arr`), so this
+  is unchanged, but it is the `pin_native_root` / `read_native_pin` idiom that
+  `s2_bb_alloc` uses two files over and this family does not.
+* **A `native-builtins` typed VIEW carries its byte start in slot 4 as
+  `-(offset + 1)`**, which `s2_bb_int_byte_off` decodes. `bb_resolve_heap_offset`
+  reads `offset`-by-name and slot 6, so a native-io typed accessor applied to
+  such a view indexes from element 0 of the shared array rather than from the
+  view's window. Also unchanged — the old `bb_state` returned the array with no
+  offset at all — but it means the two families disagree about where a view
+  starts, and native-io's is the registration that wins (§7).
