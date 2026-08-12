@@ -77,9 +77,13 @@ worked examples of the gap, all from this directory:
 * **W2-3** is at 44/44 and its `isAutomatic()` check passes **vacuously** —
   `isAutomatic()` is a hardcoded `false` and the vector never asserts otherwise.
 * **W6-8**'s headline fix is exercised by **no vector at all**.
-* **W6-2** is at 44/44 while a subtype check is missing on one of its two
+* **W6-2** was at 44/44 while a subtype check was missing on one of its two
   provider paths, because the fixture's provider is a *correct* subtype and only
-  the positive case is ever walked (§2.2).
+  the positive case was ever walked (§2.2). **Fixed 2026-08-12
+  (`W7-85-serviceloader-stream-validation.md`); the vector is now 104/104 and
+  the example stands as written.** It remains the cleanest instance of the
+  shape: a guard installed on one of two siblings, validated by a fixture that
+  only ever satisfies it.
 * **L15**'s field narrowing was landed and unexercised until 2026-08-12, because
   every field assertion in `RJdkReflect` called `setAccessible(true)` first.
 
@@ -157,7 +161,7 @@ The headline is closed and the vector passes; a specific sibling case is not.
 | `W3-4-forkjointask-status-flags-and-the-eager-default.md` | The eager-fork flip's blast radius on the Spring/H2 slice is unverified — and the two Rust guards for the now-non-default lazy path are **vacuous** (`apps/fjp_probe/` does not exist, so both tests early-return). |
 | `W4-1-publiclookup-allowedmodes-never-checked.md` | Four unit tests aimed at code no live path reaches (`native-builtins/src/classloader.rs`), green and guarding nothing. Its dead 332-line block was deleted by W7-62. **Two of its own claims are struck — §2.4.** |
 | `W4-2-unnamed-accessor-bypasses-encapsulation.md` | Array classes report module `java.base` regardless of component type — `classloading/src/class_manager.rs:9568`, unconditional. **The only live item, and `RETIREMENT-20260811.md` does not mention it.** |
-| `W6-2-module-serviceloader-provider-factory.md` | **Two rows, both found 2026-08-12 while adjudicating this record for retirement.** (1) `service_accepts_type` (`native-builtins/src/service_loader.rs:1677`) has exactly **one** caller, at `:1897` — the **iterator** path. The **stream** path (`:2401-2420`) computes `factory_return_type` and never asks it, so an illegal module-declared factory provider raises `ServiceConfigurationError` from `iterator()` and is quietly handed out by `stream()`. 44/44 cannot see it: the fixture's provider returns a *correct* subtype. (2) The constructor-form subtype check is absent on both constructor paths — downgraded from "argued refusal" to "deferred for want of a measurement", since its stated reason is that the lane could not measure it. |
+| `W6-2-module-serviceloader-provider-factory.md` | **ONE row, not two — row (1) was fixed 2026-08-12 by `W7-85-serviceloader-stream-validation.md`,** which mirrored the factory return-type gate onto the stream path, matched HotSpot's message on both, and swept the rest of the file. `RJdkModule` is now 104/104 on HotSpot with a negative fixture; the RED it was measured against had `stream().map(Provider::get)` handing out a `String` for a service interface. **Still open:** the constructor-form subtype check, absent on both paths, plus the sibling W7-85 found beside it — the JDK's **public** no-arg constructor requirement, also absent on both paths (both use `getDeclaredConstructor` and silently skip). One census of the boot modules' `provides` clauses settles both; nobody has taken it. |
 | `W6-6-nativelibraries-load-fabricated-success.md` | The boot-loader case cannot fire on either road, because `BootLoader.loadLibrary` is a no-op and `record_boot_loader_library` has zero callers. W5-1 owns the arming, and it **needs a measurement** (§2.6). Recorded 2026-08-12: that no-op's `NativeKind` is **ambient** and must stay `Bridge` — a `SyntheticStub` there would be dropped under `--jdk-only`, restoring the Linux boot-class native-library lock the short-circuit exists to avoid. |
 | `W6-8-method-invoke-exports-gate.md` | `unreflectSetter` on a trusted-final field is unchecked; the module half of `find*`/`unreflect*` is absent by design; `unreflectSpecial`'s `specialCaller` conjunct is unenforced; **and no vector asserts the positive**. |
 | `W6-12-stampedlock-split-brain.md` | The `Collections` fidelity residual, **structurally confined to `--synthetic-jdk` by construction** — `phases_early`'s identity bindings reach the registry only through `lib::register_synthetic_overrides`, which is a `#[cfg(not(feature = "synthetic-jdk"))]` no-op shim (`vm/src/native/builtins.rs:29`), so they are *compiled out* of both shipping binaries rather than out-voted. Order would not have saved it — their ambient kind is `Intrinsic`, which `JdkOnly` does **not** drop. A feature binary now exists (W7-50, 63/7); what has never been run is one in the `--synthetic-jdk` **mode**. The `Phaser` fix is unproven for the same reason. |
@@ -218,7 +222,14 @@ mode with nothing to fall back to) ·
 running VM, not `args[1]` as recorded) ·
 `W7-81-write-route-three-way.md` (its 23 call sites were a red herring; the
 defect was one helper mapping three inputs onto two outputs differently per
-branch)
+branch) ·
+`W7-85-serviceloader-stream-validation.md` (closes `W6-2`'s first row. Its RED
+and its HotSpot oracle were BOTH measured — on the dev binary and on HotSpot
+25.0.3.9 — so what is unverified is only the fix; the vector, `RJdkModule`, is
+in `JDKONLY_CLASSES` and runs 104/104 on the oracle. Read its population table
+before touching `service_loader.rs`: it names which of the file's validations
+are enforced on both provider paths, which on one, and which on neither, and it
+corrects one divergence that a source read predicts and a measurement refutes)
 
 Also filed 2026-08-12 and in the same state:
 `W7-41-format-exception-subclasses.md` ·
