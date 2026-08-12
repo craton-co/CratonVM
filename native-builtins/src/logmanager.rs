@@ -4189,6 +4189,23 @@ fn stamp_inferred_caller(ctx: &mut dyn NativeContext, record: ObjectRef) {
     let record = ctx.read_native_pin(record_pin, record);
     ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(cls_obj)));
     ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(mth_obj)));
+    // The real setters clear this; stamping the fields directly must too, or
+    // the pair is written into a record that still believes it owes an
+    // inference. That was inert while `getSourceClassName` was a shadow doing a
+    // bare field read, but those four triples are retired under `--jdk-only`
+    // since 2026-08-12 (native-api/src/retired_shadow.rs), so the REAL getter —
+    // `if (needToInferCaller) inferCaller(); return sourceClassName;` — now
+    // runs there and would overwrite this stamp with whatever its own walk
+    // found. Every `java/util/logging/` entry point into this file is itself
+    // retired in strict mode, so today that is reachable only via a non-JUL
+    // receiver (e.g. the `org/jboss/logmanager/` bridges, which are not in the
+    // retirement table); write the flag rather than rely on that staying true.
+    //
+    // Inert in `Compatible`, where the four accessors still dispatch as natives
+    // and none of them reads this flag. W7-56-infercaller-strict.md
+    if crate::log_record_real_layout(ctx, record) {
+        ctx.set_field_by_name(record, "needToInferCaller", Value::Int(0));
+    }
     ctx.unpin_native_roots(cls_pin);
     ctx.unpin_native_roots(record_pin);
 }
