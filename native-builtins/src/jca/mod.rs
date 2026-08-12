@@ -70,7 +70,7 @@ use cratonvm_native_api::NativeMethodRegistry;
 pub(crate) fn make_named_provider(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     name: &str,
-) -> Result<cratonvm_types::ObjectRef, cratonvm_types::MethodCallFailed> {
+) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::MethodCallFailed> {
     use cratonvm_types::Value;
     let p = crate::try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
     let name_s = ctx.create_string(name);
