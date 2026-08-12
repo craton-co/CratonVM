@@ -31,4 +31,10 @@ module cratonvm.jdkonly.svc {
     // raise ServiceConfigurationError. Do not "fix" WrongFactory.
     provides com.cratonvm.jdkonly.svc.Rejected
             with com.cratonvm.jdkonly.svc.internal.WrongFactory;
+
+    // The other illegal factory shape, and the one javac CAN express: a
+    // provider() that returns null. It must fail at Provider.get(), not while
+    // the wrapper is built -- see Nulled.
+    provides com.cratonvm.jdkonly.svc.Nulled
+            with com.cratonvm.jdkonly.svc.internal.NullProvider;
 }

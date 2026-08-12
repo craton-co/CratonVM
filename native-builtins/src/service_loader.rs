@@ -2044,25 +2044,44 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                         Value::Object(Some(empty_args)),
                     ],
                 );
-                ctx.unpin_native_roots(class_pin);
                 let inst = match invoked {
-                    Ok(Some(Value::Object(Some(o)))) => o,
+                    Ok(Some(Value::Object(Some(o)))) => {
+                        ctx.unpin_native_roots(class_pin);
+                        o
+                    }
                     // `ProviderImpl.invokeFactoryMethod` fails the load on a null
                     // return. Skipping the provider here would be a fabricated
                     // success for a configuration the spec rejects.
+                    //
+                    // The `stream()` path reports this through the REAL
+                    // `ProviderImpl.invokeFactoryMethod` bytecode at
+                    // `Provider.get()`, so it already carried the JDK's exact
+                    // wording. Render the same text here — the two paths
+                    // disagreeing about the message for the same provider is
+                    // the smaller sibling of the defect this whole record is
+                    // about, and `RJdkModule` now asserts they are equal.
+                    // `factory_pin` still stands at this point on purpose:
+                    // `Method.toString()` is an allocating invoke and
+                    // `class_pin` (taken first) would take it down with it.
                     Ok(_) => {
+                        let factory_now = ctx.read_native_pin(factory_pin, factory);
+                        let rendered = factory_method_display(ctx, factory_now, &fqn);
+                        ctx.unpin_native_roots(class_pin);
                         let sl_now = ctx.read_native_pin(sl_pin, sl);
                         let service_name = sl_service_name(ctx, sl_now);
                         if let Some(error) = service_configuration_error(
                             ctx,
-                            &format!("{service_name}: provider() of {fqn} returned null"),
+                            &format!("{service_name}: {rendered} returned null"),
                         ) {
                             ctx.unpin_native_roots(sl_pin);
                             return Err(error);
                         }
                         continue;
                     }
-                    Err(failure) => return Err(provider_construction_error(ctx, &fqn, failure)),
+                    Err(failure) => {
+                        ctx.unpin_native_roots(class_pin);
+                        return Err(provider_construction_error(ctx, &fqn, failure));
+                    }
                 };
                 list = ctx.read_native_pin(list_pin, list);
                 let inst_pin = ctx.pin_native_root(inst);

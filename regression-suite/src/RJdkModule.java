@@ -1,5 +1,6 @@
 import com.cratonvm.jdkonly.svc.Exported;
 import com.cratonvm.jdkonly.svc.Greeter;
+import com.cratonvm.jdkonly.svc.Nulled;
 import com.cratonvm.jdkonly.svc.Rejected;
 import com.cratonvm.jdkonly.svc.open.Opened;
 import java.io.ByteArrayOutputStream;
@@ -95,12 +96,14 @@ public class RJdkModule {
             provides.add(p.service() + "->" + impls.size());
         }
         Collections.sort(provides);
-        // Two services: Greeter with two legal providers, and Rejected with the
-        // single ILLEGAL one whose provider() return type is not a subtype (see
-        // moduleServiceRejects). The descriptor records the clause either way --
-        // the JDK's subtype rule is enforced at load, not at resolution.
+        // Three services: Greeter with two legal providers, and the two illegal
+        // factory shapes -- Rejected (provider() return type is not a subtype)
+        // and Nulled (provider() answers null). See moduleServiceRejects. The
+        // descriptor records all three clauses either way: the JDK's rules here
+        // are enforced at LOAD, not at resolution.
         check(provides.equals(Arrays.asList(
                 "com.cratonvm.jdkonly.svc.Greeter->2",
+                "com.cratonvm.jdkonly.svc.Nulled->1",
                 "com.cratonvm.jdkonly.svc.Rejected->1")), "provides: " + provides);
 
         check(d.requires().stream().anyMatch(r -> r.name().equals("java.base")),
@@ -297,6 +300,33 @@ public class RJdkModule {
 
     static final String REJECTED_SERVICE = "com.cratonvm.jdkonly.svc.Rejected";
     static final String WRONG_FACTORY = "com.cratonvm.jdkonly.svc.internal.WrongFactory";
+    static final String NULLED_SERVICE = "com.cratonvm.jdkonly.svc.Nulled";
+    static final String NULL_PROVIDER = "com.cratonvm.jdkonly.svc.internal.NullProvider";
+
+    /**
+     * {@code ProviderImpl.invokeFactoryMethod}'s null guard. Measured on
+     * HotSpot 25.0.3.9:
+     *
+     * <pre>
+     * java.util.ServiceConfigurationError: com.cratonvm.jdkonly.svc.Nulled:
+     *   public static com.cratonvm.jdkonly.svc.Nulled
+     *   com.cratonvm.jdkonly.svc.internal.NullProvider.provider() returned null
+     * </pre>
+     */
+    static void checkNullRejection(String where, Throwable t, Object handedOut) {
+        check(t != null, where + " must not hand out a null provider (got " + handedOut + ")");
+        check(t.getClass() == ServiceConfigurationError.class,
+                where + " must raise ServiceConfigurationError exactly, not "
+                        + t.getClass().getName() + ": " + t);
+        String m = t.getMessage();
+        check(m != null, where + " ServiceConfigurationError must carry a message");
+        check(m.startsWith(NULLED_SERVICE + ": "),
+                where + " message must open with the service name: " + m);
+        check(m.contains(NULL_PROVIDER), where + " message must name the provider: " + m);
+        check(m.endsWith("returned null"), where + " message tail: " + m);
+        check(t.getCause() == null,
+                where + " ServiceLoader.fail(service, msg) leaves no cause, got " + t.getCause());
+    }
 
     /**
      * The NEGATIVE half of the module-path {@code provider()} factory form:
@@ -385,6 +415,57 @@ public class RJdkModule {
             streamFirstErr = t;
         }
         checkRejection("stream().findFirst()", streamFirstErr, viaStreamFirst);
+
+        // --- the OTHER illegal factory shape: provider() answers null --------
+        // Different rule, different moment. `ProviderImpl.invokeFactoryMethod`
+        // raises only when the factory has actually been called, so
+        // `Provider.type()` must still answer normally and only `get()` throws.
+        // Asserting the type() call is the non-vacuous half: a VM that refuses
+        // a null-returning factory while building the wrapper would satisfy
+        // "get() throws" and still be wrong.
+        List<String> nulledTypes = ServiceLoader.load(Nulled.class).stream()
+                .map(p -> p.type().getName())
+                .collect(java.util.stream.Collectors.toList());
+        check(nulledTypes.equals(Collections.singletonList(NULLED_SERVICE)),
+                "Provider.type() must answer before get() is ever called: " + nulledTypes);
+
+        List<String> viaNullIterator = null;
+        Throwable nullIteratorErr = null;
+        try {
+            List<String> ids = new ArrayList<>();
+            for (Nulled n : ServiceLoader.load(Nulled.class)) {
+                ids.add(String.valueOf(n));
+            }
+            viaNullIterator = ids;
+        } catch (Throwable t) {
+            nullIteratorErr = t;
+        }
+        checkNullRejection("iterator()", nullIteratorErr, viaNullIterator);
+
+        List<String> viaNullStream = null;
+        Throwable nullStreamErr = null;
+        try {
+            viaNullStream = ServiceLoader.load(Nulled.class).stream()
+                    .map(p -> String.valueOf(p.get()))
+                    .collect(java.util.stream.Collectors.toList());
+        } catch (Throwable t) {
+            nullStreamErr = t;
+        }
+        checkNullRejection("stream().get()", nullStreamErr, viaNullStream);
+
+        // The two paths must not merely both throw -- they must report the SAME
+        // provider failure the same way. Comparing them needs no hardcoded
+        // oracle string and catches precisely the class of bug this section
+        // exists for: one path validating, the other not, or the two drifting
+        // into different wordings for one configuration error.
+        check(nullIteratorErr.getMessage().equals(nullStreamErr.getMessage()),
+                "iterator() and stream() must agree on the message:\n  iterator: "
+                        + nullIteratorErr.getMessage() + "\n  stream:   "
+                        + nullStreamErr.getMessage());
+        check(iteratorErr.getMessage().equals(streamErr.getMessage()),
+                "iterator() and stream() must agree on the message:\n  iterator: "
+                        + iteratorErr.getMessage() + "\n  stream:   "
+                        + streamErr.getMessage());
 
         // The legal service is untouched by the illegal one declared beside it,
         // and is still legal AFTER the refusals -- a "fix" that refuses
