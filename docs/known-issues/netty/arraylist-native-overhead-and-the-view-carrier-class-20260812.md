@@ -42,8 +42,23 @@ Measured on an idle box, after the memo fix:
 | `ArrayList.get(i)` | 3 ns | 428 ns | **7×** (plain Java: 62 ns) |
 
 `ArrayList.size()` is `getfield size; ireturn`. The interpreter executes that in
-27 ns when it is ordinary bytecode. It costs 337 ns as a native, and the gap is
-the view-discrimination chain.
+27 ns when it is ordinary bytecode. It costs 337 ns as a native.
+
+**How much of that 337 ns is view discrimination is not established here.** A
+sibling profile of the same VM
+([adaptive-bytebuf-allocator-throughput](adaptive-bytebuf-allocator-throughput-20260812.md))
+puts ~30% of CPU on call-transfer machinery — JIT entry/exit bookkeeping, the
+dispatch around it, and the native-registry probe — at roughly **200 ns of
+bookkeeping per entry**, paid by every native call regardless of its body. That
+is a floor this fix cannot go below, and it accounts for most of the remaining
+337 ns. The view-discrimination chain is what is left on top of it, and it is
+the part a carrier-class change could remove.
+
+The two findings agree on the shape of the problem: CratonVM's cost is per-call,
+spread across shim families that stand in for ordinary JDK bytecode
+(`Math.min(II)I` as a native is one machine instruction turned into a registry
+lookup plus a call transfer). This page is one concrete, now-partly-fixed
+instance of that.
 
 ## Why it matters beyond one netty test
 
