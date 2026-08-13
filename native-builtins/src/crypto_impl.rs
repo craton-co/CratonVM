@@ -2313,6 +2313,39 @@ impl Rsa {
         matches!(Self::try_verify_sha256(key, message, signature), Ok(true))
     }
 
+    /// PKCS#1 v1.5 verification for an arbitrary digest, **fail-closed
+    /// `bool`** — [`Self::verify_sha256`] generalised.
+    ///
+    /// The certificate-chain verifier (`x509_manager::verify_one_signature`)
+    /// dispatches on the signature-algorithm OID, and every
+    /// `sha*WithRSAEncryption` differs from the next ONLY in which digest goes
+    /// into the DigestInfo. The core it delegates to has taken a
+    /// [`DigestAlgorithm`] all along, so the whole RSA family is this one
+    /// function rather than four near-copies — and in particular nothing here
+    /// touches the in-tree [`Self::pkcs1v15_encode`], whose DigestInfo prefix
+    /// is hard-coded to SHA-256.
+    ///
+    /// Same fail-closed collapse and the same reason as `verify_sha256`: the
+    /// caller (chain validation) has no exception channel, and a refusal and a
+    /// mismatch both mean "do not trust this chain".
+    pub fn verify_pkcs1_v15(
+        key: &RsaPublicKey,
+        digest: cratonvm_native_builtins_crypto::signature::DigestAlgorithm,
+        message: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        matches!(
+            cratonvm_native_builtins_crypto::signature::verify_rsa_pkcs1_v15_checked(
+                &key.n.to_bytes_be(),
+                &key.e.to_bytes_be(),
+                digest,
+                message,
+                signature,
+            ),
+            Ok(true)
+        )
+    }
+
     /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
     /// `00 01 FF.. 00 || T`).
     ///
