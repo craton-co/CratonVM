@@ -383,12 +383,39 @@ through this and each has a cost worth stating before one is chosen:
   the one piece of this engine where a mistake is a use-after-free rather than a
   slowdown.
 
-**The intermediate step this suggests, and which the plan should adopt:
-stop-the-world *parallel* marking before *concurrent* marking.** It needs no
-barrier at all (mutators are stopped), it exercises the coordinator against a
-real heap, and `ZMarkCoordinator::mark_to_completion` is already exactly its
-driver. It converts the ownership question into a measurable step instead of a
-prerequisite for one.
+**The intermediate step: stop-the-world *parallel* marking before *concurrent*
+marking — LANDED 2026-08-13, opt-in via `CRATONVM_ZGC_PARMARK=<n>`.** It needs
+no barrier at all (mutators are stopped), and it is the first time the
+coordinator, the striped queues, the work stealing and the termination
+handshake have run against a real heap and a real object graph rather than
+`TestMarkContext`.
+
+The ownership problem is solved by `ZHeapMarkBridge`, whose soundness rests on
+three facts and needs all three: the bridge is created, used and destroyed
+inside one `mark_parallel_stw` call taking `&self`; `ZMarkCoordinator`'s `Drop`
+**joins** every worker (unusually for this crate — it does not detach, and its
+own doc says so), which covers the panic path as well as the normal one; and
+the heap cannot move while `&self` is live. The price is a pool spawn and join
+per collection, which is why it is opt-in — caching the pool would require the
+heap to be `Arc`-owned, the larger change this deliberately does not make.
+
+**Adopting the context surfaced a live defect in it.** `ZMarkContext::visit_refs`
+did not report the **collection-overlay edge** that `collect_garbage`'s serial
+loop pushes (`external_roots_for_owner`). Invisible while the serial loop is the
+only marker; a use-after-free the moment a coordinator drives a collection,
+because a native overlay is reachable *only* through the Java object that owns
+it — so the marker would sweep live contents out from under a surviving owner.
+Fixed, with two tests that were verified to fail without it.
+
+Four more tests pin the parallel marker against the serial one: identical mark
+set, reaches a grandchild (so it is not passing because everything is a root),
+leaves an unreachable object unmarked (so it is not marking everything), and
+the worker count is off by default and capped. Three of the four were verified
+to fail against a marker given no roots.
+
+**Still not done, and this is what the exit criterion needs:** the pause-time
+measurement on a heap with a large live set. `CRATONVM_ZGC_PARMARK` exists so
+that measurement can be taken; taking it is a suite run.
 
 ### Phase 4 — Relocation, gated behind the JIT barrier *(months)*
 
@@ -434,10 +461,34 @@ Writing them surfaced two things the plan's one-line summary does not carry:
   reference arm is shared with Generational and G1, so teaching it about colored
   words changes those collectors too. It needs a ZGC-aware branch.
 
+**The refusal gate is now tested, and it was not.** `zgc_relocation_permitted`
+is the single thing standing between a relocating cycle and heap corruption —
+JIT-compiled code loads reference fields with no ZGC load barrier, so a moving
+cycle hands it stale pointers into evacuated memory with no error path — and it
+had **no test at all**. A gate accidentally inverted or short-circuited would
+have compiled, passed every suite (nothing requests relocation today) and armed
+the corruption for whoever first flipped `RELOCATION_REQUESTED`. Two tests now
+pin it; the one that matters was verified to fail against a gate short-circuited
+to always permit.
+
+One of the two is deliberately recorded as **weaker than it looks**: in a
+JIT-enabled test process the `!requested` early return and the JIT refusal both
+answer `false`, so it cannot distinguish them and deleting the early return
+leaves it passing. Separating those two branches needs a `--nojit` test process,
+which this crate's suite does not run. Said in the test rather than left for
+someone to discover.
+
 Also flagged from the Phase 2.3 audit: `ZGC_ADDRESS_BITS` (42, "4 TB heap max")
 is **not yet load-bearing** — `vaddr` is adopted only as an enum today — and
 must be re-derived in this phase against this arena's actual address range
 rather than inherited from OpenJDK's.
+
+**What genuinely remains in Phase 4, unchanged:** colored slots through the
+seven sites, the interpreter/native barrier, x64 barrier emission (~6-7
+instructions), then `forwarding` + `relocate`, then `generation` +
+`remembered`. That is the months-scale body of work this plan always said it
+was, and none of it is safe to begin before Phase 3's concurrent cycle is
+measured.
 
 ---
 

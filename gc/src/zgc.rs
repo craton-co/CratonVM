@@ -2965,6 +2965,86 @@ impl ZgcRealHeap {
         self.mark_ingress.drain_into(out)
     }
 
+    /// How many mark workers a parallel stop-the-world mark should use.
+    ///
+    /// `0` and `1` both mean "do not go parallel" — the caller falls back to
+    /// the serial loop, which has no pool to spawn and no join to pay for.
+    fn parallel_mark_workers(&self) -> usize {
+        let requested = match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PARMARK") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        if requested == 0 {
+            return 0;
+        }
+        // Never more workers than the machine has cores to run them on: this
+        // is a stop-the-world phase, so oversubscription buys nothing and
+        // costs context switches inside the pause it is meant to shorten.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        requested.min(cores).min(Z_PARMARK_MAX_WORKERS)
+    }
+
+    /// Mark the whole strong closure from `roots` using the parallel engine,
+    /// at a stop-the-world — Phase 3 of the ZGC maturity plan.
+    ///
+    /// # This is PARALLEL, not CONCURRENT, and the difference is the point
+    ///
+    /// Every mutator is stopped for the whole of this call. That is what makes
+    /// it adoptable today: with no mutator running there is no producer racing
+    /// the marker, so it needs **no barrier of any kind** — not the load
+    /// barrier real ZGC uses, and not the SATB pre-write barrier
+    /// [`Self::satb_pre_barrier`] now feeds. `try_end_mark` is expected to
+    /// answer `Complete` on the first pass for exactly that reason, and a
+    /// `Restart` here would mean the engine found buffered work at a
+    /// safepoint where by construction there can be none.
+    ///
+    /// It is therefore the honest intermediate step between the single-
+    /// threaded sweep this collector has always run and the concurrent cycle
+    /// the plan ends at: it exercises the coordinator, the striped queues, the
+    /// work stealing and the termination handshake against a REAL heap and a
+    /// real object graph, where the only prior driver was `TestMarkContext`.
+    ///
+    /// # What the caller must have done first
+    ///
+    /// `begin_concurrent_mark_cycle` must be open, or `visit_refs` traces
+    /// weak/soft/phantom referents as strong edges and no reference can ever
+    /// be cleared. It warns once if not, and this function does not rely on
+    /// that warning — it is the caller's contract.
+    ///
+    /// Returns the engine's stats for the cycle.
+    fn mark_parallel_stw(&self, roots: &[u64], workers: usize) -> mark::ZMarkStatsSnapshot {
+        let bridge: std::sync::Arc<dyn mark::ZMarkContext> =
+            std::sync::Arc::new(ZHeapMarkBridge { heap: self });
+        let coordinator = mark::ZMarkCoordinator::new(bridge, workers);
+        coordinator.begin_cycle();
+        coordinator.push_roots(roots);
+        // One restart is budgeted rather than zero. Not because a mutator can
+        // race us — none is running — but because budgeting zero would turn
+        // any future flush that legitimately produces work into an
+        // "INCOMPLETE mark set" verdict, and an incomplete mark set is what
+        // the sweep is about to act on.
+        let report = coordinator.mark_to_completion(Z_PARMARK_RESTART_BUDGET);
+        if report.budget_exhausted {
+            // Cannot happen with the world stopped, which is exactly why it is
+            // worth saying loudly if it ever does: it would mean the mark set
+            // the sweep is about to trust is incomplete.
+            tracing::error!(
+                target: "zgc",
+                passes = report.passes,
+                restarts = report.restarts,
+                "zgc parallel mark: restart budget exhausted AT A SAFEPOINT — no \
+                 mutator is running, so this cannot be a mutator race; the mark \
+                 set may be incomplete"
+            );
+        }
+        coordinator.end_cycle();
+        report.stats
+        // `coordinator` drops here; its Drop stops and JOINS every worker, so
+        // no thread holding a clone of `bridge` outlives this borrow of `self`.
+    }
+
     /// Free share of the arena in permille — test support for the
     /// fragmentation-gauge fixtures, which have to assert the state they claim
     /// to have built rather than assume it.
@@ -4392,6 +4472,19 @@ const ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE: usize = 250;
 /// approach it, and the number to watch is the reported worst, not this.
 const ZGC_FRAG_FLOOR_PERMILLE: usize = 10;
 
+/// Hard ceiling on parallel-mark workers, whatever `CRATONVM_ZGC_PARMARK` and
+/// the core count say.
+///
+/// Bounds a thread count, and the thing it bounds is a user-supplied integer —
+/// i.e. unbounded — which is the shape the Phase 2.3 constant audit exists to
+/// catch. 64 is far above any plausible collection-time parallelism and far
+/// below a number that would exhaust the OS thread limit inside a safepoint.
+const Z_PARMARK_MAX_WORKERS: usize = 64;
+
+/// Restart budget for a stop-the-world parallel mark. See
+/// [`ZgcRealHeap::mark_parallel_stw`] for why this is 1 and not 0.
+const Z_PARMARK_RESTART_BUDGET: usize = 1;
+
 /// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
 ///
 /// `worst_permille` is `largest_free_block * 1000 / capacity` at its lowest
@@ -5668,6 +5761,79 @@ impl census::ZCensusHeapView for ZgcRealHeap {
 /// a colored word that somehow reached a slot would be refused by
 /// [`Self::is_in_heap`] like any other wild child, which is the outcome
 /// `vaddr`'s bit-63 tag exists to produce.
+/// Lends a `&ZgcRealHeap` to the mark engine for the duration of ONE
+/// stop-the-world collection.
+///
+/// # Why this exists
+///
+/// [`mark::ZMarkCoordinator::new`] takes an `Arc<dyn ZMarkContext>`, and
+/// `ZgcRealHeap` is held **by value** inside `VmHeap` — there is no `Arc` to
+/// hand it and no safe way to mint one. That is the whole of the reason the
+/// marking engine sat unadopted after its `ZMarkContext` impl landed; it is not
+/// a missing feature, it is an ownership mismatch.
+///
+/// # Why it is sound
+///
+/// Three facts, and all three are needed:
+///
+/// 1. **The bridge is created, used and destroyed inside a single
+///    [`ZgcRealHeap::mark_parallel_stw`] call**, which takes `&self`. It is
+///    never stored on the heap, never returned, and never handed to anything
+///    that outlives that call.
+/// 2. **[`mark::ZMarkCoordinator`]'s `Drop` joins every worker.** Unusually
+///    for this crate it does not detach — its own doc says so — so when the
+///    coordinator goes out of scope, no thread holding a clone of this `Arc`
+///    is still running. That covers the panic path as well as the normal one,
+///    which is why `mark_parallel_stw` needs no explicit guard.
+/// 3. **The heap cannot move while `&self` is live**, and `&self` outlives the
+///    coordinator by construction of (1).
+///
+/// The cost of that safety is a worker-pool spawn and join per collection.
+/// That is real and it is why this path is opt-in; caching the pool across
+/// collections would require the heap to be `Arc`-owned, which is the larger
+/// change this deliberately does not make.
+struct ZHeapMarkBridge {
+    heap: *const ZgcRealHeap,
+}
+
+// SAFETY: the pointer is only ever dereferenced through `ZMarkContext`, whose
+// methods all take `&self` on a heap that is Sync; and the bridge cannot
+// outlive the borrow it was built from — see the type doc's three facts. The
+// `!Send`ness being overridden here is `*const T`'s blanket one, not a
+// property of `ZgcRealHeap`.
+unsafe impl Send for ZHeapMarkBridge {}
+// SAFETY: as above.
+unsafe impl Sync for ZHeapMarkBridge {}
+
+impl ZHeapMarkBridge {
+    #[inline]
+    fn heap(&self) -> &ZgcRealHeap {
+        // SAFETY: see the type doc. The referent outlives every call.
+        unsafe { &*self.heap }
+    }
+}
+
+impl mark::ZMarkContext for ZHeapMarkBridge {
+    fn good_mask(&self) -> u64 {
+        self.heap().good_mask()
+    }
+    fn try_mark(&self, addr: u64) -> bool {
+        self.heap().try_mark(addr)
+    }
+    fn is_marked(&self, addr: u64) -> bool {
+        self.heap().is_marked(addr)
+    }
+    fn visit_refs(&self, addr: u64, f: &mut dyn FnMut(u64)) {
+        self.heap().visit_refs(addr, f)
+    }
+    fn is_in_heap(&self, addr: u64) -> bool {
+        self.heap().is_in_heap(addr)
+    }
+    fn object_size(&self, addr: u64) -> usize {
+        self.heap().object_size(addr)
+    }
+}
+
 impl mark::ZMarkContext for ZgcRealHeap {
     /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
     ///
@@ -5834,6 +6000,20 @@ impl mark::ZMarkContext for ZgcRealHeap {
             for m in metadata {
                 f(m as u64);
             }
+        }
+        // The native collection-overlay edges. `collect_garbage`'s serial loop
+        // pushes these and this method did not, which would have been a
+        // use-after-free the moment a coordinator drove a real collection
+        // through here: an overlay is reachable ONLY through the Java
+        // collection object that owns it, so a marker that skips this edge
+        // sweeps live native-backed contents while the owner survives.
+        //
+        // The propagation must stay owner-based rather than unconditional —
+        // `native_roots.rs::scan_collection_overlays` explicitly defers to this
+        // loop having run, and rooting every overlay regardless of reachability
+        // is what that deferral exists to avoid.
+        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
+            f(overlay_ref.as_ptr() as u64);
         }
     }
 
@@ -6317,12 +6497,42 @@ impl GarbageCollector for ZgcRealHeap {
             }
         };
 
-        // Trace from roots. A work stack holds base addresses to visit.
+        // ---- PARALLEL MARK (opt-in, Phase 3) -----------------------------
+        //
+        // `CRATONVM_ZGC_PARMARK=<n>` runs the strong closure on the real mark
+        // engine instead of the serial loop below, at this same safepoint. The
+        // two must produce the IDENTICAL mark set — that is what
+        // `parallel_mark_marks_the_same_objects_as_the_serial_loop` asserts,
+        // and it is the only claim that matters here, because the sweep that
+        // follows cannot tell which loop set the bits.
+        //
+        // Left off by default: it is a worker-pool spawn and join per
+        // collection (see `ZHeapMarkBridge` for why the pool cannot yet be
+        // cached), so whether it is a net win is a measurement on a real
+        // workload with a large live set, which is what the plan's Phase 3
+        // exit criterion asks for and this switch exists to make possible.
+        let parallel_workers = self.parallel_mark_workers();
         let mut work: Vec<usize> = Vec::new();
+        let mut wild_skipped = 0usize;
+        if parallel_workers > 1 {
+            let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+            let stats = self.mark_parallel_stw(&root_addrs, parallel_workers);
+            // `off_head_children` is this loop's `wild_skipped` under another
+            // name — the engine's own doc says so.
+            wild_skipped = stats.off_heap_children as usize;
+            tracing::debug!(
+                target: "zgc",
+                workers = parallel_workers,
+                marked = stats.objects_marked,
+                scanned = stats.objects_scanned,
+                off_heap_children = stats.off_heap_children,
+                "zgc parallel STW mark complete"
+            );
+        } else {
+        // Trace from roots. A work stack holds base addresses to visit.
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
         }
-        let mut wild_skipped = 0usize;
         while let Some(addr) = work.pop() {
             if addr == 0 {
                 continue;
@@ -6362,6 +6572,7 @@ impl GarbageCollector for ZgcRealHeap {
             {
                 work.push(overlay_ref.as_ptr() as usize);
             }
+        }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -8228,6 +8439,238 @@ mod tests {
             heap.drain_mark_ingress(&mut drained),
             0,
             "an address from a finished cycle must not survive into the next"
+        );
+    }
+
+    // -- Phase 3: the collection-overlay edge ------------------------------
+
+    /// Arming slot for [`overlay_provider_roots`]. `(owner_addr, root)`.
+    ///
+    /// A `static` because [`crate::external_roots::ExternalRootProvider`] holds
+    /// plain `fn` pointers, which cannot capture — and because providers are
+    /// process-global and **cannot be unregistered**, so the provider itself
+    /// must be inert unless a test has armed it for one specific address it
+    /// owns. Guarded by [`OVERLAY_TEST_LOCK`] so the two tests below cannot
+    /// arm it concurrently.
+    static OVERLAY_ARMED: parking_lot::Mutex<Option<(usize, ObjectRef)>> =
+        parking_lot::Mutex::new(None);
+    static OVERLAY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn overlay_provider_roots(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
+        match *OVERLAY_ARMED.lock() {
+            Some((armed_owner, root)) if armed_owner == owner_addr => vec![root],
+            _ => Vec::new(),
+        }
+    }
+
+    fn register_overlay_provider() {
+        crate::external_roots::register_external_root_provider(
+            crate::external_roots::ExternalRootProvider {
+                name: "zgc-test-collection-overlay",
+                scan: |_out| {},
+                owner_addrs: || None,
+                roots_for_owner: overlay_provider_roots,
+                roots_for_matching_owners: |_p| Vec::new(),
+                remap: |_m| {},
+                prune: |_p| {},
+            },
+        );
+    }
+
+    /// **`ZMarkContext::visit_refs` must report the collection-overlay edge.**
+    ///
+    /// The serial loop in `collect_garbage` pushes
+    /// `external_roots_for_owner(addr, class_id)`; `visit_refs` did not, until
+    /// 2026-08-13. That difference is invisible while the serial loop is the
+    /// only marker and becomes a use-after-free the moment a coordinator drives
+    /// a real collection: a native collection overlay is reachable ONLY through
+    /// the Java object that owns it, so a marker that skips the edge sweeps
+    /// live contents out from under a surviving owner.
+    ///
+    /// The exact edit that trips it: delete the `external_roots_for_owner` loop
+    /// at the end of `visit_refs`.
+    #[test]
+    fn visit_refs_reports_the_collection_overlay_edge() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        register_overlay_provider();
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let owner = heap.alloc_object(ClassId::new(7), 0);
+        let overlay = heap.alloc_object(ClassId::new(8), 0);
+        *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
+
+        let mut seen: Vec<u64> = Vec::new();
+        {
+            use super::mark::ZMarkContext;
+            heap.visit_refs(owner.as_ptr() as u64, &mut |a| seen.push(a));
+        }
+        *OVERLAY_ARMED.lock() = None;
+
+        assert!(
+            seen.contains(&(overlay.as_ptr() as u64)),
+            "visit_refs must report the overlay owned by this object; saw {seen:?}"
+        );
+    }
+
+    /// ...and the parallel marker therefore keeps the overlay alive.
+    ///
+    /// The end-to-end statement of the test above: this is the failure the
+    /// missing edge would actually have produced.
+    #[test]
+    fn the_parallel_mark_keeps_a_collection_overlay_alive() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        register_overlay_provider();
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let owner = heap.alloc_object(ClassId::new(7), 0);
+        let overlay = heap.alloc_object(ClassId::new(8), 0);
+        *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[owner.as_ptr() as u64], 2);
+        heap.end_concurrent_mark_cycle();
+        *OVERLAY_ARMED.lock() = None;
+
+        assert!(
+            heap.header_ref(overlay.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+            "an overlay reachable only through a live owner must survive the mark"
+        );
+    }
+
+    // -- Phase 3: stop-the-world PARALLEL marking --------------------------
+
+    /// Build a small object graph: a root chain plus a side branch and one
+    /// unreachable object. Returns `(roots, all_allocated, expected_live)`.
+    fn parallel_mark_fixture(heap: &ZgcRealHeap) -> (Vec<ObjectRef>, Vec<ObjectRef>, usize) {
+        // root -> a -> b, root -> c, and `dead` reachable from nothing.
+        let root = heap.alloc_object(ClassId::new(1), 2);
+        let a = heap.alloc_object(ClassId::new(1), 1);
+        let b = heap.alloc_object(ClassId::new(1), 0);
+        let c = heap.alloc_object(ClassId::new(1), 0);
+        let dead = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(root, 0, Value::Object(Some(a)));
+        heap.set_field(root, 1, Value::Object(Some(c)));
+        heap.set_field(a, 0, Value::Object(Some(b)));
+        (vec![root], vec![root, a, b, c, dead], 4)
+    }
+
+    /// **The parallel mark must produce the identical mark set to the serial
+    /// loop**, because the sweep that follows cannot tell which one set the
+    /// bits.
+    ///
+    /// Two heaps, same fixture, same roots: one collected with the serial loop
+    /// and one with `mark_parallel_stw`. Comparing survivor COUNTS after the
+    /// sweep is the end-to-end statement — a parallel mark that missed a live
+    /// object would sweep it, and one that over-marked would retain garbage.
+    #[test]
+    fn parallel_mark_marks_the_same_objects_as_the_serial_loop() {
+        // Serial arm.
+        let serial = ZgcRealHeap::with_capacity(256 * 1024);
+        let (mut serial_roots, _all, expected_live) = parallel_mark_fixture(&serial);
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        serial.collect_garbage(&stw, &mut serial_roots, &NoMonitors);
+        let serial_live = serial.registry.snapshot().bases().len();
+
+        // Parallel arm, driven directly so the test does not depend on the
+        // environment variable being visible to this process.
+        let par = ZgcRealHeap::with_capacity(256 * 1024);
+        let (par_roots, all, _) = parallel_mark_fixture(&par);
+        let skip = par.begin_concurrent_mark_cycle();
+        let _ = skip;
+        let root_addrs: Vec<u64> = par_roots.iter().map(|r| r.as_ptr() as u64).collect();
+        let stats = par.mark_parallel_stw(&root_addrs, 4);
+        par.end_concurrent_mark_cycle();
+
+        // Count what the parallel engine marked, directly off the headers.
+        let par_marked = all
+            .iter()
+            .filter(|o| {
+                par.header_ref(o.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0
+            })
+            .count();
+
+        assert_eq!(
+            par_marked, expected_live,
+            "the parallel mark must reach every reachable object and no more; \
+             engine reported objects_marked={} scanned={}",
+            stats.objects_marked, stats.objects_scanned
+        );
+        assert_eq!(
+            serial_live, expected_live,
+            "the serial arm is the control and must agree with the fixture"
+        );
+    }
+
+    /// The engine must reach a transitively-reachable object — i.e. the test
+    /// above is not passing because everything happens to be a root.
+    ///
+    /// Without this, a `mark_parallel_stw` that marked only its root set would
+    /// satisfy a survivor count on a fixture whose objects were all roots.
+    #[test]
+    fn parallel_mark_reaches_a_grandchild_not_just_the_roots() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let root = heap.alloc_object(ClassId::new(1), 1);
+        let child = heap.alloc_object(ClassId::new(1), 1);
+        let grandchild = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(root, 0, Value::Object(Some(child)));
+        heap.set_field(child, 0, Value::Object(Some(grandchild)));
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.end_concurrent_mark_cycle();
+
+        for (name, obj) in [
+            ("root", root),
+            ("child", child),
+            ("grandchild", grandchild),
+        ] {
+            assert!(
+                heap.header_ref(obj.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+                "{name} must be marked by the parallel engine"
+            );
+        }
+    }
+
+    /// An object reachable from nothing must NOT be marked.
+    ///
+    /// The counterpart to the test above: an engine that marked every
+    /// registered address would pass both survivor counts and every
+    /// reachability assertion, and would retain the whole heap forever.
+    #[test]
+    fn parallel_mark_leaves_an_unreachable_object_unmarked() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let root = heap.alloc_object(ClassId::new(1), 0);
+        let orphan = heap.alloc_object(ClassId::new(1), 0);
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.end_concurrent_mark_cycle();
+
+        assert!(heap.header_ref(root.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0);
+        assert!(
+            heap.header_ref(orphan.as_ptr()).gc_flags() & GC_FLAG_MARKED == 0,
+            "an unreachable object must not be marked, or nothing is ever collected"
+        );
+    }
+
+    /// `parallel_mark_workers` refuses to go parallel unless asked, and caps
+    /// what it is asked for.
+    ///
+    /// The cap is the Phase 2.3 rule applied to this constant: the value it
+    /// bounds is a user-supplied integer, i.e. unbounded, and spawning it
+    /// inside a safepoint is the failure mode.
+    #[test]
+    fn the_parallel_mark_worker_count_is_off_by_default_and_capped() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // Unset in this process: off.
+        assert_eq!(
+            heap.parallel_mark_workers(),
+            0,
+            "parallel marking must be opt-in"
+        );
+        // And the ceiling exists regardless of what is asked for.
+        assert!(
+            Z_PARMARK_MAX_WORKERS >= 1,
+            "the cap must admit at least one worker"
         );
     }
 

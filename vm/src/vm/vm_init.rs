@@ -9237,6 +9237,57 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod zgc_relocation_gate_tests {
+    use super::zgc_relocation_permitted;
+
+    /// **Relocation must be refused whenever the JIT is enabled**, and this is
+    /// the only thing standing between a relocating cycle and heap corruption.
+    ///
+    /// JIT-compiled code loads reference fields with no ZGC load barrier, so a
+    /// cycle that moved an object would hand it a stale pointer into evacuated
+    /// memory — a use-after-free with no error path. `zgc_relocation_permitted`
+    /// is the refusal, and until 2026-08-13 **nothing tested it**: a gate whose
+    /// body was accidentally inverted, or short-circuited to `requested`, would
+    /// have compiled, passed every suite (nothing requests relocation today)
+    /// and armed the corruption for whoever first flipped
+    /// `RELOCATION_REQUESTED`.
+    ///
+    /// The contract is stated as an equality with `disable_jit()` rather than
+    /// as a constant, so this test pins the same rule in both configurations
+    /// instead of only in whichever one the test process happens to be in.
+    #[test]
+    fn relocation_is_permitted_only_when_the_jit_is_off() {
+        let jit_off = crate::runtime::env_cache::disable_jit();
+        assert_eq!(
+            zgc_relocation_permitted(true),
+            jit_off,
+            "requested relocation must be permitted IF AND ONLY IF the JIT is              disabled; with the JIT on, compiled code loads reference fields              without the ZGC load barrier and a moving cycle hands it stale              pointers"
+        );
+    }
+
+    /// Not requested is not permitted — the branch `vm_init` actually takes
+    /// today (`RELOCATION_REQUESTED = false`).
+    ///
+    /// **Weaker than it looks, and saying so is the point.** In a test process
+    /// with the JIT enabled the `!requested` early return and the JIT refusal
+    /// both answer `false`, so this assertion cannot distinguish them:
+    /// deleting the early return leaves it passing. It is kept as a statement
+    /// of the contract, not as a mutation detector, and the detector for the
+    /// branch that matters is
+    /// [`relocation_is_permitted_only_when_the_jit_is_off`] — verified to fail
+    /// when the gate is short-circuited to always permit. A `--nojit` test
+    /// process is what would separate these two, and this crate's suite does
+    /// not run one.
+    #[test]
+    fn relocation_that_was_not_requested_is_never_permitted() {
+        assert!(
+            !zgc_relocation_permitted(false),
+            "the gate must never permit relocation nobody asked for"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
