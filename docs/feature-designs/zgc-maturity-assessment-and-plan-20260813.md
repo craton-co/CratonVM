@@ -597,17 +597,45 @@ obligation is recorded where it can be acted on: **if inline reference emission
 is ever re-enabled under an armed barrier, that function must go back to
 `false`**, and the test pinning the disjunction goes red.
 
-**What still genuinely remains**, and it is now a short list:
+**Phase 4's code is complete. What is left is one measurement and two
+directions, and they are not the same kind of thing.**
 
-* **Inline x64 barrier emission** (~6-7 instructions on the fast path). Pure
-  throughput: correctness is already carried by the helper route. It is the
-  only part of stage (a) not done, and the part that was always an
-  optimisation.
-* **Replacing `Arena` with `ZPageAllocator`.** No longer a precondition for
-  anything being adopted, but it is what turns the generational split from
-  *accounting* into a real young space, and what `zgc::relocate`'s concurrent
-  evacuator wants.
-* **Making any of it default-on**, which is a suite measurement, not code.
+*The phase's own exit criterion* is "relocation on, JIT on, both suites at
+parity, and the ~1.5x heap premium gone". Two of the four are now facts:
+relocation is on (opt-in, `CRATONVM_ZGC_RELOCATE=1`) and the JIT is on
+(`zgc_relocation_permitted` no longer refuses for it). **The other two are a
+suite measurement**, which is the same gate every default-on decision in this
+plan carries and is the one thing no amount of code closes.
+
+*Inline x64 barrier emission is CLOSED by decision, not deferred* -- and the
+reason is now an assertion, `an_armed_zgc_barrier_and_inline_reference_emission_cannot_coexist`.
+Every inline compact-field arm is gated on
+`narrow_oops_block_inline_fields`, which returns `true` whenever the barrier is
+armed. So the inline arm is **not emitted at all** in the only state where a
+barrier would have work to do; an inline sequence would execute exclusively
+with the barrier disarmed, where it is required to be the identity transform
+(bad mask 0, address mask all-ones, heap base 0) -- six instructions of
+provable no-op on the hottest path in the VM. Making it worthwhile means first
+*removing* the helper routing, which trades a mechanism that is correct today
+for one that is not yet validated, and validating it is a throughput
+measurement. If anyone lifts the ZGC clause out of that predicate the test
+fails, and at that moment the emission stops being dead code and becomes
+mandatory.
+
+*Two directions beyond this plan*, recorded here because they were identified
+while implementing it and not because any phase asks for them:
+
+* **Replacing `Arena` with `ZPageAllocator`.** It was believed to block
+  `generation`, `relocate` and `remembered`; that turned out to be false --
+  page-keyed modules need an id, live bytes and an extent, not an allocator,
+  and all three are adopted over a logical grid. What it would still buy is a
+  real young *space* rather than young *accounting*, and somewhere for
+  `zgc::relocate`'s concurrent evacuator to evacuate to.
+* **Concurrent relocation.** `zgc_concurrent`'s driver plus the load barrier
+  plus a page allocator is the full OpenJDK shape; the stop-the-world
+  compaction landed here is the honest intermediate.
+
+
 
 **R6's `VmHeap::Zgc` arm audit is DONE (2026-08-13).**
 

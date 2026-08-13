@@ -6891,4 +6891,61 @@ mod loop_xform_tests {
         );
     }
 
+    /// **Inline reference emission and an armed ZGC barrier are mutually
+    /// exclusive by construction**, and that is why there is no inline barrier
+    /// sequence in this backend.
+    ///
+    /// `zgc-jit-load-barrier.md` scopes stage (a) as "colored slots +
+    /// interpreter/native barrier + x64 barrier emission (~6-7 instructions on
+    /// the fast path)". The first two landed on 2026-08-13. The third was
+    /// **closed by decision, not deferred**, and this test is the reason
+    /// written as an assertion:
+    ///
+    /// `narrow_oops_block_inline_fields` — the predicate every inline
+    /// compact-field arm is gated on — returns `true` whenever the barrier is
+    /// armed. So the inline arm is not emitted at all in the only state where
+    /// a barrier would have anything to do. An inline sequence would therefore
+    /// execute exclusively with the barrier disarmed, where it is required to
+    /// be the identity transform (bad mask 0, address mask all-ones, heap base
+    /// 0) — six instructions of provable no-op on the hottest path in the VM.
+    ///
+    /// Making it worthwhile means first REMOVING the helper routing, i.e.
+    /// trading a mechanism that is correct today for one that is not yet
+    /// validated. That is a throughput change and it needs a suite
+    /// measurement, which is the same gate every other default-on decision in
+    /// the maturity plan carries.
+    ///
+    /// If someone lifts the ZGC clause out of
+    /// `narrow_oops_block_inline_fields`, this test fails — and at that moment
+    /// inline emission stops being dead code and starts being mandatory,
+    /// because `zgc_codegen_honours_read_barrier` would be lying.
+    #[test]
+    fn an_armed_zgc_barrier_and_inline_reference_emission_cannot_coexist() {
+        // Disarmed: inline emission is available (unless narrow oops, which is
+        // the pre-existing clause and is not what this test is about).
+        cratonvm_types::set_zgc_read_barrier_armed(false);
+        let inline_blocked_when_disarmed = zgc_read_barrier_blocks_inline_fields();
+
+        cratonvm_types::set_zgc_read_barrier_armed(true);
+        let inline_blocked_when_armed = zgc_read_barrier_blocks_inline_fields();
+        let gate_when_armed = narrow_oops_block_inline_fields();
+        cratonvm_types::set_zgc_read_barrier_armed(false);
+
+        assert!(
+            !inline_blocked_when_disarmed,
+            "a disarmed barrier must not cost the inline arms anything"
+        );
+        assert!(
+            inline_blocked_when_armed,
+            "an armed barrier must block inline reference emission"
+        );
+        assert!(
+            gate_when_armed,
+            "...and it must do so THROUGH the gate the inline arms actually              consult, or the block is decorative"
+        );
+        assert!(
+            zgc_codegen_honours_read_barrier(),
+            "the capability `zgc_relocation_permitted` trusts rests on exactly              the property asserted above"
+        );
+    }
 }
