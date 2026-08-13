@@ -1770,11 +1770,22 @@ impl Compiler {
                 // null check. Array layout is compact 8-byte pointers (matches the already-
                 // inlined `aaload` path).
                 //
-                // ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
-                // the ASE check (the interpreter does it via `set_array_element`). This inline
-                // path matches the helper's behavior exactly — no regression. Wiring an inline
-                // ASE check is a follow-up that needs type-narrowing infrastructure (not yet
-                // tracked in this JIT).
+                // ArrayStoreException: enforced here by calling
+                // `jit_aastore_type_check` before the store (see below).
+                //
+                // This note used to read "the current `jit_aastore` helper does
+                // NOT enforce the ASE check … no regression". That premise was
+                // true when written, and was falsified when the check landed in
+                // `jit_aastore` — silently, because this path had already
+                // stopped calling that helper and a premise in a comment is not
+                // a compile-time link. For the ~day it stood, a JIT-compiled
+                // `aastore` performed the store and raised nothing:
+                // `RExceptions` reads `cold=[java.lang.Integer] hot=[no-throw]`
+                // at i≈500, i.e. the tier-parity assertion caught it the moment
+                // the method tiered up. The claim that an inline ASE check
+                // "needs type-narrowing infrastructure" is also not so: type
+                // narrowing is what would let a check be ELIDED, not what makes
+                // one correct.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
@@ -1785,6 +1796,44 @@ impl Compiler {
                     // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
                     self.emit_null_check_array_store_at(code, pc);
                     self.emit_bounds_check(pc);
+                    // JVMS §aastore covariance check, BEFORE anything mutates:
+                    // on a refusal no element may be written and no barrier may
+                    // run. `jit_aastore_type_check` answers 0 (legal) or the
+                    // i64::MIN sentinel, having stashed the
+                    // ArrayStoreException; `emit_post_invoke_exception_check`
+                    // routes the sentinel through the same drain
+                    // `jit_checkcast`'s ClassCastException uses.
+                    //
+                    // A null value is legal for every reference array, so it
+                    // branches over the call entirely — `arr[i] = null` keeps
+                    // costing a test and a not-taken jump. Everything else pays
+                    // one call, which is the price of the JVMS rule; the arm
+                    // already makes one (SATB) to two (card mark) helper calls.
+                    self.load_slot_to_reg(RDX, val_slot);
+                    self.buf.emit(&[0x48, 0x85, 0xD2]); // TEST RDX, RDX
+                    self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> past the call
+                    let ase_skip_patch = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    // Args: (vm_ptr, array_ptr, value_ptr).
+                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                    self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                    // The refusal path allocates (it builds the throwable), so
+                    // spill and publish an oop map exactly as `checkcast` does.
+                    self.emit_pre_safepoint_spill();
+                    self.emit_call_absolute(self.helpers.aastore_type_check);
+                    self.emit_oop_map_for_safepoint();
+                    self.emit_post_invoke_exception_check(b'V');
+                    self.emitted_aastore_throw = true;
+                    {
+                        let here = self.buf.pos() as i32;
+                        let rel = here - (ase_skip_patch as i32 + 4);
+                        self.buf.try_patch_i32(ase_skip_patch, rel).ok();
+                    }
+                    // The call clobbers the scratch registers; re-establish
+                    // RAX=array / RCX=index for the SATB load below.
+                    self.load_slot_to_reg(RAX, array_slot);
+                    self.load_slot_to_reg(RCX, index_slot);
                     // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
                     // Inline-load the OLD reference at the slot and pipe it
                     // through `jit_satb_pre_write_barrier(vm_ptr, old_ref)`

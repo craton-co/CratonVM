@@ -1411,7 +1411,7 @@ impl SharedVm {
         // mean — a recorded violation plus a WARN naming the consequence, not
         // a silent `None`.
         let enum_impl_id =
-            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 2);
+            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 4);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
         // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
         // `org.apache.commons.logging.LogFactory.getResources`) can perform
@@ -3981,6 +3981,14 @@ impl SharedVm {
         // VM is registered, so it falls through to a no-op.
         cratonvm_classloading::install_resolution_invalidate_hook(resolution_invalidate_adapter);
 
+        // Give the GC crate a way to turn a `ClassId` into a name for its
+        // failure-path reports. Same bridge, same reason: the gc crate cannot
+        // name a `Class`. Without it the ZGC fragmentation report can only say
+        // `class_id=418`, and the second run needed to decode that is a
+        // different process with a different heap layout — so the answer does
+        // not carry over. See `cratonvm_gc::collector::set_class_namer`.
+        cratonvm_gc::collector::set_class_namer(class_name_adapter);
+
         // Found while investigating the guarded-inline-getfield SIGSEGV
         // cluster (that SIGSEGV's actual cause was a separate, already-fixed
         // bug — see `jit_invalidate_adapter`'s doc comment): `install_jit_invalidate_hook`
@@ -4218,6 +4226,30 @@ pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
     if !already {
         reg.push(weak);
     }
+}
+
+/// The `set_class_namer` adapter: `ClassId` -> binary name, for GC
+/// diagnostics only.
+///
+/// `try_read` rather than `read`, and this is load-bearing. Every caller is a
+/// failure-path report, and at least one of them (the ZGC fragmentation
+/// report) runs on a thread that has just failed an allocation — a thread that
+/// may well be the one holding the class-manager write lock further up its own
+/// stack. Blocking there would convert a diagnostic into a hang, which is
+/// strictly worse than an unnamed class id. A contended lock therefore falls
+/// back to the id, which is exactly what the caller prints when no namer is
+/// installed at all.
+fn class_name_adapter(class_id: u32) -> Option<String> {
+    let cid = crate::classloading::ClassId::new(class_id);
+    for shared in live_hook_vms() {
+        let Some(cm) = shared.classes.class_manager.try_read() else {
+            continue;
+        };
+        if let Some(class) = cm.get_class(cid) {
+            return Some(class.name.to_string());
+        }
+    }
+    None
 }
 
 /// The `ResolutionInvalidateHook` adapter handed to
@@ -9204,6 +9236,57 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod zgc_relocation_gate_tests {
+    use super::zgc_relocation_permitted;
+
+    /// **Relocation must be refused whenever the JIT is enabled**, and this is
+    /// the only thing standing between a relocating cycle and heap corruption.
+    ///
+    /// JIT-compiled code loads reference fields with no ZGC load barrier, so a
+    /// cycle that moved an object would hand it a stale pointer into evacuated
+    /// memory — a use-after-free with no error path. `zgc_relocation_permitted`
+    /// is the refusal, and until 2026-08-13 **nothing tested it**: a gate whose
+    /// body was accidentally inverted, or short-circuited to `requested`, would
+    /// have compiled, passed every suite (nothing requests relocation today)
+    /// and armed the corruption for whoever first flipped
+    /// `RELOCATION_REQUESTED`.
+    ///
+    /// The contract is stated as an equality with `disable_jit()` rather than
+    /// as a constant, so this test pins the same rule in both configurations
+    /// instead of only in whichever one the test process happens to be in.
+    #[test]
+    fn relocation_is_permitted_only_when_the_jit_is_off() {
+        let jit_off = crate::runtime::env_cache::disable_jit();
+        assert_eq!(
+            zgc_relocation_permitted(true),
+            jit_off,
+            "requested relocation must be permitted IF AND ONLY IF the JIT is              disabled; with the JIT on, compiled code loads reference fields              without the ZGC load barrier and a moving cycle hands it stale              pointers"
+        );
+    }
+
+    /// Not requested is not permitted — the branch `vm_init` actually takes
+    /// today (`RELOCATION_REQUESTED = false`).
+    ///
+    /// **Weaker than it looks, and saying so is the point.** In a test process
+    /// with the JIT enabled the `!requested` early return and the JIT refusal
+    /// both answer `false`, so this assertion cannot distinguish them:
+    /// deleting the early return leaves it passing. It is kept as a statement
+    /// of the contract, not as a mutation detector, and the detector for the
+    /// branch that matters is
+    /// [`relocation_is_permitted_only_when_the_jit_is_off`] — verified to fail
+    /// when the gate is short-circuited to always permit. A `--nojit` test
+    /// process is what would separate these two, and this crate's suite does
+    /// not run one.
+    #[test]
+    fn relocation_that_was_not_requested_is_never_permitted() {
+        assert!(
+            !zgc_relocation_permitted(false),
+            "the gate must never permit relocation nobody asked for"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -2479,6 +2479,43 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Same argument, for the classes a map view is now minted under
+    // (native-collections' `MAP_VIEW_CARRIERS`). These are REAL JDK classes,
+    // and their real bodies read `this$0` — which a CratonVM-minted view
+    // leaves null, because the view's state lives in ArrayList's own
+    // `elementData`/`size` slots instead. Every method the carriers declare
+    // themselves has to reach the registered native or it runs a JDK body over
+    // a layout that is not the JDK's.
+    //
+    // `equals`/`hashCode` are deliberately absent: the JDK's views inherit
+    // `AbstractCollection`'s identity semantics, which is what CratonVM should
+    // answer too, and there is no native registered for them on these classes
+    // (see `register_map_view_carrier_natives`).
+    if matches!(
+        class_name,
+        "java/util/HashMap$Values"
+            | "java/util/LinkedHashMap$LinkedValues"
+            | "java/util/TreeMap$Values"
+            | "java/util/TreeMap$EntrySet"
+            | "java/util/Hashtable$ValueCollection"
+            | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+    ) && matches!(
+        method_name,
+        "size"
+            | "isEmpty"
+            | "contains"
+            | "iterator"
+            | "toArray"
+            | "toString"
+            | "remove"
+            | "clear"
+            | "forEach"
+            | "stream"
+            | "removeIf"
+            | "spliterator"
+    ) {
+        return true;
+    }
     // BUG (found investigating the Tomcat Jasper/ecj JSP-compile NPE,
     // TestDefaultServlet.testBug57601 / TestMapperWebapps.testWelcomeFileStrict):
     // this function is the ONLY force-native gate consulted by the

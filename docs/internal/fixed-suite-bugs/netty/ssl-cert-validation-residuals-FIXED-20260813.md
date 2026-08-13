@@ -97,6 +97,18 @@ entry kind in one load. Measured on netty's own `mutual_auth_server.p12`
 up by the alias its own test data documents missed. Fixed in
 `native-builtins/src/keystore.rs`.
 
+## The one row that was NOT a shared cause
+
+The original doc grouped `BouncyCastleUtilTest` with the OCSP classes on the
+grounds that all three moved when BouncyCastle appeared on the classpath. A
+concurrent session root-caused that one separately — `Security.getProvider`
+returned a stand-in rather than the registered `Provider` object, so
+`BouncyCastleUtil`'s `instanceof BouncyCastleProvider` test failed — and it is
+fixed (2/2) under the retired
+`bouncycastleutiltest-security-getprovider-identity` write-up. It shares no
+cause with the rows above: the OCSP failures were a missing
+`CertStore.Collection` service and an abstract `getServerCertificates()`.
+
 ## What is left
 
 `SslContextBuilderTest`'s `testInvalidCipherJdk` (an `IllegalArgumentException`

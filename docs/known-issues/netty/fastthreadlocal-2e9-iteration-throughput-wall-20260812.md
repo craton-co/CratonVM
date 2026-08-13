@@ -115,6 +115,72 @@ changed.**
   `CRATONVM_DBG_JIT_SCAN_PROF=1` reports `jit_entries` exactly equal to the
   iteration count, which is the tell: one JIT boundary crossing per `new`.
 
+## The optimizing tier dispatched `Object.<init>` once per allocation (FIXED 2026-08-13)
+
+Measured with `CRATONVM_DBG_MIC_PROF=1` on `probes/CtorOnly.java`, which runs
+ONE loop so a whole-process profile is a profile of that shape:
+
+```
+disp_calls   = 8 393 503   for 4 197 000 iterations   -> TWO dispatches per `new`
+cyc_disp_total / disp_calls = 784 cycles per dispatch
+```
+
+`CRATONVM_DBG_MIC_TRACE=1` names them: `CtorOnly$F.<init>(I)V` **and
+`java/lang/Object.<init>()V`** — the terminal `super()` of the constructor
+chain, dispatched through the full helper for a method whose body is `return`.
+
+The single-pass backend has elided that call since it was written
+(`x64::bytecode_walk`'s `0xb7` arm: "the method body is a bare `return` and the
+VM-side registration is `native_noop_with_this`… without this it falls to
+`jit_invoke_dispatch`'s interpreter slow path once per object allocation").
+**The IR tier had no equivalent**, and it could not reach the existing
+machinery for two independent reasons:
+
+* `is_elidable_construction` **refuses `java/lang/Object`** — a registered
+  native shadows its bytecode, which is the exact hazard that check exists for
+  (`HashMap.<init>()V` was the incident) — so the pc never enters
+  `trivial_init_pcs`;
+* `trivial_init_pcs` is only supplied to the builder when the method contains a
+  `new` (`!scan.new_ops.is_empty()`), and **a constructor contains none**. This
+  is the same premise `cov-04` already found wrong in the direct-call gate a few
+  hundred lines away ("35 of the compiles this term disabled had no `new` at
+  all — they were compiled CONSTRUCTORS"); it survived here.
+
+Fixed by giving the IR builder its own `object_init_pcs` set, populated from the
+names `lib.rs` has already resolved for `invoke_info`, and elided on any
+receiver — the single-pass rule, narrowed to the literal
+`java/lang/Object.<init>()V` (the single-pass copy also catches
+resolver-rewritten user constructors; this one deliberately does not).
+
+`disp_calls` halves exactly, 8 393 503 → 4 197 002:
+
+| loop (ns/op) | HotSpot | dev | + elision |
+|---|---|---|---|
+| `new F(i)` where `F(int v){i=v;}` | 2.5 | 617 | **210** (2.9x) |
+| `new A()` where `A(){i=ATOMIC.getAndIncrement();}` | 6.8 | 612 | **306** (2.0x) |
+| `new Object()` (no constructor call) | 3.1 | 79 | 78 — unchanged |
+| **`new FastThreadLocal<Boolean>()`, the real class** | **16.2** | **833** | **383** (2.2x) |
+
+Extrapolated to this test's 2 147 483 639 iterations, the real loop goes from
+**1788 s to 822 s** (HotSpot: 35 s). `lastVariableIndex()` advances by exactly
+the iteration count in both arms, so the correctness half is untouched.
+
+Gates: `cargo test -p cratonvm-jit --lib` 1990 passed / 0 failed;
+`probes/EA.java` exact on both arms and on HotSpot; the 17-class netty network
+slice byte-identical to `dev`.
+
+### What still costs, after the elision
+
+Re-profiled (`perf record`, same loop). `alloc_tlab` is now the largest single
+entry at 11.4% — i.e. real work — and the remaining dispatch machinery
+(`jit_invoke_dispatch`, `push_entry_full`, `try_call_compiled_entry_reentrant`,
+`pin_jit_code_range_owner`, `pop_jit_entry`, `jit_activation::enter`,
+`gc_quiescence::leave`, `forward_jit_reference_args`) still sums to ~40%: the
+ONE surviving dispatch, the `<init>` call itself. A further ~6.5% is a
+per-allocation class-initialisation re-check
+(`is_class_initialized_via_manager` + `ensure_class_initialized_shared`) reached
+from `jit_new_object`, for a class whose initialised state is monotonic.
+
 ### What landed for it, and the blocker that remains
 
 `jit/src/lib.rs`'s IR (optimizing) tier refused to bind a constructor site

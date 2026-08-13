@@ -1123,6 +1123,16 @@ pub struct JitRuntimeHelpers {
     /// behaviour. Appended at the END of the struct so all prior golden
     /// offsets stay stable.
     pub ldc_class_cp: usize,
+
+    /// `aastore` element-type check — JVMS §aastore covariance.
+    ///
+    /// Returns 0 when the store is legal and the `i64::MIN` deopt sentinel
+    /// when it is not, having stashed a real `ArrayStoreException` through the
+    /// JIT_THREAD TLS. The x64 emitter lowers `aastore` inline (null check,
+    /// bounds check, SATB barrier, store, card mark) and so never reaches
+    /// [`Self::aastore`]; this is the one piece of that helper the inline path
+    /// cannot do for itself, because the answer needs the class manager.
+    pub aastore_type_check: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1296,6 +1306,7 @@ helper_fields! {
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
     // and bail the compile — the pre-fix behaviour.
     (ldc_class_cp,                   FieldKind::OptionalPtr),
+    (aastore_type_check,             FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1321,7 +1332,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 63,
+    JitRuntimeHelpers::NUM_FIELDS == 64,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1714,6 +1725,7 @@ mod tests {
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
             ldc_class_cp: 0x11B8,
+            aastore_type_check: 0x11C0,
         }
     }
 
@@ -1949,6 +1961,7 @@ mod tests {
             monitor_enter: 0,
             monitor_exit: 0,
             ldc_class_cp: 0,
+            aastore_type_check: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2124,8 +2137,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 63.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 63);
+        // And the macro-driven count is the canonical 64.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 64);
     }
 
     #[test]
@@ -2438,6 +2451,11 @@ mod tests {
                 "ldc_class_cp",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_class_cp),
             ),
+            (
+                63,
+                "aastore_type_check",
+                std::mem::offset_of!(JitRuntimeHelpers, aastore_type_check),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -2491,7 +2509,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 42, "required-pointer count drifted");
+        assert_eq!(req, 43, "required-pointer count drifted");
         assert_eq!(opt, 12, "optional-pointer count drifted");
         assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -2535,7 +2553,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -2581,7 +2599,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 42, "expected 42 required pointers");
+        assert_eq!(required.len(), 43, "expected 43 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -2696,6 +2714,7 @@ mod tests {
             "jit_drem" => h.jit_drem = 0,
             "ldc_string" => h.ldc_string = 0,
             "set_throw_bci" => h.set_throw_bci = 0,
+            "aastore_type_check" => h.aastore_type_check = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

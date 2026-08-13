@@ -2908,8 +2908,34 @@ fn safe_native_call_impl(
         // where the bytes had gone. `old_gen_needs_gc` is the same 75 %
         // threshold both major-GC branches use, so the collection this admits
         // is exactly the one that reclaims old.
+        // `|| hard_alloc_failure()` — ZGC Phase 2.4 (2026-08-13). The two
+        // predicates above are OCCUPANCY questions, and on a non-compacting
+        // heap occupancy is not what binds: an arena refuses a 2 MB array
+        // because no single hole is 2 MB, which it can do with `allocated` at
+        // 7% of capacity. `ZgcRealHeap::alloc_raw` latches on that refusal and
+        // its comment says exactly why the re-check below it is wrong — "a
+        // request that just failed is stronger evidence that a cycle is due
+        // than the `allocated >= gc_threshold` predicate, which counts LIVE
+        // bytes and therefore cannot see the bump space this heap never
+        // rewinds". It was right, and until this line the consumer overruled
+        // it: `needs_gc()` answered no, the latch was cleared a few lines
+        // below without collecting, and the signal was dropped. That is the
+        // 2026-08-13 `TestNonBlockingAPI` shape, where the arena was full of
+        // TLAB *reservations* the live-byte counter cannot see.
+        //
+        // A collection is worth running there even though the failing request
+        // has already raised its `OutOfMemoryError`: this sweep coalesces the
+        // free list and retracts the bump cursor into the freed tail, so it
+        // restores CONTIGUITY, which is the resource that was missing. The
+        // next request is the one it saves.
+        //
+        // It cannot storm — the bit is set only by a genuine refusal, is
+        // cleared unconditionally below, and `gc_overhead_limit_exceeded`
+        // still gates it, which is the same bound the soft path relies on.
         if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-            && (shared.mem.heap.needs_gc() || shared.mem.heap.old_gen_needs_gc())
+            && (shared.mem.heap.needs_gc()
+                || shared.mem.heap.old_gen_needs_gc()
+                || shared.mem.heap.hard_alloc_failure())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
             crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -2917,8 +2943,11 @@ fn safe_native_call_impl(
         }
         // Clear even when the gates said no: the flag was stale (another
         // thread's GC already relieved young) or the heap is genuinely full
-        // of live data (overhead limit) — the next spill re-sets it.
+        // of live data (overhead limit) — the next spill re-sets it. Same for
+        // the hard latch, which `collect_garbage` also lowers; clearing it
+        // here covers the overhead-limited path, where no cycle ran to do it.
         shared.mem.heap.clear_young_spill_pressure();
+        shared.mem.heap.clear_hard_alloc_failure();
     }
     if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
@@ -3083,7 +3112,40 @@ fn safe_native_call_impl(
                 "unknown native method panic".to_string()
             };
             let in_bootstrap = shared.get_init_level() < 4;
-            if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
+            if let Some(oom) = &return_oom {
+                // A heap-exhaustion unwind is NOT a native bug and must not be
+                // reported as one. `NativeAllocOom` is neither a `String` nor a
+                // `&str`, so the ladder above degrades it to "unknown native
+                // method panic" and the final arm below logged that at ERROR,
+                // naming a callback address and a Java frame — which is how a
+                // working, catchable `OutOfMemoryError` came to read as a VM
+                // crash, and why the Tomcat `TestNonBlockingAPI` page filed
+                // "root cause of the native method panic" as an open question.
+                // There was no panic to root-cause. Say what actually happened,
+                // at the severity it actually has.
+                let top = thread
+                    .frames
+                    .last()
+                    .map(|f| {
+                        format!(
+                            "{}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
+                    })
+                    .unwrap_or_default();
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    java_frame = %top,
+                    "a native allocation could not be served and unwound to the \
+                     native-call boundary, where it becomes a catchable \
+                     java.lang.OutOfMemoryError ({oom:?}). This is the handled \
+                     heap-exhaustion path, not a native method fault.",
+                );
+            } else if (msg.contains("unaligned pointer") || msg.contains("null pointer"))
+                && in_bootstrap
+            {
                 shared
                     .debug
                     .swallow_counter
@@ -4918,6 +4980,72 @@ impl NativeContextImpl<'_> {
             }
         }
         self.shared.mem.heap.alloc_object(class_id, num_fields)
+    }
+}
+
+/// `class: message` for a Throwable, read out of the heap **without invoking
+/// any Java code and without allocating a single Java object**.
+///
+/// Every caller is on a thread-death or double-fault path, and at least one of
+/// them runs on a heap that has just refused an allocation. `toString()` would
+/// need a `StringBuilder`, a `char[]` and a `String` to answer, so on exactly
+/// the failure this exists to describe it would fail again — and a second
+/// failure inside the reporter is what turns a legible error into a silent
+/// one. So: class name from the class manager, `detailMessage` read straight
+/// out of its field slot.
+///
+/// Mirrors the field walk in `runtime::exceptions::set_detail_message_by_name`
+/// (the write side), including its `_fN` opaque-bootstrap-metadata fallback,
+/// so the two cannot disagree about which slot holds the message.
+pub(crate) fn describe_throwable(shared: &SharedVm, exc: ObjectRef) -> String {
+    if shared.mem.heap.is_object_address(exc.as_ptr() as usize).is_none() {
+        return format!("<not a live object: {:p}>", exc.as_ptr());
+    }
+    let class_id = shared.mem.heap.class_id_of(exc);
+    let (name, message_slot) = {
+        let cm = shared.classes.class_manager.read();
+        let name = cm
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("<class_id={}>", class_id.as_u32()));
+        let mut slot = None;
+        let mut opaque = None;
+        let mut walk = Some(class_id);
+        while let Some(cid) = walk {
+            let Some(cls) = cm.get_class(cid) else { break };
+            if &*cls.name == "java/lang/Throwable"
+                && cls.fields.len() >= 2
+                && cls.fields.iter().take(2).all(|f| f.name.starts_with("_f"))
+            {
+                opaque = Some(cls.first_field_index + 1);
+            }
+            let mut inst = 0usize;
+            for f in &cls.fields {
+                if f.is_static() {
+                    continue;
+                }
+                if &*f.name == "detailMessage" {
+                    slot = Some(cls.first_field_index + inst);
+                    break;
+                }
+                inst += 1;
+            }
+            if slot.is_some() {
+                break;
+            }
+            walk = cls.superclass;
+        }
+        (name, slot.or(opaque))
+    };
+    let message = message_slot
+        .map(|idx| shared.mem.heap.get_field(exc, idx))
+        .and_then(|v| match v {
+            Value::Object(Some(s)) => super::read_java_string(&shared.mem.heap, s),
+            _ => None,
+        });
+    match message {
+        Some(m) => format!("{name}: {m}"),
+        None => name,
     }
 }
 
@@ -13676,9 +13804,40 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     );
                     jvm_thread.native_pin_roots.truncate(pin_base);
                     if let Err(de) = dispatch_result {
+                        // NAME both throwables. This used to print two raw
+                        // `ObjectRef { ptr: 0x... }` addresses, which says a
+                        // thread died and a handler died with it and nothing
+                        // whatsoever about either — the state the Tomcat
+                        // `TestNonBlockingAPI` double fault was first reported
+                        // in, where neither exception could be identified from
+                        // the log at all.
+                        //
+                        // `describe_throwable` deliberately reads the class and
+                        // `detailMessage` out of the heap instead of invoking
+                        // `toString()`: the commonest reason the handler
+                        // dispatch fails in the first place is that the heap
+                        // cannot serve an allocation, and a reporter that needs
+                        // three of them would fail for the same reason and
+                        // print nothing.
+                        let first = shared_arc
+                            .mem
+                            .heap
+                            .is_object_address(exc_now.as_ptr() as usize)
+                            .map(|_| describe_throwable(&shared_arc, exc_now))
+                            .unwrap_or_else(|| format!("{e:?}"));
+                        let second = match &de {
+                            MethodCallFailed::ExceptionThrown(d) => {
+                                describe_throwable(&shared_arc, *d)
+                            }
+                            other => format!("{other:?}"),
+                        };
+                        // HotSpot's shape first, so the ORIGINAL failure is
+                        // legible even when the handler chain is what broke —
+                        // the whole point of a fallback report.
+                        eprintln!("Exception in thread \"{name}\" {first}");
                         eprintln!(
-                            "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
-                            tid, e, de
+                            "Thread {tid} terminated with error: {first} \
+                             (dispatchUncaughtException also failed: {second})",
                         );
                     }
                 } else {
@@ -22741,6 +22900,43 @@ fn invoke_on_class_shared_inner(
                                     | "toString"
                                     | "hashCode"
                                     | "equals"
+                            ))
+                        // As of 2026-08-13 a view is no longer minted as an
+                        // `ArrayList` but under its own carrier class
+                        // (native-collections' `MAP_VIEW_CARRIERS`), so the
+                        // arm above no longer covers it. These are REAL JDK
+                        // classes whose own bodies read `this$0` — null on a
+                        // CratonVM view, whose state lives in ArrayList's
+                        // `elementData`/`size` slots — so every method they
+                        // declare must reach the registered native.
+                        // `equals`/`hashCode` are omitted on purpose: the JDK
+                        // views inherit `AbstractCollection`'s identity
+                        // semantics and no native is registered for them here.
+                        // Companion entry in
+                        // native_override::force_native_over_real_jdk_bytecode.
+                        || (matches!(
+                                class_name,
+                                "java/util/HashMap$Values"
+                                    | "java/util/LinkedHashMap$LinkedValues"
+                                    | "java/util/TreeMap$Values"
+                                    | "java/util/TreeMap$EntrySet"
+                                    | "java/util/Hashtable$ValueCollection"
+                                    | "java/util/concurrent/ConcurrentHashMap$ValuesView"
+                            )
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "toString"
+                                    | "remove"
+                                    | "clear"
+                                    | "forEach"
+                                    | "stream"
+                                    | "removeIf"
+                                    | "spliterator"
                             ))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
