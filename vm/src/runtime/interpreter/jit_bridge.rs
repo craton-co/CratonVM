@@ -704,6 +704,58 @@ pub(super) fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                    // `AtomicInteger` read-modify-write family, through the
+                    // SAME matcher `jit::try_compile_inner` uses so the two
+                    // doors cannot drift on which shapes are admitted.
+                    //
+                    // Registered here because this door reaches
+                    // `x64::compile_with_param_slots` directly. For this family
+                    // the OSR site is the load-bearing one, for the same reason
+                    // spelled out on the HashMap arm below: a counter loop
+                    // written inside ONE method never passes through
+                    // `jit::try_compile`, and that is exactly the shape
+                    // (`while (nextIndex.getAndIncrement() < MAX)`) this
+                    // intrinsic exists to speed up.
+                    //
+                    // The class-manager guard is read and dropped inside the
+                    // `let` so no lock is held across the matcher call.
+                    if invoke_kind == 0
+                        && target_class == "java/util/concurrent/atomic/AtomicInteger"
+                    {
+                        let atomic_cid = shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .find_bootstrap_class_by_name(
+                                "java/util/concurrent/atomic/AtomicInteger",
+                            )
+                            .map(|id| id.as_u32());
+                        if let Some((entry, num_params, ret, guard_class_id)) =
+                            atomic_cid.and_then(|cid| {
+                                cratonvm_jit::try_resolve_atomic_intrinsic(
+                                    &target_class,
+                                    &mn,
+                                    &desc,
+                                    cid,
+                                )
+                            })
+                        {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: false,
+                                    num_params,
+                                    return_type: ret,
+                                    guard_class_id,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                     // `Integer.intValue()` thin direct call — `Integer` is
                     // `final`, so a site declared against it is statically
                     // monomorphic (guard-free); the helper handles the
