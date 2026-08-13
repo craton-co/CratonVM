@@ -227,12 +227,15 @@ These are honest gaps, not oversights. Do not paper over them.
    -mp is special-cased for JBoss Modules and is unrelated). Adding that flag
    is a separate change; until then a fully modular launch is uncovered.
 
-3. TLS loopback handshake.
+3. TLS loopback handshake.  CLOSED 2026-08-13 by RSslLiveSession.
    RJdkSecurity covers SSLContext/SSLEngine construction, protocol and cipher
-   enumeration and SSLParameters, but not a real handshake: that needs a key
-   store, and generating a self-signed certificate portably requires internal
-   sun.security APIs. "TLS loopback where supported" is therefore covered only
-   as far as the engine surface.
+   enumeration and SSLParameters. The real handshake is RSslLiveSession's:
+   loopback SSLServerSocket plus HttpsURLConnection, 95 checks over the client
+   session, the server session, the HostnameVerifier door and invalidate(). The
+   claim that a portable self-signed certificate "requires internal sun.security
+   APIs" was measured FALSE -- it is assembled as DER and signed with
+   java.security.Signature, all public API, in-process, with no resource file
+   and no expiry. See docs/known-issues/jdk-only/F36-1-*.md SS3.1.
 
 4. ProcessHandle parent/info values.
    Present-vs-absent and >0 predicates only. pids, command lines, users, start

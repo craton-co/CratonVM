@@ -543,6 +543,20 @@ tables, not introduced here.
    from the one `getSSLSession()` returns, so "the verifier's session" and
    "the connection's session" are not one object even on HotSpot. F10-1
    NOMINATION 1; `net_phase_e.rs` is not this lane's file.
+
+   > **CORRECTION 2026-08-13 (F36-1 §1) — the sentence above is WRONG.** The
+   > verifier claim was measured against a `HostnameVerifier` that was **never
+   > invoked**: `HttpsURLConnection` consults a custom verifier only *after*
+   > its own endpoint-identification check fails, so the callback never ran and
+   > the "different object" was an artefact of reading an unset field.
+   > `RSslLiveSession`'s `verifier` family asserts the invocation **first** and
+   > then measures: it is the **same object**. Both halves live in one run, so
+   > the false negative reproduces on demand rather than being argued about.
+   > The rest of point 4 stands — HotSpot does return the same object from two
+   > `getSSLSession()` calls, and F10-1 NOMINATION 1 is unaffected.
+   > This note exists because of this directory's own `[triage=stale]` lesson:
+   > a reader opening one record in a chain must not get a picture a later
+   > record has already refuted.
 5. **`RSslNullSession` is not extended** to cover the four doors (§7);
    `regression-suite/src/` is not this lane's file.
 6. **Two `MockNativeContext`-visible behaviours are asserted; the HTTPS path is
