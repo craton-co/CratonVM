@@ -3684,6 +3684,28 @@ pub struct IrBuilder {
     /// the visible `putfield`s). Set by [`Self::set_trivial_init_pcs`]. An
     /// `invokespecial` whose pc is NOT here makes `build` bail.
     trivial_init_pcs: HashSet<usize>,
+    /// Bytecode pcs of `invokespecial java/lang/Object.<init>()V` — the
+    /// terminal of every constructor chain — which may be elided on **any**
+    /// receiver, unlike [`Self::trivial_init_pcs`].
+    ///
+    /// The single-pass backend has always done this (`x64::bytecode_walk`'s
+    /// `0xb7` arm) on the grounds that the body is a bare `return` and the
+    /// VM-side registration is `native_noop_with_this`, so the call has no
+    /// observable effect at all. The IR builder had no equivalent, and it
+    /// cannot borrow `trivial_init_pcs` for the job for two independent
+    /// reasons:
+    ///
+    ///  * `is_elidable_construction` REFUSES `java/lang/Object` — a registered
+    ///    native shadows its bytecode, which is the exact hazard that check
+    ///    exists for (`HashMap.<init>()V`) — so the pc never enters that set;
+    ///  * `trivial_init_pcs` is only supplied when the method contains a
+    ///    `new`, and the site that matters here is the `super()` call inside a
+    ///    **constructor**, which contains none.
+    ///
+    /// Measured: every `new F(i)` in an optimizing-tier compile paid TWO
+    /// `jit_invoke_dispatch` round trips — one for `F.<init>` and one for the
+    /// `Object.<init>` inside it — at ~784 cycles each.
+    object_init_pcs: HashSet<usize>,
     /// Gap B: resolved `invokestatic` call sites the builder lowers into an
     /// `Op::Call`. `pc → (info_ptr, num_args, ret_type)` where `info_ptr` is the
     /// address of a leaked `JitInvokeInfo` (the dispatch helper's 2nd argument),
@@ -3819,6 +3841,7 @@ impl IrBuilder {
             new_info: HashMap::new(),
             anewarray_info: HashMap::new(),
             trivial_init_pcs: HashSet::new(),
+            object_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
             invoke_labels: HashMap::new(),
             method_label: None,
@@ -4043,6 +4066,14 @@ impl IrBuilder {
     ) {
         self.new_info = new_info;
         self.trivial_init_pcs = trivial_init_pcs;
+    }
+
+    /// Supply the `invokespecial java/lang/Object.<init>()V` pcs — see
+    /// [`Self::object_init_pcs`]. Independent of [`Self::set_new_info`]: the
+    /// site that matters is the `super()` call inside a constructor, and a
+    /// constructor contains no `new`.
+    pub fn set_object_init_pcs(&mut self, pcs: HashSet<usize>) {
+        self.object_init_pcs = pcs;
     }
 
     /// cov-06: supply the resolved allocation layout (`pc → component_class_id`)
@@ -5858,14 +5889,22 @@ impl IrBuilder {
                     // is exactly what a `super()` chain call looks like, which
                     // the census found 29 of. Such a site now falls through to
                     // the call path below instead of bailing the method.
-                    let elide = self.trivial_init_pcs.contains(&pc)
+                    let elide = (self.trivial_init_pcs.contains(&pc)
                         && matches!(
                             self.peek_opt().and_then(|r| self.graph.node_opt(r)),
                             Some(Node {
                                 op: Op::New { .. },
                                 ..
                             })
-                        );
+                        ))
+                        // `java/lang/Object.<init>()V` needs no receiver check:
+                        // its body is a bare `return` and the native that
+                        // shadows it is `native_noop_with_this`, so eliding it
+                        // is sound on `this` as much as on a fresh `Op::New`.
+                        // That is the ONLY shape exempt from the check above,
+                        // and it is the terminal of every constructor chain —
+                        // see `object_init_pcs` for what it was costing.
+                        || self.object_init_pcs.contains(&pc);
                     if elide {
                         self.pop();
                         pc += 3;
