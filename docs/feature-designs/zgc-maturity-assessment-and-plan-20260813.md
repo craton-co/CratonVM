@@ -483,12 +483,56 @@ is **not yet load-bearing** — `vaddr` is adopted only as an enum today — and
 must be re-derived in this phase against this arena's actual address range
 rather than inherited from OpenJDK's.
 
-**What genuinely remains in Phase 4, unchanged:** colored slots through the
-seven sites, the interpreter/native barrier, x64 barrier emission (~6-7
-instructions), then `forwarding` + `relocate`, then `generation` +
-`remembered`. That is the months-scale body of work this plan always said it
-was, and none of it is safe to begin before Phase 3's concurrent cycle is
-measured.
+**Landed 2026-08-13: the barrier seam, and a stop-the-world compaction.**
+
+*The barrier seam.* `impl ZBarrierContext for ZgcRealHeap` makes the
+built-and-unadopted `zgc::barrier` module drivable against this heap. It puts a
+barrier on **no read path** — no interpreter `getfield`, no JIT-emitted load,
+no native accessor calls `load_barrier_fast` — so in a normal run every method
+is unreachable and the good mask never leaves `Z_REMAPPED`. Writing it forced
+`ZMarkContext::heap_base`, which had been sitting at its `None` default with a
+doc explaining that `None` was "the *honest* answer" for this heap. It stopped
+being honest the moment the heap had a barrier: the barrier speaks 42-bit
+offsets and `mark_live` must convert, so `None` would have wired a barrier to a
+marker that silently discarded everything handed to it.
+
+*Compaction.* `relocate_stw` slides every live survivor in the small-object
+region down in address order, rewrites **every reference slot in every
+survivor** through the resulting `from -> to` map, drops the bump cursor, and
+returns a non-empty `PointerMap`; `collect_garbage` rewrites the caller's roots
+through it. That last part is not optional — a root still naming a pre-slide
+address is a dangling pointer the instant the call returns, and nothing
+downstream would fix it. The high end is deliberately not compacted: large
+objects bump *down* from capacity against a different free structure, and the
+low end is where TLAB chunks fragment, which is the measured problem.
+
+Three gates, all required: `CRATONVM_ZGC_RELOCATE=1` (intent),
+`zgc_relocation_permitted` (safety — refuses whenever the JIT is on), and the
+caller's stop-the-world token. **The sub-flag is now the only thing keeping
+this off a user's machine**, because the `zgc` Cargo feature that R5 assumed
+was the outer default-off gate has been default-ON since 2026-08-10.
+
+**Two mistakes worth keeping.** The first draft filtered survivors by
+`GC_FLAG_MARKED` and moved *nothing*: the sweep clears every survivor's mark
+bit before returning, so a post-sweep compaction needs a liveness source the
+sweep does not consume. The live set is now an explicit parameter and
+`collect_garbage` passes the post-sweep registry — precisely the set the sweep
+did not reclaim. And both new flags were added *undeclared*;
+`flag_declaration_guard` caught them, with the reason that matters: an
+undeclared flag is served by a live `getenv` rather than the latched snapshot,
+so `CRATONVM_GC=token` cannot reach it and a flag-dependent test silently
+measures the developer's ambient environment.
+
+**What still genuinely remains:** colored slots through the seven sites, the
+interpreter/native barrier and x64 barrier emission (~6-7 instructions), then
+`zgc::relocate`'s *concurrent* machinery and `forwarding`'s per-page table —
+which only become the right structures once `zgc::page` is adopted, since a
+single arena with no pages carries no information in a page-keyed table — then
+`generation` + `remembered`. **And the `VmHeap::Zgc` arm audit (R6): 58 arms
+plus a macro assert non-moving, and compaction now returns a non-empty pointer
+map.** That audit is the reason compaction stays behind a default-off flag
+rather than being wired into the normal path, and it is the next thing to do
+in this phase.
 
 ---
 
