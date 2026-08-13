@@ -3860,6 +3860,72 @@ fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
     cache.insert(key, byte);
 }
 
+/// Address of an `int` field's 4-byte payload — the ONE location the
+/// interpreter, the natives and the JIT's ATOMIC_INT intrinsic must all agree
+/// on, and all reach with the SAME primitive.
+///
+/// Why this exists: `compare_and_swap_field` takes `monitors.with_cas_lock`
+/// plus the collector's `volatile_stripe_lock`. Those make the native path
+/// atomic against ITSELF, not against a hardware atomic issued from compiled
+/// code, so a compiled `LOCK XADD` racing an interpreted read-compare-write
+/// loses updates. Routing both through one aligned hardware atomic on this
+/// address is what makes the two modes atomic against EACH OTHER.
+///
+/// The offsets come from [`cratonvm_jit::AtomicIntFieldLayout`], the same type
+/// the JIT computes its baked displacement from, and the COMPACT/LEGACY choice
+/// is made per OBJECT on the `GC_FLAG_COMPACT` header bit exactly as the
+/// codegen does — a class with a registered compact layout may still have
+/// legacy-laid-out instances. If the layout ever moves, both sides move
+/// together.
+///
+/// `None` means some precondition did not hold and the caller MUST fall back to
+/// the lock-based `Value`-cell path. Callers must pass an already
+/// forwarded `obj` (see `load_and_forward`).
+fn hw_atomic_int_addr(shared: &SharedVm, obj: ObjectRef, index: usize) -> Option<*mut i32> {
+    // Arrays have no field layout; their elements keep the existing path.
+    if shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    // The slot must really be an `int`. This doubles as the bounds proof: the
+    // descriptor only resolves for a declared field index of this class.
+    if resolve_field_descriptor_byte_cached(shared, class_id, index)? != b'I' {
+        return None;
+    }
+    let header = shared.mem.heap.get_header(obj);
+    let compact = header.gc_flags() & cratonvm_types::GC_FLAG_COMPACT != 0;
+    if !compact && index >= header.num_slots() as usize {
+        return None;
+    }
+    let layout = cratonvm_jit::AtomicIntFieldLayout::new(index, class_id.as_u32())?;
+    let off = if compact {
+        layout.value_compact_offset
+    } else {
+        layout.value_legacy_offset
+    };
+    if off < 0 {
+        return None;
+    }
+    let addr = (obj.as_ptr() as usize).checked_add(off as usize)?;
+    // A hardware atomic requires natural alignment; anything else would be a
+    // torn access rather than a slow one, so refuse instead of degrading.
+    if addr % std::mem::align_of::<i32>() != 0 {
+        return None;
+    }
+    Some(addr as *mut i32)
+}
+
+/// Borrow the payload as an `AtomicI32`.
+///
+/// # Safety
+/// `addr` must come from [`hw_atomic_int_addr`] for a live, already-forwarded
+/// object, and the caller must not let the object move for the duration of the
+/// borrow. Natives run without reaching a safepoint, so a relocating collector
+/// cannot move the object underneath a single atomic op.
+unsafe fn hw_atomic_int<'a>(addr: *mut i32) -> &'a std::sync::atomic::AtomicI32 {
+    &*(addr as *const std::sync::atomic::AtomicI32)
+}
+
 fn resolve_field_descriptor_byte_cached(
     shared: &SharedVm,
     class_id: ClassId,
@@ -12205,6 +12271,56 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // write_barrier fires automatically inside set_field_volatile в†’ set_field
     }
 
+    /// Hardware `fetch_add` on an `int` field — the override the trait's
+    /// default impl has always asked for ("the VM override should map this to
+    /// a single `LOCK XADD`").
+    ///
+    /// This is not only a speed-up over the CAS retry loop: it is what puts the
+    /// native path in the SAME atomicity domain as the JIT's ATOMIC_INT
+    /// intrinsic. While this was the default lock-based loop, a compiled
+    /// `LOCK XADD` and an interpreted increment on one counter lost updates
+    /// (24,908 of 600,000 in `MixAtom`), which corrupted
+    /// `LinkedBlockingQueue`'s element count and hung
+    /// `DefaultPromiseTest.testListenerNotifyOrder`.
+    fn atomic_fetch_add_int(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i32,
+    ) -> Result<i32, MethodCallFailed> {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        if let Some(addr) = hw_atomic_int_addr(self.shared, obj, index) {
+            // SAFETY: `addr` is a live, forwarded, 4-byte-aligned `int` payload
+            // (see `hw_atomic_int_addr`); this single atomic cannot reach a
+            // safepoint, so the object cannot move under it.
+            let cell = unsafe { hw_atomic_int(addr) };
+            return Ok(cell.fetch_add(delta, std::sync::atomic::Ordering::SeqCst));
+        }
+        // Fall back to the trait's CAS retry loop for anything the hardware
+        // path refused (non-`int` slot, unresolvable layout, misalignment).
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Int(v) => v,
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_int: field {} on object is not Int: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
+            };
+            let new_val = Value::Int(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return Ok(old);
+            }
+        }
+    }
+
     fn compare_and_swap_field(
         &mut self,
         obj: ObjectRef,
@@ -12212,6 +12328,27 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         expected: Value,
         new_val: Value,
     ) -> bool {
+        // An `int`-to-`int` CAS goes to the hardware, for the same reason
+        // `atomic_fetch_add_int` does: `AtomicInteger.compareAndSet` and a
+        // compiled `LOCK XADD` must be atomic against each other, and a
+        // lock-based read-compare-write is not. No SATB pre-barrier and no
+        // write barrier here — the payload is primitive, so no reference is
+        // overwritten and none escapes.
+        if let (Value::Int(exp), Value::Int(new)) = (expected, new_val) {
+            let fwd = self.shared.mem.heap.load_and_forward(obj);
+            if let Some(addr) = hw_atomic_int_addr(self.shared, fwd, index) {
+                // SAFETY: see `atomic_fetch_add_int`.
+                let cell = unsafe { hw_atomic_int(addr) };
+                return cell
+                    .compare_exchange(
+                        exp,
+                        new,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok();
+            }
+        }
         // T19_H6: descriptor-aware CAS read+write so a long instance field
         // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
         let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
