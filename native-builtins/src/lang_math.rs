@@ -2983,39 +2983,155 @@ fn long_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
     LONG_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
+// ---------------------------------------------------------------------------
+// The three caches the family was MISSING, and why their bounds all differ.
+//
+// The boxing caches are NOT one rule applied eight times. Each bound below was
+// read out of `jdk25src/java.base/java/lang/*.java` and then MEASURED against
+// Microsoft OpenJDK 25.0.3+9 (`BoxOracle`, every code unit / every byte / the
+// whole short range walked, not sampled):
+//
+//   Character  `if (c <= 127) return CharacterCache.cache[c];`  -> 0..=127.
+//              First non-identical code unit measured on HotSpot: 128.
+//   Byte       `return ByteCache.cache[b + 128];` — UNCONDITIONAL. Every one
+//              of the 256 byte values is canonical; `Byte.valueOf` has no
+//              fresh-allocation arm at all. Measured: all 256 identical.
+//   Short      `if (sAsInt >= -128 && sAsInt <= 127)` -> -128..=127, measured
+//              by walking Short.MIN_VALUE..Short.MAX_VALUE (exactly that range
+//              came back identical).
+//
+// And the members that are deliberately NOT here:
+//
+//   Integer    -128..=IntegerCache.high (127 by default) — already correct in
+//              `native_integer_value_of`; NOT widened here.
+//   Long       -128..=127 — already correct in `native_long_value_of`.
+//   Boolean    exactly two, and they must be the `Boolean.TRUE`/`FALSE` STATIC
+//              FIELDS, not privately minted twins (see the long comment on
+//              `native_boolean_value_of`).
+//   Float      no cache. `Float.valueOf(0f) == Float.valueOf(0f)` is FALSE on
+//   Double     HotSpot, measured. Adding a cache for these would be a
+//              regression, not a completion of the family — the asymmetry is
+//              the specification.
+// ---------------------------------------------------------------------------
+
+/// `CharacterCache` for `Character.valueOf(char)`. 128 slots indexed by the
+/// code unit itself — there is no offset because the low bound is zero.
+static CHARACTER_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<128>>> =
+    std::sync::OnceLock::new();
+
+fn character_cache() -> &'static parking_lot::Mutex<ScopedValueCache<128>> {
+    CHARACTER_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `ByteCache` for `Byte.valueOf(byte)`. 256 slots indexed by `b + 128`, and
+/// unlike every other cache in this file it covers the type's ENTIRE domain.
+static BYTE_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
+
+fn byte_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    BYTE_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `ShortCache` for `Short.valueOf(short)`. 256 slots indexed by `s + 128`,
+/// covering -128..=127 out of a 65,536-value domain.
+static SHORT_CACHE: std::sync::OnceLock<parking_lot::Mutex<ScopedValueCache<256>>> =
+    std::sync::OnceLock::new();
+
+fn short_cache() -> &'static parking_lot::Mutex<ScopedValueCache<256>> {
+    SHORT_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The canonical-instance dance, once, for the caches added above.
+///
+/// Returns the cached wrapper for `idx`, allocating and installing it on the
+/// first call. The lock is DROPPED across `alloc_wrapper` (which can run
+/// `<clinit>` and can GC), so the post-allocation re-check under the lock is
+/// load-bearing: two threads that miss together must still agree on which
+/// instance is canonical, or `==` breaks for exactly the values the JLS says
+/// it must hold for. The loser's allocation is unreachable and collectible.
+fn cached_wrapper_box<const N: usize>(
+    ctx: &mut dyn NativeContext,
+    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    idx: usize,
+    class_name: &'static str,
+    value: Value,
+) -> cratonvm_types::ObjectRef {
+    let scope = ctx.vm_identity();
+    if let Some(cached) = {
+        let c = cache.lock();
+        c.get(&scope).and_then(|entries| entries[idx])
+    } {
+        return cached;
+    }
+    let obj = alloc_wrapper(ctx, class_name);
+    ctx.set_field(obj, 0, value);
+    // `alloc_wrapper` falls back to `ClassId(0)` when the wrapper class cannot
+    // be initialised — which can only happen in a bootstrap window, but these
+    // caches are process-global and never invalidated, so installing one of
+    // those would latch a wrong-classed instance as THE canonical box for the
+    // rest of the VM's life. Decline to cache instead: the caller still gets a
+    // usable object, and the value simply goes uncached until the class is
+    // real, which is the pre-fix behaviour rather than a new failure.
+    if ctx.class_id_of_object(obj).as_u32() == 0 {
+        return obj;
+    }
+    let mut guard = cache.lock();
+    let entries = guard.entry(scope).or_insert([None; N]);
+    if let Some(existing) = entries[idx] {
+        return existing;
+    }
+    entries[idx] = Some(obj);
+    obj
+}
+
+/// Report one cache's live entries for `vm_identity` to the GC.
+///
+/// Factored out when the family grew from three caches to six. The per-cache
+/// copy-pasted block is precisely how a new cache gets added to the root scan
+/// and forgotten in the remap below (or the reverse): a cache that is rooted
+/// but not re-pointed is a use-after-move that only appears after a compacting
+/// collection, and the canonical instances are by construction long-lived
+/// enough to be moved.
+fn scan_one_cache<const N: usize>(
+    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    vm_identity: usize,
+    out: &mut Vec<cratonvm_types::ObjectRef>,
+) {
+    let cache = cache.lock();
+    if let Some(entries) = cache.get(&vm_identity) {
+        for slot in entries.iter().flatten() {
+            out.push(*slot);
+        }
+    }
+}
+
+/// Remap one cache's entries for `vm_identity` through the GC pointer map.
+fn update_one_cache<const N: usize>(
+    cache: &'static parking_lot::Mutex<ScopedValueCache<N>>,
+    vm_identity: usize,
+    pointer_map: &cratonvm_types::PointerMap,
+) {
+    let mut cache = cache.lock();
+    if let Some(entries) = cache.get_mut(&vm_identity) {
+        for obj_ref in entries.iter_mut().flatten() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+}
+
 /// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
 /// Reports cached wrapper ObjectRefs for the active VM so the GC keeps them live.
 pub fn gc_scan_value_of_cache_roots(vm_identity: usize, out: &mut Vec<cratonvm_types::ObjectRef>) {
-    {
-        let cache = integer_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
-    {
-        let cache = boolean_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
-    {
-        let cache = long_cache().lock();
-        if let Some(entries) = cache.get(&vm_identity) {
-            for slot in entries.iter() {
-                if let Some(o) = slot {
-                    out.push(*o);
-                }
-            }
-        }
-    }
+    scan_one_cache(integer_cache(), vm_identity, out);
+    scan_one_cache(boolean_cache(), vm_identity, out);
+    scan_one_cache(long_cache(), vm_identity, out);
+    scan_one_cache(character_cache(), vm_identity, out);
+    scan_one_cache(byte_cache(), vm_identity, out);
+    scan_one_cache(short_cache(), vm_identity, out);
 }
 
 /// GC post-compaction hook — called from `vm/src/memory/gc.rs::update_all_roots`.
@@ -3027,51 +3143,12 @@ pub fn gc_update_value_of_cache_refs(
     if pointer_map.is_empty() {
         return;
     }
-    {
-        let mut cache = integer_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
-        }
-    }
-    {
-        let mut cache = boolean_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
-        }
-    }
-    {
-        let mut cache = long_cache().lock();
-        if let Some(entries) = cache.get_mut(&vm_identity) {
-            for slot in entries.iter_mut() {
-                if let Some(obj_ref) = slot {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                        *obj_ref =
-                            unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-            }
-        }
-    }
+    update_one_cache(integer_cache(), vm_identity, pointer_map);
+    update_one_cache(boolean_cache(), vm_identity, pointer_map);
+    update_one_cache(long_cache(), vm_identity, pointer_map);
+    update_one_cache(character_cache(), vm_identity, pointer_map);
+    update_one_cache(byte_cache(), vm_identity, pointer_map);
+    update_one_cache(short_cache(), vm_identity, pointer_map);
 }
 
 pub(crate) fn native_integer_value_of(
@@ -4138,6 +4215,24 @@ const JAVA_NUMERIC_VALUE_NEG2_RUNS: &[(u32, u32)] = &[
 
 // --- Character ---
 
+/// `Character.valueOf(char)` — JLS §5.1.7 makes the 0..127 instances CANONICAL.
+///
+/// The previous body allocated unconditionally, so
+/// `Character.valueOf('a') == Character.valueOf('a')` was **false** on this VM
+/// and **true** on HotSpot 25 — and because `javac` compiles `Character c = 'a'`
+/// to exactly this call, so was `a == b` for two autoboxed ASCII chars. The
+/// defect is visible to any Java code that keys on wrapper identity, not just
+/// to a conformance probe.
+///
+/// The bound is `c <= 127`, transcribed from
+/// `jdk25src/java.base/java/lang/Character.java`:
+/// `if (c <= 127) { return CharacterCache.cache[(int)c]; } return new Character(c);`
+/// It is NOT -128..127: `char` is unsigned, so the cache has no negative half
+/// and no `+ 128` offset. Measured on HotSpot 25.0.3+9 by walking every code
+/// unit — the first one for which `valueOf(c) != valueOf(c)` is **128**, and
+/// U+0080, U+00FF and U+FFFF are all fresh objects there. This VM must
+/// reproduce the fresh half too, so the range check has no "when in doubt,
+/// cache" arm.
 pub(crate) fn native_character_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4146,6 +4241,16 @@ pub(crate) fn native_character_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (0..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            character_cache(),
+            val as usize,
+            "java/lang/Character",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Character");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -6612,6 +6717,19 @@ pub(crate) fn native_double_compare(
 
 // --- Byte ---
 
+/// `Byte.valueOf(byte)` — the ONE member of the family with no uncached arm.
+///
+/// `jdk25src/java.base/java/lang/Byte.java` is
+/// `return ByteCache.cache[(int)b + 128];` with no range test, because the
+/// cache's 256 slots already cover every `byte`. Measured on HotSpot 25.0.3+9:
+/// `Byte.valueOf(b) == Byte.valueOf(b)` for all 256 values including
+/// `Byte.MIN_VALUE`. The previous body allocated every time, so all 256 were
+/// wrong here.
+///
+/// The range guard below is not a semantic bound (there is none) — it is an
+/// index guard. The descriptor is `(B)`, so a well-formed call always lands in
+/// the cache; a malformed one falls back to the old fresh-allocation behaviour
+/// instead of indexing off the end of the array.
 pub(crate) fn native_byte_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6620,6 +6738,16 @@ pub(crate) fn native_byte_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            byte_cache(),
+            (val + 128) as usize,
+            "java/lang/Byte",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Byte");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -6627,6 +6755,15 @@ pub(crate) fn native_byte_value_of(
 
 // --- Short ---
 
+/// `Short.valueOf(short)` — cached over -128..=127 only, out of 65,536 values.
+///
+/// `jdk25src/java.base/java/lang/Short.java`:
+/// `if (sAsInt >= -128 && sAsInt <= 127) return ShortCache.cache[sAsInt + 128];`
+/// Same numeric bound as `Integer`/`Long`, a DIFFERENT bound from `Byte`
+/// (which has no bound) and from `Character` (which has no negative half).
+/// Measured on HotSpot 25.0.3+9 by walking `Short.MIN_VALUE..=Short.MAX_VALUE`:
+/// the identical range came back as exactly -128..127, and `valueOf((short)128)`
+/// / `valueOf((short)-129)` are fresh objects.
 pub(crate) fn native_short_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6635,6 +6772,16 @@ pub(crate) fn native_short_value_of(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let obj = cached_wrapper_box(
+            ctx,
+            short_cache(),
+            (val + 128) as usize,
+            "java/lang/Short",
+            Value::Int(val),
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Short");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -6735,6 +6882,146 @@ mod tests {
         let o = ctx.alloc_object(cratonvm_types::ClassId::new(cid), 1);
         ctx.set_field(o, 0, v);
         o
+    }
+
+    // -----------------------------------------------------------------------
+    // JLS §5.1.7 boxing caches. Every bound below was measured on Microsoft
+    // OpenJDK 25.0.3+9 before it was written here; see the comment block above
+    // `CHARACTER_CACHE` for the transcript.
+    //
+    // The caches are process-global and keyed by `vm_identity()`, whose mock
+    // default is 0 and therefore SHARED by every other test in this suite.
+    // Each test below claims its own identity so its entries — which dangle
+    // once its mock heap drops — can never be handed to another test.
+    // -----------------------------------------------------------------------
+
+    fn ref_of(v: Option<Value>) -> cratonvm_types::ObjectRef {
+        match v {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a boxed object, got {other:?}"),
+        }
+    }
+
+    fn box_char(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        c: u32,
+    ) -> cratonvm_types::ObjectRef {
+        ref_of(native_character_value_of(ctx, &[Value::Int(c as i32)]).unwrap())
+    }
+
+    #[test]
+    fn character_value_of_is_canonical_through_127_and_fresh_from_128_up() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5101);
+
+        // The row RJdkIntrinsics2 --only=charcls asserts, and the boundary.
+        for c in [0u32, 'a' as u32, 126, 127] {
+            assert_eq!(
+                box_char(&mut ctx, c),
+                box_char(&mut ctx, c),
+                "Character.valueOf({c}) must be the CANONICAL instance — identity, not equality"
+            );
+        }
+
+        // The other half of the contract. HotSpot's first non-identical code
+        // unit is 128; a cache that "rounds up" to 256 or to the whole BMP
+        // fails here, and no equality-shaped assertion would notice.
+        for c in [128u32, 255, 0x0400, 0xFFFF] {
+            assert_ne!(
+                box_char(&mut ctx, c),
+                box_char(&mut ctx, c),
+                "Character.valueOf({c}) is above the cache and must be a FRESH object"
+            );
+        }
+
+        // The cached instance still carries its value — a canonical box that
+        // returns the wrong char would pass every identity row above.
+        let a = box_char(&mut ctx, 'a' as u32);
+        assert_eq!(ctx.get_field(a, 0), Value::Int('a' as i32));
+    }
+
+    #[test]
+    fn byte_value_of_is_canonical_for_all_256_values() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5102);
+        for b in -128..=127i32 {
+            let x = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(b)]).unwrap());
+            let y = ref_of(native_byte_value_of(&mut ctx, &[Value::Int(b)]).unwrap());
+            assert_eq!(
+                x, y,
+                "Byte.valueOf({b}) must be canonical — ByteCache has no uncached arm"
+            );
+            assert_eq!(ctx.get_field(x, 0), Value::Int(b));
+        }
+    }
+
+    #[test]
+    fn short_value_of_caches_minus_128_to_127_and_nothing_outside_it() {
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5103);
+        for s in [-128i32, -1, 0, 127] {
+            let x = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            let y = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            assert_eq!(x, y, "Short.valueOf({s}) must be canonical");
+        }
+        for s in [-32768i32, -129, 128, 32767] {
+            let x = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            let y = ref_of(native_short_value_of(&mut ctx, &[Value::Int(s)]).unwrap());
+            assert_ne!(
+                x, y,
+                "Short.valueOf({s}) is outside the cache and must be fresh"
+            );
+        }
+    }
+
+    #[test]
+    fn float_and_double_value_of_must_not_be_canonical() {
+        // NEGATIVE CONTROL, and the reason the fix above is three caches and
+        // not eight. Float and Double cache NOTHING; measured on HotSpot 25,
+        // `Float.valueOf(0f) == Float.valueOf(0f)` is FALSE. Making the family
+        // "consistent" here would be a regression.
+        let mut ctx = mock_ctx();
+        ctx.set_vm_identity(0x5104);
+        for f in [0.0f32, 1.0, -1.0] {
+            let x = ref_of(native_float_value_of(&mut ctx, &[Value::Float(f)]).unwrap());
+            let y = ref_of(native_float_value_of(&mut ctx, &[Value::Float(f)]).unwrap());
+            assert_ne!(x, y, "Float.valueOf({f}) must NOT be cached");
+        }
+        for d in [0.0f64, 1.0, -1.0] {
+            let x = ref_of(native_double_value_of(&mut ctx, &[Value::Double(d)]).unwrap());
+            let y = ref_of(native_double_value_of(&mut ctx, &[Value::Double(d)]).unwrap());
+            assert_ne!(x, y, "Double.valueOf({d}) must NOT be cached");
+        }
+    }
+
+    #[test]
+    fn a_cached_character_is_both_reported_as_a_root_and_remapped_after_a_move() {
+        // The pairing test. A cache that is scanned but not remapped survives
+        // a non-moving collector and hands out a dangling reference after a
+        // compacting one, which is why both hooks are asserted from one body.
+        let mut ctx = mock_ctx();
+        let vm = 0x5105usize;
+        ctx.set_vm_identity(vm);
+
+        let before = box_char(&mut ctx, 'q' as u32);
+        let mut roots: Vec<cratonvm_types::ObjectRef> = Vec::new();
+        gc_scan_value_of_cache_roots(vm, &mut roots);
+        assert!(
+            roots.contains(&before),
+            "the cached Character was not reported to the GC — it would be swept"
+        );
+
+        // A real second allocation stands in for the post-compaction address.
+        let moved = ctx.alloc_object(cratonvm_types::ClassId::new(1), 1);
+        let mut map = cratonvm_types::PointerMap::default();
+        map.insert(before.as_ptr() as usize, moved.as_ptr() as usize);
+        gc_update_value_of_cache_refs(vm, &map);
+
+        assert_eq!(
+            box_char(&mut ctx, 'q' as u32),
+            moved,
+            "the cache still points at the pre-move address — remap hook missed CHARACTER_CACHE"
+        );
     }
 
     #[test]
