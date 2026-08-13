@@ -68,6 +68,30 @@ import java.util.List;
  *
  * Every expected value below was MEASURED on HotSpot
  * (openjdk 25.0.3 2026-04-21 LTS, Microsoft build 25.0.3+9-LTS), not recalled.
+ *
+ * <h2>Reporting dialect — why every line is {@code CK }/{@code PASS }-prefixed</h2>
+ *
+ * {@code run.sh} reduces both VMs' output to its {@code ^PASS }/{@code ^CK }
+ * lines before diffing them (see {@code extract()} in
+ * {@code regression-suite/harness-guard.sh}). Until 2026-08-13 this fixture
+ * printed its ITERS header and all sixteen per-row {@code cold=/hot=} lines on
+ * NO prefix, so 17 of 18 lines were deleted and the harness compared nothing
+ * but the constant banner: a VM that answered the wrong exception kind on
+ * fifteen of sixteen rows and the right one on all sixteen produced the
+ * IDENTICAL extract. The per-row tier evidence is the entire value of this
+ * fixture, so it now goes out as
+ * {@code CK RArrayStoreTiers <row> cold=[..] hot=[..] moved=<i>} carrying the
+ * VM's OWN answers — the two VMs diff their answers against each other, not
+ * each against this file's table. See
+ * {@code docs/known-issues/jdk-only/W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet.md}
+ * §NOM-2, and W8-E9-1 §1 for why {@code fails} and {@code checks} are on
+ * SEPARATE lines (a combined line makes the harness's count parse return a
+ * non-numeric string and its guard silently no-op).
+ *
+ * <p>Rows whose expectation is {@code null} — the NPE row, whose helpful-NPE
+ * text names a local slot — are deliberately NOT printed either. Printing a
+ * value this fixture does not assert would smuggle it into the cross-VM diff as
+ * an assertion nobody adjudicated.
  */
 public class RArrayStoreTiers {
 
@@ -222,19 +246,44 @@ public class RArrayStoreTiers {
         "no-throw",
     };
 
+    /**
+     * The one evidence funnel. Prints UNCONDITIONALLY and prints the VM's own
+     * answer, so a row's value reaches the cross-VM diff whether or not this
+     * file's table agrees with it.
+     */
+    static void ck(String row, String fields) {
+        System.out.printf("CK RArrayStoreTiers %-46s %s%n", row, fields);
+    }
+
+    /**
+     * Record a divergence AND make it visible on a kept prefix. The old code
+     * printed these as {@code DIVERGENCE <text>}, which extract() deletes — so
+     * on a red run the harness could see that something failed but not what.
+     */
+    static void diverge(String detail) {
+        DIVERGENCES.add(detail);
+        System.out.println("CK RArrayStoreTiers FAILED " + detail);
+    }
+
     public static void main(String[] args) {
-        System.out.println("RArrayStoreTiers ITERS=" + ITERS
-            + "  (C1 threshold 500; run this both with and without --nojit)");
+        // ITERS is a real parameter of the measurement, not decoration: read
+        // together with a MOVED@ index it is what says whether the compiled
+        // tier was reached at all. It goes into the diff for that reason.
+        System.out.println("CK RArrayStoreTiers ITERS=" + ITERS);
 
         // Pass 1: cold messages, one execution per site, guaranteed interpreted
         // because nothing has run yet.
         for (int id = 1; id <= 16; id++) {
             String want = EXPECTED_COLD[id];
+            // null = "do not assert the message", and therefore also "do not
+            // publish it": an unasserted value on a CK line becomes an
+            // assertion by way of the cross-VM diff.
             if (want == null) continue;
             String got = observeWithMessage(id);
             checks++;
+            ck(NAMES[id], "coldmsg=[" + got + "]");
             if (!want.equals(got)) {
-                DIVERGENCES.add(NAMES[id] + " COLD-MESSAGE: want=[" + want + "] got=[" + got + "]");
+                diverge(NAMES[id] + " COLD-MESSAGE: want=[" + want + "] got=[" + got + "]");
             }
         }
 
@@ -257,30 +306,37 @@ public class RArrayStoreTiers {
             String name = NAMES[id];
             String want = EXPECTED_KIND[id];
 
+            // Evidence FIRST, verdicts after, so a FAILED line always follows
+            // the values it is about. `moved` is published on every row and not
+            // just on a transition: an absent field is not evidence, and the
+            // iteration at which an answer moved is precisely what the
+            // inline-aastore defect shows up as.
+            ck(name, "cold=[" + cold + "] hot=[" + hot + "] moved=" + movedAt);
+
             checks++;
             if (!want.equals(cold)) {
-                DIVERGENCES.add(name + " COLD: want=[" + want + "] got=[" + cold + "]");
+                diverge(name + " COLD: want=[" + want + "] got=[" + cold + "]");
             }
             checks++;
             if (!want.equals(hot)) {
-                DIVERGENCES.add(name + " HOT: want=[" + want + "] got=[" + hot + "]");
+                diverge(name + " HOT: want=[" + want + "] got=[" + hot + "]");
             }
             // Reported separately because it names the tier transition directly:
             // this is the assertion the inline-aastore defect trips.
             checks++;
             if (movedAt >= 0) {
-                DIVERGENCES.add(name + " TIER-SPLIT at i=" + movedAt
+                diverge(name + " TIER-SPLIT at i=" + movedAt
                     + ": cold=[" + cold + "] became=[" + moved + "] final=[" + hot + "]");
             }
-
-            System.out.printf("%-46s cold=[%s] hot=[%s]%s%n",
-                name, cold, hot, movedAt >= 0 ? "  MOVED@" + movedAt : "");
         }
 
+        // SEPARATE lines, and in this order. harness_check_count does
+        // `sub(/^.*checks=/, ""); print`, so `checks=63 fails=0` would publish
+        // the "count" `63 fails=0` and the guard that reads it would no-op
+        // inside its own 2>/dev/null. One value per line.
+        System.out.println("CK RArrayStoreTiers fails=" + DIVERGENCES.size());
+        System.out.println("CK RArrayStoreTiers checks=" + checks);
         if (!DIVERGENCES.isEmpty()) {
-            for (String d : DIVERGENCES) {
-                System.out.println("DIVERGENCE " + d);
-            }
             throw new AssertionError(DIVERGENCES.size() + " divergence(s)");
         }
         System.out.println("PASS RArrayStoreTiers (" + checks + " checks)");

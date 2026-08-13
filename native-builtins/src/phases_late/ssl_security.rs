@@ -262,11 +262,189 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                 algo_idx + 1,
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
+            // Provider EXISTENCE is not provider OWNERSHIP, and this overload
+            // used to stop at the first. Measured on HotSpot 25.0.3+9 today:
+            //
+            // ```text
+            // Mac.getInstance("HmacSHA256", "SUN")
+            //   -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider SUN
+            // ```
+            //
+            // `SUN` is a registered provider with **zero** `Mac` service rows
+            // (`SUN.getServices()` filtered to type `Mac` is empty — measured),
+            // so `check_named_provider_arg` admits it and every name in
+            // `mac_algorithm_supported` then answered a working HMAC under a
+            // provider that does not supply MACs at all. That is the
+            // wrong-accept half of the W4-3 species: not a wrong MAC, but a MAC
+            // where HotSpot refuses, which is the shape that only ever presents
+            // as an interop bug against everyone running a real JDK.
+            //
+            // `check_provider_ownership` consults the same service table
+            // `jca::provider_chain` seeds and that `Provider.put` populates, so
+            // an application provider registered via `Security.addProvider` +
+            // `Provider.put("Mac.<algo>", …)` is still owned and still served.
+            // Its `Shared` wording is byte-identical to the measured message.
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                algo_idx + 1,
+                "Mac",
+                &algo,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             if !mac_algorithm_supported(&algo) {
                 // Once a provider has been named, HotSpot reports the failure
                 // against THAT provider: `no such algorithm: X for provider Y`.
                 let provider = match args.get(algo_idx + 1) {
                     Some(Value::Object(Some(p))) => ctx.read_string(*p),
+                    _ => None,
+                };
+                return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
+            }
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
+            let id = ctx.identity_hash_code(obj);
+            // BUG nb-phases-late(4): bound the key-bearing side-table before
+            // inserting so it cannot retain key material for the VM lifetime.
+            let mut t = mac_state_table().lock().unwrap();
+            mac_state_evict_if_needed(&mut t, id);
+            t.insert(
+                id,
+                MacState {
+                    algo,
+                    key: Vec::new(),
+                    data: Vec::new(),
+                    initialized: false,
+                },
+            );
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    // getInstance(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;
+    //
+    // The SEVENTEENTH public method of `javax.crypto.Mac`, and the one that was
+    // registered nowhere. It went missing because
+    // `phases_late::every_public_mac_method_is_registered` — the census whose
+    // doc comment says "Every PUBLIC method of `javax.crypto.Mac` must be
+    // registered — not most of them" — had its population transcribed from THIS
+    // registrar rather than from the JDK, so it listed 16 of 17 and every one of
+    // the 16 passed. See
+    // `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`.
+    //
+    // Leaving it unregistered is not inert. The other two overloads allocate a
+    // 4-slot synthetic `javax/crypto/Mac` and seed `mac_state_table`; this one
+    // fell through to the REAL JDK body, which hands back a `Mac` with no
+    // `mac_state_table` row — while `init`, `update`, `doFinal`, `getAlgorithm`,
+    // `getMacLength` and `reset` on that object are ALL intercepted by natives
+    // that read that row. `getMacLength()` on it answers
+    // `IllegalStateException: MAC algorithm unavailable:` (empty name), and
+    // `doFinal()` answers on an empty key — a silently WRONG MAC, which is the
+    // worst outcome in this file's own accounting, since a MAC that verifies is
+    // itself the security decision.
+    //
+    // ## The contract, measured on HotSpot 25.0.3+9 (this host, 2026-08-13)
+    //
+    // ```text
+    // getInstance("HmacSHA256", SunJCE)      -> OK  prov=SunJCE len=32, getProvider() == the SAME instance
+    // getInstance("HmacSHA256", SUN)         -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider SUN
+    // getInstance("HmacSHA256", new Provider("MyAnon",…){})
+    //                                        -> NoSuchAlgorithmException: no such algorithm: HmacSHA256 for provider MyAnon
+    // getInstance("NoSuchMac",  SunJCE)      -> NoSuchAlgorithmException: no such algorithm: NoSuchMac for provider SunJCE
+    // getInstance("",           SunJCE)      -> NoSuchAlgorithmException: no such algorithm:  for provider SunJCE
+    // getInstance("HmacSHA256", (Provider)null) -> IllegalArgumentException: missing provider
+    // getInstance(null,         SunJCE)      -> NullPointerException: null algorithm name
+    // getInstance(null,         (Provider)null) -> NullPointerException: null algorithm name
+    // ```
+    //
+    // Three rows are the whole design, and none is guessable from the
+    // `(String, String)` overload:
+    //
+    // 1. **There is no `NoSuchProviderException` on this overload at all.** The
+    //    caller handed over a `Provider` INSTANCE, so there is nothing to look
+    //    up; a provider that was never passed to `Security.addProvider` is
+    //    perfectly acceptable as an argument (`MyAnon` above got as far as the
+    //    algorithm check). `check_named_provider_arg` is called anyway and is a
+    //    documented no-op for a non-`String` argument — it is here for the null
+    //    row, which it does handle, and so that the two overloads keep one
+    //    ordering rather than two.
+    // 2. **A null provider is `IllegalArgumentException("missing provider")`,
+    //    not NPE** — the same `IllegalArgumentException` the `(String, String)`
+    //    overload gives for `null` and for `""`.
+    // 3. **The null-algorithm check runs FIRST.** `getInstance(null, null)` is
+    //    NPE, not IAE — measured on both two-argument overloads. So the
+    //    algorithm argument is located before the provider is examined, which is
+    //    exactly the order below.
+    //
+    // Ownership then decides the rest: whether the *named* provider supplies the
+    // algorithm is the only question this overload can fail on, and HotSpot
+    // answers it identically for a registered provider that lacks the row (SUN)
+    // and an unregistered one that lacks it (MyAnon). `check_provider_ownership`
+    // reads the same service table for both and `ProviderArgWording::Shared`
+    // reproduces the message verbatim.
+    //
+    // **Known residual, stated so a green run is not read as more than it is:**
+    // `getProvider()` on the returned Mac answers the canonical `SunJCE` object
+    // (`jce_provider_object`), not the instance the caller passed. HotSpot
+    // returns the caller's own instance (`m.getProvider() == provider` measured
+    // `true`). Fixing that means giving `MacState` a provider field, and
+    // `MacState` is built with an explicit all-fields literal in
+    // `phases_late.rs` — a file this lane does not own — whose own comment says
+    // to list every field. For every provider this VM can actually serve a Mac
+    // from, `SunJCE` is the right answer; for an application provider it is not.
+    r.register(
+        mac,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+        |ctx, args| {
+            // NOT `mac_algorithm_arg`: that one takes the first argument
+            // `read_string` succeeds on, and on THIS overload the second
+            // argument is a `Provider`, whose `read_string` is not reliably
+            // `None`. With a null algorithm the plain scan would hand the
+            // PROVIDER back as the algorithm name and answer
+            // `NoSuchAlgorithmException` where HotSpot answers
+            // `NullPointerException: null algorithm name`. See
+            // `mac_algorithm_arg_string_typed`.
+            let Some((algo_idx, algo)) = mac_algorithm_arg_string_typed(ctx, args) else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("null algorithm name".to_string()),
+                }
+                .into());
+            };
+            // Null provider => IllegalArgumentException("missing provider").
+            // A non-null, non-String argument is the Provider instance itself,
+            // which this call is a documented no-op for.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                algo_idx + 1,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
+            // The one question this overload can fail on: does THAT provider
+            // supply this algorithm? `check_provider_ownership` reads the
+            // provider's name off the instance via `provider_name_of` when the
+            // argument is not a String, so an unregistered `Provider` object is
+            // reported by its own name — which is what HotSpot does.
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                algo_idx + 1,
+                "Mac",
+                &algo,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
+            // Backstop for the case ownership cannot see: a provider whose name
+            // this VM could not read (`provider_name_of` -> "<unknown>", which
+            // `check_provider_ownership` deliberately admits) asking for a name
+            // this engine does not compute. Refusing BEFORE allocating is the
+            // W4-3 rule — an unimplemented name must never reach a receiver,
+            // because `mac_compute_hmac` has no default arm and the object would
+            // be a Mac that answers for an algorithm nothing here implements.
+            if !mac_algorithm_supported(&algo) {
+                // Once a provider is in play HotSpot reports the failure against
+                // THAT provider, so the message must carry its name.
+                let provider = match args.get(algo_idx + 1) {
+                    Some(Value::Object(Some(p))) => {
+                        Some(crate::jca::provider_chain::provider_name_of(ctx, *p))
+                    }
                     _ => None,
                 };
                 return Err(mac_no_such_algorithm(ctx, &algo, provider.as_deref()));
@@ -716,6 +894,60 @@ fn mac_algorithm_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(usi
         Value::Object(Some(o)) => ctx.read_string(*o).map(|s| (i, s)),
         _ => None,
     })
+}
+
+/// `mac_algorithm_arg` for the `(String, Provider)` overload: locate the
+/// algorithm by the argument's declared CLASS, not by whether `read_string`
+/// happens to answer.
+///
+/// The plain scan takes the first argument `read_string` succeeds on. On the
+/// `(String, String)` overload that is always the algorithm, because the
+/// algorithm precedes the provider. On the `(String, Provider)` overload it is
+/// only the algorithm while the algorithm is non-null: a `Provider` receiver is
+/// not guaranteed to read back as `None` — `check_named_provider_arg` was
+/// written around exactly that ("a Provider object that read back as an empty
+/// string would otherwise be reported as a missing provider"). So with a null
+/// algorithm the plain scan would return the PROVIDER as the algorithm name and
+/// answer `NoSuchAlgorithmException`, where HotSpot 25.0.3+9 answers
+/// `NullPointerException: null algorithm name` — measured, for both
+/// `getInstance(null, SunJCE)` and `getInstance(null, (Provider)null)`.
+///
+/// The scan therefore skips any argument whose class is known and is not
+/// `java/lang/String`, and falls back to `read_string` only for arguments whose
+/// class the context cannot report at all. That fallback is deliberate: mock
+/// contexts in this tree do not always answer `class_name_of_id`
+/// (`docs/architecture/natives-over-real-jdk-classes.md` §4), and a helper that
+/// returned `None` there would turn every mocked call into an NPE. Under the
+/// fallback the behaviour degrades to exactly `mac_algorithm_arg`'s, never worse.
+///
+/// It also preserves the leading-`Value::Object(None)` receiver-placeholder
+/// convention that `mac_algorithm_arg` documents: a `None` slot matches neither
+/// branch and is skipped, so `[placeholder, algo, provider]` and
+/// `[algo, provider]` both resolve, and the returned INDEX keeps the provider at
+/// `idx + 1` under either.
+fn mac_algorithm_arg_string_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<(usize, String)> {
+    for (i, v) in args.iter().enumerate() {
+        let Value::Object(Some(o)) = v else { continue };
+        match ctx.class_name_of_id(ctx.class_id_of_object(*o)) {
+            // Known to be the algorithm.
+            Some(n) if n == "java/lang/String" => {
+                return ctx.read_string(*o).map(|s| (i, s));
+            }
+            // Known NOT to be a String — this is the `Provider`. Skip it rather
+            // than let `read_string` misreport it as the algorithm name.
+            Some(_) => continue,
+            // Class unknown: fall back to the original heuristic for this slot.
+            None => {
+                if let Some(s) = ctx.read_string(*o) {
+                    return Some((i, s));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Normalise a `Mac` algorithm name the way JCA lookup is case-insensitive.
@@ -1173,6 +1405,92 @@ pub(crate) const NEW13_SESS_PROTO: usize = 0;
 pub(crate) const NEW13_SESS_CIPHER: usize = 1;
 
 pub(crate) const NEW13_SESS_TLSID: usize = 2;
+
+// ---------------------------------------------------------------------------
+// The two "nothing was negotiated" sentinels
+// ---------------------------------------------------------------------------
+//
+// These are NOT stand-ins invented here. They are the JDK's own answers, read
+// off `sun.security.ssl.SSLSessionImpl.nullSession` on HotSpot 25.0.3+9-LTS on
+// this host (`scratchpad/e12/E12SessionContract.java`, arms A and B — a fresh
+// unconnected `SSLSocket`, and an `SSLEngine` before `beginHandshake()`):
+//
+//     getCipherSuite() = SSL_NULL_WITH_NULL_NULL
+//     getProtocol()    = NONE
+//     getId()          = byte[0]
+//     isValid()        = false
+//
+// Why answering them is honesty and not invention — the distinction this
+// file's `--jdk-only` posture turns on. A fabricated stand-in is a value the
+// caller cannot tell apart from a real one. These two can ALWAYS be told
+// apart, and JSSE guarantees it (`scratchpad/e12/E12HandshakeSession.java`):
+//
+//     SSL_NULL_WITH_NULL_NULL in getSupportedCipherSuites() = false
+//     setEnabledCipherSuites("SSL_NULL_WITH_NULL_NULL")     = IllegalArgumentException
+//     "NONE" in getSupportedSSLParameters().getProtocols()  = false
+//     TLS_AES_256_GCM_SHA384 in getSupportedCipherSuites()  = TRUE
+//     TLS_AES_128_GCM_SHA256 in getSupportedCipherSuites()  = TRUE
+//
+// The sentinel suite is *unofferable*: JSSE refuses to enable it, so it can
+// never be the outcome of a handshake, so returning it can never be mistaken
+// for one. The two literals this file used to fall back to are the exact
+// opposite — both are in the supported list and both are what a real TLS 1.3
+// handshake genuinely produces, so a caller has no way to tell "we negotiated
+// AES-256-GCM" from "we negotiated nothing and the VM guessed".
+//
+// That is why a fabricated cipher name is worse than a merely wrong one:
+// security-sensitive code branches on this string. `if (session
+// .getCipherSuite().contains("AES_256"))` before sending a secret gets `yes`
+// from a session that has never handshaked.
+//
+// The old fallbacks `"UNKNOWN"`, `"?"` and `"TLS"` are the third wrong answer:
+// distinguishable, but not in JSSE's vocabulary, so a caller matching `^TLS_`
+// or looking the name up in the IANA registry gets a *fourth* behaviour that
+// matches neither the sentinel nor a real suite. (`"TLS"` is additionally
+// misleading: it is the standard `SSLContext.getInstance` ALGORITHM name, so
+// it reads as a legitimate protocol answer. Measured: `"TLS"` is not in
+// `getSupportedSSLParameters().getProtocols()` either.)
+pub(crate) const JSSE_NULL_CIPHER_SUITE: &str = "SSL_NULL_WITH_NULL_NULL";
+
+/// See [`JSSE_NULL_CIPHER_SUITE`]. `SSLSession.getProtocol()` for a session
+/// that has negotiated nothing — measured, not chosen.
+pub(crate) const JSSE_NULL_PROTOCOL: &str = "NONE";
+
+/// Allocate the `NEW13_SSL_SESS_FIELDS`-shaped equivalent of JSSE's
+/// `SSLSessionImpl.nullSession`: a real, non-null session object that reports
+/// "nothing negotiated" in the JDK's own vocabulary.
+///
+/// **`SSLSocket.getSession()` is contracted never to return null**, and HotSpot
+/// honours that even for a socket that was never connected (arm A of the
+/// transcript above returns an `SSLSessionImpl`, not null). A native that hands
+/// back `Value::Object(None)` there converts HotSpot's `SSL_NULL_WITH_NULL_NULL`
+/// into a `NullPointerException` inside the *caller*, at
+/// `getSession().getCipherSuite()` — a crash where the oracle has an answer.
+///
+/// `tls_id` is written to `NEW13_SESS_TLSID` so the accessors' "is there a live
+/// stream" test (`isValid`, `getId`) keeps working; pass `-1` when there is no
+/// stream, which is the only case this constructor is for.
+pub(crate) fn new13_alloc_null_ssl_session(
+    ctx: &mut dyn NativeContext,
+    tls_id: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let session =
+        try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS)?;
+    // Same pinning discipline as `new13_alloc_ssl_session`: each
+    // `create_string` is a GC point, so `session` and the first string both
+    // have to survive the second allocation.
+    let pin = ctx.pin_native_root(session);
+    let proto_str = ctx.create_string(JSSE_NULL_PROTOCOL);
+    let proto_pin = ctx.pin_native_root(proto_str);
+    let cipher_str = ctx.create_string(JSSE_NULL_CIPHER_SUITE);
+    let session = ctx.read_native_pin(pin, session);
+    let proto_str = ctx.read_native_pin(proto_pin, proto_str);
+    ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
+    ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
+    ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
+    ctx.unpin_native_roots(pin);
+    Ok(session)
+}
 
 /// NEW-13: build a `native_tls::TlsConnector` for an SSLContext.
 ///
@@ -1708,9 +2026,19 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
         Some((p, c, _, _)) => (p, c),
         None => match rustls_info {
             Some((p, c, _, _)) => (p, c),
+            // NEITHER registry knows this id, so nothing was negotiated that
+            // this VM can report. Answer JSSE's own "no negotiation" pair
+            // rather than a plausible-looking guess — see
+            // `JSSE_NULL_CIPHER_SUITE` for why that is honesty and not
+            // invention, and why the previous literal was the dangerous kind
+            // of wrong: `TLS_AES_128_GCM_SHA256` is in HotSpot's supported
+            // list, so a caller could not tell this answer from a real
+            // handshake's. The comment 12 lines above already recorded that
+            // this fallback had once been reached by a live TLS 1.3
+            // connection and had mis-reported its suite.
             None => (
-                String::from("TLSv1.3"),
-                String::from("TLS_AES_128_GCM_SHA256"),
+                String::from(JSSE_NULL_PROTOCOL),
+                String::from(JSSE_NULL_CIPHER_SUITE),
             ),
         },
     };
@@ -2864,8 +3192,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let port = ctx.get_field(socket, NEW13_SOCK_PORT).as_int().unwrap_or(0);
         crate::net_phase_e::sock_set_for_create(ctx, socket, port, real_tls_id);
         ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(real_tls_id));
+        // The handshake above SUCCEEDED, so `rustls_session_info` returning
+        // `None` here is an internal inconsistency, not an ordinary state —
+        // but the session object still has to answer something, and the only
+        // honest something is JSSE's "nothing negotiated" pair. `"TLS"` /
+        // `"UNKNOWN"` were neither: not JSSE vocabulary, not a real suite
+        // name, and `"TLS"` reads as a legitimate protocol because it is the
+        // `SSLContext.getInstance` algorithm name. See
+        // `JSSE_NULL_CIPHER_SUITE`.
         let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
-            .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
+            .unwrap_or_else(|| {
+                (
+                    JSSE_NULL_PROTOCOL.into(),
+                    JSSE_NULL_CIPHER_SUITE.into(),
+                    None,
+                    None,
+                )
+            });
         let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3)?;
         let protocol = ctx.create_string(&protocol);
         let cipher = ctx.create_string(&cipher);
@@ -2914,9 +3257,33 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     /// back to the field on the chance the slot is usable on this layout, but
     /// nothing depends on that write landing.
     ///
-    /// Returns `Value::Object(None)` only when there is genuinely no stream
-    /// (an unconnected socket) — the one case where JSSE itself would hand
-    /// back an invalid session rather than a real one.
+    /// When there is genuinely no stream (an unconnected socket) this returns
+    /// the INVALID session JSSE returns, not null.
+    ///
+    /// FIX (E12): the sentence that used to stand here said "Returns
+    /// `Value::Object(None)` only when there is genuinely no stream (an
+    /// unconnected socket) — the one case where JSSE itself would hand back an
+    /// invalid session rather than a real one." **It named the correct
+    /// behaviour and then did the opposite.** `SSLSocket.getSession()` is
+    /// contracted never to return null; measured on HotSpot 25.0.3+9-LTS
+    /// (`scratchpad/e12/E12TwoDoors.java`, DOOR 2), a socket from the zero-arg
+    /// `SSLSocketFactory.createSocket()` — which is exactly the object this
+    /// file's own `createSocket()V` registration mints with
+    /// `NEW13_SOCK_TLSID = -1` — answers:
+    ///
+    /// ```text
+    ///   getSession()      = sun.security.ssl.SSLSessionImpl   (NOT null)
+    ///   getCipherSuite()  = SSL_NULL_WITH_NULL_NULL
+    ///   getProtocol()     = NONE
+    ///   isValid()         = false
+    ///   getId().length    = 0
+    /// ```
+    ///
+    /// so returning null turned HotSpot's answer into a
+    /// `NullPointerException` inside the caller, at the extremely common
+    /// `socket.getSession().getCipherSuite()`. A missing answer is normally
+    /// better than a wrong one; here it was neither — it was a crash where the
+    /// oracle has a defined, greppable answer.
     fn new13_resolve_socket_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Value, MethodCallFailed> {
         let stored = ctx.get_field(this, NEW13_SOCK_SESSION);
         if matches!(stored, Value::Object(Some(_))) {
@@ -2924,7 +3291,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         let tls_id = new13_resolve_tls_id(ctx, this);
         if tls_id < 0 {
-            return Ok(Value::Object(None));
+            // Deliberately NOT written back to `NEW13_SOCK_SESSION`: a socket
+            // that is connected later must build a REAL session then, and
+            // caching the null session would pin the sentinel forever. HotSpot
+            // does not cache it either — DOOR 3 of the same transcript shows
+            // two `getSession()` calls on one unconnected socket returning two
+            // different `SSLSessionImpl` instances.
+            let null_session = new13_alloc_null_ssl_session(ctx, -1)?;
+            return Ok(Value::Object(Some(null_session)));
         }
         let pin = ctx.pin_native_root(this);
         let session = new13_alloc_ssl_session(ctx, tls_id)?;
@@ -3543,6 +3917,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // came to report `[TLSv1.3]`. The fabricated value was reported
             // whatever the connection had actually negotiated, so it was a
             // guess presented as a fact, not merely an imprecise default.
+            //
+            // E12: `new13_resolve_socket_session` now returns JSSE's INVALID
+            // session instead of null for an unconnected socket, so this
+            // consumer has to reject the sentinel explicitly. **This method is
+            // about CONFIGURATION, not about what was negotiated**, and the
+            // sentinel means "nothing was negotiated" — letting it through
+            // would have made an unconnected socket report `["NONE"]`, which
+            // is a worse answer than the one being fixed. Measured on HotSpot
+            // 25.0.3+9-LTS (`scratchpad/e12/E12Enabled.java`), on a socket
+            // from the zero-arg `createSocket()`:
+            //
+            //     getEnabledProtocols()  = [TLSv1.3, TLSv1.2]
+            //     getSession().getProtocol() = NONE
+            //     getEnabledProtocols() contains "NONE" = false
+            //
+            // so the no-negotiation answer is the enabled LIST, not a single
+            // guessed version. The old `unwrap_or("TLSv1.3")` was a one-element
+            // guess in exactly the case HotSpot answers with two.
             let negotiated =
                 if let Ok(Value::Object(Some(session))) = new13_resolve_socket_session(ctx, this) {
                     match ctx.get_field(session, NEW13_SESS_PROTO) {
@@ -3551,12 +3943,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     }
                 } else {
                     None
-                };
-            let proto = negotiated.unwrap_or_else(|| "TLSv1.3".to_string());
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
-            let s = ctx.create_string(&proto);
-            ctx.set_array_element(arr, 0, Value::Object(Some(s)));
-            Ok(Some(Value::Object(Some(arr))))
+                }
+                .filter(|p| p != JSSE_NULL_PROTOCOL);
+            match negotiated {
+                Some(proto) => {
+                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+                    let s = ctx.create_string(&proto);
+                    ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+                    Ok(Some(Value::Object(Some(arr))))
+                }
+                None => {
+                    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+                    let s1 = ctx.create_string("TLSv1.3");
+                    let s2 = ctx.create_string("TLSv1.2");
+                    ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
+                    ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+                    Ok(Some(Value::Object(Some(arr))))
+                }
+            }
         },
     );
     // STUB-REMOVAL (wave 2): this was an unconditional no-op, so a caller
@@ -4354,7 +4758,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(s))));
                 }
             }
-            Ok(Some(ctx.get_field(this, NEW13_SESS_PROTO)))
+            // E12: the cached field is the fallback, but it is not guaranteed
+            // to hold a String — `try_alloc_concurrent_synthetic` sizes this
+            // object with the REAL layout and the layout guard silently drops
+            // writes whose slot type does not match (the same hazard
+            // `new13_resolve_socket_session` documents for the session slot),
+            // and other modules mint 2-, 4-, 6- and 8-field `SSLSession`s
+            // whose slot 0 is not always this one's. Returning the raw slot
+            // therefore returned a NULL String from a method JSSE contracts
+            // to be non-null. Answer the measured sentinel instead. See
+            // `JSSE_NULL_PROTOCOL`.
+            match ctx.get_field(this, NEW13_SESS_PROTO) {
+                v @ Value::Object(Some(_)) => Ok(Some(v)),
+                _ => {
+                    let s = ctx.create_string(JSSE_NULL_PROTOCOL);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
     r.register(
@@ -4374,7 +4794,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(s))));
                 }
             }
-            Ok(Some(ctx.get_field(this, NEW13_SESS_CIPHER)))
+            // E12: same as `getProtocol` just above — a non-String slot must
+            // answer the sentinel, not a null String. See
+            // `JSSE_NULL_CIPHER_SUITE`.
+            match ctx.get_field(this, NEW13_SESS_CIPHER) {
+                v @ Value::Object(Some(_)) => Ok(Some(v)),
+                _ => {
+                    let s = ctx.create_string(JSSE_NULL_CIPHER_SUITE);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
     r.register(ssl_session, "isValid", "()Z", |ctx, args| {
@@ -4399,11 +4828,32 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         } else {
             -1
         };
+        // E12: a session that has negotiated nothing has NO id, and JSSE says
+        // so with an EMPTY array rather than with 32 plausible bytes.
+        // Measured, HotSpot 25.0.3+9-LTS (`scratchpad/e12/E12SessionContract.java`):
+        //
+        //     unconnected SSLSocket / pre-handshake SSLEngine  getId() = byte[0]
+        //     after a completed TLS 1.3 handshake              getId() = byte[32]
+        //
+        // The 32 fabricated bytes are the same species of defect as the
+        // fabricated cipher name and are arguably worse, because this value's
+        // documented use is as an IDENTITY: this registration's own sibling in
+        // `t27_tls` says Tomcat reads it "for SSL session tracking". Handing
+        // a distinct, stable, non-empty id to a session that never handshaked
+        // makes an unnegotiated session look like a trackable one, and
+        // `byte[0]` is precisely the signal callers test for.
+        //
+        // Note the pre-existing bug this also fixes: the seed was derived from
+        // `tls_id` alone whenever the registry lookup missed, so EVERY
+        // never-connected session shared one id — the opposite of the
+        // uniqueness the caller assumes.
+        let Some((p, c, _, _)) = crate::servlet::s2_tls_session_info(tls_id) else {
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        };
         let mut seed: u64 = (tls_id as i64 as u64).wrapping_mul(0x9E3779B97F4A7C15);
-        if let Some((p, c, _, _)) = crate::servlet::s2_tls_session_info(tls_id) {
-            for b in p.as_bytes().iter().chain(c.as_bytes()) {
-                seed = seed.wrapping_mul(1099511628211).wrapping_add(*b as u64);
-            }
+        for b in p.as_bytes().iter().chain(c.as_bytes()) {
+            seed = seed.wrapping_mul(1099511628211).wrapping_add(*b as u64);
         }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         let mut rng = seed | 1;
@@ -5731,10 +6181,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(s)) = ctx.get_field(this, 6) {
                 return Ok(Some(Value::Object(Some(s))));
             }
-            // Build a fresh session and cache it
+            // Build a fresh session and cache it.
+            //
+            // E12: this engine has NO backing TLS connection at all — slot 6
+            // is the only session state it has, and reaching this arm means
+            // nothing has been negotiated. It used to report `TLSv1.3` /
+            // `TLS_AES_128_GCM_SHA256`: a specific, strong, *supported* suite
+            // for a handshake that never happened. HotSpot's answer for the
+            // same state is measured in arm B of
+            // `scratchpad/e12/E12SessionContract.java` — `SSL_NULL_WITH_NULL_NULL`
+            // / `NONE` — and unlike the two literals above, that pair cannot
+            // be confused with a real negotiation, because JSSE refuses to
+            // enable it (`setEnabledCipherSuites("SSL_NULL_WITH_NULL_NULL")`
+            // throws `IllegalArgumentException`). See `JSSE_NULL_CIPHER_SUITE`.
+            //
+            // Slot order here is (proto, cipher), matching the `< 7 fields`
+            // arm of `t27_tls::register_ssl_session_real`'s field-count
+            // disambiguation as well as `NEW13_SESS_PROTO`/`_CIPHER`.
             let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 2)?;
-            let proto = ctx.create_string("TLSv1.3");
-            let cipher = ctx.create_string("TLS_AES_128_GCM_SHA256");
+            let proto = ctx.create_string(JSSE_NULL_PROTOCOL);
+            let cipher = ctx.create_string(JSSE_NULL_CIPHER_SUITE);
             ctx.set_field(session, 0, Value::Object(Some(proto)));
             ctx.set_field(session, 1, Value::Object(Some(cipher)));
             ctx.set_field(this, 6, Value::Object(Some(session)));
@@ -7074,6 +7540,137 @@ pub(crate) mod new13_tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // E12 — the "nothing was negotiated" session
+    // -----------------------------------------------------------------------
+    //
+    // These exist because of the lesson E3-1 recorded one lane earlier: a
+    // family of fallbacks named only in a document sat unpatched for a day,
+    // because **a document cannot fail a build**. The behavioural half is
+    // `regression-suite/src/RSslNullSession.java`; this half needs no VM.
+
+    /// The two spellings, pinned to the HotSpot transcript that produced them.
+    ///
+    /// If someone "tidies" `SSL_NULL_WITH_NULL_NULL` into `NULL_NULL` or
+    /// `"NONE"` into `"UNKNOWN"`, this fails with the transcript in the
+    /// message rather than with a silent behaviour change nobody re-measures.
+    #[test]
+    fn the_null_session_sentinels_are_the_measured_jsse_spellings() {
+        assert_eq!(
+            JSSE_NULL_CIPHER_SUITE, "SSL_NULL_WITH_NULL_NULL",
+            "HotSpot 25.0.3+9-LTS, unconnected SSLSocket: \
+             getSession().getCipherSuite() = SSL_NULL_WITH_NULL_NULL"
+        );
+        assert_eq!(
+            JSSE_NULL_PROTOCOL, "NONE",
+            "HotSpot 25.0.3+9-LTS, unconnected SSLSocket: \
+             getSession().getProtocol() = NONE"
+        );
+        // The property that makes them safe to RETURN, stated where it can be
+        // broken: neither may ever appear in the suite list this VM claims to
+        // support, or the sentinel stops being distinguishable from a real
+        // negotiation and the whole argument for returning it collapses.
+        assert!(
+            !crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES.contains(&JSSE_NULL_CIPHER_SUITE),
+            "the null-session sentinel must never be an offerable suite"
+        );
+    }
+
+    /// `getProtocol`/`getCipherSuite`/`getId`/`isValid` on a session with no
+    /// backing stream must answer JSSE's null-session values.
+    #[test]
+    fn null_session_accessors_answer_the_sentinels_not_a_null_string() {
+        // `NativeHeapAccess` explicitly: `ctx` here is the CONCRETE
+        // `MockNativeContext`, not a `dyn NativeContext`, so supertrait
+        // methods (`alloc_object`, `set_field`, `read_string`,
+        // `array_length`) need their own trait in scope. Same reason the
+        // sibling test module at `phases_late.rs:10067` says so out loud.
+        use crate::test_utils::MockNativeContext;
+        use cratonvm_native_api::NativeHeapAccess;
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        // A 3-field session whose slots were never populated — the shape
+        // `new13_alloc_null_ssl_session` produces, and also what a dropped
+        // layout-guard write leaves behind.
+        let sess = ctx.alloc_object(ClassId::new(0), NEW13_SSL_SESS_FIELDS);
+        ctx.set_field(sess, NEW13_SESS_TLSID, Value::Int(-1));
+        let this = &[Value::Object(Some(sess))];
+
+        let proto = r
+            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .expect("getProtocol registered");
+        match proto(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some(JSSE_NULL_PROTOCOL));
+            }
+            other => panic!("getProtocol must never return a null String, got {other:?}"),
+        }
+
+        let cipher = r
+            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .expect("getCipherSuite registered");
+        match cipher(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some(JSSE_NULL_CIPHER_SUITE));
+            }
+            other => panic!("getCipherSuite must never return a null String, got {other:?}"),
+        }
+
+        // JSSE answers an EMPTY id, not 32 plausible bytes. Tomcat's
+        // `JSSESupport.getSessionId` tests exactly `length == 0`.
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => {
+                assert_eq!(ctx.array_length(a), 0, "a session with no id must answer byte[0]");
+            }
+            other => panic!("getId must return an array, got {other:?}"),
+        }
+
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        assert_eq!(is_valid(&mut ctx, this).unwrap(), Some(Value::Int(0)));
+    }
+
+    /// MUTATION CHECK for the test above. Without this, both accessors could
+    /// be `Ok(sentinel)` unconditionally and the previous test would still
+    /// pass — it would be measuring the sentinel branch and nothing else.
+    #[test]
+    fn a_populated_session_is_not_overwritten_by_the_sentinel() {
+        use crate::test_utils::MockNativeContext;
+        use cratonvm_native_api::NativeHeapAccess;
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(ClassId::new(0), NEW13_SSL_SESS_FIELDS);
+        let p = ctx.create_string("TLSv1.3");
+        let c = ctx.create_string("TLS_AES_256_GCM_SHA384");
+        ctx.set_field(sess, NEW13_SESS_PROTO, Value::Object(Some(p)));
+        ctx.set_field(sess, NEW13_SESS_CIPHER, Value::Object(Some(c)));
+        ctx.set_field(sess, NEW13_SESS_TLSID, Value::Int(-1));
+        let this = &[Value::Object(Some(sess))];
+
+        let proto = r
+            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .unwrap();
+        match proto(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some("TLSv1.3"))
+            }
+            other => panic!("a real negotiated protocol must pass through, got {other:?}"),
+        }
+        let cipher = r
+            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .unwrap();
+        match cipher(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some("TLS_AES_256_GCM_SHA384"))
+            }
+            other => panic!("a real negotiated suite must pass through, got {other:?}"),
+        }
+    }
+
     #[test]
     fn s2_tls_helpers_reject_unknown_id() {
         // A bogus id must not panic and must return errors / None so the
@@ -7123,21 +7720,63 @@ pub(crate) mod new13_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The names `mac_compute_hmac` implements are exactly the `SunJCE` `Mac`
-    /// services `jca::provider_chain` seeds. If someone adds a service row
-    /// without an implementation arm — the W4-3 defect species — this is the
-    /// test that says so.
+    /// Every `Mac` service the REAL `SunJCE` provider publishes, split into the
+    /// ones this engine computes and the ones it refuses — and both halves are
+    /// ratcheted.
     ///
-    /// This half restates the list; the other half,
-    /// `provider_chain::every_advertised_sunjce_mac_is_computable`, DERIVES it
-    /// from the registry, so the pair is a ratchet rather than two censuses. The
-    /// restated copy earns its place by pinning the normalisation, which the
-    /// registry-derived side cannot see: `mac_normalise` folds case and strips
-    /// `-` but keeps `/`, which is what stops `HmacSHA512/224` being served for
-    /// `HmacSHA512/256`.
+    /// ## What this test used to be, and why that was the E25 defect shape
+    ///
+    /// It held ONE list of 12 names, described as "the names `mac_compute_hmac`
+    /// implements are exactly the `SunJCE` `Mac` services `jca::provider_chain`
+    /// seeds", and asserted each was supported. Both sides of that "exactly"
+    /// were internal to this tree: the 12 were transcribed from
+    /// `provider_chain.rs:1371`'s seed, which was itself written alongside the
+    /// `mac_compute_hmac` arms. So the population was the answer, and the only
+    /// input that could turn it red was deleting an arm from `mac_compute_hmac`.
+    ///
+    /// In particular it could not go red for the direction
+    /// `provider_chain.rs:1376` names as "the quiet half of this defect species,
+    /// because nothing asks for a name nobody publishes": an arm added to
+    /// `mac_compute_hmac` for a name the seed does not carry. The sibling
+    /// `provider_chain::every_advertised_sunjce_mac_is_computable` does run that
+    /// direction, but over a hand-list of **6** of the 12 implemented names —
+    /// so the six added on 2026-08-12 (`HmacSHA512/224`, `HmacSHA512/256` and
+    /// the four SHA-3s) can lose their service row with nothing going red. That
+    /// gap is nominated separately; it is in a file this lane does not own.
+    ///
+    /// ## The population below is HotSpot's
+    ///
+    /// Measured on openjdk 25.0.3+9 (Microsoft-13877124), this host, 2026-08-13:
+    ///
+    /// ```java
+    /// for (Provider.Service s : Security.getProvider("SunJCE").getServices())
+    ///     if (s.getType().equals("Mac")) print(s.getAlgorithm());
+    /// ```
+    ///
+    /// answers **28** rows. Twelve are computed here; sixteen are refused, and
+    /// each of the sixteen is a real algorithm a caller has every reason to ask
+    /// for — which is exactly why "refused" has to be asserted rather than
+    /// assumed. `mac_refuses_every_algorithm_it_cannot_compute` covers seven of
+    /// them plus `Poly1305`/`AESCMAC`, which SunJCE does NOT publish and which
+    /// therefore belong to that test and not to this one.
+    ///
+    /// ## What makes it red now
+    ///
+    /// * an implemented name losing its arm — as before;
+    /// * **a refused name gaining one.** That is the reverse direction, and it
+    ///   is the point: implementing `HmacPBESHA256` without adding its SunJCE
+    ///   service row would make `Security.getAlgorithms("Mac")` under-report
+    ///   what `Mac.getInstance` will serve. The failure text says to move the
+    ///   name across and seed the row in the same change.
+    ///
+    /// **What still would not:** a SunJCE `Mac` row that exists on JDK 26 and
+    /// not on 25. The population is a dated `getServices()` transcript taken by
+    /// hand, and the honest close is a generated table, which needs a build this
+    /// lane cannot run.
     #[test]
     fn mac_supported_set_matches_the_advertised_sunjce_services() {
-        let advertised = [
+        // HotSpot SunJCE `Mac` rows, half 1 of 2: computed here.
+        let implemented = [
             "HmacMD5",
             "HmacSHA1",
             "HmacSHA224",
@@ -7151,7 +7790,36 @@ pub(crate) mod new13_tests {
             "HmacSHA3-384",
             "HmacSHA3-512",
         ];
-        for algo in advertised {
+        // HotSpot SunJCE `Mac` rows, half 2 of 2: refused here. PKCS#12
+        // (`HmacPBE*`) and PBMAC1 (`PBEWithHmac*`) are key-derivation
+        // constructions, not HMAC-over-a-digest; `SslMac*` is the SSLv3 MAC.
+        // Serving any of them would mean a second unverified construction.
+        let refused_but_advertised_by_hotspot = [
+            "HmacPBESHA1",
+            "HmacPBESHA224",
+            "HmacPBESHA256",
+            "HmacPBESHA384",
+            "HmacPBESHA512",
+            "HmacPBESHA512/224",
+            "HmacPBESHA512/256",
+            "PBEWithHmacSHA1",
+            "PBEWithHmacSHA224",
+            "PBEWithHmacSHA256",
+            "PBEWithHmacSHA384",
+            "PBEWithHmacSHA512",
+            "PBEWithHmacSHA512/224",
+            "PBEWithHmacSHA512/256",
+            "SslMacMD5",
+            "SslMacSHA1",
+        ];
+        assert_eq!(
+            implemented.len() + refused_but_advertised_by_hotspot.len(),
+            28,
+            "the two halves must partition the 28 `Mac` rows HotSpot 25.0.3+9's \
+             SunJCE publishes — if you added a row to one half, you took it from \
+             the other, or the transcript is stale"
+        );
+        for algo in implemented {
             assert!(
                 mac_algorithm_supported(algo),
                 "{algo} is advertised by provider_chain but refused here"
@@ -7165,8 +7833,41 @@ pub(crate) mod new13_tests {
                 "{algo} is advertised but has no output length"
             );
         }
-        let advertised_upper: Vec<String> =
-            advertised.iter().map(|a| mac_normalise(a)).collect();
+        for algo in refused_but_advertised_by_hotspot {
+            assert!(
+                !mac_algorithm_supported(algo),
+                "{algo} is now computed here, but it is still listed as refused. \
+                 Real SunJCE publishes it, so implementing it is welcome — move \
+                 the name into `implemented` above AND add its service row to \
+                 `jca::provider_chain`'s SunJCE seed in the SAME change. \
+                 Implemented-but-unadvertised is the quiet half of this defect: \
+                 `Security.getAlgorithms(\"Mac\")` would under-report what \
+                 `Mac.getInstance` actually serves, so nothing would ever ask."
+            );
+        }
+        let implemented_upper: Vec<String> =
+            implemented.iter().map(|a| mac_normalise(a)).collect();
+        // NOT an agreement with HotSpot — a pin on this VM's own, WIDER,
+        // normalisation. Measured on HotSpot 25.0.3+9 today:
+        //
+        // ```text
+        // Mac.getInstance("HMAC-SHA256", SunJCE)
+        //   -> NoSuchAlgorithmException: no such algorithm: HMAC-SHA256 for provider SunJCE
+        // Mac.getInstance("HmacSHA-256", SunJCE)
+        //   -> NoSuchAlgorithmException: no such algorithm: HmacSHA-256 for provider SunJCE
+        // Mac.getInstance("hmacsha512/256", SunJCE) -> OK (case folds)
+        // Mac.getInstance("HMACSHA3-512", SunJCE)   -> OK (case folds)
+        // Mac.getInstance("HmacSHA3256",  SunJCE)
+        //   -> NoSuchAlgorithmException: no such algorithm: HmacSHA3256 for provider SunJCE
+        // ```
+        //
+        // So JCA folds CASE but does not strip `-`: `HMAC-SHA224` is a name
+        // HotSpot refuses and this VM accepts. That is an over-acceptance, not a
+        // wrong MAC — the bytes served under it are the bytes `HmacSHA224` would
+        // give — and narrowing it would refuse names some caller in this tree
+        // may already rely on, which needs a run to settle. It is recorded here
+        // rather than silently frozen, because the assertions below would
+        // otherwise read as "this matches the JDK", and they do not.
         for algo in [
             "HMACMD5",
             "hmacsha256",
@@ -7178,7 +7879,7 @@ pub(crate) mod new13_tests {
             "hmacsha224",
         ] {
             assert!(
-                advertised_upper.contains(&mac_normalise(algo)),
+                implemented_upper.contains(&mac_normalise(algo)),
                 "case/hyphen normalisation drifted for {algo}"
             );
             assert!(mac_algorithm_supported(algo), "{algo} must resolve");

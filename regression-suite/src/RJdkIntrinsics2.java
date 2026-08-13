@@ -74,7 +74,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  *
  * <p><b>{@code --only=<family>} exists because a Rust panic truncates the
  * run.</b> With no arguments — which is how {@code run.sh} drives it — the
- * eleven families run in ascending order of how likely each is to ABORT the VM
+ * twelve families run in ascending order of how likely each is to ABORT the VM
  * rather than fail an assertion, so a VM that dies in {@link #divmod()} has
  * already reported the other ten. Passing {@code --only=divmod} runs that
  * family alone, which is the only way to learn anything about a family whose
@@ -136,6 +136,32 @@ public class RJdkIntrinsics2 {
         return t == null ? "none" : t.getClass().getName();
     }
 
+    /**
+     * Distance in ulps between two finite doubles, used to check {@code Math}'s
+     * transcendentals against their bit-exact {@code StrictMath} twins.
+     *
+     * <p>{@code Math}'s javadoc gives those methods a ONE ULP error budget, so
+     * a literal expected value would be over-strict and a plain {@code ==}
+     * would be wrong. Comparing the ORDER of the two bit patterns is the exact
+     * assertion the specification licenses: for two same-sign finite values the
+     * signed-magnitude bit patterns are monotonic, so their difference counts
+     * representable values between them. A NaN on either side is reported as an
+     * infinite gap so it can never pass.
+     */
+    static double ulpGap(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) {
+            return Double.POSITIVE_INFINITY;
+        }
+        long x = Double.doubleToLongBits(a);
+        long y = Double.doubleToLongBits(b);
+        if ((x < 0) != (y < 0)) {
+            // Opposite signs: only the two zeros may be this close.
+            return a == b ? 0.0 : Double.POSITIVE_INFINITY;
+        }
+        long d = x - y;
+        return d < 0 ? -(double) d : (double) d;
+    }
+
     // Operand sources neither javac nor a JIT can see through.
     static final int[] OPAQUE_I = {
         Integer.MIN_VALUE, Integer.MAX_VALUE, -1, 0, 1, 2, 3, 255, -255, -7, 36, 16, 10, 9,
@@ -149,6 +175,14 @@ public class RJdkIntrinsics2 {
         0x00aa, 0x01c5, 0x2160, 0x2170, 0x00b2, 0x001c, 0x007f, 0x009f, 0x00a0,
         0x1f600, 0xffff, 0x10000, 0x10ffff, 0x110000, 0xdbff, 0xdc00, 0xd800, 0xdfff,
         0x10428, 0x10400, 0x00df, 0x1f3fb, 0x1f44d, 0x2764, 0x1d7ce, 0x00bc, 0x0f20,
+        // E26 additions — indices 27..32, APPENDED so every index above is
+        // unchanged. 0x01c4 is the UPPERCASE Dz whose titlecase is 0x01c5.
+        0x01c4, 0x4e00, 0x0378, 0x05d0, 0x0028, 0x0009,
+    };
+    /** Ordinary double operands: the MIDDLE of the domain, not its corners. */
+    static final double[] OPAQUE_SM = {
+        2.0, 0.5, 1.0, 3.0, 10.0, 123.456, 0.1, 1.5, 27.0, 1000.0, 4.0, 1e-10, 5.0,
+        0.49999999999999994, -0.5, 22.0, 40.0, 2.5,
     };
     static final String[] OPAQUE_S = {
         "TRUE", "True", "tRuE", "1", "yes", "", " true", "z", "Z", "-z", "0", "+1",
@@ -156,6 +190,10 @@ public class RJdkIntrinsics2 {
         "9223372036854775808", "-9223372036854775808", "128", "-128", "7f", "80",
         "32768", "-32768", "ffff", "7fff", "nan", "inf", "0x1p3", "1.0f", "1.0d",
         "1e-46", "1e40", "1e-324", "1e400", "-0.0", "1.0dd", "  1.5  ",
+        // E26 additions — indices 40..49, APPENDED so every index above is
+        // unchanged.
+        "4294967295", "ffffffff", "0x1f", "#1f", "017", "-0x1f", "08",
+        "18446744073709551615", "hello123x", "4294967296",
     };
 
     // -----------------------------------------------------------------------
@@ -183,6 +221,7 @@ public class RJdkIntrinsics2 {
             0x00aa, 0x01c5, 0x2160, 0x2170, 0x00b2, 0x001c, 0x007f, 0x009f, 0x00a0,
             0x1f600, 0xffff, 0x10000, 0x10ffff, 0x110000, 0xdbff, 0xdc00, 0xd800, 0xdfff,
             0x10428, 0x10400, 0x00df, 0x1f3fb, 0x1f44d, 0x2764, 0x1d7ce, 0x00bc, 0x0f20,
+            0x01c4, 0x4e00, 0x0378, 0x05d0, 0x0028, 0x0009,
         };
         check(OPAQUE_CP.length == expect.length, "OPAQUE_CP changed shape");
         for (int k = 0; k < expect.length; k++) {
@@ -221,7 +260,9 @@ public class RJdkIntrinsics2 {
         check(!Character.isISOControl(OPAQUE_CP[8]),
                 "Character.isISOControl(0xA0 NBSP) must be false — one past the C1 range");
         check(!Character.isISOControl(OPAQUE_I[2]),
-                "Character.isISOControl(-1) must be false, not a panic");
+                "Character.isISOControl(-1) must be false — the range test is SIGNED;"
+                        + " widening the argument to unsigned still answers false, so a"
+                        + " true here means the range itself is wrong");
 
         // forDigit is specified to return the NUL character for every input it
         // cannot map — never to throw and never to index out of a table.
@@ -230,7 +271,8 @@ public class RJdkIntrinsics2 {
         check(Character.forDigit(OPAQUE_I[12], OPAQUE_I[12]) == 0,
                 "Character.forDigit(10, 10) must be U+0000 — digit >= radix");
         check(Character.forDigit(OPAQUE_I[2], OPAQUE_I[11]) == 0,
-                "Character.forDigit(-1, 16) must be U+0000, not a panic");
+                "Character.forDigit(-1, 16) must be U+0000 — a negative digit is outside"
+                        + " 0..radix; widening it to unsigned must not make it a digit");
         check(Character.forDigit(OPAQUE_I[3], OPAQUE_I[4]) == 0,
                 "Character.forDigit(0, 1) must be U+0000 — radix below MIN_RADIX");
         check(Character.forDigit(OPAQUE_I[3], 37) == 0,
@@ -241,7 +283,8 @@ public class RJdkIntrinsics2 {
         check(Character.charCount(OPAQUE_CP[9]) == 2, "Character.charCount(U+1F600) must be 2");
         check(Character.charCount(OPAQUE_CP[10]) == 1, "Character.charCount(U+FFFF) must be 1");
         check(Character.charCount(OPAQUE_I[2]) == 1,
-                "Character.charCount(-1) must be 1 — below MIN_SUPPLEMENTARY, not a panic");
+                "Character.charCount(-1) must be 1 — the compare is SIGNED; widening the"
+                        + " argument to unsigned answers 2");
         check(!Character.isValidCodePoint(OPAQUE_CP[13]),
                 "Character.isValidCodePoint(0x110000) must be false");
         check(!Character.isValidCodePoint(OPAQUE_I[2]),
@@ -317,7 +360,237 @@ public class RJdkIntrinsics2 {
                 "Character.isLetterOrDigit(U+1D7CE) must be true");
         check("a".equals(Character.toString('a')), "Character.toString('a') must be \"a\"");
 
-        sectionEnd("charcls", 86);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: eight classifiers, forDigit, digit, getNumericValue(C),
+        // charCount, the four code-point/surrogate range tests and the two (I)I
+        // case mappings. java.lang.Character declares ~60 public statics; the
+        // rows above call 17 of them, and NONE of the three whole sub-surfaces
+        // below.
+        //
+        // The block header already names the discriminating shape — "a body
+        // that answers either predicate from char::is_alphabetic cannot get both
+        // rows right" — and then never asks isAlphabetic. That is closed first.
+        // ===================================================================
+
+        // GAP 1: ONE code point, FOUR accessors, four answers. U+2160 is
+        // isUpperCase=true and isLetter=false above; it is also
+        // isAlphabetic=TRUE and isTitleCase=false, and its NUMERIC VALUE is 1
+        // while Character.digit refuses it. Two methods that both "read a digit
+        // out of a code point" must disagree here, which no single Rust call
+        // produces.
+        check(Character.isAlphabetic(OPAQUE_CP[2]),
+                "Character.isAlphabetic(U+2160) must be TRUE — Nl is alphabetic, while"
+                        + " isLetter on the SAME code point is false above");
+        check(Character.isAlphabetic(OPAQUE_CP[19]),
+                "Character.isAlphabetic(U+10400) must be true — astral Lu");
+        check(!Character.isAlphabetic(OPAQUE_CP[4]),
+                "Character.isAlphabetic(U+00B2) must be false — No is not alphabetic");
+        check(!Character.isAlphabetic(OPAQUE_CP[9]),
+                "Character.isAlphabetic(U+1F600) must be false");
+        check(Character.getNumericValue(OPAQUE_CP[2]) == 1,
+                "Character.getNumericValue(U+2160) must be 1 — ROMAN NUMERAL ONE is worth one");
+        check(Character.digit(OPAQUE_CP[2], OPAQUE_I[10]) == -1,
+                "Character.digit(U+2160, 36) must be -1 — the SAME code point the row above"
+                        + " values at 1; digit() and getNumericValue() are NOT one function");
+        check(Character.getNumericValue(OPAQUE_CP[24]) == 0,
+                "Character.getNumericValue(int U+1D7CE) must be 0 — the (I)I overload, which is"
+                        + " a different registered triple from the (C)I one above");
+        check(Character.getNumericValue(OPAQUE_CP[11]) == -1,
+                "Character.getNumericValue(int U+10000) must be -1 — no numeric value");
+        check(Character.getNumericValue(OPAQUE_I[2]) == -1,
+                "Character.getNumericValue(-1) must be -1, not a panic");
+        check(!Character.isTitleCase(OPAQUE_CP[2]),
+                "Character.isTitleCase(U+2160) must be false");
+        check(Character.isTitleCase(OPAQUE_CP[1]),
+                "Character.isTitleCase(U+01C5) must be TRUE — the one category the pair of"
+                        + " upper/lower predicates above both answer false for");
+
+        // GAP 2: toTitleCase — a THIRD case mapping, and the only one whose
+        // fixed point is not its own input. Rust has no titlecase mapping at
+        // all, so a body that aliases it onto to_uppercase gets U+01C4 wrong.
+        check(Character.toTitleCase(OPAQUE_CP[27]) == 0x01c5,
+                "Character.toTitleCase(U+01C4 UPPER DZ) must be U+01C5, NOT U+01C4 — the row"
+                        + " that separates titlecase from uppercase");
+        check(Character.toUpperCase(OPAQUE_CP[27]) == 0x01c4,
+                "Character.toUpperCase(U+01C4) must be U+01C4 itself — the contrast");
+        check(Character.toTitleCase(OPAQUE_CP[1]) == 0x01c5,
+                "Character.toTitleCase(U+01C5) must be itself — already titlecase");
+        check(Character.toTitleCase((int) 'a') == 'A',
+                "Character.toTitleCase('a') must be 'A' where no distinct titlecase exists");
+        check(Character.toTitleCase(OPAQUE_CP[18]) == 0x10400,
+                "Character.toTitleCase(U+10428) must be U+10400 — astral");
+        check(Character.toTitleCase(OPAQUE_I[2]) == -1,
+                "Character.toTitleCase(-1) must be -1 — every unmapped int maps to itself");
+
+        // GAP 3: getType. One method returning Unicode's general category,
+        // never called, and it is the single answer from which most of the
+        // predicates above are derived — so a VM can pass every predicate row
+        // by hard-coding them and still have no category table.
+        check(Character.getType(OPAQUE_CP[2]) == 10,
+                "Character.getType(U+2160) must be 10 (LETTER_NUMBER)");
+        check(Character.getType(OPAQUE_CP[1]) == 3,
+                "Character.getType(U+01C5) must be 3 (TITLECASE_LETTER)");
+        check(Character.getType(OPAQUE_CP[4]) == 11,
+                "Character.getType(U+00B2) must be 11 (OTHER_NUMBER)");
+        check(Character.getType(OPAQUE_CP[16]) == 19,
+                "Character.getType(U+D800) must be 19 (SURROGATE) — a lone surrogate HAS a"
+                        + " category; it is not unassigned");
+        check(Character.getType(OPAQUE_CP[13]) == 0,
+                "Character.getType(0x110000) must be 0 (UNASSIGNED), not a panic");
+        check(Character.getType(OPAQUE_I[2]) == 0,
+                "Character.getType(-1) must be 0 (UNASSIGNED)");
+        check(Character.getType(OPAQUE_CP[9]) == 28,
+                "Character.getType(U+1F600) must be 28 (OTHER_SYMBOL)");
+        check(Character.getType(OPAQUE_CP[8]) == 12,
+                "Character.getType(U+00A0) must be 12 (SPACE_SEPARATOR)");
+        check(Character.getType(OPAQUE_CP[5]) == 15,
+                "Character.getType(0x1C) must be 15 (CONTROL)");
+        check(Character.getType(OPAQUE_CP[26]) == 9,
+                "Character.getType(U+0F20) must be 9 (DECIMAL_DIGIT_NUMBER)");
+        check(Character.LETTER_NUMBER == 10 && Character.TITLECASE_LETTER == 3
+                        && Character.SURROGATE == 19 && Character.UNASSIGNED == 0,
+                "the four category CONSTANTS the rows above name must hold their JLS values");
+
+        // GAP 4: toChars / toCodePoint / isSurrogatePair — the surrogate
+        // ARITHMETIC, as opposed to the surrogate range tests above. This is
+        // where the family's contracts stop being uniform, deliberately:
+        // charCount(0x110000) answers 2 without validating, and toChars(0x110000)
+        // THROWS. Both rows are here so neither rule is generalised.
+        check(Character.charCount(OPAQUE_CP[13]) == 2,
+                "Character.charCount(0x110000) must be 2 — charCount NEVER validates");
+        Throwable ct = null;
+        try {
+            sink = Character.toChars(OPAQUE_CP[13]).length;
+        } catch (Throwable x) {
+            ct = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ct)),
+                "Character.toChars(0x110000) must THROW IllegalArgumentException — the same"
+                        + " argument charCount answers 2 for; got " + nameOf(ct));
+        ct = null;
+        try {
+            sink = Character.toChars(OPAQUE_I[2]).length;
+        } catch (Throwable x) {
+            ct = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ct)),
+                "Character.toChars(-1) must throw IllegalArgumentException, got " + nameOf(ct));
+        check(Character.toChars(OPAQUE_CP[9]).length == 2
+                        && Character.toChars(OPAQUE_CP[9])[0] == 0xd83d
+                        && Character.toChars(OPAQUE_CP[9])[1] == 0xde00,
+                "Character.toChars(U+1F600) must be exactly { U+D83D, U+DE00 }");
+        check(Character.toChars(OPAQUE_CP[10]).length == 1,
+                "Character.toChars(U+FFFF) must be a ONE-element array");
+        check(Character.toCodePoint((char) 0xd83d, (char) 0xde00) == 0x1f600,
+                "Character.toCodePoint(D83D, DE00) must recombine to U+1F600");
+        check(Character.isSurrogatePair((char) 0xd83d, (char) 0xde00),
+                "Character.isSurrogatePair(high, low) must be true");
+        check(!Character.isSurrogatePair((char) 0xde00, (char) 0xd83d),
+                "Character.isSurrogatePair(low, high) must be FALSE — the ORDER matters");
+        check(Character.isSurrogate((char) OPAQUE_CP[16]),
+                "Character.isSurrogate(U+D800) must be true");
+        check(!Character.isSurrogate('a'), "Character.isSurrogate('a') must be false");
+        check(Character.isSupplementaryCodePoint(OPAQUE_CP[11]),
+                "Character.isSupplementaryCodePoint(0x10000) must be true");
+        check(!Character.isSupplementaryCodePoint(OPAQUE_CP[10]),
+                "Character.isSupplementaryCodePoint(U+FFFF) must be false");
+        check(!Character.isSupplementaryCodePoint(OPAQUE_CP[13]),
+                "Character.isSupplementaryCodePoint(0x110000) must be FALSE — unlike charCount,"
+                        + " this one DOES range-check the top end");
+        check(Character.toString(OPAQUE_CP[9]).length() == 2,
+                "Character.toString(int U+1F600) must be a TWO-char string — the (I) overload"
+                        + " is a different triple from the (C) one above");
+        ct = null;
+        try {
+            sink = Character.toString(OPAQUE_CP[13]).length();
+        } catch (Throwable x) {
+            ct = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ct)),
+                "Character.toString(0x110000) must throw IllegalArgumentException, got "
+                        + nameOf(ct));
+
+        // GAP 5: Character's own CharSequence accessors — the statics that
+        // shadow String's instance methods (which `bounds` exercises) and are
+        // separate registered triples.
+        String cpPair = "a" + new String(Character.toChars(OPAQUE_CP[9])) + "b";
+        check(Character.codePointAt(cpPair, OPAQUE_I[4]) == 0x1f600,
+                "Character.codePointAt(seq, 1) must PAIR the surrogates into U+1F600");
+        check(Character.codePointAt(cpPair, OPAQUE_I[5]) == 0xde00,
+                "Character.codePointAt(seq, 2) must be the LONE low surrogate — mid-pair, so"
+                        + " there is nothing to pair it with");
+        check(Character.codePointBefore(cpPair, OPAQUE_I[6]) == 0x1f600,
+                "Character.codePointBefore(seq, 3) must walk BACK over the pair");
+        check(Character.codePointCount(cpPair, OPAQUE_I[3], 4) == 3,
+                "Character.codePointCount over \"a<U+1F600>b\" must be 3, not 4");
+        check(Character.offsetByCodePoints(cpPair, OPAQUE_I[3], OPAQUE_I[5]) == 3,
+                "Character.offsetByCodePoints(seq, 0, 2) must land at index 3");
+
+        // GAP 6: space vs whitespace, and the identifier predicates. These are
+        // the classic non-complementary pairs: TAB is whitespace and NOT a
+        // space char; NBSP is a space char and NOT whitespace. A body that
+        // answers both from Rust's `char::is_whitespace` gets exactly one of
+        // each pair wrong.
+        check(Character.isWhitespace(OPAQUE_CP[32]),
+                "Character.isWhitespace(TAB) must be true");
+        check(!Character.isSpaceChar(OPAQUE_CP[32]),
+                "Character.isSpaceChar(TAB) must be FALSE — TAB is Cc, not Zs");
+        check(Character.isSpaceChar(OPAQUE_CP[8]),
+                "Character.isSpaceChar(U+00A0 NBSP) must be TRUE — it is Zs");
+        check(!Character.isWhitespace(OPAQUE_CP[8]),
+                "Character.isWhitespace(U+00A0) must be FALSE — Java excludes non-breaking"
+                        + " spaces, and this is the exact inverse of the row above");
+        check(Character.isSpaceChar(' '), "Character.isSpaceChar(' ') must be true");
+        check(Character.isJavaIdentifierStart('$'),
+                "Character.isJavaIdentifierStart('$') must be true");
+        check(!Character.isUnicodeIdentifierStart('$'),
+                "Character.isUnicodeIdentifierStart('$') must be FALSE — the Unicode grammar"
+                        + " has no dollar sign; the two predicates differ on this one char");
+        check(!Character.isJavaIdentifierPart(OPAQUE_CP[5]),
+                "Character.isJavaIdentifierPart(0x1C) must be false");
+
+        // GAP 7: the remaining property tables and the Object-ish statics.
+        check(Character.isIdeographic(OPAQUE_CP[28]),
+                "Character.isIdeographic(U+4E00) must be true");
+        check(!Character.isIdeographic('a'), "Character.isIdeographic('a') must be false");
+        check(!Character.isDefined(OPAQUE_CP[13]),
+                "Character.isDefined(0x110000) must be false");
+        check(!Character.isDefined(OPAQUE_CP[29]),
+                "Character.isDefined(U+0378) must be false — an UNASSIGNED code point inside"
+                        + " the BMP, which is the case a bare range check gets wrong");
+        check(Character.isDefined(OPAQUE_CP[16]),
+                "Character.isDefined(U+D800) must be TRUE — a surrogate IS assigned");
+        check(Character.isMirrored((char) OPAQUE_CP[31]),
+                "Character.isMirrored('(') must be true");
+        check(!Character.isMirrored('a'), "Character.isMirrored('a') must be false");
+        check(Character.getDirectionality('a') == 0,
+                "Character.getDirectionality('a') must be 0 (LEFT_TO_RIGHT)");
+        check(Character.getDirectionality(OPAQUE_CP[30]) == 1,
+                "Character.getDirectionality(U+05D0 HEBREW ALEF) must be 1 (RIGHT_TO_LEFT)");
+        check(Character.reverseBytes('A') == 0x4100,
+                "Character.reverseBytes('A') must be U+4100");
+        check(Character.compare('a', 'b') == -1,
+                "Character.compare('a','b') must be -1 — the char DIFFERENCE, which is -1 here");
+        check(Character.hashCode('a') == 97, "Character.hashCode('a') must be the code unit, 97");
+        check(Character.valueOf('a') == Character.valueOf('a'),
+                "Character.valueOf('a') must come from the JLS-mandated 0..127 box CACHE —"
+                        + " IDENTITY, not equality");
+        check(Character.isEmoji(OPAQUE_CP[9]), "Character.isEmoji(U+1F600) must be true");
+        check(Character.isEmoji('#'),
+                "Character.isEmoji('#') must be TRUE — NUMBER SIGN carries Emoji=Yes, which is"
+                        + " the row a plausible 'is it a pictograph' body gets wrong");
+        check(Character.isEmojiPresentation(OPAQUE_CP[9]),
+                "Character.isEmojiPresentation(U+1F600) must be true");
+        check(!Character.isEmojiPresentation(OPAQUE_CP[23]),
+                "Character.isEmojiPresentation(U+2764) must be FALSE — it defaults to text");
+        check(Character.isExtendedPictographic(OPAQUE_CP[23]),
+                "Character.isExtendedPictographic(U+2764) must be true — the same code point"
+                        + " the row above answers false for");
+        check(Character.isEmojiComponent('#'), "Character.isEmojiComponent('#') must be true");
+
+        sectionEnd("charcls", 167);
     }
 
     // -----------------------------------------------------------------------
@@ -496,7 +769,212 @@ public class RJdkIntrinsics2 {
         check("-9223372036854775808".equals(Long.toString(Long.MIN_VALUE)),
                 "Long.toString(MIN_VALUE) must be \"-9223372036854775808\"");
 
-        sectionEnd("boolparse", 57);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: the SIGNED decimal/radix parsers, three radix
+        // formatters (toString(x,radix), toHexString) and the Boolean family.
+        // Never reached: the whole UNSIGNED half (parseUnsignedInt /
+        // parseUnsignedLong / toUnsignedString), the OCTAL and BINARY
+        // formatters, the `decode` grammar (three prefixes, none of which the
+        // parse grammar accepts), the CharSequence-region parser, and the
+        // boxing caches.
+        //
+        // VALUE-DOMAIN NOTE: the rows above drive the signed boundaries only.
+        // Everything below is chosen where the SIGN INTERPRETATION of the same
+        // 32 bits is what differs — which is precisely what a Rust body reaching
+        // for i32 where Java means u32 (or the reverse) gets wrong, and it is
+        // invisible to every row above.
+        // ===================================================================
+
+        // GAP 1: unsigned parse and unsigned format. Same bit pattern, two
+        // readings, and the pair -1 <-> "4294967295" is the discriminator.
+        check(Integer.parseUnsignedInt(OPAQUE_S[40]) == -1,
+                "Integer.parseUnsignedInt(\"4294967295\") must be -1 — it fits u32 and it is"
+                        + " the value parseInt REJECTS as an overflow");
+        check(Integer.parseUnsignedInt(OPAQUE_S[41], OPAQUE_I[11]) == -1,
+                "Integer.parseUnsignedInt(\"ffffffff\", 16) must be -1");
+        check(Long.parseUnsignedLong(OPAQUE_S[47]) == -1L,
+                "Long.parseUnsignedLong(\"18446744073709551615\") must be -1");
+        check("4294967295".equals(Integer.toUnsignedString(OPAQUE_I[2])),
+                "Integer.toUnsignedString(-1) must be \"4294967295\" — the inverse of the"
+                        + " first row, and NOT \"-1\"");
+        check("ffffffff".equals(Integer.toUnsignedString(OPAQUE_I[2], OPAQUE_I[11])),
+                "Integer.toUnsignedString(-1, 16) must be \"ffffffff\"");
+        check(Integer.toUnsignedString(OPAQUE_I[2], OPAQUE_I[5]).length() == 32,
+                "Integer.toUnsignedString(-1, 2) must be 32 digits");
+        check("18446744073709551615".equals(Long.toUnsignedString(OPAQUE_J[2])),
+                "Long.toUnsignedString(-1L) must be \"18446744073709551615\"");
+        check(Integer.toUnsignedLong(OPAQUE_I[2]) == 4294967295L,
+                "Integer.toUnsignedLong(-1) must be 4294967295 — a ZERO-extending widen, where"
+                        + " the i2l opcode sign-extends");
+        check(Integer.compareUnsigned(OPAQUE_I[2], OPAQUE_I[4]) == 1,
+                "Integer.compareUnsigned(-1, 1) must be 1 — signed compare says -1");
+        check(Integer.compare(OPAQUE_I[2], OPAQUE_I[4]) == -1,
+                "Integer.compare(-1, 1) must be -1 — the SIGNED twin, same operands");
+        check(Byte.toUnsignedInt((byte) -1) == 255,
+                "Byte.toUnsignedInt((byte) -1) must be 255");
+        check(Short.toUnsignedInt((short) -1) == 65535,
+                "Short.toUnsignedInt((short) -1) must be 65535");
+        Throwable u = null;
+        try {
+            sink = Integer.parseUnsignedInt(OPAQUE_S[21]);
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(u)),
+                "Integer.parseUnsignedInt(\"-128\") must throw — a MINUS SIGN is outside the"
+                        + " unsigned grammar even though the magnitude fits; got " + nameOf(u));
+        u = null;
+        try {
+            sink = Integer.parseUnsignedInt(OPAQUE_S[49]);
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(u)),
+                "Integer.parseUnsignedInt(\"4294967296\") must throw — one past u32; got "
+                        + nameOf(u));
+
+        // GAP 2: the octal and binary formatters. Both are UNSIGNED like
+        // toHexString, and both were never called.
+        check("37777777777".equals(Integer.toOctalString(OPAQUE_I[2])),
+                "Integer.toOctalString(-1) must be \"37777777777\" — unsigned");
+        check(Integer.toBinaryString(OPAQUE_I[2]).length() == 32,
+                "Integer.toBinaryString(-1) must be 32 digits");
+        check("0".equals(Integer.toBinaryString(OPAQUE_I[3])),
+                "Integer.toBinaryString(0) must be \"0\", not 32 zeros");
+        check("101".equals(Integer.toBinaryString(5)),
+                "Integer.toBinaryString(5) must be \"101\" — no leading zeros");
+        check("1777777777777777777777".equals(Long.toOctalString(OPAQUE_J[2])),
+                "Long.toOctalString(-1L) must be 22 sevens-and-a-one");
+        check(Long.toBinaryString(Long.MIN_VALUE).length() == 64,
+                "Long.toBinaryString(MIN_VALUE) must be 64 digits");
+        check("ffffffffffffffff".equals(Long.toHexString(OPAQUE_J[2])),
+                "Long.toHexString(-1L) must be sixteen f's");
+
+        // GAP 3: `decode` — a THIRD grammar on the same classes, accepting
+        // three prefixes that parseInt rejects and rejecting one thing it
+        // accepts. "017" is the sharpest: parseInt reads 17, decode reads 15.
+        check(Integer.decode(OPAQUE_S[42]).intValue() == 31,
+                "Integer.decode(\"0x1f\") must be 31 — a prefix parseInt would reject");
+        check(Integer.decode(OPAQUE_S[43]).intValue() == 31,
+                "Integer.decode(\"#1f\") must be 31 — the '#' prefix is also hex");
+        check(Integer.decode(OPAQUE_S[44]).intValue() == 15,
+                "Integer.decode(\"017\") must be 15 — a LEADING ZERO means OCTAL, where"
+                        + " Integer.parseInt(\"017\") is 17");
+        check(Integer.parseInt(OPAQUE_S[44]) == 17,
+                "Integer.parseInt(\"017\") must be 17 — the same string, the other grammar");
+        check(Integer.decode(OPAQUE_S[45]).intValue() == -31,
+                "Integer.decode(\"-0x1f\") must be -31 — the sign precedes the radix prefix");
+        check(Integer.decode(OPAQUE_S[11]).intValue() == 1,
+                "Integer.decode(\"+1\") must be 1");
+        check(Long.decode(OPAQUE_S[43]).longValue() == 31L, "Long.decode(\"#1f\") must be 31");
+        check(Byte.decode(OPAQUE_S[42]).byteValue() == 31,
+                "Byte.decode(\"0x1f\") must be 31");
+        check(Short.decode(OPAQUE_S[44]).shortValue() == 15, "Short.decode(\"017\") must be 15");
+        u = null;
+        try {
+            sink = Integer.decode(OPAQUE_S[46]).intValue();
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(u)),
+                "Integer.decode(\"08\") must throw — 8 is not an OCTAL digit; got " + nameOf(u));
+
+        // GAP 4: THE NULL CONTRACTS ARE NOT UNIFORM, inside one class. Three
+        // entry points, three different answers, and floatfmt below pins a
+        // FOURTH for the same shape on Float. A body with one shared
+        // null-guard cannot produce all four.
+        u = null;
+        try {
+            sink = Integer.parseInt((String) null);
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(u)),
+                "Integer.parseInt(null) must throw NumberFormatException — NOT NPE, which is"
+                        + " what Float.valueOf(null) throws in floatfmt; got " + nameOf(u));
+        u = null;
+        try {
+            sink = Integer.valueOf((String) null).intValue();
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(u)),
+                "Integer.valueOf((String) null) must throw NumberFormatException, got "
+                        + nameOf(u));
+        u = null;
+        try {
+            sink = Integer.decode(null).intValue();
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(u)),
+                "Integer.decode(null) must throw NullPointerException — the THIRD null contract"
+                        + " on this class, and the odd one out; got " + nameOf(u));
+
+        // GAP 5: valueOf(String), the region parser, and the boxing caches.
+        check(Integer.valueOf(OPAQUE_S[7], OPAQUE_I[10]).intValue() == 35,
+                "Integer.valueOf(\"z\", 36) must be 35 — a different triple from parseInt");
+        check(Integer.parseInt(OPAQUE_S[48], 5, 8, OPAQUE_I[12]) == 123,
+                "Integer.parseInt(\"hello123x\", 5, 8, 10) must be 123 — the CharSequence"
+                        + " REGION overload, which never allocates a substring");
+        u = null;
+        try {
+            sink = Integer.parseInt(OPAQUE_S[48], OPAQUE_I[3], 99, OPAQUE_I[12]);
+        } catch (Throwable x) {
+            u = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(u)),
+                "Integer.parseInt(seq, 0, 99, 10) must throw IndexOutOfBoundsException — a bad"
+                        + " REGION is not a bad NUMBER, so it is not NumberFormatException; got "
+                        + nameOf(u));
+        check(Integer.valueOf(127) == Integer.valueOf(127),
+                "Integer.valueOf(127) must come from the JLS-mandated -128..127 cache —"
+                        + " IDENTITY, not equality");
+        check(Long.valueOf(-128L) == Long.valueOf(-128L),
+                "Long.valueOf(-128L) must come from the cache too");
+        check(Integer.hashCode(42) == 42, "Integer.hashCode(42) must be the value itself");
+        check(Long.hashCode(OPAQUE_J[2]) == 0,
+                "Long.hashCode(-1L) must be 0 — (int)(v ^ (v >>> 32)) folds -1 to zero, which"
+                        + " no identity-shaped hash produces");
+        check(Long.hashCode(4294967296L) == 1, "Long.hashCode(2^32) must be 1");
+
+        // GAP 6: the bit-level siblings on the same two classes. The rotates
+        // are the hazard: Java MASKS the distance to 5 (or 6) bits, so a
+        // negative or over-wide distance is well defined, where Rust's shift
+        // operators panic and its rotate_left takes an unsigned distance.
+        check(Integer.rotateLeft(OPAQUE_I[4], OPAQUE_I[2]) == Integer.MIN_VALUE,
+                "Integer.rotateLeft(1, -1) must be MIN_VALUE — the distance is masked to 31,"
+                        + " never rejected");
+        check(Integer.rotateLeft(OPAQUE_I[4], 32) == 1,
+                "Integer.rotateLeft(1, 32) must be 1 — a full turn, not a shift-overflow");
+        check(Integer.rotateRight(OPAQUE_I[4], OPAQUE_I[2]) == 2,
+                "Integer.rotateRight(1, -1) must be 2");
+        check(Long.rotateLeft(OPAQUE_J[4], OPAQUE_I[2]) == Long.MIN_VALUE,
+                "Long.rotateLeft(1L, -1) must be MIN_VALUE — masked to 63");
+        check(Integer.reverse(OPAQUE_I[4]) == Integer.MIN_VALUE,
+                "Integer.reverse(1) must be MIN_VALUE");
+        check(Integer.reverseBytes(OPAQUE_I[4]) == 16777216,
+                "Integer.reverseBytes(1) must be 0x01000000");
+        check(Integer.highestOneBit(OPAQUE_I[3]) == 0,
+                "Integer.highestOneBit(0) must be 0, not a panic on a leading-zero count of 32");
+        check(Integer.highestOneBit(OPAQUE_I[2]) == Integer.MIN_VALUE,
+                "Integer.highestOneBit(-1) must be MIN_VALUE — the SIGN bit is a bit");
+        check(Integer.lowestOneBit(OPAQUE_I[3]) == 0, "Integer.lowestOneBit(0) must be 0");
+        check(Integer.numberOfLeadingZeros(OPAQUE_I[3]) == 32,
+                "Integer.numberOfLeadingZeros(0) must be 32");
+        check(Integer.numberOfTrailingZeros(OPAQUE_I[3]) == 32,
+                "Integer.numberOfTrailingZeros(0) must be 32");
+        check(Integer.bitCount(OPAQUE_I[2]) == 32, "Integer.bitCount(-1) must be 32");
+        check(Long.bitCount(OPAQUE_J[2]) == 64, "Long.bitCount(-1L) must be 64");
+        check(Long.numberOfTrailingZeros(OPAQUE_J[3]) == 64,
+                "Long.numberOfTrailingZeros(0L) must be 64");
+        check(Integer.signum(Integer.MIN_VALUE) == -1,
+                "Integer.signum(MIN_VALUE) must be -1 — computed without negating");
+        check(!Boolean.logicalXor(true, true), "Boolean.logicalXor(true, true) must be false");
+
+        sectionEnd("boolparse", 115);
     }
 
     // -----------------------------------------------------------------------
@@ -648,7 +1126,150 @@ public class RJdkIntrinsics2 {
         check(Double.isInfinite(Double.parseDouble(OPAQUE_S[36])),
                 "Double.isInfinite of the overflowed parse must be true");
 
-        sectionEnd("floatfmt", 47);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: toString, the four bit accessors, compare/hashCode/
+        // equals, valueOf(String)/parseX. Never reached: toHexString (an
+        // entirely SEPARATE formatter with its own grammar), the max/min/sum
+        // statics, isFinite, and every narrowing conversion off a box.
+        //
+        // VALUE-DOMAIN NOTE — this is the block the task's own thesis is about.
+        // Of the 47 rows above, FORTY-ONE drive a corner: NaN, +-0.0,
+        // +-Infinity, MAX_VALUE, MIN_VALUE, MIN_NORMAL, a subnormal, an
+        // underflow, an overflow. The only ordinary inputs anywhere are 0.1f,
+        // 1.1f, 1e7f, 1e-3f and 1e20f. A shortest-round-trip printer or a
+        // decimal->binary parser that is wrong in the MIDDLE — the 44-ulp shape
+        // — passes every one of those 41 rows. Everything under GAP 2 is
+        // ordinary.
+        // ===================================================================
+
+        // GAP 1: toHexString. Java's hex-float grammar is not Rust's `{:a}`
+        // (which does not exist) and not printf's %a either at the subnormal
+        // end: a SUBNORMAL prints with a LEADING ZERO and the fixed exponent
+        // p-1022, where a normal value prints "0x1." and its own exponent.
+        check("0x1.0p0".equals(Double.toHexString(OPAQUE_SM[2])),
+                "Double.toHexString(1.0) must be \"0x1.0p0\"");
+        check("0x1.0p-1".equals(Double.toHexString(OPAQUE_D[6])),
+                "Double.toHexString(0.5) must be \"0x1.0p-1\"");
+        check("-0x0.0p0".equals(Double.toHexString(OPAQUE_D[0])),
+                "Double.toHexString(-0.0) must keep the sign: \"-0x0.0p0\"");
+        check("0x0.0000000000001p-1022".equals(Double.toHexString(Double.MIN_VALUE)),
+                "Double.toHexString(MIN_VALUE) must be the SUBNORMAL form — leading \"0x0.\""
+                        + " and the exponent pinned at p-1022, not p-1074");
+        check("0x1.0p-1022".equals(Double.toHexString(Double.MIN_NORMAL)),
+                "Double.toHexString(MIN_NORMAL) must be \"0x1.0p-1022\" — one ulp of exponent"
+                        + " from the row above and a completely different shape");
+        check("0x1.fffffffffffffp1023".equals(Double.toHexString(Double.MAX_VALUE)),
+                "Double.toHexString(MAX_VALUE) must be \"0x1.fffffffffffffp1023\"");
+        check("NaN".equals(Double.toHexString(OPAQUE_D[2])),
+                "Double.toHexString(NaN) must be \"NaN\", not a hex pattern");
+        check("0x1.999999999999ap-4".equals(Double.toHexString(OPAQUE_SM[6])),
+                "Double.toHexString(0.1) must expose the FULL 52-bit significand");
+        check("0x1.0p0".equals(Float.toHexString(1.0f)), "Float.toHexString(1.0f) must be \"0x1.0p0\"");
+        check("0x0.000002p-126".equals(Float.toHexString(OPAQUE_F[4])),
+                "Float.toHexString(Float.MIN_VALUE) must be \"0x0.000002p-126\" — six hex"
+                        + " digits and the FLOAT subnormal exponent, not the double's");
+
+        // GAP 2: THE ORDINARY MIDDLE. Every value here is a plain decimal that
+        // no boundary test reaches, and each row is a place where a
+        // shortest-round-trip printer that is merely "close" prints a
+        // different string.
+        check("0.30000000000000004".equals(Double.toString(0.1 + 0.2)),
+                "Double.toString(0.1 + 0.2) must be \"0.30000000000000004\" — SEVENTEEN"
+                        + " significant digits, because sixteen do not round-trip");
+        check("0.3333333333333333".equals(Double.toString(OPAQUE_SM[2] / OPAQUE_SM[3])),
+                "Double.toString(1.0/3) must be \"0.3333333333333333\" — SIXTEEN digits, one"
+                        + " fewer than the row above, and a printer with a fixed digit count"
+                        + " gets exactly one of these two rows right");
+        check("0.6666666666666666".equals(Double.toString(OPAQUE_SM[0] / OPAQUE_SM[3])),
+                "Double.toString(2.0/3) must be \"0.6666666666666666\" — NOT ...67, the"
+                        + " shortest string that round-trips is the truncated one");
+        check("1.0E23".equals(Double.toString(1e23)),
+                "Double.toString(1e23) must be \"1.0E23\" — the classic shortest-repr case"
+                        + " where the nearest double is 9.999999999999999E22");
+        check("1.234567890123E9".equals(Double.toString(1234567890.123)),
+                "Double.toString(1234567890.123) must switch to scientific at 1e7");
+        check("1.7976931348623157E308".equals(Double.toString(Double.MAX_VALUE)),
+                "Double.toString(MAX_VALUE) must be \"1.7976931348623157E308\"");
+        check("2.2250738585072014E-308".equals(Double.toString(Double.MIN_NORMAL)),
+                "Double.toString(MIN_NORMAL) must be \"2.2250738585072014E-308\"");
+        check("0.33333334".equals(Float.toString(1.0f / 3.0f)),
+                "Float.toString(1.0f/3) must be \"0.33333334\" — EIGHT digits");
+        check("1.6777216E7".equals(Float.toString(16777216f)),
+                "Float.toString(2^24) must be \"1.6777216E7\"");
+        check(Double.doubleToRawLongBits((double) 0.1f) == 0x3fb99999a0000000L,
+                "the f2d widening of 0.1f must be 0.10000000149011612, NOT 0.1 — a body that"
+                        + " round-trips through a decimal string collapses these two");
+        check(Double.doubleToRawLongBits(Double.parseDouble("0.1")) == 0x3fb999999999999aL,
+                "Double.parseDouble(\"0.1\") must be the CORRECTLY ROUNDED double, ...99a");
+        check(Float.floatToRawIntBits(Float.parseFloat("0.1")) == 0x3dcccccd,
+                "Float.parseFloat(\"0.1\") must round in FLOAT precision, not parse as a double"
+                        + " and narrow — the two agree here and the next row is where they part");
+        check(Double.doubleToRawLongBits(Double.parseDouble("2.2250738585072012e-308"))
+                        == 0x10000000000000L,
+                "Double.parseDouble of the 2.2250738585072012e-308 half-way subnormal must be"
+                        + " MIN_NORMAL — the input that used to hang naive decimal->binary loops");
+        check(Double.doubleToRawLongBits(Double.parseDouble("0.30000000000000004"))
+                        == Double.doubleToRawLongBits(0.1 + 0.2),
+                "parsing the 17-digit string back must reproduce 0.1 + 0.2 exactly");
+        // A round-trip SWEEP over ordinary values. One row, twelve operands:
+        // a printer that is wrong anywhere in the middle fails here even if
+        // every hand-picked string above happens to match.
+        double[] rt = {
+            OPAQUE_SM[6], 0.2, 0.3, OPAQUE_SM[2] / OPAQUE_SM[3], OPAQUE_D[4], StrictMath.E,
+            OPAQUE_SM[11], 1.5e300, 6.02214076e23, 4.35, 1234567890.123, 0.1 + 0.2,
+        };
+        boolean allRoundTrip = true;
+        for (int k = 0; k < rt.length; k++) {
+            if (Double.doubleToRawLongBits(Double.parseDouble(Double.toString(rt[k])))
+                    != Double.doubleToRawLongBits(rt[k])) {
+                allRoundTrip = false;
+            }
+        }
+        check(allRoundTrip,
+                "every one of the twelve ORDINARY doubles must survive"
+                        + " toString -> parseDouble with identical bits");
+
+        // GAP 3: max/min/sum and the narrowing conversions off a box. -0.0 is
+        // the operand on which max/min are NOT the arithmetic comparison.
+        check(Double.doubleToRawLongBits(Math.max(OPAQUE_D[0], OPAQUE_D[1])) == 0L,
+                "Math.max(-0.0, 0.0) must be POSITIVE zero — == cannot tell them apart");
+        check(Double.doubleToRawLongBits(Math.min(OPAQUE_D[0], OPAQUE_D[1])) == Long.MIN_VALUE,
+                "Math.min(-0.0, 0.0) must be NEGATIVE zero");
+        check(Double.doubleToRawLongBits(Math.max(OPAQUE_D[2], OPAQUE_SM[2]))
+                        == 0x7ff8000000000000L,
+                "Math.max(NaN, 1.0) must be NaN — NaN POISONS max, it does not lose to it");
+        check(Float.floatToRawIntBits(Float.max(OPAQUE_F[0], OPAQUE_F[1])) == 0,
+                "Float.max(-0.0f, 0.0f) must be positive zero");
+        check(Float.floatToRawIntBits(Float.sum(OPAQUE_F[0], OPAQUE_F[0])) == 0x80000000,
+                "Float.sum(-0.0f, -0.0f) must be NEGATIVE zero — the only sum of two zeros"
+                        + " that is not positive");
+        check(Double.doubleToRawLongBits(Double.sum(OPAQUE_D[0], OPAQUE_D[1])) == 0L,
+                "Double.sum(-0.0, 0.0) must be positive zero");
+        check(Double.isFinite(Double.MAX_VALUE), "Double.isFinite(MAX_VALUE) must be true");
+        check(!Double.isFinite(OPAQUE_D[2]), "Double.isFinite(NaN) must be false");
+        check((int) 1e20f == Integer.MAX_VALUE,
+                "the f2i conversion of 1e20f must SATURATE to Integer.MAX_VALUE");
+        check((int) OPAQUE_F[2] == 0, "the f2i conversion of NaN must be 0");
+        check((long) Double.NEGATIVE_INFINITY == Long.MIN_VALUE,
+                "the d2l conversion of -Infinity must saturate to Long.MIN_VALUE");
+        check(Float.valueOf(OPAQUE_F[2]).intValue() == 0,
+                "Float.valueOf(NaN).intValue() must be 0");
+        check(Double.valueOf(1.9).intValue() == 1,
+                "Double.valueOf(1.9).intValue() must TRUNCATE to 1, not round to 2");
+        check(Double.valueOf(-1.9).longValue() == -1L,
+                "Double.valueOf(-1.9).longValue() must truncate TOWARD ZERO to -1, not to -2");
+        check(!Double.valueOf(OPAQUE_SM[2]).equals(Float.valueOf(1.0f)),
+                "Double.valueOf(1.0).equals(Float.valueOf(1.0f)) must be FALSE — equals is"
+                        + " type-exact even when the values agree");
+        check(Double.valueOf(OPAQUE_SM[2]).compareTo(Double.valueOf(OPAQUE_SM[0])) == -1,
+                "Double.valueOf(1.0).compareTo(2.0) must be -1");
+        check(Float.hashCode(OPAQUE_F[4]) == 1,
+                "Float.hashCode(Float.MIN_VALUE) must be 1 — the raw bits of the smallest"
+                        + " subnormal");
+
+        sectionEnd("floatfmt", 89);
     }
 
     // -----------------------------------------------------------------------
@@ -719,7 +1340,209 @@ public class RJdkIntrinsics2 {
                             + ") must throw IndexOutOfBoundsException, got " + nameOf(t));
         }
 
-        sectionEnd("hex", 26);
+        // ===================================================================
+        // E26 — the reach audit. This is the largest single hole in the file.
+        //
+        // REACH BEFORE: HexFormat is a FORMATTER AND A PARSER, and the 26 rows
+        // above call the formatter only. Not one of parseHex (three overloads),
+        // fromHexDigits (two), fromHexDigitsToLong, fromHexDigit, isHexDigit,
+        // toLowHexDigit, toHighHexDigit, toHexDigits(char/short), the
+        // digit-count toHexDigits(long,int), formatHex(Appendable,..),
+        // toString, equals or hashCode is reached. Sixteen registered triples,
+        // and the fixture exercises the half that cannot fail on a bad input.
+        //
+        // OBJECT-STATE NOTE: every parse row below is driven through BOTH a
+        // default and a CONFIGURED formatter, because a parser that ignores its
+        // own delimiter/prefix/suffix state is exactly the "fixture only ever
+        // used the default instance" shape.
+        //
+        // TRAP THIS BLOCK IS BUILT AROUND: the failure contract is NOT uniform.
+        // An odd length is IllegalArgumentException, a bad DIGIT is
+        // NumberFormatException, a bad RANGE is IndexOutOfBoundsException and a
+        // null is NullPointerException — four classes from one method family.
+        // Do not read one row as the rule for the others.
+        // ===================================================================
+
+        check(Arrays.equals(f.parseHex("00ff0a80"), hb),
+                "HexFormat.of().parseHex must invert its own formatHex");
+        check(Arrays.equals(f.parseHex("00FF0A80"), hb),
+                "parseHex must accept UPPERCASE input on a LOWERCASE formatter — the case"
+                        + " setting governs OUTPUT only");
+        check(Arrays.equals(f.withUpperCase().parseHex("00ff"), new byte[] { 0, (byte) 0xff }),
+                "and the reverse: an uppercase formatter must accept lowercase input");
+        check(f.parseHex("").length == 0, "parseHex(\"\") must be an empty array");
+        check(Arrays.equals(f.parseHex("00ff0a80", 2, 6), new byte[] { (byte) 0xff, 0x0a }),
+                "parseHex(seq, 2, 6) must be the half-open CHARACTER range, two bytes");
+        check(Arrays.equals(f.parseHex("x00ff0a80".toCharArray(), 1, 5),
+                        new byte[] { 0, (byte) 0xff }),
+                "the char[] overload must honour its own offset/length");
+        check(Arrays.equals(HexFormat.ofDelimiter(":").parseHex("00:ff:0a:80"), hb),
+                "a CONFIGURED formatter's parseHex must consume its own delimiter");
+        check(Arrays.equals(HexFormat.ofDelimiter(", ").withPrefix("0x").withSuffix("!")
+                        .parseHex("0x00!, 0xff!, 0x0a!, 0x80!"), hb),
+                "prefix + suffix + delimiter must all be stripped on the way back in — this is"
+                        + " the round trip of the 'prefix and suffix wrap each byte' row above");
+
+        // The four DIFFERENT failure classes, asserted separately.
+        Throwable h = null;
+        try {
+            sink = f.parseHex("0f0").length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(h)),
+                "parseHex(\"0f0\") must throw IllegalArgumentException — an ODD length is a"
+                        + " structural error; got " + nameOf(h));
+        h = null;
+        try {
+            sink = f.parseHex("zz").length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(h)),
+                "parseHex(\"zz\") must throw NumberFormatException — a bad DIGIT is a different"
+                        + " class from a bad LENGTH, one row up; got " + nameOf(h));
+        h = null;
+        try {
+            sink = f.parseHex("00ff", 0, 9).length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(h)),
+                "parseHex(seq, 0, 9) must throw IndexOutOfBoundsException — the THIRD class;"
+                        + " got " + nameOf(h));
+        h = null;
+        try {
+            sink = f.parseHex((CharSequence) null).length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(h)),
+                "parseHex(null) must throw NullPointerException — the FOURTH; got " + nameOf(h));
+        h = null;
+        try {
+            sink = HexFormat.ofDelimiter(":").parseHex("00ff").length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(h)),
+                "a delimited formatter must REJECT undelimited input — the state has to be"
+                        + " read on the way in, not only on the way out; got " + nameOf(h));
+        h = null;
+        try {
+            sink = f.parseHex("0x00!, 0xff!").length;
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(h)),
+                "the DEFAULT formatter must reject prefixed text the configured one accepts;"
+                        + " got " + nameOf(h));
+
+        // fromHexDigits — an UNSIGNED accumulator with a silent-truncation
+        // contract that the formatter half cannot expose.
+        check(HexFormat.fromHexDigits("ff") == 255, "fromHexDigits(\"ff\") must be 255");
+        check(HexFormat.fromHexDigits("FF") == 255, "fromHexDigits(\"FF\") must be 255");
+        check(HexFormat.fromHexDigits("ffffffff") == -1,
+                "fromHexDigits(\"ffffffff\") must be -1 — it fills the int and WRAPS to"
+                        + " negative rather than overflowing");
+        check(HexFormat.fromHexDigits("") == 0, "fromHexDigits(\"\") must be 0, not a throw");
+        check(HexFormat.fromHexDigits("abcdef", 2, 4) == 205,
+                "fromHexDigits(seq, 2, 4) must read only \"cd\"");
+        check(HexFormat.fromHexDigitsToLong("ffffffffffffffff") == -1L,
+                "fromHexDigitsToLong of sixteen f's must be -1");
+        check(HexFormat.fromHexDigitsToLong("7fffffffffffffff") == Long.MAX_VALUE,
+                "fromHexDigitsToLong(\"7fff...\") must be Long.MAX_VALUE");
+        h = null;
+        try {
+            sink = HexFormat.fromHexDigits("1ffffffff");
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(h)),
+                "fromHexDigits with NINE digits must throw IllegalArgumentException — more"
+                        + " than eight is rejected, but exactly eight silently wraps two rows"
+                        + " above; got " + nameOf(h));
+        h = null;
+        try {
+            sink = HexFormat.fromHexDigits(OPAQUE_S[42]);
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(h)),
+                "fromHexDigits(\"0x1f\") must throw NumberFormatException — there is no radix"
+                        + " PREFIX in this grammar, unlike Integer.decode; got " + nameOf(h));
+
+        // The single-digit helpers, including the two that are NOT symmetric.
+        check(HexFormat.fromHexDigit('a') == 10, "fromHexDigit('a') must be 10");
+        check(HexFormat.fromHexDigit('F') == 15, "fromHexDigit('F') must be 15");
+        h = null;
+        try {
+            sink = HexFormat.fromHexDigit('g');
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(h)),
+                "fromHexDigit('g') must throw NumberFormatException, got " + nameOf(h));
+        h = null;
+        try {
+            sink = HexFormat.fromHexDigit(OPAQUE_I[2]);
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(h)),
+                "fromHexDigit(-1) must THROW where isHexDigit(-1) merely answers false — the"
+                        + " test and the converter do not share a contract; got " + nameOf(h));
+        check(HexFormat.isHexDigit('a') && HexFormat.isHexDigit('F') && HexFormat.isHexDigit('0'),
+                "isHexDigit must accept both cases and the decimal digits");
+        check(!HexFormat.isHexDigit('g'), "isHexDigit('g') must be false");
+        check(!HexFormat.isHexDigit(OPAQUE_I[2]),
+                "isHexDigit(-1) must be FALSE, not a panic and not a throw");
+        check(!HexFormat.isHexDigit(0x10030),
+                "isHexDigit(U+10030) must be false — an ASTRAL code point is not a hex digit"
+                        + " even though its low byte is '0'");
+        check(f.toLowHexDigit(OPAQUE_I[7]) == 'f',
+                "toLowHexDigit(255) must be 'f' — the LOW nibble");
+        check(f.toHighHexDigit(OPAQUE_I[7]) == 'f', "toHighHexDigit(255) must be 'f'");
+        check(f.toHighHexDigit(0x1a) == '1',
+                "toHighHexDigit(0x1A) must be '1' — the HIGH nibble, where toLowHexDigit is 'a'");
+        check(f.toLowHexDigit(0x1a) == 'a', "toLowHexDigit(0x1A) must be 'a'");
+        check(f.withUpperCase().toLowHexDigit(OPAQUE_I[7]) == 'F',
+                "the case setting must reach the single-digit helpers too");
+
+        // The remaining formatters and the Object contract.
+        check("0041".equals(f.toHexDigits('A')),
+                "toHexDigits(char 'A') must be FOUR digits, \"0041\"");
+        check("ffff".equals(f.toHexDigits((short) -1)),
+                "toHexDigits(short -1) must be \"ffff\" — four digits, unsigned");
+        check("fff".equals(f.toHexDigits(OPAQUE_J[2], 3)),
+                "toHexDigits(-1L, 3) must be the LOW three digits");
+        check("".equals(f.toHexDigits(OPAQUE_J[2], 0)),
+                "toHexDigits(-1L, 0) must be the empty string, not a throw");
+        h = null;
+        try {
+            sink = f.toHexDigits(OPAQUE_J[2], 17).length();
+        } catch (Throwable x) {
+            h = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(h)),
+                "toHexDigits(-1L, 17) must throw IllegalArgumentException — 16 is the maximum;"
+                        + " got " + nameOf(h));
+        StringBuilder hsb = new StringBuilder("Z");
+        f.formatHex(hsb, hb);
+        check("Z00ff0a80".equals(hsb.toString()),
+                "formatHex(Appendable, hb) must APPEND, not replace");
+        check("uppercase: false, delimiter: \"\", prefix: \"\", suffix: \"\"".equals(f.toString()),
+                "HexFormat.of().toString() must report all four settings");
+        check(f.equals(HexFormat.of()), "two HexFormat.of() must be equal");
+        check(f.hashCode() == HexFormat.of().hashCode(), "and their hashCodes must agree");
+        check(!f.equals(HexFormat.ofDelimiter(":")),
+                "a delimited formatter must NOT equal the default one");
+        check(f == HexFormat.of(),
+                "HexFormat.of() must be a SINGLETON — measured identity on HotSpot 25; a VM"
+                        + " that fabricates a fresh receiver per factory call fails here and"
+                        + " nowhere else, which is exactly how the Base64 factories failed");
+
+        sectionEnd("hex", 73);
     }
 
     // -----------------------------------------------------------------------
@@ -812,7 +1635,157 @@ public class RJdkIntrinsics2 {
         check(Arrays.equals(Base64.getMimeDecoder().decode(mime), big),
                 "the MIME encoding must round-trip through the MIME decoder");
 
-        sectionEnd("b64", 27);
+        // E14: the surface the 27 rows above never reach — identity, a custom
+        // linemax, and the methods that run real JDK bytecode against a
+        // receiver this VM fabricates. Every expected value measured on
+        // HotSpot 25 (scratchpad/e14).
+        check(Base64.getEncoder() == Base64.getEncoder(),
+                "the factories are SINGLETONS — identity, not equality");
+        check(Base64.getMimeEncoder(0, new byte[] { '\n' }) == Base64.getEncoder(),
+                "getMimeEncoder(lineLength<=0) must return the basic encoder ITSELF");
+        check(Base64.getMimeEncoder(20, new byte[] { '\n' }).encodeToString(big).length() == 83,
+                "a custom linemax must be honoured: 80 chars + 3 one-byte separators");
+        byte[] dst = new byte[200];
+        check(Base64.getEncoder().encode(big, dst) == 80,
+                "encode(byte[],byte[]) must write 80 bytes for the basic encoder");
+        check(Base64.getMimeEncoder().encode(big, dst) == 82,
+                "encode(byte[],byte[]) must write 82 for the MIME encoder — it reads `newline`");
+        check(Base64.getMimeDecoder().decode(
+                        mime.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1), dst) == 60,
+                "decode(byte[],byte[]) on the MIME decoder must accept the wrapped text");
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+        try (java.io.OutputStream os = Base64.getEncoder().wrap(bo)) {
+            os.write(big);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+        check(bo.size() == 80, "getEncoder().wrap(OutputStream) must write 80 bytes");
+
+        // ===================================================================
+        // E26 — the reach audit, on top of E14's N1.
+        //
+        // REACH AFTER N1: the String and byte[] encode/decode paths, identity,
+        // one custom linemax, wrap(OutputStream). Still unreached: the
+        // ByteBuffer overloads (the only ones with POSITION state),
+        // wrap(InputStream), the getMimeEncoder(int,byte[]) argument
+        // validation, and the decoder VARIANT MATRIX.
+        //
+        // TRAP THIS BLOCK IS BUILT AROUND, measured here, not remembered: the
+        // three decoders do NOT agree, and "-_-_" has THREE different correct
+        // answers — basic throws, MIME returns an EMPTY array, URL decodes it.
+        // A row that asserts one of those for the wrong decoder is worse than
+        // no row.
+        // ===================================================================
+
+        // The decoder matrix. Every cell measured on HotSpot 25.
+        check(Arrays.equals(Base64.getUrlDecoder().decode("-_-_"), new byte[] { -5, -1, -65 }),
+                "URL decoder on \"-_-_\" -> 3 bytes");
+        check(Base64.getMimeDecoder().decode("-_-_").length == 0,
+                "MIME decoder on \"-_-_\" -> an EMPTY array: it SKIPS both illegal characters"
+                        + " and is then left with nothing, where the basic decoder THROWS on the"
+                        + " same input and the URL decoder returns three bytes");
+        check(Arrays.equals(Base64.getMimeDecoder().decode("Q*Q=="), new byte[] { 65 }),
+                "MIME decoder skips an illegal character mid-group");
+        check(Arrays.equals(Base64.getMimeDecoder().decode("+/+/"), new byte[] { -5, -1, -65 }),
+                "the MIME decoder uses the BASIC alphabet, so '+' and '/' are legal to it");
+        String[] allThreeReject = { "QQ=", "A", "QQ==X" };
+        for (int k = 0; k < allThreeReject.length; k++) {
+            Throwable bt = null;
+            try {
+                sink = Base64.getMimeDecoder().decode(allThreeReject[k]).length;
+            } catch (Throwable x) {
+                bt = x;
+            }
+            check("java.lang.IllegalArgumentException".equals(nameOf(bt)),
+                    "even the LENIENT MIME decoder must reject \"" + allThreeReject[k]
+                            + "\" — skipping illegal characters is not the same as accepting a"
+                            + " broken padding group; got " + nameOf(bt));
+        }
+        Throwable ub = null;
+        try {
+            sink = Base64.getUrlDecoder().decode("+/+/").length;
+        } catch (Throwable x) {
+            ub = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ub)),
+                "the URL decoder must REJECT the basic alphabet — the mirror of the row the"
+                        + " block above asserts for the basic decoder; got " + nameOf(ub));
+
+        // The ByteBuffer overloads: the only Base64 entry points with STATE.
+        // Both must consume their source, which a body that reads from index 0
+        // and never advances the position gets wrong while still producing the
+        // right bytes.
+        java.nio.ByteBuffer bsrc = java.nio.ByteBuffer.wrap(bb);
+        java.nio.ByteBuffer bout = Base64.getEncoder().encode(bsrc);
+        check(bsrc.position() == 5,
+                "encode(ByteBuffer) must ADVANCE the source position to its limit");
+        check(bout.remaining() == 8, "encode(ByteBuffer) must return 8 remaining bytes");
+        java.nio.ByteBuffer dsrc = java.nio.ByteBuffer.wrap(
+                "+/+/AAE=".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+        java.nio.ByteBuffer dbout = Base64.getDecoder().decode(dsrc);
+        check(dsrc.position() == 8, "decode(ByteBuffer) must advance the source position to 8");
+        check(dbout.remaining() == 5, "decode(ByteBuffer) must yield the 5 original bytes");
+        java.io.InputStream dis = Base64.getDecoder().wrap(
+                new java.io.ByteArrayInputStream(
+                        "+/+/AAE=".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)));
+        byte[] streamed;
+        try {
+            streamed = dis.readAllBytes();
+            dis.close();
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+        check(Arrays.equals(streamed, bb),
+                "getDecoder().wrap(InputStream) must stream the original five bytes back");
+
+        // getMimeEncoder(int, byte[]) argument handling — three separately
+        // specified behaviours behind one signature.
+        check(Base64.getMimeEncoder(19, new byte[] { '\n' }).encodeToString(big).length() == 84,
+                "getMimeEncoder(19) must ROUND the line length DOWN to a multiple of four"
+                        + " (19 >> 2 << 2 == 16), giving 84 characters");
+        check(Base64.getMimeEncoder(16, new byte[] { '\n' }).encodeToString(big).length() == 84,
+                "and getMimeEncoder(16) must agree exactly — the row that proves the rounding"
+                        + " happened rather than 19 being honoured");
+        check(Base64.getMimeEncoder(76, new byte[0]).encodeToString(big).length() == 80,
+                "an EMPTY separator is legal and produces no separators at all");
+        String[] badSep = { "A", "=" };
+        for (int k = 0; k < badSep.length; k++) {
+            Throwable st = null;
+            try {
+                sink = Base64.getMimeEncoder(76, badSep[k].getBytes(
+                        java.nio.charset.StandardCharsets.ISO_8859_1)).hashCode();
+            } catch (Throwable x) {
+                st = x;
+            }
+            check("java.lang.IllegalArgumentException".equals(nameOf(st)),
+                    "a line separator containing the base64-alphabet character '" + badSep[k]
+                            + "' must be rejected; got " + nameOf(st));
+        }
+        check(Base64.getMimeEncoder(76, new byte[] { '-' }) != null,
+                "'-' is NOT in the basic alphabet, so it is a legal separator — the negative"
+                        + " control for the two rows above");
+
+        // Encode content and the padding quantum across every residue class.
+        check("+/+/AAE=".equals(new String(Base64.getEncoder().encode(bb),
+                        java.nio.charset.StandardCharsets.ISO_8859_1)),
+                "encode([B) must produce the same BYTES encodeToString produces characters"
+                        + " for — the row above it only checked the length");
+        check("AA==".equals(Base64.getEncoder().encodeToString(new byte[] { 0 })),
+                "a 1-byte input must pad with TWO '='");
+        check("AAA=".equals(Base64.getEncoder().encodeToString(new byte[] { 0, 0 })),
+                "a 2-byte input must pad with ONE '='");
+        check("AAAAAA==".equals(Base64.getEncoder().encodeToString(new byte[] { 0, 0, 0, 0 })),
+                "a 4-byte input is one full quantum plus one byte: eight characters, two '='");
+        check("-_-_AAE".equals(Base64.getUrlEncoder().withoutPadding().encodeToString(bb)),
+                "withoutPadding() on the URL encoder must keep the URL ALPHABET — a copy that"
+                        + " rebuilds from a variant tag loses one of the two settings");
+        check(Base64.getEncoder().withoutPadding() != Base64.getEncoder().withoutPadding(),
+                "withoutPadding() must return a FRESH object each call — the factories are"
+                        + " singletons, this derived encoder deliberately is not");
+        check(Base64.getDecoder().decode("QQ==") != Base64.getDecoder().decode("QQ=="),
+                "decode(String) must return a fresh array, never a shared buffer");
+
+        sectionEnd("b64", 60);
     }
 
     // -----------------------------------------------------------------------
@@ -913,7 +1886,132 @@ public class RJdkIntrinsics2 {
         check(r1.toString().length() == 36, "randomUUID().toString() must be 36 characters");
         check(!r1.equals(r2), "two randomUUIDs must differ");
 
-        sectionEnd("uuid", 30);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: the constructor, toString, the two bit accessors,
+        // version/variant/hashCode/equals, fromString and randomUUID. Never
+        // reached: compareTo, nameUUIDFromBytes, and the three version-1 field
+        // accessors — which is to say, every method whose answer is NOT a
+        // rearrangement of the two longs.
+        //
+        // OBJECT-STATE NOTE: the rows above construct exactly one KIND of UUID
+        // (a hand-built one, plus randomUUID). A version-1 UUID is a distinct
+        // state with three accessors that WORK, and every other version is a
+        // state where the same three accessors must THROW. Neither was built.
+        // ===================================================================
+
+        // GAP 1: compareTo is SIGNED on each long, so it does NOT agree with
+        // the lexicographic order of toString. This is the sharpest row in the
+        // family: a body that compares the hex text, or that compares the bits
+        // unsigned, gets the opposite answer.
+        UUID cLo = new UUID(OPAQUE_J[4], OPAQUE_J[3]);
+        UUID cHi = new UUID(OPAQUE_J[2], OPAQUE_J[3]);
+        check(cLo.compareTo(cHi) == 1,
+                "new UUID(1, 0).compareTo(new UUID(-1, 0)) must be 1 — msb is compared as a"
+                        + " SIGNED long, so 0xffff... is the SMALLER one");
+        check(cLo.toString().compareTo(cHi.toString()) < 0,
+                "and the two toString()s order the OTHER way — the row that proves compareTo is"
+                        + " not implemented over the text");
+        check(new UUID(OPAQUE_J[3], OPAQUE_J[2]).compareTo(new UUID(OPAQUE_J[3], OPAQUE_J[4])) == -1,
+                "with equal msb the SIGNED lsb decides: lsb -1 sorts BEFORE lsb 1");
+        check(new UUID(OPAQUE_J[4], OPAQUE_J[4]).compareTo(new UUID(OPAQUE_J[4], OPAQUE_J[4])) == 0,
+                "compareTo must be 0 for equal values");
+        check(new UUID(OPAQUE_J[3], OPAQUE_J[3]).compareTo(new UUID(OPAQUE_J[3], OPAQUE_J[3])) == 0,
+                "the nil UUID must compare equal to itself");
+
+        // GAP 2: nameUUIDFromBytes — an MD5 digest folded into a version-3
+        // UUID. Fully deterministic, and the only method in this class whose
+        // answer is not derivable from its argument by rearrangement.
+        UUID nil = UUID.nameUUIDFromBytes(new byte[0]);
+        check("d41d8cd9-8f00-3204-a980-0998ecf8427e".equals(nil.toString()),
+                "UUID.nameUUIDFromBytes(new byte[0]) must be the MD5 of the empty input with"
+                        + " the version and variant bits overwritten");
+        check(nil.version() == 3, "nameUUIDFromBytes must set version 3");
+        check(nil.variant() == 2, "nameUUIDFromBytes must set variant 2");
+        check("97063c91-34aa-31b3-b933-47b92b5ae65d".equals(
+                        UUID.nameUUIDFromBytes("cratonvm".getBytes(
+                                java.nio.charset.StandardCharsets.US_ASCII)).toString()),
+                "nameUUIDFromBytes(\"cratonvm\") must be its own fixed digest");
+        Throwable ut = null;
+        try {
+            sink = UUID.nameUUIDFromBytes(null).version();
+        } catch (Throwable x) {
+            ut = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(ut)),
+                "nameUUIDFromBytes(null) must throw NullPointerException, got " + nameOf(ut));
+
+        // GAP 3: the version-1 accessors. THREE methods that answer on one
+        // object state and throw on every other, and neither state was built.
+        check(v1.timestamp() == 130742845922168750L,
+                "the RFC 4122 example's timestamp() must be its 60 reassembled time bits");
+        check(v1.clockSequence() == 10085, "its clockSequence() must be 10085");
+        check(v1.node() == 690568981494L, "its node() must be the low 48 bits of the lsb");
+        String[] v1Only = { "timestamp", "clockSequence", "node" };
+        for (int k = 0; k < v1Only.length; k++) {
+            Throwable vt = null;
+            try {
+                if (k == 0) {
+                    sink = (int) u.timestamp();
+                } else if (k == 1) {
+                    sink = u.clockSequence();
+                } else {
+                    sink = (int) u.node();
+                }
+            } catch (Throwable x) {
+                vt = x;
+            }
+            check("java.lang.UnsupportedOperationException".equals(nameOf(vt)),
+                    "UUID." + v1Only[k] + "() on a version-6 UUID must throw"
+                            + " UnsupportedOperationException — NOT IllegalArgument and NOT a"
+                            + " wrong answer; got " + nameOf(vt));
+        }
+
+        // GAP 4: the remaining fromString rejections and equals against a
+        // foreign type.
+        check(!u.equals("00112233-4455-6677-8899-aabbccddeeff"),
+                "UUID.equals(String) must be false even when the STRING is this UUID's own"
+                        + " toString — equals is type-exact");
+        ut = null;
+        try {
+            sink = UUID.fromString(null).version();
+        } catch (Throwable x) {
+            ut = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(ut)),
+                "UUID.fromString(null) must throw NullPointerException, got " + nameOf(ut));
+        ut = null;
+        try {
+            sink = UUID.fromString("-1-2-3-4-5").version();
+        } catch (Throwable x) {
+            ut = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ut)),
+                "UUID.fromString(\"-1-2-3-4-5\") must throw IllegalArgumentException — a"
+                        + " LEADING dash makes it six groups, the first of them empty; got "
+                        + nameOf(ut));
+        ut = null;
+        try {
+            sink = UUID.fromString("1-2-3-4").version();
+        } catch (Throwable x) {
+            ut = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(ut)),
+                "UUID.fromString(\"1-2-3-4\") must throw — FOUR groups, where five is the rule"
+                        + " that makes \"1-2-3-4-5\" legal above; got " + nameOf(ut));
+        ut = null;
+        try {
+            sink = UUID.fromString("1-2-3-4-55555555555555555").version();
+        } catch (Throwable x) {
+            ut = x;
+        }
+        check("java.lang.NumberFormatException".equals(nameOf(ut)),
+                "a node group of SEVENTEEN hex digits must throw NumberFormatException — the"
+                        + " group count is right, so it is the unsigned-long parse that fails,"
+                        + " exactly like the non-hex row above; got " + nameOf(ut));
+
+        sectionEnd("uuid", 51);
     }
 
     // -----------------------------------------------------------------------
@@ -1016,7 +2114,141 @@ public class RJdkIntrinsics2 {
                             + nameOf(t));
         }
 
-        sectionEnd("random", 34);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: the seven no-argument / single-bound draws and
+        // nextBytes. Never reached: the ORIGIN-AND-BOUND overloads, the three
+        // primitive STREAMS, nextExponential, and the no-arg constructor.
+        //
+        // OBJECT-STATE NOTE — the important one. Every Random above is FRESH or
+        // mid-stream. java.util.Random has a third state: a PENDING GAUSSIAN
+        // PARTNER, and the row above that claims "setSeed must RESET the
+        // stream, INCLUDING the Gaussian cache" does not test the cache at all
+        // — it draws nextInt(), which the cache never touches. [nextGaus] is a
+        // prior finding in exactly this family, so the untested half of its own
+        // claim is closed here.
+        //
+        // VALUE-DOMAIN NOTE: nextBytes was driven at length 7 only, chosen
+        // because it is not a multiple of four. The multiple-of-four case is
+        // the one where the tail loop must NOT run, and it was never asked.
+        // ===================================================================
+
+        // GAP 1: the pending-partner state, three ways.
+        Random ga = new Random(OPAQUE_J[8]);
+        long firstGaussian = Double.doubleToRawLongBits(ga.nextGaussian());
+        ga.setSeed(OPAQUE_J[8]);
+        check(Double.doubleToRawLongBits(ga.nextGaussian()) == firstGaussian,
+                "setSeed must DISCARD a pending Gaussian partner: after setSeed(42) the next"
+                        + " nextGaussian() must be #1 again, not the cached second value —"
+                        + " the half of the setSeed row above that it never tested");
+        Random gb = new Random(OPAQUE_J[8]);
+        sink = (int) Double.doubleToRawLongBits(gb.nextGaussian());
+        gb.setSeed(OPAQUE_J[8]);
+        check(gb.nextInt() == -1170105035,
+                "and setSeed from the pending state must also reset the INTEGER stream");
+        Random gc = new Random(OPAQUE_J[8]);
+        sink = (int) Double.doubleToRawLongBits(gc.nextGaussian());
+        check(gc.nextInt() == 1325939940,
+                "nextGaussian() must consume exactly the draws the polar method specifies, so"
+                        + " the FOLLOWING nextInt() is the stream's fifth 32-bit draw"
+                        + " (1325939940) and not its second (234785527)");
+
+        // GAP 2: nextBytes at the lengths the tail loop treats differently.
+        byte[] nb0 = new byte[0];
+        new Random(OPAQUE_J[8]).nextBytes(nb0);
+        check(nb0.length == 0, "nextBytes(new byte[0]) must be a no-op, not a panic");
+        byte[] nb4 = new byte[4];
+        new Random(OPAQUE_J[8]).nextBytes(nb4);
+        check(Arrays.equals(nb4, new byte[] { 53, -99, 65, -70 }),
+                "nextBytes(new byte[4]) — a length that is EXACTLY one draw, so the tail loop"
+                        + " must not run");
+        byte[] nb8 = new byte[8];
+        new Random(OPAQUE_J[8]).nextBytes(nb8);
+        check(Arrays.equals(nb8, new byte[] { 53, -99, 65, -70, -9, -118, -2, 13 }),
+                "nextBytes(new byte[8]) — two whole draws");
+        Throwable rt = null;
+        try {
+            new Random(OPAQUE_J[8]).nextBytes(null);
+        } catch (Throwable x) {
+            rt = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(rt)),
+                "nextBytes(null) must throw NullPointerException, got " + nameOf(rt));
+
+        // GAP 3: the origin-and-bound overloads and nextExponential. These are
+        // RandomGenerator defaults composed from the specified primitives
+        // above, so their outputs are fixed once the primitives are.
+        Random ro = new Random(OPAQUE_J[8]);
+        int[] wantRange = { 10, 13, 18, 14, 10 };
+        for (int k = 0; k < wantRange.length; k++) {
+            check(ro.nextInt(10, 20) == wantRange[k],
+                    "new Random(42).nextInt(10, 20) #" + (k + 1) + " is determined by the"
+                            + " specified nextInt() stream");
+        }
+        Random rlb = new Random(OPAQUE_J[8]);
+        check(rlb.nextLong(100L) == 91L && rlb.nextLong(100L) == 40L && rlb.nextLong(100L) == 97L,
+                "new Random(42).nextLong(100) must be 91, 40, 97");
+        Random rlr = new Random(OPAQUE_J[8]);
+        check(rlr.nextLong(10L, 20L) == 11L && rlr.nextLong(10L, 20L) == 10L,
+                "new Random(42).nextLong(10, 20) must be 11 then 10");
+        check(Double.doubleToRawLongBits(new Random(OPAQUE_J[8]).nextDouble(OPAQUE_SM[0]))
+                        == 0x3ff74833a06ff457L,
+                "new Random(42).nextDouble(2.0) #1 is the unbounded draw scaled, to the bit");
+        check(Double.doubleToRawLongBits(
+                        new Random(OPAQUE_J[8]).nextDouble(OPAQUE_SM[2], OPAQUE_SM[0]))
+                        == 0x3ffba419d037fa2cL,
+                "new Random(42).nextDouble(1.0, 2.0) #1 is specified, to the bit");
+        check(Float.floatToRawIntBits(new Random(OPAQUE_J[8]).nextFloat(2.0f)) == 0x3fba419d,
+                "new Random(42).nextFloat(2.0f) #1 is specified, to the bit");
+        check(Double.doubleToRawLongBits(new Random(OPAQUE_J[8]).nextExponential())
+                        == 0x3fc609c423733706L,
+                "new Random(42).nextExponential() #1 is specified, to the bit");
+
+        // GAP 4: the primitive streams. Their first N values must be exactly
+        // the first N values of the corresponding scalar draw — a stream that
+        // reseeds, buffers or reorders fails here and nowhere above.
+        check(Arrays.equals(new Random(OPAQUE_J[8]).ints(5).toArray(),
+                        new int[] { -1170105035, 234785527, -1360544799, 205897768, 1325939940 }),
+                "Random.ints(5) must be the SAME five values nextInt() produces, in order");
+        check(Arrays.equals(new Random(OPAQUE_J[8]).ints(5, 0, 100).toArray(),
+                        new int[] { 30, 63, 48, 84, 70 }),
+                "Random.ints(5, 0, 100) must agree with the nextInt(100) rows above");
+        check(Arrays.equals(new Random(OPAQUE_J[8]).longs(3).toArray(),
+                        new long[] { -5025562857975149833L, -5843495416241995736L,
+                            5694868678511409995L }),
+                "Random.longs(3) must be the nextLong() stream");
+        double[] ds = new Random(OPAQUE_J[8]).doubles(2).toArray();
+        check(Double.doubleToRawLongBits(ds[0]) == 0x3fe74833a06ff457L
+                        && Double.doubleToRawLongBits(ds[1]) == 0x3fe5dcf778622e01L,
+                "Random.doubles(2) must be the nextDouble() stream, to the bit");
+
+        // GAP 5: the no-argument constructor and the remaining rejections.
+        check(new Random().nextLong() != new Random().nextLong(),
+                "two default-constructed Randoms must not share a seed — the uniquifier has to"
+                        + " actually vary");
+        check(new Random(OPAQUE_J[8]).nextInt(Integer.MAX_VALUE) == 1562431130,
+                "nextInt(MAX_VALUE) — a bound that is not a power of two and fills the range,"
+                        + " so the rejection loop is exercised at its widest");
+        rt = null;
+        try {
+            sink = new Random(OPAQUE_J[8]).nextInt(OPAQUE_I[12], OPAQUE_I[12]);
+        } catch (Throwable x) {
+            rt = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(rt)),
+                "nextInt(10, 10) must throw IllegalArgumentException — an EMPTY range, got "
+                        + nameOf(rt));
+        rt = null;
+        try {
+            sink = (int) new Random(OPAQUE_J[8]).nextLong(OPAQUE_J[3]);
+        } catch (Throwable x) {
+            rt = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(rt)),
+                "nextLong(0) must throw IllegalArgumentException, got " + nameOf(rt));
+
+        sectionEnd("random", 60);
     }
 
     // -----------------------------------------------------------------------
@@ -1192,7 +2424,187 @@ public class RJdkIntrinsics2 {
         check("abcd".transform(String::length).intValue() == 4,
                 "String.transform must apply the function and return its result");
 
-        sectionEnd("strfmt", 60);
+        // ===================================================================
+        // E26 — the reach audit.
+        //
+        // REACH BEFORE: format (both overloads), formatted, chars, lines,
+        // indent, repeat, replace/replaceAll/replaceFirst, matches, valueOf,
+        // transform. Never reached: split and join (a fourth grammar), the
+        // strip family, isBlank, compareTo, equalsIgnoreCase, the LOCALE case
+        // mappings, getBytes, and half the format conversions.
+        //
+        // OBJECT-STATE NOTE: a java.lang.String has a hidden state — its CODER.
+        // A string whose characters all fit Latin-1 is stored one byte per
+        // char; anything else is UTF-16. Every string above is ASCII or carries
+        // surrogates; the LATIN-1-BUT-NOT-ASCII case (U+00E9) is a third path
+        // and was never built.
+        //
+        // CROSS-FAMILY ROW: charcls pins Character.toUpperCase(U+00DF) == U+00DF
+        // because "SS" does not fit a char. String.toUpperCase on the SAME code
+        // point must return a string of length 2. One Unicode rule, two answers,
+        // and a body that shares a case-mapping table between them cannot give
+        // both.
+        // ===================================================================
+
+        // GAP 1: split / join — trailing empty strings are DISCARDED unless the
+        // limit is negative, which is the rule no split implementation in any
+        // other language shares.
+        check("a,b,,".split(",").length == 2,
+                "\"a,b,,\".split(\",\") must be TWO elements — trailing empties are dropped");
+        check("a,b,,".split(",", -1).length == 4,
+                "the same input with limit -1 must be FOUR — the limit is what preserves them");
+        check("a,b,c".split(",", 2).length == 2 && "b,c".equals("a,b,c".split(",", 2)[1]),
+                "a positive limit must stop splitting and leave the remainder intact");
+        check("".split(",").length == 1 && "".equals("".split(",")[0]),
+                "\"\".split(\",\") must be a ONE-element array holding the empty string — not"
+                        + " an empty array, which is what \"\".lines() gives above");
+        check(",a".split(",").length == 2 && "".equals(",a".split(",")[0]),
+                "a LEADING separator must produce a leading empty element — only TRAILING"
+                        + " empties are dropped");
+        check("abc".split("").length == 3,
+                "splitting on the empty pattern must give one element per character");
+        check("a-b".equals(String.join("-", "a", "b")), "String.join must interleave");
+        check("".equals(String.join("-")), "String.join with no elements must be empty");
+
+        // GAP 2: strip vs trim. THREE different notions of blank in one class.
+        check("\u2000x".equals("\u2000x".trim()),
+                "trim() must NOT strip U+2000 — trim's rule is codepoint <= ' ', and U+2000 is"
+                        + " above it");
+        check("x".equals("\u2000x".strip()),
+                "strip() MUST strip U+2000 — the same input, the other method");
+        check("\u00a0x".equals("\u00a0x".strip()),
+                "strip() must NOT strip U+00A0 — NBSP is Zs but is not Character.isWhitespace,"
+                        + " and charcls pins that exact pair of answers above");
+        check("x".equals("\u0001x\u0001".trim()),
+                "trim() must strip U+0001 — a control character is <= ' '");
+        check("x  ".equals("  x  ".stripLeading()), "stripLeading must touch only the front");
+        check("  x".equals("  x  ".stripTrailing()), "stripTrailing must touch only the end");
+        check("\u2000".isBlank(), "\"\\u2000\".isBlank() must be true");
+        check(!"\u00a0".isBlank(),
+                "\"\\u00a0\".isBlank() must be FALSE — isBlank follows strip, not trim");
+        check("".isBlank(), "\"\".isBlank() must be true");
+
+        // GAP 3: case mapping that CHANGES LENGTH, and compareTo's raw value.
+        check("SS".equals("\u00df".toUpperCase(Locale.ROOT)),
+                "\"\\u00df\".toUpperCase() must be \"SS\" — TWO characters from one, while"
+                        + " Character.toUpperCase(U+00DF) is U+00DF in charcls above");
+        check("\u00df".toUpperCase(Locale.ROOT).length() == 2,
+                "and the length must actually grow — a char-by-char mapping cannot do this");
+        check("FF".equals("\ufb00".toUpperCase(Locale.ROOT)),
+                "\"\\ufb00 LATIN SMALL LIGATURE FF\".toUpperCase() must be \"FF\"");
+        check("i".equals("I".toLowerCase(Locale.ROOT)),
+                "\"I\".toLowerCase(ROOT) must be \"i\" — the locale-neutral answer");
+        check("a".compareTo("B") == 31,
+                "\"a\".compareTo(\"B\") must be 31 — the raw CHAR DIFFERENCE, not a normalised"
+                        + " -1/0/1, which is the shape a Rust Ord-based body returns");
+        check("a".compareToIgnoreCase("B") == -1,
+                "\"a\".compareToIgnoreCase(\"B\") must be -1 — same operands, and here the"
+                        + " difference really is -1");
+        check("ab".compareTo("abc") == -1,
+                "a prefix must compare by LENGTH DIFFERENCE when the common part is equal");
+        check(!"\u00df".equalsIgnoreCase("SS"),
+                "\"\\u00df\".equalsIgnoreCase(\"SS\") must be FALSE — equalsIgnoreCase is"
+                        + " per-character, so it does NOT agree with toUpperCase four rows up");
+        check("I".equalsIgnoreCase("i"), "\"I\".equalsIgnoreCase(\"i\") must be true");
+
+        // GAP 4: bytes and the coder. The lone-surrogate row is the one a Rust
+        // `String` cannot even represent: Java replaces it with '?' (0x3F) on
+        // the way out, NOT with U+FFFD.
+        check(Arrays.equals("\ud800".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        new byte[] { 63 }),
+                "an unpaired high surrogate must encode to UTF-8 as the single byte '?' (0x3F)"
+                        + " — the encoder's unmappable-character replacement, not U+FFFD");
+        check(Arrays.equals("a\ud800b".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        new byte[] { 97, 63, 98 }),
+                "and the surrounding characters must survive intact");
+        check(Arrays.equals("\u00e9".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        new byte[] { -61, -87 }),
+                "U+00E9 must be TWO bytes in UTF-8");
+        check(Arrays.equals("\u00e9".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
+                        new byte[] { -23 }),
+                "and ONE byte in ISO-8859-1 — the row that proves the charset is read");
+        check("\ufffda".equals(new String(new byte[] { (byte) 0xff, 0x61 },
+                        java.nio.charset.StandardCharsets.UTF_8)),
+                "DECODING an invalid UTF-8 byte must give U+FFFD — the opposite replacement"
+                        + " from the encoding direction three rows above");
+        check("a\u00e9ba\u00e9b".equals("a\u00e9b".repeat(2)),
+                "repeat() on a LATIN-1-but-not-ASCII string — the compact-string path no other"
+                        + " row in this file takes");
+        check("a\u4e00ba\u4e00b".equals("a\u4e00b".repeat(2)),
+                "repeat() on a UTF-16 string must agree");
+        check("a\u00e9b".indexOf(0xe9) == 1, "indexOf(int) must find a Latin-1 code point");
+        check("a\ud83d\ude00b".indexOf(OPAQUE_CP[9]) == 1,
+                "indexOf(int) must find an ASTRAL code point at its CODE UNIT index");
+        check("\ud800".codePoints().toArray()[0] == 55296,
+                "codePoints() over a lone surrogate must yield 55296, not U+FFFD");
+
+        // GAP 5: the format conversions and the exception classes they raise.
+        // Three MORE distinct throwables from one method.
+        check(String.format("%c", Integer.valueOf(OPAQUE_CP[9])).length() == 2,
+                "%c over an ASTRAL code point must emit a surrogate PAIR — two chars from one"
+                        + " conversion");
+        check("0x1.0p0".equals(String.format(Locale.ROOT, "%a", Double.valueOf(OPAQUE_SM[2]))),
+                "%a must be the hex-float form, agreeing with Double.toHexString in floatfmt");
+        check("37777777777".equals(String.format(Locale.ROOT, "%o", Integer.valueOf(OPAQUE_I[2]))),
+                "%o of -1 must be UNSIGNED octal");
+        check("010".equals(String.format(Locale.ROOT, "%#o", Integer.valueOf(8))),
+                "the '#' flag on %o must prefix a zero");
+        check("0xff".equals(String.format(Locale.ROOT, "%#x", Integer.valueOf(OPAQUE_I[7]))),
+                "the '#' flag on %x must prefix \"0x\"");
+        check("FF".equals(String.format(Locale.ROOT, "%X", Integer.valueOf(OPAQUE_I[7]))),
+                "%X must upper-case the DIGITS");
+        check("61".equals(String.format("%h", "a")),
+                "%h must be the hex of hashCode() — 97 is 0x61");
+        check("null".equals(String.format("%h", (Object) null)),
+                "%h of null must be the string \"null\", NOT the hash of anything");
+        check("   ab".equals(String.format("%5.2s", "abcdef")),
+                "a PRECISION on %s must TRUNCATE before the width pads");
+        check("(1,234.50)".equals(
+                        String.format(Locale.ROOT, "%,(.2f", Double.valueOf(-1234.5))),
+                "',' and '(' must compose: grouped digits inside parentheses, no minus sign");
+        check("-003.140".equals(String.format(Locale.ROOT, "%08.3f", Double.valueOf(-3.14))),
+                "zero padding must go AFTER the minus sign, not before it");
+        check("1.235e-04".equals(String.format(Locale.ROOT, "%.3e", Double.valueOf(0.000123456))),
+                "%.3e must round the significand and keep a two-digit exponent");
+        check("1e+01".equals(String.format(Locale.ROOT, "%.0e", Double.valueOf(9.9))),
+                "%.0e of 9.9 must carry into the exponent and emit NO decimal point");
+        check("x x".equals(String.format("%s %<s", "x")),
+                "the '<' relative index must re-use the PREVIOUS argument");
+        String[] badFmt2 = { "%.2d", "%0$s" };
+        String[] wantEx2 = {
+            "java.util.IllegalFormatPrecisionException",
+            "java.util.IllegalFormatArgumentIndexException",
+        };
+        for (int k = 0; k < badFmt2.length; k++) {
+            Throwable ft = null;
+            try {
+                sink = String.format(Locale.ROOT, badFmt2[k], Integer.valueOf(1)).length();
+            } catch (Throwable x) {
+                ft = x;
+            }
+            check(wantEx2[k].equals(nameOf(ft)),
+                    "String.format(\"" + badFmt2[k] + "\") must throw " + wantEx2[k]
+                            + " — a DISTINCT subclass, not the generic one; got " + nameOf(ft));
+        }
+        t = null;
+        try {
+            sink = String.format("%c", Integer.valueOf(OPAQUE_CP[13])).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.util.IllegalFormatCodePointException".equals(nameOf(t)),
+                "%c over 0x110000 must throw IllegalFormatCodePointException, got " + nameOf(t));
+        t = null;
+        try {
+            sink = String.format(Locale.ROOT, (String) null).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "String.format(locale, null) must throw NullPointerException — a null FORMAT"
+                        + " is not a format error; got " + nameOf(t));
+
+        sectionEnd("strfmt", 114);
     }
 
     // -----------------------------------------------------------------------
@@ -1408,7 +2820,551 @@ public class RJdkIntrinsics2 {
                         + " NEGATIVE-length row W7-95 pinned returns true, so this one proves the"
                         + " null check happens FIRST; got " + nameOf(t));
 
-        sectionEnd("bounds", 35);
+        // E8-1 N1 (APPLIED by E39) — ... and the other half of the same
+        // expression: the JDK's four-term `||` SHORT-CIRCUITS, so `other` is
+        // only dereferenced by the fourth term. A null `other` behind a failing
+        // earlier term is a plain `false`, NOT a throw — measured on OpenJDK
+        // 25.0.3+9. A fix that checks null first passes the row above and fails
+        // these two.
+        step("bounds", "String.regionMatches(bad toffset, null)");
+        t = null;
+        boolean shortCircuited = false;
+        try {
+            shortCircuited = !"ab".regionMatches(OPAQUE_I[13], null, OPAQUE_I[3], OPAQUE_I[4]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check(t == null && shortCircuited,
+                "\"ab\".regionMatches(9, null, 0, 1) must answer FALSE without touching `other` —"
+                        + " term three (toffset > length() - len) decides it; got " + nameOf(t));
+        step("bounds", "String.regionMatches(negative ooffset, null)");
+        t = null;
+        shortCircuited = false;
+        try {
+            shortCircuited = !"ab".regionMatches(OPAQUE_I[3], null, OPAQUE_I[2], OPAQUE_I[4]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check(t == null && shortCircuited,
+                "\"ab\".regionMatches(0, null, -1, 1) must answer FALSE — term one (ooffset < 0)"
+                        + " decides it before `other` is read; got " + nameOf(t));
+
+        // ===================================================================
+        // E26 — the reach audit. Every step line below still precedes its call.
+        //
+        // REACH BEFORE: AtomicReferenceArray's six plain accessors and the
+        // int-capacity constructor; CharBuffer's get/charAt/toString/remaining/
+        // hasArray. Never reached: the ARRAY constructor, toString, the six
+        // functional updaters, compareAndExchange and the whole
+        // plain/opaque/acquire/release mode surface.
+        //
+        // OBJECT-STATE NOTE — the important one for this family. Every
+        // CharBuffer above is `CharBuffer.wrap(String)` or a ByteBuffer view.
+        // A String-wrapped buffer is READ-ONLY and has NO accessible array; an
+        // allocate()d one is writable and does. The fixture asserts hasArray()
+        // == false for the view and never builds the state where it is true,
+        // and never once calls put() — so nothing here has ever checked that a
+        // write into a read-only buffer is refused.
+        //
+        // TRAP: the failure classes are deliberately NOT uniform. An index is
+        // IndexOutOfBounds, a POSITION is IllegalArgumentException, a write to
+        // a read-only buffer is ReadOnlyBufferException, an over-read is
+        // BufferUnderflowException and a missing mark is InvalidMarkException.
+        // Five classes, one class hierarchy, and none of them interchangeable.
+        // ===================================================================
+
+        // GAP 1: AtomicReferenceArray's array constructor and toString.
+        AtomicReferenceArray<String> fromArray =
+                new AtomicReferenceArray<>(new String[] { "a", "b", "c" });
+        check(fromArray.length() == 3, "the E[] constructor must take its length from the array");
+        check("b".equals(fromArray.get(OPAQUE_I[4])), "and its contents");
+        check("[a, b, c]".equals(fromArray.toString()),
+                "AtomicReferenceArray.toString must be the element list, not an identity hash");
+        check("[]".equals(new AtomicReferenceArray<String>(new String[0]).toString()),
+                "an empty one must print \"[]\"");
+        String[] backing = { "a", "b" };
+        AtomicReferenceArray<String> copied = new AtomicReferenceArray<>(backing);
+        backing[0] = "MUTATED";
+        check("a".equals(copied.get(OPAQUE_I[3])),
+                "the E[] constructor must COPY — mutating the source array afterwards must not"
+                        + " be visible, which a body that keeps the caller's pointer fails");
+        t = null;
+        try {
+            sink = new AtomicReferenceArray<String>((String[]) null).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "new AtomicReferenceArray((E[]) null) must throw NullPointerException — where"
+                        + " the int constructor's bad input is NegativeArraySizeException; got "
+                        + nameOf(t));
+
+        // GAP 2: the functional updaters and compareAndExchange.
+        AtomicReferenceArray<String> fn = new AtomicReferenceArray<>(OPAQUE_I[5]);
+        fn.set(OPAQUE_I[3], "x");
+        check("x".equals(fn.getAndUpdate(OPAQUE_I[3], s -> s + "!")),
+                "getAndUpdate must return the OLD value");
+        check("x!".equals(fn.get(OPAQUE_I[3])), "and must have stored the new one");
+        check("x!?".equals(fn.updateAndGet(OPAQUE_I[3], s -> s + "?")),
+                "updateAndGet must return the NEW value — the opposite half of the same pair");
+        check("x!?Z".equals(fn.accumulateAndGet(OPAQUE_I[3], "Z", (p, q) -> p + q)),
+                "accumulateAndGet must apply the binary operator and return the new value");
+        check("x!?Z".equals(fn.getAndAccumulate(OPAQUE_I[3], "W", (p, q) -> p + q)),
+                "getAndAccumulate must return the OLD value");
+        check("x!?ZW".equals(fn.get(OPAQUE_I[3])), "and must have stored the accumulation");
+        String witness = fn.get(OPAQUE_I[3]);
+        check("x!?ZW".equals(fn.compareAndExchange(OPAQUE_I[3], "wrong", "n")),
+                "a FAILED compareAndExchange must return the WITNESSED value, not the expected"
+                        + " one and not a boolean");
+        // The comparison is REFERENCE identity, not equals. An equal-but-
+        // distinct String must NOT succeed — measured on HotSpot 25, and a body
+        // that compares by value writes here where the JDK does not.
+        check(witness == fn.compareAndExchange(
+                        OPAQUE_I[3], new String(witness.toCharArray()), "z"),
+                "compareAndExchange with an EQUAL BUT DISTINCT expected reference must FAIL and"
+                        + " return the witness");
+        check(witness == fn.get(OPAQUE_I[3]),
+                "and must not have written — the comparison is ==, never equals()");
+        check(witness == fn.compareAndExchange(OPAQUE_I[3], witness, "n"),
+                "a SUCCEEDING compareAndExchange must return the OLD REFERENCE");
+        check("n".equals(fn.get(OPAQUE_I[3])), "and the write must have landed");
+        check("n".equals(fn.getPlain(OPAQUE_I[3])) && "n".equals(fn.getOpaque(OPAQUE_I[3]))
+                        && "n".equals(fn.getAcquire(OPAQUE_I[3])),
+                "getPlain / getOpaque / getAcquire must all read the same value a plain get does");
+        fn.setPlain(OPAQUE_I[4], "p");
+        check("p".equals(fn.getPlain(OPAQUE_I[4])), "setPlain then getPlain must round-trip");
+        fn.setRelease(OPAQUE_I[4], "r");
+        check("r".equals(fn.getAcquire(OPAQUE_I[4])), "setRelease then getAcquire must round-trip");
+        fn.setOpaque(OPAQUE_I[4], "o");
+        check("o".equals(fn.getOpaque(OPAQUE_I[4])), "setOpaque then getOpaque must round-trip");
+        check(fn.weakCompareAndSetPlain(OPAQUE_I[4], "o", "w"),
+                "weakCompareAndSetPlain must succeed on the current value in a single thread");
+        step("bounds", "AtomicReferenceArray.getAndUpdate(9)");
+        t = null;
+        try {
+            fn.getAndUpdate(OPAQUE_I[13], s -> s);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.ArrayIndexOutOfBoundsException".equals(nameOf(t)),
+                "getAndUpdate(9, ..) must throw ArrayIndexOutOfBoundsException BEFORE it calls"
+                        + " the function; got " + nameOf(t));
+        step("bounds", "AtomicReferenceArray.getPlain(-1)");
+        t = null;
+        try {
+            fn.getPlain(OPAQUE_I[2]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.ArrayIndexOutOfBoundsException".equals(nameOf(t)),
+                "getPlain(-1) must throw ArrayIndexOutOfBoundsException — the RELAXED accessors"
+                        + " are relaxed about MEMORY ORDER, not about bounds; got " + nameOf(t));
+        step("bounds", "AtomicReferenceArray.compareAndExchange(9)");
+        t = null;
+        try {
+            fn.compareAndExchange(OPAQUE_I[13], null, null);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.ArrayIndexOutOfBoundsException".equals(nameOf(t)),
+                "compareAndExchange(9, ..) must throw, got " + nameOf(t));
+
+        // GAP 3: the CharBuffer STATES, and the five distinct failure classes.
+        CharBuffer ro = CharBuffer.wrap("abcd");
+        check(ro.isReadOnly(),
+                "CharBuffer.wrap(String) must be READ-ONLY — a state no row above ever asked"
+                        + " about, and the reason the next two rows throw");
+        check(!ro.hasArray(), "a String-wrapped buffer must report hasArray() == false");
+        check(ro.capacity() == 4, "and capacity 4");
+        step("bounds", "CharBuffer.wrap(String).array()");
+        t = null;
+        try {
+            sink = ro.array().length;
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.UnsupportedOperationException".equals(nameOf(t)),
+                "array() on a buffer with no accessible array must throw"
+                        + " UnsupportedOperationException, got " + nameOf(t));
+        step("bounds", "CharBuffer.wrap(String).put(0,'x')");
+        t = null;
+        try {
+            ro.put(OPAQUE_I[3], 'x');
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "put() into a read-only buffer must throw ReadOnlyBufferException — NOT"
+                        + " UnsupportedOperation and NOT a silent no-op; got " + nameOf(t));
+        CharBuffer wr = CharBuffer.allocate(OPAQUE_I[6] + 1);
+        check(!wr.isReadOnly(), "CharBuffer.allocate(4) must be WRITABLE — the other state");
+        check(wr.hasArray() && wr.array().length == 4 && wr.arrayOffset() == 0,
+                "and array-backed, with a zero offset");
+        wr.put(OPAQUE_I[3], 'z');
+        check(wr.get(OPAQUE_I[3]) == 'z', "put(0,'z') into a writable buffer must be readable back");
+        step("bounds", "CharBuffer.allocate(4).put(9,'z')");
+        t = null;
+        try {
+            wr.put(OPAQUE_I[13], 'z');
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(t)),
+                "put(9,'z') past the end must throw IndexOutOfBoundsException, got " + nameOf(t));
+        step("bounds", "CharBuffer.allocate(-1)");
+        t = null;
+        try {
+            sink = CharBuffer.allocate(OPAQUE_I[2]).capacity();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "CharBuffer.allocate(-1) must throw IllegalArgumentException — where"
+                        + " new AtomicReferenceArray(-1) is NegativeArraySizeException above;"
+                        + " got " + nameOf(t));
+
+        // GAP 4: position / limit / slice — the state a buffer carries, and the
+        // exception class that is NOT IndexOutOfBounds.
+        CharBuffer win = CharBuffer.wrap("abcdef", OPAQUE_I[4], OPAQUE_I[6]);
+        check(win.position() == 1 && win.limit() == 3 && win.remaining() == 2,
+                "wrap(seq, 1, 3) must set position 1 and limit 3 — the second argument is a"
+                        + " START and the third a LENGTH-derived END, not a length");
+        check("bc".equals(win.toString()),
+                "and its toString must be the REMAINING characters only");
+        step("bounds", "CharBuffer.wrap(seq, 1, 9)");
+        t = null;
+        try {
+            sink = CharBuffer.wrap("abcdef", OPAQUE_I[4], OPAQUE_I[13]).limit();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(t)),
+                "wrap(seq, 1, 9) must throw IndexOutOfBoundsException, got " + nameOf(t));
+        CharBuffer st = CharBuffer.wrap("abcd");
+        step("bounds", "CharBuffer.position(9)");
+        t = null;
+        try {
+            st.position(OPAQUE_I[13]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "position(9) must throw IllegalArgumentException — a POSITION is not an INDEX,"
+                        + " and this is the row that separates the two contracts; got "
+                        + nameOf(t));
+        step("bounds", "CharBuffer.limit(9)");
+        t = null;
+        try {
+            st.limit(OPAQUE_I[13]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "limit(9) must throw IllegalArgumentException, got " + nameOf(t));
+        step("bounds", "CharBuffer.position(-1)");
+        t = null;
+        try {
+            st.position(OPAQUE_I[2]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(t)),
+                "position(-1) must throw IllegalArgumentException, got " + nameOf(t));
+        st.position(OPAQUE_I[4]);
+        check(st.slice().get(OPAQUE_I[3]) == 'b',
+                "slice() must start at the current POSITION");
+        check(st.slice().capacity() == 3, "and its capacity must be the remaining count");
+        check(st.duplicate().position() == 1, "duplicate() must carry the position over");
+        check("bc".equals(st.subSequence(OPAQUE_I[3], OPAQUE_I[5]).toString()),
+                "subSequence indices are RELATIVE TO THE POSITION, like charAt above");
+        step("bounds", "CharBuffer.subSequence(0, 9)");
+        t = null;
+        try {
+            sink = st.subSequence(OPAQUE_I[3], OPAQUE_I[13]).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(t)),
+                "subSequence(0, 9) must throw IndexOutOfBoundsException, got " + nameOf(t));
+        CharBuffer walked = CharBuffer.wrap("abcd");
+        walked.get();
+        walked.get();
+        check(walked.rewind().position() == 0, "rewind() must reset the position to zero");
+        step("bounds", "CharBuffer relative get() past the limit");
+        t = null;
+        try {
+            CharBuffer over = CharBuffer.wrap("abcd");
+            for (int k = 0; k < 5; k++) {
+                sink = over.get();
+            }
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.BufferUnderflowException".equals(nameOf(t)),
+                "a RELATIVE get() past the limit must throw BufferUnderflowException — where"
+                        + " the ABSOLUTE get(9) above throws IndexOutOfBounds; got " + nameOf(t));
+        step("bounds", "CharBuffer.reset() with no mark");
+        t = null;
+        try {
+            CharBuffer.wrap("abcd").reset();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.InvalidMarkException".equals(nameOf(t)),
+                "reset() with no mark set must throw InvalidMarkException — the fifth distinct"
+                        + " class in this family; got " + nameOf(t));
+
+        // GAP 5: String's own most-called accessor, and a read-only ByteBuffer.
+        step("bounds", "String.charAt(len)");
+        t = null;
+        try {
+            sink = "ab".charAt(OPAQUE_I[5]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "\"ab\".charAt(2) must throw StringIndexOutOfBoundsException, got " + nameOf(t));
+        step("bounds", "String.charAt(-1)");
+        t = null;
+        try {
+            sink = "ab".charAt(OPAQUE_I[2]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "\"ab\".charAt(-1) must throw StringIndexOutOfBoundsException, got " + nameOf(t));
+        step("bounds", "String.substring(3)");
+        t = null;
+        try {
+            sink = "ab".substring(OPAQUE_I[6]).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "\"ab\".substring(3) must throw StringIndexOutOfBoundsException, got "
+                        + nameOf(t));
+        check("".equals("ab".substring(OPAQUE_I[5])),
+                "\"ab\".substring(2) must be the EMPTY string — one past the end is legal here,"
+                        + " which charAt(2) two rows up rejects");
+        step("bounds", "String.substring(2, 1)");
+        t = null;
+        try {
+            sink = "ab".substring(OPAQUE_I[5], OPAQUE_I[4]).length();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "\"ab\".substring(2, 1) must throw StringIndexOutOfBoundsException, got "
+                        + nameOf(t));
+        step("bounds", "ByteBuffer.getChar(7) — one byte short of a char");
+        t = null;
+        try {
+            sink = raw.getChar(7);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.IndexOutOfBoundsException".equals(nameOf(t)),
+                "getChar(7) on an 8-byte buffer must throw — the LAST byte cannot start a"
+                        + " two-byte read, so the bound is capacity-1, not capacity; got "
+                        + nameOf(t));
+        step("bounds", "ByteBuffer.asReadOnlyBuffer().putChar(0)");
+        t = null;
+        try {
+            raw.asReadOnlyBuffer().putChar(OPAQUE_I[3], 'x');
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.nio.ReadOnlyBufferException".equals(nameOf(t)),
+                "putChar into a read-only ByteBuffer must throw ReadOnlyBufferException, got "
+                        + nameOf(t));
+
+        sectionEnd("bounds", 93);
+    }
+
+    // -----------------------------------------------------------------------
+    // 9b. strnull — String's REFERENCE-ARGUMENT contracts. Three nominations
+    //     from two other lanes land here, applied by E39; each is measured on
+    //     OpenJDK 25.0.3+9 and none of them is remembered.
+    //
+    //     (a) E8-1 N2 — the NULL-argument family. Nine String methods returned
+    //     a plausible wrong VALUE for a null argument and no regression row
+    //     noticed, because every row in `strfmt` and `bounds` passes valid
+    //     arguments: `false` from the predicates, `-1` from the searches
+    //     (indistinguishable from a real miss), a null String[] from split, ""
+    //     from join and copyValueOf, the receiver from transform, a silent
+    //     success from getChars.
+    //
+    //     The four non-throwing rows and the startsWith escape hatch are
+    //     deliberate and load-bearing: "takes a reference" does NOT imply
+    //     "throws", and a fix applied by SHAPE breaks equals/equalsIgnoreCase.
+    //     Keep them. This is the same non-uniformity `bounds` pins for
+    //     regionMatches, one method over.
+    //
+    //     (b) E18-1 N3 — the argument-TYPE test. `String.equals` is guarded by
+    //     `instanceof String`; `contentEquals` is the sibling that compares
+    //     across CharSequence types. The JIT's StringEquals intrinsic inlines a
+    //     String-layout decode of the ARGUMENT guarded only against null, so a
+    //     same-length StringBuilder is the operand that separates them.
+    //
+    //     (c) E18-1 N6 — `indexOf(int)`/`lastIndexOf(int)` do NOT narrow to a
+    //     code unit; the gate is Character.isValidCodePoint, checked BEFORE any
+    //     narrowing. Four disagreeing implementations of this one JVMS rule
+    //     have been found in this tree (E18-1, E27-1), and until E26 nothing in
+    //     the fixture called `lastIndexOf(int)` at all.
+    //
+    //     N6's own `mixed.indexOf(0x10437) == 3` row is NOT here: E26's
+    //     `strfmt` row `indexOf(OPAQUE_CP[9]) == 1` on the astral-emoji
+    //     receiver already asserts it, and the extra discrimination N6 carried
+    //     — a receiver where the MASKED low half occurs EARLIER than the pair —
+    //     is carried by the `lastIndexOf(0x10437, 2)` row below, whose receiver
+    //     is the same string and whose backward scan passes over that very
+    //     unit. Two rows asserting one contract is how a denominator drifts.
+    // -----------------------------------------------------------------------
+    static void strnull() {
+        String s = "abc";
+        String nul = (String) NULL_OBJ;
+
+        // --- (a) E8-1 N2. The four that must NOT throw. ---
+        check(!s.equals(NULL_OBJ), "\"abc\".equals(null) must be FALSE, not a throw");
+        check(!s.equalsIgnoreCase(nul),
+                "\"abc\".equalsIgnoreCase(null) must be FALSE, not a throw — the sibling"
+                        + " compareToIgnoreCase(null) DOES throw");
+        check("null".equals(String.valueOf(NULL_OBJ)),
+                "String.valueOf((Object) null) must be the four-character string \"null\"");
+        check("a,null,b".equals(String.join(",", "a", null, "b")),
+                "a null ELEMENT of String.join must render as \"null\"");
+
+        // The negative-offset escape hatch: startsWith has regionMatches's
+        // short-circuiting shape, so this one is FALSE and not a throw.
+        Throwable t = null;
+        boolean neg = false;
+        try {
+            neg = !s.startsWith(nul, OPAQUE_I[2]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check(t == null && neg,
+                "\"abc\".startsWith(null, -1) must be FALSE — toffset < 0 is checked before the"
+                        + " prefix is dereferenced; got " + nameOf(t));
+
+        // Everything else throws NullPointerException.
+        checkNpe("contains", () -> s.contains(nul));
+        checkNpe("startsWith", () -> s.startsWith(nul));
+        checkNpe("startsWith(_,0)", () -> s.startsWith(nul, OPAQUE_I[3]));
+        checkNpe("endsWith", () -> s.endsWith(nul));
+        checkNpe("indexOf(String)", () -> s.indexOf(nul));
+        checkNpe("lastIndexOf(String)", () -> s.lastIndexOf(nul));
+        checkNpe("compareTo", () -> s.compareTo(nul));
+        checkNpe("compareToIgnoreCase", () -> s.compareToIgnoreCase(nul));
+        checkNpe("concat", () -> s.concat(nul));
+        checkNpe("split", () -> s.split(nul));
+        checkNpe("split(_,2)", () -> s.split(nul, OPAQUE_I[5]));
+        checkNpe("matches", () -> s.matches(nul));
+        checkNpe("replaceAll", () -> s.replaceAll(nul, "x"));
+        checkNpe("transform", () -> s.transform(null));
+        checkNpe("toUpperCase(Locale)", () -> s.toUpperCase((Locale) NULL_OBJ));
+        checkNpe("toLowerCase(Locale)", () -> s.toLowerCase((Locale) NULL_OBJ));
+        checkNpe("join(null delim)", () -> String.join(null, "a", "b"));
+        checkNpe("join(null array)", () -> String.join(",", (CharSequence[]) NULL_OBJ));
+        checkNpe("join(null iterable)", () -> String.join(",", NULL_ITER));
+        checkNpe("copyValueOf", () -> String.copyValueOf((char[]) NULL_OBJ));
+        checkNpe("valueOf(char[])", () -> String.valueOf((char[]) NULL_OBJ));
+        checkNpe("new String(char[])", () -> new String((char[]) NULL_OBJ));
+        checkNpe("getChars(null dst)", () -> {
+            s.getChars(OPAQUE_I[3], OPAQUE_I[4], (char[]) NULL_OBJ, OPAQUE_I[3]);
+            return null;
+        });
+
+        // getChars checks the SOURCE range before it looks at dst, so a bad
+        // range plus a null dst is a StringIndexOutOfBoundsException — and the
+        // destination-range failure is ALSO StringIndexOutOfBounds, not
+        // ArrayIndexOutOfBounds.
+        t = null;
+        try {
+            s.getChars(OPAQUE_I[3], OPAQUE_I[13], (char[]) NULL_OBJ, OPAQUE_I[3]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "getChars(0, 9, null, 0) must report the SOURCE range first, as"
+                        + " StringIndexOutOfBoundsException; got " + nameOf(t));
+        t = null;
+        try {
+            s.getChars(OPAQUE_I[3], OPAQUE_I[6], new char[OPAQUE_I[6]], OPAQUE_I[5]);
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.StringIndexOutOfBoundsException".equals(nameOf(t)),
+                "getChars(0, 3, new char[3], 2) must throw StringIndexOutOfBoundsException — NOT"
+                        + " ArrayIndexOutOfBounds, String does its own checking; got " + nameOf(t));
+
+        // --- (b) E18-1 N3. equals is TYPE-guarded; contentEquals is not. ---
+        // A same-LENGTH non-String CharSequence: `new StringBuilder(3)` really
+        // does have capacity 3 on OpenJDK 25.0.3+9, so an equals() that reads
+        // the argument's value array by slot index matches it.
+        StringBuilder sb3 = new StringBuilder(OPAQUE_I[6]);
+        sb3.append("abc");
+        check(!"abc".equals((Object) sb3),
+                "String.equals(StringBuilder) must be FALSE — equals is guarded by"
+                        + " `instanceof String`, and contentEquals is the method that says true");
+        check("abc".contentEquals(sb3),
+                "String.contentEquals(StringBuilder) must be TRUE — the sibling that DOES compare"
+                        + " content across CharSequence types");
+
+        // --- (c) E18-1 N6. indexOf(int) does not narrow to a code unit. ---
+        // 0x10437 & 0xFFFF == 0x0437, and this receiver holds a real U+0437 at
+        // index 1, EARLIER than the pair at 3 — so a masking implementation and
+        // a first-hit-wins hybrid answer 1 where the JDK answers 3.
+        // Both receivers are built from EXPLICIT code units rather than written
+        // as non-ASCII source characters: run.sh compiles src/*.java with no
+        // -encoding flag, so a literal operand would be decoded with whatever
+        // the platform's native encoding happens to be. The array spelling also
+        // says what the receiver IS — "x", U+0437, "y", the D801/DC37 pair, "z"
+        // — which is the whole point of the rows below.
+        String mixed = new String(
+                new char[] { 'x', (char) 0x0437, 'y', (char) 0xd801, (char) 0xdc37, 'z' });
+        String ffffq = new String(new char[] { (char) 0xffff, 'q' });
+        check("abc".indexOf(0x10061) < 0,
+                "\"abc\".indexOf(0x10061) must be -1 — a MASKING implementation finds 'a' at 0");
+        check("abc".lastIndexOf(0x10061) < 0,
+                "\"abc\".lastIndexOf(0x10061) must be -1 — same rule, backwards");
+        check(mixed.lastIndexOf(0xDC37) == 4,
+                "a LONE low surrogate is an ordinary code-unit scan — an implementation built on"
+                        + " a code-point type answers -1 here");
+        check(ffffq.indexOf(-1) < 0,
+                "indexOf(-1) must be -1 even when the receiver holds U+FFFF: the gate is"
+                        + " isValidCodePoint, not a narrowing cast to (char)");
+        check(mixed.lastIndexOf(0x10437, OPAQUE_I[5]) < 0
+                        && mixed.lastIndexOf(0x10437, OPAQUE_I[6]) == 3,
+                "lastIndexOf(supplementary, from) starts at min(from, length - 2), not length - 1"
+                        + " — and the fromIndex=2 half also rejects a scan that would settle for"
+                        + " the masked low half sitting at index 1");
+
+        sectionEnd("strnull", 37);
+    }
+
+    /** Opaque null, so javac cannot fold a null-argument call at compile time. */
+    static final Object NULL_OBJ = null;
+
+    /**
+     * The same opaque null, pre-typed for {@code String.join}'s Iterable
+     * overload. A {@code (Iterable<CharSequence>) NULL_OBJ} cast would select
+     * the same overload but makes the whole file compile with an unchecked
+     * warning, and run.sh compiles src/*.java in one javac invocation.
+     */
+    static final Iterable<CharSequence> NULL_ITER = null;
+
+    /** Asserts that {@code body} throws exactly java.lang.NullPointerException. */
+    static void checkNpe(String what, java.util.concurrent.Callable<Object> body) {
+        Throwable t = null;
+        try {
+            body.call();
+        } catch (Throwable x) {
+            t = x;
+        }
+        check("java.lang.NullPointerException".equals(nameOf(t)),
+                "String." + what + " with a null argument must throw NullPointerException, got "
+                        + nameOf(t));
     }
 
     // -----------------------------------------------------------------------
@@ -1590,7 +3546,232 @@ public class RJdkIntrinsics2 {
         check(StrictMath.abs(OPAQUE_J[0]) == Long.MIN_VALUE,
                 "StrictMath.abs(Long.MIN_VALUE) must wrap too");
 
-        sectionEnd("strictExact", 34);
+        // ===================================================================
+        // E26 — the reach audit. THE SHARPEST VALUE-DOMAIN HOLE IN THE FILE.
+        //
+        // Of the 34 rows above, thirty-two drive MIN_VALUE, MAX_VALUE, -0.0 or
+        // -1. Not one drives an ordinary number. StrictMath's contract is that
+        // it reproduces fdlibm BIT FOR BIT — so unlike Math, its answers on
+        // ordinary inputs are fully specified and assertable — and none of them
+        // has ever been asked. A body that dispatches to Rust's `f64::powf`
+        // (which is the platform libm, not fdlibm) answers every one of the 34
+        // rows above correctly and is wrong here.
+        //
+        // The complementary row is Math: its javadoc allows 1 ulp of error from
+        // the exact result and requires semi-monotonicity, so Math.X is checked
+        // AGAINST StrictMath.X with a 1-ulp budget rather than against a
+        // literal. That is the assertion shape a 44-ulp fast path fails and a
+        // legitimately-different-but-conforming implementation passes.
+        //
+        // Also never reached: absExact (the THROWING twin of the four wrapping
+        // abs rows directly above), divideExact, the ceil/floor Exact forms,
+        // clamp, multiplyFull, round/rint and the ulp/nextUp family.
+        // ===================================================================
+
+        // GAP 1: StrictMath on ordinary inputs, to the bit.
+        check(Double.doubleToRawLongBits(StrictMath.pow(OPAQUE_SM[0], OPAQUE_SM[1]))
+                        == 0x3ff6a09e667f3bcdL,
+                "StrictMath.pow(2.0, 0.5) must be 0x3ff6a09e667f3bcd — fdlibm's answer, not"
+                        + " merely one within an ulp of it");
+        check(Double.doubleToRawLongBits(StrictMath.pow(OPAQUE_SM[4], OPAQUE_SM[15]))
+                        == 0x4480f0cf064dd592L,
+                "StrictMath.pow(10.0, 22.0) must be 0x4480f0cf064dd592 — the largest power of"
+                        + " ten that is exact in a double, and the classic pow fast-path case");
+        check(Double.doubleToRawLongBits(StrictMath.pow(OPAQUE_SM[3], OPAQUE_SM[16]))
+                        == 0x43e517168a4523fdL,
+                "StrictMath.pow(3.0, 40.0) must be 0x43e517168a4523fd");
+        check(Double.doubleToRawLongBits(StrictMath.pow(OPAQUE_SM[1], OPAQUE_SM[1]))
+                        == 0x3fe6a09e667f3bcdL,
+                "StrictMath.pow(0.5, 0.5) must be 0x3fe6a09e667f3bcd");
+        check(Double.doubleToRawLongBits(StrictMath.exp(OPAQUE_SM[2])) == 0x4005bf0a8b14576aL,
+                "StrictMath.exp(1.0) must be 0x4005bf0a8b14576a — note this is NOT Math.E's"
+                        + " bit pattern; fdlibm's exp(1) is one ulp above the constant");
+        check(Double.doubleToRawLongBits(StrictMath.log(OPAQUE_SM[0])) == 0x3fe62e42fefa39efL,
+                "StrictMath.log(2.0) must be 0x3fe62e42fefa39ef");
+        check(Double.doubleToRawLongBits(StrictMath.log10(OPAQUE_SM[9])) == 0x4008000000000000L,
+                "StrictMath.log10(1000.0) must be EXACTLY 3.0");
+        check(Double.doubleToRawLongBits(StrictMath.sqrt(OPAQUE_SM[0])) == 0x3ff6a09e667f3bcdL,
+                "StrictMath.sqrt(2.0) must be 0x3ff6a09e667f3bcd");
+        check(Double.doubleToRawLongBits(StrictMath.cbrt(OPAQUE_SM[8])) == 0x4008000000000000L,
+                "StrictMath.cbrt(27.0) must be EXACTLY 3.0");
+        check(Double.doubleToRawLongBits(StrictMath.sin(OPAQUE_SM[2])) == 0x3feaed548f090ceeL,
+                "StrictMath.sin(1.0) must be 0x3feaed548f090cee");
+        check(Double.doubleToRawLongBits(StrictMath.cos(OPAQUE_SM[2])) == 0x3fe14a280fb5068cL,
+                "StrictMath.cos(1.0) must be 0x3fe14a280fb5068c");
+        check(Double.doubleToRawLongBits(StrictMath.tan(OPAQUE_SM[2])) == 0x3ff8eb245cbee3a6L,
+                "StrictMath.tan(1.0) must be 0x3ff8eb245cbee3a6");
+        check(Double.doubleToRawLongBits(StrictMath.atan2(OPAQUE_SM[2], OPAQUE_SM[0]))
+                        == 0x3fddac670561bb4fL,
+                "StrictMath.atan2(1.0, 2.0) must be 0x3fddac670561bb4f");
+        check(Double.doubleToRawLongBits(StrictMath.hypot(OPAQUE_SM[3], OPAQUE_SM[10]))
+                        == 0x4014000000000000L,
+                "StrictMath.hypot(3.0, 4.0) must be EXACTLY 5.0 — no rounding error at all");
+        check(Double.doubleToRawLongBits(StrictMath.expm1(OPAQUE_SM[11]))
+                        == 0x3ddb7cdfd9dda4e3L,
+                "StrictMath.expm1(1e-10) must be 0x3ddb7cdfd9dda4e3 — expm1 exists precisely so"
+                        + " this is not exp(x)-1, which would round to 1e-10 exactly");
+        check(Double.doubleToRawLongBits(StrictMath.log1p(OPAQUE_SM[11]))
+                        == 0x3ddb7cdfd9d1d693L,
+                "StrictMath.log1p(1e-10) must be 0x3ddb7cdfd9d1d693 — and must DIFFER from"
+                        + " expm1's answer above in the last three hex digits");
+        check(Double.doubleToRawLongBits(StrictMath.sinh(OPAQUE_SM[2])) == 0x3ff2cd9fc44eb982L,
+                "StrictMath.sinh(1.0) must be 0x3ff2cd9fc44eb982");
+        check(Double.doubleToRawLongBits(StrictMath.IEEEremainder(OPAQUE_SM[12], OPAQUE_SM[3]))
+                        == 0xbff0000000000000L,
+                "StrictMath.IEEEremainder(5.0, 3.0) must be -1.0 — it rounds the quotient to"
+                        + " NEAREST, where the drem opcode truncates and answers 2.0");
+        check(Double.doubleToRawLongBits(OPAQUE_SM[12] % OPAQUE_SM[3]) == 0x4000000000000000L,
+                "and 5.0 % 3.0 must be 2.0 — the same operands, the other rounding rule");
+
+        // GAP 2: Math must be within ONE ulp of StrictMath, everywhere in the
+        // ordinary domain. Eight functions x ten operands = eighty comparisons
+        // in one row; the 44-ulp shape fails it and a conforming variant does
+        // not.
+        double worst = 0;
+        for (int k = 0; k < OPAQUE_SM.length; k++) {
+            double x = OPAQUE_SM[k];
+            if (!(x > 0.0)) {
+                continue;
+            }
+            worst = Math.max(worst, ulpGap(Math.exp(x), StrictMath.exp(x)));
+            worst = Math.max(worst, ulpGap(Math.log(x), StrictMath.log(x)));
+            worst = Math.max(worst, ulpGap(Math.sin(x), StrictMath.sin(x)));
+            worst = Math.max(worst, ulpGap(Math.cos(x), StrictMath.cos(x)));
+            worst = Math.max(worst, ulpGap(Math.atan(x), StrictMath.atan(x)));
+            worst = Math.max(worst, ulpGap(Math.cbrt(x), StrictMath.cbrt(x)));
+            worst = Math.max(worst, ulpGap(Math.pow(x, OPAQUE_D[7]), StrictMath.pow(x, OPAQUE_D[7])));
+            worst = Math.max(worst, ulpGap(Math.pow(OPAQUE_D[7], x), StrictMath.pow(OPAQUE_D[7], x)));
+        }
+        check(worst <= 1.0,
+                "every Math transcendental must be within ONE ulp of its StrictMath twin over"
+                        + " the whole ordinary operand set — Math's javadoc budget. Worst gap"
+                        + " seen: " + worst + " ulp");
+        check(Double.doubleToRawLongBits(Math.sqrt(OPAQUE_SM[0]))
+                        == Double.doubleToRawLongBits(StrictMath.sqrt(OPAQUE_SM[0])),
+                "Math.sqrt has NO error budget — it is required to be correctly rounded, so it"
+                        + " must equal StrictMath.sqrt to the bit");
+
+        // GAP 3: round / rint — two rounding rules on the same operands, and
+        // the one input the JDK itself once got wrong.
+        check(Math.round(OPAQUE_D[6]) == 1L, "Math.round(0.5) must be 1 — ties go UP");
+        check(Math.round(OPAQUE_SM[14]) == 0L,
+                "Math.round(-0.5) must be 0 — 'up' means toward POSITIVE infinity, so this is"
+                        + " not symmetric with the row above");
+        check(Math.round(OPAQUE_D[7]) == 3L, "Math.round(2.5) must be 3");
+        check(Math.round(-OPAQUE_D[7]) == -2L, "Math.round(-2.5) must be -2");
+        check(Math.round(OPAQUE_SM[13]) == 0L,
+                "Math.round(0.49999999999999994) must be 0 — the largest double below 0.5."
+                        + " The naive floor(x + 0.5) answers 1, and that WAS a JDK bug");
+        check(Math.round(OPAQUE_D[2]) == 0L, "Math.round(NaN) must be 0");
+        check(Math.round(Float.NaN) == 0, "Math.round(Float.NaN) must be 0");
+        check(Math.round(Double.MAX_VALUE) == Long.MAX_VALUE,
+                "Math.round(MAX_VALUE) must SATURATE to Long.MAX_VALUE");
+        check(StrictMath.round(OPAQUE_D[7]) == 3L, "StrictMath.round(2.5) must agree: 3");
+        check(StrictMath.round(OPAQUE_SM[13]) == 0L,
+                "StrictMath.round(0.49999999999999994) must agree: 0");
+        check(Double.doubleToRawLongBits(Math.rint(OPAQUE_D[7])) == 0x4000000000000000L,
+                "Math.rint(2.5) must be 2.0 — HALF-EVEN, where Math.round(2.5) is 3 above."
+                        + " Two rounding modes, one operand, and this is the pair that"
+                        + " distinguishes them");
+        check(Double.doubleToRawLongBits(Math.rint(OPAQUE_D[3])) == 0x4000000000000000L,
+                "Math.rint(1.5) must ALSO be 2.0 — half-even rounds both 1.5 and 2.5 to 2");
+        check(Double.doubleToRawLongBits(Math.rint(OPAQUE_SM[14])) == Long.MIN_VALUE,
+                "Math.rint(-0.5) must be NEGATIVE zero");
+        check(Double.doubleToRawLongBits(StrictMath.rint(OPAQUE_D[7])) == 0x4000000000000000L,
+                "StrictMath.rint(2.5) must agree: 2.0");
+        check(Double.doubleToRawLongBits(Math.ceil(OPAQUE_SM[14])) == Long.MIN_VALUE,
+                "Math.ceil(-0.5) must be NEGATIVE zero, not positive zero");
+        check(Double.doubleToRawLongBits(Math.floor(OPAQUE_SM[14])) == 0xbff0000000000000L,
+                "Math.floor(-0.5) must be -1.0");
+
+        // GAP 4: signum / copySign / nextUp / ulp — the sign-bit family.
+        check(Double.doubleToRawLongBits(Math.signum(OPAQUE_D[0])) == Long.MIN_VALUE,
+                "Math.signum(-0.0) must be -0.0, not 0.0 and not -1.0");
+        check(Double.doubleToRawLongBits(Math.copySign(OPAQUE_SM[2], OPAQUE_D[0]))
+                        == 0xbff0000000000000L,
+                "Math.copySign(1.0, -0.0) must be -1.0 — the SIGN of a negative zero is"
+                        + " readable, which == cannot see");
+        check(Double.doubleToRawLongBits(StrictMath.copySign(OPAQUE_SM[2], OPAQUE_D[0]))
+                        == 0xbff0000000000000L,
+                "StrictMath.copySign must agree");
+        check(Double.doubleToRawLongBits(Math.nextUp(OPAQUE_D[1])) == 1L,
+                "Math.nextUp(0.0) must be Double.MIN_VALUE — the smallest subnormal");
+        check(Double.doubleToRawLongBits(Math.nextDown(OPAQUE_D[1])) == 0x8000000000000001L,
+                "Math.nextDown(0.0) must be -Double.MIN_VALUE");
+        check(Double.doubleToRawLongBits(Math.ulp(OPAQUE_SM[2])) == 0x3cb0000000000000L,
+                "Math.ulp(1.0) must be 2^-52");
+        check(Double.doubleToRawLongBits(Math.ulp(OPAQUE_D[1])) == 1L,
+                "Math.ulp(0.0) must be MIN_VALUE, not zero");
+        check(Double.doubleToRawLongBits(Math.abs(OPAQUE_D[2])) == 0x7ff8000000000000L,
+                "Math.abs(NaN) must be the canonical NaN, not a sign-stripped payload");
+
+        // GAP 5: the EXACT twins of the wrapping rows directly above, plus the
+        // remaining integral statics. absExact is the complement of the four
+        // step-guarded abs rows: same operand, opposite contract.
+        step("strictExact", "Math.absExact(Integer.MIN_VALUE)");
+        Throwable e = null;
+        try {
+            sink = Math.absExact(OPAQUE_I[0]);
+        } catch (Throwable x) {
+            e = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(e)),
+                "Math.absExact(Integer.MIN_VALUE) must THROW ArithmeticException — the exact"
+                        + " operand on which Math.abs WRAPS four rows above; got " + nameOf(e));
+        step("strictExact", "Math.absExact(Long.MIN_VALUE)");
+        e = null;
+        try {
+            sink = (int) Math.absExact(OPAQUE_J[0]);
+        } catch (Throwable x) {
+            e = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(e)),
+                "Math.absExact(Long.MIN_VALUE) must throw ArithmeticException, got " + nameOf(e));
+        check(Math.absExact(-5) == 5, "Math.absExact(-5) must simply be 5");
+        check(Math.divideExact(7, OPAQUE_I[5]) == 3,
+                "Math.divideExact(7, 2) must be 3 — it truncates like idiv");
+        step("strictExact", "Math.divideExact(Integer.MIN_VALUE, -1)");
+        e = null;
+        try {
+            sink = Math.divideExact(OPAQUE_I[0], OPAQUE_I[2]);
+        } catch (Throwable x) {
+            e = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(e)),
+                "Math.divideExact(MIN_INT, -1) must throw ArithmeticException — where the idiv"
+                        + " OPCODE wraps; got " + nameOf(e));
+        check(Math.multiplyFull(OPAQUE_I[0], OPAQUE_I[0]) == 4611686018427387904L,
+                "Math.multiplyFull(MIN_INT, MIN_INT) must be 2^62 — a long result that the"
+                        + " (II)I product cannot hold");
+        check(StrictMath.multiplyFull(OPAQUE_I[2], OPAQUE_I[2]) == 1L,
+                "StrictMath.multiplyFull(-1, -1) must be 1, not 4294967295");
+        check(Math.clamp(5L, OPAQUE_J[4], 3L) == 3L, "Math.clamp(5, 1, 3) must be 3");
+        check(Double.doubleToRawLongBits(Math.clamp(OPAQUE_D[0], OPAQUE_D[0], OPAQUE_D[1]))
+                        == Long.MIN_VALUE,
+                "Math.clamp(-0.0, -0.0, 0.0) must be NEGATIVE zero — clamp orders the two"
+                        + " zeros, so it cannot be written with a plain <=");
+        e = null;
+        try {
+            sink = (int) Math.clamp(5L, 3L, OPAQUE_J[4]);
+        } catch (Throwable x) {
+            e = x;
+        }
+        check("java.lang.IllegalArgumentException".equals(nameOf(e)),
+                "Math.clamp with min > max must throw IllegalArgumentException — NOT"
+                        + " ArithmeticException, which every other row in this block raises;"
+                        + " got " + nameOf(e));
+        check(Math.toIntExact(OPAQUE_J[5]) == 2,
+                "Math.toIntExact must exist on Math too, not only on StrictMath");
+        e = null;
+        try {
+            sink = Math.toIntExact(OPAQUE_J[1]);
+        } catch (Throwable x) {
+            e = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(e)),
+                "Math.toIntExact(MAX_LONG) must throw ArithmeticException, got " + nameOf(e));
+
+        sectionEnd("strictExact", 91);
     }
 
     // -----------------------------------------------------------------------
@@ -1657,7 +3838,158 @@ public class RJdkIntrinsics2 {
                         + " reaches floorMod(JJ)J with an operand pair the (II)I row cannot"
                         + " produce");
 
-        sectionEnd("divmod", 12);
+        // ===================================================================
+        // E26 — the reach audit. Same hazard, wider.
+        //
+        // REACH BEFORE: StrictMath.floorDiv/floorMod, the ldiv and lrem
+        // OPCODES, and one widened Math.floorMod. Never reached: Math's own
+        // floorDiv/floorMod (separate registered triples from StrictMath's),
+        // the INT opcodes at the same overflow point, the divide-by-zero
+        // opcodes, the whole ceil family, and the four UNSIGNED division
+        // methods — where the divisor being "negative" is the normal case.
+        //
+        // VALUE-DOMAIN NOTE: the rows above drive (-7, 2) and the MIN/-1
+        // overflow. The plain TRUNCATING operators on the same operands were
+        // never asked, so nothing here has ever shown that floorDiv and idiv
+        // differ at all.
+        // ===================================================================
+
+        // GAP 1: the truncating operators next to the flooring methods, on the
+        // SAME operands. Four answers, and no two of them agree.
+        check(OPAQUE_I[9] / OPAQUE_I[5] == -3,
+                "the idiv OPCODE must TRUNCATE -7/2 toward zero: -3");
+        check(Math.floorDiv(OPAQUE_I[9], OPAQUE_I[5]) == -4,
+                "Math.floorDiv(-7, 2) must FLOOR to -4 — the same operands, one apart");
+        check(OPAQUE_I[9] % OPAQUE_I[5] == -1,
+                "the irem OPCODE's sign follows the DIVIDEND: -7 % 2 is -1");
+        check(Math.floorMod(OPAQUE_I[9], OPAQUE_I[5]) == 1,
+                "Math.floorMod's sign follows the DIVISOR: floorMod(-7, 2) is 1");
+        check(Math.floorDiv(OPAQUE_J[6], OPAQUE_I[5]) == -4L,
+                "Math.floorDiv(-7L, 2) — the (JI)J overload, a third registered triple beside"
+                        + " (II)I and (JJ)J");
+        check(Math.floorMod(OPAQUE_J[6], OPAQUE_I[5]) == 1L,
+                "Math.floorMod(-7L, 2) must be 1");
+
+        // GAP 2: the INT opcodes at the overflow point the long ones were
+        // checked at, and division by zero. Same JVMS 6.5 rule, separate
+        // implementations.
+        step("divmod", "idiv Integer.MIN_VALUE / -1");
+        check(OPAQUE_I[0] / OPAQUE_I[2] == Integer.MIN_VALUE,
+                "the idiv OPCODE must wrap MIN_INT / -1 to MIN_INT (JVMS 6.5), exactly as ldiv"
+                        + " does above");
+        step("divmod", "irem Integer.MIN_VALUE % -1");
+        check(OPAQUE_I[0] % OPAQUE_I[2] == 0, "the irem OPCODE must answer 0 for MIN_INT % -1");
+        step("divmod", "Math.floorDiv(Integer.MIN_VALUE, -1)");
+        check(Math.floorDiv(OPAQUE_I[0], OPAQUE_I[2]) == Integer.MIN_VALUE,
+                "Math.floorDiv(MIN_INT, -1) must wrap — StrictMath's twin is checked above and"
+                        + " [2twins] is a standing record about exactly this pair");
+        step("divmod", "idiv by zero");
+        Throwable d = null;
+        try {
+            sink = OPAQUE_I[4] / OPAQUE_I[3];
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "1 / 0 must throw ArithmeticException from the OPCODE, got " + nameOf(d));
+        d = null;
+        try {
+            sink = OPAQUE_I[4] % OPAQUE_I[3];
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "1 % 0 must throw ArithmeticException, got " + nameOf(d));
+        d = null;
+        try {
+            sink = Math.floorDiv(OPAQUE_I[4], OPAQUE_I[3]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Math.floorDiv(1, 0) must throw ArithmeticException, got " + nameOf(d));
+
+        // GAP 3: the UNSIGNED division family. Every operand here is negative
+        // as a signed int and enormous as an unsigned one, which is the whole
+        // point — a body that forwards to a signed divide gets all four wrong.
+        step("divmod", "Integer.divideUnsigned(-1, 2)");
+        check(Integer.divideUnsigned(OPAQUE_I[2], OPAQUE_I[5]) == Integer.MAX_VALUE,
+                "Integer.divideUnsigned(-1, 2) must be 2147483647 — the SIGNED -1/2 is 0");
+        check(Integer.remainderUnsigned(OPAQUE_I[2], OPAQUE_I[6]) == 0,
+                "Integer.remainderUnsigned(-1, 3) must be 0 — 4294967295 is divisible by 3,"
+                        + " where the signed -1 % 3 is -1");
+        check(Integer.divideUnsigned(OPAQUE_I[2], -2) == 1,
+                "Integer.divideUnsigned(-1, -2) must be 1 — BOTH operands read unsigned");
+        check(Long.divideUnsigned(OPAQUE_J[2], OPAQUE_J[5]) == Long.MAX_VALUE,
+                "Long.divideUnsigned(-1L, 2L) must be Long.MAX_VALUE");
+        check(Long.remainderUnsigned(OPAQUE_J[2], 3L) == 0L,
+                "Long.remainderUnsigned(-1L, 3L) must be 0");
+        step("divmod", "Integer.divideUnsigned(1, 0)");
+        d = null;
+        try {
+            sink = Integer.divideUnsigned(OPAQUE_I[4], OPAQUE_I[3]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Integer.divideUnsigned(1, 0) must throw ArithmeticException — Rust's"
+                        + " u32 division PANICS here; got " + nameOf(d));
+        d = null;
+        try {
+            sink = Integer.remainderUnsigned(OPAQUE_I[4], OPAQUE_I[3]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Integer.remainderUnsigned(1, 0) must throw ArithmeticException, got "
+                        + nameOf(d));
+
+        // GAP 4: the ceil family — a THIRD rounding direction, and the one
+        // whose mod is signed opposite to floorMod's.
+        check(Math.ceilDiv(OPAQUE_I[9], OPAQUE_I[5]) == -3,
+                "Math.ceilDiv(-7, 2) must be -3 — rounds toward POSITIVE infinity, which here"
+                        + " coincides with idiv and differs from floorDiv");
+        check(Math.ceilDiv(7, OPAQUE_I[5]) == 4,
+                "Math.ceilDiv(7, 2) must be 4 — and HERE it differs from idiv's 3, so the two"
+                        + " rows together show it is neither");
+        check(Math.ceilMod(OPAQUE_I[9], OPAQUE_I[5]) == -1, "Math.ceilMod(-7, 2) must be -1");
+        check(Math.ceilMod(7, OPAQUE_I[5]) == -1,
+                "Math.ceilMod(7, 2) must ALSO be -1 — ceilMod's sign follows the NEGATED"
+                        + " divisor, so a positive dividend gives a negative remainder");
+        check(Math.ceilDiv(OPAQUE_J[6], OPAQUE_J[5]) == -3L, "Math.ceilDiv(-7L, 2L) must be -3");
+        step("divmod", "Math.ceilDiv(Integer.MIN_VALUE, -1)");
+        check(Math.ceilDiv(OPAQUE_I[0], OPAQUE_I[2]) == Integer.MIN_VALUE,
+                "Math.ceilDiv(MIN_INT, -1) must WRAP like its floor twin");
+        step("divmod", "Math.ceilDivExact(Integer.MIN_VALUE, -1)");
+        d = null;
+        try {
+            sink = Math.ceilDivExact(OPAQUE_I[0], OPAQUE_I[2]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Math.ceilDivExact(MIN_INT, -1) must THROW where ceilDiv wraps one row up; got "
+                        + nameOf(d));
+        step("divmod", "Math.floorDivExact(Integer.MIN_VALUE, -1)");
+        d = null;
+        try {
+            sink = Math.floorDivExact(OPAQUE_I[0], OPAQUE_I[2]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Math.floorDivExact(MIN_INT, -1) must throw ArithmeticException, got "
+                        + nameOf(d));
+        d = null;
+        try {
+            sink = Math.ceilDiv(OPAQUE_I[4], OPAQUE_I[3]);
+        } catch (Throwable x) {
+            d = x;
+        }
+        check("java.lang.ArithmeticException".equals(nameOf(d)),
+                "Math.ceilDiv(1, 0) must throw ArithmeticException, got " + nameOf(d));
+
+        sectionEnd("divmod", 40);
     }
 
     // Ordered by how likely each family is to ABORT the VM rather than fail an
@@ -1665,7 +3997,7 @@ public class RJdkIntrinsics2 {
     // the first aborting family never reports.
     static final String[] FAMILIES = {
         "charcls", "boolparse", "floatfmt", "hex", "b64", "uuid", "random", "strfmt",
-        "bounds", "strictExact", "divmod",
+        "bounds", "strnull", "strictExact", "divmod",
     };
 
     static void runFamily(String name) {
@@ -1687,6 +4019,8 @@ public class RJdkIntrinsics2 {
             strfmt();
         } else if ("bounds".equals(name)) {
             bounds();
+        } else if ("strnull".equals(name)) {
+            strnull();
         } else if ("strictExact".equals(name)) {
             strictExact();
         } else if ("divmod".equals(name)) {

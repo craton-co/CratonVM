@@ -12042,7 +12042,15 @@ pub fn register_essential_natives_with_shims(
                 return Ok(Some(Value::Object(Some(cached))));
             }
 
-            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
+            // 5, not 2: `class_manager.rs:15407` declares the synthetic
+            // `java/lang/Module` as `instance_fields(5)` and
+            // `jboss_jdkspecific.rs:214` allocates `MODULE_FIELD_COUNT = 5`.
+            // The object was 5 slots wide either way (`num_fields.max(real)`);
+            // asking 2 only fired `report_layout_alias(.., 2, 5)` on every
+            // uncached call. The synthetic-mode twin of this triple
+            // (`phases_late/reflect_invoke.rs`) now asks 5 as well — see
+            // docs/known-issues/jdk-only/E28-R11-P59-MODULE-WIDTHS-AND-CATALOG-20260813.md §1.2.
+            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
             // GC-safety: `create_string` below allocates (String + char[]) and
             // can trigger a moving GC. `m_obj` lives only in this Rust local —
             // not a GC root — so without pinning it would be relocated/reclaimed
@@ -12057,7 +12065,7 @@ pub fn register_essential_natives_with_shims(
                 .map(|name| Value::Object(Some(ctx.create_string(name))))
                 .unwrap_or(Value::Object(None));
             let m_obj = ctx.read_native_pin(pin, m_obj);
-            // Dual-write the name. Field index 0 is the synthetic 2-field Module
+            // Dual-write the name. Field index 0 is the synthetic Module
             // contract (the `register_p59_module` getName/isNamed/toString natives
             // read slot 0). But real `java.lang.Module.isNamed()`/`getName()`
             // bytecode reads the named `name` field (slot 1 in the real layout —
@@ -13053,11 +13061,35 @@ pub fn register_essential_natives_with_shims(
     // that holds the class.  This satisfies Quarkus/Spring/etc. code paths
     // that derive their application root from `getProtectionDomain().getCodeSource().getLocation().getPath()`.
     //
-    // Layouts (synthetic; field names match what our PD/CS/URL natives read):
-    //   ProtectionDomain — field 0: CodeSource, field 1: Permissions
-    //   CodeSource       — field 0: URL,        field 1: Certificate[]
-    //   URL              — field 0: String path (absolute FS path, '/'-separated)
-    //                      field 1: String protocol ("file"), field 2: String host ("")
+    // Layouts, as the body BELOW actually writes them — this block described a
+    // different object until 2026-08-13 and was contradicted 100 lines further
+    // down inside its own closure:
+    //   ProtectionDomain — slot 0: CodeSource; slot 1 is `classloader`, NOT
+    //                      `Permissions` (see the SBR-13 note at the tail — the
+    //                      Permissions-on-slot-1 layout is the bug that note
+    //                      records fixing). Everything else goes in by name via
+    //                      `populate_protection_domain_fields`.
+    //   CodeSource       — written BY NAME (`location`, `certs`); slot 1 is
+    //                      `signers` on the real class, so the raw-slot form
+    //                      was wrong here too.
+    //   URL              — the real JDK 25 13-field order, NOT a 3-field
+    //                      synthetic one: 0=protocol, 1=host, 2=port(int),
+    //                      3=file, 4=query, 5=authority, 6=path, 7=userInfo,
+    //                      8=ref, 9=hostAddress, 10=handler, 11=hashCode(int),
+    //                      12=tempState. Confirmed against `javap -p java.net.URL`
+    //                      on JDK 25.0.3.
+    //
+    // SHADOWED: this registration has no runtime effect. `Class.getProtectionDomain()`
+    // is registered THREE times in this one function — at `:13017` and again at
+    // `:13234`, both with `lang_class::native_class_get_protection_domain0`, with
+    // this closure sandwiched between them. `register()` is
+    // last-registration-wins, so `:13234` answers and the three allocations in
+    // this closure (`ProtectionDomain` 4, `URL` 13, `CodeSource` 2) never run.
+    // Kept because
+    // the two bodies are not identical and the live one has no equivalent of
+    // this one's `jar:file:` handling; deleting it is a behaviour question, not
+    // a cleanup. See
+    // docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §4.
     registry.register(
         "java/lang/Class",
         "getProtectionDomain",
@@ -20351,8 +20383,11 @@ pub fn register_essential_natives_with_shims(
     // gets `getOffsets`/`getOffsetsByWall` called directly (downcast in
     // `GregorianCalendar`'s own bytecode), anything else (e.g.
     // `SimpleTimeZone`) goes through the generic `TimeZone.getOffset(long)`.
-    // Both concrete classes are covered below so it doesn't matter which one
-    // `alloc_synth_timezone` constructed for a given zone id.
+    // Only `ZoneInfo` and the abstract `TimeZone` itself are registered below:
+    // C12-1 removed `java/util/SimpleTimeZone`, whose id is an opaque LABEL and
+    // whose offset is the caller's `rawOffset`, and `alloc_synth_timezone` no
+    // longer constructs one for any id. See
+    // `docs/known-issues/jdk-only/E1-1-simpledateformat-format-zone-arm-landed.md`.
     fn tzdb_offsets(
         ctx: &mut dyn NativeContext,
         this: cratonvm_types::ObjectRef,
@@ -32372,62 +32407,200 @@ fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 // ===========================================================================
 // Base64 — Encoder/Decoder for basic, URL-safe, and MIME variants
-// Encoder uses the real JDK field layout: newline, linemax, isURL, doPadding.
-// Decoder = 1-field synthetic (field 0 = Int variant tag)
-// Tags: 0 = basic, 1 = url-safe, 2 = MIME
+//
+// BOTH synthetics use the REAL JDK instance-field layout, in declaration
+// order, so that the public methods this file does NOT register (7 of the 18
+// — see `register_base64_natives`) can run real JDK bytecode against a
+// receiver this file fabricated. Read off `javap -p` on 25.0.3+9-LTS:
+//
+//   java.util.Base64$Encoder   0 newline:[B  1 linemax:I  2 isURL:Z  3 doPadding:Z
+//   java.util.Base64$Decoder   0 isURL:Z     1 isMIME:Z
+//
+// The Decoder was a ONE-field synthetic holding an Int variant tag (0/1/2) in
+// slot 0 until 2026-08-13, which slot 0 of the real layout calls `isURL`. So
+// `getMimeDecoder()` wrote 2 into `isURL` and left `isMIME` false, and every
+// real-bytecode entry point read our MIME decoder as a URL, non-MIME one.
+// Measured on HotSpot by building `Decoder(isURL=true, isMIME=false)` through
+// the private constructor and decoding what `getMimeDecoder()` must accept
+// (`scratchpad/e14/B64Unreg.java`):
+//
+//   input                real getMimeDecoder()  our fabricated shape
+//   76-col wrapped text   len=60                 IllegalArgumentException:
+//                                                  Illegal base64 character d
+//   "-_-_"                len=0                  len=3
+//   "QQ\n=="              len=1                  IllegalArgumentException:
+//                                                  Illegal base64 character a
+//
+// Three of four rows wrong, one of them silently. That is the two-readers-of-
+// one-slot shape: the NATIVE route read slot 0 as a variant tag and the
+// BYTECODE route read it as `isURL`.
+//
+// The variant tag survives as this file's INTERNAL vocabulary (it is what
+// `b64_decode`/`b64_encode` take), derived from the two booleans on read.
+// Tags: 0 = basic, 1 = url-safe, 2 = MIME.
 // ===========================================================================
 
+const B64_ENCODER_CLASS: &str = "java/util/Base64$Encoder";
+const B64_DECODER_CLASS: &str = "java/util/Base64$Decoder";
+const B64_ENCODER_FIELD_NEWLINE: usize = 0;
 const B64_ENCODER_FIELD_LINEMAX: usize = 1;
 const B64_ENCODER_FIELD_IS_URL: usize = 2;
 const B64_ENCODER_FIELD_DO_PADDING: usize = 3;
-const B64_DECODER_FIELD_VARIANT: usize = 0;
+const B64_ENCODER_NUM_FIELDS: usize = 4;
+const B64_DECODER_FIELD_IS_URL: usize = 0;
+const B64_DECODER_FIELD_IS_MIME: usize = 1;
+const B64_DECODER_NUM_FIELDS: usize = 2;
 const B64_VARIANT_BASIC: i32 = 0;
 const B64_VARIANT_URL: i32 = 1;
 const B64_VARIANT_MIME: i32 = 2;
+
+/// `Base64.Encoder.MIMELINEMAX`.
+const B64_MIME_LINEMAX: i32 = 76;
+
+/// What the real JDK writes into `linemax` for every encoder that does NOT
+/// wrap lines — **-1, not 0**, and the difference is load-bearing.
+///
+/// `outLength` and `encode0` both test `linemax > 0`, which reads 0 and -1
+/// alike. `Base64$EncOutputStream` does not: it tests `linepos == linemax`,
+/// and `linepos` starts at 0. Measured on HotSpot by constructing each shape
+/// through the private `Encoder(boolean,byte[],int,boolean)` constructor
+/// (`scratchpad/e14/B64Zero.java`), encoding 60 bytes:
+///
+/// ```text
+/// linemax=0  newline=null  encodeToString=80  wrap(OutputStream)=NPE / "b" is null
+/// linemax=0  newline=CRLF  encodeToString=80  wrap(OutputStream)=82   <- WRONG, a
+///                                                                       basic stream
+///                                                                       with a CRLF in it
+/// linemax=-1 newline=null  encodeToString=80  wrap(OutputStream)=80   <- real getEncoder()
+/// ```
+///
+/// So this file writing 0 meant `Base64.getEncoder().wrap(os)` — one of the
+/// unregistered methods, hence real bytecode — threw NullPointerException on
+/// the first write. Writing -1 is what makes `wrap` correct, and it is ALSO
+/// why "just give the fabricated encoder a CRLF newline" is not the fix on its
+/// own: with linemax still 0 that turns the NPE into a silently wrong 82.
+const B64_NO_LINEMAX: i32 = -1;
+
+/// `Base64.Encoder.CRLF` — the line separator of `getMimeEncoder()`.
+const B64_MIME_CRLF: [u8; 2] = [b'\r', b'\n'];
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_CHARS: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Variant-tag entry point, kept for the callers outside this module
+/// (`http_url_connection.rs`, `net_phase_e.rs`, `regex_matcher.rs`'s test) that
+/// only ever want one of the three canonical encoders. MIME here means the
+/// canonical `getMimeEncoder()` shape, 76 columns and CRLF.
+///
+/// Everything driven by an actual `Base64$Encoder` receiver goes through
+/// [`b64_encode_wrapped`] instead, because a receiver carries its OWN
+/// `linemax`/`newline` and this tag cannot represent them.
 pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8> {
-    let table = if variant == B64_VARIANT_URL {
-        B64_URL_CHARS
+    let (linemax, newline): (i32, &[u8]) = if variant == B64_VARIANT_MIME {
+        (B64_MIME_LINEMAX, &B64_MIME_CRLF)
     } else {
-        B64_CHARS
+        (B64_NO_LINEMAX, &[])
     };
-    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0;
-    let mut line_len = 0;
-    // Real `Base64.Encoder.encode0` writes the MIME line separator only when
-    // more input remains (`if (dp < len && sp < end)`), so a payload that ends
-    // exactly on a 76-char boundary gets NO trailing CRLF (57 bytes → 76
-    // chars, not 78). Emitting it eagerly after the quad that fills the line —
-    // as this loop used to — appended a phantom CRLF at end-of-output. Emit it
-    // lazily instead, just before whatever actually follows.
-    while i + 2 < input.len() {
-        if variant == B64_VARIANT_MIME && line_len == 76 {
-            out.push(b'\r');
-            out.push(b'\n');
-            line_len = 0;
+    b64_encode_wrapped(
+        input,
+        variant == B64_VARIANT_URL,
+        no_padding,
+        linemax,
+        newline,
+    )
+}
+
+/// Line-for-line port of real `java.util.Base64.Encoder.encode0` (JDK 25
+/// `java.base/java/util/Base64.java`), with `linemax` and `newline` taken from
+/// the caller instead of hardcoded at 76/CRLF.
+///
+/// Hardcoding them made `Base64.getMimeEncoder(20, new byte[]{'\n'})` — the one
+/// factory this file does not register, so it runs real bytecode and hands back
+/// a real `Encoder` with `linemax=20, newline=[10]` — encode with 76-column
+/// CRLF wrapping anyway. On the 60-byte fixture (80 base64 chars) that is
+/// `80 + 1 separator x 2 bytes = 82` against HotSpot's
+/// `80 + 3 separators x 1 byte = 83`. **Off by one, not off by a mile**, which
+/// is the dangerous kind: a caller asserting "about the right length", or
+/// `decode`-ing the result (MIME decoding ignores every non-alphabet byte, so
+/// both round-trip), cannot tell. It is wrong in the LINE STRUCTURE, not the
+/// length — one 76-char line where the caller asked for four 20-char lines.
+///
+/// Three details of `encode0` that a plausible rewrite gets wrong, each
+/// measured on HotSpot in `scratchpad/e14/B64Line.java`:
+///
+/// 1. **The separator test is `dlen == linemax`, an EQUALITY.** `slen` is
+///    rounded down to a whole number of triples, so a `linemax` that is not a
+///    multiple of 4 can never be hit and the encoder emits NO separators at
+///    all: `linemax=20 -> 83` but `linemax=22 -> 80`, and `linemax=6 -> 80`.
+///    A `>=` here would wrap all three.
+/// 2. **A separator is written only when input remains** (`&& sp < end`), so a
+///    payload ending exactly on a line boundary gets no trailing separator:
+///    57 bytes at `linemax=76` is 76 chars, not 78; 15 bytes at `linemax=20`
+///    is 20, not 21.
+/// 3. **`linemax > 0` is not the same as "wraps"**, and `linemax` past the
+///    payload is fine: `linemax=1000` on 60 bytes is 80 chars.
+///
+/// The one deliberate divergence is `linemax` in `1..=3`, where
+/// `linemax / 4 * 3` is 0, real JDK's block size becomes 0 and its
+/// `while (sp < sl)` loop never advances. Measured: HotSpot **hangs** (all
+/// three values still running after 1.2 s in `scratchpad/e14/B64Fab.java`).
+/// No public factory can produce it — `getMimeEncoder(int, byte[])` rounds
+/// `lineLength >> 2 << 2` and returns the unwrapped `RFC4648` singleton for
+/// anything below 4 — so it is reachable only through reflection. We treat it
+/// as "no wrapping" rather than reproducing a hang.
+fn b64_encode_wrapped(
+    input: &[u8],
+    is_url: bool,
+    no_padding: bool,
+    linemax: i32,
+    newline: &[u8],
+) -> Vec<u8> {
+    let table = if is_url { B64_URL_CHARS } else { B64_CHARS };
+    let end = input.len();
+    // `int slen = (end - off) / 3 * 3;` — the whole-triple prefix. `sl` is
+    // where the 3-byte loop stops and the 1-or-2-byte tail begins.
+    let sl = end / 3 * 3;
+    // `if (linemax > 0 && slen > linemax / 4 * 3) slen = linemax / 4 * 3;` —
+    // real JDK REUSES `slen` as the per-line block size once the payload is
+    // longer than one line. When it is not, the whole payload is one block and
+    // `dlen` may still equal `linemax` exactly (15 bytes at linemax 20), which
+    // rule 2 above is what keeps from emitting a trailing separator.
+    let line_bytes = if linemax > 0 {
+        (linemax / 4 * 3) as usize
+    } else {
+        0
+    };
+    let block = if linemax > 0 && sl > line_bytes && line_bytes > 0 {
+        line_bytes
+    } else {
+        sl
+    };
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4 + newline.len() * 4);
+    let mut sp = 0usize;
+    while sp < sl {
+        let sl0 = (sp + block).min(sl);
+        let mut sp0 = sp;
+        while sp0 < sl0 {
+            let triple = ((input[sp0] as u32) << 16)
+                | ((input[sp0 + 1] as u32) << 8)
+                | input[sp0 + 2] as u32;
+            out.push(table[((triple >> 18) & 0x3F) as usize]);
+            out.push(table[((triple >> 12) & 0x3F) as usize]);
+            out.push(table[((triple >> 6) & 0x3F) as usize]);
+            out.push(table[(triple & 0x3F) as usize]);
+            sp0 += 3;
         }
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
-        let b2 = input[i + 2] as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(table[((triple >> 18) & 0x3F) as usize]);
-        out.push(table[((triple >> 12) & 0x3F) as usize]);
-        out.push(table[((triple >> 6) & 0x3F) as usize]);
-        out.push(table[(triple & 0x3F) as usize]);
-        i += 3;
-        line_len += 4;
+        let dlen = (sl0 - sp) / 3 * 4;
+        sp = sl0;
+        // `if (dlen == linemax && sp < end)` — see rules 1 and 2 above.
+        if linemax > 0 && dlen == linemax as usize && sp < end {
+            out.extend_from_slice(newline);
+        }
     }
-    let remaining = input.len() - i;
-    if remaining > 0 && variant == B64_VARIANT_MIME && line_len == 76 {
-        out.push(b'\r');
-        out.push(b'\n');
-    }
+    let remaining = end - sp;
     if remaining == 1 {
-        let b0 = input[i] as u32;
+        let b0 = input[sp] as u32;
         out.push(table[((b0 >> 2) & 0x3F) as usize]);
         out.push(table[((b0 << 4) & 0x3F) as usize]);
         if !no_padding {
@@ -32435,8 +32608,8 @@ pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8
             out.push(b'=');
         }
     } else if remaining == 2 {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
+        let b0 = input[sp] as u32;
+        let b1 = input[sp + 1] as u32;
         out.push(table[((b0 >> 2) & 0x3F) as usize]);
         out.push(table[(((b0 << 4) | (b1 >> 4)) & 0x3F) as usize]);
         out.push(table[((b1 << 2) & 0x3F) as usize]);
@@ -32621,6 +32794,37 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// 11 of `java.util.Base64`'s 18 public methods are registered here. The other
+/// SEVEN are **deliberately left to real JDK bytecode**, which is the whole
+/// point of `--jdk-only` mode: a native that shadows correct bytecode is a
+/// liability, and each of these seven would be one.
+///
+/// | left unregistered | why NOT a native | HotSpot, 60-byte fixture |
+/// |---|---|---|
+/// | `Base64.getMimeEncoder(I[B)LBase64$Encoder;` | a native would have to re-implement three separately measured behaviours: `lineLength >> 2 << 2` rounding (`19 -> 16`, `22 -> 20`), the `IllegalArgumentException / Illegal base64 line separator character 0x41` alphabet check on the separator (`'-'` passes, `'='` does not), and the `lineLength <= 0 -> Encoder.RFC4648` aliasing. The bytecode has all three. | 83 |
+/// | `Base64$Encoder.encode([B[B)I` | real `encode0` + the `Output byte array is too small for encoding all input bytes` contract | 82 mime / 80 basic |
+/// | `Base64$Encoder.encode(LByteBuffer;)LByteBuffer;` | plus ByteBuffer position/limit semantics (measured: source position advances to 60) | 82 |
+/// | `Base64$Encoder.wrap(LOutputStream;)LOutputStream;` | returns a stateful `Base64$EncOutputStream` | 82 |
+/// | `Base64$Decoder.decode([B[B)I` | real `decode0` | 60 |
+/// | `Base64$Decoder.decode(LByteBuffer;)LByteBuffer;` | ditto | 60 |
+/// | `Base64$Decoder.wrap(LInputStream;)LInputStream;` | returns a stateful `Base64$DecInputStream` | 60 |
+///
+/// All seven read their answer off the RECEIVER's fields, so "leave it to
+/// bytecode" is only a real decision once the receiver is honest — which is why
+/// this lane's work is in `b64_alloc_encoder` (writing `newline`, and `-1` not
+/// `0` into `linemax`) and `b64_alloc_decoder` (the two-boolean layout) rather
+/// than in seven new `registry.register` calls. Before those two fixes, four of
+/// the seven threw `NullPointerException` and three silently decoded as the
+/// wrong variant.
+///
+/// **Synthetic-JDK mode is the exception, and it stays broken on purpose.**
+/// There is no bytecode there, so all seven are `NoSuchMethodError`. Registering
+/// them to fix that would ALSO shadow the real bytecode in real-JDK mode,
+/// because a `registry.register` call cannot see the runtime JDK mode — the same
+/// trap in reverse as gating a native on a feature flag and thereby dropping it
+/// from a mode whose stub has no method bodies. Nothing in the corpus is known
+/// to call these seven; leaving them unregistered keeps the real-JDK answer
+/// correct and costs synthetic mode only what it already lacked.
 fn register_base64_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: Base64 encode/decode is a spec-exact algorithm replicating
     // real JDK bytecode → Intrinsic.
@@ -32694,53 +32898,201 @@ fn register_base64_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// Allocate a fabricated `Base64$Encoder` with all FOUR JDK fields written.
+///
+/// **The GC hazard this function's shape exists to avoid.**
+/// `try_alloc_concurrent_synthetic` hands back a bare `ObjectRef` — a raw
+/// pointer into the GC heap (`types/src/value.rs`), not a root. The MIME arm
+/// then has to allocate a second object, the `byte[]{13,10}` line separator,
+/// *between* that allocation and the `set_field` calls that finish the encoder.
+/// `new_array` can trigger a young collection, and this VM's young collector
+/// MOVES: it evacuates survivors and rewrites only the root sets it knows —
+/// thread stacks, statics, `native_pin_roots`, and the per-thread handle-slot
+/// table (`vm/src/memory/roots.rs`). A raw `ObjectRef` in a Rust local is in
+/// none of them, and the encoder is at that moment young, half-built, and
+/// referenced from nowhere in Java — so it is not merely relocatable, it is
+/// *collectable*. The four `set_field`s would then write `newline`, `linemax`,
+/// `isURL`, `doPadding` into whatever now occupies the vacated from-space slot.
+/// That is the bug family `types/src/handle.rs` opens by calling this codebase's
+/// #1 recurring defect, with 37+ independently-found sites.
+///
+/// The old body was safe only because it never allocated between the two — it
+/// simply left `newline` null. Fixing that introduces the hazard, which is why
+/// this is not the one-liner it looks like. `NativeHandleScope` closes it: the
+/// encoder is read back through a collector-updated slot AFTER the array
+/// allocation, never from the pre-allocation local, and the scope pops on every
+/// Rust exit path including the `?` above.
 fn b64_alloc_encoder(
     ctx: &mut dyn NativeContext,
     variant: i32,
     no_padding: bool,
 ) -> MethodCallResult {
-    let encoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Encoder", 4)?;
-    ctx.set_field(
+    use cratonvm_types::ArrayElementType;
+    let mut scope = NativeHandleScope::new(ctx);
+    let encoder =
+        try_alloc_concurrent_synthetic(&mut *scope, B64_ENCODER_CLASS, B64_ENCODER_NUM_FIELDS)?;
+    let encoder_h = scope.root(encoder);
+    // ---- allocating region: `encoder` must not be read as a raw local past here
+    let newline_h = if variant == B64_VARIANT_MIME {
+        let arr = scope.new_array(ArrayElementType::Byte, B64_MIME_CRLF.len());
+        for (i, &b) in B64_MIME_CRLF.iter().enumerate() {
+            scope.set_array_element(arr, i, Value::Int(b as i32));
+        }
+        Some(scope.root(arr))
+    } else {
+        None
+    };
+    // ---- end allocating region: re-read both through their slots
+    let encoder = scope.get(&encoder_h);
+    let newline = newline_h.as_ref().map(|h| scope.get(h));
+    // Real `getEncoder()`/`getUrlEncoder()` have `newline == null`; only the
+    // MIME encoder carries CRLF. Writing null EXPLICITLY (rather than leaving
+    // the slot untouched) is what makes the fabricated object's shape match the
+    // real one even when `try_alloc_concurrent_synthetic` hands back a recycled
+    // span.
+    scope.set_field(encoder, B64_ENCODER_FIELD_NEWLINE, Value::Object(newline));
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_LINEMAX,
-        Value::Int(if variant == B64_VARIANT_MIME { 76 } else { 0 }),
+        // -1, not 0, for the non-wrapping encoders — see `B64_NO_LINEMAX`.
+        Value::Int(if variant == B64_VARIANT_MIME {
+            B64_MIME_LINEMAX
+        } else {
+            B64_NO_LINEMAX
+        }),
     );
-    ctx.set_field(
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_IS_URL,
-        Value::Int(if variant == B64_VARIANT_URL { 1 } else { 0 }),
+        Value::Int(i32::from(variant == B64_VARIANT_URL)),
     );
-    ctx.set_field(
+    scope.set_field(
         encoder,
         B64_ENCODER_FIELD_DO_PADDING,
-        Value::Int(if no_padding { 0 } else { 1 }),
+        Value::Int(i32::from(!no_padding)),
     );
     Ok(Some(Value::Object(Some(encoder))))
 }
 
+/// Allocate a fabricated `Base64$Decoder` in the real JDK's TWO-boolean layout
+/// (`isURL`, `isMIME`) — see this section's header for the measured damage the
+/// previous one-Int-slot layout did to every real-bytecode entry point.
+///
+/// No allocation happens between the object and its field writes, so unlike
+/// `b64_alloc_encoder` this one needs no handle scope.
 fn b64_alloc_decoder(ctx: &mut dyn NativeContext, variant: i32) -> MethodCallResult {
-    let decoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Decoder", 1)?;
-    ctx.set_field(decoder, B64_DECODER_FIELD_VARIANT, Value::Int(variant));
+    let decoder = try_alloc_concurrent_synthetic(ctx, B64_DECODER_CLASS, B64_DECODER_NUM_FIELDS)?;
+    ctx.set_field(
+        decoder,
+        B64_DECODER_FIELD_IS_URL,
+        Value::Int(i32::from(variant == B64_VARIANT_URL)),
+    );
+    ctx.set_field(
+        decoder,
+        B64_DECODER_FIELD_IS_MIME,
+        Value::Int(i32::from(variant == B64_VARIANT_MIME)),
+    );
     Ok(Some(Value::Object(Some(decoder))))
 }
 
+/// The real JDK's own singleton for one of the six no-arg factories, or `None`
+/// when there is no real class library to take it from.
+///
+/// **Why this, and not a native-side cache.** HotSpot returns the SAME object
+/// from repeated calls — identity, not equality (`scratchpad/e14/B64Ident.java`):
+///
+/// ```text
+/// Base64.getEncoder()    == Base64.getEncoder()    -> true
+/// Base64.getUrlEncoder() == Base64.getUrlEncoder() -> true
+/// Base64.getMimeEncoder()== Base64.getMimeEncoder()-> true
+/// Base64.getDecoder()    == Base64.getDecoder()    -> true
+/// Base64.getUrlDecoder() == Base64.getUrlDecoder() -> true
+/// Base64.getMimeDecoder()== Base64.getMimeDecoder()-> true
+/// ```
+///
+/// and they are exactly the `static final` fields `Encoder.RFC4648` /
+/// `RFC4648_URLSAFE` / `RFC2045` and the matching three on `Decoder`. Caching a
+/// FABRICATED object in a native `static` would reproduce the `==` rows above,
+/// but it cannot reproduce this one, also measured:
+///
+/// ```text
+/// Base64.getMimeEncoder(0, sep) == Base64.getEncoder() -> true
+/// ```
+///
+/// `getMimeEncoder(int, byte[])` is deliberately unregistered (see
+/// `register_base64_natives`), so it runs real bytecode and returns the real
+/// `Encoder.RFC4648` for any `lineLength <= 0`. No amount of native-side caching
+/// makes that equal to an object this file fabricated; only *being* the JDK's
+/// singleton does. Taking the field is also free of the two things a cache would
+/// need and could get wrong: it is already a GC root (a static field), so no
+/// `register_var_handle_root` / `read_var_handle_root` re-read discipline, and
+/// it is already VM-scoped, so no process-global `static` to scope by
+/// `vm_identity()`.
+///
+/// Caching is otherwise SAFE — every instance field of both classes is `final`
+/// (measured), so a shared instance has no mutable state — but unnecessary.
+///
+/// Returns `None`, and the caller fabricates exactly as before, whenever the
+/// real class library is absent (synthetic-JDK mode), the class will not
+/// initialize, the field is not declared, or it holds anything other than a
+/// non-null reference. `Base64$Encoder.<clinit>` and `Base64$Decoder.<clinit>`
+/// build these three statics each and call nothing on `java.util.Base64`
+/// (checked with `javap -c`), so this cannot recurse back into the factory.
+fn b64_jdk_singleton(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field_name: &str,
+) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(class_name).ok()?;
+    let index = ctx.static_field_index_by_name(cid, field_name)?;
+    match ctx.get_static_field(cid, index) {
+        Value::Object(Some(singleton)) => Some(singleton),
+        _ => None,
+    }
+}
+
+/// One of the three `Encoder` factories: the real JDK's singleton when there is
+/// one, otherwise a fabricated stand-in built to the same field layout.
+fn b64_encoder_factory(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    variant: i32,
+) -> MethodCallResult {
+    match b64_jdk_singleton(ctx, B64_ENCODER_CLASS, field_name) {
+        Some(singleton) => Ok(Some(Value::Object(Some(singleton)))),
+        None => b64_alloc_encoder(ctx, variant, false),
+    }
+}
+
+/// One of the three `Decoder` factories; see [`b64_encoder_factory`].
+fn b64_decoder_factory(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    variant: i32,
+) -> MethodCallResult {
+    match b64_jdk_singleton(ctx, B64_DECODER_CLASS, field_name) {
+        Some(singleton) => Ok(Some(Value::Object(Some(singleton)))),
+        None => b64_alloc_decoder(ctx, variant),
+    }
+}
+
 fn native_b64_get_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_BASIC, false)
+    b64_encoder_factory(ctx, "RFC4648", B64_VARIANT_BASIC)
 }
 fn native_b64_get_url_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_URL, false)
+    b64_encoder_factory(ctx, "RFC4648_URLSAFE", B64_VARIANT_URL)
 }
 fn native_b64_get_mime_encoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_encoder(ctx, B64_VARIANT_MIME, false)
+    b64_encoder_factory(ctx, "RFC2045", B64_VARIANT_MIME)
 }
 fn native_b64_get_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_BASIC)
+    b64_decoder_factory(ctx, "RFC4648", B64_VARIANT_BASIC)
 }
 fn native_b64_get_url_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_URL)
+    b64_decoder_factory(ctx, "RFC4648_URLSAFE", B64_VARIANT_URL)
 }
 fn native_b64_get_mime_decoder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    b64_alloc_decoder(ctx, B64_VARIANT_MIME)
+    b64_decoder_factory(ctx, "RFC2045", B64_VARIANT_MIME)
 }
 
 /// Helper: read byte[] arg into a Vec<u8>
@@ -32765,21 +33117,111 @@ fn b64_write_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
     result
 }
 
-/// Helper: get variant tag from encoder/decoder `this`
-fn b64_encoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if matches!(ctx.get_field(this, B64_ENCODER_FIELD_IS_URL), Value::Int(v) if v != 0) {
-        B64_VARIANT_URL
-    } else if matches!(ctx.get_field(this, B64_ENCODER_FIELD_LINEMAX), Value::Int(v) if v != 0) {
-        B64_VARIANT_MIME
-    } else {
-        B64_VARIANT_BASIC
+/// Everything real `Base64$Encoder` carries, read off the receiver's four
+/// JDK-aligned fields rather than collapsed into a three-valued variant tag.
+///
+/// A tag cannot express this family. `isURL` picks the ALPHABET and `linemax` /
+/// `newline` control LINE WRAPPING, and in the real JDK the two are
+/// independent — collapsing them meant the wrapping of every encoder was
+/// inferred from a tag instead of read, so a custom `linemax` could not
+/// survive the trip. Measured shapes (`scratchpad/e14/B64Line.java`, all four
+/// fields via reflection):
+///
+/// ```text
+/// getEncoder()                  linemax=-1  isURL=false  newline=null       60B -> 80
+/// getUrlEncoder()               linemax=-1  isURL=true   newline=null       60B -> 80
+/// getMimeEncoder()              linemax=76  isURL=false  newline=[13,10]    60B -> 82
+/// getMimeEncoder(20,{'\n'})     linemax=20  isURL=false  newline=[10]       60B -> 83
+/// getMimeEncoder(20,{'\n'})
+///     .withoutPadding()         linemax=20  isURL=false  newline=[10]       60B -> 83
+/// ```
+struct B64EncoderShape {
+    is_url: bool,
+    linemax: i32,
+    newline: Vec<u8>,
+    no_padding: bool,
+}
+
+impl B64EncoderShape {
+    fn encode(&self, input: &[u8]) -> Vec<u8> {
+        b64_encode_wrapped(
+            input,
+            self.is_url,
+            self.no_padding,
+            self.linemax,
+            &self.newline,
+        )
     }
 }
 
-fn b64_decoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, B64_DECODER_FIELD_VARIANT) {
+/// Read the encoder shape off `this`, or throw the `NullPointerException`
+/// HotSpot throws.
+///
+/// A `linemax > 0` encoder with a null `newline` is not merely unusual, it is
+/// FATAL on the real JDK — and fatal on the very first call, not only on inputs
+/// long enough to wrap, because `Encoder.encodedOutLength` sizes the
+/// destination with
+///
+/// ```text
+/// if (linemax > 0) len += (len - 1) / linemax * newline.length;
+/// ```
+///
+/// before `encode0` ever runs. Measured by constructing that exact shape
+/// through the private constructor (`scratchpad/e14/B64Fab.java`) — this is
+/// what CratonVM's fabricated MIME encoder looked like to real bytecode until
+/// `b64_alloc_encoder` started writing field 0:
+///
+/// ```text
+/// Encoder(false, null, 76, true).encodeToString(30 bytes / 40 chars, no wrap needed)
+///   -> java.lang.NullPointerException / Cannot read the array length because "this.newline" is null
+/// ...identically for 57B, 60B, encode([B), encode([B[B), encode(ByteBuffer), wrap(OutputStream).
+/// ```
+///
+/// Reproducing the throw rather than defaulting to CRLF matters because the two
+/// are indistinguishable to a caller that only ever wraps: defaulting would give
+/// a plausible answer for an object the JDK considers malformed, which is the
+/// same "quiet wrong answer" shape as the null-argument defect this family was
+/// last fixed for.
+fn b64_encoder_shape(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<B64EncoderShape, MethodCallFailed> {
+    let linemax = match ctx.get_field(this, B64_ENCODER_FIELD_LINEMAX) {
         Value::Int(v) => v,
-        _ => B64_VARIANT_BASIC,
+        _ => B64_NO_LINEMAX,
+    };
+    let newline = match ctx.get_field(this, B64_ENCODER_FIELD_NEWLINE) {
+        Value::Object(Some(arr)) => b64_read_byte_array(ctx, arr),
+        _ if linemax > 0 => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => Vec::new(),
+    };
+    Ok(B64EncoderShape {
+        is_url: matches!(ctx.get_field(this, B64_ENCODER_FIELD_IS_URL), Value::Int(v) if v != 0),
+        linemax,
+        newline,
+        no_padding: b64_no_padding(ctx, this),
+    })
+}
+
+/// Decoder variant from the real JDK's two booleans.
+///
+/// `isMIME` is tested first because `Decoder.RFC2045` is `(isURL=false,
+/// isMIME=true)` and the ordering only matters for a `(true, true)` decoder,
+/// which no public factory can produce — `getUrlDecoder()` is `(true, false)`,
+/// `getMimeDecoder()` is `(false, true)`, and the constructor is private. Such
+/// a decoder would use the URL alphabet AND ignore junk; this file's
+/// three-valued tag cannot say that, and `b64_decode` — verified 36/36 against
+/// HotSpot over the malformed-input matrix and deliberately not touched here —
+/// is written against the tag. Recorded rather than modelled.
+fn b64_decoder_variant(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if matches!(ctx.get_field(this, B64_DECODER_FIELD_IS_MIME), Value::Int(v) if v != 0) {
+        B64_VARIANT_MIME
+    } else if matches!(ctx.get_field(this, B64_DECODER_FIELD_IS_URL), Value::Int(v) if v != 0) {
+        B64_VARIANT_URL
+    } else {
+        B64_VARIANT_BASIC
     }
 }
 
@@ -32787,78 +33229,125 @@ fn b64_no_padding(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     !matches!(ctx.get_field(this, B64_ENCODER_FIELD_DO_PADDING), Value::Int(v) if v != 0)
 }
 
+/// Receiver of an instance `Base64$Encoder` / `Base64$Decoder` native.
+///
+/// Two rules live here because every native in this family got both wrong:
+///
+/// 1. A null receiver is `NullPointerException` on HotSpot. The interpreter
+///    throws it before an instance method body runs, so this arm is defensive
+///    rather than reachable — but it must still have the right SHAPE.
+/// 2. It must NOT be `Ok(None)`. Every native in this family has a descriptor
+///    that returns a value (`[B`, `Ljava/lang/String;`,
+///    `Ljava/util/Base64$Encoder;`), and `Ok(None)` is the VOID shape: it hands
+///    the interpreter a value of the wrong kind instead of a result or a throw.
+///    docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
+fn b64_receiver(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.first() {
+        Some(Value::Object(Some(o))) => Ok(*o),
+        _ => Err(RuntimeError::NullPointerException { message: None }.into()),
+    }
+}
+
+/// The `byte[]` / `String` argument of a `Base64` encode/decode native.
+///
+/// HotSpot 25 throws `NullPointerException` for a null argument on EVERY
+/// overload — measured for all 13 encoder/decoder combinations, e.g.
+///
+/// ```text
+/// Encoder.encode((byte[])null)  -> NPE / Cannot read the array length because "src" is null
+/// Encoder.encodeToString(null)  -> NPE / Cannot read the array length because "src" is null
+/// Decoder.decode((byte[])null)  -> NPE / Cannot read the array length because "src" is null
+/// Decoder.decode((String)null)  -> NPE / Cannot invoke
+///                                  "String.getBytes(java.nio.charset.Charset)" because "src" is null
+/// ```
+///
+/// identically for the Url and Mime variants. The message is a HotSpot
+/// helpful-NPE built from the callee's local-variable table, not part of the
+/// specified contract, so `message: None` is left unset here; callers assert on
+/// the TYPE (`RJdkIntrinsics2 --only=b64` checks `nameOf(t)`).
+fn b64_arg(args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    match args.get(1) {
+        Some(Value::Object(Some(o))) => Ok(*o),
+        _ => Err(RuntimeError::NullPointerException { message: None }.into()),
+    }
+}
+
 fn native_b64_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
-    // `Ok(None)` is the VOID shape and these natives' descriptors return
-    // `[B` / `String`, so answering it here handed the interpreter a value
-    // of the wrong kind instead of throwing.
-    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-    };
-    let variant = b64_encoder_variant(ctx, this);
-    let no_padding = b64_no_padding(ctx, this);
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
+    let shape = b64_encoder_shape(ctx, this)?;
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, no_padding);
+    let encoded = shape.encode(&bytes);
     let result = b64_write_byte_array(ctx, &encoded);
     Ok(Some(Value::Object(Some(result))))
 }
 
 fn native_b64_encode_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
-    // `Ok(None)` is the VOID shape and these natives' descriptors return
-    // `[B` / `String`, so answering it here handed the interpreter a value
-    // of the wrong kind instead of throwing.
-    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-    };
-    let variant = b64_encoder_variant(ctx, this);
-    let no_padding = b64_no_padding(ctx, this);
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
+    let shape = b64_encoder_shape(ctx, this)?;
     let bytes = b64_read_byte_array(ctx, src);
-    let encoded = b64_encode(&bytes, variant, no_padding);
+    let encoded = shape.encode(&bytes);
     let s = String::from_utf8_lossy(&encoded);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// Real `Encoder.withoutPadding()` is
+/// `if (!doPadding) return this; return new Encoder(isURL, newline, linemax, false);`
+///
+/// It **copies the fields**, it does not re-derive them from a variant. This
+/// used to call `b64_alloc_encoder(ctx, variant, true)`, which rebuilt the
+/// encoder from a three-valued tag and so replaced any custom line wrapping with
+/// the canonical 76/CRLF. Measured on HotSpot:
+///
+/// ```text
+/// getMimeEncoder(20,{'\n'})                  linemax=20 newline=[10]  60B -> 83
+/// getMimeEncoder(20,{'\n'}).withoutPadding() linemax=20 newline=[10]  60B -> 83
+/// getMimeEncoder(20,{'\n'}).withoutPadding() 61B -> 86   (padded: 88)
+/// ```
+///
+/// Note the copy shares the SAME `newline` array (real JDK passes the reference
+/// straight through; `getMimeEncoder(int, byte[])` does not defensively copy the
+/// caller's array either — measured: mutating it afterwards changes the
+/// encoder's output). Copying the field VALUE reproduces that, and it is also
+/// why no array is allocated here.
+///
+/// Identity: `withoutPadding()` on an already-unpadded encoder returns THIS
+/// (`np.withoutPadding() == np` measured true), but on a padded one it returns a
+/// FRESH object every call (`enc.withoutPadding() == enc.withoutPadding()`
+/// measured **false**) — so unlike the six factories this one must not be
+/// memoized.
 fn native_b64_without_padding(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let variant = b64_encoder_variant(ctx, this);
+    let this = b64_receiver(args)?;
     if b64_no_padding(ctx, this) {
-        Ok(Some(Value::Object(Some(this))))
-    } else {
-        b64_alloc_encoder(ctx, variant, true)
+        return Ok(Some(Value::Object(Some(this))));
     }
+    // `this` crosses an allocating call, so it is rooted and re-read through the
+    // collector-updated slot; see `b64_alloc_encoder` for the full hazard.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let copy = try_alloc_concurrent_synthetic(
+        &mut *scope,
+        B64_ENCODER_CLASS,
+        B64_ENCODER_NUM_FIELDS,
+    )?;
+    let copy_h = scope.root(copy);
+    let this = scope.get(&this_h);
+    let newline = scope.get_field(this, B64_ENCODER_FIELD_NEWLINE);
+    let linemax = scope.get_field(this, B64_ENCODER_FIELD_LINEMAX);
+    let is_url = scope.get_field(this, B64_ENCODER_FIELD_IS_URL);
+    let copy = scope.get(&copy_h);
+    scope.set_field(copy, B64_ENCODER_FIELD_NEWLINE, newline);
+    scope.set_field(copy, B64_ENCODER_FIELD_LINEMAX, linemax);
+    scope.set_field(copy, B64_ENCODER_FIELD_IS_URL, is_url);
+    scope.set_field(copy, B64_ENCODER_FIELD_DO_PADDING, Value::Int(0));
+    Ok(Some(Value::Object(Some(copy))))
 }
 
 fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    // A null ARGUMENT to encode/decode is a NullPointerException on HotSpot.
-    // `Ok(None)` is the VOID shape and these natives' descriptors return
-    // `[B` / `String`, so answering it here handed the interpreter a value
-    // of the wrong kind instead of throwing.
-    // docs/known-issues/jdk-only/W8-C15-2-option-objects-with-no-reader.md
-    let src = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
-    };
+    let this = b64_receiver(args)?;
+    let src = b64_arg(args)?;
     let variant = b64_decoder_variant(ctx, this);
     let bytes = b64_read_byte_array(ctx, src);
     match b64_decode(&bytes, variant) {
@@ -32871,15 +33360,16 @@ fn native_b64_decode_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
+    let this = b64_receiver(args)?;
     let variant = b64_decoder_variant(ctx, this);
-    let src_str = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    // This was the FOURTH null-argument site, and the one a
+    // `grep '"decode".*Ljava/lang/String'` misses because its registration
+    // spans four lines. Defaulting a null argument to `String::new()` decoded
+    // the EMPTY input instead of throwing, so `decode((String) null)` RETURNED
+    // a zero-length `byte[]` where HotSpot throws NullPointerException —
+    // the one shape a caller cannot distinguish from a legitimate `decode("")`.
+    let src = b64_arg(args)?;
+    let src_str = ctx.read_string(src).unwrap_or_default();
     // Real `Decoder.decode(String)` is `decode(src.getBytes(ISO_8859_1))`: one
     // byte per UTF-16 unit, with anything above U+00FF replaced by `'?'`.
     // Handing it UTF-8 instead splits every non-ASCII char into a multi-byte
@@ -32900,7 +33390,10 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod base64_tests {
-    use super::{b64_decode, b64_encode, B64_VARIANT_BASIC, B64_VARIANT_MIME, B64_VARIANT_URL};
+    use super::{
+        b64_decode, b64_encode, b64_encode_wrapped, B64_VARIANT_BASIC, B64_VARIANT_MIME,
+        B64_VARIANT_URL,
+    };
     #[allow(unused_imports)]
     use cratonvm_native_api::{
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
@@ -33099,6 +33592,124 @@ mod base64_tests {
         assert_eq!(b64_encode(&[0], B64_VARIANT_BASIC, true), b"AA");
         assert_eq!(b64_encode(&[0, 0], B64_VARIANT_BASIC, false), b"AAA=");
         assert_eq!(b64_encode(&[0, 0], B64_VARIANT_BASIC, true), b"AAA");
+    }
+
+    /// Every row is a literal line of `scratchpad/e14/B64Line.java`'s output on
+    /// HotSpot 25 (`java --add-opens java.base/java.util=ALL-UNNAMED`), encoding
+    /// 60 bytes `0..59` — 80 base64 characters before any separator — through
+    /// `Base64.getMimeEncoder(lineLength, separator)`.
+    ///
+    /// The rows are chosen to separate the three rules that a
+    /// "wrap every `linemax` characters" rewrite gets wrong, so that a
+    /// regression names itself:
+    ///
+    /// * **rounding** — 19 wraps at 16, 21/22/23 wrap at 20 (`lineLength >> 2 << 2`);
+    /// * **`dlen == linemax` is an EQUALITY** — a `linemax` that is not a
+    ///   multiple of 4 emits NO separators (22 -> 80, 6 -> 80), which a `>=`
+    ///   would turn into 83/93;
+    /// * **separator length is not 2** — 80 + 3x1 = 83 for `{'\n'}` against
+    ///   80 + 1x2 = 82 for the canonical 76/CRLF. Those two differ by ONE, which
+    ///   is why a "roughly the right length" assertion cannot see the bug.
+    #[test]
+    fn line_wrapping_matches_hotspot_for_every_measured_linemax() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        let lf = b"\n".as_slice();
+        let crlf = b"\r\n".as_slice();
+
+        // (linemax, separator, expected length) — `lineLength` already rounded,
+        // exactly as `getMimeEncoder(int, byte[])` stores it.
+        let rows: &[(i32, &[u8], usize)] = &[
+            (-1, &[], 80),    // getEncoder()
+            (0, &[], 80),     // no encoder produces this, but `> 0` must reject it
+            (4, crlf, 118),   // 80 + 19x2
+            (8, b"!#$", 107), // 80 + 9x3   — a 3-byte separator
+            (16, lf, 84),     // 80 + 4x1
+            (20, lf, 83),     // 80 + 3x1  <- THE ROW: 83, not 82
+            (24, lf, 83),     // 80 + 3x1, different line count, same total
+            (76, lf, 81),     // 80 + 1x1
+            (76, crlf, 82),   // 80 + 1x2  — canonical getMimeEncoder()
+            (1000, lf, 80),   // linemax past the payload wraps nothing
+            (6, lf, 80),      // not a multiple of 4 -> `dlen == linemax` never holds
+            (22, lf, 80),     // ditto
+            (20, &[], 80),    // an EMPTY separator is legal and adds nothing
+        ];
+        for &(linemax, newline, expected) in rows {
+            let encoded = b64_encode_wrapped(&payload, false, false, linemax, newline);
+            assert_eq!(
+                encoded.len(),
+                expected,
+                "linemax={linemax} newline={newline:?}: HotSpot answers {expected}"
+            );
+        }
+
+        // The full text of the row that used to be wrong, not just its length:
+        // four 20-character lines separated by LF, no trailing separator.
+        let encoded = b64_encode_wrapped(&payload, false, false, 20, lf);
+        assert_eq!(
+            std::str::from_utf8(&encoded).expect("ascii"),
+            "AAECAwQFBgcICQoLDA0O\nDxAREhMUFRYXGBkaGxwd\nHh8gISIjJCUmJygpKiss\nLS4vMDEyMzQ1Njc4OTo7"
+        );
+    }
+
+    /// `dlen == linemax && sp < end`: a payload that ends exactly on a line
+    /// boundary gets no trailing separator, at any linemax.
+    #[test]
+    fn no_trailing_separator_at_any_linemax() {
+        let lf = b"\n".as_slice();
+        // 15 bytes = 20 chars = exactly one line at linemax 20.
+        let exact = b64_encode_wrapped(&[0u8; 15], false, false, 20, lf);
+        assert_eq!(exact.len(), 20, "HotSpot: 20, not 21");
+        // 16 bytes = 20 chars + a 1-byte tail, so the separator DOES appear.
+        let spill = b64_encode_wrapped(&[0u8; 16], false, false, 20, lf);
+        assert_eq!(spill.len(), 25, "HotSpot: 20 + separator + \"AA==\"");
+        assert_eq!(
+            std::str::from_utf8(&spill).expect("ascii"),
+            "AAAAAAAAAAAAAAAAAAAA\nAA=="
+        );
+        // 57 bytes = exactly one 76-char line.
+        assert_eq!(
+            b64_encode_wrapped(&[0u8; 57], false, false, 76, b"\r\n").len(),
+            76
+        );
+    }
+
+    /// A `linemax` of 1..=3 makes real JDK's block size `linemax / 4 * 3` zero,
+    /// and its `while (sp < sl)` loop then never advances — measured: HotSpot
+    /// was still running all three after 1.2 s
+    /// (`scratchpad/e14/B64Fab.java`). No public factory can produce it, so
+    /// this is a deliberate divergence: we treat it as "no wrapping". The test
+    /// exists so the guard is not "simplified" back into a hang.
+    #[test]
+    fn a_sub_quantum_linemax_terminates_instead_of_spinning() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        for linemax in 1..=3 {
+            let encoded = b64_encode_wrapped(&payload, false, false, linemax, b"\n");
+            assert_eq!(
+                encoded.len(),
+                80,
+                "linemax={linemax} must terminate, not wrap"
+            );
+        }
+    }
+
+    /// The variant-tag entry point that this module's out-of-file callers use
+    /// must still mean exactly what it meant before `linemax`/`newline` became
+    /// parameters.
+    #[test]
+    fn the_variant_tag_wrapper_still_means_76_and_crlf() {
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_MIME, false),
+            b64_encode_wrapped(&payload, false, false, 76, b"\r\n")
+        );
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_BASIC, false),
+            b64_encode_wrapped(&payload, false, false, -1, &[])
+        );
+        assert_eq!(
+            b64_encode(&payload, B64_VARIANT_URL, true),
+            b64_encode_wrapped(&payload, true, true, -1, &[])
+        );
     }
 }
 
@@ -42035,6 +42646,50 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(g))))
     });
 
+    // The TWO-argument `ofSequential(Supplier, Integrator)` — added because its
+    // absence here was an out-of-bounds read, not a missing feature.
+    //
+    // `java/util/stream/Gatherer` has NO `synthetic_stub_fields` arm, so
+    // `class_num_total_fields` answers 0 and `try_alloc_concurrent_synthetic`'s
+    // `num_fields.max(real)` leaves the caller's request as the LITERAL object
+    // width. Two registrars model this class at two widths with two different
+    // slot maps:
+    //
+    //   this file            5 slots: initializer 0, integrator 1, combiner 2,
+    //                        finisher 3, KIND 4
+    //   phases_late/streams.rs  3 slots: initializer 0, integrator 1, finisher 2
+    //
+    // `register_phase_d_natives` (this one) runs AFTER `register_phase67_natives`
+    // inside `register_synthetic_overrides`, and `register()` is
+    // last-registration-wins, so this file's accessors and `Stream.gather` win
+    // for every triple both files spell. Every 3-slot factory in `streams.rs`
+    // was therefore shadowed by a 5-slot one here — EXCEPT this overload, which
+    // only `streams.rs` registered (`streams.rs:4541`). Its 3-slot product then
+    // reached `pd_stream_gather`, whose first act is `ctx.get_field(gatherer, 4)`:
+    // `Heap::get_field` asserts `index < num_slots`, so `stream.gather(g)` on a
+    // gatherer from this overload aborts the VM with "field index 4 out of
+    // bounds (num_slots=3)". `finisher()` (slot 3) is the same panic one slot
+    // lower, and `combiner()` (slot 2) would have returned the FINISHER.
+    //
+    // Registering it here shadows the 3-slot factory with the same 5-slot shape
+    // the sibling overloads already use, which is the whole fix; the alternative
+    // (widening `streams.rs` to 5) would leave two copies of one slot map.
+    // Verified against the oracle: `javap -p java.util.stream.Gatherer` on
+    // JDK 25.0.3 declares all four of `ofSequential`'s/`of`'s arities, of which
+    // this VM serves three — see
+    // docs/known-issues/jdk-only/E35-R11-SYNTHETIC-WIDTH-SWEEP-20260813.md §3.1.
+    r.register(gatherer, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
+        let initializer = args.first().copied().unwrap_or(Value::Object(None));
+        let integrator = args.get(1).copied().unwrap_or(Value::Object(None));
+        let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
+        ctx.set_field(g, 0, initializer);
+        ctx.set_field(g, 1, integrator);
+        ctx.set_field(g, 2, Value::Object(None));
+        ctx.set_field(g, 3, Value::Object(None));
+        ctx.set_field(g, 4, Value::Int(GATHERER_KIND_CUSTOM));
+        Ok(Some(Value::Object(Some(g))))
+    });
+
     r.register(
         gatherer,
         "of",
@@ -42806,6 +43461,511 @@ mod base64_encoder_tests {
         };
 
         assert_eq!(ctx.read_string(encoded).as_deref(), Some("__8"));
+    }
+
+    /// A null ARGUMENT to any `Base64` encode/decode overload is a
+    /// `NullPointerException` on HotSpot 25 — measured for all 13
+    /// encoder/decoder combinations, e.g.
+    ///
+    /// ```text
+    /// Decoder.decode((String)null) -> java.lang.NullPointerException
+    ///     / Cannot invoke "String.getBytes(java.nio.charset.Charset)" because "src" is null
+    /// ```
+    ///
+    /// `Base64$Decoder.decode(Ljava/lang/String;)[B` was the LAST of the four
+    /// to be fixed: it defaulted a null to `String::new()` and returned an
+    /// EMPTY `byte[]`, which is why `RJdkIntrinsics2 --only=b64` reported
+    /// "decode((String) null) must throw NullPointerException, got none" while
+    /// the other three arms were already patched. Returning `Ok(None)` is
+    /// equally wrong — every descriptor here returns a value, so `Ok(None)` is
+    /// the VOID shape.
+    ///
+    /// Mutation check: revert any one arm to `Ok(None)` or to a defaulted
+    /// empty input and exactly that row fails.
+    #[test]
+    fn null_argument_throws_npe_on_every_value_returning_overload() {
+        fn assert_npe(label: &str, result: MethodCallResult) {
+            match result {
+                Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::NullPointerException { .. },
+                ))) => {}
+                Ok(Some(v)) => {
+                    panic!("{label}: returned {v:?}, HotSpot throws NullPointerException")
+                }
+                Ok(None) => panic!(
+                    "{label}: returned the VOID shape `Ok(None)` for a descriptor that returns a \
+                     value — the interpreter gets a value of the wrong kind"
+                ),
+                Err(other) => panic!("{label}: threw {other:?}, expected NullPointerException"),
+            }
+        }
+
+        // Every (factory, method) pair whose descriptor takes a reference
+        // argument, across all three variants.
+        let encoder_factories: [(&str, NativeCallback); 3] = [
+            ("basic", native_b64_get_encoder),
+            ("url", native_b64_get_url_encoder),
+            ("mime", native_b64_get_mime_encoder),
+        ];
+        let decoder_factories: [(&str, NativeCallback); 3] = [
+            ("basic", native_b64_get_decoder),
+            ("url", native_b64_get_url_decoder),
+            ("mime", native_b64_get_mime_decoder),
+        ];
+
+        for (variant, factory) in encoder_factories {
+            let mut ctx = MockNativeContext::new();
+            let enc = match factory(&mut ctx, &[]).expect("factory ok").expect("encoder") {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected encoder, got {other:?}"),
+            };
+            let null_arg = [Value::Object(Some(enc)), Value::Object(None)];
+            assert_npe(
+                &format!("{variant} Encoder.encode((byte[])null)"),
+                native_b64_encode(&mut ctx, &null_arg),
+            );
+            assert_npe(
+                &format!("{variant} Encoder.encodeToString(null)"),
+                native_b64_encode_to_string(&mut ctx, &null_arg),
+            );
+            // …and through withoutPadding(), which returns a DIFFERENT object.
+            let unpadded = match native_b64_without_padding(&mut ctx, &[Value::Object(Some(enc))])
+                .expect("withoutPadding ok")
+                .expect("encoder")
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected encoder, got {other:?}"),
+            };
+            assert_npe(
+                &format!("{variant} Encoder.withoutPadding().encodeToString(null)"),
+                native_b64_encode_to_string(
+                    &mut ctx,
+                    &[Value::Object(Some(unpadded)), Value::Object(None)],
+                ),
+            );
+        }
+
+        for (variant, factory) in decoder_factories {
+            let mut ctx = MockNativeContext::new();
+            let dec = match factory(&mut ctx, &[]).expect("factory ok").expect("decoder") {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected decoder, got {other:?}"),
+            };
+            let null_arg = [Value::Object(Some(dec)), Value::Object(None)];
+            assert_npe(
+                &format!("{variant} Decoder.decode((byte[])null)"),
+                native_b64_decode_bytes(&mut ctx, &null_arg),
+            );
+            // THE ROW THAT WAS FAILING.
+            assert_npe(
+                &format!("{variant} Decoder.decode((String)null)"),
+                native_b64_decode_string(&mut ctx, &null_arg),
+            );
+        }
+    }
+
+    /// The null-argument fix must not swallow the legitimate EMPTY input:
+    /// HotSpot returns a zero-length array for `decode("")` and
+    /// `decode(new byte[0])`, and that is exactly the answer the broken
+    /// `decode((String) null)` used to give — so this is the negative control
+    /// that keeps the fix from being "throw on anything falsy".
+    #[test]
+    fn empty_input_still_decodes_to_an_empty_array() {
+        let mut ctx = MockNativeContext::new();
+        let dec = match native_b64_get_decoder(&mut ctx, &[])
+            .expect("getDecoder ok")
+            .expect("decoder")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected decoder, got {other:?}"),
+        };
+        let empty_str = ctx.create_string("");
+        let decoded = match native_b64_decode_string(
+            &mut ctx,
+            &[Value::Object(Some(dec)), Value::Object(Some(empty_str))],
+        )
+        .expect("decode(\"\") must NOT throw")
+        .expect("decode returns an array")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected byte[], got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(decoded), 0, "decode(\"\") is empty, not a throw");
+    }
+
+    // ---------------------------------------------------------------------
+    // Below: BEHAVIOURAL cover for the fabricated receiver. Every assertion
+    // reads a value the native WROTE, or an answer the native COMPUTED from a
+    // receiver's fields — never "the triple is registered". A sibling file's 64
+    // registration-only tests all stayed green through a real layout defect.
+    // ---------------------------------------------------------------------
+
+    fn obj(result: MethodCallResult, what: &str) -> ObjectRef {
+        match result.unwrap_or_else(|e| panic!("{what} failed: {e:?}")) {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("{what}: expected an object, got {other:?}"),
+        }
+    }
+
+    fn encode_to_string(ctx: &mut MockNativeContext, enc: ObjectRef, src: &[u8]) -> String {
+        let arr = ctx.new_array(ArrayElementType::Byte, src.len());
+        for (i, &b) in src.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(b as i32));
+        }
+        let s = obj(
+            native_b64_encode_to_string(ctx, &[Value::Object(Some(enc)), Value::Object(Some(arr))]),
+            "encodeToString",
+        );
+        ctx.read_string(s).expect("encodeToString returns a String")
+    }
+
+    /// Give an encoder the field values real `Base64.getMimeEncoder(20, {'\n'})`
+    /// bytecode would have built, since that factory is deliberately
+    /// unregistered and this file therefore never allocates such an object
+    /// itself.
+    fn retune(ctx: &mut MockNativeContext, enc: ObjectRef, linemax: i32, sep: &[u8]) {
+        let nl = ctx.new_array(ArrayElementType::Byte, sep.len());
+        for (i, &b) in sep.iter().enumerate() {
+            ctx.set_array_element(nl, i, Value::Int(b as i32));
+        }
+        ctx.set_field(enc, B64_ENCODER_FIELD_LINEMAX, Value::Int(linemax));
+        ctx.set_field(enc, B64_ENCODER_FIELD_NEWLINE, Value::Object(Some(nl)));
+    }
+
+    /// (1) The fabricated `Encoder` must carry all FOUR JDK fields.
+    ///
+    /// `newline` was left unwritten, and real `Encoder.encodedOutLength` reads
+    /// `newline.length` for EVERY encode call whose `linemax > 0` — not only
+    /// ones long enough to wrap. Measured on HotSpot by building the same shape
+    /// through the private constructor (`scratchpad/e14/B64Fab.java`):
+    ///
+    /// ```text
+    /// Encoder(false, null, 76, true).encodeToString(30 bytes) ->
+    ///   NullPointerException / Cannot read the array length because "this.newline" is null
+    /// Encoder(false, {13,10}, 76, true).encodeToString(60 bytes) -> 82  (== getMimeEncoder())
+    /// ```
+    ///
+    /// The mock's unwritten slots read back as `Value::Int(0)`, so the
+    /// `Value::Object(None)` assertions below fail if the explicit null write is
+    /// dropped — they measure the WRITE, not the default.
+    #[test]
+    fn fabricated_encoders_carry_the_jdk_newline_and_linemax_fields() {
+        let mut ctx = MockNativeContext::new();
+
+        let mime = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        assert_eq!(
+            ctx.get_field(mime, B64_ENCODER_FIELD_LINEMAX),
+            Value::Int(76)
+        );
+        let nl = match ctx.get_field(mime, B64_ENCODER_FIELD_NEWLINE) {
+            Value::Object(Some(a)) => a,
+            other => panic!(
+                "getMimeEncoder()'s `newline` is {other:?}; real encode0 and encodedOutLength \
+                 both dereference it, and HotSpot NPEs on a null one"
+            ),
+        };
+        assert_eq!(ctx.array_length(nl), 2, "CRLF is two bytes");
+        assert_eq!(ctx.get_array_element(nl, 0), Value::Int(13));
+        assert_eq!(ctx.get_array_element(nl, 1), Value::Int(10));
+
+        // (2) -1, NOT 0, for the non-wrapping encoders. `> 0` reads them alike;
+        // `Base64$EncOutputStream`'s `linepos == linemax` does not, and with 0 it
+        // fires on the very first byte: `getEncoder().wrap(os)` measured as
+        // NullPointerException / Cannot read the array length because "b" is null.
+        for (name, factory) in [
+            ("getEncoder", native_b64_get_encoder as NativeCallback),
+            ("getUrlEncoder", native_b64_get_url_encoder),
+        ] {
+            let enc = obj(factory(&mut ctx, &[]), name);
+            assert_eq!(
+                ctx.get_field(enc, B64_ENCODER_FIELD_LINEMAX),
+                Value::Int(-1),
+                "{name}: real JDK writes -1; 0 makes the unregistered wrap(OutputStream) \
+                 throw NullPointerException on its first write"
+            );
+            assert_eq!(
+                ctx.get_field(enc, B64_ENCODER_FIELD_NEWLINE),
+                Value::Object(None),
+                "{name}: `newline` must be written null explicitly, not left as the \
+                 allocator found it"
+            );
+        }
+    }
+
+    /// (2) A custom `linemax`/`newline` must reach the encoder.
+    ///
+    /// `Base64.getMimeEncoder(int, byte[])` is unregistered, so it runs real
+    /// bytecode and hands back an `Encoder` with `linemax=20, newline=[10]`;
+    /// `encodeToString` on it is then intercepted here. HotSpot answers **83**
+    /// for the 60-byte fixture and this file used to answer **82** — one short,
+    /// because it re-derived 76/CRLF from a variant tag. 82 vs 83 is the
+    /// dangerous kind of wrong: both round-trip through a MIME decoder and both
+    /// pass a length-is-about-right assertion. So assert the TEXT.
+    #[test]
+    fn a_custom_linemax_and_separator_reach_the_encoder() {
+        let mut ctx = MockNativeContext::new();
+        let payload: Vec<u8> = (0..60u16).map(|i| i as u8).collect();
+
+        let canonical = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        assert_eq!(
+            encode_to_string(&mut ctx, canonical, &payload).len(),
+            82,
+            "getMimeEncoder(): 80 chars + one CRLF"
+        );
+
+        let custom = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        retune(&mut ctx, custom, 20, b"\n");
+        let encoded = encode_to_string(&mut ctx, custom, &payload);
+        assert_eq!(
+            encoded,
+            "AAECAwQFBgcICQoLDA0O\nDxAREhMUFRYXGBkaGxwd\nHh8gISIjJCUmJygpKiss\nLS4vMDEyMzQ1Njc4OTo7",
+            "four 20-char lines separated by LF"
+        );
+        assert_eq!(
+            encoded.len(),
+            83,
+            "HotSpot: 83. The hardcoded 76/CRLF gave 82"
+        );
+    }
+
+    /// (2, cont.) `withoutPadding()` COPIES the fields; it does not rebuild the
+    /// encoder from a variant. Rebuilding silently reset a custom 20/LF encoder
+    /// to 76/CRLF. Measured on HotSpot:
+    /// `getMimeEncoder(20,{'\n'}).withoutPadding()` keeps `linemax=20`,
+    /// `newline=[10]`, and encodes 61 bytes to 86 (88 with padding).
+    #[test]
+    fn without_padding_preserves_a_custom_linemax_and_shares_the_separator() {
+        let mut ctx = MockNativeContext::new();
+        let padded = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        retune(&mut ctx, padded, 20, b"\n");
+        let sep = ctx.get_field(padded, B64_ENCODER_FIELD_NEWLINE);
+
+        let unpadded = obj(
+            native_b64_without_padding(&mut ctx, &[Value::Object(Some(padded))]),
+            "withoutPadding",
+        );
+        assert_ne!(
+            unpadded, padded,
+            "a PADDED encoder returns a fresh object (HotSpot: \
+             enc.withoutPadding() == enc.withoutPadding() is false)"
+        );
+        assert_eq!(
+            ctx.get_field(unpadded, B64_ENCODER_FIELD_LINEMAX),
+            Value::Int(20),
+            "the copy must keep the custom linemax, not fall back to 76"
+        );
+        assert_eq!(
+            ctx.get_field(unpadded, B64_ENCODER_FIELD_NEWLINE),
+            sep,
+            "real JDK passes the SAME newline array to the copy"
+        );
+
+        let payload = vec![0u8; 61];
+        assert_eq!(encode_to_string(&mut ctx, padded, &payload).len(), 88);
+        assert_eq!(encode_to_string(&mut ctx, unpadded, &payload).len(), 86);
+
+        // …and an ALREADY-unpadded encoder returns `this` (HotSpot: identity true).
+        let again = obj(
+            native_b64_without_padding(&mut ctx, &[Value::Object(Some(unpadded))]),
+            "withoutPadding",
+        );
+        assert_eq!(again, unpadded);
+    }
+
+    /// (1, cont.) An encoder with `linemax > 0` and a null `newline` is the
+    /// exact shape this file used to fabricate, and HotSpot throws
+    /// `NullPointerException` for it on every encode call. Reproduce the throw
+    /// rather than quietly defaulting to CRLF — a default would give a plausible
+    /// answer for an object the JDK considers malformed.
+    #[test]
+    fn a_wrapping_encoder_with_a_null_newline_throws_npe() {
+        let mut ctx = MockNativeContext::new();
+        let enc = obj(native_b64_get_mime_encoder(&mut ctx, &[]), "getMimeEncoder");
+        ctx.set_field(enc, B64_ENCODER_FIELD_NEWLINE, Value::Object(None));
+        let arr = ctx.new_array(ArrayElementType::Byte, 30);
+        match native_b64_encode_to_string(
+            &mut ctx,
+            &[Value::Object(Some(enc)), Value::Object(Some(arr))],
+        ) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. },
+            ))) => {}
+            other => panic!(
+                "linemax=76 with a null newline must throw NullPointerException \
+                 (HotSpot: Cannot read the array length because \"this.newline\" is null), got {other:?}"
+            ),
+        }
+        // A NON-wrapping encoder with a null newline is perfectly legal — that
+        // is what `getEncoder()` is — so the throw must not generalise.
+        let basic = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_eq!(encode_to_string(&mut ctx, basic, &[0u8; 30]).len(), 40);
+    }
+
+    /// (4) The `Decoder` synthetic must be the real JDK's TWO-boolean layout.
+    ///
+    /// It was one Int slot holding a variant tag, and slot 0 of the real layout
+    /// is `isURL` — so `getMimeDecoder()` wrote 2 into `isURL` and left `isMIME`
+    /// false. Measured on HotSpot by building `Decoder(isURL=true, isMIME=false)`
+    /// through the private constructor and feeding it what a MIME decoder must
+    /// accept (`scratchpad/e14/B64Unreg.java`): 76-column wrapped text became
+    /// `IllegalArgumentException / Illegal base64 character d`, `"-_-_"` decoded
+    /// to 3 bytes instead of 0, `"QQ\n=="` threw instead of decoding to 1 byte.
+    ///
+    /// Both halves are asserted: the field VALUES (what real bytecode reads) and
+    /// the decode ANSWERS (what this file's own natives compute from them).
+    #[test]
+    fn decoder_uses_the_two_boolean_jdk_layout() {
+        let mut ctx = MockNativeContext::new();
+        // (factory, isURL, isMIME) — read off HotSpot with reflection.
+        let rows: [(&str, NativeCallback, i32, i32); 3] = [
+            ("getDecoder", native_b64_get_decoder, 0, 0),
+            ("getUrlDecoder", native_b64_get_url_decoder, 1, 0),
+            ("getMimeDecoder", native_b64_get_mime_decoder, 0, 1),
+        ];
+        for (name, factory, is_url, is_mime) in rows {
+            let dec = obj(factory(&mut ctx, &[]), name);
+            assert_eq!(
+                ctx.get_field(dec, B64_DECODER_FIELD_IS_URL),
+                Value::Int(is_url),
+                "{name}: field 0 is `isURL`, and real bytecode reads it as a boolean"
+            );
+            assert_eq!(
+                ctx.get_field(dec, B64_DECODER_FIELD_IS_MIME),
+                Value::Int(is_mime),
+                "{name}: field 1 is `isMIME`"
+            );
+        }
+
+        // The three variants must still answer differently — this is what the
+        // old layout broke, by making the MIME decoder read back as a URL one.
+        // `None` means the decoder threw, which is a legitimate answer here.
+        //
+        // `-_-_` is the input with THREE different correct answers across the
+        // variants, so it alone separates all three field pairs above.
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_url_decoder,
+                "getUrlDecoder",
+                "-_-_"
+            ),
+            Some(3),
+            "the URL alphabet decodes -_-_ to 3 bytes"
+        );
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_mime_decoder,
+                "getMimeDecoder",
+                "-_-_"
+            ),
+            Some(0),
+            "MIME IGNORES them -> empty. Under the old layout this decoder read \
+             back as URL and answered 3."
+        );
+        assert_eq!(
+            decode_len(&mut ctx, native_b64_get_decoder, "getDecoder", "-_-_"),
+            None,
+            "BASIC rejects them"
+        );
+        // A CRLF-wrapped payload: MIME accepts, BASIC rejects.
+        assert_eq!(
+            decode_len(
+                &mut ctx,
+                native_b64_get_mime_decoder,
+                "getMimeDecoder",
+                "QQ\r\n=="
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            decode_len(&mut ctx, native_b64_get_decoder, "getDecoder", "QQ\r\n=="),
+            None
+        );
+    }
+
+    /// Decoded length through a factory's decoder, or `None` when it threw.
+    fn decode_len(
+        ctx: &mut MockNativeContext,
+        factory: NativeCallback,
+        name: &str,
+        text: &str,
+    ) -> Option<usize> {
+        let dec = obj(factory(ctx, &[]), name);
+        let s = ctx.create_string(text);
+        match native_b64_decode_string(ctx, &[Value::Object(Some(dec)), Value::Object(Some(s))]) {
+            Ok(Some(Value::Object(Some(a)))) => Some(ctx.array_length(a)),
+            Ok(other) => panic!("{name}.decode({text:?}): expected a byte[], got {other:?}"),
+            Err(_) => None,
+        }
+    }
+
+    /// (3) The six no-arg factories are SINGLETONS on HotSpot — `==`, not
+    /// `equals` (`scratchpad/e14/B64Ident.java`, all six rows `true`) — and the
+    /// singletons are the JDK's own `Encoder.RFC4648` / `RFC4648_URLSAFE` /
+    /// `RFC2045` statics and the three matching ones on `Decoder`.
+    ///
+    /// So the fix is to RETURN THE JDK'S FIELD, not to memoize a fabricated
+    /// object in a native `static`. A cache would reproduce `getEncoder() ==
+    /// getEncoder()` but not this, also measured:
+    ///
+    /// ```text
+    /// Base64.getMimeEncoder(0, sep) == Base64.getEncoder() -> true
+    /// ```
+    ///
+    /// because `getMimeEncoder(int, byte[])` is unregistered, runs real
+    /// bytecode, and returns the real `RFC4648` for any `lineLength <= 0`.
+    ///
+    /// This test DECLARES the static field on the mock rather than relying on a
+    /// name-to-slot fallback, so it measures the lookup and not the mock.
+    #[test]
+    fn the_factories_return_the_jdk_singleton_when_there_is_one() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx
+            .ensure_class_initialized("java/util/Base64$Encoder")
+            .expect("class");
+        let marker = obj(
+            native_b64_get_mime_encoder(&mut ctx, &[]),
+            "stand-in object",
+        );
+        ctx.set_declared_fields(
+            cid,
+            vec![FieldMetadata {
+                name: "RFC4648".to_string(),
+                descriptor: "Ljava/util/Base64$Encoder;".to_string(),
+                access_flags: 0x0008, // ACC_STATIC
+                slot_index: 0,
+                declaring_class_id: cid,
+                is_static: true,
+            }],
+        );
+        ctx.set_static_field(cid, 0, Value::Object(Some(marker)));
+
+        let first = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        let second = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_eq!(
+            first, marker,
+            "getEncoder() must hand back java.util.Base64$Encoder.RFC4648 itself"
+        );
+        assert_eq!(first, second, "HotSpot: getEncoder() == getEncoder()");
+    }
+
+    /// …and the fallback is what keeps the row above from being a regression in
+    /// synthetic-JDK mode, where there is no `RFC4648` field to take. With no
+    /// declared static the factory must fabricate, exactly as before, and the
+    /// fabricated object must still be usable.
+    #[test]
+    fn the_factories_fabricate_when_there_is_no_jdk_singleton() {
+        let mut ctx = MockNativeContext::new();
+        let first = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        let second = obj(native_b64_get_encoder(&mut ctx, &[]), "getEncoder");
+        assert_ne!(
+            first, second,
+            "with no real class library there is nothing to be a singleton OF; \
+             fabricating a fresh encoder is the documented fallback"
+        );
+        assert_eq!(encode_to_string(&mut ctx, first, b"\xff\xff\xff").len(), 4);
     }
 }
 

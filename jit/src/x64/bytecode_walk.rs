@@ -1807,40 +1807,132 @@ impl Compiler {
                 // and no ABI change — `helpers.aastore` has been populated all
                 // along (the slot was simply never emitted against).
                 //
-                // A cheaper shape exists — keep this inline lowering and call
-                // a *check-only* helper before the store — but it needs a new
-                // helper + `jit-api` ABI slot, i.e. a coordinated change
-                // across three crates. That is the throughput follow-up; it is
-                // deliberately not bundled with the correctness fix, because
-                // the correctness fix has to be landable on its own. The cost
-                // being paid back is one call per reference array store.
+                // The cheaper shape — keep the inline lowering and call a
+                // *check-only* helper before the store — is `helpers
+                // .aastore_check` (`jit_aastore_check`, W8-E19-1). It exists
+                // now, so this arm has two lowerings and picks by whether the
+                // slot is wired. `0` means a hand-built test table: route the
+                // WHOLE opcode to `helpers.aastore`, never the bare inline
+                // store, which is the defect above.
                 //
-                // ## Ordering
+                // ## Ordering — JVMS §6.5 is NPE → AIOOBE → ASE
                 //
-                // `flush_scratch_registers` first: it rewrites every
-                // register-resident (`Scratch`/`Xmm`) stack slot to a frame
-                // slot, so the three `load_slot_to_reg` calls below all read
-                // from memory and cannot clobber one another's source
-                // register regardless of ABI (`ARG_REGS` is RCX/RDX/R8/R9 on
-                // Windows, RDI/RSI/RDX/RCX on SysV).
+                // Not stylistic. Putting the covariance check ahead of the
+                // bounds check reproduces the exact divergence
+                // `RArrayStoreTiers` s15 caught in the interpreter fast path:
+                // ASE reported for a past-the-end index.
                 //
-                // `emit_post_invoke_exception_check(b'V')` drains the pending
-                // NPE / AIOOBE / ArrayStoreException the helper may have set.
-                // 0x53 is a one-byte opcode, so the snapshot keeps THIS pc as
-                // the throw pc, which is what the handler `[start_pc, end_pc)`
+                // `flush_scratch_registers` first, on BOTH arms: it rewrites
+                // every register-resident (`Scratch`/`Xmm`) stack slot to a
+                // frame slot, so every `load_slot_to_reg` below reads from
+                // memory and cannot clobber another's source register
+                // regardless of ABI (`ARG_REGS` is RCX/RDX/R8/R9 on Windows,
+                // RDI/RSI/RDX/RCX on SysV).
+                //
+                // A helper call clobbers the caller-saved registers, so
+                // `array_slot` / `index_slot` / `val_slot` are RE-LOADED after
+                // the check and again after the SATB barrier. Hoisting those
+                // loads above either call is silently wrong.
+                //
+                // 0x53 is a one-byte opcode, so
+                // `emit_post_invoke_exception_check` keeps THIS pc as the
+                // throw pc, which is what the handler `[start_pc, end_pc)`
                 // range test needs (see the note at that function).
+                //
+                // ## What the guard actually guards, per arm
+                //
+                // `jit_aastore` returns `()`, so after it RAX is UNDEFINED and
+                // `emit_post_invoke_exception_check(b'V')` is comparing
+                // garbage: on that arm the exception is delivered by the
+                // interpreter's post-JIT-return drain
+                // (`take_all_jit_signals`), not by this guard. Kept anyway —
+                // it is free on the not-taken path and a spurious hit only
+                // routes to the same drain — but do NOT read it as the
+                // mechanism. `jit_aastore_check` returns a real `i64::MIN`
+                // sentinel, so on the inline arm the guard means what it says.
+                //
+                // ## Why the inline arm also closes a `has_dispatch` hole
+                //
+                // `jit_aastore_check` builds its `ArrayStoreException` through
+                // `jit_thread_mut()`, which only the dispatch-aware entry sets
+                // (`vm/src/runtime/interpreter/jit_bridge.rs`, the
+                // `!compiled.has_dispatch` arm skips `set_jit_thread`). The
+                // helper-only arm above emits NO bounds-check stub and NO
+                // null-check stub, so a method whose only listed content is an
+                // `aastore` computes `has_dispatch == false` in
+                // `x64/driver.rs` — and then the check fails open (its
+                // documented last resort) and the illegal store proceeds. The
+                // inline arm below emits both stubs, which is exactly what
+                // that computation reads, so it forces the dispatch entry as a
+                // structural consequence rather than by a flag someone has to
+                // remember. See the record for the narrow shapes that reach
+                // it.
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
                     let index_slot = self.pop_stack();
                     let array_slot = self.pop_stack();
-                    // jit_aastore(vm_ptr, array_ptr, index, val)
-                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                    self.load_slot_to_reg(ARG_REGS[2], index_slot);
-                    self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                    self.emit_call_absolute(self.helpers.aastore);
-                    self.emit_post_invoke_exception_check(b'V');
+                    if self.helpers.aastore_check == 0 {
+                        // jit_aastore(vm_ptr, array_ptr, index, val) — the
+                        // complete opcode.
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                        self.load_slot_to_reg(ARG_REGS[2], index_slot);
+                        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                        self.emit_call_absolute(self.helpers.aastore);
+                        self.emit_post_invoke_exception_check(b'V');
+                    } else {
+                        self.load_slot_to_reg(RAX, array_slot);
+                        self.load_slot_to_reg(RCX, index_slot);
+                        // 1. NPE on a null array (JVMS §aastore). Records a
+                        //    null-check stub.
+                        self.emit_null_check_array_store_at(code, pc);
+                        // 2. AIOOBE. Records a bounds-check stub.
+                        self.emit_bounds_check(pc);
+                        // 3. ASE — jit_aastore_check(vm_ptr, array_ptr, val)
+                        //    -> i64::MIN (refused, exception published) | 0.
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                        self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                        self.emit_call_absolute(self.helpers.aastore_check);
+                        // `b'V'` is the OPCODE's return descriptor, which is
+                        // what this parameter documents; it selects the plain
+                        // `CMP RAX, i64::MIN; JE bail`, correct because the
+                        // helper returns only `0` or the sentinel. Unlike the
+                        // arm above, RAX here is a defined value.
+                        self.emit_post_invoke_exception_check(b'V');
+                        // 4. SATB pre-write barrier on the OLD element, before
+                        //    it is overwritten. Round-7 CRIT (history/
+                        //    round7-gc.md §1): a still-live reference dropped
+                        //    by JIT code during concurrent marking is a
+                        //    use-after-free on the next mixed evacuation. The
+                        //    helper short-circuits on one Acquire load when no
+                        //    mark cycle is in flight.
+                        self.load_slot_to_reg(RAX, array_slot);
+                        self.load_slot_to_reg(RCX, index_slot);
+                        self.emit_ref_aload_regs(); // RAX = OLD ref value
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.emit_mov_reg_reg(ARG_REGS[1], RAX);
+                        self.emit_call_absolute(self.helpers.satb_pre_write_barrier);
+                        // 5. The store itself:
+                        //    MOV [RAX + RCX*8 + HEADER_SIZE], RDX.
+                        self.load_slot_to_reg(RAX, array_slot);
+                        self.load_slot_to_reg(RCX, index_slot);
+                        self.load_slot_to_reg(RDX, val_slot);
+                        self.emit_ref_astore_regs();
+                        // 6. Post-store publication. Generational GC exposes a
+                        //    stable atomic card map, so RAX=array / RDX=value
+                        //    can mark it inline; G1/ZGC keep their
+                        //    collector-specific helper.
+                        if self.inline_card_mark_available() {
+                            self.emit_inline_card_mark_regs(RAX, RDX);
+                        } else {
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                            self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                            self.emit_call_absolute(self.helpers.write_barrier);
+                        }
+                    }
                     pc += 1;
                 }
 

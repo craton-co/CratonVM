@@ -5403,7 +5403,25 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
 
-    // StringTemplate.STR processor
+    // StringTemplate.STR / RAW / FMT — THREE FIELD-SHAPED ROWS, DEAD, VERDICT
+    // "DELETE", NOT DELETED HERE (2026-08-13, lane E36).
+    //
+    // Same dead shape as the rest of the family: a field name in the method
+    // slot, `Ljava/lang/StringTemplate$Processor;` where a method descriptor
+    // belongs, and no `getstatic` path in this VM consults the native
+    // registry.
+    //
+    // Unlike `System$Logger$Level` there is nothing here worth converting.
+    // `java.lang.StringTemplate` was a preview API and was WITHDRAWN: measured
+    // on this host, `javap -p java.lang.StringTemplate` answers
+    // `Error: class not found`. On JDK 25 the class does not exist, so no
+    // bytecode can reference it in real-JDK mode, and nothing declares it on
+    // the synthetic side either.
+    //
+    // Left in place only because `vm/src/vm/tests.rs`'s
+    // `string_template_basics_p67` `call_native`s the `STR` row — the exact
+    // shape where a test is the sole thing keeping a dead registration alive.
+    // The paired deletion is nominated so the two land together.
     r.register(
         st,
         "STR",
@@ -5638,62 +5656,46 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackWalker.Option enum
+    // StackWalker.Option enum — the three field-shaped registrations that used
+    // to sit here (`RETAIN_CLASS_REFERENCE`, `SHOW_HIDDEN_FRAMES`,
+    // `SHOW_REFLECT_FRAMES`, each with the FIELD descriptor
+    // `Ljava/lang/StackWalker$Option;` in the METHOD registry's descriptor
+    // slot) are DELETED as of 2026-08-13, lane E36. This note is kept because
+    // it is the second time someone will come here looking for where an
+    // `Option` constant is minted.
     //
-    // DEAD REGISTRATIONS — measured, not inferred (2026-08-12; see
-    // docs/known-issues/jdk-only/W7-93-stackwalker-option-constants-null.md).
-    // These three name a FIELD descriptor in the METHOD registry's descriptor
-    // slot, so the triple they key is one no dispatch can ever produce: a
-    // `getstatic` resolves through the class's static-field storage and never
-    // consults the native method registry, and no call site invokes a method
-    // named `RETAIN_CLASS_REFERENCE`. Confirmed under `--jdk-only`: the values
-    // a program actually reads back out of these statics are the objects
-    // `stack_walker::native_option_clinit` allocated (identity-checked), and
-    // `values()[0] == Option.RETAIN_CLASS_REFERENCE` holds — so nothing here
-    // ran.
+    // They were a duplicate-fix shadow, not merely dead. The initialiser that
+    // actually answers is `stack_walker.rs`'s `native_option_clinit`,
+    // registered as `("java/lang/StackWalker$Option", "<clinit>", "()V")` —
+    // the ONE shape a `getstatic` can reach, because `vm_util.rs` consults the
+    // registry for `<clinit>` and class initialization then publishes into the
+    // statics that `getstatic` reads. `class_manager.rs` declares the three
+    // statics for the stub, so those publishes land. Verified before deleting:
+    // that registration is present, it writes all three constants and
+    // `$VALUES`, and its own unit test
+    // (`option_clinit_populates_enum_values_array`) asserts `values()[i]` is
+    // `==` the published static AND that each carries a populated `name`.
     //
-    // They are worse than merely inert: `p57_alloc_enum` allocates a FRESH
-    // instance per call, so if a future dispatch change ever made them live
-    // they would hand back constants that are NOT `==` to the ones in
-    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` comparison
-    // an enum switch compiles to. Do not treat them as the place to fix an
-    // `Option` constant; the initialiser is `native_option_clinit`. They are
-    // left in place only because deleting registrations moves
-    // `scripts/baselines/jdk-only-bridge-ratchet.json`, which needs a build to
-    // re-freeze.
-    let swo = "java/lang/StackWalker$Option";
-    r.register(
-        swo,
-        "RETAIN_CLASS_REFERENCE",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| {
-            p57_alloc_enum(
-                ctx,
-                "java/lang/StackWalker$Option",
-                "RETAIN_CLASS_REFERENCE",
-                0,
-            )
-        },
-    );
-    r.register(
-        swo,
-        "SHOW_HIDDEN_FRAMES",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/lang/StackWalker$Option", "SHOW_HIDDEN_FRAMES", 1),
-    );
-    r.register(
-        swo,
-        "SHOW_REFLECT_FRAMES",
-        "Ljava/lang/StackWalker$Option;",
-        |ctx, _args| {
-            p57_alloc_enum(
-                ctx,
-                "java/lang/StackWalker$Option",
-                "SHOW_REFLECT_FRAMES",
-                2,
-            )
-        },
-    );
+    // The deleted rows were also worse than inert: `p57_alloc_enum` mints a
+    // FRESH instance per call, so had any dispatch change made them live they
+    // would have handed back constants that are NOT `==` to the ones in
+    // `$VALUES`, breaking `Enum.valueOf`, `EnumSet` and every `==` an enum
+    // switch compiles to.
+    //
+    // Two consequences of the deletion, both stated rather than hidden:
+    //   * it moves `scripts/baselines/jdk-only-bridge-ratchet.json`'s
+    //     registration counts by three, which needs a build to re-freeze; that
+    //     baseline's own note already says it is stale and pending re-freeze.
+    //   * `jca/cipher.rs` points at "phases_late.rs's three StackWalker$Option
+    //     static-field registrations" while explaining why
+    //     `JceSecurityManager.<clinit>` dies. That cross-reference is now
+    //     dangling and its diagnosis is unchanged by this deletion — the
+    //     constants were never coming from here. Nominated, not edited: that
+    //     file belongs to another lane.
+    //
+    // Nothing in the tree called these: `grep -rn "StackWalker\$Option"`
+    // returns only `class_manager.rs`, `stack_walker.rs`, the `cipher.rs`
+    // comment and this block, so no test had to change with them.
 
     // java.lang.invoke.SerializedLambda — used by lambda serialization support
     let sl = "java/lang/invoke/SerializedLambda";
@@ -5842,7 +5844,43 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     crate::register_system_logger_methods(r, crate::CRATON_SYSTEM_LOGGER_CLASS);
     crate::register_system_logger_methods(r, "java/lang/System$Logger");
 
-    // System.Logger.Level enum
+    // System.Logger.Level enum — SEVEN FIELD-SHAPED ROWS, DEAD, VERDICT
+    // "CONVERT", NOT CONVERTED HERE (2026-08-13, lane E36).
+    //
+    // Same shape as the `StackWalker$Option` rows deleted above: a field name
+    // in the method slot and `Ljava/lang/System$Logger$Level;` where a method
+    // descriptor belongs. No `getstatic` path in this VM consults the native
+    // registry, so none of the seven can fire in any tier, and
+    // `p57_alloc_enum` mints a fresh instance per call so if one ever did it
+    // would fail `==` against the class's own constants.
+    //
+    // They are NOT in the "dead twice over" class that the primitive rows are:
+    // measured on this host, `System.Logger.Level.INFO` compiles to
+    // `getstatic java/lang/System$Logger$Level.INFO:Ljava/lang/System$Logger$Level;`
+    // — a real runtime read. So the right end state is a native `<clinit>`.
+    // Three things have to land WITH that conversion, and none of them is in
+    // this lane's files, which is why the rows are still here:
+    //
+    //   1. `classloading/src/class_manager.rs` declares NO statics for this
+    //      class (`grep "System\$Logger\$Level"` → nothing), and
+    //      `set_static_field_by_name` resolves a DECLARED static and is a
+    //      silent no-op otherwise. A `<clinit>` landed alone publishes into
+    //      the void — measured next door: that is exactly the state
+    //      `HttpClient$Version`'s converted `<clinit>` is in today.
+    //   2. This is a REAL JDK class with real `<clinit>` bytecode in every
+    //      image, and a registered native beats real bytecode on the cold
+    //      interpreter path (see the note on `native_option_clinit`). A native
+    //      `<clinit>` here SHADOWS the JDK's, so it must reproduce it fully —
+    //      including `private final int severity`, which the constants carry
+    //      and `Level.getSeverity()` returns. Measured on the oracle:
+    //      ALL=-2147483648, TRACE=400, DEBUG=500, INFO=800, WARNING=900,
+    //      ERROR=1000, OFF=2147483647. A conversion that writes only
+    //      name/ordinal turns `getSeverity()` into 0 for every level in the
+    //      mode that matters most.
+    //   3. `vm/src/vm/tests.rs`'s `system_logger_p67` `call_native`s the
+    //      `INFO` row directly, so deleting these seven turns it red. That
+    //      file belongs to another lane; the paired edit is nominated so the
+    //      two land together.
     let sll = "java/lang/System$Logger$Level";
     r.register(
         sll,
@@ -9556,40 +9594,81 @@ mod cert_verify_bounds_security_tests {
     /// iteration 2 of 4096), while every other Mac caller in the tree stayed
     /// green. A per-descriptor census is the only thing that catches the next
     /// one.
+    ///
+    /// **The population below is the JDK's, not this VM's.** Read off
+    /// `javap -public -s javax.crypto.Mac` on the oracle
+    /// (openjdk 25.0.3 2026-04-21 LTS, Microsoft-13877124, build 25.0.3+9-LTS)
+    /// on 2026-08-13: **17** public methods. Until then this test listed
+    /// **16** of them — every one of which is registered — so a census whose
+    /// stated subject is "every PUBLIC method, not most of them" was itself
+    /// built from the registered set and could not go red for the one case it
+    /// exists to catch. The seventeenth,
+    /// `getInstance(String, java.security.Provider)`, is NOT registered
+    /// anywhere in the tree (`grep -rn 'javax/crypto/Mac'`: only
+    /// `phases_late/ssl_security.rs` and this file), and is carried below as an
+    /// explicit `false` row rather than by omission.
+    ///
+    /// The `expect_registered` column is ratcheted in BOTH directions: a row
+    /// that flips either way fails, so registering the missing overload
+    /// requires deleting its `false` and its note, and a registration silently
+    /// disappearing is a failure rather than a shorter list.
     #[test]
     fn every_public_mac_method_is_registered() {
         let mut r = NativeMethodRegistry::new();
         register_p68_crypto_mac(&mut r);
-        for (name, desc) in [
-            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;"),
+        // (method, descriptor, expect_registered, note when NOT expected)
+        for (name, desc, expect_registered, why_not) in [
+            ("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", true, ""),
             (
                 "getInstance",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
+                true,
+                "",
             ),
-            ("getAlgorithm", "()Ljava/lang/String;"),
-            ("getProvider", "()Ljava/security/Provider;"),
-            ("getMacLength", "()I"),
-            ("init", "(Ljava/security/Key;)V"),
+            (
+                "getInstance",
+                "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;",
+                true,
+                "",
+            ),
+            ("getAlgorithm", "()Ljava/lang/String;", true, ""),
+            ("getProvider", "()Ljava/security/Provider;", true, ""),
+            ("getMacLength", "()I", true, ""),
+            ("init", "(Ljava/security/Key;)V", true, ""),
             (
                 "init",
                 "(Ljava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+                true,
+                "",
             ),
-            ("update", "(B)V"),
-            ("update", "([B)V"),
-            ("update", "([BII)V"),
-            ("update", "(Ljava/nio/ByteBuffer;)V"),
-            ("doFinal", "()[B"),
-            ("doFinal", "([B)[B"),
-            ("doFinal", "([BI)V"),
-            ("reset", "()V"),
-            ("clone", "()Ljava/lang/Object;"),
+            ("update", "(B)V", true, ""),
+            ("update", "([B)V", true, ""),
+            ("update", "([BII)V", true, ""),
+            ("update", "(Ljava/nio/ByteBuffer;)V", true, ""),
+            ("doFinal", "()[B", true, ""),
+            ("doFinal", "([B)[B", true, ""),
+            ("doFinal", "([BI)V", true, ""),
+            ("reset", "()V", true, ""),
+            ("clone", "()Ljava/lang/Object;", true, ""),
         ] {
-            assert!(
-                r.find("javax/crypto/Mac", name, desc).is_some(),
-                "javax/crypto/Mac.{name}{desc} is not registered — it will run the \
-                 real JDK body against never-initialised instance fields and throw \
-                 \"MAC not initialized\""
-            );
+            let registered = r.find("javax/crypto/Mac", name, desc).is_some();
+            if expect_registered {
+                assert!(
+                    registered,
+                    "javax/crypto/Mac.{name}{desc} is not registered — it will run \
+                     the real JDK body against never-initialised instance fields \
+                     and throw \"MAC not initialized\""
+                );
+            } else {
+                assert!(
+                    !registered,
+                    "javax/crypto/Mac.{name}{desc} IS now registered, but this \
+                     census still carries it as a known gap. Delete the `false` row \
+                     and its note — a recorded gap that has been closed must stop \
+                     being recorded, or the next reader takes the note as a \
+                     standing exemption. The note said:\n{why_not}"
+                );
+            }
         }
     }
 
@@ -9962,92 +10041,356 @@ mod essential_vs_synthetic_jdk_coverage_audit {
             .collect()
     }
 
-    /// Diffs the (class, method, descriptor) triples reachable from
-    /// `register_p59_module` (synthetic-jdk-only — dead code in the default
-    /// `cratonvm-cli` build) against `register_essential_natives` (the
-    /// real-JDK path the default build actually uses). Anything in the
-    /// former but not the latter has the same "silently missing from the
-    /// build that matters" shape that broke `Module.getDescriptor()`.
+    /// Turn a declared row list into the triple set it names, rejecting a
+    /// duplicated row (which would make the two-way ratchet below silently
+    /// tolerant of one deletion).
+    fn declared(label: &str, rows: &[Row]) -> BTreeSet<(String, String, String)> {
+        let set: BTreeSet<(String, String, String)> = rows
+            .iter()
+            .map(|(c, m, d, _why)| (c.to_string(), m.to_string(), d.to_string()))
+            .collect();
+        assert_eq!(
+            set.len(),
+            rows.len(),
+            "{label} lists a triple twice; a duplicated row makes the reverse \
+             ratchet unable to see the first deletion"
+        );
+        set
+    }
+
+    /// `(class, method, descriptor, why this row is here)`. The fourth field is
+    /// load-bearing: it is what stops a row being added to shut the gate up.
+    type Row = (&'static str, &'static str, &'static str, &'static str);
+
+    /// Triples `register_p59_module` registers and `register_essential_natives`
+    /// does NOT — the population the original `difference` check watched.
     ///
-    /// Every entry below was individually triaged against a real-HotSpot
-    /// probe (see task history / `reference_essential_vs_synthetic_jdk_registration_split`
-    /// memory); this is not a blanket allowlist, it's a closed list of the
-    /// exact 8 candidates this audit originally surfaced:
+    /// Each was individually triaged against a real-HotSpot probe (see task
+    /// history / `reference_essential_vs_synthetic_jdk_registration_split`
+    /// memory). This is not a blanket allowlist; it is a closed list, and
+    /// `phase59_module_vs_essential_natives` fails in BOTH directions against
+    /// it.
+    const P59_ONLY: &[Row] = &[
+        (
+            "java/lang/Module",
+            "isNamed",
+            "()Z",
+            "probe-verified to already match HotSpot through the real-bytecode \
+             fallback: real `isNamed` reads the dual-written `name` field.",
+        ),
+        (
+            "java/lang/Module",
+            "toString",
+            "()Ljava/lang/String;",
+            "probe-verified: real `toString`'s \"module X\" format never touches \
+             the null `descriptor`/`reads` fields.",
+        ),
+        (
+            "java/lang/Module",
+            "addReads",
+            "(Ljava/lang/Module;)Ljava/lang/Module;",
+            "the PUBLIC instance method, distinct from `addReads0` which the \
+             essential path does register (lib.rs). Real `implAddReads` \
+             delegates to `addReads0`, which updates the `ModuleRegistry`; the \
+             `addReads` then `canRead` round trip was probe-verified against \
+             HotSpot.",
+        ),
+    ];
+
+    /// Triples registered by BOTH registrars — the population the original
+    /// `difference` check was structurally unable to see.
     ///
-    /// - `canRead`, `addExports`, `addOpens` — FIXED on this branch
-    ///   (registered above via `native_module_can_read`/
-    ///   `native_module_add_exports`/`native_module_add_opens`), so they no
-    ///   longer appear in the diff at all and are not listed here.
-    /// - `getDescriptor` — already fixed on the separate, not-yet-merged
-    ///   `fix/es-module-getdescriptor-null` branch (registers the same shape
-    ///   of essential-native override there). Not duplicated here to avoid
-    ///   two divergent implementations existing pre-merge.
-    /// - `isNamed`, `toString` — probe-verified to already match real
-    ///   HotSpot via the real-bytecode fallback (real bytecode reads a
-    ///   dual-written `name` field for `isNamed`, and `toString`'s basic
-    ///   "module X" format doesn't touch the null `descriptor`/`reads`
-    ///   fields). No essential registration needed.
-    /// - `addReads` (the public instance method, distinct from the
-    ///   already-essential-registered `addReads0`) — real bytecode's
-    ///   `implAddReads` delegates to `addReads0`, which is already reachable
-    ///   in the essential path and correctly updates the `ModuleRegistry`;
-    ///   probe-verified round-trip (`addReads` then `canRead`) matches
-    ///   HotSpot. No separate registration needed.
-    /// - `ModuleDescriptor.isAutomatic()`/`isOpen()` — trivial field reads
-    ///   (`return automatic;`/`return open;`); correctness is contingent on
-    ///   the `getDescriptor` fix above populating those fields, so this
-    ///   resolves once that branch merges. Not independently testable here
-    ///   since this worktree doesn't have that fix (`getDescriptor()`
-    ///   returns null).
+    /// A triple lands here when `register_p59_module` and
+    /// `register_essential_natives` each install a body for it. In
+    /// synthetic-jdk mode phase 59 runs LAST and therefore WINS
+    /// (`register_builtins` calls `register_essential_natives` and then
+    /// `register_synthetic_overrides`); in `--real-jdk` / `--jdk-only`
+    /// `register_p59_module` is never called at all, so the essential body is
+    /// the only one. That asymmetry is the hazard: a divergence between the two
+    /// bodies is a MODE-DEPENDENT behaviour change that no diff of the triples
+    /// can show, because the triple is identical on both sides.
     ///
-    /// If this test starts failing again with an entry NOT in the list
-    /// above, that's a genuinely new candidate — triage it the same way
-    /// (real-HotSpot probe comparison) before deciding fix vs. no-op.
+    /// Rows are marked:
+    ///
+    /// - **SHARED FN** — both sides register the same `fn` item, so there are
+    ///   no two bodies to diverge. Safe by construction, not by review.
+    /// - **TWIN** — two separately written bodies. Whoever changes one must
+    ///   read the other, and say here what the difference is for.
+    ///
+    /// Two TWIN rows below carry a KNOWN divergence, established by
+    /// `docs/known-issues/jdk-only/E16-R11-P59-MODULE-LAYER-TWIN-20260813.md`
+    /// §1.4 and §5, and NOT closed by this lane (both bodies live in
+    /// `phases_late/reflect_invoke.rs`, which this lane does not own).
+    const P59_AND_ESSENTIAL: &[Row] = &[
+        (
+            "java/lang/ModuleLayer",
+            "boot",
+            "()Ljava/lang/ModuleLayer;",
+            "TWIN, KNOWN DIVERGENT. essential: `jboss_jdkspecific::native_module_layer_boot`, \
+             memoised per VM (`ModuleLayer.boot() == ModuleLayer.boot()` is a \
+             spec'd identity), allocating `MODULE_LAYER_FIELD_COUNT` = 2 slots \
+             and populating `parents`/`nameToModule`/`modules` by NAME. p59: a \
+             fresh, unmemoised layer per call, requesting 1 slot against a \
+             declared synthetic width of 2 (class_manager.rs `instance_fields(2)`), \
+             with none of those three fields. See E16 §5.3.",
+        ),
+        (
+            "java/lang/ModuleLayer",
+            "modules",
+            "()Ljava/util/Set;",
+            "TWIN, KNOWN DIVERGENT. essential: `jboss_jdkspecific::native_module_layer_modules`, \
+             which derives and CACHES `layer.servicesCatalog` from `nameToModule` \
+             as a side effect. `service_loader.rs:775` invokes this method purely \
+             for that side effect and then reads the field by name. p59 ignores \
+             its receiver and builds a fresh `HashSet` from the module registry, \
+             so in synthetic-jdk mode (where p59 wins) that read finds nothing. \
+             See E16 §1.4.",
+        ),
+        (
+            "java/lang/ModuleLayer",
+            "findModule",
+            "(Ljava/lang/String;)Ljava/util/Optional;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_layer_find_module`, \
+             which answers from the layer's `nameToModule`. p59 answers from \
+             `all_module_names()` filtered by `module_is_class_path_only`. Both \
+             now exclude a modular jar that reached the registry only through \
+             `-cp`; that filter was added to p59 by lane E16 precisely because \
+             this row exists.",
+        ),
+        (
+            "java/lang/Module",
+            "getName",
+            "()Ljava/lang/String;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_name` (reads \
+             the real `name` field by NAME, on a Module that is an instance of \
+             the real class). p59 reads slot 0 of a 2-slot synthetic Module. The \
+             two agree only because p59's Modules are the ones p59 itself \
+             allocated.",
+        ),
+        (
+            "java/lang/Module",
+            "getLayer",
+            "()Ljava/lang/ModuleLayer;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_layer`. See \
+             the `MODULE_FIELD_COUNT` doc comment in jboss_jdkspecific.rs for \
+             what a hand-picked slot index costs on this exact method: a raw \
+             slot-1 write intended for `layer` landed on the REAL `name` field \
+             of the shared unnamed-module mirror.",
+        ),
+        (
+            "java/lang/Module",
+            "getPackages",
+            "()Ljava/util/Set;",
+            "TWIN. essential: `jboss_jdkspecific::native_module_get_packages`, \
+             backed by the off-object `module_packages_table` that \
+             `defineModule0` seeds, falling back to `BOOT_JDK_PACKAGES`. p59 \
+             answers from the VM's package index. Different sources, same \
+             question.",
+        ),
+        (
+            "java/lang/Module",
+            "canRead",
+            "(Ljava/lang/Module;)Z",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_can_read` \
+             — the same fn item p59 registers. One body.",
+        ),
+        (
+            "java/lang/Module",
+            "addExports",
+            "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_add_exports`. \
+             One body.",
+        ),
+        (
+            "java/lang/Module",
+            "addOpens",
+            "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
+            "SHARED FN. lib.rs registers `crate::phases_late::native_module_add_opens`. \
+             One body.",
+        ),
+        (
+            "java/lang/Module",
+            "getDescriptor",
+            "()Ljava/lang/module/ModuleDescriptor;",
+            "TWIN. Was P59-ONLY when this guard was written, with the note that \
+             the essential-side fix lived on an unmerged branch. That branch \
+             merged: lib.rs now registers a `getDescriptor` that prefers the \
+             object's real `descriptor` field and falls back to building one \
+             from the module name. p59 allocates a 2-slot `ModuleDescriptor` \
+             and copies slot 0. The stale P59-ONLY row is deleted, which is the \
+             reverse direction of this ratchet doing its job.",
+        ),
+        (
+            "java/lang/Module",
+            "isExported",
+            "(Ljava/lang/String;)Z",
+            "TWIN. essential (lib.rs) resolves the receiver with \
+             `module_name_of_mirror`; p59 uses `read_module_name`. Both then ask \
+             the VM's export graph.",
+        ),
+        (
+            "java/lang/Module",
+            "isExported",
+            "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            "TWIN. Qualified form of the row above; same receiver-resolution \
+             difference.",
+        ),
+        (
+            "java/lang/Module",
+            "isOpen",
+            "(Ljava/lang/String;)Z",
+            "TWIN. Same shape as `isExported(String)`, against the opens graph.",
+        ),
+        (
+            "java/lang/Module",
+            "isOpen",
+            "(Ljava/lang/String;Ljava/lang/Module;)Z",
+            "TWIN. Qualified form of the row above.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "name",
+            "()Ljava/lang/String;",
+            "TWIN. essential: `reflect_annotations::register_module_builder_overrides`, \
+             reached from `register_essential_natives_with_shims`, on a \
+             16-slot descriptor written by NAME. p59 reads slot 0 of the 2-slot \
+             descriptor its own `getDescriptor` allocates.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "isAutomatic",
+            "()Z",
+            "TWIN. Was P59-ONLY when this guard was written (\"resolves once the \
+             getDescriptor branch merges\"). It merged, via \
+             `register_module_builder_overrides`. Stale row deleted.",
+        ),
+        (
+            "java/lang/module/ModuleDescriptor",
+            "isOpen",
+            "()Z",
+            "TWIN. Same history as `isAutomatic` above.",
+        ),
+        (
+            "java/lang/Class",
+            "getModule",
+            "()Ljava/lang/Module;",
+            "TWIN. essential (lib.rs) caches ONE canonical Module per module \
+             name, because the JDK compares Modules by identity and a fresh \
+             instance per call broke \
+             `Throwable.validateSuppressedExceptionsList`. p59 has its own \
+             canonical-per-name cache. Two caches for one identity invariant.",
+        ),
+    ];
+
+    /// Partitions `register_p59_module`'s triples against
+    /// `register_essential_natives` and ratchets BOTH halves, in BOTH
+    /// directions, against the two lists above.
+    ///
+    /// **What makes this fail.** Any of:
+    ///
+    /// 1. a triple `register_p59_module` registers that `register_essential_natives`
+    ///    does not, and that `P59_ONLY` does not name — the original check, the
+    ///    "silently missing from the build that matters" shape that broke
+    ///    `Module.getDescriptor()`;
+    /// 2. a triple registered by BOTH and not named in `P59_AND_ESSENTIAL` —
+    ///    the shape the original check was structurally unable to see, because
+    ///    `p59.difference(&essential)` is empty for exactly the triples where
+    ///    two bodies compete and the mode decides which one runs;
+    /// 3. a row in either list that no longer describes reality — a triple that
+    ///    stopped being p59-only because the essential path picked it up, or
+    ///    stopped being double-registered because one side dropped it. Three
+    ///    such rows were found stale when this ratchet was added
+    ///    (`Module.getDescriptor`, `ModuleDescriptor.isAutomatic`,
+    ///    `ModuleDescriptor.isOpen`), all of which the one-way `difference`
+    ///    check had been quietly carrying as permission;
+    /// 4. the same triple named on both lists, or twice on one list.
+    ///
+    /// It does NOT compare BODIES. Nothing here can tell you that p59's
+    /// `ModuleLayer.modules()` dropped the `servicesCatalog` side effect the
+    /// essential twin has — only that both register the method, and that
+    /// somebody had to write down which one wins where. That is the whole
+    /// claim: an unnamed intersection triple is now loud, and a name left
+    /// behind after the intersection changes is also loud.
     #[test]
     fn phase59_module_vs_essential_natives() {
         let p59 = dump_triples(|r| register_p59_module(r));
         let essential = dump_triples(|r| register_essential_natives(r));
 
-        let already_triaged: BTreeSet<(String, String, String)> = [
-            (
-                "java/lang/Module",
-                "getDescriptor",
-                "()Ljava/lang/module/ModuleDescriptor;",
-            ),
-            ("java/lang/Module", "isNamed", "()Z"),
-            ("java/lang/Module", "toString", "()Ljava/lang/String;"),
-            (
-                "java/lang/Module",
-                "addReads",
-                "(Ljava/lang/Module;)Ljava/lang/Module;",
-            ),
-            ("java/lang/module/ModuleDescriptor", "isAutomatic", "()Z"),
-            ("java/lang/module/ModuleDescriptor", "isOpen", "()Z"),
-        ]
-        .into_iter()
-        .map(|(c, m, d)| (c.to_string(), m.to_string(), d.to_string()))
-        .collect();
+        let declared_only = declared("P59_ONLY", P59_ONLY);
+        let declared_both = declared("P59_AND_ESSENTIAL", P59_AND_ESSENTIAL);
+        let on_both_lists: Vec<_> = declared_only.intersection(&declared_both).collect();
+        assert!(
+            on_both_lists.is_empty(),
+            "a triple cannot be both p59-only and double-registered; \
+             listed twice: {on_both_lists:?}"
+        );
 
-        let missing: Vec<_> = p59
-            .difference(&essential)
-            .filter(|t| !already_triaged.contains(*t))
-            .collect();
-        if !missing.is_empty() {
-            let report = missing
-                .iter()
-                .map(|(c, m, d)| format!("{c}.{m}{d}"))
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            panic!(
-                "\n{} NEW triple(s) registered in register_p59_module but NOT \
-                 in register_essential_natives, and not in the already-triaged \
-                 allowlist above (candidates for the same class of gap that \
-                 broke Module.getDescriptor() — triage against a real-HotSpot \
-                 probe before fixing or allowlisting):\n  {}\n",
-                missing.len(),
-                report
-            );
+        let actual_only: BTreeSet<(String, String, String)> =
+            p59.difference(&essential).cloned().collect();
+        let actual_both: BTreeSet<(String, String, String)> =
+            p59.intersection(&essential).cloned().collect();
+
+        fn audit(
+            problems: &mut Vec<String>,
+            label: &str,
+            actual: &BTreeSet<(String, String, String)>,
+            listed: &BTreeSet<(String, String, String)>,
+            undeclared_hint: &str,
+            stale_hint: &str,
+        ) {
+            for t in actual.difference(listed) {
+                problems.push(format!(
+                    "UNDECLARED in {label}: {}.{}{} — {undeclared_hint}",
+                    t.0, t.1, t.2
+                ));
+            }
+            for t in listed.difference(actual) {
+                problems.push(format!(
+                    "STALE row in {label}: {}.{}{} — {stale_hint}",
+                    t.0, t.1, t.2
+                ));
+            }
         }
+
+        let mut problems: Vec<String> = Vec::new();
+        audit(
+            &mut problems,
+            "P59_ONLY",
+            &actual_only,
+            &declared_only,
+            "register_p59_module registers it and register_essential_natives does \
+             not, so it is missing from the build the corpora run. Triage against \
+             a real-HotSpot probe, then either register it on the essential path \
+             or add a P59_ONLY row saying why that is correct.",
+            "it is no longer p59-only. If the essential path picked it up, MOVE \
+             the row to P59_AND_ESSENTIAL and say which body wins in which mode; \
+             if p59 dropped it, DELETE the row. Leaving it here is how a triaged \
+             list turns into permission.",
+        );
+        audit(
+            &mut problems,
+            "P59_AND_ESSENTIAL",
+            &actual_both,
+            &declared_both,
+            "BOTH registrars install a body for this triple. In synthetic-jdk mode \
+             phase 59 runs last and WINS; in --real-jdk/--jdk-only phase 59 is \
+             never called and the essential body is the only one. Read both \
+             bodies, then add a row saying whether they are the same fn item \
+             (SHARED FN) or two implementations (TWIN) and what the difference \
+             is for. An unread intersection is how ModuleLayer.modules() lost \
+             its servicesCatalog side effect in one mode only.",
+            "it is no longer double-registered. Find out which side dropped it: \
+             if the essential path did, this is now a p59-only triple and the \
+             row belongs in P59_ONLY; if p59 did, DELETE the row.",
+        );
+
+        assert!(
+            problems.is_empty(),
+            "\n{} problem(s) in the phase-59 / essential module-native \
+             partition:\n  {}\n",
+            problems.len(),
+            problems.join("\n  ")
+        );
     }
 }
 

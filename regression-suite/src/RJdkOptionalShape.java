@@ -760,8 +760,15 @@ public class RJdkOptionalShape {
         laws("misc.constable.integer", opt(Integer.valueOf(1).describeConstable()), Integer.class);
         laws("misc.constable.string", opt("x".describeConstable()), String.class);
         laws("misc.constable.class", opt(String.class.describeConstable()), ClassDesc.class);
-        laws("misc.stackwalker", opt(StackWalker.getInstance().walk(s -> s.findFirst())),
-                StackWalker.StackFrame.class);
+        // The laws run INSIDE the walk on purpose: a StackFrame is specified to be valid only
+        // for the duration of the walk function, and laws() calls toString() and hashCode() on
+        // the value. Examining it after the walk returned would make this row's own validity a
+        // JDK implementation detail rather than a statement about the Optional.
+        Boolean swPresent = StackWalker.getInstance().walk(s -> {
+            Optional<StackWalker.StackFrame> first = opt(s.findFirst());
+            laws("misc.stackwalker", first, StackWalker.StackFrame.class);
+            return Boolean.valueOf(first.isPresent());
+        });
 
         check(!opt(Object.class.getModule().getDescriptor().mainClass()).isPresent(),
                 "java.base's ModuleDescriptor.mainClass() must be EMPTY");
@@ -769,7 +776,7 @@ public class RJdkOptionalShape {
                 "Integer.valueOf(1).describeConstable() must be Optional[1]");
         check("x".equals(opt("x".describeConstable()).get()),
                 "\"x\".describeConstable() must be Optional[x]");
-        check(opt(StackWalker.getInstance().walk(s -> s.findFirst())).isPresent(),
+        check(swPresent.booleanValue(),
                 "StackWalker.walk(findFirst) must be PRESENT -- this frame exists");
 
         ob("misc-module-mainClass-present",
@@ -939,7 +946,35 @@ public class RJdkOptionalShape {
         check(timed.version() == HttpClient.Version.HTTP_2 || timed.version() == HttpClient.Version.HTTP_1_1,
                 "HttpClient.version() must be an HttpClient.Version constant");
 
-        sectionEnd("httpmint", 12 * LAWS + 14);
+        // Two builder round-trips that need NO enum constant, added by E13.
+        //
+        // Every other present row above reaches its native through an argument
+        // the VM has to mint -- a Duration, an HttpClient.Version. These two do
+        // not, which is why they are here: they are the only rows in this block
+        // that can still speak if the enum constants themselves are unavailable.
+        //
+        // ofByteArray: the argument is a `[B`, and the native that used to read
+        // it matched `Value::Int` against the array reference, so every
+        // publisher it minted claimed length 0 while the `ofString` sibling one
+        // method above always read its reference argument.
+        ob("mint-ofByteArray-len",
+                (int) HttpRequest.BodyPublishers.ofByteArray(new byte[5]).contentLength());
+        check(HttpRequest.BodyPublishers.ofByteArray(new byte[5]).contentLength() == 5L,
+                "BodyPublishers.ofByteArray(new byte[5]).contentLength() must be 5, not 0 -- a"
+                        + " native that reads the array as an int measures nothing");
+
+        // expectContinue is THE NEGATIVE CONTROL of the builder family, in
+        // Java. Its descriptor is (Z): a primitive boolean really does arrive
+        // as an int, so the idiom that is wrong for the six reference-taking
+        // setters is CORRECT here. A blanket "no builder reads an int" fix
+        // breaks this row and nothing else in the block.
+        HttpRequest continued = HttpRequest.newBuilder(uri).GET().expectContinue(true).build();
+        ob("mint-expectContinue-roundtrip", continued.expectContinue() ? 1 : 0);
+        check(continued.expectContinue(),
+                "expectContinue(true) must round-trip -- (Z) is a PRIMITIVE parameter and the"
+                        + " int-reading idiom is right here");
+
+        sectionEnd("httpmint", 12 * LAWS + 16);
     }
 
     // Ordered by how likely each family is to ABORT the VM rather than fail an assertion,

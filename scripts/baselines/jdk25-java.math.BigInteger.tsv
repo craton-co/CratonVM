@@ -1,0 +1,85 @@
+# jdk-baseline	1
+# kind	class
+# name	java.math.BigInteger
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/math/BigInteger.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	52
+# protected-methods	0
+# rows	71
+# columns	kind	name	descriptor	flags
+CLASS	java.math.BigInteger		public
+EXTENDS	java.lang.Number		
+IMPLEMENTS	java.lang.Comparable		
+SUPERTYPE	java.io.Serializable		
+SUPERTYPE	java.lang.Comparable		
+SUPERTYPE	java.lang.Number		
+SUPERTYPE	java.lang.Object		
+METHOD	<init>	(IILjava/util/Random;)V	public
+METHOD	<init>	(ILjava/util/Random;)V	public
+METHOD	<init>	(I[B)V	public
+METHOD	<init>	(I[BII)V	public
+METHOD	<init>	(Ljava/lang/String;)V	public
+METHOD	<init>	(Ljava/lang/String;I)V	public
+METHOD	<init>	([B)V	public
+METHOD	<init>	([BII)V	public
+METHOD	abs	()Ljava/math/BigInteger;	public
+METHOD	add	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	and	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	andNot	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	bitCount	()I	public
+METHOD	bitLength	()I	public
+METHOD	byteValueExact	()B	public
+METHOD	clearBit	(I)Ljava/math/BigInteger;	public
+METHOD	compareTo	(Ljava/lang/Object;)I	public,bridge,synthetic
+METHOD	compareTo	(Ljava/math/BigInteger;)I	public
+METHOD	divide	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	divideAndRemainder	(Ljava/math/BigInteger;)[Ljava/math/BigInteger;	public
+METHOD	doubleValue	()D	public
+METHOD	equals	(Ljava/lang/Object;)Z	public
+METHOD	flipBit	(I)Ljava/math/BigInteger;	public
+METHOD	floatValue	()F	public
+METHOD	gcd	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	getLowestSetBit	()I	public
+METHOD	hashCode	()I	public
+METHOD	intValue	()I	public
+METHOD	intValueExact	()I	public
+METHOD	isProbablePrime	(I)Z	public
+METHOD	longValue	()J	public
+METHOD	longValueExact	()J	public
+METHOD	max	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	min	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	mod	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	modInverse	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	modPow	(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	multiply	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	negate	()Ljava/math/BigInteger;	public
+METHOD	nextProbablePrime	()Ljava/math/BigInteger;	public
+METHOD	not	()Ljava/math/BigInteger;	public
+METHOD	or	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	parallelMultiply	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	pow	(I)Ljava/math/BigInteger;	public
+METHOD	probablePrime	(ILjava/util/Random;)Ljava/math/BigInteger;	public,static
+METHOD	remainder	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	setBit	(I)Ljava/math/BigInteger;	public
+METHOD	shiftLeft	(I)Ljava/math/BigInteger;	public
+METHOD	shiftRight	(I)Ljava/math/BigInteger;	public
+METHOD	shortValueExact	()S	public
+METHOD	signum	()I	public
+METHOD	sqrt	()Ljava/math/BigInteger;	public
+METHOD	sqrtAndRemainder	()[Ljava/math/BigInteger;	public
+METHOD	subtract	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+METHOD	testBit	(I)Z	public
+METHOD	toByteArray	()[B	public
+METHOD	toString	()Ljava/lang/String;	public
+METHOD	toString	(I)Ljava/lang/String;	public
+METHOD	valueOf	(J)Ljava/math/BigInteger;	public,static
+METHOD	xor	(Ljava/math/BigInteger;)Ljava/math/BigInteger;	public
+FIELD	ONE	Ljava/math/BigInteger;	public,static,final
+FIELD	TEN	Ljava/math/BigInteger;	public,static,final
+FIELD	TWO	Ljava/math/BigInteger;	public,static,final
+FIELD	ZERO	Ljava/math/BigInteger;	public,static,final

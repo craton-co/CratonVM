@@ -1,0 +1,47 @@
+# jdk-baseline	1
+# kind	class
+# name	java.lang.module.ModuleDescriptor
+# module	java.base
+# java.version	25.0.3
+# java.vm.version	25.0.3+9-LTS
+# java.vendor.version	Microsoft-13877124
+# source	jrt:/modules/java.base/java/lang/module/ModuleDescriptor.class
+# generator	scripts/jdk-baseline/generate.py
+# regenerate	python scripts/jdk-baseline/generate.py --update
+# public-methods	28
+# protected-methods	0
+# rows	33
+# columns	kind	name	descriptor	flags
+CLASS	java.lang.module.ModuleDescriptor		public,final
+EXTENDS	java.lang.Object		
+IMPLEMENTS	java.lang.Comparable		
+SUPERTYPE	java.lang.Comparable		
+SUPERTYPE	java.lang.Object		
+METHOD	accessFlags	()Ljava/util/Set;	public
+METHOD	compareTo	(Ljava/lang/Object;)I	public,bridge,synthetic
+METHOD	compareTo	(Ljava/lang/module/ModuleDescriptor;)I	public
+METHOD	equals	(Ljava/lang/Object;)Z	public
+METHOD	exports	()Ljava/util/Set;	public
+METHOD	hashCode	()I	public
+METHOD	isAutomatic	()Z	public
+METHOD	isOpen	()Z	public
+METHOD	mainClass	()Ljava/util/Optional;	public
+METHOD	modifiers	()Ljava/util/Set;	public
+METHOD	name	()Ljava/lang/String;	public
+METHOD	newAutomaticModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
+METHOD	newModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
+METHOD	newModule	(Ljava/lang/String;Ljava/util/Set;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
+METHOD	newOpenModule	(Ljava/lang/String;)Ljava/lang/module/ModuleDescriptor$Builder;	public,static
+METHOD	opens	()Ljava/util/Set;	public
+METHOD	packages	()Ljava/util/Set;	public
+METHOD	provides	()Ljava/util/Set;	public
+METHOD	rawVersion	()Ljava/util/Optional;	public
+METHOD	read	(Ljava/io/InputStream;)Ljava/lang/module/ModuleDescriptor;	public,static
+METHOD	read	(Ljava/io/InputStream;Ljava/util/function/Supplier;)Ljava/lang/module/ModuleDescriptor;	public,static
+METHOD	read	(Ljava/nio/ByteBuffer;)Ljava/lang/module/ModuleDescriptor;	public,static
+METHOD	read	(Ljava/nio/ByteBuffer;Ljava/util/function/Supplier;)Ljava/lang/module/ModuleDescriptor;	public,static
+METHOD	requires	()Ljava/util/Set;	public
+METHOD	toNameAndVersion	()Ljava/lang/String;	public
+METHOD	toString	()Ljava/lang/String;	public
+METHOD	uses	()Ljava/util/Set;	public
+METHOD	version	()Ljava/util/Optional;	public

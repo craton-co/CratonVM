@@ -235,9 +235,9 @@ marginally smaller wrong number.
 | `getNumericValue` | 784 | **372** | `Nl`/`No`/`-2` residual |
 | `isLetterOrDigit` | 1,257 | **957** | now exactly `isLetter\|\|isDigit` |
 | `isLetter` | 957 | 957 | no std route — N2 |
-| `toUpperCase` | 2,153 | **27** | needs N1 to take effect |
-| `toLowerCase` | 2,051 | **3** | needs N1 to take effect |
-| `isUpperCase` / `isLowerCase` | 3 / 3 | 3 / 3 | Unicode version skew |
+| `toUpperCase` | 2,153 | **0** | E7-1: enumerated from JDK 25, all planes |
+| `toLowerCase` | 2,051 | **0** | E7-1: enumerated from JDK 25, all planes |
+| `isUpperCase` / `isLowerCase` | 3 / 3 | **0 / 0** | E7-1: enumerated; the skew list is gone |
 
 **These "after" numbers are derived, not executed.** This lane may not build, so
 no binary containing them exists yet. The `isWhitespace`, `isDigit` and
@@ -363,19 +363,30 @@ and an audit of its callers; until then, treat any native that round-trips a
   `Other_Alphabetic`. No Rust std route. Closed by N2.
 * **`getNumericValue`** — 372 BMP code points: `Nl`/`No` values and the `-2`
   sentinel. Closed by N2.
-* **`toUpperCase`** — 27 BMP code points, the `U+1F80..U+1FAF` / `U+1FB3` /
+* **`toUpperCase`** — was 27 BMP code points, the `U+1F80..U+1FAF` / `U+1FB3` /
   `U+1FC3` / `U+1FF3` ypogegrammeni family, where the full mapping is multi-char
-  but the simple mapping is a *different* single char. Closed by N2.
-* **Supplementary digits** — `isDigit(int)` / `digit(int,int)` for
-  `U+1D7CE..U+1E959`. `JAVA_DIGIT_RUNS` is BMP-only *by design* (its doc comment
-  explains why: `Integer.parseInt` walks with `charAt`, so a supplementary digit
-  arrives as a surrogate pair and matches nothing — extending the table would
-  make `parseInt` more permissive than Java). Unchanged by this work, and only
-  reachable through the `int` overloads. Closed by N2.
-* **`isUpperCase` / `isLowerCase`** — 3 code points each
+  but the simple mapping is a *different* single char. **Closed by E7-1**, which
+  replaced the derivation with `JAVA_TO_UPPER_RUNS` / `JAVA_TO_LOWER_RUNS`
+  enumerated from JDK 25 over all 1,114,112 code points. Not by N2 — the natives
+  are still registered.
+* **Supplementary digits** — split into two halves that were closed separately.
+  `isDigit(int)` / `isLetterOrDigit(int)` are **closed**: W7-95(C1) added
+  `JAVA_SUPPLEMENTARY_DIGIT_RUNS` (39 runs, 390 code points) beside the BMP
+  table, because the code-POINT overloads really do answer for them.
+  `digit(int,int)` is **not a residual at all** — it is unregistered, so real
+  `CharacterData` bytecode answers it and answers it correctly; see
+  `E17-1-character-digit-int-and-the-fifteen-unregistered.md`, which measures
+  what a naive `(II)I` registration against `native_character_digit` would cost
+  (**12,246** wrong answers over 390 code points × 35 radices) and records why
+  it must not be added. `JAVA_DIGIT_RUNS` stays BMP-only *by design* (its doc
+  comment explains why: `Integer.parseInt` walks with `charAt`, so a
+  supplementary digit arrives as a surrogate pair and matches nothing —
+  extending that table would make `parseInt` more permissive than Java).
+* **`isUpperCase` / `isLowerCase`** — was 3 code points each
   (`U+0295`, `U+A7CE`, `U+A7CF`, `U+A7D2`, `U+A7D4`, `U+A7F1`): Unicode
-  **version** skew between Rust's tables and JDK 25's, not a rule error. Closed
-  by N2, which is version-locked to the image by construction.
+  **version** skew between Rust's tables and JDK 25's, not a rule error.
+  **Closed by E7-1**'s `JAVA_UPPERCASE_RUNS` / `JAVA_LOWERCASE_RUNS`, which are
+  version-locked to the image by construction. Not by N2.
 * **Methods not reached by this lane**: `codePointAt(char[],int)`,
   `codePointCount`, `offsetByCodePoints`, `toChars`, `reverseBytes`,
   `getName`, `codePointOf`, `UnicodeBlock`/`UnicodeScript` lookups, and the

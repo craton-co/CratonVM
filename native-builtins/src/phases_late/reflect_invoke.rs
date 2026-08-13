@@ -2815,9 +2815,12 @@ pub(crate) fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) 
 /// path) and `register_essential_natives` (native-builtins/src/lib.rs, the
 /// path the default `cratonvm-cli` build actually uses — `register_p59_module`
 /// is unreachable there, since its only caller chain is entirely
-/// `#[cfg(feature = "synthetic-jdk")]`-gated; see `native_module_get_descriptor`
-/// or `Module.canUse` in lib.rs for the fuller writeup of this recurring
-/// essential-vs-synthetic-jdk gap).
+/// `#[cfg(feature = "synthetic-jdk")]`-gated; see the `Module.getDescriptor`
+/// registration in `register_essential_natives` (`lib.rs:12229`) or
+/// `Module.canUse` in lib.rs for the fuller writeup of this recurring
+/// essential-vs-synthetic-jdk gap. There is no fn named
+/// `native_module_get_descriptor` — this pointer was stale; the essential
+/// `getDescriptor` is an inline closure).
 ///
 /// Unlike `getDescriptor`, real bytecode doesn't NPE for `canRead` — it
 /// silently returns the WRONG boolean instead, which is easy to miss in a
@@ -2987,21 +2990,147 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     let ml = "java/lang/ModuleLayer";
 
     // ModuleLayer.boot() → ModuleLayer
+    //
+    // WIDTH: 2, not 1. Neither number is the real JDK width — `javap -p
+    // java.lang.ModuleLayer` on openjdk 25.0.3+9 declares SIX instance fields
+    // (`cf`, `parents`, `nameToModule`, `allLayers`, `modules`,
+    // `servicesCatalog`). 2 is what THIS VM declares for its synthetic
+    // stand-in (`classloading/src/class_manager.rs:15403`,
+    // `"java/lang/ModuleLayer" => instance_fields(2)`, fields literally named
+    // `_f0`/`_f1`) and it is what the essential twin allocates
+    // (`jboss_jdkspecific.rs:190`, `MODULE_LAYER_FIELD_COUNT = 2`, used by
+    // `build_boot_layer`). This triple is in the p59/essential INTERSECTION
+    // (`phases_late.rs`, `P59_AND_ESSENTIAL`): which body runs is decided by
+    // the VM mode, not by the caller, so the two must stay interchangeable.
+    //
+    // The `1` was NOT an out-of-bounds hazard at the allocation, and saying so
+    // would be wrong: `try_alloc_concurrent_synthetic` ends its success arm
+    // with `let n = num_fields.max(real)` (util_concurrent_ext.rs:983), so an
+    // under-request is clamped UP to the class's declared count and this
+    // already produced a 2-slot object. What the `1` bought was a
+    // `report_layout_alias("java/lang/ModuleLayer", 1, 2)` on EVERY call, via
+    // `layout_alias::classify` — the mismatch detector firing on a mismatch
+    // that was this file's own — plus a real hazard in the FAILURE arm, where
+    // `refused_class(ctx, name, 1)` → `try_ensure_synthetic_class(name, 1)`
+    // fabricates a genuinely 1-field `java/lang/ModuleLayer` class
+    // (`fabricate_class` sets `num_total_fields: num_fields` verbatim,
+    // class_manager.rs:4249) and a matching object, after which the twin's
+    // `MODULE_LAYER_FIELD_COUNT` write is out of bounds by construction.
+    //
+    // Nothing reads slot 1 by index anywhere in the tree; `build_boot_layer`
+    // addresses `parents`/`nameToModule`/`modules` by NAME. See
+    // docs/known-issues/jdk-only/E20-R11-INTERSECTION-BLIND-GUARD-20260813.md §4.1.
     r.register(ml, "boot", "()Ljava/lang/ModuleLayer;", |ctx, _args| {
-        let layer = try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", 1)?;
+        let layer = try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", 2)?;
         ctx.set_field(layer, 0, Value::Int(1)); // is boot
         Ok(Some(Value::Object(Some(layer))))
     });
 
     // ModuleLayer.modules() → Set<Module>
-    // Returns Module objects for all registered modules in the boot layer.
-    r.register(ml, "modules", "()Ljava/util/Set;", |ctx, _args| {
+    // Returns Module objects for all registered modules in the boot layer,
+    // MINUS every module whose only source is the application CLASS path.
+    //
+    // The registry is not the boot layer. `ClassManager::new` scans the app
+    // class path for `module-info.class` and registers what it finds, so
+    // `all_module_names()` includes modular jars that arrived on `-cp`. A real
+    // JVM ignores such a `module-info` outright — the jar is an unnamed-module
+    // citizen — so it is in neither `ModuleLayer.boot().modules()` nor
+    // `findModule`. Measured on HotSpot 25 today with one jar in two positions
+    // (scratchpad/e16, `com.e16.svc`, a javac-built modular jar with NO
+    // `ModulePackages` attribute — the shape 38 of the corpus's 51 module-info
+    // jars have):
+    //
+    // | jar position   | findModule | modules() contains | getModule().isNamed() |
+    // |----------------|------------|--------------------|-----------------------|
+    // | `-cp`          | false      | false              | false                 |
+    // | `--module-path`| true       | true               | true                  |
+    //
+    // All three flip together; answering `true` here for a `-cp` jar while
+    // `Class.getModule()` below answers the unnamed module is a state HotSpot
+    // never produces, and it is what let `ServiceLoader` see one provider twice
+    // (`JUnitException: Cannot create Launcher for multiple engines with the
+    // same ID 'junit-jupiter'`).
+    //
+    // Same gate, same accessor, as `populate_boot_layer_modules`
+    // (jboss_jdkspecific.rs) — deliberately NOT a second filter. Note this
+    // surface's exposure is NOT the `ModulePackages`-dependent one:
+    // `Class.getModule()` further down calls `module_name_of_class`, which
+    // returns the class record's `module_name`, which `ClassManager` computed
+    // once at define time from `ModuleRegistry::module_for_package`
+    // (class_manager.rs:6178) — and a `module-info` with no `ModulePackages`
+    // attribute registers ZERO packages, so that lookup misses and
+    // `getModule()` answers unnamed. That accidental miss is what kept 13 of
+    // the corpus's 14 double-source jars from tripping the JDK's `isNamed()`
+    // guard. `all_module_names()` is the registry's KEY set: it misses nothing.
+    // So this pair would report a `-cp` module present regardless of
+    // `ModulePackages` — strictly wider exposure than the boot-layer path, not
+    // narrower.
+    //
+    // See docs/known-issues/jdk-only/E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX-20260813.md
+    // (§4.1 and NOM E-7) and docs/known-issues/jdk-only/E16-R11-P59-MODULE-LAYER-TWIN-20260813.md.
+    r.register(ml, "modules", "()Ljava/util/Set;", |ctx, args| {
         use cratonvm_types::ArrayElementType;
-        let names = ctx.all_module_names();
+        // A receiver carrying its OWN `nameToModule` map is its own authority,
+        // and answering it from the boot `ModuleRegistry` is asking the wrong
+        // object — the rule `native_module_layer_find_module` already states
+        // for `findModule`. The essential twin
+        // (`jboss_jdkspecific::native_module_layer_modules`) implements exactly
+        // that arm, and it carries a SIDE EFFECT this body never had: it calls
+        // `ServicesCatalog.create()`, `register(Module)`s every value of the
+        // map into it, and writes the result back to the receiver's
+        // `servicesCatalog` field (it also caches the derived set into
+        // `modules`). `service_loader.rs:775-790` invokes
+        // `ModuleLayer.modules()` for that side effect ALONE — it discards the
+        // returned Set and then reads `layer.servicesCatalog` — so without it
+        // `ServiceLoader.load(layer, service)` sees zero module-sourced
+        // providers, which is the `module service providers: []` shape
+        // `jboss_jdkspecific.rs:347-357` documents.
+        //
+        // CALL the twin; do not copy it. The gate below is the twin's own
+        // entry condition, so the two bodies cannot disagree about when the
+        // arm applies. Delegating UNCONDITIONALLY would be wrong: the twin's
+        // fallback builds an EMPTY `java/util/HashSet` through its real
+        // constructor, so a synthetic 2-slot boot layer would go from the
+        // registry's module list to nothing.
+        //
+        // PREDICTED: inert as of today, and the reason is worth writing down
+        // because it corrects the record this closes. In synthetic-jdk mode —
+        // the ONLY mode this registrar runs in (`vm_init.rs:1932`) —
+        // `java/lang/ModuleLayer` resolves to the fabricated stub
+        // `class_manager.rs:15403` declares as `instance_fields(2)`, whose
+        // fields are named `_f0`/`_f1`. `get_field_by_name`
+        // (`vm_exec.rs:10980`) returns `Object(None)` for a name that does not
+        // resolve, so the gate below is false — and so is the identical gate
+        // inside the twin. The same fact makes `build_boot_layer`'s three
+        // `set_field_by_name` writes no-ops. The runtime blocker on the
+        // services catalog in synthetic mode is therefore the field NAMES, not
+        // which registrar won: neither body would have written a catalog.
+        // See docs/known-issues/jdk-only/E28-R11-P59-MODULE-WIDTHS-AND-CATALOG-20260813.md,
+        // which nominates the `class_manager.rs` change that makes this live.
+        if let Some(Value::Object(Some(layer))) = args.first() {
+            if matches!(
+                ctx.get_field_by_name(*layer, "nameToModule"),
+                Value::Object(Some(_))
+            ) {
+                return crate::jboss_jdkspecific::native_module_layer_modules(ctx, args);
+            }
+        }
+        let all = ctx.all_module_names();
+        let names: Vec<String> = all
+            .into_iter()
+            .filter(|name| !ctx.module_is_class_path_only(name))
+            .collect();
         let len = names.len();
         let arr = ctx.new_array(ArrayElementType::Reference, len);
         for (i, name) in names.iter().enumerate() {
-            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
+            // 5: `class_manager.rs:15407` declares the synthetic
+            // `java/lang/Module` as `instance_fields(5)` and the essential
+            // twin's builder (`jboss_jdkspecific::build_module`) allocates
+            // `MODULE_FIELD_COUNT = 5`. The object was already 5 slots wide
+            // (`num_fields.max(real)`); asking 2 only fired
+            // `report_layout_alias("java/lang/Module", 2, 5)` on every module
+            // of every call.
+            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
             let name_str = ctx.create_string(name);
             ctx.set_field(m_obj, 0, Value::Object(Some(name_str)));
             // field 1 = layer — we don't set it here to avoid infinite recursion
@@ -3015,20 +3144,43 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     });
 
     // ModuleLayer.findModule(String) → Optional<Module>
+    //
+    // Empty for a modular jar that reached the registry only through the
+    // application class path — see the `modules()` comment above for the
+    // HotSpot 25 transcript both surfaces are matched against, and for why the
+    // gate cannot be left off "because it is dead": this registrar OVERWRITES
+    // `jboss_jdkspecific`'s filtered pair whenever it runs.
     r.register(
         ml,
         "findModule",
         "(Ljava/lang/String;)Ljava/util/Optional;",
         |ctx, args| {
+            // Same delegation, same gate, same reason as `modules()` above: a
+            // layer that carries its own `nameToModule` is authoritative in
+            // BOTH directions, and the essential twin
+            // (`jboss_jdkspecific::native_module_layer_find_module`) is the
+            // body that consults it — a miss there is a real absence, not a
+            // reason to fall through to the boot registry. Also inert today
+            // for the same reason (the synthetic stub's fields are `_f0`/`_f1`).
+            if let Some(Value::Object(Some(layer))) = args.first() {
+                if matches!(
+                    ctx.get_field_by_name(*layer, "nameToModule"),
+                    Value::Object(Some(_))
+                ) {
+                    return crate::jboss_jdkspecific::native_module_layer_find_module(ctx, args);
+                }
+            }
             let name_str = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
             let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            // Check if this module exists in the registry.
+            // Check if this module exists in the registry AND is a real module
+            // of the boot layer rather than a `-cp` jar's ignored descriptor.
             let names = ctx.all_module_names();
-            if names.iter().any(|n| n == &name_str) {
-                let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
+            if names.iter().any(|n| n == &name_str) && !ctx.module_is_class_path_only(&name_str) {
+                // 5 — see the `modules()` allocation above.
+                let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
                 let js = ctx.create_string(&name_str);
                 ctx.set_field(m_obj, 0, Value::Object(Some(js)));
                 ctx.set_field(opt, 0, Value::Object(Some(m_obj)));
@@ -3081,7 +3233,29 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/module/ModuleDescriptor;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 2)?;
+            // 16, not 2 — and this one is NOT a clamped floor. There is no
+            // `java/lang/module/ModuleDescriptor` arm in
+            // `class_manager.rs::synthetic_stub_fields`, so the fabricated stub
+            // declares ZERO instance fields, `class_num_total_fields` answers
+            // 0, and `num_fields.max(real)` leaves the request untouched: this
+            // site produced genuinely 2-slot descriptors while all SEVEN other
+            // allocation sites in the tree produce 16-slot ones
+            // (`jboss_jdkspecific.rs:1642` `build_module_descriptor` — which is
+            // what the essential `Module.getDescriptor` twin at `lib.rs:12229`
+            // reaches through `build_synthetic_module_descriptor` — and `:1733`;
+            // `reflect_annotations.rs:1672`, `:2048`, `:2110`, `:2178`). One
+            // class, two object widths, decided by which registrar ran.
+            //
+            // Slots 0 (name) and 1 (flags) below keep their meaning; the
+            // essential `isOpen` twin (`reflect_annotations.rs:1419`) reads
+            // slot 1 UNGUARDED as its fallback, so uniform width is what keeps
+            // that read in bounds for every descriptor regardless of origin.
+            // The `layout_alias` report is NOT silenced by this — `classify(n,
+            // 0)` reports `Undeclared` for any `n` — and the fix for that is a
+            // declaration, nominated in
+            // docs/known-issues/jdk-only/E28-R11-P59-MODULE-WIDTHS-AND-CATALOG-20260813.md.
+            let desc =
+                try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
             ctx.set_field(desc, 0, ctx.get_field(this, 0)); // name
             ctx.set_field(desc, 1, Value::Int(0)); // flags
             Ok(Some(Value::Object(Some(desc))))
@@ -3176,7 +3350,9 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     // Queries the real readability graph in the ModuleRegistry.
     //
     // Same essential-vs-synthetic-jdk coverage gap as `getDescriptor` (see
-    // `native_module_get_descriptor`'s doc comment): this closure is
+    // `native_module_can_read`'s doc comment above; the `getDescriptor` twin
+    // is the inline closure at `lib.rs:12229`, not a fn named
+    // `native_module_get_descriptor` — no such fn exists): this closure is
     // registered here AND in `register_essential_natives`
     // (native-builtins/src/lib.rs) via the shared `native_module_can_read`
     // fn — this function's own registration only takes effect in
@@ -3289,7 +3465,16 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             // getModule() returns a stale ref (a reused slot → String →
             // `String.isNamed()` NoSuchMethodError). Same bug class as
             // reference_classloader_gc_root_gap.
-            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
+            //
+            // 5, per `class_manager.rs:15407` (`instance_fields(5)`) and
+            // `jboss_jdkspecific.rs:214` (`MODULE_FIELD_COUNT = 5`). NOTE the
+            // OTHER twin of this very triple, `lib.rs`'s real-JDK
+            // `Class.getModule()`, still asks 2 — the declaration and the two
+            // essential registrars do not agree with each other about this
+            // class. 5 is the only number that is never an under-request, and
+            // the object was 5 slots wide either way; see the nomination in
+            // docs/known-issues/jdk-only/E28-R11-P59-MODULE-WIDTHS-AND-CATALOG-20260813.md.
+            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 5)?;
             let pin = ctx.pin_native_root(m_obj);
             let module_name_val = module_name
                 .as_deref()

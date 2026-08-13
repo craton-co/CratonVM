@@ -32,8 +32,37 @@
 //    proves the file system half stayed fixed.
 //
 // Every expectation was measured on Microsoft OpenJDK 25.0.3+9 (HotSpot is
-// the oracle), transcript in W8-C14-1 section 2. Output is one ok/FAIL line
-// per check plus a final @@RESULT line.
+// the oracle), transcript in W8-C14-1 section 2.
+//
+// OUTPUT DIALECT -- read this before changing a println.
+//
+// run.sh's extract() keeps ONLY lines prefixed `PASS ` or `CK ` and deletes
+// everything else before the cross-VM diff. This file used to print
+// `ok <name>` per check and end on `@@RESULT checks=12 fails=0`: 13 lines out
+// of 13 were DELETED, the cross-VM key was the empty string, and no
+// `PASS RFsSingleton` line was ever printed -- so run.sh scored the vector
+// `FAIL no PASS line` on any VM, including a correct one, and guards G4+G2+G3
+// all fired on the ORACLE arm. Measured on HotSpot 25.0.3+9; the fourth
+// instance of the shape repaired in
+// docs/known-issues/jdk-only/W8-E9-1-three-broken-oracles-and-the-suite-denominator.md.
+//
+// So: every check funnels through check()/checkStr(), which print
+// `CK RFsSingleton <name>=<ACTUAL>`. The value is the VM's own answer, never
+// this file's expectation, so the two VMs diff their answers against EACH
+// OTHER and not each against a constant. The tail is
+// `CK RFsSingleton fails=N`, then `CK RFsSingleton checks=N`, then
+// `PASS RFsSingleton (N checks)` on the clean path only.
+//
+// `fails` and `checks` are on SEPARATE lines deliberately.
+// harness_check_count does `sub(/^.*checks=/, ""); print`, i.e. it takes the
+// whole rest of the line, so a combined `CK ... checks=12 fails=0` yields the
+// "count" `12 fails=0` and G3's numeric test then errors out inside its own
+// `2>/dev/null`. One value per line.
+//
+// `@@RESULT` was DROPPED rather than kept alongside: it is on a deleted
+// prefix, so keeping it would re-fire G1 for one line. Checked before
+// removing -- nothing under regression-suite/ parses `@@RESULT`, and the
+// runners that do (apps/hib-suite-runner, probes/) never run this class.
 
 import java.net.URI;
 import java.nio.file.FileSystem;
@@ -48,13 +77,29 @@ public class RFsSingleton {
     static int checks = 0;
     static int fails = 0;
 
+    // The single funnel. It prints the ACTUAL answer unconditionally -- a line
+    // that only appears when a check passes is a line the diff cannot use, and
+    // one that carries the EXPECTED value would make both VMs print the same
+    // text whatever they did.
     static void check(String name, boolean actual, boolean expected) {
         checks++;
-        if (actual == expected) {
-            System.out.println("ok " + name);
-        } else {
+        System.out.println("CK RFsSingleton " + name + "=" + actual);
+        if (actual != expected) {
             fails++;
-            System.out.println("FAIL " + name + " expected=" + expected + " actual=" + actual);
+            System.out.println("CK RFsSingleton FAILED " + name + " expected=" + expected);
+        }
+    }
+
+    // Same funnel for the one check whose observable is a string rather than a
+    // boolean. It must not collapse to `scheme.equals("file")`: the defect this
+    // vector was written against answered "jrt" for the platform file system,
+    // and a boolean would tell the reader only that something was wrong.
+    static void checkStr(String name, String actual, String expected) {
+        checks++;
+        System.out.println("CK RFsSingleton " + name + "=" + actual);
+        if (!expected.equals(actual)) {
+            fails++;
+            System.out.println("CK RFsSingleton FAILED " + name + " expected=" + expected);
         }
     }
 
@@ -94,14 +139,7 @@ public class RFsSingleton {
         // sun.nio.fs.WindowsFileSystem receiver hold defaultDirectory and
         // defaultRoot: both non-null, so it answered "jrt" for the platform's
         // own file system.)
-        checks++;
-        String scheme = p1.getScheme();
-        if ("file".equals(scheme)) {
-            System.out.println("ok prov.scheme");
-        } else {
-            fails++;
-            System.out.println("FAIL prov.scheme expected=file actual=" + scheme);
-        }
+        checkStr("prov.scheme", p1.getScheme(), "file");
 
         // The javadoc of FileSystemProvider.installedProviders makes the default
         // provider the FIRST element of that list.
@@ -133,9 +171,11 @@ public class RFsSingleton {
         defaultFileSystem();
         defaultProvider();
         negativeControls();
-        System.out.println("@@RESULT checks=" + checks + " fails=" + fails);
+        System.out.println("CK RFsSingleton fails=" + fails);
+        System.out.println("CK RFsSingleton checks=" + checks);
         if (fails != 0) {
             throw new RuntimeException(fails + " default-filesystem singleton checks failed");
         }
+        System.out.println("PASS RFsSingleton (" + checks + " checks)");
     }
 }

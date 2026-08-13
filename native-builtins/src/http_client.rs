@@ -90,6 +90,16 @@ const HRS_NUM_FIELDS: usize = 7;
 const HTTP_VERSION_1_1: i32 = 0;
 const HTTP_VERSION_2: i32 = 1;
 
+/// `HRQ_VERSION`'s "no version override on this request" encoding.
+///
+/// A distinct sentinel is needed because this file's `HTTP_VERSION_1_1` is `0`
+/// — the JDK's real ordinal — so `0` already means HTTP/1.1 and cannot double
+/// as "unset". (`http2.rs` stores `ordinal + 1` for exactly this reason and so
+/// gets `0` for free; the two encodings are reconciled in
+/// `http_version_mirror`.) Only `HttpRequestImpl` has an "unset" state:
+/// `HttpClient.version()` always answers a concrete version on the oracle.
+const HRQ_VERSION_UNSET: i32 = -1;
+
 const REDIRECT_NEVER: i32 = 0;
 const REDIRECT_NORMAL: i32 = 1;
 const REDIRECT_ALWAYS: i32 = 2;
@@ -1450,6 +1460,161 @@ fn do_send(
     Ok(Some(Value::Object(Some(resp_obj))))
 }
 
+// ---------------------------------------------------------------------------
+// Enum mirrors and Optional payloads
+//
+// E13-1 §3 named the shape these helpers exist to remove: a native that answers
+// in a form its DESCRIPTOR does not name. Nine sites in this file stored an
+// `Int` — an ordinal or a raw millisecond count — and then handed it to
+// bytecode that was about to `checkcast`/`areturn` a reference, or buried it in
+// slot 0 of a `java.util.Optional`, where `isPresent()` reads it as PRESENT
+// (`ref_operand_is_null` counts `Object(None)`, `Uninitialized` and `Long(0)`
+// as null, and `Value::Int(0)` is not among them).
+// ---------------------------------------------------------------------------
+
+/// Resolve an enum constant by ORDINAL, through the class's static field.
+///
+/// Going through the static is what makes the answer the *same object*
+/// `GETSTATIC` yields, so `client.version() == HttpClient.Version.HTTP_2` and
+/// `client.version() == client.version()` both hold. Minting a fresh instance
+/// per call (the `p57_alloc_enum` shape) satisfies neither, and an enum whose
+/// constants fail `==` breaks `EnumMap`, `EnumSet` and every `switch` on it.
+///
+/// The constants come from `phases_late::net_channels`, which owns the
+/// `<clinit>` that publishes them — deliberately NOT a second copy of the name
+/// list here. `net_channels`' registration comment records why a `<clinit>` is
+/// the only shape that works.
+///
+/// Fails to `Object(None)` rather than to the ordinal: the callers below all
+/// declare a reference return, and surfacing a primitive tag there is the
+/// unsoundness this whole helper exists to end.
+fn enum_constant_static(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    constants: &[&str],
+    ordinal: i32,
+) -> Value {
+    let Ok(idx) = usize::try_from(ordinal) else {
+        return Value::Object(None);
+    };
+    let Some(name) = constants.get(idx) else {
+        return Value::Object(None);
+    };
+    let Ok(cid) = ctx.ensure_class_initialized(class_name) else {
+        return Value::Object(None);
+    };
+    match ctx.static_field_index_by_name(cid, name) {
+        Some(slot) => match ctx.get_static_field(cid, slot) {
+            v @ Value::Object(Some(_)) => v,
+            _ => Value::Object(None),
+        },
+        None => Value::Object(None),
+    }
+}
+
+/// `HttpClient.Version` for an ordinal in THIS file's encoding.
+///
+/// **The two files disagree about the encoding and both are internally
+/// consistent.** Here `HTTP_VERSION_1_1 = 0` / `HTTP_VERSION_2 = 1` — the JDK's
+/// real ordinals. In `http2.rs` the same names are `1` and `2`, because that
+/// file needs `0` to mean "no version override". Nothing hands one file's
+/// stored int to the other today; if anything ever does, this is where it will
+/// go wrong, so the ordinal is converted at the boundary here rather than
+/// stored as a shared convention.
+fn http_version_mirror(ctx: &mut dyn NativeContext, ordinal: i32) -> Value {
+    enum_constant_static(
+        ctx,
+        crate::phases_late::net_channels::HTTP_CLIENT_VERSION,
+        crate::phases_late::net_channels::HTTP_VERSION_CONSTANTS,
+        ordinal,
+    )
+}
+
+/// `HttpClient.Redirect` for an ordinal in this file's encoding, which is
+/// `NEVER = 0`, `NORMAL = 1`, `ALWAYS = 2` — and that is NOT the JDK's
+/// declaration order, which is `NEVER`(0), `ALWAYS`(1), `NORMAL`(2) (measured:
+/// `javap -p java.net.http.HttpClient$Redirect`, and `values()` on JDK
+/// 25.0.3+9-LTS). The two are remapped here rather than renumbered, because
+/// `REDIRECT_*` is compared against a wire-behaviour flag in `do_send` and
+/// renumbering would change which requests follow redirects.
+fn http_redirect_mirror(ctx: &mut dyn NativeContext, stored: i32) -> Value {
+    let jdk_ordinal = match stored {
+        REDIRECT_ALWAYS => 1,
+        REDIRECT_NORMAL => 2,
+        REDIRECT_NEVER => 0,
+        _ => return Value::Object(None),
+    };
+    enum_constant_static(
+        ctx,
+        crate::phases_late::net_channels::HTTP_CLIENT_REDIRECT,
+        crate::phases_late::net_channels::HTTP_REDIRECT_CONSTANTS,
+        jdk_ordinal,
+    )
+}
+
+/// A 1-slot `java.util.Optional` holding a `java.time.Duration`, or empty.
+///
+/// One helper for both `HttpClientImpl.connectTimeout()` and
+/// `HttpRequestImpl.timeout()` — they had the same job and only one of them did
+/// it. `0` is this file's "unset" encoding for both fields and maps to EMPTY,
+/// which is what the oracle answers for a default client and a default request
+/// (`Optional.empty` for both, measured on JDK 25.0.3+9-LTS).
+///
+/// The seconds/nanos split is floor-normalised (`div_euclid`/`rem_euclid`), not
+/// truncating: a real `Duration.ofMillis(-1500)` is `seconds = -2,
+/// nanos = +500_000_000`, and `nanos` is documented non-negative. The
+/// truncating form this replaces produced `seconds = -1, nanos = -500_000_000`,
+/// which no JDK `Duration` method is prepared for.
+///
+/// `opt` is pinned across the `Duration` allocation: it is an `ObjectRef` held
+/// in a Rust local while another allocation runs, which is the native
+/// stale-local family. Both of this file's `Duration`-minting sites now route
+/// through here, so the file has no half-pinned pair.
+fn alloc_optional_duration_ms(
+    ctx: &mut dyn NativeContext,
+    ms: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+    if ms == 0 {
+        ctx.set_field(opt, 0, Value::Object(None));
+        return Ok(opt);
+    }
+    let opt_pin = ctx.pin_native_root(opt);
+    let dur = try_alloc_concurrent_synthetic(ctx, "java/time/Duration", 2)?;
+    let opt = ctx.read_native_pin(opt_pin, opt);
+    ctx.unpin_native_roots(opt_pin);
+    ctx.set_field(dur, 0, Value::Long(ms.div_euclid(1000)));
+    // Cast: `rem_euclid(1000)` is in `0..=999`, so the product is at most
+    // 999_000_000 — inside `i32`.
+    ctx.set_field(dur, 1, Value::Int((ms.rem_euclid(1000) * 1_000_000) as i32));
+    ctx.set_field(opt, 0, Value::Object(Some(dur)));
+    Ok(opt)
+}
+
+/// A 1-slot `java.util.Optional` wrapping a value that is already a reference
+/// (or `Object(None)` for empty).
+///
+/// The arity was right at every one of these sites before this patch; what
+/// this centralises is the rule that slot 0 of a `java.util.Optional` is the
+/// REFERENCE `value` field and nothing else. `OptionalInt`/`OptionalLong`/
+/// `OptionalDouble` really are `(boolean isPresent, T value)` and must NOT be
+/// routed through here.
+fn alloc_optional_ref(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+    ctx.set_field(
+        opt,
+        0,
+        match value {
+            v @ Value::Object(Some(_)) => v,
+            _ => Value::Object(None),
+        },
+    );
+    Ok(opt)
+}
+
 fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
     let cls = "jdk/internal/net/http/HttpResponseImpl";
     r.register(cls, "statusCode", "()I", |ctx, args| {
@@ -1497,8 +1662,13 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, ctx.get_field(this, HRS_PREVIOUS));
+            // CORRECT BEFORE THIS PATCH and re-verified, not swept up:
+            // `HRS_PREVIOUS` is a reference slot (`alloc_response` writes
+            // `Object(None)` into it), so slot 0 of the Optional received a
+            // reference. Routed through the shared helper for the invariant,
+            // not for a fix.
+            let previous = ctx.get_field(this, HRS_PREVIOUS);
+            let opt = alloc_optional_ref(ctx, previous)?;
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1508,7 +1678,12 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpClient$Version;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, HRS_VERSION)))
+            // WAS: `Ok(Some(ctx.get_field(this, HRS_VERSION)))` — and
+            // `alloc_response` writes an `Int` there. The descriptor says
+            // `HttpClient$Version`, so this returned a primitive where the
+            // caller's bytecode `areturn`s / `checkcast`s a reference.
+            let stored = ctx.get_field(this, HRS_VERSION).as_int().unwrap_or(HTTP_VERSION_2);
+            Ok(Some(http_version_mirror(ctx, stored)))
         },
     );
     r.register(
@@ -1536,7 +1711,19 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, HRQ_BODY_BYTES, Value::Object(None));
         ctx.set_field(this, HRQ_HEADERS, Value::Object(None));
         ctx.set_field(this, HRQ_TIMEOUT_MS, Value::Long(0));
-        ctx.set_field(this, HRQ_VERSION, Value::Int(HTTP_VERSION_2));
+        // WAS `Value::Int(HTTP_VERSION_2)`, which this file's own accessor then
+        // reported as a PRESENT version override. The oracle disagrees:
+        // `HttpRequest.newBuilder(uri).build().version()` is `Optional.empty`
+        // on JDK 25.0.3+9-LTS — a request carries a version only if one was
+        // set on it. `HTTP_VERSION_1_1 = 0` here, so `0` is not free as the
+        // "unset" encoding and `HRQ_VERSION_UNSET` is a distinct sentinel.
+        //
+        // SLOT AUDIT for this change: `HRQ_VERSION` (slot 5) has exactly one
+        // writer (this line) and one reader (`version()` below) in the whole
+        // tree — `do_send` reads the version off the CLIENT (`HCI_VERSION`),
+        // never off the request. So changing the stored default cannot reach
+        // the wire path.
+        ctx.set_field(this, HRQ_VERSION, Value::Int(HRQ_VERSION_UNSET));
         Ok(None)
     });
     r.register(cls, "method", "()Ljava/lang/String;", |ctx, args| {
@@ -1567,14 +1754,35 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "version", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, ctx.get_field(this, HRQ_VERSION));
+        // WAS: the raw `Int` ordinal straight into slot 0 of the Optional.
+        // `Value::Int(1)` is not null to `ref_operand_is_null`, so
+        // `isPresent()` said TRUE for every request ever built and `get()`
+        // handed back a primitive typed as `HttpClient$Version`.
+        let stored = ctx
+            .get_field(this, HRQ_VERSION)
+            .as_int()
+            .unwrap_or(HRQ_VERSION_UNSET);
+        let mirror = if stored == HRQ_VERSION_UNSET {
+            Value::Object(None)
+        } else {
+            http_version_mirror(ctx, stored)
+        };
+        let opt = alloc_optional_ref(ctx, mirror)?;
         Ok(Some(Value::Object(Some(opt))))
     });
     r.register(cls, "timeout", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, ctx.get_field(this, HRQ_TIMEOUT_MS));
+        // WAS: the raw `Long` millis into slot 0 of an `Optional<Duration>`.
+        // `Long(0)` reads as null, so the default request answered EMPTY by
+        // accident and was right; any non-zero timeout would have put a
+        // `Long` where a `Duration` is declared. Same treatment as
+        // `HttpClientImpl.connectTimeout()`, which had it right all along.
+        let ms = match ctx.get_field(this, HRQ_TIMEOUT_MS) {
+            Value::Long(v) => v,
+            Value::Int(v) => i64::from(v),
+            _ => 0,
+        };
+        let opt = alloc_optional_duration_ms(ctx, ms)?;
         Ok(Some(Value::Object(Some(opt))))
     });
 }
@@ -1587,7 +1795,15 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpClient$Version;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, HCI_VERSION)))
+            // WAS: the raw `Int` from `HCI_VERSION`, against a descriptor that
+            // names `HttpClient$Version`. HotSpot answers `HTTP_2` for a
+            // default client (measured), which is what this now returns —
+            // as the interned constant, so `== HttpClient.Version.HTTP_2`.
+            let stored = ctx
+                .get_field(this, HCI_VERSION)
+                .as_int()
+                .unwrap_or(HTTP_VERSION_2);
+            Ok(Some(http_version_mirror(ctx, stored)))
         },
     );
     r.register(
@@ -1596,19 +1812,37 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpClient$Redirect;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, HCI_FOLLOW_REDIRECTS)))
+            // WAS: the raw `Int` from `HCI_FOLLOW_REDIRECTS`, same defect.
+            //
+            // A MEASURED DIVERGENCE THIS PATCH DELIBERATELY DOES NOT FIX:
+            // `hci_init` stores `REDIRECT_NORMAL`, but on JDK 25.0.3+9-LTS
+            // both `HttpClient.newHttpClient().followRedirects()` and
+            // `HttpClient.newBuilder().build().followRedirects()` answer
+            // `NEVER`. Correcting the DEFAULT is not a type fix: `do_send`
+            // feeds `HCI_FOLLOW_REDIRECTS` to `perform_request`, so flipping it
+            // stops this VM following redirects on every request that has not
+            // asked. That belongs in its own change with its own evidence —
+            // it is recorded as a residual, not folded in here.
+            let stored = ctx
+                .get_field(this, HCI_FOLLOW_REDIRECTS)
+                .as_int()
+                .unwrap_or(REDIRECT_NORMAL);
+            Ok(Some(http_redirect_mirror(ctx, stored)))
         },
     );
     r.register(cls, "executor", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, ctx.get_field(this, HCI_EXECUTOR));
+        // CORRECT BEFORE THIS PATCH: `HCI_EXECUTOR` is a reference slot
+        // (`hci_init` writes `Object(None)`); nothing in the tree ever writes
+        // a non-null one, so this is honestly EMPTY. Same for the three below.
+        let value = ctx.get_field(this, HCI_EXECUTOR);
+        let opt = alloc_optional_ref(ctx, value)?;
         Ok(Some(Value::Object(Some(opt))))
     });
     r.register(cls, "proxy", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, ctx.get_field(this, HCI_PROXY));
+        let value = ctx.get_field(this, HCI_PROXY);
+        let opt = alloc_optional_ref(ctx, value)?;
         Ok(Some(Value::Object(Some(opt))))
     });
     r.register(
@@ -1617,8 +1851,8 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, ctx.get_field(this, HCI_COOKIE_HANDLER));
+            let value = ctx.get_field(this, HCI_COOKIE_HANDLER);
+            let opt = alloc_optional_ref(ctx, value)?;
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1628,18 +1862,17 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let timeout = ctx.get_field(this, HCI_CONNECT_TIMEOUT_MS);
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            match timeout {
-                Value::Long(0) => ctx.set_field(opt, 0, Value::Object(None)),
-                Value::Long(ms) => {
-                    let dur = try_alloc_concurrent_synthetic(ctx, "java/time/Duration", 2)?;
-                    ctx.set_field(dur, 0, Value::Long(ms / 1000));
-                    ctx.set_field(dur, 1, Value::Int(((ms % 1000) * 1_000_000) as i32));
-                    ctx.set_field(opt, 0, Value::Object(Some(dur)));
-                }
-                _ => ctx.set_field(opt, 0, Value::Object(None)),
-            }
+            // CORRECT BEFORE THIS PATCH — E2-1 read this site and used it as
+            // the model for its own fix. Moved onto the shared helper so the
+            // `Duration` normalisation and the GC pin exist once; the change
+            // in behaviour is confined to a negative `ms`, which now
+            // floor-normalises the way a real `Duration` does.
+            let ms = match ctx.get_field(this, HCI_CONNECT_TIMEOUT_MS) {
+                Value::Long(v) => v,
+                Value::Int(v) => i64::from(v),
+                _ => 0,
+            };
+            let opt = alloc_optional_duration_ms(ctx, ms)?;
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1649,8 +1882,8 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, ctx.get_field(this, HCI_AUTHENTICATOR));
+            let value = ctx.get_field(this, HCI_AUTHENTICATOR);
+            let opt = alloc_optional_ref(ctx, value)?;
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -2179,5 +2412,266 @@ mod http_client_tests {
         assert!(!is_sensitive_redirect_header("Accept"));
         assert!(!is_sensitive_redirect_header("User-Agent"));
         assert!(!is_sensitive_redirect_header("Content-Type"));
+    }
+
+    // -----------------------------------------------------------------------
+    // E21 — the accessors that answered in a form their descriptor does not
+    // name. Every test below INVOKES the native through the registry and
+    // asserts the slot it actually wrote; the 22 tests that were here before
+    // are registration-only (`find(...).is_some()`) and stayed green through
+    // the entire life of these defects.
+    //
+    // WHAT THE MOCK CAN AND CANNOT MEASURE, stated once: `MockNativeContext`
+    // has NO statics table — `set_static_field` is a no-op,
+    // `static_field_index_by_name` answers `None` and `get_static_field`
+    // answers `Value::Int(0)`. So `enum_constant_static` can only ever reach
+    // its fail-safe here, and these tests pin the LAW ("never a primitive
+    // where a reference is declared", "slot 0 of an Optional is a reference"),
+    // not the mirror lookup. The mirror needs a VM, and the record nominates
+    // the mock upgrade that would let a unit test see it.
+    // -----------------------------------------------------------------------
+
+    const CLS_CLIENT: &str = "jdk/internal/net/http/HttpClientImpl";
+    const CLS_REQ: &str = "jdk/internal/net/http/HttpRequestImpl";
+    const CLS_RESP: &str = "jdk/internal/net/http/HttpResponseImpl";
+
+    fn e21_cb(class: &str, name: &str, desc: &str) -> cratonvm_native_api::NativeCallback {
+        let mut r = NativeMethodRegistry::new();
+        register_http_client_real(&mut r);
+        r.find(class, name, desc)
+            .unwrap_or_else(|| panic!("{class}.{name}{desc} must be registered"))
+    }
+
+    /// Invoke a `(this)` native. `<init>` and other `void` natives answer
+    /// `None` here — `e21_value` is the arm that demands a return value.
+    fn e21_call(
+        cb: cratonvm_native_api::NativeCallback,
+        ctx: &mut crate::test_utils::MockNativeContext,
+        this: ObjectRef,
+    ) -> Option<Value> {
+        cb(ctx, &[Value::Object(Some(this))]).expect("native must not fail")
+    }
+
+    fn e21_value(
+        cb: cratonvm_native_api::NativeCallback,
+        ctx: &mut crate::test_utils::MockNativeContext,
+        this: ObjectRef,
+    ) -> Value {
+        e21_call(cb, ctx, this).expect("native must return a value")
+    }
+
+    /// An `Optional` is ONE slot and that slot is a REFERENCE.
+    ///
+    /// The mock zero-fills fields to `Value::Int(0)`, so a native that wrote
+    /// nothing fails here too — which is the same shape as the bug.
+    fn e21_assert_optional(ctx: &crate::test_utils::MockNativeContext, v: Value) -> Value {
+        let Value::Object(Some(opt)) = v else {
+            panic!("expected an Optional object, got {v:?}");
+        };
+        assert_eq!(
+            ctx.object_num_fields(opt),
+            1,
+            "java.util.Optional declares ONE field, the reference `value`; a \
+             2-slot (isPresent, value) layout is OptionalInt/Long/Double's"
+        );
+        let slot0 = ctx.get_field(opt, 0);
+        assert!(
+            matches!(slot0, Value::Object(_)),
+            "slot 0 of a java.util.Optional is the reference `value`; {slot0:?} \
+             there makes isPresent() answer TRUE for an empty Optional and \
+             get() hand a primitive to a caller that will dereference it"
+        );
+        slot0
+    }
+
+    /// A default request has NO version override — measured on JDK 25.0.3+9-LTS:
+    /// `HttpRequest.newBuilder(uri).build().version()` is `Optional.empty`.
+    ///
+    /// Before this patch `<init>` stored `Int(HTTP_VERSION_2)` and the accessor
+    /// dropped it straight into slot 0, so `isPresent()` was TRUE for every
+    /// request ever built and `get()` returned an `Int` typed as
+    /// `HttpClient$Version`.
+    #[test]
+    fn e21_request_version_is_empty_and_never_a_primitive() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(CLS_REQ).unwrap();
+        let this = ctx.alloc_object(cid, HRQ_NUM_FIELDS);
+        assert!(e21_call(e21_cb(CLS_REQ, "<init>", "()V"), &mut ctx, this).is_none());
+        assert_eq!(
+            ctx.get_field(this, HRQ_VERSION),
+            Value::Int(HRQ_VERSION_UNSET),
+            "<init> must record NO version override"
+        );
+        let v = e21_value(
+            e21_cb(CLS_REQ, "version", "()Ljava/util/Optional;"),
+            &mut ctx,
+            this,
+        );
+        assert_eq!(e21_assert_optional(&ctx, v), Value::Object(None));
+    }
+
+    /// A request timeout is an `Optional<Duration>`, not an `Optional<long>`.
+    ///
+    /// `Long(0)` reads as null to `ref_operand_is_null`, so the ABSENT arm was
+    /// accidentally right and only the PRESENT arm was wrong — which is why no
+    /// registration-only test and no absent-case fixture row could see it.
+    #[test]
+    fn e21_request_timeout_present_is_a_duration_not_a_long() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(CLS_REQ).unwrap();
+        let this = ctx.alloc_object(cid, HRQ_NUM_FIELDS);
+        ctx.set_field(this, HRQ_TIMEOUT_MS, Value::Long(7_000));
+        let v = e21_value(
+            e21_cb(CLS_REQ, "timeout", "()Ljava/util/Optional;"),
+            &mut ctx,
+            this,
+        );
+        let Value::Object(Some(dur)) = e21_assert_optional(&ctx, v) else {
+            panic!("timeout(7000ms) must be PRESENT and hold a Duration");
+        };
+        assert_eq!(ctx.get_field(dur, 0), Value::Long(7));
+        assert_eq!(ctx.get_field(dur, 1), Value::Int(0));
+
+        let this2 = ctx.alloc_object(cid, HRQ_NUM_FIELDS);
+        ctx.set_field(this2, HRQ_TIMEOUT_MS, Value::Long(0));
+        let v2 = e21_value(
+            e21_cb(CLS_REQ, "timeout", "()Ljava/util/Optional;"),
+            &mut ctx,
+            this2,
+        );
+        assert_eq!(e21_assert_optional(&ctx, v2), Value::Object(None));
+    }
+
+    /// A negative `Duration` is floor-normalised, not truncated:
+    /// `Duration.ofMillis(-1500)` is `seconds = -2, nanos = +500_000_000` on
+    /// the oracle, and `Duration`'s `nanos` is documented non-negative.
+    #[test]
+    fn e21_connect_timeout_duration_is_floor_normalised() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(CLS_CLIENT).unwrap();
+        let this = ctx.alloc_object(cid, HCI_NUM_FIELDS);
+        ctx.set_field(this, HCI_CONNECT_TIMEOUT_MS, Value::Long(-1_500));
+        let v = e21_value(
+            e21_cb(CLS_CLIENT, "connectTimeout", "()Ljava/util/Optional;"),
+            &mut ctx,
+            this,
+        );
+        let Value::Object(Some(dur)) = e21_assert_optional(&ctx, v) else {
+            panic!("a non-zero connectTimeout must be PRESENT");
+        };
+        assert_eq!(ctx.get_field(dur, 0), Value::Long(-2));
+        assert_eq!(ctx.get_field(dur, 1), Value::Int(500_000_000));
+    }
+
+    /// The four presence accessors were already the right SHAPE — right arity
+    /// AND a reference in slot 0. This is the negative control: it must keep
+    /// passing, and anyone who "simplifies" the helper into a flag breaks it
+    /// by name.
+    #[test]
+    fn e21_presence_accessors_are_empty_optionals_not_flags() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(CLS_CLIENT).unwrap();
+        let this = ctx.alloc_object(cid, HCI_NUM_FIELDS);
+        assert!(e21_call(e21_cb(CLS_CLIENT, "<init>", "()V"), &mut ctx, this).is_none());
+        for name in ["executor", "proxy", "cookieHandler", "authenticator"] {
+            let v = e21_value(
+                e21_cb(CLS_CLIENT, name, "()Ljava/util/Optional;"),
+                &mut ctx,
+                this,
+            );
+            assert_eq!(
+                e21_assert_optional(&ctx, v),
+                Value::Object(None),
+                "{name}() stores no object anywhere, so empty() is the honest answer"
+            );
+        }
+    }
+
+    /// The three enum-returning accessors must never surface a primitive.
+    ///
+    /// Under the mock the mirror lookup cannot succeed (no statics table), so
+    /// the assertion is the FAIL-SAFE: `Object(None)`, never `Int(ordinal)`.
+    /// That is precisely the discriminator — every one of these three returned
+    /// `Value::Int` before this patch, against a descriptor naming
+    /// `HttpClient$Version` / `HttpClient$Redirect`.
+    #[test]
+    fn e21_enum_accessors_never_return_an_ordinal() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let ccid = ctx.ensure_class_initialized(CLS_CLIENT).unwrap();
+        let client = ctx.alloc_object(ccid, HCI_NUM_FIELDS);
+        assert!(e21_call(e21_cb(CLS_CLIENT, "<init>", "()V"), &mut ctx, client).is_none());
+        let rcid = ctx.ensure_class_initialized(CLS_RESP).unwrap();
+        let resp = ctx.alloc_object(rcid, HRS_NUM_FIELDS);
+        ctx.set_field(resp, HRS_VERSION, Value::Int(HTTP_VERSION_2));
+
+        for (this, cls, name, desc) in [
+            (
+                client,
+                CLS_CLIENT,
+                "version",
+                "()Ljava/net/http/HttpClient$Version;",
+            ),
+            (
+                client,
+                CLS_CLIENT,
+                "followRedirects",
+                "()Ljava/net/http/HttpClient$Redirect;",
+            ),
+            (
+                resp,
+                CLS_RESP,
+                "version",
+                "()Ljava/net/http/HttpClient$Version;",
+            ),
+        ] {
+            let v = e21_value(e21_cb(cls, name, desc), &mut ctx, this);
+            assert!(
+                matches!(v, Value::Object(_)),
+                "{cls}.{name}{desc} declares a REFERENCE return; {v:?} is an \
+                 ordinal handed to bytecode about to areturn/checkcast it"
+            );
+        }
+    }
+
+    /// `HttpResponse.previousResponse()` — covered by nothing else in the
+    /// repository, and the row C12-3 calls "the one that settles what this is".
+    #[test]
+    fn e21_previous_response_is_an_empty_optional() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(CLS_RESP).unwrap();
+        let this = ctx.alloc_object(cid, HRS_NUM_FIELDS);
+        ctx.set_field(this, HRS_PREVIOUS, Value::Object(None));
+        let v = e21_value(
+            e21_cb(CLS_RESP, "previousResponse", "()Ljava/util/Optional;"),
+            &mut ctx,
+            this,
+        );
+        assert_eq!(e21_assert_optional(&ctx, v), Value::Object(None));
+    }
+
+    /// The two files' version encodings differ and that is deliberate; this
+    /// test exists so a "tidy-up" that unifies them has to read the reason.
+    /// `http2.rs` stores `ordinal + 1` (so `0` can mean "no override"); this
+    /// file stores the JDK ordinal itself and uses a separate sentinel.
+    #[test]
+    fn e21_this_files_version_constants_are_the_jdk_ordinals() {
+        assert_eq!(HTTP_VERSION_1_1, 0);
+        assert_eq!(HTTP_VERSION_2, 1);
+        assert_eq!(
+            crate::phases_late::net_channels::HTTP_VERSION_CONSTANTS,
+            &["HTTP_1_1", "HTTP_2"],
+            "declaration order IS the ordinal; measured with javap on JDK 25"
+        );
+        assert_eq!(
+            crate::phases_late::net_channels::HTTP_REDIRECT_CONSTANTS,
+            &["NEVER", "ALWAYS", "NORMAL"],
+            "NOT this file's REDIRECT_* order (NEVER, NORMAL, ALWAYS) — \
+             http_redirect_mirror remaps between them"
+        );
+        assert_ne!(
+            REDIRECT_NORMAL, 2,
+            "if REDIRECT_* is ever renumbered to the JDK's ordinals, \
+             http_redirect_mirror's remap must go with it"
+        );
     }
 }

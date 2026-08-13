@@ -6133,7 +6133,31 @@ impl ClassManager {
                 // gets automatic-module access semantics. Without this, a lazy
                 // re-register would overwrite the eager `automatic=true` entry with
                 // a strict one and re-break readability (e.g. org.jboss.logging).
-                desc.automatic = !is_platform_module_name(&desc.name);
+                //
+                // …but NOT over an existing EXPLICIT registration. `vm_init`
+                // re-registers every `--module-path` module with
+                // `automatic = false` immediately after `ClassManager::new`
+                // (whose app-class-path scan had stamped it `true`, because the
+                // module roots are also put on the application search path).
+                // `is_platform_module_name` is false for any app-named module,
+                // so without this guard a later lazy load of that same
+                // `module-info` silently downgrades a `--module-path` module
+                // back to automatic — and `automatic` is now load-bearing:
+                // `populate_boot_layer_modules` reads it (through
+                // `NativeContext::module_is_class_path_only`) to decide what may
+                // enter `ModuleLayer.boot()` and the system loader's
+                // `ServicesCatalog`. A downgrade there would evict a genuine
+                // module-path module from the boot layer, which is what
+                // `regression-suite/src/RJdkModule.java` asserts against.
+                // Nothing is lost for the case the paragraph above defends: a
+                // `-cp` jar such as `org.jboss.logging` is never registered
+                // explicit by anyone, so it still lands on `automatic = true`.
+                // See docs/known-issues/jdk-only/E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX-20260813.md.
+                let already_explicit = self
+                    .module_registry
+                    .get(&desc.name)
+                    .is_some_and(|prev| !prev.automatic);
+                desc.automatic = !already_explicit && !is_platform_module_name(&desc.name);
                 let packages: Vec<String> = class_file
                     .attributes
                     .iter()
@@ -15470,6 +15494,107 @@ fn native_constant_surface_raw_slot_layout_audit() {
     }
 }
 
+/// The `<init>` descriptors a synthetic stub of a **measured** JDK
+/// Throwable-family class must declare, or `None` for a name outside the
+/// measured set.
+///
+/// THIS IS THE STUB MIRROR OF THE REGISTRY TABLE IN
+/// `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`.
+/// The two halves are kept identical by
+/// `throwable_ctor_table_matches_the_stub_declarations` below, a source witness
+/// that reads both files out of the working tree — the crate dependency runs
+/// native-builtins → classloading, so classloading cannot import the other
+/// copy, and a silently drifting second copy is exactly the failure this
+/// change is fixing. (The durable fix is one table behind a `pub use` in
+/// `classloading/src/lib.rs`; that file is not this lane's to edit, and the
+/// nomination is in `docs/known-issues/jdk-only/E34-1-*.md`.)
+///
+/// Until 2026-08-13 this arm declared the SAME four descriptors for every name
+/// ending in `Exception`/`Error`. Against JDK 25.0.3+9-LTS that was wrong 103
+/// times over these 62 classes and missed 15 real constructors — worst of all
+/// `AssertionError.<init>(Ljava/lang/Object;)V`, which is what `javac` emits
+/// for both `throw new AssertionError(msg)` and `assert cond : msg`.
+///
+/// REGENERATE with `scratchpad/e34/Gen34.java` on the target JDK: a JDK bump
+/// then shows up as a diff of this literal rather than as drift.
+// THROWABLE-CTOR-TABLE BEGIN
+fn jdk_throwable_ctor_descriptors(name: &str) -> Option<&'static [&'static str]> {
+    // `#[rustfmt::skip]`: one row per class is the INTERFACE — it is what
+    // `Gen34.java` emits, what the source witness parses, and what makes a JDK
+    // bump a one-line-per-class diff. rustfmt would explode each row over six
+    // lines and destroy all three.
+    #[rustfmt::skip]
+    const TABLE: &[(&str, &[&str])] = &[
+        ("java/lang/Throwable", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/Exception", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/RuntimeException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/Error", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/LinkageError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
+        ("java/lang/NoClassDefFoundError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/SecurityException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/ReflectiveOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/ClassNotFoundException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
+        ("java/lang/NoSuchMethodError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/NoSuchFieldError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/NoSuchMethodException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/NoSuchFieldException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/CloneNotSupportedException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/InstantiationException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/IllegalAccessException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/reflect/InaccessibleObjectException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/reflect/InvocationTargetException", &["()V", "(Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;Ljava/lang/String;)V"]),
+        ("java/lang/InterruptedException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/NullPointerException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/ArithmeticException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/ArrayIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
+        ("java/lang/IndexOutOfBoundsException", &["()V", "(I)V", "(J)V", "(Ljava/lang/String;)V"]),
+        ("java/lang/StringIndexOutOfBoundsException", &["()V", "(I)V", "(Ljava/lang/String;)V"]),
+        ("java/lang/ClassCastException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/IllegalArgumentException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/IllegalStateException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/UnsupportedOperationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/TypeNotPresentException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
+        ("java/lang/StackOverflowError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/OutOfMemoryError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/util/NoSuchElementException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/util/InputMismatchException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/util/MissingResourceException", &["(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"]),
+        ("java/util/FormatterClosedException", &["()V"]),
+        ("java/io/IOException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/io/FileNotFoundException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/io/UncheckedIOException", &["(Ljava/io/IOException;)V", "(Ljava/lang/String;Ljava/io/IOException;)V"]),
+        ("java/io/NotSerializableException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/io/EOFException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/io/UnsupportedEncodingException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/net/MalformedURLException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/net/UnknownHostException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/NumberFormatException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/util/ConcurrentModificationException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/util/concurrent/TimeoutException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/util/concurrent/RejectedExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/util/concurrent/CancellationException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/util/concurrent/CompletionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/util/concurrent/ExecutionException", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/util/concurrent/BrokenBarrierException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/text/ParseException", &["(Ljava/lang/String;I)V"]),
+        ("java/lang/NegativeArraySizeException", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/AssertionError", &["()V", "(C)V", "(D)V", "(F)V", "(I)V", "(J)V", "(Ljava/lang/Object;)V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Z)V"]),
+        ("java/lang/MatchException", &["(Ljava/lang/String;Ljava/lang/Throwable;)V"]),
+        ("java/lang/IncompatibleClassChangeError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/IllegalAccessError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/ExceptionInInitializerError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/VerifyError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/AbstractMethodError", &["()V", "(Ljava/lang/String;)V"]),
+        ("java/lang/InternalError", &["()V", "(Ljava/lang/String;)V", "(Ljava/lang/String;Ljava/lang/Throwable;)V", "(Ljava/lang/Throwable;)V"]),
+        ("java/lang/UnsatisfiedLinkError", &["()V", "(Ljava/lang/String;)V"]),
+    ];
+    // THROWABLE-CTOR-TABLE END
+    TABLE
+        .iter()
+        .find(|(cls, _)| *cls == name)
+        .map(|(_, descriptors)| *descriptors)
+}
+
 fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     let mut out = Vec::new();
     let mk_ctor = |descriptor: &str| ClassFileMethod {
@@ -15480,7 +15605,21 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     };
     let is_throwable_like =
         name == "java/lang/Throwable" || name.ends_with("Exception") || name.ends_with("Error");
-    if is_throwable_like {
+    if let Some(descriptors) = jdk_throwable_ctor_descriptors(name) {
+        // A JDK class we have measured: declare exactly what the real class
+        // declares. This is the stub half of the fix in
+        // `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`
+        // and MUST move with it — the registry and the stub have to agree about
+        // which constructors exist, or a call resolves to a declared-but-native
+        // `<init>` with no registration behind it (still an error, just a
+        // different one).
+        out.extend(descriptors.iter().map(|d| mk_ctor(*d)));
+    } else if is_throwable_like {
+        // Not a class in the table — an application throwable
+        // (`…/DbException`), or a JDK throwable outside the measured set. Keep
+        // the historical four-descriptor guess: it is a guess, but narrowing it
+        // for a class whose real constructor set we have NOT measured would
+        // remove answers with nothing to put in their place.
         out.extend([
             mk_ctor("()V"),
             mk_ctor("(Ljava/lang/String;)V"),
@@ -18114,6 +18253,111 @@ mod tests {
         let child = mgr.class_store.get(child_id).unwrap();
         assert_eq!(child.first_field_index, 2);
         assert_eq!(child.num_total_fields, 3);
+    }
+
+    /// The two copies of the Throwable `<init>` descriptor table must agree.
+    ///
+    /// `jdk_throwable_ctor_descriptors` (this file) says which constructors a
+    /// synthetic stub DECLARES; `throwable_ctors` in
+    /// `native-builtins/src/lang_misc.rs::register_throwable_subclass_natives`
+    /// says which constructors are REGISTERED. If those disagree, a call site
+    /// either resolves to a declared-but-unimplemented `<init>` or misses a
+    /// registered one — the exact half-fix shape this table was introduced to
+    /// end. They cannot be one constant: the crate dependency runs
+    /// native-builtins -> classloading, and `classloading/src/lib.rs` (which
+    /// would have to export it) is owned elsewhere. So the copies are kept
+    /// honest here instead of hoped about.
+    ///
+    /// This is a SOURCE witness — it reads the working tree, not the compiled
+    /// tables — because the other copy is in a crate this one cannot link.
+    /// It fails loudly (not vacuously) if either file or either marker is
+    /// missing, and it mutation-checks itself by requiring a plausible row
+    /// count on both sides before comparing.
+    #[test]
+    fn throwable_ctor_table_matches_the_stub_declarations() {
+        // Assembled rather than written as one literal so this test's own text
+        // is not what the scan finds in this file.
+        let begin = format!("// THROWABLE-CTOR-{}-BEGIN", "TABLE").replace("-BEGIN", " BEGIN");
+        let end = format!("// THROWABLE-CTOR-{}-END", "TABLE").replace("-END", " END");
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the classloading crate directory must have a parent")
+            .to_path_buf();
+        assert!(
+            workspace.join("Cargo.toml").is_file(),
+            "workspace root not found at {} — failing rather than comparing nothing",
+            workspace.display()
+        );
+
+        /// Pull every `("class", &["desc", ...]),` row out of a source region.
+        fn rows(text: &str, begin: &str, end: &str, what: &str) -> Vec<(String, Vec<String>)> {
+            let start = text
+                .find(begin)
+                .unwrap_or_else(|| panic!("{what}: start marker {begin:?} not found"));
+            let stop = text[start..]
+                .find(end)
+                .map(|i| start + i)
+                .unwrap_or_else(|| panic!("{what}: end marker {end:?} not found"));
+            let mut out = Vec::new();
+            for line in text[start..stop].lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("(\"") else {
+                    continue;
+                };
+                let Some((class, tail)) = rest.split_once("\", &[") else {
+                    continue;
+                };
+                let Some((body, _)) = tail.split_once("]),") else {
+                    continue;
+                };
+                let descriptors: Vec<String> = body
+                    .split(',')
+                    .map(|d| d.trim().trim_matches('"').to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                out.push((class.to_string(), descriptors));
+            }
+            out
+        }
+
+        let stub_src = std::fs::read_to_string(
+            workspace
+                .join("classloading")
+                .join("src")
+                .join("class_manager.rs"),
+        )
+        .expect("this file is readable");
+        let registrar_src = std::fs::read_to_string(
+            workspace
+                .join("native-builtins")
+                .join("src")
+                .join("lang_misc.rs"),
+        )
+        .expect("native-builtins/src/lang_misc.rs is readable");
+
+        let stub = rows(&stub_src, &begin, &end, "stub table (class_manager.rs)");
+        let registrar = rows(
+            &registrar_src,
+            &begin,
+            &end,
+            "registrar table (lang_misc.rs)",
+        );
+
+        // A witness that can pass on an empty parse measures nothing.
+        assert!(
+            stub.len() >= 60 && registrar.len() >= 60,
+            "parsed {} stub rows and {} registrar rows — the extractor is broken, \
+             not the tables",
+            stub.len(),
+            registrar.len()
+        );
+        assert_eq!(
+            stub, registrar,
+            "the synthetic-stub `<init>` table and the native-registry `<init>` \
+             table have drifted. Both are generated by `scratchpad/e34/Gen34.java` \
+             from the target JDK; regenerate and paste the SAME rows into both."
+        );
     }
 
     /// `Class::superclass` may only be written by `ClassStore::set_superclass`.

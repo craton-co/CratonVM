@@ -1105,6 +1105,180 @@ fn redirect_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::e
     crate::phases_late::p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", name, ordinal)
 }
 
+// ---------------------------------------------------------------------------
+// ARGUMENT DECODING — read the DESCRIPTOR, not the neighbouring idiom.
+//
+// Six builder natives in this file matched `Some(Value::Int(n))` against an
+// argument whose descriptor is a REFERENCE (`Ljava/time/Duration;`,
+// `Ljava/net/http/HttpClient$Version;`, `Ljava/net/http/HttpClient$Redirect;`,
+// `[B`). That arm can never fire, so the `_ =>` default ALWAYS won and every
+// such setter silently discarded what the caller passed. The helpers below
+// decode what the descriptor actually says arrives.
+//
+// This is NOT "every `Value::Int` match in a builder is wrong":
+// `HttpRequest$Builder.expectContinue(Z)` uses the identical idiom and is
+// CORRECT, because its descriptor really is a primitive `boolean`. Same
+// structure as `HttpHeaders.firstValueAsLong`, whose 2-slot
+// `(isPresent, value)` `OptionalLong` is right where the reference `Optional`'s
+// was wrong. Both are pinned by negative-control tests below. Read the
+// descriptor before changing an arm.
+//
+// See docs/known-issues/jdk-only/E13-1-the-six-builders-decode-a-reference-as-an-int.md
+// ---------------------------------------------------------------------------
+
+/// Instance slots of a `java.time.Duration`: `seconds` (`long`) then `nanos`
+/// (`int`).
+///
+/// `javap -p java.time.Duration` (JDK 25) declares exactly those two instance
+/// fields in that order, and `util_time::alloc_duration` mints the synthetic
+/// with the same pair — so one decode serves both shapes.
+const DUR_SLOT_SECONDS: usize = 0;
+const DUR_SLOT_NANOS: usize = 1;
+
+/// Instance slots of a `java.lang.Enum`: `name` (a `String`) then `ordinal`
+/// (`int`) — the order `java.lang.Enum` declares them and the order
+/// `phases_late::p57_alloc_enum` writes them.
+const ENUM_SLOT_NAME: usize = 0;
+const ENUM_SLOT_ORDINAL: usize = 1;
+
+/// `HttpClient.Version` constants, name -> the ordinal THIS file uses.
+/// Verified against `HttpClient.Version.values()` on HotSpot 25: `HTTP_1_1`=0,
+/// `HTTP_2`=1 — the JDK ordinals and this file's constants agree.
+const VERSION_NAMES: &[(&str, i32)] = &[("HTTP_1_1", HTTP_VERSION_1_1), ("HTTP_2", HTTP_VERSION_2)];
+
+/// `HttpClient.Redirect` constants. Verified against
+/// `HttpClient.Redirect.values()` on HotSpot 25: `NEVER`=0, `ALWAYS`=1,
+/// `NORMAL`=2 — again matching this file's constants.
+const REDIRECT_NAMES: &[(&str, i32)] = &[
+    ("NEVER", REDIRECT_NEVER),
+    ("ALWAYS", REDIRECT_ALWAYS),
+    ("NORMAL", REDIRECT_NORMAL),
+];
+
+/// Decode a `java.time.Duration` ARGUMENT to whole milliseconds.
+///
+/// Both encodings reconcile here (the "one concept, two encodings" shape) via
+/// the CLASS-SIDE witness: resolve the NAME to a slot against the receiver's
+/// own class, and fall back to the synthetic layout only when the class does
+/// not declare it. That is deliberately not a `get_field_by_name` VALUE read —
+/// `test_utils::MockNativeContext::get_field_by_name` answers `Value::Int(0)`
+/// for an unresolvable name where production answers `Value::Object(None)`
+/// (its own doc comment records the divergence and two bugs already paid for
+/// by it), so a value-side fallback would be steered by the mock rather than
+/// by the VM. `resolve_field_index_by_class_id` is the read the mock answers
+/// faithfully.
+///
+/// `Duration` is floor-normalised (`ofMillis(-1500)` is `seconds=-2,
+/// nanos=500_000_000`), so `seconds * 1000 + nanos / 1_000_000` is correct for
+/// negative durations too.
+///
+/// The raw `Long` / `Int` arms are retained as a fallback for any caller that
+/// hands over bare millis rather than a `Duration`.
+fn duration_arg_millis(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> i64 {
+    match arg {
+        Some(Value::Object(Some(d))) => {
+            let d = *d;
+            let cid = ctx.class_id_of_object(d);
+            let sec_slot = ctx
+                .resolve_field_index_by_class_id(cid, "seconds")
+                .unwrap_or(DUR_SLOT_SECONDS);
+            let nano_slot = ctx
+                .resolve_field_index_by_class_id(cid, "nanos")
+                .unwrap_or(DUR_SLOT_NANOS);
+            let secs = match ctx.get_field(d, sec_slot) {
+                Value::Long(n) => n,
+                Value::Int(n) => i64::from(n),
+                _ => 0,
+            };
+            let nanos = match ctx.get_field(d, nano_slot) {
+                Value::Int(n) => n,
+                Value::Long(n) => n as i32,
+                _ => 0,
+            };
+            secs.saturating_mul(1_000)
+                .saturating_add(i64::from(nanos) / 1_000_000)
+        }
+        // Bare millis — not what any descriptor in this file says, but cheap to
+        // honour and the shape the pre-fix code was (unreachably) written for.
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => i64::from(*n),
+        _ => 0,
+    }
+}
+
+/// Decode an ENUM ARGUMENT to its ordinal, or `None` when it carries neither
+/// encoding.
+///
+/// `None` rather than `0` on purpose: a decoder that silently decays to ordinal
+/// zero is how `TimeUnit` turned `SECONDS.toNanos(1)` into `1`
+/// (`phases_early::tu_ordinal`). Each caller keeps its OWN documented default.
+///
+/// NAME first, ordinal second. The name is the encoding-independent identity of
+/// an enum constant, it is what `p57_alloc_enum` writes into slot 0, and it
+/// survives an ordinal renumbering in a future JDK. Both fields are located by
+/// the CLASS-SIDE witness rather than a `get_field_by_name` value read — see
+/// [`duration_arg_millis`] for why. `java.lang.Enum` declares `name` and
+/// `ordinal` on the SUPERCLASS, and `resolve_field_index_by_class_id` walks the
+/// hierarchy, so a real enum resolves both.
+///
+/// Neither step calls `invoke_virtual`, unlike
+/// `phases_early::enum_value_ordinal`: no native in this file re-enters the
+/// interpreter, and an argument decoder is the wrong place to start.
+fn enum_arg_ordinal(
+    ctx: &mut dyn NativeContext,
+    arg: Option<&Value>,
+    names: &[(&str, i32)],
+) -> Option<i32> {
+    let obj = match arg {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let cid = ctx.class_id_of_object(obj);
+    let name_slot = ctx
+        .resolve_field_index_by_class_id(cid, "name")
+        .unwrap_or(ENUM_SLOT_NAME);
+    let ordinal_slot = ctx
+        .resolve_field_index_by_class_id(cid, "ordinal")
+        .unwrap_or(ENUM_SLOT_ORDINAL);
+    if let Value::Object(Some(s)) = ctx.get_field(obj, name_slot) {
+        if let Some(text) = ctx.read_string(s) {
+            if let Some((_, ord)) = names.iter().find(|(k, _)| *k == text) {
+                return Some(*ord);
+            }
+        }
+    }
+    let ordinal = match ctx.get_field(obj, ordinal_slot) {
+        Value::Int(n) => Some(n),
+        _ => None,
+    };
+    // An ordinal outside the constants this file models is not a usable answer;
+    // hand back `None` so the caller's default applies rather than storing a
+    // number `version_enum` / `redirect_enum` would have to invent a name for.
+    ordinal.filter(|n| names.iter().any(|(_, o)| o == n))
+}
+
+/// The declared content length of a `BodyPublisher` ARGUMENT (slot 0, a
+/// `Long`; `-1` is the publishers' "unknown length"), or `None` when the
+/// argument is not a publisher.
+///
+/// Found by grepping the SHAPE rather than the `Value::Int` idiom: `POST`,
+/// `PUT` and `method(String, BodyPublisher)` set `REQ_HAS_BODY` from their
+/// publisher argument and then throw the publisher away, so `REQ_BODY_LEN`
+/// stayed 0 and `bodyPublisher().get().contentLength()` answered 0 for every
+/// body. Same family as the six `Value::Int` sites — a builder that does not
+/// read the reference it was handed — with a quieter tell.
+fn body_publisher_arg_len(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> Option<i64> {
+    let bp = match arg {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    match ctx.get_field(bp, 0) {
+        Value::Long(n) => Some(n),
+        Value::Int(n) => Some(i64::from(n)),
+        _ => None,
+    }
+}
+
 fn register_http_client(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1286,9 +1460,32 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Long(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
-            ctx.set_field(opt, 0, Value::Int(if ms > 0 { 1 } else { 0 }));
-            ctx.set_field(opt, 1, Value::Long(ms));
+            // `java.util.Optional` has ONE instance field and it is a
+            // REFERENCE (`javap -p java.util.Optional`, JDK 25): `isPresent()`
+            // is `value != null` and `get()` returns `value` itself. This VM's
+            // own synthetic `Optional` natives model it identically
+            // (`phases_early::register_core_stdlib_extras`). A presence flag in
+            // slot 0 therefore IS the value, and `Value::Int(0)` is not null to
+            // either reader -- so an EMPTY Optional reported PRESENT and
+            // `get()` handed back the flag. The (flag, payload) layout is the
+            // real layout of `OptionalInt`/`OptionalLong`/`OptionalDouble`, not
+            // of this class -- see the `firstValueAsLong` site below, which is
+            // CORRECT for exactly that reason. See
+            // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
+            // Declared `Optional<Duration>`; the same body as
+            // `http_client.rs:1632`'s `connectTimeout`.
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            if ms > 0 {
+                let nanos = ((ms % 1000) * 1_000_000) as i32;
+                // `crate::util_time` is gated behind `#[cfg(feature = "synthetic-jdk")]`,
+                // but this file compiles in EVERY configuration. The crate root
+                // carries an ungated twin with the same job (and normalisation
+                // the gated one lacks), so use it rather than gating the caller.
+                let dur = crate::alloc_duration(ctx, ms / 1000, nanos)?;
+                ctx.set_field(opt, 0, Value::Object(Some(dur)));
+            } else {
+                ctx.set_field(opt, 0, Value::Object(None));
+            }
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1312,12 +1509,18 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
     // executor() -> Optional<Executor>
     r.register(cls, "executor", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let has = match ctx.get_field(this, CLIENT_HAS_EXECUTOR) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
+        // Slot 0 of a `java.util.Optional` is `value`, a REFERENCE -- an `Int`
+        // there reads as PRESENT and `get()` returns the flag. The arity was
+        // already right here and the TYPE was not, which is what shows the
+        // defect is the flag rather than the slot count. See
+        // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md.
+        // The synthetic client stores a presence FLAG and never the `Executor`
+        // itself (`CLIENT_HAS_EXECUTOR` is only ever written `Int(0)` by
+        // `alloc_http_client`, then copied by `Builder.build()`), so `empty()`
+        // is the only answer this layout can give truthfully: a MISSING answer
+        // where there was a wrong one.
         let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, Value::Int(has));
+        ctx.set_field(opt, 0, Value::Object(None));
         Ok(Some(Value::Object(Some(opt))))
     });
 
@@ -1328,12 +1531,13 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has = match ctx.get_field(this, CLIENT_HAS_COOKIE) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
+            // See `executor()` above and
+            // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md:
+            // slot 0 is the reference `value`, and this layout holds a flag
+            // rather than the `CookieHandler`, so `empty()` is the only
+            // truthful answer.
             let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, Value::Int(has));
+            ctx.set_field(opt, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1341,12 +1545,10 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
     // proxy() -> Optional<ProxySelector>
     r.register(cls, "proxy", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let has = match ctx.get_field(this, CLIENT_HAS_PROXY) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
+        // See `executor()` above: slot 0 is the reference `value`, and this
+        // layout holds a flag rather than the `ProxySelector`.
         let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-        ctx.set_field(opt, 0, Value::Int(has));
+        ctx.set_field(opt, 0, Value::Object(None));
         Ok(Some(Value::Object(Some(opt))))
     });
 
@@ -1357,12 +1559,10 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has = match ctx.get_field(this, CLIENT_HAS_AUTH) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
+            // See `executor()` above: slot 0 is the reference `value`, and
+            // this layout holds a flag rather than the `Authenticator`.
             let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, Value::Int(has));
+            ctx.set_field(opt, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -1442,10 +1642,10 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let v = match args.get(1) {
-                Some(Value::Int(n)) => *n,
-                _ => HTTP_VERSION_2,
-            };
+            // The parameter is an ENUM REFERENCE. The `Some(Value::Int(n))`
+            // this used to match could never fire, so `version(HTTP_1_1)` built
+            // an HTTP_2 client — the default silently overwrote the caller.
+            let v = enum_arg_ordinal(ctx, args.get(1), VERSION_NAMES).unwrap_or(HTTP_VERSION_2);
             ctx.set_field(this, 0, Value::Int(v));
             Ok(Some(Value::Object(Some(this))))
         },
@@ -1458,11 +1658,11 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/time/Duration;)Ljava/net/http/HttpClient$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ms = match args.get(1) {
-                Some(Value::Long(n)) => *n,
-                Some(Value::Int(n)) => *n as i64,
-                _ => 0,
-            };
+            // The parameter is a `java.time.Duration` REFERENCE, so neither the
+            // `Long` nor the `Int` arm ever fired and `CLIENT_CONNECT_TIMEOUT`
+            // could never be non-zero — which is why `connectTimeout()` had no
+            // reachable present arm at all.
+            let ms = duration_arg_millis(ctx, args.get(1));
             ctx.set_field(this, 2, Value::Long(ms));
             Ok(Some(Value::Object(Some(this))))
         },
@@ -1475,16 +1675,20 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/net/http/HttpClient$Redirect;)Ljava/net/http/HttpClient$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let policy = match args.get(1) {
-                Some(Value::Int(n)) => *n,
-                _ => REDIRECT_NEVER,
-            };
+            // Enum REFERENCE parameter: `followRedirects(ALWAYS)` used to leave
+            // the policy at NEVER.
+            let policy =
+                enum_arg_ordinal(ctx, args.get(1), REDIRECT_NAMES).unwrap_or(REDIRECT_NEVER);
             ctx.set_field(this, 1, Value::Int(policy));
-            ctx.set_field(
-                this,
-                7,
-                Value::Int(if policy != REDIRECT_NEVER { 1 } else { 0 }),
-            );
+            // A SLOT COLLISION this fix would otherwise have activated: this
+            // used to also write `Int(policy != NEVER)` into BUILDER slot 7 —
+            // which `build()` copies to `CLIENT_HAS_COOKIE`, not to
+            // `CLIENT_FOLLOW_REDIR` (slot 8, which `build()` does not copy at
+            // all). It was inert only because `policy` could never be anything
+            // but `NEVER`, so it always wrote the same 0 the initialiser had
+            // just written; the moment the decode above works it starts
+            // clobbering the cookie-handler flag with a redirect answer.
+            // `build()` derives `CLIENT_FOLLOW_REDIR` from the policy instead.
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -1606,6 +1810,18 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
             };
             ctx.set_field(client, dest, field_val);
         }
+        // `CLIENT_FOLLOW_REDIR` is slot 8 and the copy loop only reaches slot
+        // 7, so it can only be derived here. See `followRedirects` above for
+        // the slot collision this replaces.
+        let policy = match ctx.get_field(client, CLIENT_REDIRECT) {
+            Value::Int(n) => n,
+            _ => REDIRECT_NEVER,
+        };
+        ctx.set_field(
+            client,
+            CLIENT_FOLLOW_REDIR,
+            Value::Int(i32::from(policy != REDIRECT_NEVER)),
+        );
         ctx.set_field(client, CLIENT_POOL_SIZE, Value::Int(DEFAULT_POOL_SIZE));
         Ok(Some(Value::Object(Some(client))))
     });
@@ -1703,15 +1919,20 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
-            ctx.set_field(opt, 0, Value::Int(has_body));
+            // Slot 0 of a `java.util.Optional` is `value`, a REFERENCE. The
+            // publisher belongs THERE; parked at slot 1 nothing ever read it.
+            // See
+            // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             if has_body == 1 {
                 let len = match ctx.get_field(this, REQ_BODY_LEN) {
                     Value::Long(n) => n,
                     _ => 0,
                 };
                 let bp = alloc_body_publisher(ctx, len)?;
-                ctx.set_field(opt, 1, Value::Object(Some(bp)));
+                ctx.set_field(opt, 0, Value::Object(Some(bp)));
+            } else {
+                ctx.set_field(opt, 0, Value::Object(None));
             }
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1724,9 +1945,20 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
             Value::Long(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
-        ctx.set_field(opt, 0, Value::Int(if ms > 0 { 1 } else { 0 }));
-        ctx.set_field(opt, 1, Value::Long(ms));
+        // Declared `Optional<Duration>`; slot 0 is the reference `value`. See
+        // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        if ms > 0 {
+            let nanos = ((ms % 1000) * 1_000_000) as i32;
+            // `crate::util_time` is gated behind `#[cfg(feature = "synthetic-jdk")]`,
+            // but this file compiles in EVERY configuration. The crate root
+            // carries an ungated twin with the same job (and normalisation
+            // the gated one lacks), so use it rather than gating the caller.
+            let dur = crate::alloc_duration(ctx, ms / 1000, nanos)?;
+            ctx.set_field(opt, 0, Value::Object(Some(dur)));
+        } else {
+            ctx.set_field(opt, 0, Value::Object(None));
+        }
         Ok(Some(Value::Object(Some(opt))))
     });
 
@@ -1747,9 +1979,36 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
-        ctx.set_field(opt, 0, Value::Int(if ver != 0 { 1 } else { 0 }));
-        ctx.set_field(opt, 1, Value::Int(if ver > 0 { ver - 1 } else { 0 }));
+        // Slot 0 of a `java.util.Optional` is `value`, a REFERENCE, and this
+        // is declared `Optional<HttpClient$Version>` -- so slot 0 must hold an
+        // ENUM MIRROR or null, never an ordinal and never a flag. See
+        // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md.
+        //
+        // E2-1 left this unconditionally EMPTY, correctly: `REQ_VERSION` could
+        // never be non-zero, because its only writer
+        // (`HttpRequest$Builder.version(HttpClient$Version)`) matched
+        // `Some(Value::Int(n))` against a reference argument and always took the
+        // `_ => 0` arm. That builder is FIXED in this same file now, so
+        // `REQ_VERSION` carries 1 = HTTP_1_1 / 2 = HTTP_2 and the present arm is
+        // live. The `Optional` must be PINNED across `version_enum`'s
+        // allocation: a moving young GC there relocates `opt` and the write
+        // would land on a stale address (the native-stale-local family). See
+        // docs/known-issues/jdk-only/E13-1-the-six-builders-decode-a-reference-as-an-int.md
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        if ver > 0 {
+            let opt_pin = ctx.pin_native_root(opt);
+            let mirror = version_enum(ctx, ver - 1);
+            let opt = ctx.read_native_pin(opt_pin, opt);
+            ctx.unpin_native_roots(opt_pin);
+            match mirror? {
+                Some(v @ Value::Object(Some(_))) => ctx.set_field(opt, 0, v),
+                // `version_enum` could not mint the constant; an honestly-empty
+                // Optional beats an undereferenceable slot 0.
+                _ => ctx.set_field(opt, 0, Value::Object(None)),
+            }
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+        ctx.set_field(opt, 0, Value::Object(None));
         Ok(Some(Value::Object(Some(opt))))
     });
     r.set_category(__prev_cat);
@@ -1817,6 +2076,12 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             ctx.set_field(this, REQ_HAS_BODY, Value::Int(has_body));
+            // Same as `POST` — carry the publisher's declared length instead of
+            // recording only that a body exists.
+            let body_len = body_publisher_arg_len(ctx, args.get(2));
+            if let Some(len) = body_len {
+                ctx.set_field(this, REQ_BODY_LEN, Value::Long(len));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -1843,6 +2108,14 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, REQ_METHOD, Value::Int(METHOD_POST));
             ctx.set_field(this, REQ_HAS_BODY, Value::Int(1));
+            // The publisher's declared length used to be dropped on the floor,
+            // so `bodyPublisher().get().contentLength()` answered 0 for every
+            // body. `-1` (the streaming publishers' "unknown") is a legitimate
+            // answer and is carried through unchanged.
+            let body_len = body_publisher_arg_len(ctx, args.get(1));
+            if let Some(len) = body_len {
+                ctx.set_field(this, REQ_BODY_LEN, Value::Long(len));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -1856,6 +2129,11 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, REQ_METHOD, Value::Int(METHOD_PUT));
             ctx.set_field(this, REQ_HAS_BODY, Value::Int(1));
+            // Same as `POST` — see there.
+            let body_len = body_publisher_arg_len(ctx, args.get(1));
+            if let Some(len) = body_len {
+                ctx.set_field(this, REQ_BODY_LEN, Value::Long(len));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -1930,11 +2208,9 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ms = match args.get(1) {
-                Some(Value::Long(n)) => *n,
-                Some(Value::Int(n)) => *n as i64,
-                _ => 0,
-            };
+            // `java.time.Duration` REFERENCE parameter — see the
+            // `HttpClient$Builder.connectTimeout` twin above.
+            let ms = duration_arg_millis(ctx, args.get(1));
             ctx.set_field(this, REQ_TIMEOUT, Value::Long(ms));
             Ok(Some(Value::Object(Some(this))))
         },
@@ -1947,6 +2223,12 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         "(Z)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // NEGATIVE CONTROL — DO NOT "fix" this to match its neighbours.
+            // The descriptor is `(Z)`: a primitive `boolean`, which really does
+            // arrive as `Value::Int`. This is the one builder in the file for
+            // which the `Some(Value::Int(n))` idiom is CORRECT, and
+            // `e13_expect_continue_still_reads_a_primitive_boolean` fails by
+            // name if anyone sweeps it up with the six that were wrong.
             let flag = match args.get(1) {
                 Some(Value::Int(n)) => *n,
                 _ => 0,
@@ -1963,9 +2245,13 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ver = match args.get(1) {
-                Some(Value::Int(n)) => *n + 1, // 1=HTTP_1_1, 2=HTTP_2 (0 = no override)
-                _ => 0,
+            // Enum REFERENCE parameter. `REQ_VERSION` encodes 0 = "no
+            // override", 1 = HTTP_1_1, 2 = HTTP_2, so a decoded ordinal is
+            // stored as `ordinal + 1`; an undecodable argument keeps 0, which
+            // is what `HttpRequest.version()` reports as an empty `Optional`.
+            let ver = match enum_arg_ordinal(ctx, args.get(1), VERSION_NAMES) {
+                Some(ord) => ord + 1,
+                None => 0,
             };
             ctx.set_field(this, REQ_VERSION, Value::Int(ver));
             Ok(Some(Value::Object(Some(this))))
@@ -2101,12 +2387,15 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let has = match ctx.get_field(this, RESP_HAS_PREV) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
+            // The arity was already right and the TYPE was not: slot 0 of a
+            // `java.util.Optional` is the reference `value`, so an `Int` there
+            // reads as PRESENT. This is the row that shows the defect is the
+            // flag and not the slot count. `RESP_HAS_PREV` is only ever written
+            // `Int(0)` and no previous response is stored anywhere, so
+            // `empty()` is the truthful answer. See
+            // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
             let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
-            ctx.set_field(opt, 0, Value::Int(has));
+            ctx.set_field(opt, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(opt))))
         },
     );
@@ -2118,11 +2407,15 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
-        ctx.set_field(opt, 0, Value::Int(has));
+        // Slot 0 of a `java.util.Optional` is the reference `value`; the
+        // session belongs THERE. See
+        // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         if has == 1 {
             let ssl = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6)?;
-            ctx.set_field(opt, 1, Value::Object(Some(ssl)));
+            ctx.set_field(opt, 0, Value::Object(Some(ssl)));
+        } else {
+            ctx.set_field(opt, 0, Value::Object(None));
         }
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -2206,19 +2499,23 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+            // Slot 0 of a `java.util.Optional` is the reference `value`; the
+            // header string belongs THERE. Contrast `firstValueAsLong` just
+            // below, which returns a `java.util.OptionalLong` -- whose REAL
+            // layout IS `(boolean isPresent, long value)`, so its 2-slot
+            // `Int`-at-0 form is correct and must not be swept up in this fix.
+            // See
+            // docs/known-issues/jdk-only/D3-2-http2-optional-reference-layout.md
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             let lower = queried.to_lowercase();
             if lower == "content-type" && has_ct == 1 {
                 let sv = ctx.create_string("application/json");
-                ctx.set_field(opt, 0, Value::Int(1));
-                ctx.set_field(opt, 1, Value::Object(Some(sv)));
+                ctx.set_field(opt, 0, Value::Object(Some(sv)));
             } else if lower == "content-length" && has_cl == 1 {
                 let sv = ctx.create_string("20");
-                ctx.set_field(opt, 0, Value::Int(1));
-                ctx.set_field(opt, 1, Value::Object(Some(sv)));
+                ctx.set_field(opt, 0, Value::Object(Some(sv)));
             } else {
-                ctx.set_field(opt, 0, Value::Int(0));
-                ctx.set_field(opt, 1, Value::Object(None));
+                ctx.set_field(opt, 0, Value::Object(None));
             }
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -2312,8 +2609,12 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
-            let len = match args.get(0) {
-                Some(Value::Int(n)) => *n as i64,
+            // STATIC, so `args[0]` is the array itself — a REFERENCE, never the
+            // `Value::Int` this used to match, so every `ofByteArray` publisher
+            // reported `contentLength() == 0`. The `ofString` sibling directly
+            // above always read its reference argument; this one did not.
+            let len = match args.first() {
+                Some(Value::Object(Some(arr))) => ctx.array_length(*arr) as i64,
                 _ => 0,
             };
             let bp = alloc_body_publisher(ctx, len)?;
@@ -3515,5 +3816,903 @@ mod http2_tests {
         assert_eq!(status, 404, "M14: expected 404");
         assert_eq!(body, "Not Found");
         server.join().expect("M14: server thread panicked");
+    }
+
+    // --- E2: `java.util.Optional` is (reference-or-null), never (flag, payload)
+    //
+    // `javap -p --module java.base java.util.Optional` (JDK 25) declares ONE
+    // instance field, `private final T value`, and it is a REFERENCE. The three
+    // PRIMITIVE Optionals genuinely do declare `boolean isPresent` at slot 0 and
+    // `value` at slot 1 -- which is why the (flag, payload) idiom looked right
+    // and why `firstValueAsLong` below must keep it. `ref_operand_is_null`
+    // (`vm/src/runtime/interpreter.rs:8246`) counts only `Object(None)`,
+    // `Uninitialized` and `Long(0)` as null, so an `Int(0)` parked in slot 0
+    // made an EMPTY Optional answer `isPresent() == true` and made `get()`
+    // return the flag. These tests INVOKE the natives rather than merely
+    // asserting they are registered -- the 64 tests above are registration-only
+    // and every one of them stayed green through the whole defect.
+    //
+    // See docs/known-issues/jdk-only/E2-1-optional-reference-layout-landed.md
+
+    /// Every reference-`Optional` producer in this file, invoked for real.
+    /// Returns slot 0 of the `Optional` the native actually built.
+    fn opt_slot0(
+        cb: cratonvm_native_api::NativeCallback,
+        ctx: &mut crate::test_utils::MockNativeContext,
+        args: &[Value],
+    ) -> Value {
+        match cb(ctx, args).expect("native must not fail") {
+            Some(Value::Object(Some(opt))) => {
+                assert_eq!(
+                    ctx.object_num_fields(opt),
+                    1,
+                    "java.util.Optional has exactly ONE instance field"
+                );
+                ctx.get_field(opt, 0)
+            }
+            other => panic!("expected an Optional object, got {other:?}"),
+        }
+    }
+
+    fn find_cb(class: &str, name: &str, desc: &str) -> cratonvm_native_api::NativeCallback {
+        let mut r = NativeMethodRegistry::new();
+        register_http2_natives(&mut r);
+        r.find(class, name, desc)
+            .unwrap_or_else(|| panic!("{class}.{name}{desc} must be registered"))
+    }
+
+    fn alloc_of(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        class: &str,
+        n: usize,
+    ) -> ObjectRef {
+        let cid = ctx.ensure_class_initialized(class).unwrap();
+        ctx.alloc_object(cid, n)
+    }
+
+    /// The assertion that names the defect. A bare `Value::Int` in slot 0 is
+    /// what `isPresent()` reads as the reference `value`.
+    fn assert_not_a_flag(site: &str, slot0: &Value) {
+        if let Value::Int(n) = slot0 {
+            panic!(
+                "{site}: slot 0 of a java.util.Optional is the REFERENCE `value`, \
+                 but it holds Value::Int({n}). isPresent() reads this as PRESENT \
+                 (Int(0) is not null to ref_operand_is_null) and get() returns the flag."
+            );
+        }
+    }
+
+    #[test]
+    fn e2_http_client_presence_accessors_answer_empty_not_a_flag() {
+        // executor/proxy/authenticator/cookieHandler store a presence FLAG and
+        // never the object itself, so `empty()` is the only truthful answer.
+        // These four have the CORRECT arity (1) and had the WRONG type, which
+        // is the shape the layout-alias instrument (a slot COUNT comparison) is
+        // structurally blind to.
+        for (name, flag_slot) in [
+            ("executor", CLIENT_HAS_EXECUTOR),
+            ("proxy", CLIENT_HAS_PROXY),
+            ("authenticator", CLIENT_HAS_AUTH),
+            ("cookieHandler", CLIENT_HAS_COOKIE),
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, "java/net/http/HttpClient", 10);
+            // Set the flag to 1 -- the case that used to produce Int(1), which
+            // `get()` would have handed back where an object is declared.
+            ctx.set_field(this, flag_slot, Value::Int(1));
+            let cb = find_cb("java/net/http/HttpClient", name, "()Ljava/util/Optional;");
+            let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(this))]);
+            assert_not_a_flag(name, &slot0);
+            assert_eq!(
+                slot0,
+                Value::Object(None),
+                "{name}: no object is stored in this layout, so empty() is the only truthful answer"
+            );
+        }
+    }
+
+    #[test]
+    fn e2_connect_timeout_absent_is_null_and_present_is_a_duration() {
+        let cb = || find_cb("java/net/http/HttpClient", "connectTimeout", "()Ljava/util/Optional;");
+
+        // Absent: this is the row that used to report isPresent() == true.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpClient", 10);
+        ctx.set_field(this, CLIENT_CONNECT_TIMEOUT, Value::Long(0));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("connectTimeout.absent", &slot0);
+        assert_eq!(slot0, Value::Object(None));
+
+        // Present: declared Optional<Duration>, so slot 0 owes a Duration
+        // object -- not a Long and certainly not the flag. 1500ms == 1s + 500ms.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpClient", 10);
+        ctx.set_field(this, CLIENT_CONNECT_TIMEOUT, Value::Long(1500));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("connectTimeout.present", &slot0);
+        match slot0 {
+            Value::Object(Some(dur)) => {
+                assert_eq!(ctx.get_field(dur, 0), Value::Long(1), "Duration seconds");
+                assert_eq!(
+                    ctx.get_field(dur, 1),
+                    Value::Int(500_000_000),
+                    "Duration nanos"
+                );
+            }
+            other => panic!("connectTimeout present must hold a Duration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e2_request_timeout_absent_is_null_and_present_is_a_duration() {
+        let cb = || find_cb("java/net/http/HttpRequest", "timeout", "()Ljava/util/Optional;");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+        ctx.set_field(this, REQ_TIMEOUT, Value::Long(0));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("timeout.absent", &slot0);
+        assert_eq!(slot0, Value::Object(None));
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+        ctx.set_field(this, REQ_TIMEOUT, Value::Long(7000));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("timeout.present", &slot0);
+        match slot0 {
+            Value::Object(Some(dur)) => {
+                assert_eq!(ctx.get_field(dur, 0), Value::Long(7), "Duration seconds");
+                assert_eq!(ctx.get_field(dur, 1), Value::Int(0), "Duration nanos");
+            }
+            other => panic!("timeout present must hold a Duration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e2_body_publisher_moves_the_publisher_into_slot_zero() {
+        let cb = || find_cb(
+            "java/net/http/HttpRequest",
+            "bodyPublisher",
+            "()Ljava/util/Optional;",
+        );
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+        ctx.set_field(this, REQ_HAS_BODY, Value::Int(0));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("bodyPublisher.absent", &slot0);
+        assert_eq!(slot0, Value::Object(None));
+
+        // Present: the publisher used to be parked at slot 1, where no real
+        // bytecode ever read it.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+        ctx.set_field(this, REQ_HAS_BODY, Value::Int(1));
+        ctx.set_field(this, REQ_BODY_LEN, Value::Long(2));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("bodyPublisher.present", &slot0);
+        assert!(
+            matches!(slot0, Value::Object(Some(_))),
+            "bodyPublisher present must hold the publisher itself, got {slot0:?}"
+        );
+    }
+
+    /// Declared `Optional<HttpClient$Version>`, so slot 0 owes an enum mirror
+    /// or null -- **never an ordinal**, which is the law this test states and
+    /// which has not changed.
+    ///
+    /// AMENDED by E13. E2 wrote this asserting `Value::Object(None)` for BOTH
+    /// `REQ_VERSION == 0` and `REQ_VERSION == 2`, because `REQ_VERSION` could
+    /// not then be non-zero: its only writer,
+    /// `HttpRequest$Builder.version(HttpClient$Version)`, matched
+    /// `Some(Value::Int(n))` against a reference argument. E13 fixed that
+    /// builder, so `2` now means an explicit HTTP_2 override and the present
+    /// arm is live. The `Int(2)` row moved from "empty" to "an enum mirror";
+    /// `assert_not_a_flag` -- the actual C12-3 assertion -- still holds on
+    /// both, and `e13_request_version_optional_now_holds_the_enum_mirror`
+    /// drives the same site through the real builder.
+    #[test]
+    fn e2_request_version_is_never_an_ordinal() {
+        for (stored, expect_present) in [(Value::Int(0), false), (Value::Int(2), true)] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+            ctx.set_field(this, REQ_VERSION, stored);
+            let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+            let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(this))]);
+            assert_not_a_flag("version", &slot0);
+            if expect_present {
+                match slot0 {
+                    Value::Object(Some(mirror)) => assert_eq!(
+                        ctx.get_field(mirror, ENUM_SLOT_ORDINAL),
+                        Value::Int(HTTP_VERSION_2),
+                        "an ENUM MIRROR, not the raw ordinal, belongs in slot 0"
+                    ),
+                    other => panic!("an explicit version override must be PRESENT, got {other:?}"),
+                }
+            } else {
+                assert_eq!(slot0, Value::Object(None));
+            }
+        }
+    }
+
+    /// The row C12-3 calls "the one that settles what this is": the arity was
+    /// already correct (1 slot) and the TYPE was not. It is covered by NO Java
+    /// fixture -- `RJdkOptionalShape` cannot reach it without a loopback
+    /// `HttpServer` -- and it is invisible to the layout-alias instrument,
+    /// which compares slot COUNTS. This test is its only coverage.
+    #[test]
+    fn e2_previous_response_is_empty_not_a_flag() {
+        for flag in [0, 1] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, "java/net/http/HttpResponse", 7);
+            ctx.set_field(this, RESP_HAS_PREV, Value::Int(flag));
+            let cb = find_cb(
+                "java/net/http/HttpResponse",
+                "previousResponse",
+                "()Ljava/util/Optional;",
+            );
+            let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(this))]);
+            assert_not_a_flag("previousResponse", &slot0);
+            assert_eq!(
+                slot0,
+                Value::Object(None),
+                "no previous response is stored anywhere in this layout"
+            );
+        }
+    }
+
+    #[test]
+    fn e2_ssl_session_moves_the_session_into_slot_zero() {
+        let cb = || find_cb("java/net/http/HttpResponse", "sslSession", "()Ljava/util/Optional;");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpResponse", 7);
+        ctx.set_field(this, RESP_HAS_SSL, Value::Int(0));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("sslSession.absent", &slot0);
+        assert_eq!(slot0, Value::Object(None));
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpResponse", 7);
+        ctx.set_field(this, RESP_HAS_SSL, Value::Int(1));
+        let slot0 = opt_slot0(cb(), &mut ctx, &[Value::Object(Some(this))]);
+        assert_not_a_flag("sslSession.present", &slot0);
+        assert!(
+            matches!(slot0, Value::Object(Some(_))),
+            "sslSession present must hold the SSLSession itself, got {slot0:?}"
+        );
+    }
+
+    #[test]
+    fn e2_first_value_moves_the_string_into_slot_zero() {
+        let cb = || find_cb(
+            "java/net/http/HttpHeaders",
+            "firstValue",
+            "(Ljava/lang/String;)Ljava/util/Optional;",
+        );
+
+        // Present: the header string used to sit at slot 1.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        ctx.set_field(this, HDR_HAS_CT, Value::Int(1));
+        let key = ctx.create_string("Content-Type");
+        let slot0 = opt_slot0(
+            cb(),
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(key))],
+        );
+        assert_not_a_flag("firstValue.present", &slot0);
+        match slot0 {
+            Value::Object(Some(s)) => {
+                assert_eq!(ctx.read_string(s).as_deref(), Some("application/json"));
+            }
+            other => panic!("firstValue present must hold the String, got {other:?}"),
+        }
+
+        // Absent: an unknown header name.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        ctx.set_field(this, HDR_HAS_CT, Value::Int(1));
+        let key = ctx.create_string("X-Absent");
+        let slot0 = opt_slot0(
+            cb(),
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(key))],
+        );
+        assert_not_a_flag("firstValue.absent", &slot0);
+        assert_eq!(slot0, Value::Object(None));
+    }
+
+    /// NEGATIVE CONTROL -- the test that must FAIL if anyone "simplifies" the
+    /// fix above into a blanket one.
+    ///
+    /// `java.util.OptionalLong` really does declare `boolean isPresent` at slot
+    /// 0 and `long value` at slot 1 (`javap -p --module java.base`, JDK 25), so
+    /// `firstValueAsLong`'s 2-slot (flag, payload) form is CORRECT and sits
+    /// twelve lines below the last site that was wrong. That adjacency is the
+    /// best available explanation of how the defect happened: the idiom is
+    /// right for the class one method away. Applying the reference-Optional
+    /// fix here would BREAK a working accessor.
+    #[test]
+    fn e2_optional_long_keeps_the_primitive_flag_payload_layout() {
+        let cb = || find_cb(
+            "java/net/http/HttpHeaders",
+            "firstValueAsLong",
+            "(Ljava/lang/String;)Ljava/util/OptionalLong;",
+        );
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, "java/net/http/HttpHeaders", 3);
+        ctx.set_field(this, HDR_HAS_CL, Value::Int(1));
+        let key = ctx.create_string("Content-Length");
+        let opt = match cb()(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(key))],
+        )
+        .expect("native must not fail")
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an OptionalLong, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.object_num_fields(opt),
+            2,
+            "OptionalLong declares TWO fields -- do not collapse it to one"
+        );
+        assert_eq!(
+            ctx.get_field(opt, 0),
+            Value::Int(1),
+            "OptionalLong slot 0 IS `boolean isPresent` -- a flag here is CORRECT"
+        );
+        assert_eq!(
+            ctx.get_field(opt, 1),
+            Value::Long(20),
+            "OptionalLong slot 1 IS `long value`"
+        );
+    }
+
+    // =====================================================================
+    // E13 -- THE SIX BUILDERS THAT DECODED A REFERENCE AS AN `Int`.
+    //
+    // Behavioural, like E2's: each drives the native through the registry and
+    // asserts the value it actually STORED. `http2.rs` had 64 tests before E2
+    // and every one was registration-only, so all 64 stayed green through both
+    // of these defect families -- a native existing says nothing about what it
+    // writes.
+    //
+    // The setups build their arguments the way the VM mints them
+    // (`p57_alloc_enum`: name at slot 0, ordinal at slot 1;
+    // `util_time::alloc_duration`: seconds at slot 0, nanos at slot 1) rather
+    // than by name, so the class-side-witness fallback in the decoders is the
+    // path under test. `test_utils::MockNativeContext::get_field_by_name`
+    // answers `Value::Int(0)` for an unresolvable name where production answers
+    // `Value::Object(None)`; the decoders deliberately never take a value-side
+    // by-name read, so that divergence cannot steer these results.
+    //
+    // See docs/known-issues/jdk-only/E13-1-the-six-builders-decode-a-reference-as-an-int.md
+    // =====================================================================
+
+    const CLS_CLIENT_BUILDER: &str = "java/net/http/HttpClient$Builder";
+    const CLS_REQUEST_BUILDER: &str = "java/net/http/HttpRequest$Builder";
+    const DESC_CLIENT_VERSION: &str =
+        "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;";
+    const DESC_REQUEST_VERSION: &str =
+        "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;";
+
+    /// An enum constant shaped the way `phases_late::p57_alloc_enum` mints one.
+    fn alloc_enum_const(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        class: &str,
+        name: &str,
+        ordinal: i32,
+    ) -> ObjectRef {
+        let obj = alloc_of(ctx, class, 2);
+        let n = ctx.create_string(name);
+        ctx.set_field(obj, ENUM_SLOT_NAME, Value::Object(Some(n)));
+        ctx.set_field(obj, ENUM_SLOT_ORDINAL, Value::Int(ordinal));
+        obj
+    }
+
+    /// A `java.time.Duration` shaped the way `util_time::alloc_duration` mints
+    /// one: floor-normalised `seconds` (`Long`) and `nanos` (`Int`).
+    fn alloc_dur(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        seconds: i64,
+        nanos: i32,
+    ) -> ObjectRef {
+        let obj = alloc_of(ctx, "java/time/Duration", 2);
+        ctx.set_field(obj, DUR_SLOT_SECONDS, Value::Long(seconds));
+        ctx.set_field(obj, DUR_SLOT_NANOS, Value::Int(nanos));
+        obj
+    }
+
+    /// Drive a fluent setter and check it hands the receiver back -- a builder
+    /// that returns anything else breaks the chain the caller wrote.
+    fn call_setter(
+        cb: cratonvm_native_api::NativeCallback,
+        ctx: &mut crate::test_utils::MockNativeContext,
+        this: ObjectRef,
+        arg: Value,
+    ) {
+        match cb(ctx, &[Value::Object(Some(this)), arg]).expect("native must not fail") {
+            Some(Value::Object(Some(ret))) => assert_eq!(
+                ret.as_ptr(),
+                this.as_ptr(),
+                "a fluent setter must return its own receiver"
+            ),
+            other => panic!("expected the builder back, got {other:?}"),
+        }
+    }
+
+    /// THE DISCRIMINATING CASE. `HTTP_1_1` is the constant the pre-fix
+    /// `_ => HTTP_VERSION_2` fallback swallowed: a caller who asked for
+    /// HTTP/1.1 got an HTTP/2 client, and asking for HTTP_2 looked "right" only
+    /// because the default happened to agree. Both are asserted so a future
+    /// regression cannot hide behind the agreeing one.
+    #[test]
+    fn e13_client_builder_version_stores_the_constant_the_caller_passed() {
+        for (name, ordinal, expected) in [
+            ("HTTP_1_1", 0, HTTP_VERSION_1_1),
+            ("HTTP_2", 1, HTTP_VERSION_2),
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+            let v = alloc_enum_const(&mut ctx, "java/net/http/HttpClient$Version", name, ordinal);
+            let cb = find_cb(CLS_CLIENT_BUILDER, "version", DESC_CLIENT_VERSION);
+            call_setter(cb, &mut ctx, this, Value::Object(Some(v)));
+            assert_eq!(
+                ctx.get_field(this, 0),
+                Value::Int(expected),
+                "version({name}) must store ordinal {expected}; the descriptor's parameter is a \
+                 REFERENCE, so a `Some(Value::Int(n))` match here never fires and the default wins"
+            );
+        }
+    }
+
+    /// The two encodings of one concept, separated. Each arm carries ONLY its
+    /// own encoding and the other slot is left at the mock's `Int(0)` default,
+    /// so each is a real single-path test:
+    ///
+    /// * NAME-only `HTTP_2` -- slot 1 reads `Int(0)`. Answering `HTTP_2` proves
+    ///   the name was consulted FIRST; a decoder that only read the ordinal
+    ///   would answer `HTTP_1_1` here.
+    /// * ORDINAL-only `1` -- slot 0 holds no string, so the name lookup misses
+    ///   and the ordinal path must carry it.
+    #[test]
+    fn e13_enum_decode_reads_the_name_first_and_the_ordinal_as_a_fallback() {
+        let cb = || find_cb(CLS_CLIENT_BUILDER, "version", DESC_CLIENT_VERSION);
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        let by_name = alloc_of(&mut ctx, "java/net/http/HttpClient$Version", 2);
+        let n = ctx.create_string("HTTP_2");
+        ctx.set_field(by_name, ENUM_SLOT_NAME, Value::Object(Some(n)));
+        call_setter(cb(), &mut ctx, this, Value::Object(Some(by_name)));
+        assert_eq!(
+            ctx.get_field(this, 0),
+            Value::Int(HTTP_VERSION_2),
+            "the NAME must be consulted before the ordinal slot"
+        );
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        let by_ordinal = alloc_of(&mut ctx, "java/net/http/HttpClient$Version", 2);
+        ctx.set_field(by_ordinal, ENUM_SLOT_ORDINAL, Value::Int(HTTP_VERSION_2));
+        call_setter(cb(), &mut ctx, this, Value::Object(Some(by_ordinal)));
+        assert_eq!(
+            ctx.get_field(this, 0),
+            Value::Int(HTTP_VERSION_2),
+            "a constant with no readable name must still decode through its ordinal"
+        );
+    }
+
+    #[test]
+    fn e13_client_builder_connect_timeout_decodes_a_duration() {
+        let cb = || {
+            find_cb(
+                CLS_CLIENT_BUILDER,
+                "connectTimeout",
+                "(Ljava/time/Duration;)Ljava/net/http/HttpClient$Builder;",
+            )
+        };
+
+        // 1500 ms == Duration.ofMillis(1500) == seconds 1, nanos 500_000_000.
+        // This is the value RJdkOptionalShape's `mint-connectTimeout-present-millis`
+        // asks for, and it was unreachable: CLIENT_CONNECT_TIMEOUT could never
+        // be non-zero, so `connectTimeout()` had no present arm to take.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        let d = alloc_dur(&mut ctx, 1, 500_000_000);
+        call_setter(cb(), &mut ctx, this, Value::Object(Some(d)));
+        assert_eq!(ctx.get_field(this, 2), Value::Long(1500));
+
+        // Duration is FLOOR-normalised, so ofMillis(-1500) is seconds -2 with
+        // nanos +500_000_000. A decoder that truncated toward zero would say
+        // -1000 here.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        let d = alloc_dur(&mut ctx, -2, 500_000_000);
+        call_setter(cb(), &mut ctx, this, Value::Object(Some(d)));
+        assert_eq!(ctx.get_field(this, 2), Value::Long(-1500));
+
+        // A null Duration keeps the pre-fix answer rather than inventing one.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        call_setter(cb(), &mut ctx, this, Value::Object(None));
+        assert_eq!(ctx.get_field(this, 2), Value::Long(0));
+    }
+
+    #[test]
+    fn e13_request_builder_timeout_decodes_a_duration() {
+        let cb = find_cb(
+            CLS_REQUEST_BUILDER,
+            "timeout",
+            "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
+        );
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+        let d = alloc_dur(&mut ctx, 7, 0);
+        call_setter(cb, &mut ctx, this, Value::Object(Some(d)));
+        assert_eq!(
+            ctx.get_field(this, REQ_TIMEOUT),
+            Value::Long(7000),
+            "the 7000 ms `mint-timeout-present-millis` asks for"
+        );
+    }
+
+    /// Covers the enum decode AND the slot collision the decode uncovered:
+    /// `followRedirects` used to also write `Int(policy != NEVER)` into BUILDER
+    /// slot 7, which `build()` copies to `CLIENT_HAS_COOKIE`. That was inert
+    /// only while `policy` was stuck at `NEVER`.
+    #[test]
+    fn e13_follow_redirects_decodes_the_enum_and_leaves_the_cookie_flag_alone() {
+        for (name, ordinal, follow) in [
+            ("NEVER", REDIRECT_NEVER, 0),
+            ("ALWAYS", REDIRECT_ALWAYS, 1),
+            ("NORMAL", REDIRECT_NORMAL, 1),
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let bld = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+            init_http_client_builder_fields(&mut ctx, bld);
+            // A cookie handler IS configured -- the flag the stray write to
+            // builder slot 7 would have overwritten with a redirect answer.
+            let cookie_cb = find_cb(
+                CLS_CLIENT_BUILDER,
+                "cookieHandler",
+                "(Ljava/net/CookieHandler;)Ljava/net/http/HttpClient$Builder;",
+            );
+            let handler = alloc_of(&mut ctx, "java/net/CookieHandler", 1);
+            call_setter(cookie_cb, &mut ctx, bld, Value::Object(Some(handler)));
+
+            let e = alloc_enum_const(&mut ctx, "java/net/http/HttpClient$Redirect", name, ordinal);
+            let cb = find_cb(
+                CLS_CLIENT_BUILDER,
+                "followRedirects",
+                "(Ljava/net/http/HttpClient$Redirect;)Ljava/net/http/HttpClient$Builder;",
+            );
+            call_setter(cb, &mut ctx, bld, Value::Object(Some(e)));
+            assert_eq!(
+                ctx.get_field(bld, 1),
+                Value::Int(ordinal),
+                "followRedirects({name}) must store the policy it was given"
+            );
+            assert_eq!(
+                ctx.get_field(bld, 7),
+                Value::Int(1),
+                "builder slot 7 is the COOKIE flag; followRedirects must not touch it"
+            );
+
+            let build = find_cb(CLS_CLIENT_BUILDER, "build", "()Ljava/net/http/HttpClient;");
+            let client = match build(&mut ctx, &[Value::Object(Some(bld))])
+                .expect("build must not fail")
+            {
+                Some(Value::Object(Some(c))) => c,
+                other => panic!("build() must return an HttpClient, got {other:?}"),
+            };
+            assert_eq!(ctx.get_field(client, CLIENT_REDIRECT), Value::Int(ordinal));
+            assert_eq!(
+                ctx.get_field(client, CLIENT_HAS_COOKIE),
+                Value::Int(1),
+                "the cookie flag must survive the redirect policy"
+            );
+            assert_eq!(
+                ctx.get_field(client, CLIENT_FOLLOW_REDIR),
+                Value::Int(follow),
+                "CLIENT_FOLLOW_REDIR is slot 8 and the copy loop stops at 7, so build() must \
+                 derive it"
+            );
+        }
+    }
+
+    #[test]
+    fn e13_request_builder_version_stores_the_ordinal_plus_one() {
+        let cb = || find_cb(CLS_REQUEST_BUILDER, "version", DESC_REQUEST_VERSION);
+        for (name, ordinal, stored) in [("HTTP_1_1", 0, 1), ("HTTP_2", 1, 2)] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+            let v = alloc_enum_const(&mut ctx, "java/net/http/HttpClient$Version", name, ordinal);
+            call_setter(cb(), &mut ctx, this, Value::Object(Some(v)));
+            assert_eq!(
+                ctx.get_field(this, REQ_VERSION),
+                Value::Int(stored),
+                "REQ_VERSION encodes 0 = no override, so {name} is stored as {stored}"
+            );
+        }
+    }
+
+    /// An argument the decoder cannot read must leave each site's OWN default
+    /// standing -- never a silent decay to ordinal 0. That decay is what turned
+    /// `TimeUnit.SECONDS.toNanos(1)` into `1` (`phases_early::tu_ordinal`), and
+    /// here it would make `version(<unreadable>)` mean HTTP_1_1 on the client
+    /// and an explicit HTTP_1_1 override on the request.
+    #[test]
+    fn e13_an_undecodable_enum_argument_keeps_each_sites_own_default() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        let cb = find_cb(CLS_CLIENT_BUILDER, "version", DESC_CLIENT_VERSION);
+        call_setter(cb, &mut ctx, this, Value::Object(None));
+        assert_eq!(
+            ctx.get_field(this, 0),
+            Value::Int(HTTP_VERSION_2),
+            "HttpClient$Builder.version's documented default is HTTP_2, not ordinal 0"
+        );
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+        let cb = find_cb(CLS_REQUEST_BUILDER, "version", DESC_REQUEST_VERSION);
+        call_setter(cb, &mut ctx, this, Value::Object(None));
+        assert_eq!(
+            ctx.get_field(this, REQ_VERSION),
+            Value::Int(0),
+            "HttpRequest$Builder.version's default is 0 == NO override"
+        );
+
+        // An ordinal outside the modelled constants is not a usable answer
+        // either -- `version_enum` would have to invent a name for it.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+        let bogus = alloc_of(&mut ctx, "java/net/http/HttpClient$Version", 2);
+        ctx.set_field(bogus, ENUM_SLOT_ORDINAL, Value::Int(97));
+        let cb = find_cb(CLS_REQUEST_BUILDER, "version", DESC_REQUEST_VERSION);
+        call_setter(cb, &mut ctx, this, Value::Object(Some(bogus)));
+        assert_eq!(ctx.get_field(this, REQ_VERSION), Value::Int(0));
+    }
+
+    /// `BodyPublishers.ofByteArray` is STATIC, so `args[0]` is the `[B` itself.
+    /// Every publisher it minted reported `contentLength() == 0`, while the
+    /// `ofString` sibling directly above it always read its reference argument.
+    #[test]
+    fn e13_of_byte_array_reads_the_array_length() {
+        let cb = find_cb(
+            "java/net/http/HttpRequest$BodyPublishers",
+            "ofByteArray",
+            "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
+        );
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 5);
+        let bp = match cb(&mut ctx, &[Value::Object(Some(arr))]).expect("native must not fail") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a BodyPublisher, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(bp, 0),
+            Value::Long(5),
+            "contentLength() reads slot 0 as a Long"
+        );
+    }
+
+    /// Found by grepping the SHAPE ("a builder that does not read the reference
+    /// it was handed") rather than the `Value::Int` idiom: `POST`, `PUT` and
+    /// `method(String, BodyPublisher)` recorded only THAT a body existed, so
+    /// `bodyPublisher().get().contentLength()` answered 0 for every body --
+    /// which is `mint-bodyPublisher-present-len`.
+    #[test]
+    fn e13_post_put_and_method_carry_the_publishers_content_length() {
+        let bp_cb = find_cb(
+            "java/net/http/HttpRequest$BodyPublishers",
+            "ofString",
+            "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
+        );
+        for (method, desc, extra) in [
+            (
+                "POST",
+                "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+                0usize,
+            ),
+            (
+                "PUT",
+                "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+                0,
+            ),
+            (
+                "method",
+                "(Ljava/lang/String;Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+                1,
+            ),
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+            let body = ctx.create_string("hi");
+            let bp = match bp_cb(&mut ctx, &[Value::Object(Some(body))])
+                .expect("ofString must not fail")
+            {
+                Some(Value::Object(Some(o))) => o,
+                other => panic!("expected a BodyPublisher, got {other:?}"),
+            };
+            let cb = find_cb(CLS_REQUEST_BUILDER, method, desc);
+            let mut args = vec![Value::Object(Some(this))];
+            if extra == 1 {
+                let name = ctx.create_string("POST");
+                args.push(Value::Object(Some(name)));
+            }
+            args.push(Value::Object(Some(bp)));
+            cb(&mut ctx, &args).expect("native must not fail");
+            assert_eq!(ctx.get_field(this, REQ_HAS_BODY), Value::Int(1));
+            assert_eq!(
+                ctx.get_field(this, REQ_BODY_LEN),
+                Value::Long(2),
+                "{method} must carry the publisher's declared length, not just a has-body flag"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL -- the test that must FAIL if anyone "simplifies" the
+    /// six fixes above into "no builder matches `Value::Int`".
+    ///
+    /// `expectContinue`'s descriptor is `(Z)`: a primitive `boolean`, which
+    /// really does arrive as a `Value::Int`. The idiom is CORRECT here and
+    /// wrong twelve lines away, exactly as `firstValueAsLong`'s
+    /// `(isPresent, value)` layout is correct where the reference `Optional`'s
+    /// was wrong. Read the DESCRIPTOR, not the neighbouring line.
+    #[test]
+    fn e13_expect_continue_still_reads_a_primitive_boolean() {
+        let cb = || {
+            find_cb(
+                CLS_REQUEST_BUILDER,
+                "expectContinue",
+                "(Z)Ljava/net/http/HttpRequest$Builder;",
+            )
+        };
+        for flag in [0, 1] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let this = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+            call_setter(cb(), &mut ctx, this, Value::Int(flag));
+            assert_eq!(
+                ctx.get_field(this, REQ_EXPECT_100),
+                Value::Int(flag),
+                "a primitive boolean parameter DOES arrive as Value::Int -- this arm is correct"
+            );
+        }
+    }
+
+    /// END TO END through the pair E2 could not join up: builder -> build() ->
+    /// accessor. E2 pinned `HttpRequest.version()` at unconditionally EMPTY and
+    /// said so in a comment, because `REQ_VERSION` could not be non-zero. This
+    /// patch makes it non-zero, so slot 0 of the `Optional` must now hold an
+    /// ENUM MIRROR -- still never an ordinal and never a flag.
+    #[test]
+    fn e13_request_version_optional_now_holds_the_enum_mirror() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let bld = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+        init_http_request_fields(&mut ctx, bld);
+        let v = alloc_enum_const(&mut ctx, "java/net/http/HttpClient$Version", "HTTP_2", 1);
+        let set = find_cb(CLS_REQUEST_BUILDER, "version", DESC_REQUEST_VERSION);
+        call_setter(set, &mut ctx, bld, Value::Object(Some(v)));
+        let build = find_cb(CLS_REQUEST_BUILDER, "build", "()Ljava/net/http/HttpRequest;");
+        let req = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
+            Some(Value::Object(Some(r))) => r,
+            other => panic!("build() must return an HttpRequest, got {other:?}"),
+        };
+
+        let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+        let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(req))]);
+        assert_not_a_flag("version.present", &slot0);
+        match slot0 {
+            Value::Object(Some(mirror)) => {
+                let name = match ctx.get_field(mirror, ENUM_SLOT_NAME) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    other => panic!("an enum mirror's slot 0 is its name, got {other:?}"),
+                };
+                assert_eq!(name.as_deref(), Some("HTTP_2"));
+                assert_eq!(
+                    ctx.get_field(mirror, ENUM_SLOT_ORDINAL),
+                    Value::Int(HTTP_VERSION_2)
+                );
+            }
+            other => panic!("version() present must hold an HttpClient$Version, got {other:?}"),
+        }
+
+        // The absent arm still answers empty -- no override was requested.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let req = alloc_of(&mut ctx, "java/net/http/HttpRequest", 8);
+        init_http_request_fields(&mut ctx, req);
+        let cb = find_cb("java/net/http/HttpRequest", "version", "()Ljava/util/Optional;");
+        let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(req))]);
+        assert_eq!(slot0, Value::Object(None));
+    }
+
+    /// The other two `Optional` present arms E2 could only reach by writing the
+    /// backing field by hand, now driven through the BUILDER the way Java does.
+    /// This is what `mint-connectTimeout-present-millis` and
+    /// `mint-timeout-present-millis` execute.
+    #[test]
+    fn e13_the_duration_optionals_are_reachable_through_the_builder_now() {
+        // HttpClient: connectTimeout(Duration.ofMillis(1500)).build().connectTimeout()
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let bld = alloc_of(&mut ctx, CLS_CLIENT_BUILDER, 8);
+        init_http_client_builder_fields(&mut ctx, bld);
+        let d = alloc_dur(&mut ctx, 1, 500_000_000);
+        let set = find_cb(
+            CLS_CLIENT_BUILDER,
+            "connectTimeout",
+            "(Ljava/time/Duration;)Ljava/net/http/HttpClient$Builder;",
+        );
+        call_setter(set, &mut ctx, bld, Value::Object(Some(d)));
+        let build = find_cb(CLS_CLIENT_BUILDER, "build", "()Ljava/net/http/HttpClient;");
+        let client = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail")
+        {
+            Some(Value::Object(Some(c))) => c,
+            other => panic!("build() must return an HttpClient, got {other:?}"),
+        };
+        let cb = find_cb(
+            "java/net/http/HttpClient",
+            "connectTimeout",
+            "()Ljava/util/Optional;",
+        );
+        let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(client))]);
+        assert_not_a_flag("connectTimeout.present", &slot0);
+        match slot0 {
+            Value::Object(Some(dur)) => {
+                assert_eq!(ctx.get_field(dur, DUR_SLOT_SECONDS), Value::Long(1));
+                assert_eq!(
+                    ctx.get_field(dur, DUR_SLOT_NANOS),
+                    Value::Int(500_000_000),
+                    "1500 ms must round-trip through the builder as 1 s + 500 ms"
+                );
+            }
+            other => panic!("connectTimeout present must hold a Duration, got {other:?}"),
+        }
+
+        // HttpRequest: POST(ofString("hi")).build().bodyPublisher().contentLength()
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let bld = alloc_of(&mut ctx, CLS_REQUEST_BUILDER, 8);
+        init_http_request_fields(&mut ctx, bld);
+        let body = ctx.create_string("hi");
+        let bp_cb = find_cb(
+            "java/net/http/HttpRequest$BodyPublishers",
+            "ofString",
+            "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
+        );
+        let bp = match bp_cb(&mut ctx, &[Value::Object(Some(body))]).expect("ofString must not fail")
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected a BodyPublisher, got {other:?}"),
+        };
+        let post = find_cb(
+            CLS_REQUEST_BUILDER,
+            "POST",
+            "(Ljava/net/http/HttpRequest$BodyPublisher;)Ljava/net/http/HttpRequest$Builder;",
+        );
+        call_setter(post, &mut ctx, bld, Value::Object(Some(bp)));
+        let build = find_cb(CLS_REQUEST_BUILDER, "build", "()Ljava/net/http/HttpRequest;");
+        let req = match build(&mut ctx, &[Value::Object(Some(bld))]).expect("build must not fail") {
+            Some(Value::Object(Some(r))) => r,
+            other => panic!("build() must return an HttpRequest, got {other:?}"),
+        };
+        let cb = find_cb(
+            "java/net/http/HttpRequest",
+            "bodyPublisher",
+            "()Ljava/util/Optional;",
+        );
+        let slot0 = opt_slot0(cb, &mut ctx, &[Value::Object(Some(req))]);
+        assert_not_a_flag("bodyPublisher.present", &slot0);
+        match slot0 {
+            Value::Object(Some(pub_obj)) => assert_eq!(
+                ctx.get_field(pub_obj, 0),
+                Value::Long(2),
+                "the body \"hi\" is 2 bytes; this is `mint-bodyPublisher-present-len`"
+            ),
+            other => panic!("bodyPublisher present must hold the publisher, got {other:?}"),
+        }
     }
 }

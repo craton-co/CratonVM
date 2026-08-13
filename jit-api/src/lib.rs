@@ -1123,6 +1123,24 @@ pub struct JitRuntimeHelpers {
     /// behaviour. Appended at the END of the struct so all prior golden
     /// offsets stay stable.
     pub ldc_class_cp: usize,
+    /// JVMS §6.5 *aastore* covariance check ONLY — `extern "C" fn(vm_ptr: i64,
+    /// array_ptr: i64, val: i64) -> i64`. Returns `i64::MIN` when the store
+    /// must be refused and an `ArrayStoreException` has been published on this
+    /// thread, `0` when it may proceed. NOT the store: the caller keeps the
+    /// inline `MOV`, the SATB pre-write barrier and the card mark.
+    ///
+    /// Exists so the `0x53` lowering can keep the inline
+    /// `MOV [array + index*8 + HEADER_SIZE], val` and call out only for the
+    /// type check, instead of routing the whole opcode through
+    /// [`Self::aastore`] (W7-38 restored correctness that way and paid one
+    /// call per reference array store for it).
+    ///
+    /// `0` = not wired (hand-built test tables) → the backend must fall back
+    /// to calling [`Self::aastore`], which is the complete opcode. It must NOT
+    /// fall back to the bare inline store: that is the heap-type-confusion
+    /// defect W7-38 fixed. Appended at the END of the struct so all prior
+    /// golden offsets stay stable.
+    pub aastore_check: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -1296,6 +1314,9 @@ helper_fields! {
     // Optional: 0 makes the single-pass backend refuse an `ldc <Class>` site
     // and bail the compile — the pre-fix behaviour.
     (ldc_class_cp,                   FieldKind::OptionalPtr),
+    // Optional: 0 makes the `0x53` lowering call `aastore` (the complete
+    // opcode) instead of inline-store-plus-check. Never the bare inline store.
+    (aastore_check,                  FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -1321,7 +1342,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 63,
+    JitRuntimeHelpers::NUM_FIELDS == 64,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1714,6 +1735,7 @@ mod tests {
             monitor_enter: 0x11A8,
             monitor_exit: 0x11B0,
             ldc_class_cp: 0x11B8,
+            aastore_check: 0x11C0,
         }
     }
 
@@ -1949,6 +1971,7 @@ mod tests {
             monitor_enter: 0,
             monitor_exit: 0,
             ldc_class_cp: 0,
+            aastore_check: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2124,8 +2147,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 63.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 63);
+        // And the macro-driven count is the canonical 64.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 64);
     }
 
     #[test]
@@ -2437,6 +2460,11 @@ mod tests {
                 62,
                 "ldc_class_cp",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_class_cp),
+            ),
+            (
+                63,
+                "aastore_check",
+                std::mem::offset_of!(JitRuntimeHelpers, aastore_check),
             ),
         ];
 

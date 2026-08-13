@@ -7608,18 +7608,26 @@ pub enum JitIntrinsic {
     // inlined as a coder+length-guarded raw byte compare (deopts to native
     // on a coder mismatch or a non-String argument).
     //
-    // Phase 3b follow-up: `compareTo` and both `indexOf` overloads are now
-    // ALSO inlined. Unlike `equals` (which can byte-compare only when the
-    // coders match), these three decode each receiver/argument character
+    // Phase 3b follow-up: `compareTo` and `indexOf(String)` are now ALSO
+    // inlined. Unlike `equals` (which can byte-compare only when the
+    // coders match), these decode each receiver/argument character
     // through a per-string `coder` branch (0 LATIN1 = 1 byte/char, 1 UTF16
     // = 2 LE bytes/char), so EVERY coder combination — including mixed —
     // is handled inline with no coder-mismatch deopt. The deopt stub is
     // still used for the genuinely uncertain cases (null receiver, null
     // String argument, null backing `value` array). Variant ordering here
     // is local and not externally observed.
-    StringEquals,      // equals(Ljava/lang/Object;)Z
-    StringCompareTo,   // compareTo(Ljava/lang/String;)I
-    StringIndexOfChar, // indexOf(I)I
+    StringEquals,    // equals(Ljava/lang/Object;)Z
+    StringCompareTo, // compareTo(Ljava/lang/String;)I
+    // `indexOf(I)I` — the codegen for this variant still exists in
+    // `x64/bytecode_walk.rs`, but `try_resolve_string_intrinsic` no longer
+    // hands the entry out, so nothing reaches it. Its inline body masks the
+    // needle to `ch & 0xFFFF`, which is not what the JDK does — the gate is
+    // `Character.isValidCodePoint`, applied BEFORE any narrowing, and a
+    // supplementary `ch` is matched as a surrogate PAIR. See the retirement
+    // note in `try_resolve_string_intrinsic` for the measured rows and for
+    // what restoring the fast path would take.
+    StringIndexOfChar, // indexOf(I)I — NOT handed out; see above
     StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -8689,29 +8697,83 @@ pub fn try_resolve_string_intrinsic(
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-    // `equals`, `compareTo` and both `indexOf` overloads are inlined. The
-    // codegen ladder decodes every character through the receiver's /
-    // argument's own `coder` byte, so all LATIN1/UTF16 combinations are
-    // handled inline; only null receiver / null argument / null backing
-    // array route to the deopt stub. These signatures are declared on
-    // `java/lang/String` (not CharSequence), so they never reach a guarded
-    // (CharSequence) call site.
+    // `equals`, `compareTo` and `indexOf(String)` are inlined. The codegen
+    // ladder decodes every character through the receiver's / argument's own
+    // `coder` byte, so all LATIN1/UTF16 combinations are handled inline. These
+    // signatures are declared on `java/lang/String` (not CharSequence), so they
+    // never reach a guarded (CharSequence) call site.
     //
+    //   * equals(Object)      — the argument is NOT assumed to be a String.
+    //     The emitted body (`x64/bytecode_walk.rs`) tests the argument's
+    //     ObjectHeader class id against the receiver's and routes a mismatch
+    //     to the deopt stub, which is what makes it agree with
+    //     `String.equals`'s `anObject instanceof String` guard: String is
+    //     final, so equal class ids IS the instanceof. That test is
+    //     load-bearing, not an optimisation — everything below it reaches the
+    //     argument's `value` array by SLOT INDEX, and CratonVM's synthetic
+    //     `StringBuilder` also has `char[] value` at slot 0. Measured on
+    //     OpenJDK 25.0.3+9: `"abc".equals(new StringBuilder(3).append("abc"))`
+    //     is `false` (the builder really does have capacity 3, so even the
+    //     length matches) while `contentEquals` is `true`. See E18-1 §3, which
+    //     fixed the same hole on the native side; this door already had the
+    //     class-id compare, so both tiers now answer `false`.
     //   * compareTo(String)   — lexicographic decoded-char compare; the
     //     unsigned-char difference at the first mismatch, else len1-len2.
-    //   * indexOf(I)          — scan for `(ch & 0xFFFF)` from index 0,
-    //     bit-identical to native `String.indexOf(int)` (which likewise
-    //     masks to a single code unit — supplementary code points match
-    //     their masked low half, no surrogate special-casing).
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
+    //
+    // `indexOf(I)` is deliberately NOT recognised — see the block below.
     if is_string {
         let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
             ("compareTo", "(Ljava/lang/String;)I") => {
                 Some((JitIntrinsic::StringCompareTo, 1, b'I'))
             }
-            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
+            // `indexOf(I)` — RETIRED, deliberately not intrinsified here.
+            //
+            // The inline body masks the needle to `ch & 0xFFFF` and the comment
+            // that used to stand here called that "bit-identical to native
+            // `String.indexOf(int)`". Both halves were false. The JDK does not
+            // narrow `ch`: it gates on `Character.isValidCodePoint` FIRST, then
+            // scans for one code unit if `ch <= 0xFFFF` and for the SURROGATE
+            // PAIR if `ch >= 0x10000`. Measured on OpenJDK 25.0.3+9 (this
+            // lane's `scratchpad/e27/E27Probe.java`):
+            //
+            //     "abc".indexOf(0x10061)   -1     masking finds 'a' at 0
+            //     "￿q".indexOf(-1)    -1     masking finds U+FFFF at 0
+            //     mixed.indexOf(0x10437)    3     the pair, not its low half at 1
+            //
+            // The `indexOf(-1)` row is the one that rejects the plausible wrong
+            // fix: `(char) -1` IS `0xFFFF` and the receiver DOES hold `0xFFFF`,
+            // yet HotSpot answers -1 — so the rule is the validity gate, not a
+            // narrowing cast.
+            //
+            // E18-1 rewrote the native side onto ONE `code_point_needle`
+            // predicate plus two shared scanners, replacing four divergent
+            // copies of this single JVMS rule. Re-implementing the gate here
+            // would make a fifth. Dropping the recognition sends the call site
+            // through ordinary dispatch to that one predicate instead, which is
+            // the only way this door can carry the rule without owning a copy
+            // of it — `jit/src/lib.rs` is below `native-builtins` in the crate
+            // graph and cannot call `code_point_needle` directly.
+            //
+            // Verified before landing: ordinary dispatch reaches a CORRECT
+            // implementation in both modes. In real-JDK mode a `Bridge`-kind
+            // `java/lang/String` native is dropped at registration
+            // (`native-api/src/registry.rs`, `drop_real_layout_synthetic`), so
+            // nothing shadows the real JDK's own `String.indexOf(int)`
+            // bytecode; in synthetic-jdk mode `register_synthetic_overrides`
+            // last-write-wins with `native_string_index_of`, which is the
+            // `code_point_needle` body.
+            //
+            // This costs the inline scan on a hot method. Restoring it is a
+            // codegen change, not a recognition change: emit the fast path
+            // under a runtime screen (`ch < 0 || ch > 0xFFFF` -> deopt), which
+            // admits exactly the range where a single-code-unit scan already IS
+            // the whole answer and defers every other case to the predicate.
+            // That belongs in `x64/bytecode_walk.rs` and is nominated as N2b in
+            // `docs/known-issues/jdk-only/`
+            // `E27-1-the-jit-indexof-int-intrinsic-was-the-fifth-copy.md`.
             ("indexOf", "(Ljava/lang/String;)I") => Some((JitIntrinsic::StringIndexOfStr, 1, b'I')),
             _ => None,
         };

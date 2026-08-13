@@ -979,6 +979,28 @@ pub(crate) fn native_string_equals(
         return Ok(Some(Value::Int(1)));
     }
 
+    // E18. `String.equals(Object)` is
+    // `(anObject instanceof String aString) && …`, and the type test is not
+    // decoration here: everything below reaches the ARGUMENT's `value` field
+    // by SLOT INDEX (`string_char_array` is `get_field(obj, 0)`), and
+    // CratonVM's own synthetic `StringBuilder` layout is `char[] value @0`
+    // too. A builder whose backing array happens to be exactly as long as the
+    // receiver therefore compared EQUAL to it. That is reachable, not
+    // theoretical: `new StringBuilder(3).append("abc")` has `capacity() == 3`
+    // on OpenJDK 25.0.3+9 (measured), so `"abc".equals(sb)` answered `true`
+    // where HotSpot answers `false` — and `equals` is what every `Map` and
+    // `List.contains` in the VM ultimately calls.
+    //
+    // `java/lang/String` is final and bootstrap-defined, so every String in a
+    // VM shares the receiver's class id: the test is one integer compare and
+    // needs no name lookup on this very hot path. It is written against
+    // `this`'s id rather than a resolved `java/lang/String` id deliberately —
+    // if the receiver's id were ever surprising, two Strings would still agree
+    // with each other and the answer would be unchanged.
+    if ctx.class_id_of_object(other) != ctx.class_id_of_object(this) {
+        return Ok(Some(Value::Int(0)));
+    }
+
     // Cheap rejection: different backing-array lengths cannot be equal.
     // Avoids the bulk decode for the common "different strings" case.
     let (_, len_a) = match string_char_array(ctx, this) {
@@ -1017,22 +1039,29 @@ pub(crate) fn native_string_index_of(
     // VM-bulk copy when the backing array is `char[]`), then scan the
     // local slice. Avoids N per-element virtual `get_array_element`
     // calls when the haystack is long.
-    let needle = (ch & 0xFFFF) as u16;
-    let pos = with_string_chars_scratch(ctx, this, |buf| {
-        buf.iter()
-            .position(|&c| c == needle)
-            .map(|i| i as i32)
-            .unwrap_or(-1)
-    });
+    //
+    // The needle is [`code_point_needle`]'s, not `(ch & 0xFFFF)`: a
+    // supplementary `ch` is a surrogate PAIR and an invalid one matches
+    // nothing. See that function for the measured rows.
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    let pos =
+        with_string_chars_scratch(ctx, this, |buf| index_of_units_from(buf, needle.units(), 0));
     Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.indexOf(int ch, int fromIndex)`.
 ///
-/// Searches the string for the first occurrence of the given code-unit
-/// (after treating the `ch` argument the same way the JDK does: values
-/// outside the BMP are matched via the surrogate pair). Clamps
-/// `fromIndex` to `[0, len)`; a value ≥ length returns `-1`.
+/// Searches the string for the first occurrence of the given code point,
+/// starting at `max(fromIndex, 0)`; a `fromIndex` past the last possible start
+/// returns `-1`.
+///
+/// E18. The doc above used to say values outside the BMP "are matched via the
+/// surrogate pair" while the body one line below it read
+/// `let needle = (ch & 0xFFFF) as u16;` — the doc described the JDK and the
+/// code did the opposite, so `"abc".indexOf(0x10061, 0)` answered `0` where
+/// HotSpot answers `-1`. Both halves now come from [`code_point_needle`].
 pub(crate) fn native_string_index_of_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1050,29 +1079,25 @@ pub(crate) fn native_string_index_of_from(
         _ => 0,
     };
 
-    // Note: for BMP characters this matches the raw char; for supplementary
-    // code points the caller is expected to have already decomposed to
-    // surrogates in the underlying `String.value` char array, so a direct
-    // code-unit compare is still correct against the leading surrogate.
-    let needle = (ch & 0xFFFF) as u16;
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
+    };
     let pos = with_string_chars_scratch(ctx, this, |buf| {
-        let start = from.max(0) as usize;
-        if start >= buf.len() {
-            return -1i32;
-        }
-        buf[start..]
-            .iter()
-            .position(|&c| c == needle)
-            .map(|i| (start + i) as i32)
-            .unwrap_or(-1)
+        index_of_units_from(buf, needle.units(), from)
     });
     Ok(Some(Value::Int(pos)))
 }
 
 /// T2.2.6: `String.lastIndexOf(int ch, int fromIndex)`.
 ///
-/// Searches backward from `min(fromIndex, len-1)` for the last
+/// Searches backward from `min(fromIndex, len - needleWidth)` for the last
 /// occurrence of `ch`. A negative `fromIndex` always returns `-1`.
+///
+/// E18. `len - 1` in the old doc is right only for a BMP `ch`; the JDK's
+/// `lastIndexOfSupplementary` starts at `len - 2` because the pair needs two
+/// units, which is why [`last_index_of_units_from`] takes the width instead of
+/// assuming it. The old body masked with `& 0xFFFF`, so
+/// `"abc".lastIndexOf(0x10061, 2)` answered `0` where HotSpot answers `-1`.
 pub(crate) fn native_string_last_index_of_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1090,21 +1115,11 @@ pub(crate) fn native_string_last_index_of_from(
         _ => 0,
     };
 
-    if from < 0 {
+    let Some(needle) = code_point_needle(ch) else {
         return Ok(Some(Value::Int(-1)));
-    }
-    let needle = (ch & 0xFFFF) as u16;
+    };
     let pos = with_string_chars_scratch(ctx, this, |buf| {
-        if buf.is_empty() {
-            return -1i32;
-        }
-        let start = (from as usize).min(buf.len() - 1);
-        // rposition scans backwards; map onto the original index.
-        buf[..=start]
-            .iter()
-            .rposition(|&c| c == needle)
-            .map(|i| i as i32)
-            .unwrap_or(-1)
+        last_index_of_units_from(buf, needle.units(), i64::from(from))
     });
     Ok(Some(Value::Int(pos)))
 }
@@ -3706,7 +3721,13 @@ pub(crate) fn native_string_contains(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        // `contains` is `indexOf(s.toString()) >= 0`; the JDK's NPE comes from
+        // that `toString()`. See `string_arg_npe`.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"java.lang.CharSequence.toString()\" because \"s\" is null",
+            ))
+        }
     };
     let found = with_two_string_chars_scratches(ctx, this, other, |haystack, needle| {
         if needle.is_empty() {
@@ -3730,7 +3751,7 @@ pub(crate) fn native_string_starts_with(
     };
     let prefix = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => return Err(string_arg_npe(STARTS_WITH_NPE)),
     };
     let result = with_two_string_chars_scratches(ctx, this, prefix, |this_chars, prefix_chars| {
         this_chars.starts_with(prefix_chars)
@@ -3738,6 +3759,25 @@ pub(crate) fn native_string_starts_with(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// HotSpot's helpful-NPE text for a null `prefix`, shared by both
+/// `startsWith` overloads (the one-argument form is `startsWith(prefix, 0)`).
+const STARTS_WITH_NPE: &str = "Cannot invoke \"String.length()\" because \"prefix\" is null";
+
+/// `String.startsWith(String prefix, int toffset)`.
+///
+/// The JDK's guard is `if (toffset < 0 || toffset > length() - prefix.length())
+/// return false;` — a short-circuiting `||` whose SECOND term dereferences
+/// `prefix`, exactly like `regionMatches`. So a negative `toffset` answers
+/// `false` for a null prefix and every other `toffset` throws. Measured on
+/// OpenJDK 25.0.3+9 with `"abc"`: `startsWith(null, -1)` is `false`;
+/// `startsWith(null, 0)`, `startsWith(null, 3)` and
+/// `startsWith(null, Integer.MAX_VALUE)` all throw NullPointerException.
+///
+/// The old `offset` handling was also wrong for a negative `toffset` in a way
+/// the null rows exposed: `*v as usize` reinterprets `-1` as `usize::MAX`,
+/// which then failed the `offset <= len` test and answered `false` — the right
+/// answer by accident, from an expression that would have panicked had the
+/// comparison been written the other way round.
 pub(crate) fn native_string_starts_with_offset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3746,14 +3786,19 @@ pub(crate) fn native_string_starts_with_offset(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let prefix = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let offset = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let toffset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // Term one, before the prefix is touched.
+    if toffset < 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let prefix = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(string_arg_npe(STARTS_WITH_NPE)),
+    };
+    let offset = toffset as usize;
     let result = with_two_string_chars_scratches(ctx, this, prefix, |this_chars, prefix_chars| {
         if offset <= this_chars.len() {
             this_chars[offset..].starts_with(prefix_chars)
@@ -3774,7 +3819,11 @@ pub(crate) fn native_string_ends_with(
     };
     let suffix = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.length()\" because \"suffix\" is null",
+            ))
+        }
     };
     let result = with_two_string_chars_scratches(ctx, this, suffix, |this_chars, suffix_chars| {
         this_chars.ends_with(suffix_chars)
@@ -3972,34 +4021,17 @@ fn string_case_impl(
         // sharp s. Only `Character.toUpperCase(char)` is the 1:1 mapping, and
         // that lives in `java_char_to_upper_case`.
         //
-        // The one correction is the version skew: Rust's tables case-pair the
-        // six code points in `JDK_UNMAPPED_CASE_CODE_POINTS`, and the JDK maps
-        // each to itself (measured: `toUpperCase()` of the one-character string
-        // `[A7D3]` is `[A7D3]` on OpenJDK 25.0.3+9). Map character by
-        // character only when one is
-        // actually present, so the ordinary path keeps the single bulk call —
-        // the ASCII fast path above never reaches here, and every code point
-        // in the list is above U+A7CD, so the scan is a cheap early-out for
-        // essentially all real text.
-        let mapped = if folded
-            .chars()
-            .any(|c| is_jdk_unmapped_case_code_point(u32::from(c)))
-        {
-            let mut out = String::with_capacity(folded.len());
-            for c in folded.chars() {
-                if is_jdk_unmapped_case_code_point(u32::from(c)) {
-                    out.push(c);
-                } else if lowercase {
-                    out.extend(c.to_lowercase());
-                } else {
-                    out.extend(c.to_uppercase());
-                }
-            }
-            out
-        } else if lowercase {
-            folded.to_lowercase()
+        // The one correction is the version skew, and it is now applied by
+        // `case_map`'s shared helper rather than by a loop written out here:
+        // this arm and `case_map::map_locale_dependent`'s fallback arms are the
+        // same rule for different locales, and only one of them had the fix.
+        // The helper keeps the cheap early-out — the ASCII fast path above
+        // never reaches here, and every skewed code point is above U+A7CD, so
+        // ordinary text still takes a single bulk `str::to_uppercase` call.
+        let mapped = if lowercase {
+            crate::case_map::jdk_to_lowercase(&folded)
         } else {
-            folded.to_uppercase()
+            crate::case_map::jdk_to_uppercase(&folded)
         };
         if mapped == folded {
             false
@@ -4020,11 +4052,49 @@ fn string_case_impl(
 
 /// The `Locale` operand of a `to{Lower,Upper}Case(Locale)` native, if the call
 /// has one. A null (or absent) argument means "use the default locale".
+///
+/// **This collapses two different calls**, so it is correct only where the two
+/// cannot occur at the same site. A native reached through an argument slice CAN
+/// tell them apart — `toUpperCase()` has one argument and `toUpperCase(null)`
+/// has two — and must use [`locale_arg_checked`].
+///
+/// The JIT's direct helper was previously listed here as a caller that
+/// "genuinely cannot tell them apart". It can, and the claim was the whole
+/// defect: see [`jit_string_to_lower_case`]. Its one bound descriptor,
+/// `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`, has a
+/// MANDATORY `Locale` slot, so "absent" is not a state that site can be in and
+/// a `None` there is an explicit `null`.
 pub(crate) fn locale_arg(args: &[Value], index: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(index) {
         Some(Value::Object(Some(o))) => Some(*o),
         _ => None,
     }
+}
+
+/// [`locale_arg`], but an explicitly-passed `null` `Locale` is the JDK's
+/// `NullPointerException` rather than "use the default".
+///
+/// Measured on OpenJDK 25.0.3+9: `"abc".toUpperCase((Locale) null)`,
+/// `"abc".toLowerCase((Locale) null)` and `"".toUpperCase((Locale) null)` all
+/// throw NPE, while the no-argument `"abc".toUpperCase()` answers `"ABC"`. The
+/// throw comes from `StringLatin1.toLowerCase`'s `locale.getLanguage()`, which
+/// is why an empty receiver throws too — there is no short circuit in front of
+/// it. This VM answered the default-locale result for all three.
+///
+/// The two cases are distinguished by ARITY, which is sound because the two
+/// overloads have different descriptors: a slot that is present and holds
+/// `Object(None)` is a real `null` argument, an absent slot is the no-arg
+/// overload.
+fn locale_arg_checked(
+    args: &[Value],
+    index: usize,
+) -> Result<Option<cratonvm_types::ObjectRef>, cratonvm_types::error::MethodCallFailed> {
+    if matches!(args.get(index), Some(Value::Object(None))) {
+        return Err(
+            cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+        );
+    }
+    Ok(locale_arg(args, index))
 }
 
 fn string_case_native(
@@ -4037,7 +4107,7 @@ fn string_case_native(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    string_case_impl(ctx, this, locale_arg(args, 1), lowercase, memoize)
+    string_case_impl(ctx, this, locale_arg_checked(args, 1)?, lowercase, memoize)
 }
 
 /// `String.toLowerCase()` / `toLowerCase(Locale)` **with** the per-receiver
@@ -4080,8 +4150,17 @@ pub fn native_string_latin1_to_lower_case(
     args: &[Value],
 ) -> MethodCallResult {
     let this = args.first().cloned().unwrap_or(Value::Object(None));
-    let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
-    native_string_to_lower_case(ctx, &[this, locale])
+    // An ABSENT locale slot must stay absent. Since `string_case_native` began
+    // distinguishing "no `Locale` argument" from "an explicit null `Locale`" by
+    // arity, materialising `Value::Object(None)` for a missing slot here would
+    // have turned every short call into a NullPointerException. (A slot that is
+    // present and null is forwarded unchanged — the JDK's own NPE for
+    // `toLowerCase(null)` is raised inside this very method, by
+    // `StringLatin1.toLowerCase`'s `locale.getLanguage()`.)
+    match args.get(2) {
+        Some(locale) => native_string_to_lower_case(ctx, &[this, locale.clone()]),
+        None => native_string_to_lower_case(ctx, &[this]),
+    }
 }
 
 /// Whether a cached virtual-native call is one of the String lower-case
@@ -4101,19 +4180,46 @@ pub fn is_lower_case_native_callback(callback: cratonvm_native_api::NativeCallba
 /// `String.toLowerCase(Locale)` for the JIT's thin direct-call helpers, which
 /// hold raw `ObjectRef`s rather than a `&[Value]`.
 ///
-/// Same implementation (and same per-receiver memo) as the interpreted native —
-/// which is the point: the JIT helper used to carry its own copy of the mapping
-/// and ignore the `Locale`, so `s.toLowerCase(TURKISH)` returned the Turkish
-/// answer interpreted and the root answer once the caller tiered up.
+/// # It is the SAME body as the interpreted native, and that is the fix
+///
+/// This used to call [`string_case_impl`] directly, one layer BELOW
+/// [`string_case_native`] — so when E8 added the null-`Locale` check to
+/// [`locale_arg_checked`], the interpreter began throwing and the compiled path
+/// kept answering the default-locale result. A `s.toLowerCase((Locale) null)`
+/// inside a loop therefore threw for its first few hundred executions and then
+/// silently started returning a string, at whatever iteration the caller tiered
+/// up. That is the `aastore` store-check shape: correct until it is hot.
+///
+/// It now goes through `string_case_native`, i.e. the exact function the
+/// registered native calls, with the `Locale` argument reconstituted as a
+/// PRESENT slot. Present-and-null is what this site always is: the JIT binds
+/// exactly one descriptor here,
+/// `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;`
+/// (`jit/src/lib.rs`, the `STRING_LATIN1_LOWER_DIRECT_FN` ladder), whose third
+/// parameter is mandatory — there is no arity by which this caller could be the
+/// no-argument overload. So the arity rule that separates `toLowerCase()` from
+/// `toLowerCase(null)` is not being bypassed here, it is being *supplied*.
+///
+/// The one-line predecessor also silently discarded every `Err`: an exception
+/// raised inside the case mapping became a `null` return and then a
+/// wrong-place NPE in the caller. Returning [`MethodCallResult`] is what lets
+/// `vm/src/jit/helpers.rs` route it through `handle_jit_dispatch_error`, the
+/// same way its `jit_hashmap_get_direct` sibling already does.
+///
+/// Measured on OpenJDK 25.0.3+9: `"AbC".toLowerCase((Locale) null)` throws
+/// NullPointerException, and so does it on the 200 000th warm iteration — the
+/// oracle's answer does not depend on its tier either.
 pub fn jit_string_to_lower_case(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     locale: Option<cratonvm_types::ObjectRef>,
-) -> Option<cratonvm_types::ObjectRef> {
-    match string_case_impl(ctx, this, locale, true, true) {
-        Ok(Some(Value::Object(Some(o)))) => Some(o),
-        _ => None,
-    }
+) -> MethodCallResult {
+    string_case_native(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(locale)],
+        true,
+        true,
+    )
 }
 
 /// `String.toUpperCase()` / `toUpperCase(Locale)` **without** the memo.
@@ -4267,21 +4373,17 @@ pub(crate) fn native_string_index_of_str(
     };
     let target = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(-1))),
+        // `-1` — "not found" — was the single most misleading of the swallowed
+        // nulls: it is the method's ordinary answer, so a caller could not
+        // distinguish it from a real miss. HotSpot throws.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.coder()\" because \"str\" is null",
+            ))
+        }
     };
-    let result = with_two_string_chars_scratches(ctx, this, target, |haystack, needle| -> i32 {
-        if needle.is_empty() {
-            return 0;
-        }
-        if needle.len() > haystack.len() {
-            return -1;
-        }
-        for i in 0..=(haystack.len() - needle.len()) {
-            if &haystack[i..i + needle.len()] == needle {
-                return i as i32;
-            }
-        }
-        -1
+    let result = with_two_string_chars_scratches(ctx, this, target, |haystack, needle| {
+        index_of_units_from(haystack, needle, 0)
     });
     Ok(Some(Value::Int(result)))
 }
@@ -4467,6 +4569,16 @@ fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> Met
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// HotSpot's helpful-NPE text for a null `regex`, shared by every `split` entry
+/// point.
+///
+/// All of them used to answer a NULL `String[]`, which is worse than a wrong
+/// array: `for (String p : s.split(null))` then fails with an NPE at the
+/// CALLER's line, blaming the caller for the native's contract violation.
+/// Measured on OpenJDK 25.0.3+9: `"a,b".split(null)` and `"a,b".split(null, 2)`
+/// both throw.
+const SPLIT_REGEX_NPE: &str = "Cannot invoke \"String.length()\" because \"regex\" is null";
+
 fn native_string_split_with_delimiters(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4478,7 +4590,7 @@ fn native_string_split_with_delimiters(
     };
     let delim_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(string_arg_npe(SPLIT_REGEX_NPE)),
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
@@ -4592,7 +4704,7 @@ pub(crate) fn native_string_split_impl(
     };
     let delim_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Err(string_arg_npe(SPLIT_REGEX_NPE)),
     };
     let s = ctx.read_string(this).unwrap_or_default();
     let delim = ctx.read_string(delim_obj).unwrap_or_default();
@@ -4644,15 +4756,40 @@ pub(crate) fn native_string_split_impl(
     string_array_from_parts(ctx, &parts)
 }
 
+/// `String.join(CharSequence delimiter, CharSequence... elements)`.
+///
+/// # Three different nulls, three different answers
+///
+/// Measured on OpenJDK 25.0.3+9. The JDK's body opens
+/// `var delim = delimiter.toString(); var elems = new String[elements.length];`
+/// and renders each element with `String.valueOf`:
+///
+/// ```text
+/// String.join(null, "a", "b")                 NullPointerException  (delimiter, FIRST)
+/// String.join(",", (CharSequence[]) null)     NullPointerException  (elements)
+/// String.join(null, (CharSequence[]) null)    NullPointerException  naming the DELIMITER
+/// String.join(",", "a", null, "b")            "a,null,b"            <- an ELEMENT renders
+/// String.join(",", new String[0])             ""
+/// ```
+///
+/// This VM answered `""` for the first three and already rendered `"null"` for
+/// the fourth. The delimiter is checked before the array because the JDK's
+/// order is observable through the message, and because an empty `elements`
+/// array does not excuse a null delimiter — `String.join(null, new String[0])`
+/// throws.
 pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Static method: args[0] = delimiter, args[1] = CharSequence[]
     let delim = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => String::new(),
+        _ => return Err(string_arg_npe(JOIN_DELIMITER_NPE)),
     };
     let arr = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"elements\" is null",
+            ))
+        }
     };
     let mut scope = NativeHandleScope::new(ctx);
     let arr_handle = scope.root(arr);
@@ -4682,17 +4819,40 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ))))
 }
 
+/// HotSpot's helpful-NPE text for a null `delimiter`, shared by both `join`
+/// overloads.
+const JOIN_DELIMITER_NPE: &str =
+    "Cannot invoke \"java.lang.CharSequence.toString()\" because \"delimiter\" is null";
+
+/// `String.join(CharSequence delimiter, Iterable<? extends CharSequence>)`.
+///
+/// Same three-nulls table as [`native_string_join`], with one difference the
+/// message records: this overload opens with two explicit
+/// `Objects.requireNonNull` calls rather than implicit dereferences, so HotSpot
+/// raises a NullPointerException with a NULL message for both. Measured:
+/// `String.join(",", (Iterable) null)` and `String.join(null, List.of())` both
+/// throw with no message. The delimiter is still checked first.
 pub(crate) fn native_string_join_iterable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let delim = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => String::new(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let iterable = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: None,
+            }
+            .into())
+        }
     };
     let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
         Some(Value::Object(Some(obj))) => obj,
@@ -4742,6 +4902,56 @@ fn regex_arg_npe(parameter: &str) -> cratonvm_types::error::RuntimeError {
     cratonvm_types::error::RuntimeError::NullPointerException {
         message: Some(format!("null {parameter} argument")),
     }
+}
+
+/// The `NullPointerException` a `String` native owes for a reference argument
+/// its JDK counterpart dereferences.
+///
+/// # Why this is a family and not a handful of one-offs
+///
+/// `String`'s natives are written as `match args.get(n) { Some(Object(Some(o)))
+/// => o, _ => <default> }`, and that `_` arm swallows a null argument into
+/// whatever the failure value happens to be: `false` for the predicates, `-1`
+/// for the searches, a NULL `String[]` for `split`, `""` for `join` and
+/// `copyValueOf`, a silent no-op for `getChars`. Every one of those is a wrong
+/// *value* handed back where HotSpot raises — the failure mode a native
+/// shadowing bytecode is most likely to have and least likely to have noticed,
+/// because nothing crashes and no test that only exercises valid inputs can
+/// see it.
+///
+/// # The contracts are NOT uniform, so each one is measured
+///
+/// Measured on Microsoft OpenJDK 25.0.3+9 (`probes/e8/NullContracts`):
+///
+/// ```text
+/// equals(null)                     false            <- NOT a throw
+/// equalsIgnoreCase(null)           false            <- NOT a throw
+/// startsWith(null, -1)             false            <- NOT a throw (toffset < 0 wins)
+/// regionMatches(-1, null, 0, 1)    false            <- NOT a throw (see region_matches_impl)
+/// String.valueOf((Object) null)    "null"           <- NOT a throw
+/// String.join(",", "a", null, "b") "a,null,b"       <- a null ELEMENT renders
+/// String.format("%s", (Object[]) null)  "null"      <- a null varargs ARRAY is one null arg
+/// contains(null) startsWith(null) endsWith(null) concat(null) compareTo(null)
+/// compareToIgnoreCase(null) indexOf((String) null) lastIndexOf((String) null)
+/// split(null) matches(null) replace(null, x) transform(null)
+/// String.join(null, …) String.join(",", (CharSequence[]) null)
+/// String.valueOf((char[]) null) String.copyValueOf(null) getChars(…, null, …)
+/// toUpperCase((Locale) null) toLowerCase((Locale) null)   ->  NullPointerException
+/// ```
+///
+/// The two `false` rows and the three rendering rows are the reason this is a
+/// per-method measurement rather than a rule applied by shape: "reference
+/// parameter" does not imply "throws", and `equals`/`equalsIgnoreCase` in
+/// particular are specified to answer `false`.
+///
+/// `message` is HotSpot's helpful-NPE text where it was captured verbatim.
+/// Control flow depends on the *class*, but the text is what a caller logging
+/// the exception will print, and it is free to be right.
+fn string_arg_npe(message: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(message.to_string()),
+    }
+    .into()
 }
 
 pub(crate) fn native_string_replace_all(
@@ -4826,6 +5036,38 @@ pub(crate) fn native_string_matches(
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
 
+/// `String.equalsIgnoreCase(String)`.
+///
+/// **The null argument is `false`, NOT a throw** — measured on
+/// OpenJDK 25.0.3+9, and the JDK source says why:
+/// `(anotherString != null) && ...`. This is one of the two rows in the whole
+/// `String` null sweep that is specified to answer rather than raise (the other
+/// is `equals`), which is why the sweep had to be a measurement per method.
+///
+/// # The comparison rule, which was not the JDK's
+///
+/// The old body was `a.to_lowercase() == b.to_lowercase()` — Rust's FULL
+/// (SpecialCasing) mappings over whole strings. The JDK is
+/// `regionMatches(true, 0, other, 0, length())` after a length check, i.e. the
+/// per-code-unit `StringUTF16.regionMatchesCI` rule already transcribed in
+/// [`code_unit_eq_ignore_case`]. The two disagree, measured:
+///
+/// ```text
+///                                        HotSpot 25   to_lowercase() gave
+/// "İ".equalsIgnoreCase("i")         true         false   (full mapping is i + U+0307)
+/// "ꟓ".equalsIgnoreCase("꟒")    false        true    (Rust pairs them, the JDK does not)
+/// "ꟕ".equalsIgnoreCase("꟔")    false        true
+/// "꟏".equalsIgnoreCase("꟎")    false        true
+/// "ꟑ".equalsIgnoreCase("Ꟑ")    true         true    <- control: a REAL pair
+/// "K".equalsIgnoreCase("k")         true         true
+/// "ß".equalsIgnoreCase("ss")        false        false
+/// ```
+///
+/// The doc on `case_map::JDK_UNMAPPED_CASE_CODE_POINTS` already claimed
+/// `equalsIgnoreCase` among the four answers it had measured and corrected.
+/// The claim was true of the measurement and false of the code: the fix went
+/// into `java_char_to_upper_case`, which this method never called.
+/// `[1 of 10 callsites]` — the helper existed and one caller used it.
 pub(crate) fn native_string_equals_ignore_case(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4836,17 +5078,56 @@ pub(crate) fn native_string_equals_ignore_case(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
+        // Specified, not swallowed: `equalsIgnoreCase(null)` IS `false`.
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = ctx.read_string(this).unwrap_or_default();
-    let b = ctx.read_string(other).unwrap_or_default();
-    Ok(Some(Value::Int(if a.to_lowercase() == b.to_lowercase() {
-        1
-    } else {
-        0
-    })))
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    // The thread-local scratches, not `read_string_chars`: this method is on
+    // the hot path for HTTP header matching and must not start allocating two
+    // Vecs per call to gain its correctness.
+    let equal = with_two_string_chars_scratches(ctx, this, other, |a, b| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(&x, &y)| code_unit_eq_ignore_case(x, y))
+    });
+    Ok(Some(Value::Int(if equal { 1 } else { 0 })))
 }
 
+/// `String.compareToIgnoreCase(String)`.
+///
+/// Unlike its `equalsIgnoreCase` sibling, a null argument here THROWS —
+/// measured on OpenJDK 25.0.3+9 (`Cannot read field "value" because "s2" is
+/// null`), because `CASE_INSENSITIVE_ORDER.compare` dereferences both operands
+/// with no guard. The two methods sit next to each other, take the same
+/// parameter type, and have opposite null contracts; this VM answered `0` —
+/// "equal" — for the null.
+///
+/// # The magnitude, not just the sign
+///
+/// The old body lower-cased both strings with Rust's full mapping and returned
+/// `-1`/`0`/`1` from an `Ordering`. The JDK's `StringLatin1.compareToCI` /
+/// `StringUTF16.compareToCI` return the DIFFERENCE of the two folded code
+/// units, and the fold is the same upper-then-lower composition as
+/// [`code_unit_eq_ignore_case`]:
+///
+/// ```text
+/// c1 == c2                       -> keep going
+/// u1 = toUpper(c1), u2 = toUpper(c2); u1 == u2  -> keep going
+/// l1 = toLower(u1), l2 = toLower(u2); l1 == l2  -> keep going
+/// otherwise                      -> return l1 - l2
+/// exhausted                      -> return len1 - len2
+/// ```
+///
+/// Measured rows the old shape got wrong: `"_".compareToIgnoreCase("a")` is
+/// `-2` (the fold leaves `_` alone and lowercases `A` back to `a`, so it is
+/// `0x5F - 0x61`) and was `-1`; `"İ".compareToIgnoreCase("i")` is `0` and
+/// was non-zero; `"ꟓ".compareToIgnoreCase("꟒")` is `1` and was `0`.
+/// A comparator only needs the sign, but `compareToIgnoreCase` is a public
+/// method whose javadoc specifies the value, and the first two rows are sign
+/// errors anyway.
 pub(crate) fn native_string_compare_to_ignore_case(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4857,15 +5138,31 @@ pub(crate) fn native_string_compare_to_ignore_case(
     };
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read field \"value\" because \"s2\" is null",
+            ))
+        }
     };
-    let a = ctx.read_string(this).unwrap_or_default().to_lowercase();
-    let b = ctx.read_string(other).unwrap_or_default().to_lowercase();
-    Ok(Some(Value::Int(match a.cmp(&b) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    })))
+    let result = with_two_string_chars_scratches(ctx, this, other, |a, b| {
+        for (&c1, &c2) in a.iter().zip(b.iter()) {
+            if c1 == c2 {
+                continue;
+            }
+            let u1 = java_char_to_upper_case(c1);
+            let u2 = java_char_to_upper_case(c2);
+            if u1 == u2 {
+                continue;
+            }
+            let l1 = java_char_to_lower_case(u1);
+            let l2 = java_char_to_lower_case(u2);
+            if l1 != l2 {
+                return i32::from(l1) - i32::from(l2);
+            }
+        }
+        a.len() as i32 - b.len() as i32
+    });
+    Ok(Some(Value::Int(result)))
 }
 
 pub(crate) fn native_string_last_index_of_char(
@@ -4880,44 +5177,165 @@ pub(crate) fn native_string_last_index_of_char(
         Some(Value::Int(c)) => *c,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: lastIndexOf is defined over UTF-16 code UNITS, not
     // Unicode code points. The old `rfind` + `chars().count()` returned a
     // code-point index, off by the count of preceding supplementary chars.
-    // Encode both haystack and the target code point to UTF-16 and search the
-    // u16 slice (a supplementary `ch` becomes a surrogate pair).
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let needle_units: Vec<u16> = match char::from_u32(ch as u32) {
-        Some(c) => {
-            let mut buf = [0u16; 2];
-            c.encode_utf16(&mut buf).to_vec()
-        }
-        None => return Ok(Some(Value::Int(-1))),
+    //
+    // E18: the `char::from_u32(ch)` + `encode_utf16` that replaced it is the
+    // ONE member of this family that got the surrogate pair right, and it is
+    // still not the JDK's rule — `char::from_u32` rejects the surrogate code
+    // points, so a lone-surrogate `ch` returned `-1` where HotSpot finds it
+    // (`"xзy𐐷z".lastIndexOf(0xDC37)` is `4`). [`code_point_needle`] is the
+    // rule; this native and its three siblings now share it.
+    let Some(needle) = code_point_needle(ch) else {
+        return Ok(Some(Value::Int(-1)));
     };
-    let result = last_index_of_units(&s_units, &needle_units);
+    let result = with_string_chars_scratch(ctx, this, |buf| {
+        last_index_of_units_from(buf, needle.units(), i64::MAX)
+    });
     Ok(Some(Value::Int(result)))
 }
 
-/// Helper: last index (in UTF-16 code units) of `needle` within `haystack`.
-/// Returns -1 when not found. An empty needle returns `haystack.len()` to
-/// match `String.lastIndexOf("")` semantics used by the str variant.
-fn last_index_of_units(haystack: &[u16], needle: &[u16]) -> i32 {
+/// The UTF-16 code units that `String.{indexOf,lastIndexOf}(int ch[, int])`
+/// actually searches for — `None` when no sequence of code units can match.
+///
+/// # E18. Three copies of this rule, and the two that answered were wrong
+///
+/// The JDK does **not** narrow `ch` to a code unit. `String.indexOf(int)` is
+///
+/// ```text
+/// isLatin1() ? StringLatin1.indexOf(value, ch, …)   // if (!canEncode(ch)) return -1;
+///            : StringUTF16 .indexOf(value, ch, …)   // !isValidCodePoint  -> -1
+///                                                   //  ch <  0x10000     -> scan for (char) ch
+///                                                   //  ch >= 0x10000     -> scan for the PAIR
+/// ```
+///
+/// so a supplementary `ch` is matched as a surrogate *pair* and never as its
+/// low half. `native_string_index_of`, `native_string_index_of_from` and
+/// `native_string_last_index_of_from` all wrote `(ch & 0xFFFF) as u16`, which
+/// finds the masked half; `native_string_last_index_of_char` instead wrote
+/// `char::from_u32(ch)` + `encode_utf16`, which gets the pair right but drops
+/// every LONE SURROGATE `ch` on the floor (`char::from_u32(0xDC37)` is `None`).
+/// One JVMS rule, four implementations counting the JIT's, four different sets
+/// of wrong answers. This is now the only place the rule is written down.
+///
+/// Measured on OpenJDK 25.0.3+9 (`scratchpad/e18/CharSearch.java`,
+/// `Idx3.java`), receiver `"xзy𐐷z"` unless noted:
+///
+/// ```text
+/// "abc".indexOf(0x10061)          -1   masking finds 'a' at 0        <- the KEY row
+/// "з".indexOf(0x10437)       -1   masking finds it at 0
+/// mixed.indexOf(0x10437)           3   the pair, not the low half
+/// mixed.indexOf(0xD801)            3   a lone HIGH surrogate is a plain unit scan
+/// mixed.indexOf(0xDC37)            4   a lone LOW surrogate too — char::from_u32 says None
+/// "￿q".indexOf(0xFFFF)        0   0xFFFF is a valid (non-)character
+/// "￿q".indexOf(-1)           -1   NOT (char)(-1) == 0xFFFF: isValidCodePoint gates first
+/// "abc".indexOf(0x110000)         -1
+/// "abc".lastIndexOf(0x10061)      -1                                 <- the KEY row again
+/// ```
+///
+/// The `-1` row is the one that shows the rule is `isValidCodePoint`, not a
+/// narrowing cast: `(char) -1` is `0xFFFF`, the receiver holds `0xFFFF`, and
+/// HotSpot still answers `-1`.
+fn code_point_needle(ch: i32) -> Option<CharNeedle> {
+    if !(0..=0x10_FFFF).contains(&ch) {
+        // `Character.isValidCodePoint(ch)` — checked before any narrowing.
+        return None;
+    }
+    if ch <= 0xFFFF {
+        // A BMP code point, INCLUDING an unpaired surrogate value: the JDK
+        // scans for the single code unit and so must this.
+        return Some(CharNeedle {
+            units: [ch as u16, 0],
+            len: 1,
+        });
+    }
+    let off = ch - 0x1_0000;
+    Some(CharNeedle {
+        units: [
+            (0xD800 + (off >> 10)) as u16,
+            (0xDC00 + (off & 0x3FF)) as u16,
+        ],
+        len: 2,
+    })
+}
+
+/// One or two UTF-16 code units — the output of [`code_point_needle`].
+#[derive(Clone, Copy)]
+struct CharNeedle {
+    units: [u16; 2],
+    len: usize,
+}
+
+impl CharNeedle {
+    fn units(&self) -> &[u16] {
+        &self.units[..self.len]
+    }
+}
+
+/// Forward scan for `needle` in `haystack`, both in UTF-16 code units, starting
+/// at `max(from, 0)`.
+///
+/// The empty-needle answer is `clamp(from, 0, haystack.len())`, which is the
+/// JDK's — measured: `"abcabc".indexOf("", 99)` is `6` and `indexOf("", -5)` is
+/// `0`. Shared by the code-point family and the `String`-needle family; the four
+/// hand-rolled copies of this loop it replaces disagreed only in their bounds
+/// arithmetic, which is the part worth having in one place.
+fn index_of_units_from(haystack: &[u16], needle: &[u16], from: i32) -> i32 {
+    if needle.is_empty() {
+        return from.clamp(0, haystack.len() as i32);
+    }
+    if needle.len() > haystack.len() {
+        return -1;
+    }
+    let max_start = haystack.len() - needle.len();
+    let mut i = from.max(0) as usize;
+    while i <= max_start {
+        if &haystack[i..i + needle.len()] == needle {
+            return i as i32;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Backward scan for `needle` in `haystack`, starting at
+/// `min(from, haystack.len() - needle.len())`.
+///
+/// That subtraction is the JDK's own: `StringUTF16.lastIndexOfChar` starts at
+/// `min(fromIndex, length - 1)` and `lastIndexOfSupplementary` at
+/// `min(fromIndex, length - 2)`, which is the same expression once the needle
+/// width is a parameter rather than a hard-coded 1 or 2.
+///
+/// `from` is `i64` so that a NEGATIVE `from` finds nothing rather than
+/// saturating to a `usize`: the JDK's loop counter simply starts below zero and
+/// never runs. Measured — `"abc".lastIndexOf('a', -1)` is `-1`, and
+/// `mixed.lastIndexOf(0x10437, -1)` is `-1` even though the pair is present.
+fn last_index_of_units_from(haystack: &[u16], needle: &[u16], from: i64) -> i32 {
     if needle.is_empty() {
         return haystack.len() as i32;
     }
     if needle.len() > haystack.len() {
         return -1;
     }
-    let mut i = haystack.len() - needle.len();
-    loop {
-        if &haystack[i..i + needle.len()] == needle {
+    let mut i = from.min((haystack.len() - needle.len()) as i64);
+    while i >= 0 {
+        let at = i as usize;
+        if &haystack[at..at + needle.len()] == needle {
             return i as i32;
-        }
-        if i == 0 {
-            return -1;
         }
         i -= 1;
     }
+    -1
+}
+
+/// Helper: last index (in UTF-16 code units) of `needle` within `haystack`.
+/// Returns -1 when not found. An empty needle returns `haystack.len()` to
+/// match `String.lastIndexOf("")` semantics used by the str variant.
+fn last_index_of_units(haystack: &[u16], needle: &[u16]) -> i32 {
+    // "no `fromIndex`" is "start as far right as the needle fits", which is
+    // what [`last_index_of_units_from`] does with a `from` it cannot exceed.
+    last_index_of_units_from(haystack, needle, i64::MAX)
 }
 
 pub(crate) fn native_string_last_index_of_str(
@@ -4930,7 +5348,13 @@ pub(crate) fn native_string_last_index_of_str(
     };
     let needle = match args.get(1) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(-1))),
+        // See `native_string_index_of_str`: `-1` is indistinguishable from a
+        // legitimate miss. HotSpot throws.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read field \"value\" because \"tgtStr\" is null",
+            ))
+        }
     };
     let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: lastIndexOf(String) must return a UTF-16 code-UNIT
@@ -4942,6 +5366,34 @@ pub(crate) fn native_string_last_index_of_str(
     Ok(Some(Value::Int(result)))
 }
 
+/// `String.getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin)`.
+///
+/// # Three checks, in the JDK's order, none of which this body had
+///
+/// The old version silently clamped `srcEnd` to the receiver's length, ignored
+/// a negative `srcBegin`, and treated a null `dst` as a NO-OP that returned
+/// normally. `getChars` is the JDK's bulk copy out of a `String`, so a caller
+/// that mis-sizes its buffer got a partly-filled array and no signal at all.
+///
+/// Measured on OpenJDK 25.0.3+9 with the receiver `"abc"`:
+///
+/// ```text
+/// getChars(0, 9, null, 0)          StringIndexOutOfBoundsException: Range [0, 9) out of bounds for length 3
+/// getChars(2, 1, null, 0)          StringIndexOutOfBoundsException: Range [2, 1) out of bounds for length 3
+/// getChars(-1, 1, null, 0)         StringIndexOutOfBoundsException: Range [-1, 1) out of bounds for length 3
+/// getChars(0, 1, null, 0)          NullPointerException: Cannot read the array length because "dst" is null
+/// getChars(0, 1, null, -1)         NullPointerException                       <- null beats dstBegin
+/// getChars(0, 1, new char[4], -1)  StringIndexOutOfBoundsException: Range [-1, -1 + 1) out of bounds for length 4
+/// getChars(0, 3, new char[4], 2)   StringIndexOutOfBoundsException: Range [2, 2 + 3) out of bounds for length 4
+/// getChars(0, 0, new char[0], 0)   (returns normally)
+/// ```
+///
+/// So the order is: `checkBoundsBeginEnd(srcBegin, srcEnd, length())` first —
+/// it fires even when `dst` is null — then the null check, then
+/// `checkBoundsOffCount(dstBegin, srcEnd - srcBegin, dst.length)`. Both range
+/// failures are `StringIndexOutOfBoundsException`, not
+/// `ArrayIndexOutOfBoundsException`, including the one about the destination
+/// ARRAY: `String.getChars` does its own checking before the `arraycopy`.
 pub(crate) fn native_string_get_chars(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4951,29 +5403,61 @@ pub(crate) fn native_string_get_chars(
         _ => return Ok(None),
     };
     let src_begin = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let src_end = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let dst = match args.get(3) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None),
-    };
-    let dst_begin = match args.get(4) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: getChars indexes over UTF-16 code UNITS, not Unicode
     // code points. The old `s.chars()` (one entry per code point) put
     // supplementary chars in a single slot and shifted every later index,
-    // corrupting the dest array. Decode to u16 and copy one code unit per slot.
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let end = src_end.min(units.len());
-    for (i, &cu) in units.iter().enumerate().take(end).skip(src_begin) {
+    // corrupting the dest array.
+    //
+    // `read_string_chars`, not `ctx.read_string(..).encode_utf16()`: the range
+    // check below is against `length()`, so it must read the `value` array
+    // through the SAME path `String.length()` does. Going via a Rust `String`
+    // also substitutes U+FFFD for every unpaired surrogate, which this method
+    // must copy out intact.
+    let units = read_string_chars(ctx, this);
+    let length = units.len() as i32;
+    // Check one: the SOURCE range, before `dst` is looked at.
+    if src_begin < 0 || src_begin > src_end || src_end > length {
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range(src_begin, src_end, length).into(),
+        );
+    }
+    // Check two: the destination reference.
+    let dst = match args.get(3) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"dst\" is null",
+            ))
+        }
+    };
+    let dst_begin = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    // Check three: the destination range, `checkBoundsOffCount` style.
+    let count = src_end - src_begin;
+    let dst_len = ctx.array_length(dst) as i32;
+    if bounds_off_count_violation(dst_begin, count, dst_len).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::sioobe_range_size(dst_begin, count, dst_len)
+                .into(),
+        );
+    }
+    let src_begin = src_begin as usize;
+    let dst_begin = dst_begin as usize;
+    for (i, &cu) in units
+        .iter()
+        .enumerate()
+        .take(src_end as usize)
+        .skip(src_begin)
+    {
         ctx.set_array_element(dst, dst_begin + (i - src_begin), Value::Int(cu as i32));
     }
     Ok(None)
@@ -5046,6 +5530,19 @@ pub(crate) fn native_string_strip_trailing(
     native_string_strip_impl(ctx, args, false, true)
 }
 
+/// `String.copyValueOf(char[])` — and, registered under the same body,
+/// `String.valueOf(char[])`.
+///
+/// Both are `new String(data)`, which dereferences the array for its length.
+/// Measured on OpenJDK 25.0.3+9: `String.copyValueOf(null)`,
+/// `String.valueOf((char[]) null)`, `new String((char[]) null)` and
+/// `new String((char[]) null, 0, 1)` all throw NullPointerException. This body
+/// answered `""` — and `""` is a legal result of this method, so nothing
+/// downstream could tell the difference.
+///
+/// `String.valueOf((Object) null)` is the row that does NOT throw: it is
+/// specified as the four-character string `"null"`, and
+/// `native_string_value_of_object` already answers that.
 pub(crate) fn native_string_copy_value_of(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5053,7 +5550,11 @@ pub(crate) fn native_string_copy_value_of(
     // Static method: args[0] = char[]
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot read the array length because \"value\" is null",
+            ))
+        }
     };
     let len = ctx.array_length(arr);
     let mut chars = Vec::with_capacity(len);
@@ -5415,7 +5916,14 @@ pub(crate) fn native_string_transform(
     };
     let function = match args.get(1) {
         Some(Value::Object(Some(f))) => *f,
-        _ => return Ok(Some(Value::Object(Some(this)))),
+        // Returning the receiver made `s.transform(null)` behave like the
+        // identity function — a plausible, silently wrong answer. `transform`
+        // is `f.apply(this)`, so a null `f` is an NPE on OpenJDK 25.0.3+9.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"java.util.function.Function.apply(Object)\" because \"f\" is null",
+            ))
+        }
     };
     ctx.invoke_virtual(
         function,
@@ -8130,9 +8638,9 @@ pub(crate) fn format_arg(
 /// zero mismatches, and agreeing with the enumeration below at every one of
 /// them — but it was correct *by consulting a Rust Unicode table at runtime*,
 /// and that is the dependency this file has already been bitten by once: see
-/// [`JDK_UNMAPPED_CASE_CODE_POINTS`], where Rust's tables being NEWER than the
-/// JDK's produced a wrong answer that no amount of care about the Java side
-/// could have caught. Whitespace is a small, stable, enumerable set, so the
+/// `case_map::JDK_UNMAPPED_CASE_CODE_POINTS`, where Rust's tables being NEWER
+/// than the JDK's produced a wrong answer that no amount of care about the Java
+/// side could have caught. Whitespace is a small, stable, enumerable set, so the
 /// version-skew hazard is removed rather than managed.
 ///
 /// The enumeration itself was swept exhaustively: `WsSweep`, all 1,114,112
@@ -8161,58 +8669,18 @@ fn java_char_is_whitespace(ch: u16) -> bool {
     // excluded by the javadoc), and 0x0085 NEL.
 }
 
-/// Code points whose case mapping **Rust has and the JDK does not**.
-///
-/// Not a Unicode subtlety — a VERSION SKEW, and the reason this file no longer
-/// derives any table from Rust's `char` methods where the JDK's answer can be
-/// enumerated instead.
-///
-/// Measured on Microsoft OpenJDK 25.0.3+9, which is on Unicode 16:
-///
-/// ```text
-///          Character.toUpperCase  toLowerCase  isDefined  getType
-/// U+A7CE   U+A7CE                 U+A7CE       false      0 (UNASSIGNED)
-/// U+A7CF   U+A7CF                 U+A7CF       false      0
-/// U+A7D2   U+A7D2                 U+A7D2       false      0
-/// U+A7D3   U+A7D3                 U+A7D3       true       2 (LOWERCASE_LETTER)
-/// U+A7D4   U+A7D4                 U+A7D4       false      0
-/// U+A7D5   U+A7D5                 U+A7D5       true       2 (LOWERCASE_LETTER)
-/// ```
-///
-/// All six map to THEMSELVES, for `Character.toUpperCase`/`toLowerCase`, for
-/// `String.toUpperCase`/`toLowerCase`, and for `String.regionMatches(true,…)`
-/// / `equalsIgnoreCase` — all four measured. Rust's tables are newer and pair
-/// them (`A7CF`/`A7CE`, `A7D3`/`A7D2`, `A7D5`/`A7D4`), so every one of those
-/// answers came back wrong.
-///
-/// Note the two shapes, because they need the same fix for different reasons:
-/// four of the six are UNASSIGNED in the JDK's Unicode version, while `A7D3`
-/// and `A7D5` are assigned lowercase letters that simply have no uppercase
-/// partner yet — a newer Unicode added the capitals. **The VM must answer what
-/// the JDK answers, not what Unicode currently says**, and this list will need
-/// revisiting whenever *either* side moves. That is the recurring hazard, and
-/// it is why the whitespace predicate above was converted to an enumeration.
-///
-/// How this was missed the first time, since the method looked exhaustive: the
-/// original exception table was derived by dumping all 65,536 BMP code units
-/// from the JDK and diffing them against **Python's** `str.upper()`/`lower()`
-/// as a stand-in for Rust's. Python here is on UCD 16.0.0 and agrees with the
-/// JDK at all six, so the diff was empty and reported success. The Java side of
-/// that measurement was real; the Rust side was a proxy that was never
-/// validated as one. `[setup lies]` — a probe's setup is code that can be
-/// wrong, and an exhaustive sweep against the wrong oracle is still exhaustive.
-const JDK_UNMAPPED_CASE_CODE_POINTS: [u16; 6] = [0xA7CE, 0xA7CF, 0xA7D2, 0xA7D3, 0xA7D4, 0xA7D5];
-
-/// Whether a code unit is one of [`JDK_UNMAPPED_CASE_CODE_POINTS`].
-///
-/// A contiguous range test would be wrong: `U+A7D0`/`U+A7D1` and
-/// `U+A7D6`/`U+A7D7` sit inside the same span and ARE case pairs in the JDK
-/// (measured: `toUpperCase(U+A7D1) == U+A7D0`), so the six must be listed, not
-/// bracketed.
-#[inline]
-fn is_jdk_unmapped_case_code_point(cp: u32) -> bool {
-    cp <= 0xFFFF && JDK_UNMAPPED_CASE_CODE_POINTS.contains(&(cp as u16))
-}
+// The JDK-vs-Rust Unicode version skew — `JDK_UNMAPPED_CASE_CODE_POINTS` and
+// its predicate — used to be declared HERE, and `case_map.rs` had no arm for it
+// at all. Those two files are the only case-mapping code in the crate and they
+// split the work by locale: this one handles the root and ordinary locales,
+// `case_map.rs` handles `tr`/`az`/`lt`. A constant that lives in one half is a
+// fix that half the locales never get, which is exactly what happened —
+// `"ꟓ".toUpperCase(Locale.ROOT)` was right and
+// `"ꟓ".toUpperCase(Locale.forLanguageTag("tr"))` was wrong. The definition now
+// lives next to the table it corrects; see
+// [`crate::case_map::JDK_UNMAPPED_CASE_CODE_POINTS`] for the measurement and
+// for why a THIRD copy was not the answer.
+use crate::case_map::is_jdk_unmapped_case_code_point;
 
 /// [`java_char_is_whitespace`] for a Rust `char` rather than a code unit.
 ///
@@ -8554,8 +9022,8 @@ pub(crate) fn native_string_region_matches_ic(
         _ => 0,
     };
     let other = match args.get(3) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        Some(Value::Object(o)) => *o,
+        _ => None,
     };
     let ooffset_i = match args.get(4) {
         Some(Value::Int(v)) => *v,
@@ -8589,17 +9057,60 @@ pub(crate) fn native_string_region_matches_ic(
 /// answered `false` from an `if len_i < 0 { return false }` guard that has no
 /// counterpart in the JDK. Callers that pass a computed length depend on it.
 ///
+/// **A null `other` is a NullPointerException — but only where the JDK's `||`
+/// actually dereferences it.** That expression SHORT-CIRCUITS, and `other` is
+/// touched at the FOURTH term, so the null contract is conditional on the first
+/// three. Every row measured on OpenJDK 25.0.3+9 with `"abc"` as the receiver:
+///
+/// ```text
+/// regionMatches(  0, null,  0,  1)   NullPointerException   (reaches other.length())
+/// regionMatches(  0, null,  0, -1)   NullPointerException   (negative len does NOT save it)
+/// regionMatches(  3, null,  0,  0)   NullPointerException   (toffset == length() - len)
+/// "".regionMatches(0, null, 0,  0)   NullPointerException   (empty receiver, still reached)
+/// regionMatches( -1, null,  0,  1)   false                  (toffset < 0, term two)
+/// regionMatches(  0, null, -1,  1)   false                  (ooffset < 0, term one)
+/// regionMatches( 99, null,  0,  1)   false                  (term three, other never read)
+/// regionMatches(  0, null,  0,  4)   false                  (term three: 0 > 3 - 4)
+/// ```
+///
+/// with the five-argument overload answering identically for
+/// `ignoreCase = true` and delegating for `ignoreCase = false`. This VM
+/// answered `false` to all eight: `other` was unwrapped at the top of the
+/// native and a null took the same exit as a bounds failure, which is the
+/// `[default=wrong write]` shape — a defaulting reader turning a contract
+/// violation into a plausible answer. The two behaviours cannot be separated by
+/// checking null first (three of the eight rows would then be wrong), so the
+/// order below is the JDK's expression, term for term.
+///
 /// **Both sides are read losslessly.** `ctx.read_string` goes through a Rust
 /// `String`, where every unpaired surrogate becomes U+FFFD — so two *different*
 /// lone surrogates compared equal. `read_string_chars` reads the `value`
 /// arrays as UTF-16 code units, which is also the unit `toffset`/`ooffset`/`len`
-/// are specified in.
+/// are specified in. `other` is read only after it has survived the first three
+/// terms, which is both the JDK's order and the cheaper one.
+/// Whether the JDK's `regionMatches` bounds expression already answers `false`
+/// from its first THREE terms — the ones that do not touch `other`.
+///
+/// Split out so the short-circuit point is testable without a receiver, a
+/// heap or a `NativeContext`: `true` here means "return false, and `other`
+/// must NOT be dereferenced", `false` means "the JDK now evaluates
+/// `other.length()`", which is where a null argument becomes a
+/// NullPointerException. See [`region_matches_impl`] for the eight measured
+/// rows this reproduces.
+///
+/// `this_len`, `toffset`, `ooffset` and `len` are `i64` for the same reason the
+/// JDK widens to `long`: its own comment says "toffset, ooffset, or len might
+/// be near `-1>>>1`", so `length() - len` must not wrap.
+fn region_matches_short_circuits(this_len: i64, toffset: i64, ooffset: i64, len: i64) -> bool {
+    ooffset < 0 || toffset < 0 || toffset > this_len - len
+}
+
 #[allow(clippy::too_many_arguments)]
 fn region_matches_impl(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     toffset_i: i32,
-    other: cratonvm_types::ObjectRef,
+    other: Option<cratonvm_types::ObjectRef>,
     ooffset_i: i32,
     len_i: i32,
     ignore_case: bool,
@@ -8607,17 +9118,27 @@ fn region_matches_impl(
     // regionMatches offsets/len are in UTF-16 code UNITS, not Unicode code
     // points. Index over u16 to agree with charAt/length.
     let s_units = read_string_chars(ctx, this);
-    let o_units = read_string_chars(ctx, other);
 
-    // The JDK's test, in `i64` for the same reason the JDK uses `long`.
+    // The JDK's test, in `i64` for the same reason the JDK uses `long`, and in
+    // the JDK's order so that the `other.length()` dereference happens exactly
+    // where the JDK's does.
     let toffset = i64::from(toffset_i);
     let ooffset = i64::from(ooffset_i);
     let len = i64::from(len_i);
-    if ooffset < 0
-        || toffset < 0
-        || toffset > s_units.len() as i64 - len
-        || ooffset > o_units.len() as i64 - len
-    {
+    if region_matches_short_circuits(s_units.len() as i64, toffset, ooffset, len) {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Term four. `other.length()` — the JDK's implicit null check.
+    let Some(other) = other else {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some(
+                "Cannot invoke \"String.length()\" because \"other\" is null".to_string(),
+            ),
+        }
+        .into());
+    };
+    let o_units = read_string_chars(ctx, other);
+    if ooffset > o_units.len() as i64 - len {
         return Ok(Some(Value::Int(0)));
     }
     if len <= 0 {
@@ -8693,8 +9214,8 @@ pub(crate) fn native_string_region_matches(
         _ => 0,
     };
     let other = match args.get(2) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Int(0))),
+        Some(Value::Object(o)) => *o,
+        _ => None,
     };
     let ooffset_i = match args.get(3) {
         Some(Value::Int(v)) => *v,
@@ -9141,42 +9662,37 @@ fn native_string_index_of_str_from(
     };
     let tgt = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(-1))),
+        // E18. E8 fixed the ONE-argument `indexOf(String)` and left this
+        // overload swallowing its null into a `-1` — the same
+        // indistinguishable-from-a-real-miss answer, from the sibling
+        // registered twelve lines away. The two overloads even have DIFFERENT
+        // helpful-NPE texts, measured on OpenJDK 25.0.3+9:
+        //   "abc".indexOf(null)     -> Cannot invoke "String.coder()"  because "str"    is null
+        //   "abc".indexOf(null, 0)  -> Cannot invoke "String.length()" because "tgtStr" is null
+        // and the offset does NOT gate it: `indexOf(null, -1)` and
+        // `indexOf(null, 99)` throw as well, so unlike `startsWith`/
+        // `regionMatches` there is no short-circuit to transcribe here.
+        _ => {
+            return Err(string_arg_npe(
+                "Cannot invoke \"String.length()\" because \"tgtStr\" is null",
+            ))
+        }
     };
-    let from_raw = match args.get(2) {
+    let from = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let src = ctx.read_string(this).unwrap_or_default();
-    let needle = ctx.read_string(tgt).unwrap_or_default();
     // bug nb-lang-string: index over UTF-16 code UNITS, not Unicode code
     // points. Rust `char` is a code point, so `chars()`-based indexing is off
     // by one per preceding supplementary (>U+FFFF) char and disagrees with
-    // charAt/length. Match `encode_utf16()` as charAt and the static helper do.
-    let src_units: Vec<u16> = src.encode_utf16().collect();
-    let needle_units: Vec<u16> = needle.encode_utf16().collect();
-    let src_len = src_units.len() as i32;
-    let from = from_raw.max(0);
-    if needle_units.is_empty() {
-        // JDK: empty needle → clamp(from, 0, length)
-        return Ok(Some(Value::Int(from.min(src_len))));
-    }
-    if from >= src_len {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let nlen = needle_units.len();
-    if nlen > src_units.len() {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let max_start = src_units.len() - nlen;
-    let mut i = from as usize;
-    while i <= max_start {
-        if src_units[i..i + nlen] == needle_units[..] {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-        i += 1;
-    }
-    Ok(Some(Value::Int(-1)))
+    // charAt/length. E18: reading through `ctx.read_string` (a Rust `String`)
+    // additionally turned every unpaired surrogate into U+FFFD on BOTH sides,
+    // so two different lone surrogates matched — the scratch decode is the
+    // lossless one and is what `indexOf(String)` already used.
+    let result = with_two_string_chars_scratches(ctx, this, tgt, |haystack, needle| {
+        index_of_units_from(haystack, needle, from)
+    });
+    Ok(Some(Value::Int(result)))
 }
 
 /// `String.indexOf(byte[] src, byte coder, int srcCount, String tgt, int from)`
@@ -9245,27 +9761,13 @@ fn native_string_index_of_static_helper(
         }
     }
 
-    let needle_str = ctx.read_string(tgt).unwrap_or_default();
-    let needle_units: Vec<u16> = needle_str.encode_utf16().collect();
-
-    let src_len = src_units.len() as i32;
-    let from = from_raw.max(0);
-    if needle_units.is_empty() {
-        return Ok(Some(Value::Int(from.min(src_len))));
-    }
-    if from >= src_len {
-        return Ok(Some(Value::Int(-1)));
-    }
-    let nlen = needle_units.len();
-    let max_start = src_units.len().saturating_sub(nlen);
-    let mut i = from as usize;
-    while i <= max_start {
-        if src_units[i..i + nlen] == needle_units[..] {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-        i += 1;
-    }
-    Ok(Some(Value::Int(-1)))
+    // E18: the same scan as the two public overloads. The private copy that
+    // stood here had a `saturating_sub` where they had a length guard, so a
+    // needle LONGER than `srcCount` re-examined index 0 instead of failing —
+    // one rule, three loops, three bounds expressions.
+    let needle_units = with_string_chars_scratch(ctx, tgt, |units| units.to_vec());
+    let result = index_of_units_from(&src_units, &needle_units, from_raw);
+    Ok(Some(Value::Int(result)))
 }
 
 // ---------------------------------------------------------------------------
@@ -9541,6 +10043,202 @@ mod tests {
         // Lone surrogate code units only match when bit-identical.
         assert!(code_unit_eq_ignore_case(0xD83D, 0xD83D));
         assert!(!code_unit_eq_ignore_case(0xD83D, 0xDE00));
+    }
+
+    /// The rule `equalsIgnoreCase` now shares with `regionMatches(true, …)`.
+    ///
+    /// Every row is the verbatim OpenJDK 25.0.3+9 answer to the corresponding
+    /// `String.equalsIgnoreCase` call. The A7Dx rows are the ones Rust's
+    /// `to_lowercase()` — the implementation this replaced — got wrong.
+    #[test]
+    fn equals_ignore_case_folds_the_way_the_jdk_does() {
+        // "İ".equalsIgnoreCase("i") is TRUE: Java's 1:1 toLowerCase(U+0130) is
+        // a plain `i`, while Rust's full mapping is `i` + U+0307.
+        assert!(code_unit_eq_ignore_case(0x0130, 0x0069));
+        assert!(code_unit_eq_ignore_case(0x0130, 0x0049));
+        // U+212A KELVIN SIGN folds onto `k` through the upper-then-lower
+        // composition.
+        assert!(code_unit_eq_ignore_case(0x212A, 0x006B));
+        // The titlecase letter matches its uppercase partner.
+        assert!(code_unit_eq_ignore_case(0x01C5, 0x01C4));
+        // The six the JDK does not case-pair, measured `false` on HotSpot and
+        // `true` under Rust's newer tables.
+        assert!(!code_unit_eq_ignore_case(0xA7D3, 0xA7D2));
+        assert!(!code_unit_eq_ignore_case(0xA7D5, 0xA7D4));
+        assert!(!code_unit_eq_ignore_case(0xA7CF, 0xA7CE));
+        // ... and the neighbours that ARE pairs, so this is not a range.
+        assert!(code_unit_eq_ignore_case(0xA7D1, 0xA7D0));
+        assert!(code_unit_eq_ignore_case(0xA7D7, 0xA7D6));
+        // Identity still holds for all six.
+        for cp in [0xA7CEu16, 0xA7CF, 0xA7D2, 0xA7D3, 0xA7D4, 0xA7D5] {
+            assert!(code_unit_eq_ignore_case(cp, cp));
+        }
+    }
+
+    /// `compareToIgnoreCase` returns a DIFFERENCE, not a sign.
+    ///
+    /// The folded-difference rows measured on OpenJDK 25.0.3+9:
+    /// `"_".compareToIgnoreCase("a")` is `-2`, `"B".compareToIgnoreCase("a")`
+    /// is `1`, `"İ".compareToIgnoreCase("i")` is `0`, and
+    /// `"\u{A7D3}".compareToIgnoreCase("\u{A7D2}")` is `1`. The old body
+    /// returned `-1`/`0`/`1` from an `Ordering` over Rust-lowercased strings,
+    /// which is a wrong magnitude in the first row and a wrong SIGN in the
+    /// third and fourth.
+    #[test]
+    fn compare_to_ignore_case_returns_the_folded_difference() {
+        // The fold each row depends on, in the JDK's upper-then-lower order.
+        let folded = |c: u16| java_char_to_lower_case(java_char_to_upper_case(c));
+        assert_eq!(i32::from(folded(b'_' as u16)) - i32::from(folded(b'a' as u16)), -2);
+        assert_eq!(i32::from(folded(b'B' as u16)) - i32::from(folded(b'a' as u16)), 1);
+        // "İ" vs "i": the uppercases differ, the lowercases do not, so the
+        // loop continues and equal lengths give 0.
+        assert_ne!(java_char_to_upper_case(0x0130), java_char_to_upper_case(0x0069));
+        assert_eq!(folded(0x0130), folded(0x0069));
+        // A7D3 vs A7D2: both fold to themselves, so the difference is 1.
+        assert_eq!(i32::from(folded(0xA7D3)) - i32::from(folded(0xA7D2)), 1);
+    }
+
+    /// The `regionMatches` short circuit, pinned against the eight rows
+    /// measured on OpenJDK 25.0.3+9 with the receiver `"abc"`.
+    ///
+    /// `true` means the JDK returned `false` without touching `other`; `false`
+    /// means it reached `other.length()`, which is a NullPointerException when
+    /// `other` is null. All eight used to answer plain `false` here.
+    #[test]
+    fn region_matches_dereferences_other_exactly_where_the_jdk_does() {
+        let abc = 3i64;
+        // Reaches other.length() -> NPE for a null `other`.
+        assert!(!region_matches_short_circuits(abc, 0, 0, 1));
+        assert!(!region_matches_short_circuits(abc, 0, 0, -1)); // negative len does NOT save it
+        assert!(!region_matches_short_circuits(abc, 3, 0, 0)); // toffset == length() - len
+        assert!(!region_matches_short_circuits(0, 0, 0, 0)); // "" receiver, still reached
+        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+        // Decided by terms one to three -> `false`, `other` never read.
+        assert!(region_matches_short_circuits(abc, -1, 0, 1)); // toffset < 0
+        assert!(region_matches_short_circuits(abc, 0, -1, 1)); // ooffset < 0
+        assert!(region_matches_short_circuits(abc, 99, 0, 1)); // toffset > len - len
+        assert!(region_matches_short_circuits(abc, 0, 0, 4)); // 0 > 3 - 4
+        assert!(region_matches_short_circuits(abc, i64::from(i32::MAX), 0, 1));
+        // The widening is load-bearing: with `i32` arithmetic
+        // `length() - Integer.MIN_VALUE` wraps negative and the third term
+        // would wrongly short-circuit.
+        assert!(!region_matches_short_circuits(abc, 0, 0, i64::from(i32::MIN)));
+    }
+
+    // -----------------------------------------------------------------------
+    // E18: String.{indexOf,lastIndexOf}(int ch[, int from])
+    //
+    // Written against a `&[u16]` rather than a heap String on purpose: a
+    // `NativeContext` mock cannot even express the interesting receivers,
+    // because `create_string(&str)` cannot hold an UNPAIRED surrogate and the
+    // lone-surrogate rows are half the contract. Every expectation below is a
+    // measured OpenJDK 25.0.3+9 answer (`scratchpad/e18/CharSearch.java`,
+    // `Idx3.java`) — not a re-derivation from Rust's `char`, which is the
+    // proxy-oracle trap E8 §4.2 warns about and which is exactly what
+    // `char::from_u32` was doing here.
+    // -----------------------------------------------------------------------
+
+    /// `"xзy𐐷z"` — a Cyrillic з (U+0437, the LOW HALF of U+10437 when masked),
+    /// then the real surrogate pair for U+10437 at index 3.
+    const MIXED: &[u16] = &[0x0078, 0x0437, 0x0079, 0xD801, 0xDC37, 0x007A];
+    /// `"abc"`, whose 'a' is `0x10061 & 0xFFFF`.
+    const ABC: &[u16] = &[0x0061, 0x0062, 0x0063];
+
+    fn idx(h: &[u16], ch: i32, from: i32) -> i32 {
+        match code_point_needle(ch) {
+            Some(n) => index_of_units_from(h, n.units(), from),
+            None => -1,
+        }
+    }
+
+    fn last_idx(h: &[u16], ch: i32, from: i64) -> i32 {
+        match code_point_needle(ch) {
+            Some(n) => last_index_of_units_from(h, n.units(), from),
+            None => -1,
+        }
+    }
+
+    #[test]
+    fn a_supplementary_needle_is_a_surrogate_pair_and_never_its_masked_low_half() {
+        // THE row: `(ch & 0xFFFF)` finds 'a' at 0. HotSpot answers -1.
+        assert_eq!(idx(ABC, 0x10061, 0), -1);
+        assert_eq!(idx(ABC, 0x10061, -5), -1);
+        assert_eq!(last_idx(ABC, 0x10061, 2), -1);
+        assert_eq!(last_idx(ABC, 0x10061, i64::MAX), -1);
+        // Same shape with a receiver that really does contain the low half.
+        assert_eq!(idx(&[0x0437], 0x10437, 0), -1);
+        assert_eq!(last_idx(&[0x0437], 0x10437, i64::MAX), -1);
+        // …and the pair itself IS found, at the index of the HIGH surrogate.
+        assert_eq!(idx(MIXED, 0x10437, 0), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, i64::MAX), 3);
+    }
+
+    #[test]
+    fn a_lone_surrogate_needle_is_an_ordinary_code_unit_scan() {
+        // `char::from_u32` answers `None` for both of these, which is how
+        // `lastIndexOf(int)` came to return -1 where HotSpot returns 3 and 4.
+        assert_eq!(idx(MIXED, 0xD801, 0), 3);
+        assert_eq!(idx(MIXED, 0xDC37, 0), 4);
+        assert_eq!(last_idx(MIXED, 0xD801, i64::MAX), 3);
+        assert_eq!(last_idx(MIXED, 0xDC37, i64::MAX), 4);
+    }
+
+    #[test]
+    fn the_gate_is_is_valid_code_point_and_not_a_narrowing_cast() {
+        // `(char) -1` is 0xFFFF and this receiver holds 0xFFFF, yet HotSpot
+        // answers -1: `Character.isValidCodePoint` is checked first.
+        let ffff: &[u16] = &[0xFFFF, 0x0071];
+        assert_eq!(idx(ffff, -1, 0), -1);
+        assert_eq!(last_idx(ffff, -1, i64::MAX), -1);
+        assert_eq!(idx(ffff, i32::MIN, 0), -1);
+        // 0xFFFF is a NONCHARACTER but a valid code point, so it IS found.
+        assert_eq!(idx(ffff, 0xFFFF, 0), 0);
+        // Above the Unicode range, nothing matches.
+        assert_eq!(idx(ABC, 0x110000, 0), -1);
+        assert_eq!(idx(ABC, 0x1FFFFFF, 0), -1);
+        assert_eq!(last_idx(ABC, 0x110000, i64::MAX), -1);
+    }
+
+    #[test]
+    fn from_index_clamps_forward_and_floors_backward() {
+        assert_eq!(idx(MIXED, 0x10437, 3), 3);
+        assert_eq!(idx(MIXED, 0x10437, 4), -1); // starts past the pair
+        assert_eq!(idx(MIXED, 0x10437, 99), -1);
+        assert_eq!(idx(MIXED, 0x10437, -5), 3); // negative clamps to 0
+        assert_eq!(idx(ABC, 0x61, 99), -1);
+        // Backward: `min(from, len - width)`, and a NEGATIVE from finds
+        // nothing even when the needle is present — the JDK's loop counter
+        // starts below zero and never runs.
+        assert_eq!(last_idx(MIXED, 0x10437, 99), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 4), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 3), 3);
+        assert_eq!(last_idx(MIXED, 0x10437, 2), -1); // width 2: start is 2, pair is at 3
+        assert_eq!(last_idx(MIXED, 0x10437, -1), -1);
+        assert_eq!(last_idx(ABC, 0x61, -1), -1);
+        assert_eq!(last_idx(ABC, 0x61, 99), 0);
+        assert_eq!(last_idx(&[], 0x61, 0), -1);
+        // A two-unit needle in a two-unit haystack, started past index 0.
+        assert_eq!(idx(&[0xD801, 0xDC37], 0x10437, 1), -1);
+        assert_eq!(idx(&[0xD801, 0xDC37], 0x10437, 0), 0);
+    }
+
+    #[test]
+    fn the_empty_string_needle_keeps_its_own_contract() {
+        // Not reachable from `code_point_needle` (which is never empty) but
+        // shared with the String-needle overloads, whose measured answers are
+        // `"abcabc".indexOf("", 99) == 6` and `indexOf("", -5) == 0`.
+        let abcabc: &[u16] = &[0x61, 0x62, 0x63, 0x61, 0x62, 0x63];
+        assert_eq!(index_of_units_from(abcabc, &[], 99), 6);
+        assert_eq!(index_of_units_from(abcabc, &[], -5), 0);
+        assert_eq!(index_of_units_from(abcabc, &[], 2), 2);
+        assert_eq!(last_index_of_units_from(abcabc, &[], 99), 6);
+        assert_eq!(last_index_of_units(abcabc, &[]), 6);
+        // …and a needle longer than the haystack is a miss, not a panic.
+        assert_eq!(index_of_units_from(&[0x61], &[0x61, 0x62], 0), -1);
+        assert_eq!(
+            last_index_of_units_from(&[0x61], &[0x61, 0x62], i64::MAX),
+            -1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9852,6 +10550,51 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "hello");
+    }
+
+    /// E18. The JIT's door and the interpreter's door must answer the same
+    /// null `Locale`.
+    ///
+    /// This is the whole shape of the bug: `jit_string_to_lower_case` called
+    /// `string_case_impl` one layer BELOW the null check, so the same source
+    /// line threw while it was interpreted and returned the default-locale
+    /// string once it tiered up. A tier-dependent answer is invisible to any
+    /// test that runs the method only a few times, which is why the assertion
+    /// is written against the two ENTRY POINTS rather than against the
+    /// behaviour of a warm loop.
+    ///
+    /// Measured on OpenJDK 25.0.3+9: `"AbC".toLowerCase()` is `"abc"`,
+    /// `"AbC".toLowerCase((Locale) null)` throws NullPointerException, and it
+    /// still throws on the 200 000th warm iteration — HotSpot's answer does
+    /// not depend on its tier either.
+    #[test]
+    fn the_jit_lower_case_door_enforces_the_same_null_locale_as_the_native() {
+        let mut ctx = mock_ctx();
+        let s = ctx.create_string("AbC");
+
+        // ABSENT Locale slot — the no-argument overload. Answers, does not
+        // throw. (The JIT has no such call: its one bound descriptor,
+        // `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`,
+        // always carries the slot.)
+        let absent = native_string_to_lower_case(&mut ctx, &[Value::Object(Some(s))]);
+        match absent {
+            Ok(Some(Value::Object(Some(o)))) => assert_eq!(ctx.read_string(o).unwrap(), "abc"),
+            other => panic!("toLowerCase() must answer \"abc\", got {other:?}"),
+        }
+
+        // PRESENT-and-null Locale — both doors must throw.
+        let interpreted =
+            native_string_to_lower_case(&mut ctx, &[Value::Object(Some(s)), Value::Object(None)]);
+        assert!(
+            interpreted.is_err(),
+            "the interpreted native must throw for toLowerCase((Locale) null)"
+        );
+        let jit = jit_string_to_lower_case(&mut ctx, s, None);
+        assert!(
+            jit.is_err(),
+            "the JIT direct-call door must throw for the SAME call the interpreter throws for — \
+             it took `string_case_impl` directly and answered the default-locale string"
+        );
     }
 
     #[test]

@@ -11729,20 +11729,74 @@ pub(crate) fn p57_default_provider_singleton(
     p57_fs_provider(ctx, fs)
 }
 
+/// Fallback slot of `java.lang.Enum`'s own `name` field — the slot
+/// `Enum.name()`/`Enum.toString()` read.
+///
+/// `Enum` declares `name` then `ordinal`, and inherited fields come first in
+/// the layout, so `0`/`1` hold for any enum subclass whatever fields IT
+/// declares. These two constants are a local copy of
+/// `lang_misc::ENUM_NAME_SLOT`/`ENUM_ORDINAL_SLOT` only because those are
+/// private to that module; promoting them to `pub(crate)` and deleting this
+/// pair is nominated in `E36-1-inverted-enum-fallbacks-and-dead-field-rows.md`.
+///
+/// **Order is load-bearing and has been got wrong here.** Until this change
+/// `posix_file_permission_stub_clinit` fell back to `name → 1, ordinal → 0`,
+/// i.e. it wrote the ORDINAL where `name()` looks. That produces a NAMELESS
+/// enum constant: non-null, every null check passes, `toString()` answers
+/// null, `compareTo` calls every pair equal, and `Enum.valueOf` matches
+/// nothing. One nameless constant in one JDK enum zeroed fifteen netty
+/// classes earlier in this session, so this is a paid-for trap, not a
+/// hypothetical.
+pub(crate) const ENUM_NAME_SLOT: usize = 0;
+
+/// Fallback slot of `java.lang.Enum`'s own `ordinal` field. See
+/// [`ENUM_NAME_SLOT`] — the pair must not be swapped.
+pub(crate) const ENUM_ORDINAL_SLOT: usize = 1;
+
+/// Resolve `(name_slot, ordinal_slot)` for an enum constant's two `Enum`
+/// fields — the single place in this file where those slots are decided.
+///
+/// **Resolved against `java/lang/Enum`, never against the receiver's class.**
+/// `resolve_field_index_by_class_id` returns the MOST-DERIVED declaration, and
+/// an enum may declare its own field called `name`, which shadows `Enum`'s:
+/// Spring Boot's `WebEndpointTest.Infrastructure` does exactly that
+/// (`JERSEY("Jersey")`), which made `name()` answer `"Jersey"` instead of
+/// `"JERSEY"` and took the whole test class down with a
+/// `PreconditionViolationException`. `lang_misc::native_enum_name` carries the
+/// full account; this helper exists so no site in this file can reach for a
+/// literal or for the receiver again.
+pub(crate) fn enum_name_ordinal_slots(ctx: &mut dyn NativeContext) -> (usize, usize) {
+    // `Enum` must be loaded before its layout can be resolved; on the
+    // synthetic side this is what materialises the two-field stub model.
+    let _ = ctx.ensure_class_initialized("java/lang/Enum");
+    let name_slot = ctx
+        .resolve_field_index("java/lang/Enum", "name")
+        .unwrap_or(ENUM_NAME_SLOT);
+    let ordinal_slot = ctx
+        .resolve_field_index("java/lang/Enum", "ordinal")
+        .unwrap_or(ENUM_ORDINAL_SLOT);
+    (name_slot, ordinal_slot)
+}
+
 pub(crate) fn p57_alloc_enum(
     ctx: &mut dyn NativeContext,
     class: &str,
     name: &str,
     ordinal: i32,
 ) -> MethodCallResult {
+    // Was two hard-coded literals (`0`/`1`). They happened to be the right way
+    // round, which is exactly why they were dangerous: the sibling copy of the
+    // same two lines in `posix_file_permission_stub_clinit` was INVERTED and
+    // nothing connected the two. One resolver, one order.
+    let (name_slot, ordinal_slot) = enum_name_ordinal_slots(ctx);
     let obj = try_alloc_concurrent_synthetic(ctx, class, 2)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh enum (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
     let n = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
-    ctx.set_field(obj, 0, Value::Object(Some(n)));
-    ctx.set_field(obj, 1, Value::Int(ordinal));
+    ctx.set_field(obj, name_slot, Value::Object(Some(n)));
+    ctx.set_field(obj, ordinal_slot, Value::Int(ordinal));
     ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -14930,30 +14984,37 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(file, "separator", "Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string(std::path::MAIN_SEPARATOR_STR);
-        Ok(Some(Value::Object(Some(s))))
-    });
-    // KEEP: `File.separatorChar` is a compile-time platform constant in the
-    // real JDK too; `MAIN_SEPARATOR` is the genuine host value, not a stand-in.
-    r.register(file, "separatorChar", "C", |_ctx, _args| {
-        Ok(Some(Value::Int(std::path::MAIN_SEPARATOR as i32)))
-    });
-    r.register(file, "pathSeparator", "Ljava/lang/String;", |ctx, _args| {
-        #[cfg(windows)]
-        let sep = ";";
-        #[cfg(not(windows))]
-        let sep = ":";
-        let s = ctx.create_string(sep);
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(file, "pathSeparatorChar", "C", |_ctx, _args| {
-        #[cfg(windows)]
-        let sep = ';' as i32;
-        #[cfg(not(windows))]
-        let sep = ':' as i32;
-        Ok(Some(Value::Int(sep)))
-    });
+    // DELETED 2026-08-13 (lane E36): the four `java/io/File` separator
+    // constants — `separator` `Ljava/lang/String;`, `separatorChar` `C`,
+    // `pathSeparator` `Ljava/lang/String;`, `pathSeparatorChar` `C` — were
+    // registered as METHODS carrying a FIELD descriptor. That triple is one no
+    // dispatch can produce: every native-registry lookup originates at an
+    // INVOKE, whose descriptor starts with '(', and none of this VM's three
+    // static-read paths consults the registry —
+    // `interpreter/opcodes.rs Instruction::Getstatic`, `jit/helpers.rs
+    // jit_getstatic`, and `ir_lower.rs emit_inline_getstatic`, which bakes the
+    // statics base as an immediate and emits two `mov`s with no call at all.
+    //
+    // The comment that stood over `separatorChar` said to KEEP it because it
+    // is "a compile-time platform constant in the real JDK too". That is the
+    // one claim here that is measurable, and it is FALSE: in the JDK these are
+    // `public static final char separatorChar = fs.getSeparator();` — a method
+    // call, not a constant expression — so javac does NOT inline them.
+    // Measured on this host (Microsoft build 25.0.3+9-LTS), all four compile
+    // to a real read:
+    //
+    //     getstatic java/io/File.separator:Ljava/lang/String;
+    //     getstatic java/io/File.separatorChar:C
+    //     getstatic java/io/File.pathSeparator:Ljava/lang/String;
+    //     getstatic java/io/File.pathSeparatorChar:C
+    //
+    // So they are genuinely read at runtime, and these rows still could never
+    // answer one. The thing that DOES answer is `vm/src/vm/vm_util.rs`'s
+    // post-clinit fixup for `java/io/File`, which sets all four statics by
+    // name (plus `FS`) from the same host values — so this deletion changes no
+    // behaviour, it removes a second, unreachable publisher.
+    // `jdk-only-dead-everywhere.tsv` already carries `separatorChar` as
+    // `method-nowhere`. No test in the tree calls any of the four.
     r.set_category(__prev_cat);
     ()
 }
@@ -17164,7 +17225,7 @@ fn posix_permission_set(ctx: &mut dyn NativeContext, mode: i32) -> Option<Object
         _ => return None,
     };
     let set_pin = ctx.pin_native_root(set);
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let pfp = POSIX_FILE_PERMISSION;
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     for i in 0..9 {
@@ -19412,7 +19473,39 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
     // displacing the real one). Only the `StandardWatchEventKinds` constants
     // stay here: they are plain named singletons, not a second implementation.
 
-    // StandardWatchEventKinds
+    // StandardWatchEventKinds — FOUR FIELD-SHAPED ROWS, DEAD AND TYPE-WRONG,
+    // VERDICT "DELETE", NOT DELETED HERE (2026-08-13, lane E36).
+    //
+    // The comment above says these "stay here: they are plain named singletons,
+    // not a second implementation". They are neither: they are field names in
+    // the method slot with `Ljava/nio/file/WatchEvent$Kind;` where a method
+    // descriptor belongs, and no `getstatic` path in this VM consults the
+    // native registry (`interpreter/opcodes.rs Instruction::Getstatic`,
+    // `jit/helpers.rs jit_getstatic`, and `ir_lower.rs emit_inline_getstatic`,
+    // which bakes the statics base as an immediate and emits two `mov`s with
+    // no call at all). `StandardWatchEventKinds.ENTRY_CREATE` compiles to
+    // `getstatic ...ENTRY_CREATE:Ljava/nio/file/WatchEvent$Kind;` — measured —
+    // so it is a real read that these rows can never answer.
+    //
+    // They are also type-wrong. Each body returns `ctx.create_string("…")`: a
+    // `java/lang/String` where the descriptor names a `WatchEvent$Kind`. On the
+    // oracle the constant's class is
+    // `java.nio.file.StandardWatchEventKinds$StdWatchEventKind`, `name()` is
+    // `"ENTRY_CREATE"` and `type()` is `interface java.nio.file.Path` — a bare
+    // String has none of that.
+    //
+    // Nothing depends on them: the real consumer, `native-io`'s
+    // `watch_event_kind_object`, reads the STATIC
+    // (`static_field_index_by_name` + `get_static_field`) and falls back to a
+    // synthetic one-field `WatchEvent$Kind` carrying the bit. Converting these
+    // to a `<clinit>` belongs with the `WatchService` work in that crate,
+    // which owns the surface and the layout — not here.
+    //
+    // Left in place only because `vm/src/vm/tests.rs`'s `watch_event_kinds_p66`
+    // `call_native`s `ENTRY_CREATE`/`ENTRY_MODIFY` — and it asserts
+    // `read_java_string(...) == "ENTRY_CREATE"`, i.e. it does not merely keep a
+    // dead row alive, it pins the wrong TYPE as correct. The paired deletion is
+    // nominated so the two land together.
     let swek = "java/nio/file/StandardWatchEventKinds";
     r.register(
         swek,
@@ -19559,6 +19652,36 @@ pub(crate) fn apply_unix_mode(p: &str, mode: Option<u32>) {
     }
 }
 
+/// The one spelling of the class name, so the `<clinit>`, `values()`,
+/// `valueOf` and the mode-bit walker cannot drift apart.
+pub(crate) const POSIX_FILE_PERMISSION: &str = "java/nio/file/attribute/PosixFilePermission";
+
+/// `java.nio.file.attribute.PosixFilePermission`'s constants **in declaration
+/// order**.
+///
+/// The index into this slice IS the ordinal, so the order is load-bearing:
+/// `Enum.compareTo` is `this.ordinal - other.ordinal`, `EnumMap`/`EnumSet` key
+/// on it, `values()` must hand it back in the same order, and
+/// `posix_permission_bits_from_set`'s `BITS` table is positionally paired with
+/// it. Measured on the oracle, not assumed —
+/// `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+/// (Microsoft build 25.0.3+9-LTS) declares them in exactly this order and a
+/// run reports `values()[8].ordinal() == 8`. Note it is neither alphabetical
+/// nor sorted by mode bit; a plausible-looking reordering silently changes
+/// `compareTo`, `EnumSet` iteration and every permission mask this file
+/// computes.
+pub(crate) const POSIX_FILE_PERMISSION_CONSTANTS: &[&str] = &[
+    "OWNER_READ",
+    "OWNER_WRITE",
+    "OWNER_EXECUTE",
+    "GROUP_READ",
+    "GROUP_WRITE",
+    "GROUP_EXECUTE",
+    "OTHERS_READ",
+    "OTHERS_WRITE",
+    "OTHERS_EXECUTE",
+];
+
 /// Convert a `Set<PosixFilePermission>` (the 9 canonical singleton constants
 /// from `posix_file_permission_stub_clinit`/the real enum) into a Unix
 /// permission-bits mode (e.g. for `std::fs::Permissions::from_mode`). Walks
@@ -19567,27 +19690,21 @@ pub(crate) fn apply_unix_mode(p: &str, mode: Option<u32>) {
 /// `Set` implementation the caller passes in, not just our synthetic
 /// `HashSet`).
 pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> u32 {
-    const NAMES: [&str; 9] = [
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
+    // Positionally paired with `POSIX_FILE_PERMISSION_CONSTANTS`: index i is
+    // the mode bit of constant i. The two used to be a private 9-element
+    // `NAMES` here plus a second private `NAMES` inside the `<clinit>`, which
+    // is two chances for the declaration order to drift.
     const BITS: [u32; 9] = [
         0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
     ];
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let pfp = POSIX_FILE_PERMISSION;
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     let mut mode = 0u32;
-    for i in 0..9 {
+    for i in 0..BITS.len().min(POSIX_FILE_PERMISSION_CONSTANTS.len()) {
         let Some(c) = cid else { break };
-        let Some(slot) = ctx.static_field_index_by_name(c, NAMES[i]) else {
+        let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i])
+        else {
             continue;
         };
         let constant = ctx.get_static_field(c, slot);
@@ -19601,55 +19718,201 @@ pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: O
     mode
 }
 
+/// `java.nio.file.attribute.PosixFilePermission.<clinit>` — the guarded entry
+/// point. The body is [`posix_publish_constants`].
+///
+/// The split is deliberate: `is_class_synthetic_stub` answers the trait
+/// default `false` under `MockNativeContext`, so a test driven through this
+/// function measures the guard and never reaches a single field write. With
+/// the body factored out, the part that can be wrong is the part that is
+/// tested.
 pub(crate) fn posix_file_permission_stub_clinit(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    const P: &str = "java/nio/file/attribute/PosixFilePermission";
-    if !ctx.is_class_synthetic_stub(P) {
+    if !ctx.is_class_synthetic_stub(POSIX_FILE_PERMISSION) {
         return Ok(None);
     }
-    let Some(cid) = ctx.class_id_by_name(P) else {
+    posix_publish_constants(ctx)
+}
+
+/// Mint and publish `PosixFilePermission`'s nine constants the way its real
+/// `<clinit>` does, then publish `$VALUES`.
+///
+/// Three obligations, each silent when dropped:
+///
+/// 1. **`name` and `ordinal` must be written, in that order.** This function
+///    used to resolve both against `P` — the RECEIVER class — with the
+///    fallbacks INVERTED (`ordinal → 0`, `name → 1`). It was latent only
+///    because `class_manager.rs` gives the stub `java/lang/Enum` as its
+///    superclass so the lookup succeeds; one missing superclass row, or one
+///    enum copied from this model without that row, and every constant is
+///    NAMELESS — non-null, `valueOf` matching nothing. Both slots now come
+///    from [`enum_name_ordinal_slots`], which resolves against
+///    `java/lang/Enum` and cannot be got the wrong way round at one site
+///    without being wrong at all of them.
+/// 2. **Declaration order is the ordinal.** Measured, not assumed:
+///    `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+///    (Microsoft build 25.0.3+9-LTS) declares OWNER_{READ,WRITE,EXECUTE},
+///    GROUP_{…}, OTHERS_{…}, and a run reports `values()[8].ordinal() == 8`.
+///    `compareTo`, `EnumMap` and `EnumSet` all key on it.
+/// 3. **`$VALUES` is re-READ out of the statics**, not filled from the refs
+///    minted in pass one: `new_ref_array` allocates and can move them. That
+///    re-read is also what makes `values()[i] == CONSTANT`, the identity
+///    `Enum.valueOf`, `Class.getEnumConstants` and `EnumSet` rely on.
+///
+/// KNOWN GAP, unfixed here: `class_manager.rs` declares the nine constants for
+/// this stub but NOT `$VALUES`, and `set_static_field_by_name` resolves a
+/// DECLARED static and is a silent no-op otherwise. So the `$VALUES` publish
+/// below currently goes nowhere on the synthetic side and
+/// `PosixFilePermission.values()` falls back to reading the nine statics one
+/// by one (which works). The declaration is nominated; the publish is written
+/// now so it starts working the moment that lands, and `values()` does not
+/// depend on it either way.
+pub(crate) fn posix_publish_constants(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let p = POSIX_FILE_PERMISSION;
+    let Some(cid) = ctx.class_id_by_name(p) else {
         return Ok(None);
     };
-    if let Some(slot) = ctx.static_field_index_by_name(cid, "OWNER_READ") {
+    // Idempotence: `<clinit>` runs once per class by construction, but a
+    // second entry through any path must not replace live constants with
+    // fresh objects that fail `==`.
+    if let Some(slot) = ctx.static_field_index_by_name(cid, POSIX_FILE_PERMISSION_CONSTANTS[0]) {
         if matches!(ctx.get_static_field(cid, slot), Value::Object(Some(_))) {
             return Ok(None);
         }
     }
-    const NAMES: &[&str] = &[
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
-    let _ = ctx.ensure_class_initialized("java/lang/Enum");
-    let ord_idx = ctx.resolve_field_index(P, "ordinal").unwrap_or(0);
-    let name_idx = ctx.resolve_field_index(P, "name").unwrap_or(1);
+    let (name_idx, ord_idx) = enum_name_ordinal_slots(ctx);
     let nfields = ctx.class_num_total_fields(cid).max(2);
-    for (ord, &name) in NAMES.iter().enumerate() {
+    for (ord, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
         let obj = ctx.alloc_object(cid, nfields);
-        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        // Pin across `create_string` — a moving young GC there would relocate
+        // the fresh constant while this frame still holds `obj` (the native
+        // stale-local family). Nothing allocates between the field writes and
+        // the publish to the static, which is a GC root, so the constant is
+        // never unreachable-but-live.
+        let obj_pin = ctx.pin_native_root(obj);
         let name_obj = ctx.create_string(name);
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
         ctx.set_field(obj, name_idx, Value::Object(Some(name_obj)));
-        ctx.set_static_field_by_name(P, name, Value::Object(Some(obj)));
+        // Cast: nine constants is far inside `i32`.
+        ctx.set_field(obj, ord_idx, Value::Int(ord as i32));
+        ctx.set_static_field_by_name(p, name, Value::Object(Some(obj)));
     }
+    let values_array = ctx.new_ref_array(cid, POSIX_FILE_PERMISSION_CONSTANTS.len());
+    for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        // `set_array_element` does not allocate, so `values_array` cannot move
+        // underneath this loop.
+        ctx.set_array_element(values_array, idx, published);
+    }
+    ctx.set_static_field_by_name(p, "$VALUES", Value::Object(Some(values_array)));
+    // `stack_walker.rs`'s model publishes both spellings and `vm_util.rs`'s
+    // post-clinit fixup falls back from one to the other; a write to an
+    // undeclared static is a no-op, so writing both costs nothing.
+    ctx.set_static_field_by_name(p, "ENUM$VALUES", Value::Object(Some(values_array)));
     Ok(None)
+}
+
+/// `PosixFilePermission.values()` — a FRESH array each call, holding the
+/// interned constants.
+///
+/// Freshness is measured, not stylistic: on the oracle
+/// `PosixFilePermission.values() != PosixFilePermission.values()` (the real
+/// method is `$VALUES.clone()`, javap-confirmed) while
+/// `values()[0] == OWNER_READ`. Handing back one shared array would let a
+/// single caller's `values()[0] = null` corrupt every later caller.
+///
+/// Reads through the nine STATICS rather than through `$VALUES` so it answers
+/// correctly in both modes and before the nominated `$VALUES` declaration
+/// lands: in real-JDK mode the statics hold the JDK's own interned constants,
+/// so this returns those.
+pub(crate) fn posix_file_permission_values(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION)?;
+    let arr = ctx.new_ref_array(cid, POSIX_FILE_PERMISSION_CONSTANTS.len());
+    for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        ctx.set_array_element(arr, idx, published);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `PosixFilePermission.valueOf(String)` — resolved THROUGH the static field,
+/// so the answer is the same object `GETSTATIC` yields
+/// (`valueOf("GROUP_WRITE") == GROUP_WRITE`, measured on the oracle).
+///
+/// Both failure shapes are the oracle's, quoted from this host:
+/// `valueOf(null)` → `NullPointerException: Name is null`;
+/// `valueOf("nope")` → `IllegalArgumentException: No enum constant
+/// java.nio.file.attribute.PosixFilePermission.nope`. The `$` replacement is
+/// carried from the shared idiom for nested enums; this class is top-level so
+/// it never fires here.
+pub(crate) fn posix_file_permission_value_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let requested = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let Some(requested) = requested else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Name is null".to_string()),
+        }
+        .into());
+    };
+    let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION)?;
+    if POSIX_FILE_PERMISSION_CONSTANTS.contains(&requested.as_str()) {
+        if let Some(slot) = ctx.static_field_index_by_name(cid, &requested) {
+            let published = ctx.get_static_field(cid, slot);
+            if matches!(published, Value::Object(Some(_))) {
+                return Ok(Some(published));
+            }
+        }
+    }
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!(
+            "No enum constant {}.{requested}",
+            POSIX_FILE_PERMISSION.replace('/', ".").replace('$', ".")
+        ),
+    }
+    .into())
 }
 
 pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
-        "java/nio/file/attribute/PosixFilePermission",
+        POSIX_FILE_PERMISSION,
         "<clinit>",
         "()V",
         posix_file_permission_stub_clinit,
+    );
+    // `values()`/`valueOf(String)` are `invokestatic` against the ENUM class,
+    // and a synthetic stub declares neither — `PosixFilePermission.values()`
+    // was a `NoSuchMethodError`, and `EnumSet.allOf` / `Class
+    // .getEnumConstants` had nothing to read. Unlike the `<clinit>` these two
+    // are NOT gated on `is_class_synthetic_stub`: both answer by reading the
+    // class's own statics, so on a real JDK class they return the JDK's own
+    // interned constants and agree with the bytecode they shadow.
+    r.register(
+        POSIX_FILE_PERMISSION,
+        "values",
+        "()[Ljava/nio/file/attribute/PosixFilePermission;",
+        |ctx, _args| posix_file_permission_values(ctx),
+    );
+    r.register(
+        POSIX_FILE_PERMISSION,
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/nio/file/attribute/PosixFilePermission;",
+        posix_file_permission_value_of,
     );
     r.set_category(__prev_cat);
 }
@@ -19774,38 +20037,29 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         ctx.invoke_virtual(inst, "toString", "()Ljava/lang/String;", &[])
     });
 
-    // PosixFilePermission enum
-    let pfp = "java/nio/file/attribute/PosixFilePermission";
-    // Register each individually (NativeCallback = fn ptr, no captures)
-
-    r.register(
-        pfp,
-        "values",
-        "()[Ljava/nio/file/attribute/PosixFilePermission;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 9);
-            // Can't iterate/capture — just return the array (elements are null but array exists)
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
+    // PosixFilePermission.values() — REMOVED here, and this note is the whole
+    // reason to read the code rather than the comment. It was:
+    //
+    //     let arr = ctx.new_array(Reference, 9);
+    //     // Can't iterate/capture — just return the array (elements are null
+    //     // but array exists)
+    //
+    // i.e. nine NULLS with the difficulty stated as the excuse. Anything that
+    // walked it — `EnumSet.allOf`, `Class.getEnumConstants`, a `for (var p :
+    // values())` loop — got nine nulls, and every `p.name()` on one NPEs. The
+    // replacement is `posix_file_permission_values`, registered from
+    // `register_posix_file_permission_stub_clinit` at the bottom of this
+    // function alongside `valueOf`; it reads the nine statics, so it answers
+    // in BOTH modes. Both rows named the same triple, so this was also a
+    // last-write-wins race that the fabricated one only lost by ordering.
 
     // PosixFilePermissions utility
     let pfps = "java/nio/file/attribute/PosixFilePermissions";
-    // The 9 PosixFilePermission constants in canonical "rwxrwxrwx" order, with
-    // the rwx char expected at each position. The constants are stable singletons
-    // (PosixFilePermission stub_clinit / real enum), so a HashSet of them works
-    // with Set.contains(OWNER_READ) downstream.
-    const PFP_NAMES: [&str; 9] = [
-        "OWNER_READ",
-        "OWNER_WRITE",
-        "OWNER_EXECUTE",
-        "GROUP_READ",
-        "GROUP_WRITE",
-        "GROUP_EXECUTE",
-        "OTHERS_READ",
-        "OTHERS_WRITE",
-        "OTHERS_EXECUTE",
-    ];
+    // `PFP_PAT` is positionally paired with `POSIX_FILE_PERMISSION_CONSTANTS`:
+    // the rwx char expected at each position of a canonical "rwxrwxrwx"
+    // string. The name list used to be a third private copy here (after the
+    // `<clinit>`'s and `posix_permission_bits_from_set`'s); it is now the one
+    // shared constant, so the pairing cannot drift.
     const PFP_PAT: [char; 9] = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
     r.register(
         pfps,
@@ -19818,13 +20072,13 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(Some(ctx.create_string("---------"))))),
             };
-            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let pfp = POSIX_FILE_PERMISSION;
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             let mut out = String::with_capacity(9);
             for i in 0..9 {
                 let present = if let Some(c) = cid {
-                    match ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                    match ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                         Some(slot) => {
                             let constant = ctx.get_static_field(c, slot);
                             matches!(
@@ -19870,7 +20124,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 &[Value::Object(Some(set))],
             );
             let chars: Vec<char> = perms.chars().collect();
-            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let pfp = POSIX_FILE_PERMISSION;
             // Pin across the clinit / add() invokes below — a moving young GC
             // there would relocate the fresh set (native stale-local family).
             let set_pin = ctx.pin_native_root(set);
@@ -19879,7 +20133,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             for i in 0..9 {
                 if chars.get(i).copied() == Some(PFP_PAT[i]) {
                     if let Some(c) = cid {
-                        if let Some(slot) = ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                        if let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                             let constant = ctx.get_static_field(c, slot);
                             if matches!(constant, Value::Object(Some(_))) {
                                 let set = ctx.read_native_pin(set_pin, set);
@@ -19956,6 +20210,313 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
     ()
+}
+
+/// The enum-constant minting laws this file has already broken once.
+///
+/// Every one of these drives a real function through `MockNativeContext`; none
+/// asserts only that an object is non-null, because a NAMELESS enum constant
+/// is non-null and passes every null check — that is the whole failure mode.
+#[cfg(test)]
+mod e36_enum_constant_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::FieldMetadata;
+
+    /// Declare `class_name`'s statics at slots `0..n` so
+    /// `set_static_field_by_name` has something to resolve. The mock's
+    /// `static_field_index_by_name` reads exactly this table, and the VM's
+    /// resolves a DECLARED static and is a silent no-op otherwise — so a test
+    /// that skips this measures the mock's emptiness, not the native.
+    fn declare_statics(ctx: &MockNativeContext, class_id: ClassId, names: &[&str], desc: &str) {
+        let fields = names
+            .iter()
+            .enumerate()
+            .map(|(slot_index, name)| FieldMetadata {
+                name: (*name).to_string(),
+                descriptor: desc.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: class_id,
+                is_static: true,
+            })
+            .collect();
+        ctx.set_declared_fields(class_id, fields);
+    }
+
+    /// The fallback pair is `name → 0, ordinal → 1` and NOT the other way
+    /// round.
+    ///
+    /// This is the assertion that would have failed on
+    /// `posix_file_permission_stub_clinit` before 2026-08-13, where the two
+    /// were `ordinal → 0, name → 1`. Inverted, the ordinal lands in the slot
+    /// `Enum.name()` reads and every constant is nameless: `toString()` null,
+    /// `compareTo` calling every pair equal, and `Enum.valueOf` matching
+    /// nothing. One such constant in one JDK enum zeroed fifteen netty classes.
+    #[test]
+    fn the_enum_slot_fallbacks_are_name_then_ordinal() {
+        assert_eq!(
+            (ENUM_NAME_SLOT, ENUM_ORDINAL_SLOT),
+            (0, 1),
+            "Enum declares name then ordinal; swapping these mints nameless constants"
+        );
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(enum_name_ordinal_slots(&mut ctx), (0, 1));
+    }
+
+    /// The slots are RESOLVED, not hard-coded — the mutation half.
+    ///
+    /// `java/lang/Enum` is declared here with its two fields in the opposite
+    /// order, which is the only way to tell a resolver from a literal: an
+    /// implementation that returned `(0, 1)` unconditionally passes the test
+    /// above and fails this one.
+    #[test]
+    fn the_enum_slots_follow_the_declared_layout_not_a_literal() {
+        let mut ctx = MockNativeContext::new();
+        let enum_cid = ctx.ensure_class_initialized("java/lang/Enum").unwrap();
+        ctx.set_declared_fields(
+            enum_cid,
+            vec![
+                FieldMetadata {
+                    name: "ordinal".to_string(),
+                    descriptor: "I".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: enum_cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: "name".to_string(),
+                    descriptor: "Ljava/lang/String;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: enum_cid,
+                    is_static: false,
+                },
+            ],
+        );
+        assert_eq!(
+            enum_name_ordinal_slots(&mut ctx),
+            (1, 0),
+            "the slots must come from Enum's layout, not from the fallback literals"
+        );
+    }
+
+    /// `p57_alloc_enum` writes the NAME as a String and the ORDINAL as an int,
+    /// each in the slot the layout says — not "a non-null object exists".
+    ///
+    /// The receiver's own layout is deliberately not consulted: `java/lang/Enum`
+    /// is declared inverted again, so a constant minted through the receiver
+    /// (or through literals) puts the String where `ordinal()` reads.
+    #[test]
+    fn an_alloc_enum_constant_carries_a_readable_name() {
+        let mut ctx = MockNativeContext::new();
+        let v = p57_alloc_enum(&mut ctx, "java/nio/file/FileVisitResult", "TERMINATE", 3)
+            .expect("alloc enum")
+            .expect("a value");
+        let obj = match v {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected an enum constant, got {other:?}"),
+        };
+        let (name_slot, ordinal_slot) = enum_name_ordinal_slots(&mut ctx);
+        let name_ref = match ctx.get_field(obj, name_slot) {
+            Value::Object(Some(s)) => s,
+            other => panic!("name slot {name_slot} holds {other:?}, not a String — NAMELESS"),
+        };
+        assert_eq!(ctx.read_string(name_ref).as_deref(), Some("TERMINATE"));
+        assert_eq!(ctx.get_field(obj, ordinal_slot), Value::Int(3));
+    }
+
+    /// The nine constants are published with a populated `name`, the ordinal
+    /// is the DECLARATION index, and `$VALUES[i]` is the same object as the
+    /// static.
+    ///
+    /// Driven through `posix_publish_constants`, not through
+    /// `posix_file_permission_stub_clinit`: the latter's first act is
+    /// `is_class_synthetic_stub`, which answers the trait default `false`
+    /// under the mock, so a test aimed there would measure the guard and reach
+    /// no field write at all.
+    #[test]
+    fn every_posix_permission_constant_is_published_with_its_name() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        let mut statics: Vec<&str> = POSIX_FILE_PERMISSION_CONSTANTS.to_vec();
+        statics.push("$VALUES");
+        declare_statics(
+            &ctx,
+            cid,
+            &statics,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let (name_slot, ordinal_slot) = enum_name_ordinal_slots(&mut ctx);
+        for (ord, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx
+                .static_field_index_by_name(cid, name)
+                .unwrap_or_else(|| panic!("{name} was not declared"));
+            let constant = match ctx.get_static_field(cid, slot) {
+                Value::Object(Some(o)) => o,
+                other => panic!("{name} published as {other:?}"),
+            };
+            let name_ref = match ctx.get_field(constant, name_slot) {
+                Value::Object(Some(s)) => s,
+                other => panic!("{name} has a nameless constant: name slot holds {other:?}"),
+            };
+            assert_eq!(
+                ctx.read_string(name_ref).as_deref(),
+                Some(name),
+                "name() must answer the constant's own name"
+            );
+            assert_eq!(
+                ctx.get_field(constant, ordinal_slot),
+                Value::Int(ord as i32),
+                "{name}'s ordinal is its declaration index"
+            );
+        }
+
+        let values_slot = ctx.static_field_index_by_name(cid, "$VALUES").unwrap();
+        let values = match ctx.get_static_field(cid, values_slot) {
+            Value::Object(Some(a)) => a,
+            other => panic!("$VALUES is {other:?}"),
+        };
+        assert_eq!(ctx.array_length(values), 9);
+        for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx.static_field_index_by_name(cid, name).unwrap();
+            assert_eq!(
+                ctx.get_array_element(values, idx),
+                ctx.get_static_field(cid, slot),
+                "$VALUES[{idx}] must be == the {name} static, not a second object"
+            );
+        }
+    }
+
+    /// A second entry does not replace live constants with fresh objects that
+    /// fail `==`.
+    #[test]
+    fn publishing_twice_keeps_the_first_constants() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+        let slot = ctx
+            .static_field_index_by_name(cid, "OWNER_READ")
+            .expect("declared");
+        let first = ctx.get_static_field(cid, slot);
+        posix_publish_constants(&mut ctx).expect("publish again");
+        assert_eq!(first, ctx.get_static_field(cid, slot));
+    }
+
+    /// `values()` hands back a FRESH array holding the interned constants.
+    ///
+    /// Both halves are the oracle's, measured on this host:
+    /// `values() != values()` (the real method is `$VALUES.clone()`) while
+    /// `values()[0] == OWNER_READ`. Returning one shared array would let a
+    /// single caller's `values()[0] = null` corrupt every later caller.
+    #[test]
+    fn values_is_a_fresh_array_of_the_interned_constants() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let first = posix_file_permission_values(&mut ctx).unwrap().unwrap();
+        let second = posix_file_permission_values(&mut ctx).unwrap().unwrap();
+        assert_ne!(first, second, "values() must clone, not share $VALUES");
+        let (a, b) = match (first, second) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => (a, b),
+            other => panic!("values() answered {other:?}"),
+        };
+        assert_eq!(ctx.array_length(a), 9);
+        for (idx, &name) in POSIX_FILE_PERMISSION_CONSTANTS.iter().enumerate() {
+            let slot = ctx.static_field_index_by_name(cid, name).unwrap();
+            let published = ctx.get_static_field(cid, slot);
+            assert_eq!(ctx.get_array_element(a, idx), published);
+            assert_eq!(ctx.get_array_element(b, idx), published);
+        }
+    }
+
+    /// `valueOf` resolves THROUGH the static, and both failure shapes are the
+    /// oracle's — quoted, not invented:
+    /// `valueOf(null)` → `NullPointerException: Name is null`;
+    /// `valueOf("nope")` → `IllegalArgumentException: No enum constant
+    /// java.nio.file.attribute.PosixFilePermission.nope`.
+    #[test]
+    fn value_of_returns_the_interned_constant_and_the_jdks_two_failures() {
+        let mut ctx = MockNativeContext::new();
+        let cid = ctx.ensure_class_initialized(POSIX_FILE_PERMISSION).unwrap();
+        declare_statics(
+            &ctx,
+            cid,
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            "Ljava/nio/file/attribute/PosixFilePermission;",
+        );
+        posix_publish_constants(&mut ctx).expect("publish");
+
+        let wanted = ctx.create_string("GROUP_WRITE");
+        let got = posix_file_permission_value_of(&mut ctx, &[Value::Object(Some(wanted))])
+            .unwrap()
+            .unwrap();
+        let slot = ctx.static_field_index_by_name(cid, "GROUP_WRITE").unwrap();
+        assert_eq!(
+            got,
+            ctx.get_static_field(cid, slot),
+            "valueOf must answer the same object GETSTATIC yields"
+        );
+
+        match posix_file_permission_value_of(&mut ctx, &[Value::Object(None)]) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { message },
+            ))) => assert_eq!(message.as_deref(), Some("Name is null")),
+            other => panic!("valueOf(null) answered {other:?}"),
+        }
+
+        let bogus = ctx.create_string("nope");
+        match posix_file_permission_value_of(&mut ctx, &[Value::Object(Some(bogus))]) {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::IllegalArgumentException { message },
+            ))) => assert_eq!(
+                message,
+                "No enum constant java.nio.file.attribute.PosixFilePermission.nope"
+            ),
+            other => panic!("valueOf(\"nope\") answered {other:?}"),
+        }
+    }
+
+    /// The constant order IS the ordinal, so it is pinned against a
+    /// plausible-looking reordering. Taken from
+    /// `javap -p java.nio.file.attribute.PosixFilePermission` on this host
+    /// (Microsoft build 25.0.3+9-LTS) — it is neither alphabetical nor sorted
+    /// by mode bit, and `posix_permission_bits_from_set`'s `BITS` table is
+    /// positionally paired with it.
+    #[test]
+    fn the_constant_order_is_the_jdk_declaration_order() {
+        assert_eq!(
+            POSIX_FILE_PERMISSION_CONSTANTS,
+            &[
+                "OWNER_READ",
+                "OWNER_WRITE",
+                "OWNER_EXECUTE",
+                "GROUP_READ",
+                "GROUP_WRITE",
+                "GROUP_EXECUTE",
+                "OTHERS_READ",
+                "OTHERS_WRITE",
+                "OTHERS_EXECUTE",
+            ]
+        );
+    }
 }
 
 // =============================================================================

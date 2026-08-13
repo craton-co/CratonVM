@@ -492,8 +492,57 @@ public class RSimpleDateFormatZone {
         sectionEnd("dstrule", 11);
     }
 
+    // -----------------------------------------------------------------------
+    // 7. memo -- TARGETS THE FORMAT PATH THROUGH THE PER-FORMATTER MEMO.
+    //
+    // The other format blocks cannot see this defect: a fresh formatter's
+    // first format declines the VM's fast path (its `zeroDigit` field is not
+    // armed yet) and the second is cross-checked against bytecode, which
+    // corrects it. This block defeats both. It warms ONE formatter under a
+    // zone the VM answers correctly for, so the shape is verified, then swaps
+    // in a SimpleTimeZone with the SAME offset and a contradicting id: the
+    // shape key is unchanged, the memo hits, and no cross-check runs. Removing
+    // the two warm-up formats makes this block green on a broken VM, which is
+    // its mutation check.
+    //
+    // The fast path memoizes verified shapes keyed by (formatter, shape) and
+    // `setTimeZone` invalidates NOTHING, so a shape verified under one zone is
+    // then SERVED under a different one with no cross-check. Both zones here
+    // carry the same +03:00 offset so the shape key cannot change; only the
+    // ANSWER may, and only on a VM that resolves the id instead of reading the
+    // caller's rawOffset. Tokyo's true offset (32,400,000) differs from the
+    // 10,800,000 supplied, which is what makes the row non-vacuous -- asserted
+    // by notVacuous rather than assumed.
+    // -----------------------------------------------------------------------
+    static void memo() {
+        SimpleDateFormat f = new SimpleDateFormat(PAT, Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("Etc/GMT-3"));
+        check(TimeZone.getTimeZone("Etc/GMT-3").getOffset(JAN) == 10800000,
+                "memo: Etc/GMT-3 must be +03:00 at JAN");
+        String warm1 = fmt(f, new Date(JAN));
+        String warm2 = fmt(f, new Date(JAN));
+        check("2021-01-15 15:00:00 +0300".equals(warm1), "memo: warm-up 1, got " + warm1);
+        check("2021-01-15 15:00:00 +0300".equals(warm2), "memo: warm-up 2, got " + warm2);
+        notVacuous("memo", 10800000, "Asia/Tokyo", JAN);
+        f.setTimeZone(new SimpleTimeZone(10800000, "Asia/Tokyo"));
+        // Second vacuity screen, and the reason this block is 6 checks rather than the 5 the
+        // nomination's body contained: if setTimeZone silently failed to take, the assertion
+        // below would pass for the wrong reason -- the formatter would still be holding
+        // Etc/GMT-3, which answers +0300 correctly on every VM.
+        check(f.getTimeZone().getRawOffset() == 10800000,
+                "memo: setTimeZone must have TAKEN -- the formatter's zone must now report"
+                        + " rawOffset 10800000, got " + f.getTimeZone().getRawOffset());
+        String after = fmt(f, new Date(JAN));
+        ob("memo-after-zone-swap", after);
+        check("2021-01-15 15:00:00 +0300".equals(after),
+                "memo: after setTimeZone(new SimpleTimeZone(10800000, \"Asia/Tokyo\")) the SAME"
+                        + " formatter must still answer from the caller's rawOffset, got \"" + after
+                        + "\" -- a per-(formatter, shape) memo served a zone it never checked");
+        sectionEnd("memo", 6);
+    }
+
     static final String[] FAMILIES = {
-        "control", "fmtdate", "routes", "roundtrip", "parse", "dstrule",
+        "control", "fmtdate", "routes", "roundtrip", "parse", "dstrule", "memo",
     };
 
     static void runFamily(String name) throws ParseException {
@@ -509,6 +558,8 @@ public class RSimpleDateFormatZone {
             parse();
         } else if ("dstrule".equals(name)) {
             dstrule();
+        } else if ("memo".equals(name)) {
+            memo();
         } else {
             throw new AssertionError("unknown family: " + name);
         }

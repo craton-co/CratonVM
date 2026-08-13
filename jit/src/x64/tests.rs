@@ -399,6 +399,12 @@ fn test_helpers() -> JitRuntimeHelpers {
         // Unwired (0) — these tests build no class-`ldc` site, and 0 makes
         // the backend refuse one rather than emit a null CALL.
         ldc_class_cp: 0,
+        // Unwired (0) on purpose: it routes the `0x53` arm to `aastore` (the
+        // complete opcode), which is the lowering every existing `aastore`
+        // codegen test in this file was written against. Wiring the panicking
+        // sentinel here would switch them all to the inline-store-plus-check
+        // arm and emit a CALL to a stub that panics.
+        aastore_check: 0,
     }
 }
 

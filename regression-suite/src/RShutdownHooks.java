@@ -43,13 +43,24 @@ import java.io.FileOutputStream;
  * folded in here because a vector that terminates the process cannot also
  * print its own PASS line.
  *
- * Measured on HotSpot 25.0.3+9 (Microsoft build 25.0.3+9-LTS), Windows, after
- * `run.sh`'s own `extract()` filter:
+ * Measured on HotSpot 25.0.3+9 (Microsoft build 25.0.3+9-LTS), Windows, rc=0.
+ * The RAW output and the output after `run.sh`'s `extract()` filter are now the
+ * SAME five lines — that is the contract, and it is what keeps guard G1 quiet:
  *   CK RShutdownHooks pre removed=true removedAgain=false dupIAE=true
- *   PASS RShutdownHooks checks=4
+ *   PASS RShutdownHooks (4 checks)
+ *   CK RShutdownHooks hookErr ran=true
  *   CK RShutdownHooks hookOut ran=true
  *   CK RShutdownHooks hookFd1 ran=true ownThread=true err=ok out=ok
- * PREDICTED on CratonVM: the first two lines match, the last two are ABSENT.
+ * PREDICTED on CratonVM: the first two lines match, the last three are ABSENT.
+ *
+ * Until 2026-08-13 the third line read `hook-stderr` and the second read
+ * `PASS RShutdownHooks checks=4`. Both were harness-invisible: extract() drops
+ * any line not prefixed `PASS `/`CK `, so the oracle printed evidence the suite
+ * could not see (G1), and `harness_check_count` parses only
+ * `PASS <Class> (N checks)` / `CK <Class> checks=N`, so the published count was
+ * unreadable (G3). Both guards fired on HOTSPOT, which is what made this
+ * vector's CratonVM result uninterpretable in either direction; neither was a
+ * fact about either VM.
  *
  * Mutation-checked (see the record): dropping the `addShutdownHook(live)` call
  * deletes both hook lines; letting a REMOVED hook run adds a line; and a hook
@@ -83,7 +94,23 @@ public class RShutdownHooks {
             boolean own = "cratonvm-hook-A".equals(Thread.currentThread().getName());
             boolean errOk;
             try {
-                System.err.println("hook-stderr");
+                // CK-prefixed on PURPOSE. This line used to read `hook-stderr`,
+                // which extract() DELETES — so the oracle printed one line the
+                // suite cannot see and guard G1 fired on HotSpot every run,
+                // making this vector's redness uninterpretable in either
+                // direction. The channel still has to be exercised (that is what
+                // `errOk` measures), and a probe whose output is deleted proves
+                // nothing about the channel, so the probe's text carries the
+                // prefix. It also strengthens the vector: `err=ok` on the fd1
+                // line says the write did not throw, while THIS line landing
+                // says the bytes actually arrived — a VM with a silently dead
+                // System.err answers err=ok and still loses this line.
+                //
+                // Ordering is deterministic and already load-bearing here: err,
+                // out and fd1 are written and flushed in sequence by one thread
+                // onto one merged stream (run.sh captures 2>&1), which is why
+                // hookOut/hookFd1 could already be diffed as an ordered pair.
+                System.err.println("CK RShutdownHooks hookErr ran=true");
                 System.err.flush();
                 errOk = true;
             } catch (Throwable e) {
@@ -146,7 +173,15 @@ public class RShutdownHooks {
 
         System.out.println("CK RShutdownHooks pre removed=" + removed
                 + " removedAgain=" + removedAgain + " dupIAE=" + dupIae);
-        System.out.println("PASS RShutdownHooks checks=" + checks);
+        // PARENTHESISED, and that is not cosmetic. harness_check_count parses
+        // exactly two spellings — `PASS <Class> (N checks)` and
+        // `CK <Class> checks=N` — and nothing else. This line said
+        // `PASS RShutdownHooks checks=4`, which matches NEITHER, so the vector
+        // published a count that the guard could not read and G3 fired on it
+        // every run. A census of the suite found this file was the only one of
+        // 77 counting vectors using that spelling; the other 76 are already
+        // parenthesised.
+        System.out.println("PASS RShutdownHooks (" + checks + " checks)");
         // main returns normally; the hook's CK line must follow.
     }
 }

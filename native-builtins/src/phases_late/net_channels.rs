@@ -691,11 +691,26 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     // one-sided renumbering would only move the disagreement.
     let sk = "java/nio/channels/SelectionKey";
 
-    // The four public interest-op constants. They are `static final int`s, so
-    // they register with the FIELD descriptor "I" rather than a method one.
-    // Every `SelectionKey` instance method below existed, but nothing could
-    // name the bits they take: `key.interestOps(SelectionKey.OP_READ)` had no
-    // way to reach the value 1. The values are fixed by the JDK spec.
+    // The four public interest-op constants, registered with the FIELD
+    // descriptor "I" rather than a method one.
+    //
+    // THE CLAIM THIS COMMENT USED TO MAKE IS FALSE, and the note ~40 lines
+    // below says so while these four rows are still here — the file
+    // contradicted itself. `key.interestOps(SelectionKey.OP_READ)` STILL has no
+    // way to reach the value 1 through these rows: javac emits `GETSTATIC` for
+    // a `static final int`, and no `GETSTATIC` path in this VM consults the
+    // native registry (the three paths are enumerated at the
+    // `HttpClient$Version` registration below). They are dead in both run
+    // modes, reachable only by an explicit `call_native` — which is exactly
+    // what `vm/src/vm/tests.rs`'s `selection_key_constants_p58` does, so the
+    // test passes while nothing on the bytecode side can select them.
+    //
+    // Left in place rather than deleted only because deleting them turns that
+    // test red in a file this lane does not own; the removal, and the
+    // `<clinit>` replacement that would make the constants actually readable,
+    // are nominated in
+    // docs/known-issues/jdk-only/E21-1-getstatic-has-no-native-path.md.
+    // The values are fixed by the JDK spec.
     r.register(sk, "OP_READ", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.register(sk, "OP_WRITE", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
     r.register(sk, "OP_CONNECT", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
@@ -740,12 +755,17 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // REMOVED (stub-removal wave 2): `SelectionKey.OP_READ/OP_WRITE/OP_CONNECT/
-    // OP_ACCEPT` were registered as *methods* with the FIELD descriptor "I".
+    // NOT REMOVED — this note said "REMOVED (stub-removal wave 2)" and was
+    // wrong: the four `SelectionKey.OP_READ/OP_WRITE/OP_CONNECT/OP_ACCEPT`
+    // rows it describes are still registered ~40 lines above, where a second
+    // comment used to claim they made the constants reachable. Corrected in
+    // place on 2026-08-13 rather than deleted, because the DIAGNOSIS below is
+    // right and is the one this file's `HttpClient$Version` fix rests on:
+    //
     // The registry is keyed on (class, method, descriptor) and every lookup
     // comes from an invoke instruction, whose descriptor always starts with
     // '('; javac emits `getstatic` for these `static final int` constants and
-    // there is no getstatic-to-native path. The four entries could therefore
+    // there is no getstatic-to-native path. The four entries can therefore
     // never be selected in either run mode — dead registrations, not stubs.
     // (`native-io/src/lib.rs` separately registers them with a well-formed
     // "()I" descriptor; that one is at least reachable by an explicit call.)
@@ -969,6 +989,185 @@ pub(crate) fn p98_do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) ->
 // HttpResponse = 3-field synthetic (statusCode=0 Int, body=1, headers=2)
 // =============================================================================
 
+pub(crate) const HTTP_CLIENT_VERSION: &str = "java/net/http/HttpClient$Version";
+pub(crate) const HTTP_CLIENT_REDIRECT: &str = "java/net/http/HttpClient$Redirect";
+
+/// `java.net.http.HttpClient$Version`'s constants **in declaration order**.
+///
+/// The index into this slice IS the ordinal, so the order is load-bearing:
+/// `Enum.compareTo` is `this.ordinal - other.ordinal`, `EnumMap`/`EnumSet` key
+/// on it, and `values()` must hand it back in the same order. Measured on the
+/// oracle, not assumed — `javap -p java.net.http.HttpClient$Version` on this
+/// host (Microsoft build 25.0.3+9-LTS) declares `HTTP_1_1` then `HTTP_2`, and a
+/// run of `values()` reports `ordinal()` 0 and 1 respectively.
+pub(crate) const HTTP_VERSION_CONSTANTS: &[&str] = &["HTTP_1_1", "HTTP_2"];
+
+/// `java.net.http.HttpClient$Redirect`'s constants in declaration order:
+/// `NEVER`(0), `ALWAYS`(1), `NORMAL`(2). Measured the same way. Note it is
+/// neither alphabetical nor least-to-most permissive — a plausible-looking
+/// reordering here silently changes `compareTo` and `EnumSet` iteration.
+pub(crate) const HTTP_REDIRECT_CONSTANTS: &[&str] = &["NEVER", "ALWAYS", "NORMAL"];
+
+/// Mint and publish an enum's constants the way its real `<clinit>` would.
+///
+/// Registered as `("<class>", "<clinit>", "()V")`, which is the ONLY shape a
+/// `GETSTATIC` can reach through (see the long note at the registration site).
+/// Three obligations, each of which is silent when dropped:
+///
+/// 1. **`name` and `ordinal` must be written.** A constant allocated bare is
+///    NON-NULL with a null `name()`, so every null check passes while
+///    `Enum.valueOf` matches nothing, `toString()` is null and `compareTo`
+///    calls every pair equal. That exact defect (a nameless enum constant)
+///    zeroed fifteen netty classes earlier this session, so this is the trap
+///    being avoided rather than a hypothetical.
+/// 2. **The slots are resolved against `java/lang/Enum`, never the receiver's
+///    class.** `Enum` declares `name` then `ordinal` and inherited fields come
+///    first in the layout, so 0/1 hold for any subclass whatever fields IT
+///    declares — and an enum that declares its OWN `name` field would shadow
+///    `Enum`'s if resolution were receiver-scoped (`lang_misc::native_enum_name`
+///    records what that cost in Spring Boot). The fallbacks `0`/`1` match
+///    `lang_misc`'s `ENUM_NAME_SLOT`/`ENUM_ORDINAL_SLOT`, which is what
+///    `Enum.name()`/`ordinal()` actually read; getting the fallback pair the
+///    wrong way round produces exactly the nameless constant of (1).
+/// 3. **`$VALUES` is re-READ out of the statics**, not filled from the refs
+///    minted in pass one: `new_ref_array` allocates and can move them. This is
+///    also what makes `values()[i] == CONSTANT` — the identity `Enum.valueOf`,
+///    `Class.getEnumConstants` and `EnumSet` all rely on.
+///
+/// Two guards, and why each is the one used:
+///
+/// * `is_class_synthetic_stub` — only ever mint into a class THIS VM
+///   fabricated. In real-JDK mode `java.net.http.HttpClient$Version` is a real
+///   class with real `<clinit>` bytecode; `vm_util` prefers a class's own
+///   `<clinit>` over the registry, but native-vs-bytecode dispatch elsewhere in
+///   this VM is not uniformly bytecode-first, and clobbering the real JDK's
+///   interned constants with synthetic stand-ins would be a regression in the
+///   mode that matters most. The cost is that `MockNativeContext` answers
+///   `false`, so this body cannot be driven from a Rust unit test (see the
+///   record's nomination for the mock).
+/// * an **idempotence** check on the first constant — `<clinit>` is invoked
+///   once per class by construction, but `nio_file`'s equivalent carries the
+///   same guard and a second entry through any path must not replace live
+///   constants with fresh objects that fail `==`.
+fn http_enum_clinit(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    constants: &[&str],
+) -> MethodCallResult {
+    if !ctx.is_class_synthetic_stub(class_name) {
+        return Ok(None);
+    }
+    let Some(cid) = ctx.class_id_by_name(class_name) else {
+        return Ok(None);
+    };
+    if let Some(first) = constants.first() {
+        if let Some(slot) = ctx.static_field_index_by_name(cid, first) {
+            if matches!(ctx.get_static_field(cid, slot), Value::Object(Some(_))) {
+                return Ok(None);
+            }
+        }
+    }
+    let _ = ctx.ensure_class_initialized("java/lang/Enum");
+    let name_slot = ctx
+        .resolve_field_index("java/lang/Enum", "name")
+        .unwrap_or(0);
+    let ordinal_slot = ctx
+        .resolve_field_index("java/lang/Enum", "ordinal")
+        .unwrap_or(1);
+    for (ordinal, name) in constants.iter().enumerate() {
+        let obj = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
+        // Pin across `create_string` — a moving young GC there would relocate
+        // the fresh constant (native stale-local family). Nothing allocates
+        // between the field writes and the publish to the static, which is a
+        // GC root, so the constant is never unreachable-but-live.
+        let obj_pin = ctx.pin_native_root(obj);
+        let name_str = ctx.create_string(name);
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
+        ctx.set_field(obj, name_slot, Value::Object(Some(name_str)));
+        // Cast: a constant count is far inside `i32`.
+        ctx.set_field(obj, ordinal_slot, Value::Int(ordinal as i32));
+        ctx.set_static_field_by_name(class_name, name, Value::Object(Some(obj)));
+    }
+    let values_array = ctx.new_ref_array(cid, constants.len());
+    for (idx, name) in constants.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        // `set_array_element` does not allocate, so `values_array` cannot move
+        // underneath this loop.
+        ctx.set_array_element(values_array, idx, published);
+    }
+    ctx.set_static_field_by_name(class_name, "$VALUES", Value::Object(Some(values_array)));
+    Ok(None)
+}
+
+/// `values()` — a FRESH array each call, holding the interned constants.
+///
+/// Freshness is measured, not stylistic: on the oracle
+/// `Version.values() != Version.values()` (the real method clones `$VALUES`),
+/// while `values()[1] == Version.HTTP_2`. Handing back the `$VALUES` array
+/// itself would let one caller's `values()[0] = null` corrupt every later one.
+fn http_enum_values(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    constants: &[&str],
+) -> MethodCallResult {
+    let cid = ctx.ensure_class_initialized(class_name)?;
+    let arr = ctx.new_ref_array(cid, constants.len());
+    for (idx, name) in constants.iter().enumerate() {
+        let published = match ctx.static_field_index_by_name(cid, name) {
+            Some(slot) => ctx.get_static_field(cid, slot),
+            None => Value::Object(None),
+        };
+        ctx.set_array_element(arr, idx, published);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `valueOf(String)` — resolved THROUGH the static field, so the answer is the
+/// same object `GETSTATIC` yields (`valueOf("HTTP_2") == HTTP_2`).
+///
+/// Both failure shapes are the oracle's, quoted from this host:
+/// `valueOf(null)` → `NullPointerException: Name is null`;
+/// `Redirect.valueOf("nope")` → `IllegalArgumentException: No enum constant
+/// java.net.http.HttpClient.Redirect.nope` — note the nested class renders with
+/// a DOT, so both `/` and `$` are replaced.
+fn http_enum_value_of(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    constants: &[&str],
+    args: &[Value],
+) -> MethodCallResult {
+    let requested = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let Some(requested) = requested else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("Name is null".to_string()),
+        }
+        .into());
+    };
+    let cid = ctx.ensure_class_initialized(class_name)?;
+    if constants.contains(&requested.as_str()) {
+        if let Some(slot) = ctx.static_field_index_by_name(cid, &requested) {
+            let published = ctx.get_static_field(cid, slot);
+            if matches!(published, Value::Object(Some(_))) {
+                return Ok(Some(published));
+            }
+        }
+    }
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!(
+            "No enum constant {}.{requested}",
+            class_name.replace('/', ".").replace('$', ".")
+        ),
+    }
+    .into())
+}
+
 pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1028,40 +1227,74 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
         p60_new_http_client,
     );
 
-    // HttpClient.Version enum
-    let hcv = "java/net/http/HttpClient$Version";
+    // HttpClient.Version / HttpClient.Redirect — the enum constants.
+    //
+    // These five were registered in the FIELD shape until 2026-08-13 — a
+    // method NAME that is really a field name, and a FIELD descriptor where a
+    // method descriptor belongs (the descriptor's quotes are elided below so a
+    // `register(` sweep does not count this comment as a live row):
+    //
+    //     r.register(hcv, "HTTP_2", Ljava/net/http/HttpClient$Version;, ...)
+    //
+    // and were DEAD, for exactly the reason the `SelectionKey.OP_*` note at
+    // the top of this file gives: the native registry is keyed on
+    // `(class, method, descriptor)` and every lookup originates at an INVOKE
+    // instruction, whose descriptor starts with '('. `GETSTATIC` never
+    // consults it — traced again for this change across all three static-read
+    // paths this VM has:
+    //
+    //   * `vm/src/runtime/interpreter/opcodes.rs` `Instruction::Getstatic`
+    //     — resolve, JVMTI watchpoint, `System.out/err/in` intercept, a
+    //       `java/lang/Boolean` `TRUE`/`FALSE` special case, `get_static_shared`;
+    //   * `vm/src/jit/helpers.rs` `jit_getstatic` — the same intercepts, then
+    //     `get_static_shared`;
+    //   * `jit/src/x64.rs` / `ir_lower.rs` `emit_inline_getstatic` — bakes the
+    //     statics-base address and emits two loads, no helper call at all.
+    //
+    // None of the three has a registry lookup, so `HttpClient.Version.HTTP_2`
+    // pushed the prepared default (null) and every builder downstream received
+    // `Object(None)`.
+    //
+    // The shape the VM DOES support for a static constant is a native
+    // `<clinit>`: `vm/src/vm/vm_util.rs` consults the registry for
+    // `("<clinit>", "()V")` when the class itself declares no `<clinit>`, and
+    // class initialization invokes it exactly once, after which plain
+    // `getstatic` reads the published statics. The working models are
+    // `stack_walker.rs`'s `native_option_clinit` (`StackWalker$Option`) and
+    // `phases_late/nio_file.rs`'s `posix_file_permission_stub_clinit`.
+    //
+    // `values()` and `valueOf(String)` are registered alongside because javac
+    // emits `invokestatic` for both against the ENUM class, and a synthetic
+    // stub declares neither — `Version.values()` was a `NoSuchMethodError`.
+    let hcv = HTTP_CLIENT_VERSION;
+    r.register(hcv, "<clinit>", "()V", |ctx, _args| {
+        http_enum_clinit(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS)
+    });
+    r.register(hcv, "values", "()[Ljava/net/http/HttpClient$Version;", |ctx, _args| {
+        http_enum_values(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS)
+    });
     r.register(
         hcv,
-        "HTTP_1_1",
-        "Ljava/net/http/HttpClient$Version;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/net/http/HttpClient$Version", "HTTP_1_1", 0),
-    );
-    r.register(
-        hcv,
-        "HTTP_2",
-        "Ljava/net/http/HttpClient$Version;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/net/http/HttpClient$Version", "HTTP_2", 1),
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/net/http/HttpClient$Version;",
+        |ctx, args| http_enum_value_of(ctx, HTTP_CLIENT_VERSION, HTTP_VERSION_CONSTANTS, args),
     );
 
-    // HttpClient.Redirect enum
-    let hcr = "java/net/http/HttpClient$Redirect";
+    let hcr = HTTP_CLIENT_REDIRECT;
+    r.register(hcr, "<clinit>", "()V", |ctx, _args| {
+        http_enum_clinit(ctx, HTTP_CLIENT_REDIRECT, HTTP_REDIRECT_CONSTANTS)
+    });
     r.register(
         hcr,
-        "NEVER",
-        "Ljava/net/http/HttpClient$Redirect;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", "NEVER", 0),
+        "values",
+        "()[Ljava/net/http/HttpClient$Redirect;",
+        |ctx, _args| http_enum_values(ctx, HTTP_CLIENT_REDIRECT, HTTP_REDIRECT_CONSTANTS),
     );
     r.register(
         hcr,
-        "ALWAYS",
-        "Ljava/net/http/HttpClient$Redirect;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", "ALWAYS", 1),
-    );
-    r.register(
-        hcr,
-        "NORMAL",
-        "Ljava/net/http/HttpClient$Redirect;",
-        |ctx, _args| p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", "NORMAL", 2),
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/net/http/HttpClient$Redirect;",
+        |ctx, args| http_enum_value_of(ctx, HTTP_CLIENT_REDIRECT, HTTP_REDIRECT_CONSTANTS, args),
     );
 
     // HttpRequest = 3-field (uri=0, method=1, headers=2)

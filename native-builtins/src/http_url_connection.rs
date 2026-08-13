@@ -2050,7 +2050,11 @@ fn huc_builtin_endpoint_identification(host: &str, chain: &[Vec<u8>]) -> Result<
 ///
 /// Prefix-only, deliberately: it is exactly the five `TLS13_*` variants, and a
 /// name that does not carry the prefix is already the registry's.
-fn jsse_cipher_suite_name(rustls_name: &str) -> String {
+///
+/// `pub(crate)` because `t27_tls.rs` has the other seven producers of a rustls
+/// suite name and reaches this through its own `negotiated_suite_name` adapter
+/// — see `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
+pub(crate) fn jsse_cipher_suite_name(rustls_name: &str) -> String {
     match rustls_name.strip_prefix("TLS13_") {
         Some(rest) => format!("TLS_{rest}"),
         None => rustls_name.to_string(),

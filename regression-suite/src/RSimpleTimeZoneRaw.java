@@ -72,6 +72,17 @@ import java.util.TimeZone;
  *
  * Determinism: no host zone, no wall clock. The two instants are fixed epoch
  * millis.
+ *
+ * OUTPUT CONTRACT. Exactly two lines, both of which survive {@code run.sh}'s
+ * {@code extract()} filter, and no third line on any other prefix:
+ * <pre>
+ *   CK RSimpleTimeZoneRaw checks=104
+ *   PASS RSimpleTimeZoneRaw (104 checks)
+ * </pre>
+ * Measured on HotSpot 25.0.3+9 (Microsoft build, Windows), rc=0. Anything
+ * printed on a prefix other than {@code PASS }/{@code CK } is deleted before
+ * the cross-VM diff and trips guard G1 on the oracle, so this vector reports
+ * only through the count line and through throwing.
  */
 public class RSimpleTimeZoneRaw {
     static int checks;
@@ -105,7 +116,18 @@ public class RSimpleTimeZoneRaw {
         mutation();
         realZonesStillResolve();
         System.out.println("CK RSimpleTimeZoneRaw checks=" + checks);
-        System.out.println("RESULT RSimpleTimeZoneRaw PASS");
+        // The banner run.sh actually looks for. This line used to read
+        // `RESULT RSimpleTimeZoneRaw PASS`, which is neither: run.sh's own
+        // verdict greps `^PASS <Class>` and its guard G4 greps the same, so a
+        // PERFECT VM was scored FAIL ("no PASS line") and the HotSpot oracle was
+        // reported sick ("exited 0 but printed no PASS line"). extract() then
+        // DELETED the RESULT line, so nothing carried the word PASS into the
+        // diff at all. Measured on HotSpot 25.0.3+9: rc=0, 104 checks, every
+        // assertion holding — the fixture's expectations were always right and
+        // only its banner was in the wrong dialect.
+        // The parenthesised spelling is deliberate: harness_check_count parses
+        // `PASS <Class> (N checks)` or `CK <Class> checks=N` and NOTHING else.
+        System.out.println("PASS RSimpleTimeZoneRaw (" + checks + " checks)");
     }
 
     /** The id contributes nothing, for every id, resolvable or not. */

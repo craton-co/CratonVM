@@ -1539,13 +1539,35 @@ pub trait NativeClassAccess {
 
     /// Every module name the VM's module registry knows, in no defined order.
     ///
-    /// The registry is small by construction — `java.base` plus whatever
-    /// `--module-path` supplied — because only two sites populate it, so
-    /// callers may enumerate it eagerly. An empty vector means "this context
-    /// does not model modules", exactly as [`module_is_registered`] returning
-    /// `false` does, and must not be read as "no modules exist".
+    /// The registry is small by construction, so callers may enumerate it
+    /// eagerly. An empty vector means "this context does not model modules",
+    /// exactly as [`module_is_registered`] returning `false` does, and must not
+    /// be read as "no modules exist".
+    ///
+    /// It is NOT just "`java.base` plus whatever `--module-path` supplied", and
+    /// it is NOT populated by only two sites. A THIRD site scans the
+    /// APPLICATION CLASS PATH for `module-info.class` and registers what it
+    /// finds — so a modular jar on `-cp`, which a real JVM treats as an
+    /// unnamed-module citizen whose `module-info` is ignored, appears here as a
+    /// module. That false sentence is what made a real defect look impossible
+    /// from this trait's side: registering such a jar's services twice made
+    /// `ServiceLoader` throw "multiple engines with the same ID". Use
+    /// [`Self::module_is_class_path_only`] below to tell the two apart.
+    /// docs/known-issues/jdk-only/E4-R11-CLASS-PATH-MODULE-BOOT-LAYER-FIX-20260813.md
     fn module_names(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// True when `module_name` reached the registry ONLY by scanning the
+    /// application class path — i.e. a modular jar on `-cp`, which a real JVM
+    /// treats as an unnamed-module citizen whose `module-info` is ignored.
+    ///
+    /// Callers that model the JDK's module *system* must skip these; callers
+    /// that only want labelling may not care. Defaults to `false` so a context
+    /// that does not model modules keeps its existing behaviour.
+    fn module_is_class_path_only(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
     }
 
     /// `exports` directives declared by `module_name`, as

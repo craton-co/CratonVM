@@ -51,7 +51,25 @@
 set +e
 export MSYS2_ARG_CONV_EXCL='*'; export MSYS_NO_PATHCONV=1
 
-ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)"
+# ROOT must FAIL LOUDLY rather than fall back. The old fallback was
+# `|| echo C:/craton/CratonVM`, and on this case-insensitive filesystem that IS
+# `C:/craton/cratonvm` — the main checkout, usually on `dev`. So any invocation
+# where `git rev-parse` failed silently measured a DIFFERENT TREE and reported
+# perfectly well-formed results about it.
+#
+# That is not hypothetical: running this script from a copy placed outside the
+# repo (an attempt to make it immune to mid-run edits) sent `dirname
+# "${BASH_SOURCE[0]}"` to a non-repo directory, took the fallback, and scheduled
+# the main checkout's fixtures. It showed up as 19 `missing:` entries for
+# fixtures that existed in the intended worktree.
+# docs/known-issues/jdk-only/W8-D2-1-two-summary-lines-and-the-suite-denominator.md
+ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$ROOT" ] || [ ! -d "$ROOT/regression-suite/src" ]; then
+  echo "run.sh: cannot resolve the repository root from $(dirname "${BASH_SOURCE[0]}")." >&2
+  echo "run.sh: run this script from inside its own worktree — do NOT copy it elsewhere," >&2
+  echo "run.sh: because ROOT is derived from BASH_SOURCE and a copy relocates the run." >&2
+  exit 3
+fi
 HERE="$ROOT/regression-suite"
 CV="${CV:-$ROOT/target/release/cratonvm.exe}"
 JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
@@ -63,6 +81,19 @@ JAVAC="$JDK/bin/javac.exe"; HS="$JDK/bin/java.exe"
 [ -x "$CV" ] || { case "$CV" in *.exe) [ -x "${CV%.exe}" ] && CV="${CV%.exe}" ;; esac; }
 BUILD="$HERE/build"
 TIMEOUT="${TIMEOUT:-120}"
+
+# The CLASS-PATH separator, for the one vector that needs a second entry
+# (class_cp_extra below). Load-bearing and platform-dependent: `;` on Windows,
+# `:` everywhere else. Both VMs are handed the same string, and both parse it
+# with the host's convention — CratonVM's launcher and HotSpot agree here
+# because the JDK's own rule is the host's, not the shell's. Derived from
+# `uname` rather than from $JDK, because the suite is run from Git Bash on
+# Windows (where java.exe wants `;`) and from a POSIX shell on the Linux build
+# host (where it wants `:`), and $JDK looks the same in both.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*|*NT-*) CPSEP=';' ;;
+  *)                          CPSEP=':' ;;
+esac
 
 # JDK-only corpus inputs. `modules/` holds a real named module compiled to
 # `build-modules/` and put on the module path; `resources/` holds real
@@ -103,7 +134,34 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # every scheduled class already receives that flag, so a second registration
 # would run the identical command twice. Nothing schedules by glob — every list
 # here is explicit — so the name collision is cosmetic.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints"
+#
+# RJdkOptionalShape is scheduled here and its REACH IS NARROWER THAN ITS NAME.
+# Read this before quoting a green run of it as cover for C12-3.
+#
+# The vector's own "Mode independence" section says `http2.rs` "is registered in
+# both arms", and that premise was MEASURED FALSE (lane E2, 2026-08-13): the
+# nine Optional-minting sites in native-builtins/src/http2.rs only answer under
+# `--synthetic-jdk`. In the default mode this list runs, a DIFFERENT
+# implementation answers — net_phase_e.rs's re5_optional — and it is already
+# correct. So the vector's httpmint() block, the only block written to reach
+# C12-3, cannot exhibit C12-3 as scheduled.
+#
+# It is deliberately still scheduled, and the distinction is the point: this is
+# NOT a gate that cannot fail. core(), prim(), stream(), version(), process()
+# and misc() are real coverage of re5_optional and of the class library, and
+# they go red if either regresses. What is untrue is only the CLAIM that a
+# green RJdkOptionalShape says anything about http2.rs. A vector whose name
+# overstates its reach is a labelling defect; unscheduling it to fix the label
+# would delete working coverage to solve a documentation problem.
+#
+# Covering http2.rs needs a SECOND BINARY, not a flag: `--synthetic-jdk` is a
+# runtime mode that a stock build refuses (exit 1); only a binary built with
+# `--features synthetic-jdk` accepts it. That is why no arm is added here yet —
+# an arm nobody on this box can execute would either skip (a gate that cannot
+# fail, the exact defect this file's guards exist to catch) or fail every run
+# for all eight lanes. The design constraints for landing one are in
+# docs/known-issues/jdk-only/W8-E9-1-three-broken-oracles-and-the-suite-denominator.md.
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArrayStoreTiers RArrayStoreInterfaces RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews RJdkFormatLocale RJdkStrictMath RJdkByteOrder RJdkIntrinsics RJdkIntrinsics2 RShutdownHooks RSimpleTimeZoneRaw RImmutableFactoryTypes RJdkStringCodePoints RFsSingleton RJdkOptionalShape RSimpleDateFormatZone RJdkIntrinsics3"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -116,7 +174,35 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews"
+# RServiceLoaderDoubleSource landed 2026-08-13 (lane D1) and was registered
+# NOWHERE until now: it compiled, produced a COVERAGE WARNING on every run, and
+# would have been FATAL under STRICT_COVERAGE=1 — which this file's own
+# documentation says CI should set. Its author left it unscheduled on purpose,
+# because its only discriminating check needs one class-path entry the harness
+# has to supply and it FAILS rather than skips when that entry is absent. That
+# wiring is now here: class_cp_extra() puts the compiled module on -cp and
+# class_args() hands both VMs the three properties that name it. Wiring first,
+# registration second — the same ordering this file states for
+# RPriorityQueueGc, and for the same reason: a vector registered before its
+# input exists is red for a harness reason, which is noise, not coverage.
+#
+# It is in the JDK-ONLY list rather than CORE because that is where the defect
+# was measured (four bc-java classes under `--jdk-only`, all four dying in
+# EngineIdValidator before running a test), and because the record specifying
+# this wiring nominates that list. It deliberately does NOT get a `--jdk-only`
+# pin in class_cv_args: its discriminating assertion is
+# ModuleLayer.boot().findModule(<a -cp-only module>), and the promotion it
+# catches (populate_boot_layer_modules) is unconditional, so under `SUITE=all`
+# with no CRATONVM_ARGS the vector still asks a real question about Compatible
+# mode. Pinning the flag would hide whether the promotion happens there too.
+#
+# MEASURED on HotSpot 25.0.3+9 in exactly the scheduled configuration:
+# rc=0, PASS RServiceLoaderDoubleSource (1266 checks), 6 lines out, 6 through
+# extract(), all guards silent, md5-identical over 3 runs. It is predicted RED
+# on CratonVM until the fix lands — that is the gate doing its job, not a bad
+# registration.
+# docs/known-issues/jdk-only/D1-R11-SERVICELOADER-DOUBLE-SOURCE-20260813.md
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging RJdkSqlPackage RJdkEnvMap RJdkProxyIface RJdkFunctionCombinators RJdkForeign RJdkEnumerations RJdkAsyncChannel RJdkMapViews RServiceLoaderDoubleSource"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
@@ -155,6 +241,48 @@ JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJ
 # is still ahead. If either comes back red, that is the gate doing its job and
 # means the underlying fix regressed; it is not a bad registration.
 UNREGISTERED_CLASSES="RConcurrent RCanAccessOutsider"
+
+# ---- G5: vectors whose reach is narrower than their schedule --------------
+#
+# One row per adjudication. Format, `|`-separated, `#` starts a comment line:
+#
+#     <Class>|<INERT|LIVE>|<family>|<mode>|<reason>
+#
+# INERT  a NAMED FAMILY of that vector's rows targets code that only runs in
+#        <mode>, which is not the mode the vector is scheduled in. The family
+#        executes and passes, for reasons unrelated to the defect it names.
+# LIVE   the source NAMES <mode> — which is what the ADD scan keys on — and has
+#        been adjudicated as genuinely discriminating where it is scheduled.
+#
+# THE UNIT IS THE FAMILY, NOT THE VECTOR, and that is the whole design. The row
+# that motivated this guard is RJdkOptionalShape's: its httpmint() block is the
+# only block written to reach C12-3, and lane E2 MEASURED that the nine
+# Optional-minting sites in native-builtins/src/http2.rs answer only under
+# --synthetic-jdk, while in the default mode this suite runs a different
+# implementation (net_phase_e.rs's re5_optional) answers and is already correct.
+# Its six other families are real default-mode coverage that goes red if the
+# class library or re5_optional regresses. So the defect is a MISLABELLING of
+# one family, not a vacuous fixture, and a guard that could not draw that line
+# would demand the deletion of working coverage to fix a documentation problem.
+#
+# Both directions are loud (harness_guard_nondiscriminating): a listed vector
+# whose source names the mode and has no row is an ADD error, and a row whose
+# class, family or mode-mention has gone away — or whose mode the run is
+# actually executing — is a STALE error. Clearing an entry is what makes the run
+# green again, exactly as in harness-uncounted.txt.
+#
+# This is deliberately NOT a fifth term on the COUNTS: line. That line exists to
+# stop four incommensurable populations being summed, and a hand-maintained
+# fifth would undo it in the act of extending it; G5 findings are per-vector
+# instrument flags and are counted with G1-G4 in the existing harness
+# population. See W8-E9-1 §6 for the argument that was declined and W8-E15-1 for
+# this one.
+HARNESS_NONDISCRIMINATING="
+RJdkOptionalShape|INERT|httpmint|--synthetic-jdk|the nine Optional-minting sites in native-builtins/src/http2.rs answer only under --synthetic-jdk (measured, lane E2 2026-08-13); in default mode net_phase_e.rs's re5_optional answers and is already correct. core/prim/stream/version/process/misc ARE live default-mode coverage.
+RBlockingQueue|LIVE|-|--synthetic-jdk|its source names the synthetic-jdk Cargo feature only to record where the ORIGINAL defect lived (a synthetic <init> that never assigned takeLock). Every assertion is a queue CONTRACT asserted against whatever implementation answers, so the rows discriminate in the mode they are scheduled in.
+RDirectBufferElem|LIVE|-|--synthetic-jdk|its own header states which natives its rows reach in the mode it is scheduled in (register_s2_bytebuffer, and the forced-native ByteBuffer methods) and states explicitly that they do NOT reach the native-io family that is synthetic-jdk-only. The mode is named to bound the claim, not to make it.
+RJdkByteOrder|LIVE|-|--synthetic-jdk|the defect it was written against was synthetic-jdk-only, but every assertion is about the CONTENTS of the buffer and the IDENTITY of its backing array after order(), which is a mode-independent contract asked of whatever implementation answers.
+"
 
 # ---- list hygiene, computed before anything is pruned --------------------
 #
@@ -219,6 +347,17 @@ if [ -z "$(printf '%s' "$CLASSES" | tr -d ' \t')" ]; then
   exit 3
 fi
 
+# Identify the RUN, not just the result. Two run.sh processes sharing one
+# redirect target produce two summaries in one file with no way to tell which
+# tree, which revision or which schedule each belongs to — and because
+# `git checkout` writes the working tree in index order, where
+# regression-suite/run.sh (entry 63) precedes regression-suite/src/*.java
+# (65+), a suite launched during a branch switch reads the NEW class lists
+# against the OLD sources and reports every not-yet-written vector as
+# `missing:`. Both happened on 2026-08-13 and cost a full audit to reconstruct
+# from byte offsets. See docs/known-issues/jdk-only/
+# W8-D2-1-two-summary-lines-and-the-suite-denominator.md.
+echo "== RUN pid=$$ tree=$HERE rev=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo '?') suite=${SUITE:-core} scheduled=$(printf '%s' "$CLASSES" | wc -w) missing=$(printf '%s' "$MISSING_CLASSES" | wc -w) =="
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
 
@@ -336,6 +475,49 @@ class_args() {
   case "$1" in
     RJdkModule)
       [ -n "$HAVE_MODULE" ] && printf '%s' "--module-path $MODBUILD --add-modules $JDKONLY_MODULE"
+      ;;
+    # The three properties that name the modular class-path entry
+    # class_cp_extra() supplies. Handed to BOTH VMs (CratonVM's launcher parses
+    # -D into system properties the same way; vm-cli/src/main.rs), because the
+    # oracle has to see the identical configuration or the diff is meaningless.
+    #
+    # This arm must NEVER grow a --module-path: the vector asserts
+    # `System.getProperty("jdk.module.path") == null` as a PRECONDITION, since a
+    # --module-path module IS resolved into the boot layer and IS defined to the
+    # application loader on a real JVM — supplying both would make the vector
+    # measure its own command line instead of the VM.
+    RServiceLoaderDoubleSource)
+      [ -n "$HAVE_MODULE" ] && printf '%s' \
+        "-Dcratonvm.rt.cpmodule=$JDKONLY_MODULE -Dcratonvm.rt.cpclass=com.cratonvm.jdkonly.svc.Greeter -Dcratonvm.rt.cpservice=com.cratonvm.jdkonly.svc.Greeter"
+      ;;
+    *) : ;;
+  esac
+}
+
+# Extra CLASS-PATH entries a vector needs, appended to $BUILD, separator
+# included so an empty answer is a literal no-op. Handed to BOTH VMs.
+#
+# RServiceLoaderDoubleSource needs a MODULAR artefact (here: the exploded module
+# regression-suite/modules/ already compiles for RJdkModule) on the CLASS path,
+# and it must be there WHEN THE VM STARTS — CratonVM scans the application class
+# path for module-info.class inside ClassManager::new, before main, so a jar the
+# vector built itself would be scanned by nobody. That is the whole reason this
+# hook exists and the reason the vector could not simply be added to a list.
+#
+# The same directory must NOT also reach class_args() as a --module-path: see
+# the note there.
+#
+# If compile_modules could not build the module, $HAVE_MODULE is empty and this
+# emits nothing — the vector then fails on its own first assertion with
+# "-Dcratonvm.rt.cpmodule=<module name> is REQUIRED … a green result would mean
+# nothing". That is deliberate and is the vector's own design: a precondition
+# that silently disarms the only discriminating check is how a gate becomes
+# green-forever. The same absence already makes RJdkModule meaningless, so it is
+# a tree-level fault either way, and it is loud in both places.
+class_cp_extra() {
+  case "$1" in
+    RServiceLoaderDoubleSource)
+      [ -n "$HAVE_MODULE" ] && printf '%s' "$CPSEP$MODBUILD/$JDKONLY_MODULE"
       ;;
     *) : ;;
   esac
@@ -464,9 +646,10 @@ run_pass() {
   for c in $CLASSES; do
     extra=$(class_args "$c")
     cvextra=$(class_cv_args "$c")
+    cpx=$(class_cp_extra "$c")
     # $CRATONVM_ARGS, $extra and $cvextra are intentionally unquoted: all three
     # are flag lists, not single paths.
-    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra -cp "$BUILD" "$c" 2>&1)
+    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra -cp "$BUILD$cpx" "$c" 2>&1)
     cvrc=$?
     cvkey=$(printf '%s\n' "$cvout" | extract)
     # A failed assertion throws AssertionError → non-zero exit (handled by the rc
@@ -495,12 +678,12 @@ run_pass() {
     # TRUNCATED ground truth, and the raw output was thrown away, so the lines
     # extract() deleted — which is exactly the evidence the harness is blind to
     # — could not be inspected. Guards G1 and G4 both need what was discarded.
-    HARNESS_GUARD_MSGS=""; guarded=0
+    HARNESS_GUARD_MSGS=""; guarded=0; guarded_oracle=0
     if [ -x "$HS" ]; then
-      timeout "$TIMEOUT" "$HS" $extra -cp "$BUILD" "$c" > "$GUARDTMP/hs.raw" 2>&1
+      timeout "$TIMEOUT" "$HS" $extra -cp "$BUILD$cpx" "$c" > "$GUARDTMP/hs.raw" 2>&1
       hsrc=$?
       hskey=$(extract < "$GUARDTMP/hs.raw")
-      harness_guard_oracle "$c" "$GUARDTMP/hs.raw" "$hsrc" || guarded=1
+      harness_guard_oracle "$c" "$GUARDTMP/hs.raw" "$hsrc" || { guarded=1; guarded_oracle=1; }
       if [ "$state" = PASS ] && [ "$cvkey" != "$hskey" ]; then
         state=FAIL; why="output differs from HotSpot"
         printf '    --- HotSpot ---\n%s\n    --- CratonVM ---\n%s\n' "$hskey" "$cvkey" | sed 's/^/    /'
@@ -519,8 +702,29 @@ run_pass() {
     # "the VM answered wrongly" and "the instrument cannot see the answer" are
     # different findings and must not be summed into one number.
     if [ "$guarded" -ne 0 ]; then
-      hbad=$((hbad+1)); hfailed="$hfailed $c"
       printf '%s\n' "$HARNESS_GUARD_MSGS"
+      # COUNTED only when it is an INDEPENDENT finding.
+      #   G1/G4 (oracle-side) always are: a sick or silent oracle invalidates
+      #   the ground truth whatever CratonVM did.
+      #   G2/G3 read CratonVM's surviving output, so on a vector that ALREADY
+      #   FAILED they merely restate the failure — a vector that throws before
+      #   its banner leaves an empty cv.key BY CONSTRUCTION, and G2+G3 then fire
+      #   for it every single time. On 2026-08-13 all 9 harness flags in a
+      #   SUITE=all run sat on vectors already counted red: 9 duplicate points
+      #   in "21 failed", 0 independent findings. The blindness G2/G3 exist to
+      #   catch (W7-60) is a vector that PASSES with nothing observable, so ask
+      #   them about a PASS. The messages print above either way, so a red
+      #   vector that is also uncounted is still visible — it just does not
+      #   inflate the number.
+      #
+      # SAFETY PROPERTY, verified rather than assumed: this can only ever
+      # SUBTRACT a point from a vector that is already contributing one via
+      # $fail, so `total_fail` cannot reach 0 by way of this branch and a run
+      # that should be red cannot become green. The suppressed direction is
+      # strictly "stop double-counting"; it is never "stop failing".
+      if [ "$state" = PASS ] || [ "$guarded_oracle" -ne 0 ]; then
+        hbad=$((hbad+1)); hfailed="$hfailed $c"
+      fi
     fi
   done
   rm -rf "$GUARDTMP"
@@ -571,6 +775,10 @@ else
   fi
 fi
 
+# Snapshot the ONLY failure population that shares a denominator with
+# $total_pass — scheduled vectors that ran and lost — before list errors,
+# coverage errors and harness flags are folded into $total_fail below.
+total_vecfail=$total_fail
 echo "---------------------------------------------"
 
 # ---- list hygiene, reported where the summary is actually read -----------
@@ -604,6 +812,24 @@ if [ -n "$UNREGISTERED_FOUND" ]; then
   done
 fi
 
+# ---- G5, the reach ratchet ------------------------------------------------
+#
+# Run ONCE per invocation, not once per vector: it compares the class LISTS
+# against the vector SOURCES and against the mode this run is executing, and
+# none of those change between passes. Uses LISTED_CLASSES (both lists, captured
+# before prune_missing) so its answer does not depend on SUITE.
+#
+# Counted into $total_hbad — the existing harness-flag population — so the
+# COUNTS: line stays a four-term decomposition and still closes. A G5 finding is
+# a per-vector flag on a scheduled vector, which is precisely what that term
+# already says it holds; it is not another vector and not a list error.
+HARNESS_GUARD_MSGS=""
+if ! harness_guard_nondiscriminating "$HERE/src" "$LISTED_CLASSES"; then
+  printf '%s\n' "$HARNESS_GUARD_MSGS"
+  total_hbad=$((total_hbad+HARNESS_G5_BAD))
+  total_hfailed="$total_hfailed$HARNESS_G5_CLASSES"
+fi
+
 # ---- the instrument's own verdict ----------------------------------------
 #
 # Counted into the exit status, and reported on its own line. A harness guard
@@ -614,11 +840,21 @@ fi
 # this defect survived long enough to be measured.
 if [ "$total_hbad" -gt 0 ]; then
   echo "  HARNESS: $total_hbad vector(s) reported on a comparison the suite cannot see:${total_hfailed}"
-  echo "    Each is explained above. Fix the vector (or its row in harness-uncounted.txt);"
-  echo "    reproduce without a CratonVM build via: bash regression-suite/harness-selfcheck.sh"
+  echo "    Each is explained above. Fix the vector, or its row in the table the guard names:"
+  echo "    G3 -> regression-suite/harness-uncounted.txt, G5 -> HARNESS_NONDISCRIMINATING in this file."
+  echo "    G1-G4 reproduce without a CratonVM build via: bash regression-suite/harness-selfcheck.sh"
   total_fail=$((total_fail+total_hbad))
   total_failed="$total_failed$(printf '%s' "$total_hfailed" | sed 's/ / harness:/g')"
 fi
 
+# $total_fail is the EXIT-STATUS accumulator and sums four incommensurable
+# populations: scheduled vectors that lost; registrations with no source and
+# sources with no registration (neither ever ran); and one point per vector
+# whose instrument-blindness guard fired (which is a FLAG ON a vector, usually
+# one already counted red above — not another vector). Only the first shares a
+# denominator with $total_pass, so "$total_pass passed, $total_fail failed" is
+# not a pair and must never be quoted as one. Print the decomposition so the
+# reader does not have to read this script to interpret the line.
 echo "REGRESSION SUITE: $total_pass passed, $total_fail failed${total_failed:+ ( failed:$total_failed )}"
+echo "  COUNTS: $total_pass of $((total_pass+total_vecfail)) SCHEDULED vectors passed; $total_vecfail scheduled vectors failed; $((total_fail-total_vecfail-total_hbad)) list/coverage errors (never scheduled); $total_hbad harness-blindness flags (per-vector flags, not extra vectors)."
 [ "$total_fail" -eq 0 ]

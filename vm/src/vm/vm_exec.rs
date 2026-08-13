@@ -8404,6 +8404,15 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .module_names()
     }
 
+    fn module_is_class_path_only(&self, module_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .is_class_path_only(module_name)
+    }
+
     fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
         self.shared
             .classes

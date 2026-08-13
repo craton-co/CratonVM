@@ -2071,7 +2071,33 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
         native_string_get_bytes_deprecated,
     );
 
-    // T8.2.5 — Character deprecated statics
+    // T8.2.5 — Character deprecated statics.
+    //
+    // These three own their registry slots. A second, byte-identical copy used
+    // to be registered from `native-builtins/src/deprecated_io_util.rs`; it lost
+    // the slot every time (`owns_slot: false, overwrote: bridge` in the registry
+    // dump) and was deleted 2026-08-13 (lane E23).
+    //
+    // MEASURED, HotSpot 25, all 65,536 `char` values
+    // (`.../scratchpad/e23/Witness23.java`,
+    // `docs/known-issues/jdk-only/E23-1-synthetic-jdk-nosuchmethoderror-census.md` §6):
+    //
+    //   isSpace(C)Z                0 mismatches — exact, keep
+    //   isJavaLetter(C)Z         949 mismatches — WRONG
+    //   isJavaLetterOrDigit(C)Z 1010 mismatches — WRONG
+    //
+    // The two wrong ones model `isJavaIdentifierStart`/`Part` as
+    // `is_alphabetic()/is_alphanumeric() || '_' || '$'`. The JDK's predicate also
+    // admits `Sc` (currency: `¢ £ ¤ ¥`, first miss U+00A2) and `Pc`, and excludes
+    // the `Other_Alphabetic` combining marks Rust's `Alphabetic` includes (first
+    // over-accept U+0345). `java/lang/Character` is `has_code: true` in real-JDK
+    // mode, so both natives SHADOW correct image bytecode with a wrong answer.
+    //
+    // Do NOT "fix" them by widening the Rust predicate: an exact body needs a
+    // Unicode general-category table, and Rust's is a NEWER Unicode version than
+    // the image's — the exact trap E17-1 §5 documents for `getType`. The closure
+    // is to DELETE both registrations so real-JDK mode falls through to bytecode;
+    // that is a mode-visible change and is nominated, not taken here.
     let ch = "java/lang/Character";
     r.register(ch, "isJavaLetter", "(C)Z", native_char_is_java_letter);
     r.register(

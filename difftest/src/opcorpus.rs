@@ -1134,16 +1134,158 @@ mod tests {
         generate_all(&OpcodeCorpusConfig::default())
     }
 
+    /// The JVMS 6.5 opcode table, taken from OUTSIDE this crate.
+    ///
+    /// WHY THIS EXISTS. Until 2026-08-13
+    /// `there_is_an_entry_for_every_named_opcode_and_nothing_else` asserted
+    /// `p.mnemonic == matrix::opcode_name(p.opcode)` — but `generate_all` builds
+    /// the corpus as `(0..=0xc9).filter_map(matrix::opcode_name)`, so the corpus
+    /// and the assertion were the same expression evaluated twice. A misspelled
+    /// mnemonic (`invokedyanmic`), a swapped `dup_x2`/`dup2_x1`, or any wrong
+    /// opcode-to-name mapping in `matrix::NAMES` was invisible: the corpus
+    /// carried the wrong name and the test agreed with it. The `len() == 202`
+    /// half was already a compile-time fact of `const NAMES: [&str; 202]`.
+    /// (E25 sweep,
+    /// `docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md`
+    /// section 4.1, row 34.)
+    ///
+    /// PROVENANCE — two independent JDK 25 sources, cross-checked against each
+    /// other on 2026-08-13, neither of which is `matrix::opcode_name`:
+    ///
+    /// 1. `jdk.hotspot.agent/sun/jvm/hotspot/interpreter/Bytecodes.java` from a
+    ///    JDK 25 source checkout (`C:\craton\jdk25src` on this host) — the
+    ///    Serviceability Agent's bytecode table. Every `def(_x, "x", ...)` row
+    ///    joined to its `public static final int _x = N;` value; 202 rows with
+    ///    value <= 0xc9. That join is the table below, verbatim.
+    /// 2. `java.lang.classfile.Opcode` (JEP 484 ClassFile API), enumerated by
+    ///    running `Opcode.values()` on
+    ///    `openjdk 25.0.3 2026-04-21 LTS, Microsoft-13877124, build 25.0.3+9-LTS`
+    ///    on this host — skipping `isWide()` pseudo-opcodes, keyed by
+    ///    `bytecode()`, lowercased. 201 rows.
+    ///
+    /// The two agree on all 201 opcodes they share. Source 2 has no entry for
+    /// `0xc4 wide`, because the ClassFile API models `wide` as a modifier on the
+    /// widened opcode rather than as an opcode of its own; source 1 does, JVMS
+    /// 6.5 does, and this crate's decoder must, so the table keeps it.
+    ///
+    /// RESIDUAL: a transcribed table carries the "JDK 26 changes it" risk, and
+    /// nothing re-derives this one at test time. The risk is small — the last
+    /// assignment added below `0xca` was `0xba invokedynamic` in Java 7 — but it
+    /// is not zero. Re-run the two extractions on a JDK bump.
+    #[rustfmt::skip]
+    const JVMS_MNEMONICS: &[(u8, &str)] = &[
+    (0x00, "nop"), (0x01, "aconst_null"), (0x02, "iconst_m1"), (0x03, "iconst_0"),
+    (0x04, "iconst_1"), (0x05, "iconst_2"), (0x06, "iconst_3"), (0x07, "iconst_4"),
+    (0x08, "iconst_5"), (0x09, "lconst_0"), (0x0a, "lconst_1"), (0x0b, "fconst_0"),
+    (0x0c, "fconst_1"), (0x0d, "fconst_2"), (0x0e, "dconst_0"), (0x0f, "dconst_1"),
+    (0x10, "bipush"), (0x11, "sipush"), (0x12, "ldc"), (0x13, "ldc_w"), (0x14, "ldc2_w"),
+    (0x15, "iload"), (0x16, "lload"), (0x17, "fload"), (0x18, "dload"), (0x19, "aload"),
+    (0x1a, "iload_0"), (0x1b, "iload_1"), (0x1c, "iload_2"), (0x1d, "iload_3"),
+    (0x1e, "lload_0"), (0x1f, "lload_1"), (0x20, "lload_2"), (0x21, "lload_3"),
+    (0x22, "fload_0"), (0x23, "fload_1"), (0x24, "fload_2"), (0x25, "fload_3"),
+    (0x26, "dload_0"), (0x27, "dload_1"), (0x28, "dload_2"), (0x29, "dload_3"),
+    (0x2a, "aload_0"), (0x2b, "aload_1"), (0x2c, "aload_2"), (0x2d, "aload_3"),
+    (0x2e, "iaload"), (0x2f, "laload"), (0x30, "faload"), (0x31, "daload"), (0x32, "aaload"),
+    (0x33, "baload"), (0x34, "caload"), (0x35, "saload"), (0x36, "istore"), (0x37, "lstore"),
+    (0x38, "fstore"), (0x39, "dstore"), (0x3a, "astore"), (0x3b, "istore_0"),
+    (0x3c, "istore_1"), (0x3d, "istore_2"), (0x3e, "istore_3"), (0x3f, "lstore_0"),
+    (0x40, "lstore_1"), (0x41, "lstore_2"), (0x42, "lstore_3"), (0x43, "fstore_0"),
+    (0x44, "fstore_1"), (0x45, "fstore_2"), (0x46, "fstore_3"), (0x47, "dstore_0"),
+    (0x48, "dstore_1"), (0x49, "dstore_2"), (0x4a, "dstore_3"), (0x4b, "astore_0"),
+    (0x4c, "astore_1"), (0x4d, "astore_2"), (0x4e, "astore_3"), (0x4f, "iastore"),
+    (0x50, "lastore"), (0x51, "fastore"), (0x52, "dastore"), (0x53, "aastore"),
+    (0x54, "bastore"), (0x55, "castore"), (0x56, "sastore"), (0x57, "pop"), (0x58, "pop2"),
+    (0x59, "dup"), (0x5a, "dup_x1"), (0x5b, "dup_x2"), (0x5c, "dup2"), (0x5d, "dup2_x1"),
+    (0x5e, "dup2_x2"), (0x5f, "swap"), (0x60, "iadd"), (0x61, "ladd"), (0x62, "fadd"),
+    (0x63, "dadd"), (0x64, "isub"), (0x65, "lsub"), (0x66, "fsub"), (0x67, "dsub"),
+    (0x68, "imul"), (0x69, "lmul"), (0x6a, "fmul"), (0x6b, "dmul"), (0x6c, "idiv"),
+    (0x6d, "ldiv"), (0x6e, "fdiv"), (0x6f, "ddiv"), (0x70, "irem"), (0x71, "lrem"),
+    (0x72, "frem"), (0x73, "drem"), (0x74, "ineg"), (0x75, "lneg"), (0x76, "fneg"),
+    (0x77, "dneg"), (0x78, "ishl"), (0x79, "lshl"), (0x7a, "ishr"), (0x7b, "lshr"),
+    (0x7c, "iushr"), (0x7d, "lushr"), (0x7e, "iand"), (0x7f, "land"), (0x80, "ior"),
+    (0x81, "lor"), (0x82, "ixor"), (0x83, "lxor"), (0x84, "iinc"), (0x85, "i2l"),
+    (0x86, "i2f"), (0x87, "i2d"), (0x88, "l2i"), (0x89, "l2f"), (0x8a, "l2d"), (0x8b, "f2i"),
+    (0x8c, "f2l"), (0x8d, "f2d"), (0x8e, "d2i"), (0x8f, "d2l"), (0x90, "d2f"), (0x91, "i2b"),
+    (0x92, "i2c"), (0x93, "i2s"), (0x94, "lcmp"), (0x95, "fcmpl"), (0x96, "fcmpg"),
+    (0x97, "dcmpl"), (0x98, "dcmpg"), (0x99, "ifeq"), (0x9a, "ifne"), (0x9b, "iflt"),
+    (0x9c, "ifge"), (0x9d, "ifgt"), (0x9e, "ifle"), (0x9f, "if_icmpeq"), (0xa0, "if_icmpne"),
+    (0xa1, "if_icmplt"), (0xa2, "if_icmpge"), (0xa3, "if_icmpgt"), (0xa4, "if_icmple"),
+    (0xa5, "if_acmpeq"), (0xa6, "if_acmpne"), (0xa7, "goto"), (0xa8, "jsr"), (0xa9, "ret"),
+    (0xaa, "tableswitch"), (0xab, "lookupswitch"), (0xac, "ireturn"), (0xad, "lreturn"),
+    (0xae, "freturn"), (0xaf, "dreturn"), (0xb0, "areturn"), (0xb1, "return"),
+    (0xb2, "getstatic"), (0xb3, "putstatic"), (0xb4, "getfield"), (0xb5, "putfield"),
+    (0xb6, "invokevirtual"), (0xb7, "invokespecial"), (0xb8, "invokestatic"),
+    (0xb9, "invokeinterface"), (0xba, "invokedynamic"), (0xbb, "new"), (0xbc, "newarray"),
+    (0xbd, "anewarray"), (0xbe, "arraylength"), (0xbf, "athrow"), (0xc0, "checkcast"),
+    (0xc1, "instanceof"), (0xc2, "monitorenter"), (0xc3, "monitorexit"), (0xc4, "wide"),
+    (0xc5, "multianewarray"), (0xc6, "ifnull"), (0xc7, "ifnonnull"), (0xc8, "goto_w"),
+    (0xc9, "jsr_w"),
+    ];
+
+    /// `matrix::opcode_name` answers the JVMS, not itself.
+    ///
+    /// This is the test that makes a typo in `matrix::NAMES` reportable. It
+    /// compares the whole `u8` domain, not the corpus's own range, so a name
+    /// appearing where the JVMS has a reserved opcode is caught too.
+    #[test]
+    fn the_matrix_opcode_table_is_the_jvms_opcode_table() {
+        assert_eq!(
+            JVMS_MNEMONICS.len(),
+            202,
+            "the external table lost rows in transcription"
+        );
+        for (i, (op, _)) in JVMS_MNEMONICS.iter().enumerate() {
+            assert_eq!(
+                *op as usize, i,
+                "the external table is not dense and in opcode order at index {i}"
+            );
+        }
+        let mut wrong: Vec<String> = Vec::new();
+        for op in 0u8..=0xff {
+            let jvms = JVMS_MNEMONICS
+                .iter()
+                .find(|(o, _)| *o == op)
+                .map(|(_, name)| *name);
+            let ours = matrix::opcode_name(op);
+            if ours != jvms {
+                wrong.push(format!("{op:#04x}: matrix={ours:?} JVMS={jvms:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "matrix::opcode_name disagrees with the JDK 25 opcode table:\n  {}\n\n\
+             The JVMS table above came from the Serviceability Agent's \
+             Bytecodes.java and from java.lang.classfile.Opcode; if a JDK bump \
+             genuinely changed an assignment, re-derive it (see the const's \
+             PROVENANCE) rather than editing a row to match this crate.",
+            wrong.join("\n  ")
+        );
+    }
+
     #[test]
     fn there_is_an_entry_for_every_named_opcode_and_nothing_else() {
         let programs = all();
-        assert_eq!(programs.len(), 202, "one entry per JVMS mnemonic");
+        // The expectation is the EXTERNAL table's population, not this crate's.
+        let named_in_range = JVMS_MNEMONICS.iter().filter(|(op, _)| *op <= 0xc9).count();
+        assert_eq!(
+            programs.len(),
+            named_in_range,
+            "one entry per JVMS mnemonic in 0x00..=0xc9"
+        );
         for (idx, p) in programs.iter().enumerate() {
             assert_eq!(p.opcode as usize, idx, "entries are in opcode order");
+            let jvms = JVMS_MNEMONICS
+                .iter()
+                .find(|(o, _)| *o == p.opcode)
+                .map(|(_, name)| *name);
             assert_eq!(
                 Some(p.mnemonic),
-                matrix::opcode_name(p.opcode),
-                "mnemonic must come from the matrix's table, never a second copy"
+                jvms,
+                "corpus entry {idx} carries a mnemonic the JVMS does not give \
+                 opcode {:#04x}. Before 2026-08-13 this compared against \
+                 matrix::opcode_name, which is where the corpus got the name \
+                 from, so it could not fail.",
+                p.opcode
             );
         }
     }
@@ -1335,7 +1477,10 @@ mod tests {
         let h = helper("h", "int p", "int a = p;", "s += a;");
         assert!(h.contains("for (int k = 0; k < 3; k++)"));
         assert!(h.contains("catch (RuntimeException ex)"));
-        assert!(h.contains("    int a = p;"), "decls are indented into place");
+        assert!(
+            h.contains("    int a = p;"),
+            "decls are indented into place"
+        );
         assert!(balanced(&h), "helper braces: {h}");
     }
 
@@ -1350,7 +1495,11 @@ mod tests {
                 .support
                 .reason()
                 .unwrap_or_else(|| panic!("{} has no reason", p.mnemonic));
-            assert!(reason.len() > 40, "{}: reason is not actionable", p.mnemonic);
+            assert!(
+                reason.len() > 40,
+                "{}: reason is not actionable",
+                p.mnemonic
+            );
         }
         // Everything else is generated.
         for p in by_op.values() {
@@ -1364,8 +1513,10 @@ mod tests {
     #[test]
     fn the_large_recipes_are_sized_by_config_and_can_be_skipped() {
         let big = OpcodeCorpusConfig::default();
-        let by_op: std::collections::BTreeMap<u8, OpcodeProgram> =
-            generate_all(&big).into_iter().map(|p| (p.opcode, p)).collect();
+        let by_op: std::collections::BTreeMap<u8, OpcodeProgram> = generate_all(&big)
+            .into_iter()
+            .map(|p| (p.opcode, p))
+            .collect();
         // goto_w needs a >32 KiB method: ~4 bytes per statement.
         let goto_w = by_op[&0xc8].source.as_ref().expect("goto_w generated");
         assert!(goto_w.matches("s += 1;").count() >= 9_000);

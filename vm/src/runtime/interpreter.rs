@@ -6869,12 +6869,26 @@ fn execute_frame_from_index(
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
-                        if index < 0 {
+                        // JVMS 6.5 fixes the order NPE -> AIOOBE -> ASE, and the
+                        // bounds test is TWO-SIDED. This arm checked only
+                        // `index < 0`, so an index PAST THE END fell through to
+                        // the covariance check below and reported
+                        // ArrayStoreException where HotSpot reports
+                        // ArrayIndexOutOfBoundsException (measured:
+                        // RArrayStoreTiers s15, String[] as Object[], index 5
+                        // into length 1).
+                        //
+                        // The slow-path `Instruction::Aastore` arm in opcodes.rs
+                        // received the full two-sided check first. This fast-path
+                        // twin is the one the interpreter actually dispatches, so
+                        // fixing only the other one changed nothing observable --
+                        // the same two-handlers-for-one-opcode drift as the JIT
+                        // emitter that never called `jit_aastore`.
+                        let arr_len = shared.mem.heap.array_length(arr_ref) as i32;
+                        if index < 0 || index >= arr_len {
                             let _ = frame;
-                            pending_runtime_error = Some((
-                                RuntimeError::aioobe(index, shared.mem.heap.array_length(arr_ref) as i32),
-                                saved_pc,
-                            ));
+                            pending_runtime_error =
+                                Some((RuntimeError::aioobe(index, arr_len), saved_pc));
                             continue;
                         }
                         // JVMS §aastore covariance check (mirrors the slow-path
@@ -6890,13 +6904,26 @@ fn execute_frame_from_index(
                                 && !aastore_element_assignable(shared, arr_ref, elem_ref)
                             {
                                 let _ = frame;
-                                let elem_cls = shared
+                                // Name the VALUE'S OWN class, HotSpot-style. On
+                                // a reference array the header class id is the
+                                // COMPONENT's, so the raw lookup answers
+                                // `java.lang.Integer` for an `Integer[]` where
+                                // HotSpot answers `[Ljava.lang.Integer;`
+                                // (`RArrayStoreTiers` s04). `cce_display_class_
+                                // name` is the existing repair for exactly that
+                                // — see the long note on the slow-path
+                                // `Instruction::Aastore` twin in opcodes.rs.
+                                // Separate statements: the helper takes the
+                                // class-manager read lock itself.
+                                let raw_elem_name = shared
                                     .classes
                                     .class_manager
                                     .read()
                                     .get_class(shared.mem.heap.class_id_of(elem_ref))
                                     .map(|c| c.name.to_string())
                                     .unwrap_or_else(|| "?".to_string());
+                                let elem_cls =
+                                    cce_display_class_name(shared, elem_ref, &raw_elem_name);
                                 pending_runtime_error = Some((
                                     RuntimeError::ArrayStoreException { message: elem_cls },
                                     saved_pc,

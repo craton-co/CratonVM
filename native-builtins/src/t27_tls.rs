@@ -1466,6 +1466,37 @@ pub(crate) struct ServerRegistry {
     pub(crate) server_streams: HashMap<i32, TlsServerStreamEntry>,
 }
 
+/// The negotiated suite's name in JSSE's spelling, which is what
+/// `SSLSession.getCipherSuite()` is contracted to return.
+///
+/// `format!("{:?}", cs.suite())` prints rustls's `CipherSuite` VARIANT name.
+/// rustls spells its five TLS 1.3 suites `TLS13_AES_256_GCM_SHA384`
+/// (`rustls-0.23.38/src/enums.rs:113`-`145`, the `enum_builder!` variants);
+/// the IANA registry — and therefore JSSE — spells the same suite
+/// `TLS_AES_256_GCM_SHA384`. Measured against HotSpot 25.0.3+9-LTS on this
+/// host rather than recalled: of 31 supported suites, the number whose name
+/// begins `TLS13_` is **zero**, and a live TLS 1.3 handshake's
+/// `getSession().getCipherSuite()` answers `TLS_AES_256_GCM_SHA384`. TLS 1.3
+/// is this VM's default, so the raw `{:?}` name was a name no JSSE program has
+/// ever seen, on essentially every connection. `java_cipher_name_to_suite` in
+/// this file — the VM's own reverse mapping — has never accepted it either, so
+/// the round trip did not close.
+///
+/// The pass-through half is measured too, not assumed: all 23 `CipherSuite`
+/// variants were checked against JSSE's supported list, and every one of the 14
+/// negotiable TLS 1.2 suites is byte-identical under both spellings, with zero
+/// non-`TLS13_` names altered by the rewrite. See
+/// `docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
+///
+/// ONE function, so this file has ONE place that knows the translation and the
+/// number of sites that can drift is 2 (one per file) rather than 8. The prefix
+/// rewrite itself lives in `http_url_connection` and is unit-tested there in
+/// both directions; `the_only_rustls_suite_spelling_left_is_the_adapters_own`
+/// below pins the family so a ninth producer cannot be added silently.
+fn negotiated_suite_name(cs: rustls::SupportedCipherSuite) -> String {
+    crate::http_url_connection::jsse_cipher_suite_name(&format!("{:?}", cs.suite()))
+}
+
 pub(crate) struct TlsClientStreamEntry {
     /// Per-stream mutex, NOT guarded by `sreg()`. Blocking socket I/O on one
     /// TLS connection must never hold the process-wide registry lock — see
@@ -3242,17 +3273,29 @@ pub(crate) fn rustls_client_connect(
         }
     }
 
+    // E12: `"TLS"` and `"UNKNOWN"` are not JSSE vocabulary — a caller matching
+    // `^TLS_` or looking the name up in the IANA registry gets an answer that
+    // matches neither a real suite nor the JDK's own "nothing negotiated"
+    // literal. (`"TLS"` is the worse of the two: it is the standard
+    // `SSLContext.getInstance` ALGORITHM name, so it reads as legitimate.)
+    // These arms sit immediately after a handshake that SUCCEEDED, so reaching
+    // one is an internal inconsistency rather than an ordinary state — but the
+    // value flows straight through `rustls_session_info` into `SSLSession`, so
+    // it must be spelled in the vocabulary the caller reads. See
+    // `phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE`.
     let negotiated_protocol = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
         Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
+        _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
     }
     .to_string();
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
+        .map(negotiated_suite_name)
+        .unwrap_or_else(|| {
+            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
+        });
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -3295,6 +3338,53 @@ pub(crate) fn rustls_client_connect(
 /// clone the `TcpListener` handle and the `closed` flag), then polling
 /// `accept()` non-blockingly outside the lock so a `close()` call can always
 /// acquire the mutex immediately and is noticed within one poll interval.
+/// The cipher-suite name for a connection that **did** negotiate one which
+/// this VM cannot name.
+///
+/// E31 (E22-1's NOMINATION E): "UNKNOWN" was spelled twice, as a bare literal,
+/// beside a long comment explaining why it must not become
+/// `SSL_NULL_WITH_NULL_NULL`. That reasoning is right and this constant does
+/// not disturb it — it gives the value a definition so the two sites cannot
+/// drift and so a reader who greps the literal lands on the argument rather
+/// than on a stray string. Restating the argument once, at the definition:
+///
+/// * The four **rustls** producer arms reach their fallback when the handshake
+///   succeeded *and rustls reports no suite* — an internal inconsistency, for
+///   which "nothing was negotiated" is an honest description. They use
+///   `JSSE_NULL_CIPHER_SUITE`.
+/// * The two **native-tls** acceptor arms are reached BY SUCCEEDING.
+///   `acceptor.accept(tcp)` returned; the stream is encrypted; a suite
+///   genuinely was negotiated. Writing the sentinel there would assert "no
+///   cipher" about a live encrypted connection — false in the *dangerous*
+///   direction, the same direction as the fabrication this family removed,
+///   merely inverted. This value is not JSSE vocabulary either, but it is
+///   **loud rather than plausible**, which is the correct trade when the truth
+///   is unavailable. Do not "complete the family" here.
+///
+/// **The gap is now verified rather than asserted, and the two arms turn out
+/// not to be one row.** E22-1 offered "read the suite out of the underlying
+/// `SslStream` via the backend-specific escape hatch" as option (b).
+///
+/// * For the `Native` arm there is no such hatch in the version this tree
+///   builds against. `native-tls` 0.2.18's `TlsStream` exposes exactly
+///   `buffered_read_size`, `peer_certificate`, `tls_server_end_point`,
+///   `negotiated_alpn` and `shutdown`; its `get_ref`/`get_mut` hand back the
+///   underlying transport rather than the backend handle, and the
+///   `imp::TlsStream` field is private. Even `negotiated_alpn` is
+///   `#[cfg(feature = "alpn")]` and this workspace takes native-tls with
+///   default features (`default = []`), so it does not exist here either.
+///   Naming the suite needs a forked dependency or routing this path through
+///   rustls.
+/// * The `LegacyDsa` arm is **openssl**, not native-tls, and that check is
+///   what separated them: `SslRef::version_str()` is unconditional and now
+///   supplies the real protocol version there (it used to be a hardcoded
+///   `"TLSv1.2"`). Its cipher is still unnamed only because the JSSE-spelled
+///   accessor, `SslCipherRef::standard_name()`, is `#[cfg(ossl111)]`.
+///
+/// So this constant is reached by two arms for two different reasons, and only
+/// one of them is genuinely without an accessor.
+pub(crate) const NATIVE_TLS_UNNAMEABLE_SUITE: &str = "UNKNOWN";
+
 pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let debug_hs = crate::nbflags().dbg_tls_hs;
     // Step 1: pop the config + a cloned tcp listener handle + the closed
@@ -3406,17 +3496,22 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     );
                 }
                 let sni = stream.conn.server_name().map(|s| s.to_string());
+                // E12: see the identical arms in `tls_connect_rustls` — the
+                // "we handshaked but cannot name the outcome" spelling has to
+                // be JSSE's, not this file's invention.
                 let protocol = match stream.conn.protocol_version() {
                     Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
                     Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-                    _ => "TLS",
+                    _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
                 }
                 .to_string();
                 let cipher = stream
                     .conn
                     .negotiated_cipher_suite()
-                    .map(|cs| format!("{:?}", cs.suite()))
-                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                    .map(negotiated_suite_name)
+                    .unwrap_or_else(|| {
+                        crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
+                    });
                 let alpn = stream
                     .conn
                     .alpn_protocol()
@@ -3427,11 +3522,50 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let stream = acceptor
                     .accept(tcp)
                     .map_err(|e| format!("legacy TLS server handshake: {e}"))?;
+                // E12 — DELIBERATELY NOT the sentinel, and this is the row that
+                // shows why a family fix applied uniformly would be wrong. The
+                // two rustls arms above reach their fallback only when the
+                // handshake succeeded yet reports no suite (an internal
+                // inconsistency, so "nothing negotiated" is honest). THIS arm
+                // reached here BY succeeding: `accept()` returned, the stream
+                // is encrypted, a suite genuinely was negotiated — native-tls
+                // 0.2 simply exposes no accessor to name it. Writing
+                // `SSL_NULL_WITH_NULL_NULL` here would assert "no cipher" about
+                // a live encrypted connection, and security-sensitive code
+                // branching on that string would conclude the wrong thing in
+                // the DANGEROUS direction. `"UNKNOWN"` is not JSSE vocabulary
+                // either — it is loud rather than plausible, which is the
+                // correct trade when the truth is unavailable. The argument now
+                // lives once, on `NATIVE_TLS_UNNAMEABLE_SUITE`, together with
+                // the verification that no accessor exists in native-tls
+                // 0.2.18 to make it knowable.
+                //
+                // E31 — ALPN looked knowable here and is NOT:
+                // `TlsStream::negotiated_alpn()` exists in native-tls 0.2.18
+                // but is `#[cfg(feature = "alpn")]`, and this workspace depends
+                // on `native-tls = "0.2"` with default features, whose
+                // `default = []`. So `SSLSocket.getApplicationProtocol()`
+                // answering `""` for a legacy-accepted socket is a dependency
+                // feature gap, not an oversight, and reading it would not
+                // compile. Recorded because "the accessor exists" was the
+                // obvious next move and it is wrong.
+                //
+                // NOT CHANGED, and disclosed rather than fixed: the `"TLSv1.2"`
+                // beside the suite is a fabrication of the same species the
+                // comment above refuses for the cipher — a real, plausible
+                // protocol version asserted about a handshake whose version is
+                // equally unknowable here. It is worse than a conservative
+                // under-report on THESE arms specifically, because they are the
+                // *legacy* acceptors: a caller testing "am I on at least TLS
+                // 1.2" is told yes for a connection that may be 1.0 or 1.1.
+                // Left alone because changing it is a behaviour change on a
+                // live, succeeding connection and this lane cannot run one; see
+                // the record's NOMINATION.
                 (
                     TlsServerStream::Native(stream),
                     None,
                     "TLSv1.2".to_string(),
-                    "UNKNOWN".to_string(),
+                    NATIVE_TLS_UNNAMEABLE_SUITE.to_string(),
                     None,
                 )
             }
@@ -3440,11 +3574,38 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let stream = acceptor
                     .accept(tcp)
                     .map_err(|e| format!("legacy DSA TLS server handshake: {e}"))?;
+                // E12: same reasoning as the `Native` arm above for the CIPHER
+                // — a real handshake we cannot name is NOT "nothing
+                // negotiated".
+                //
+                // E31 — but this arm is NOT the same as the `Native` one, and
+                // treating the two as a family is what hid it. This stream is
+                // `openssl::ssl::SslStream`, not `native_tls::TlsStream`, and
+                // openssl DOES expose the negotiated protocol version:
+                // `SslRef::version_str()` (`SSL_get_version`), unconditional in
+                // openssl 0.10.76 — no `ossl111`-style cfg gate, unlike
+                // `SslCipherRef::standard_name()`. So the `"TLSv1.2"` literal
+                // that used to stand here was a fabrication with a real value
+                // sitting one call away, and on the LEGACY acceptor of all
+                // places: a caller testing "am I on at least TLS 1.2" was told
+                // yes for a connection that may have been 1.0 or 1.1 — false in
+                // the dangerous direction, which is exactly what the cipher
+                // comment above refuses to do.
+                //
+                // The CIPHER is deliberately still unnamed here even though
+                // `SslCipherRef::name()` is unconditional: it returns the
+                // OpenSSL spelling (`ECDHE-RSA-AES256-GCM-SHA384`), not the
+                // JSSE/IANA one, and `standard_name()` — which does return the
+                // JSSE spelling — is `#[cfg(ossl111)]`, a build-configuration
+                // gate this lane cannot verify. Handing JSSE callers an
+                // OpenSSL-vocabulary name is a different wrong answer, not a
+                // right one; the real fix is a name-mapping table, nominated.
+                let proto = stream.ssl().version_str().to_string();
                 (
                     TlsServerStream::LegacyDsa(stream),
                     None,
-                    "TLSv1.2".to_string(),
-                    "UNKNOWN".to_string(),
+                    proto,
+                    NATIVE_TLS_UNNAMEABLE_SUITE.to_string(),
                     None,
                 )
             }
@@ -3589,17 +3750,29 @@ pub(crate) fn rustls_server_handshake_over_stream(
         .sock
         .set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
+    // E12: `"TLS"` and `"UNKNOWN"` are not JSSE vocabulary — a caller matching
+    // `^TLS_` or looking the name up in the IANA registry gets an answer that
+    // matches neither a real suite nor the JDK's own "nothing negotiated"
+    // literal. (`"TLS"` is the worse of the two: it is the standard
+    // `SSLContext.getInstance` ALGORITHM name, so it reads as legitimate.)
+    // These arms sit immediately after a handshake that SUCCEEDED, so reaching
+    // one is an internal inconsistency rather than an ordinary state — but the
+    // value flows straight through `rustls_session_info` into `SSLSession`, so
+    // it must be spelled in the vocabulary the caller reads. See
+    // `phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE`.
     let negotiated_protocol = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
         Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
+        _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
     }
     .to_string();
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
+        .map(negotiated_suite_name)
+        .unwrap_or_else(|| {
+            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
+        });
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -3664,17 +3837,29 @@ pub(crate) fn rustls_client_handshake_over_stream(
                 .map_err(|e| format!("handshake process: {}", e))?;
         }
     }
+    // E12: `"TLS"` and `"UNKNOWN"` are not JSSE vocabulary — a caller matching
+    // `^TLS_` or looking the name up in the IANA registry gets an answer that
+    // matches neither a real suite nor the JDK's own "nothing negotiated"
+    // literal. (`"TLS"` is the worse of the two: it is the standard
+    // `SSLContext.getInstance` ALGORITHM name, so it reads as legitimate.)
+    // These arms sit immediately after a handshake that SUCCEEDED, so reaching
+    // one is an internal inconsistency rather than an ordinary state — but the
+    // value flows straight through `rustls_session_info` into `SSLSession`, so
+    // it must be spelled in the vocabulary the caller reads. See
+    // `phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE`.
     let negotiated_protocol = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
         Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
+        _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
     }
     .to_string();
     let negotiated_cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
+        .map(negotiated_suite_name)
+        .unwrap_or_else(|| {
+            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.to_string()
+        });
     let negotiated_alpn = stream
         .conn
         .alpn_protocol()
@@ -4451,6 +4636,11 @@ pub(crate) fn register_t27_natives(r: &mut NativeMethodRegistry) {
     register_https_url_connection(r);
     register_self_test(r);
     register_alpn_accessor(r);
+    // E31: must run after `register_p68_ssl` (lib.rs calls this function at
+    // ~18540, that one at 18474) — but nothing else registers this triple in
+    // either mode, so the ordering is a property to preserve rather than a
+    // conflict to win. See the function's own doc for the oracle.
+    register_socket_handshake_session(r);
     r.set_category(__prev_cat);
 }
 
@@ -4912,8 +5102,19 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // Build an SSLSocket wrapper. Reuses the existing SSLSocket/
         // SSLSocketInputStream/SSLSocketOutputStream classes.
         let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", SSS_SOCK_FIELDS)?;
-        let (proto, cipher, alpn, sni) = rustls_session_info(stream_id)
-            .unwrap_or_else(|| ("TLSv1.3".into(), "UNKNOWN".into(), None, None));
+        // E12: a MISS here means the registry has no record of this stream, so
+        // there is nothing this VM can report about what it negotiated. The old
+        // pair announced the VM's default TLS version for a stream it could not
+        // find. Answer JSSE's own "nothing negotiated" spelling instead — see
+        // `phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE`.
+        let (proto, cipher, alpn, sni) = rustls_session_info(stream_id).unwrap_or_else(|| {
+            (
+                crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL.into(),
+                crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into(),
+                None,
+                None,
+            )
+        });
         // PIN across every allocation below. `create_string` and
         // `alloc_concurrent_synthetic` can each run a moving young collection,
         // which relocates `sock` — after which the raw `set_field` writes, the
@@ -4947,7 +5148,12 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         crate::net_phase_e::sock_set_for_create(ctx, sock, 0, tls_id);
 
         // 4-field synthetic session: proto, cipher, streamId, attrs (slot 3 —
-        // see SSLSESS_ATTRS_SLOT doc comment).
+        // see `sslsess_attrs_slot`, which is the width->slot table; this row
+        // and the 8-field one are the only two with a dedicated attrs slot).
+        // E31: these two comments used to name `SSLSESS_ATTRS_SLOT`, a doc
+        // comment on a constant that has never existed in this tree — the
+        // width rule they pointed at was only ever `num_fields - 1` open-coded
+        // at five call sites. It exists now.
         let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4)?;
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
@@ -5208,6 +5414,120 @@ fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
             let s = ctx.create_string("");
             Ok(Some(Value::Object(Some(s))))
         },
+    );
+    r.set_category(__prev_cat);
+}
+
+/// `javax.net.ssl.SSLSocket.getHandshakeSession()`.
+///
+/// **E31 — this registration is what lets `RSslNullSession` reach any of its
+/// session assertions at all.** It was registered NOWHERE (confirmed against
+/// `--dump-native-registry`, E22-1 §1), and unlike most of the JSSE surface
+/// this method is NOT abstract: `javax/net/ssl/SSLSocket` carries a concrete
+/// body, and the body is
+///
+/// ```java
+/// // C:\craton\jdk25src/java.base/javax/net/ssl/SSLSocket.java:474-476
+/// public SSLSession getHandshakeSession() {
+///     throw new UnsupportedOperationException();
+/// }
+/// ```
+///
+/// HotSpot never reaches it because `sun.security.ssl.SSLSocketImpl` overrides
+/// it; CratonVM's socket **is** a `javax/net/ssl/SSLSocket`, so an
+/// un-intercepted call threw where the oracle answers. `getApplicationProtocol`
+/// (registered directly above) is the same shape — its base body throws too
+/// (`SSLSocket.java:753`, measured) — which is why that one already had a
+/// native and this one being absent was easy to miss.
+///
+/// ## The contract, taken from the override rather than from the base class
+///
+/// ```java
+/// // jdk25src/java.base/sun/security/ssl/SSLSocketImpl.java:384-392
+/// public SSLSession getHandshakeSession() {
+///     socketLock.lock();
+///     try {
+///         return conContext.handshakeContext == null ?
+///                 null : conContext.handshakeContext.handshakeSession;
+///     } finally { socketLock.unlock(); }
+/// }
+/// ```
+///
+/// So it is non-null over exactly one window: from the moment a handshake
+/// context exists until it is torn down. Measured on HotSpot 25.0.3+9-LTS,
+/// `scratchpad/e31/E31HandshakeSessionSocket.java` (loopback, self-signed
+/// PKCS12, 3 runs):
+///
+/// ```text
+/// ARM0 abstract-SSLSocket.getHandshakeSession   = THREW UnsupportedOperationException
+/// ARMA unconnected.getHandshakeSession          = null
+/// ARMA after getSession(), getHandshakeSession  = null
+/// ARMA after close(), getHandshakeSession       = null
+/// ARMM before startHandshake()                  = null
+/// ARMM inside X509ExtendedTrustManager.checkServerTrusted(chain,auth,Socket)
+///                                               = SSLSessionImpl{TLS_AES_256_GCM_SHA384,
+///                                                 TLSv1.3, id=32B, valid=true}
+/// ARMM inside HandshakeCompletedListener        = null   (fires after teardown)
+/// ARMF client after startHandshake() returned   = null
+/// ARMF server after startHandshake() returned   = null
+/// ARMF after close()                            = null
+/// ```
+///
+/// ## Why `null` UNCONDITIONALLY is the right body here, not a lazy one
+///
+/// The non-null window is real, but it is only *observable* from inside a
+/// handshake callback that receives the `Socket` — the 3-arg
+/// `X509ExtendedTrustManager.checkServerTrusted(chain, authType, Socket)` /
+/// `checkClientTrusted(..., Socket)` overloads, or an `SNIMatcher`. It cannot
+/// be observed from another thread, because `getHandshakeSession()` takes the
+/// same `socketLock` the handshaking thread is holding; the probe's
+/// `HandshakeCompletedListener` arm measures the other edge — by the time the
+/// completion notification runs, `handshakeContext` is already null.
+///
+/// **CratonVM never invokes those overloads.** `engine_run_trust_check` in this
+/// file dispatches exactly one descriptor,
+/// `([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V` — the 2-arg
+/// form, which gets no socket — and there is no `SNIMatcher` callback either.
+/// Every socket handshake this VM performs is also synchronous inside
+/// `startHandshake()`/`createSocket(host, port)`. So there is no state in which
+/// application code can hold a CratonVM `SSLSocket` *and* be inside its
+/// handshake, and `null` is HotSpot's answer for every state that is reachable.
+/// If the 3-arg trust-manager overload is ever wired up, this body has to grow
+/// the `is_handshaking()` gate that `SSLEngineImpl.getHandshakeSession` in this
+/// file already carries — that gate is the model to copy, and the reason this
+/// comment names the condition instead of just asserting the constant.
+///
+/// ## Why a native on a class that HAS a bytecode body is reached at all
+///
+/// Worth stating, because it is the objection that makes this registration
+/// look futile: `javax/net/ssl/SSLSocket` is a real, loaded JDK class here, so
+/// "the receiver's own class declares the method in bytecode" is true — and
+/// `invoke.rs`'s hierarchy walk skips a native when that is true. That skip is
+/// in the FALLBACK arm. `resolve_step1_native` runs first and matches the
+/// receiver's own class name exactly, which is why every other native this
+/// family registers on `javax/net/ssl/SSLSocket` works.
+///
+/// The witness is in the fixture itself rather than in the dispatcher:
+/// `RSslNullSession` DOOR 1's **first** check is `s.isConnected()`, answered by
+/// a native registered on exactly this class name, and the vector is recorded
+/// as reaching check 2 before aborting — so check 1 was served by the native on
+/// a class whose bytecode body exists. Same class, same mechanism.
+///
+/// One aliasing note for whoever changes this: `invoke.rs` also routes a
+/// receiver whose class starts with `sun/security/ssl/SSLSocketImpl` to
+/// `javax/net/ssl/SSLSocket`'s registrations. So if a genuinely real
+/// `SSLSocketImpl` ever exists in this VM, this body shadows its
+/// `conContext.handshakeContext` read too. That is still correct for every
+/// state such a socket could be observed in here, for the callback reason
+/// above — but it is the assumption to re-check, not a coincidence to rely on.
+fn register_socket_handshake_session(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "getHandshakeSession",
+        "()Ljavax/net/ssl/SSLSession;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.set_category(__prev_cat);
 }
@@ -5887,16 +6207,19 @@ pub(crate) fn run_loopback_self_test(
         }
     }
 
+    // E12: diagnostic-only (this is the VM-private loopback self-test), but it
+    // is the sixth raw spelling of the same concept in this file and there
+    // should be one. `"?"` in particular is in nobody's vocabulary.
     let proto = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
         Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
+        _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
     };
     let cipher = stream
         .conn
         .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "?".into());
+        .map(negotiated_suite_name)
+        .unwrap_or_else(|| crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into());
     let alpn = stream
         .conn
         .alpn_protocol()
@@ -6328,6 +6651,103 @@ mod tests {
         assert!(msg.starts_with("OK "), "unexpected result: {}", msg);
         assert!(msg.contains("proto=TLSv1.3"));
         assert!(msg.contains("alpn=h2"));
+        // The cipher substring was never asserted here, which is why the
+        // rustls spelling survived in this string. It is now the ONLY
+        // behavioural exercise of `negotiated_suite_name` that needs no
+        // network: a real in-process TLS 1.3 handshake, whose name must be
+        // the one HotSpot reports. Measured on this host, HotSpot 25.0.3+9-LTS
+        // answers `TLS_AES_256_GCM_SHA384` for a live TLS 1.3 session and lists
+        // ZERO supported suites beginning `TLS13_`.
+        assert!(
+            msg.contains("cipher=TLS_"),
+            "cipher must carry JSSE's spelling: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("cipher=TLS13_"),
+            "cipher is still in rustls's TLS 1.3 spelling, which JSSE never \
+             produces -- `negotiated_suite_name` was bypassed: {}",
+            msg
+        );
+    }
+
+    /// The family guard for the rustls-vs-JSSE cipher spelling.
+    ///
+    /// The helper `http_url_connection::jsse_cipher_suite_name` existed, was
+    /// unit-tested in both directions, and had exactly ONE of the eight
+    /// producers of a rustls suite name as a caller — the other seven lived in
+    /// this file and each re-spelled the name by hand. Testing the FUNCTION is
+    /// what let that happen: nothing asserted that anyone CALLS it. This
+    /// asserts the call, by shape, over the working tree.
+    ///
+    /// Exactly two occurrences of the raw `{:?}`-on-a-suite idiom may exist in
+    /// this file: inside `negotiated_suite_name`, which is the translation, and
+    /// inside `engine_take_pending_trust_check`, whose value never reaches Java
+    /// (its sole reader is a `contains("ECDSA")` guess, invariant under the
+    /// rewrite — see the comment at that site). A ninth producer, or a rewrite
+    /// of one of the six adapted call sites back to the raw idiom, fails here.
+    ///
+    /// Reads the working tree rather than `include_str!` — this repository is
+    /// edited from both Windows and Linux, so `\r` is normalised.
+    #[test]
+    fn the_only_rustls_suite_spelling_left_is_the_adapters_own() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("t27_tls.rs");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            println!("t27_tls.rs not on disk at {path:?}; witness skipped");
+            return;
+        };
+        let lines: Vec<&str> = src.lines().map(|l| l.trim_end_matches('\r')).collect();
+
+        // Assembled from fragments so this test's own source does not contain
+        // the needle it searches for.
+        let needle = format!("{}{}{}", "format!(\"{:", "?}\", cs.", "suite())");
+
+        let mut found: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // Prose mentions the idiom in doc comments; only code counts.
+            if t.starts_with("//") {
+                continue;
+            }
+            if !line.contains(&needle) {
+                continue;
+            }
+            let owner = lines[..=i]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    let l = l.trim_start();
+                    for p in ["pub(crate) fn ", "pub fn ", "fn "] {
+                        if let Some(rest) = l.strip_prefix(p) {
+                            return Some(
+                                rest.split(['(', '<', ' ']).next().unwrap_or("").to_string(),
+                            );
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| format!("<no enclosing fn, line {}>", i + 1));
+            found.push(owner);
+        }
+        found.sort();
+        found.dedup();
+
+        let expected = vec![
+            "engine_take_pending_trust_check".to_string(),
+            "negotiated_suite_name".to_string(),
+        ];
+        assert_eq!(
+            found, expected,
+            "the raw rustls suite spelling must appear ONLY in \
+             `negotiated_suite_name` (the translation) and \
+             `engine_take_pending_trust_check` (never reaches Java). Found it \
+             in: {found:?}. Every other producer feeds \
+             `SSLSession.getCipherSuite()`, which is contracted to return the \
+             IANA/JSSE name -- HotSpot 25 lists ZERO suites spelled `TLS13_`. \
+             Use `negotiated_suite_name`."
+        );
     }
 
     /// T2.7-SEC-1 — release-config server with no keystore must refuse to
@@ -7345,6 +7765,307 @@ mod tests {
             consumed_after > 0,
             "application data must be consumed once the handshake is reported finished"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // E12/E22 — the "nothing was negotiated" session, in the LIVE registrar
+    // -----------------------------------------------------------------------
+    //
+    // `phases_late::ssl_security` already has tests of this shape. They pass,
+    // and they measured code that is DEAD: `--dump-native-registry` shows THIS
+    // file's `getProtocol`/`getCipherSuite`/`getId`/`isValid` owning the
+    // `javax/net/ssl/SSLSession` slots in the default real-JDK mode, which is
+    // the mode `--jdk-only` runs. Duplicating the coverage here is the point:
+    // a green test over an overwritten registration is worse than no test,
+    // because it reads as proof.
+
+    fn session_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        super::register_ssl_session_real(&mut r);
+        r
+    }
+
+    /// DOOR 1 of `regression-suite/src/RSslNullSession.java`, without a VM:
+    /// the 3-field session `ssl_security::new13_alloc_null_ssl_session` mints
+    /// for an `SSLSocket` that was never connected (`tls_id = -1`).
+    ///
+    /// `getId` and `isValid` are the two this file decides and the two the
+    /// nominated patch would have missed — a field-count-only test treats
+    /// every shape narrower than 7 as "negotiated", which is exactly this one.
+    #[test]
+    fn the_null_socket_session_has_no_id_and_is_not_valid() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        // [0]=proto [1]=cipher [2]=tls_id, tls_id = -1 => never connected.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
+        let p = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+        let c = ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+        ctx.set_field(sess, 0, Value::Object(Some(p)));
+        ctx.set_field(sess, 1, Value::Object(Some(c)));
+        ctx.set_field(sess, 2, Value::Int(-1));
+        let this = &[Value::Object(Some(sess))];
+
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => assert_eq!(
+                ctx.array_length(a),
+                0,
+                "HotSpot answers byte[0] for a session that negotiated nothing; \
+                 Tomcat's JSSESupport.java:171 tests `length == 0` exactly"
+            ),
+            other => panic!("getId must return an array, got {other:?}"),
+        }
+
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(0)),
+            "HotSpot 25.0.3+9-LTS, unconnected SSLSocket: isValid() = false"
+        );
+    }
+
+    /// MUTATION CHECK for the test above. Without it, `getId` could return
+    /// `byte[0]` and `isValid` `false` unconditionally and the previous test
+    /// would still pass — measuring one branch and calling it coverage.
+    ///
+    /// The 32-byte id is itself a CratonVM stand-in (this VM does not surface
+    /// the real negotiated session id); what is pinned here is only that a
+    /// session which DID negotiate is not dragged into the null-session
+    /// branch by this change.
+    #[test]
+    fn a_session_that_negotiated_keeps_its_id_and_its_validity() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+
+        // 3-field accept/connect shape with a real stream id.
+        let live = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
+        ctx.set_field(live, 2, Value::Int(0)); // id 0 is a VALID stream id
+        // 8-field engine shape, slot 2 = the isValid flag, set.
+        let engine_ok = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(engine_ok, 2, Value::Int(1));
+        // 8-field engine shape BEFORE a handshake — the DOOR 2 state.
+        let engine_pre = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(engine_pre, 2, Value::Int(0));
+
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+
+        for (what, sess, want_len, want_valid) in [
+            ("3-field, stream id 0", live, 32usize, 1i32),
+            ("8-field, negotiated", engine_ok, 32, 1),
+            ("8-field, pre-handshake", engine_pre, 0, 0),
+        ] {
+            let this = &[Value::Object(Some(sess))];
+            match get_id(&mut ctx, this) {
+                Ok(Some(Value::Object(Some(a)))) => {
+                    assert_eq!(ctx.array_length(a), want_len, "getId: {what}")
+                }
+                other => panic!("getId must return an array for {what}, got {other:?}"),
+            }
+            assert_eq!(
+                is_valid(&mut ctx, this).unwrap(),
+                Some(Value::Int(want_valid)),
+                "isValid: {what}"
+            );
+        }
+    }
+
+    /// `getProtocol`/`getCipherSuite` are contracted non-null by JSSE, and
+    /// both used to hand back `ctx.get_field(..)` raw. `http2.rs` mints a
+    /// 6-field session and never writes a slot of it, so that shape produced a
+    /// null String from a method that cannot return one.
+    #[test]
+    fn an_unpopulated_session_shape_answers_the_sentinel_not_a_null_string() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 6);
+        let this = &[Value::Object(Some(sess))];
+
+        let proto = r
+            .find("javax/net/ssl/SSLSession", "getProtocol", "()Ljava/lang/String;")
+            .expect("getProtocol registered");
+        match proto(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => assert_eq!(
+                ctx.read_string(s).as_deref(),
+                Some(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL)
+            ),
+            other => panic!("getProtocol must never return a null String, got {other:?}"),
+        }
+
+        let cipher = r
+            .find("javax/net/ssl/SSLSession", "getCipherSuite", "()Ljava/lang/String;")
+            .expect("getCipherSuite registered");
+        match cipher(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(s)))) => assert_eq!(
+                ctx.read_string(s).as_deref(),
+                Some(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE)
+            ),
+            other => panic!("getCipherSuite must never return a null String, got {other:?}"),
+        }
+    }
+
+    /// §2's argument, mechanised on THIS file's list rather than argued: the
+    /// sentinel is safe to return only because it can never be the outcome of
+    /// a handshake. `SUPPORTED_CIPHER_SUITE_NAMES` is what this VM claims to
+    /// support through `getSupportedCipherSuites`, so if the sentinel ever
+    /// appears in it the reason for returning the sentinel is gone.
+    #[test]
+    fn the_sentinel_is_never_offerable_and_the_fabrication_always_was() {
+        assert!(
+            !SUPPORTED_CIPHER_SUITE_NAMES
+                .contains(&crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE),
+            "the null-session sentinel must never be an offerable suite — that \
+             unofferability is the whole reason it is not a fabrication"
+        );
+        assert!(
+            SUPPORTED_CIPHER_SUITE_NAMES.contains(&"TLS_AES_256_GCM_SHA384"),
+            "the literal this lane REMOVED is offerable, which is exactly why no \
+             caller could tell it from a real negotiation"
+        );
+    }
+
+    /// E31 — THE SLOT COLLISION, as a test rather than as a nomination.
+    ///
+    /// `putValue` used to write its `java.util.HashMap` into
+    /// `num_fields - 1`, which on the 3-field null-session shape is the STREAM
+    /// ID. That is the slot `session_has_negotiated` reads, so a single
+    /// `putValue` turned `Int(-1)` into an object reference, took the
+    /// predicate's defensive `_ => true` arm, and handed the session back its
+    /// 32-byte fabricated id and `isValid() == true`.
+    ///
+    /// This is the whole defect in one assertion: **do the writes, then re-ask
+    /// the two accessors E12/E22 fixed.** Jetty's
+    /// `SecureRequestCustomizer.retrieveSni()` is the real caller.
+    #[test]
+    fn a_put_value_cannot_resurrect_the_null_sessions_id_or_validity() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        // The DOOR 1 shape: [0]=proto [1]=cipher [2]=tls_id = -1.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 3);
+        ctx.set_field(sess, 2, Value::Int(-1));
+
+        let name = ctx.create_string("org.eclipse.jetty.sni.host");
+        let value = ctx.create_string("example.test");
+        let put = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "putValue",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+            )
+            .expect("putValue registered");
+        put(
+            &mut ctx,
+            &[
+                Value::Object(Some(sess)),
+                Value::Object(Some(name)),
+                Value::Object(Some(value)),
+            ],
+        )
+        .expect("putValue must not fail");
+
+        assert_eq!(
+            ctx.get_field(sess, 2),
+            Value::Int(-1),
+            "putValue must not overwrite NEW13_SESS_TLSID on a shape with no \
+             attribute slot — that slot is what says 'nothing was negotiated'"
+        );
+
+        let this = &[Value::Object(Some(sess))];
+        let get_id = r
+            .find("javax/net/ssl/SSLSession", "getId", "()[B")
+            .expect("getId registered");
+        match get_id(&mut ctx, this) {
+            Ok(Some(Value::Object(Some(a)))) => assert_eq!(
+                ctx.array_length(a),
+                0,
+                "a putValue must not give an unhandshaked session an id"
+            ),
+            other => panic!("getId must return an array, got {other:?}"),
+        }
+        let is_valid = r
+            .find("javax/net/ssl/SSLSession", "isValid", "()Z")
+            .expect("isValid registered");
+        assert_eq!(
+            is_valid(&mut ctx, this).unwrap(),
+            Some(Value::Int(0)),
+            "a putValue must not make an unhandshaked session valid"
+        );
+    }
+
+    /// MUTATION CHECK for the test above. Without it, `putValue` could no-op
+    /// for EVERY shape and the collision test would still pass — the classic
+    /// "measured the refusal, called it coverage" shape. The 8-field engine
+    /// session has a dedicated attribute slot and must still round-trip.
+    #[test]
+    fn a_shape_with_a_real_attribute_slot_still_round_trips() {
+        use crate::test_utils::MockNativeContext;
+        let r = session_registry();
+        let mut ctx = MockNativeContext::new();
+        // 8-field engine shape: slot 2 = isValid flag, slot 7 = attrs.
+        let sess = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        ctx.set_field(sess, 2, Value::Int(1));
+
+        let name = ctx.create_string("k");
+        let value = ctx.create_string("v");
+        let put = r
+            .find(
+                "javax/net/ssl/SSLSession",
+                "putValue",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+            )
+            .expect("putValue registered");
+        put(
+            &mut ctx,
+            &[
+                Value::Object(Some(sess)),
+                Value::Object(Some(name)),
+                Value::Object(Some(value)),
+            ],
+        )
+        .expect("putValue must not fail");
+        assert!(
+            matches!(ctx.get_field(sess, 7), Value::Object(Some(_))),
+            "slot 7 IS the attribute slot on the 8-field shape — putValue must \
+             still store there, or `sslsess_attrs_slot` has disabled the API"
+        );
+        assert_eq!(
+            ctx.get_field(sess, 2),
+            Value::Int(1),
+            "and it must not have touched the isValid flag"
+        );
+    }
+
+    /// The width->slot rules, pinned as a table so a future shape has to
+    /// declare which convention it uses instead of inheriting one silently.
+    /// The 6-field row is the one that was wrong (`>= 7`): `tls.rs`'s and
+    /// `http2.rs`'s sessions are cipher-first like the 8-field engine shape,
+    /// not protocol-first like the narrow ones.
+    #[test]
+    fn the_session_slot_conventions_are_split_at_six_fields_not_seven() {
+        for n in [0usize, 1] {
+            assert_eq!(session_cipher_slot(n), None, "width {n} carries neither");
+            assert_eq!(session_proto_slot(n), None, "width {n} carries neither");
+        }
+        for n in [2usize, 3, 4] {
+            assert_eq!(session_proto_slot(n), Some(0), "width {n} is protocol-first");
+            assert_eq!(session_cipher_slot(n), Some(1), "width {n} is protocol-first");
+        }
+        for n in [6usize, 8] {
+            assert_eq!(session_cipher_slot(n), Some(0), "width {n} is cipher-first");
+            assert_eq!(session_proto_slot(n), Some(1), "width {n} is cipher-first");
+        }
     }
 }
 
@@ -9004,6 +9725,16 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
     if trust_ctx_key.is_none() && endpoint_identity.is_none() {
         return None;
     }
+    // DELIBERATELY the raw rustls spelling, and the ONLY place in this file
+    // that is. This string never reaches Java: its sole reader is the
+    // `contains("ECDSA")` auth-type guess below, which feeds `checkServerTrusted`
+    // an `"ECDSA"`/`"RSA"` literal. `jsse_cipher_suite_name` rewrites only the
+    // `TLS13_` prefix, so it can only alter a TLS 1.3 name, and no TLS 1.3 suite
+    // contains `ECDSA` under either spelling (measured: all five variants, both
+    // spellings) — the guess is invariant under the rewrite. Applying the helper
+    // here would be a no-op that additionally claims "this is a JSSE cipher
+    // name", which it is not. Named here so the next reader need not re-derive
+    // it, and so the witness test's one exception is legible at the site.
     let cipher_name = state
         .conn
         .as_ref()
@@ -9400,56 +10131,99 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 // Native registrations (WP5.1 + WP5.4)
 // -----------------------------------------------------------------------------
 
-/// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
-/// outside a handshake, best-effort default) cipher/protocol/ALPN state.
-/// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
-/// registration for why real JDK's `getHandshakeSession()` cannot be left
-/// un-intercepted on this engine implementation.
+/// Build a synthetic `SSLSession` reflecting `id`'s negotiated cipher/protocol/
+/// ALPN state, or — before/outside a handshake — JSSE's own "nothing was
+/// negotiated" answers. Shared by `getSession()` and `getHandshakeSession()`
+/// — see the latter's registration for why real JDK's `getHandshakeSession()`
+/// cannot be left un-intercepted on this engine implementation.
 fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<ObjectRef, MethodCallFailed> {
     let (proto, cipher, alpn) = with_engine(id, |s| {
         let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
             Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
             Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-            _ => "TLSv1.3",
+            // E12: no connection means no negotiated version. `"TLSv1.3"`
+            // here reported the VM's DEFAULT as though it were the outcome.
+            _ => crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL,
         };
+        // E12: JSSE's own answer for "no cipher negotiated", NOT a guess. The
+        // literal that used to stand here (`TLS_AES_256_GCM_SHA384`) is in
+        // HotSpot's SUPPORTED suite list and is byte-for-byte what a real TLS
+        // 1.3 handshake produces, so no test a caller can write separated this
+        // fallback from a genuine negotiation — and security-sensitive code
+        // branches on this string. The sentinel is UNOFFERABLE
+        // (`setEnabledCipherSuites("SSL_NULL_WITH_NULL_NULL")` throws
+        // IllegalArgumentException, measured), so it can never be confused
+        // with a negotiation. See `JSSE_NULL_CIPHER_SUITE` and
+        // docs/known-issues/jdk-only/
+        // E12-1-the-null-session-and-the-fabricated-cipher.md §1-§2.
         let cipher = s
             .conn
             .as_ref()
             .and_then(|c| c.negotiated_cipher_suite())
-            .map(|cs| format!("{:?}", cs.suite()))
-            .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
+            .map(negotiated_suite_name)
+            .unwrap_or_else(|| {
+                crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into()
+            });
         let alpn = s.negotiated_alpn.clone().unwrap_or_default();
         (proto.to_string(), cipher, alpn)
     })
     .unwrap_or_else(|| {
         (
-            "TLSv1.3".into(),
-            "TLS_AES_256_GCM_SHA384".into(),
+            crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL.into(),
+            crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE.into(),
             String::new(),
         )
     });
+    // E12: slot 2 is the `isValid` flag, and this constructor also serves
+    // engines that have NEVER handshaked. HotSpot answers `isValid() == false`
+    // for a session with no negotiation (measured, E12-1 §1) — writing 1
+    // unconditionally was a third fabrication beside the cipher and the id.
+    // A session is valid iff a connection actually negotiated something.
+    //
+    // ORDERING: this must never land ahead of the cipher/protocol sentinels
+    // above. On its own it would make `isValid()` false while
+    // `getCipherSuite()` still answered `TLS_AES_256_GCM_SHA384` — a session
+    // reporting a strong suite while denying it is valid, a state no real
+    // JSSE session can be in and more confusing than either bug alone.
+    //
+    // NOT tied to `invalidate()`: measured (E12-1 §1 arm E), `invalidate()`
+    // changes `isValid()` and nothing else — cipher, protocol and id all
+    // survive it — and closing the socket does not invalidate at all (arm G).
+    let negotiated = with_engine(id, |s| {
+        s.conn
+            .as_ref()
+            .and_then(|c| c.negotiated_cipher_suite())
+            .is_some()
+    })
+    .unwrap_or(false);
     // 8-field synthetic session: cipher, protocol, valid, peerHost, peerPort,
-    // creationTime, alpn, attrs (slot 7 — see SSLSESS_ATTRS_SLOT doc comment).
+    // creationTime, alpn, attrs (slot 7 — see `sslsess_attrs_slot`).
     let ses = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 8)?;
+    // GC (found while landing E12): each `create_string` allocates and is
+    // therefore a GC point, so a moving young collection between the
+    // allocation above and the `set_field`s below relocates `ses` and every
+    // write lands through a stale reference. `phases_late::ssl_security
+    // ::new13_alloc_null_ssl_session` pins for exactly this reason; this
+    // constructor is the one that needed it most, because it runs on EVERY
+    // `getSession()`/`getHandshakeSession()` call at arbitrary allocation
+    // pressure rather than once at socket construction.
+    let pin = ctx.pin_native_root(ses);
     let cipher_s = ctx.create_string(&cipher);
+    let cipher_pin = ctx.pin_native_root(cipher_s);
     let proto_s = ctx.create_string(&proto);
+    let proto_pin = ctx.pin_native_root(proto_s);
     let alpn_s = ctx.create_string(&alpn);
+    let ses = ctx.read_native_pin(pin, ses);
+    let cipher_s = ctx.read_native_pin(cipher_pin, cipher_s);
+    let proto_s = ctx.read_native_pin(proto_pin, proto_s);
     ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
     ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
-    ctx.set_field(ses, 2, Value::Int(1));
+    ctx.set_field(ses, 2, Value::Int(if negotiated { 1 } else { 0 }));
     ctx.set_field(ses, 3, Value::Object(None));
     ctx.set_field(ses, 4, Value::Int(-1));
-    ctx.set_field(
-        ses,
-        5,
-        Value::Long(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
-        ),
-    );
+    ctx.set_field(ses, 5, Value::Long(crate::epoch_millis_now()));
     ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
+    ctx.unpin_native_roots(pin);
     // Associate the peer (client) cert chain with this session object so
     // SSLSession.getPeerCertificates() can return it for mTLS auth.
     let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
@@ -9907,11 +10681,33 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     // manifested as an indefinite hang/silent-exit crash rather than a
     // visible test failure — see
     // fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md.
-    // Real JDK's `getHandshakeSession()` returns the session being
-    // negotiated (or null outside a handshake); returning the same
-    // best-effort synthetic session `getSession()` already builds (complete
-    // with graceful "no negotiation yet" defaults) is sufficient for every
-    // caller in this codebase's suites, which only use it for buffer sizing.
+    // Real JDK's `getHandshakeSession()` returns the session being negotiated,
+    // and NULL outside a handshake — which the sentence above already said and
+    // the code below then did not do. It returned a populated synthetic
+    // session unconditionally, so it was right only in the middle window and
+    // wrong on BOTH sides, including for the exact caller this comment names:
+    // Jetty asks before `beginHandshake()`, i.e. precisely where the correct
+    // answer is null.
+    //
+    // E12 — measured, HotSpot 25.0.3+9-LTS, stepping a client/server engine
+    // pair (`scratchpad/e12/E12HandshakeSession.java`, E12-1 §1):
+    //
+    //     step  0  NEED_WRAP        client getHandshakeSession() = null
+    //     step  5  NEED_WRAP        client getHandshakeSession() = populated
+    //     step 10  NOT_HANDSHAKING  client getHandshakeSession() = null
+    //
+    // Null before, populated during, null after.
+    //
+    // WHY RETURNING NULL CANNOT BREAK THE JETTY CALLER THIS COMMENT NAMES,
+    // argued from the oracle rather than from Jetty's source (which is not
+    // checked out on this host): HotSpot returns null here for every
+    // brand-new connection, which is exactly when Jetty calls it. Any caller
+    // that works on HotSpot therefore already tolerates null at this call
+    // site — otherwise it would NPE on real JSSE on every connection. The
+    // original CratonVM defect this registration exists for was a *different*
+    // NPE (real `SSLEngineImpl.getHandshakeSession()` dereferencing a
+    // `conContext` this VM never populates); it is fixed by the registration
+    // EXISTING, not by what the registration returns.
     r.register(
         cls_impl,
         "getHandshakeSession",
@@ -9919,6 +10715,17 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
+            // `conn` is `None` until `beginHandshake` realizes the rustls
+            // connection, and `is_handshaking()` flips false once the
+            // handshake completes — so this is non-null over exactly the
+            // window HotSpot measures above, and null on both sides of it.
+            let mid_handshake = with_engine(id, |s| {
+                s.conn.as_ref().map(|c| c.is_handshaking()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+            if !mid_handshake {
+                return Ok(Some(Value::Object(None)));
+            }
             Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
                 ctx, id,
             )?))))
@@ -11407,6 +12214,162 @@ pub(crate) fn record_client_peer_chain(
         .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
+/// Did the `javax/net/ssl/SSLSession` object `this` actually negotiate
+/// anything?
+///
+/// This is the ONE predicate behind `SSLSession.isValid()` and the "does this
+/// session have an id at all" test in `getId()`, because HotSpot answers both
+/// from the same underlying state — measured, HotSpot 25.0.3+9-LTS
+/// (`scratchpad/e12/E12SessionContract.java`, recorded in
+/// `docs/known-issues/jdk-only/E12-1-the-null-session-and-the-fabricated-cipher.md`
+/// §1):
+///
+/// ```text
+///   nothing negotiated:  isValid() = false   getId() = byte[0]
+///   after a handshake:   isValid() = true    getId() = byte[32]
+/// ```
+///
+/// Keeping the two in one function is deliberate. E3-1's recorded lesson in
+/// this same family is that a rule spread over N call sites drifts, and this
+/// rule now has to hold across FIVE different widths of synthetic
+/// `SSLSession` — the "nothing negotiated" signal lives in a different place
+/// in each, so the field count is the discriminator (the same convention
+/// `getProtocol`/`getCipherSuite` already use):
+///
+/// | width | minted by | slot 2 holds | negotiated when |
+/// |---|---|---|---|
+/// | 2 | `phases_late::ssl_security`'s `SSLEngine.getSession` fallback | — | **never** — that shape exists only to carry the sentinel pair |
+/// | 3 | `ssl_security::new13_alloc_null_ssl_session` and `new13_alloc_ssl_session` | `NEW13_SESS_TLSID` | a stream id was recorded (`>= 0`); the NULL session carries `-1` |
+/// | 4 | `SSLServerSocket.accept` in this file | the stream id, always `>= 0` | always — the shape is only minted after a handshake |
+/// | 6 | `http2.rs`'s `HttpResponse.sslSession()`; `tls.rs` | — | always (same reason) |
+/// | 8 | `build_synthetic_ssl_session` in this file | the `isValid` flag | the flag is set |
+///
+/// The 3-field row is the one the nomination that prompted this did not
+/// cover, and it is the row that decides an unconnected `SSLSocket`: a
+/// field-count test alone would treat every narrow shape as negotiated and
+/// leave the null session answering `isValid() = true` / a 32-byte id, which
+/// is the exact defect in the mode this file is live in.
+///
+/// E31: `pub(crate)` since 2026-08-13. `tls.rs` had grown its OWN width-blind
+/// copies of this question (`isValid` on `javax/net/ssl/SSLSession` and again
+/// on `sun/security/ssl/SSLSessionImpl`, each testing a field count and
+/// answering `true` for everything narrower), which is how the null session
+/// stayed valid under `--synthetic-jdk` after this predicate fixed it in the
+/// default mode. There is one rule; it lives here; both files call it.
+pub(crate) fn session_has_negotiated(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.object_num_fields(this) {
+        // No slot at all, and never minted for a negotiated session.
+        0..=2 => false,
+        3 => match ctx.get_field(this, 2) {
+            Value::Int(tls_id) => tls_id >= 0,
+            // Defensive: `putValue` stores its attribute HashMap in slot
+            // `num_fields - 1`, which on THIS shape is the stream id — see
+            // E22-1's NOMINATION on the attribute-slot collision. If that has
+            // happened the id is already gone; keep the pre-E12 answer rather
+            // than inventing a new one from a clobbered slot.
+            _ => true,
+        },
+        n if n >= 7 => matches!(ctx.get_field(this, 2), Value::Int(v) if v != 0),
+        // 4- and 6-field shapes are only minted after a handshake.
+        _ => true,
+    }
+}
+
+/// The slot holding the negotiated CIPHER SUITE, by shape width — and its
+/// twin below for the PROTOCOL. Two conventions exist and the width is what
+/// separates them:
+///
+/// | width | minted by | slot 0 | slot 1 |
+/// |---|---|---|---|
+/// | 2 | `ssl_security`'s `SSLEngine.getSession` fallback | protocol | cipher |
+/// | 3 | `ssl_security::new13_alloc_{,null_}ssl_session` | protocol | cipher |
+/// | 4 | `SSLServerSocket.accept` in this file | protocol | cipher |
+/// | 6 | `tls.rs::init_ssl_session_fields`; `http2.rs` | **cipher** | **protocol** |
+/// | 8 | `build_synthetic_ssl_session` in this file | **cipher** | **protocol** |
+///
+/// E31: the threshold used to be `>= 7`, which put the 6-field row on the
+/// wrong side of the line — `getProtocol()` on a `tls.rs` session read its
+/// cipher slot and vice versa. That was inert only because the 6-field shape
+/// stores `Int` indices rather than `String`s, so both accessors fell through
+/// to the sentinel arm instead of returning the *other* value; a producer that
+/// ever wrote real names into that shape would have swapped them. Stating the
+/// rule as `>= 6` makes it true rather than harmlessly false, and changes no
+/// answer today (verified against every minter in the table).
+///
+/// `None` for a shape too short to carry the pair at all. Both accessors used
+/// to index slot 0 or 1 with no floor, so a foreign or 1-field receiver was an
+/// out-of-range field read on a class the real JDK also defines — the shape
+/// this directory records as a real bug rather than a miss. Returning an
+/// `Option` is what makes that check unskippable at the call site.
+pub(crate) fn session_cipher_slot(num_fields: usize) -> Option<usize> {
+    match num_fields {
+        0..=1 => None,
+        n if n >= 6 => Some(0),
+        _ => Some(1),
+    }
+}
+
+/// See [`session_cipher_slot`] for the width table this mirrors.
+pub(crate) fn session_proto_slot(num_fields: usize) -> Option<usize> {
+    match num_fields {
+        0..=1 => None,
+        n if n >= 6 => Some(1),
+        _ => Some(0),
+    }
+}
+
+/// The dedicated `SSLSession` attribute-map slot for this shape, or `None` for
+/// a shape that has no slot to spare.
+///
+/// **E31 — this replaces a bare `num_fields - 1` at five call sites, and the
+/// bare form was a live slot collision.** `num_fields - 1` is the attribute
+/// slot on exactly two of the five widths this tree mints; on the other three
+/// it is a field that means something else, and `putValue` wrote a
+/// `java.util.HashMap` straight over it:
+///
+/// | width | `num_fields - 1` is | what a `putValue` destroyed |
+/// |---|---|---|
+/// | 2 | the cipher-suite `String` | `getCipherSuite()` answers the map |
+/// | 3 | `ssl_security::NEW13_SESS_TLSID` | see below — the worst one |
+/// | 4 | a dedicated attrs slot | nothing |
+/// | 6 | `tls.rs::SES_CREATION_TIME` | `getCreationTime()` returns an object reference through a `()J` descriptor |
+/// | 8 | a dedicated attrs slot | nothing |
+///
+/// The 3-field row is why this is a priority rather than a tidy-up. Slot 2 on
+/// that shape is the stream id, and it is also the slot
+/// [`session_has_negotiated`] reads to decide whether anything was negotiated.
+/// A single `putValue` on an unconnected socket's session therefore turned
+/// `Int(-1)` ("nothing negotiated") into `Object(Some(map))`, which takes that
+/// function's defensive `_ => true` arm — so `isValid()` went back to `true`
+/// and `getId()` went back to 32 fabricated bytes. **A `putValue` resurrected
+/// the exact fabrication the E12/E22 lanes removed**, on the one shape whose
+/// whole purpose is to represent "no handshake happened". The defensive arm is
+/// what kept that from being a *new* wrong answer relative to the pre-E12
+/// code; it was never a reason the collision was safe.
+///
+/// Jetty's `SecureRequestCustomizer.retrieveSni()` calls `getValue()` then
+/// `putValue()` on every SSL request, so the writer is not hypothetical — it
+/// is the caller the attribute API was registered for in the first place.
+///
+/// Returning `None` (rather than widening the three shapes) is the change that
+/// cannot break anything else: `putValue`/`removeValue` become no-ops and
+/// `getValue`/`getValueNames` answer null/`String[0]`, which is what those
+/// shapes already answer today for a session nobody has written to. The
+/// divergence that remains — a `putValue` on a 2-, 3- or 6-field session does
+/// not round-trip through `getValue` — is a *quiet* miss on a JSSE convenience
+/// API, against a *loud* corruption of the negotiation state. Widening those
+/// three shapes is the real fix and is nominated, not done here: the 3-field
+/// one is `ssl_security.rs`'s and cannot be widened without moving
+/// `session_has_negotiated`'s arms in the same commit (E22-1's NOMINATION C
+/// carries that warning already).
+fn sslsess_attrs_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    match ctx.object_num_fields(this) {
+        4 => Some(3),
+        n if n >= 7 => Some(n - 1),
+        _ => None,
+    }
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 
@@ -11454,15 +12417,28 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KEEP (correct constants — these are protocol limits, not placeholders).
-    // Buffer sizes are layout-independent JSSE constants. The real JDK returns
-    // 16384 (`SSLRecord.maxDataSize`, the RFC 8446 §5.1 TLSPlaintext cap) for
-    // `getApplicationBufferSize` and 16709 (`SSLRecord.maxRecordSize` = 5
-    // header + 16 IV + 16384 data + 256 padding + 48 MAC) for
-    // `getPacketBufferSize`. Real `SSLSessionImpl` varies these only via
-    // `SSLParameters.setMaximumPacketSize` and only for DTLS; CratonVM models
-    // neither (`git grep maximumPacketSize` — no hits), so the real behaviour
-    // is constant here too.
+    // KEEP THE VALUES — but the claim that used to head this block was WRONG,
+    // and wrong in the confident register that stops the next reader checking.
+    // It said "KEEP (correct constants…) the real JDK returns 16384 for
+    // getApplicationBufferSize". Measured on HotSpot 25.0.3+9-LTS
+    // (`scratchpad/e12/E12SessionContract.java`, E12-1 §1):
+    //
+    //     getApplicationBufferSize()  null session      = 16704
+    //     getApplicationBufferSize()  after TLS 1.3     = 16676
+    //     getPacketBufferSize()       every state       = 16709
+    //
+    // So `getPacketBufferSize` is right and `getApplicationBufferSize` is NOT
+    // a constant in real JSSE at all: `SSLSessionImpl` derives it from the
+    // packet size minus the negotiated suite's record expansion, which is why
+    // it moves when a suite is negotiated. 16384 is the RFC 8446 §5.1
+    // TLSPlaintext cap, i.e. a floor rather than the JDK's answer.
+    //
+    // The VALUE is deliberately left at 16384: it is a safe UNDER-report
+    // against this VM's own engine (which never emits more than it advertises),
+    // and raising a buffer-size constant without auditing every
+    // `BUFFER_OVERFLOW` path is how a constant becomes an outage. What is
+    // fixed here is the assertion, not the number. Same correction is owed to
+    // the twin in `tls.rs` — see E22-1's NOMINATION.
     //
     // SHADOWING (wave 4 correction — the wave-3 note was wrong): `tls.rs
     // ::register_ssl_session` registers the same two triples, but its registrar
@@ -11482,9 +12458,23 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // negotiated session id bytes; the abstract interface declaration has no
     // Code, so without a real-mode native this throws AbstractMethodError and
     // every HTTPS request to a protected resource fails (HTTP -1). Return a
-    // stable 32-byte id derived from the session object's identity.
+    // stable 32-byte id derived from the session object's identity — but ONLY
+    // for a session that actually negotiated one.
+    //
+    // E12: a session that negotiated nothing has NO id, and JSSE says so with
+    // `byte[0]` rather than 32 plausible bytes. This has a named, measured
+    // consumer: Tomcat's `JSSESupport.getSessionId`
+    // (java/org/apache/tomcat/util/net/jsse/JSSESupport.java:171) is
+    // `if (ssl_session == null || ssl_session.length == 0) return null;` — it
+    // tests `length == 0` EXACTLY, so the fabricated 32 bytes are precisely
+    // the value that defeats it and makes an unhandshaken session present as
+    // a trackable one. Measured HotSpot 25.0.3+9-LTS, E12-1 §1/§4.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if !session_has_negotiated(ctx, this) {
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+            return Ok(Some(Value::Object(Some(empty))));
+        }
         let seed = gc_stable_objref_key(ctx, this);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         // SplitMix64-style fill so the 32 bytes are stable per session and not
@@ -11499,18 +12489,35 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // proto/cipher slot order differs between the two real-mode shapes:
-    //   7-field (SSLEngineImpl.getSession): [0]=cipher [1]=proto [2]=valid ...
-    //   3-field (SSLServerSocket.accept):   [0]=proto  [1]=cipher [2]=stream_id
-    // Disambiguate by field count so both return the correct String.
+    // proto/cipher slot order differs between the shapes; the width is what
+    // separates the two conventions. E31: the table (and the off-by-one this
+    // comment used to carry — it named a "7-field" and a "3-field" shape that
+    // are actually 8 and 4) now lives on `session_cipher_slot`, which both
+    // accessors below call instead of re-deriving `>= 7` twice.
+    //
+    // E12: and NEVER hand back a null String. Both of these are contracted
+    // non-null by JSSE, and both used to return `ctx.get_field(...)` raw — so
+    // a shape whose slot was never populated (e.g. `http2.rs`'s 6-field
+    // `HttpResponse.sslSession()` session, which is allocated and never
+    // written) produced a null String from a method that cannot return one,
+    // and the caller NPE'd on `.equals`/`.startsWith`. The sentinel is the
+    // right answer there because an unpopulated slot IS "nothing negotiated";
+    // see `JSSE_NULL_CIPHER_SUITE` for why it is honesty and not invention.
     r.register(cls, "getProtocol", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let slot = if ctx.object_num_fields(this) >= 7 {
-            1
-        } else {
-            0
-        };
-        Ok(Some(ctx.get_field(this, slot)))
+        // Bound to a `let` on purpose: a closure written directly in a match
+        // scrutinee is a temporary whose `&ctx` capture lives to the end of the
+        // match, which collides with the `&mut ctx` the sentinel arms need.
+        let raw = session_proto_slot(ctx.object_num_fields(this))
+            .map(|slot| ctx.get_field(this, slot));
+        match raw {
+            Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+            _ => {
+                let s =
+                    ctx.create_string(crate::phases_late::ssl_security::JSSE_NULL_PROTOCOL);
+                Ok(Some(Value::Object(Some(s))))
+            }
+        }
     });
     r.register(
         cls,
@@ -11518,38 +12525,74 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let slot = if ctx.object_num_fields(this) >= 7 {
-                0
-            } else {
-                1
-            };
-            Ok(Some(ctx.get_field(this, slot)))
+            // See `getProtocol` above for why this is a `let` and not an
+            // inline match scrutinee.
+            let raw = session_cipher_slot(ctx.object_num_fields(this))
+                .map(|slot| ctx.get_field(this, slot));
+            match raw {
+                Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+                _ => {
+                    let s = ctx
+                        .create_string(crate::phases_late::ssl_security::JSSE_NULL_CIPHER_SUITE);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+            }
         },
     );
 
-    // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
-    // accept session has no flag — treat it as valid (it was just negotiated).
+    // E12: `isValid` and `getId` answer from ONE predicate, because HotSpot
+    // answers them from one piece of state — see `session_has_negotiated`.
+    // This used to return `Value::Int(1)` for every shape narrower than 7
+    // fields on the reasoning that "the accept session was just negotiated".
+    // That reasoning holds for the 4-field accept shape and NOT for the
+    // 3-field NEW-13 shape, which `ssl_security::new13_resolve_socket_session`
+    // also mints — with `tls_id = -1` — for a socket that was never connected.
+    // So an unconnected `SSLSocket.getSession().isValid()` answered `true`
+    // where HotSpot measures `false` (E12-1 §1 arm A).
+    //
+    // Deliberately NOT tied to stream liveness: measured (arm G), closing the
+    // socket does NOT invalidate the session — it outlives its transport, for
+    // resumption — so validity must not be a "is the stream still in the
+    // registry" test. Reading the session's own recorded id keeps the answer
+    // stable across `close()`.
+    //
     // SHADOWING (wave 3): `tls.rs::register_ssl_session` registers the same
-    // triple and runs later, so THAT one wins. Its version was slot-2-only and
-    // mis-reported the 3-field accept session; it has been made field-count
-    // aware to match this logic. Keep the two in step.
+    // triple and runs later, so THAT one wins under `--synthetic-jdk`; in the
+    // default real-JDK mode (which is what `--jdk-only` runs) THIS one is
+    // live — confirmed against `--dump-native-registry`, not source order.
+    // Its version was slot-2-only and mis-reported the 3-field accept session;
+    // it has been made field-count aware to match this logic. Keep in step.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 2)))
+        Ok(Some(Value::Int(if session_has_negotiated(ctx, this) {
+            1
         } else {
-            Ok(Some(Value::Int(1)))
-        }
+            0
+        })))
     });
 
-    // creation / last-accessed time: the 7-field engine session stores a
-    // millis timestamp in slot 5; the 3-field shape has none → 0.
+    // creation / last-accessed time: the 8-field engine session stores a
+    // millis timestamp in slot 5; the narrower shapes have no slot for one.
+    //
+    // E12: the narrow shapes used to answer `0`, and HotSpot never does —
+    // measured (E12-1 §1), `getCreationTime()` is a real epoch value in EVERY
+    // state including the null session, and `0` is exactly the value
+    // application code reads as "there is no session". Answer a real epoch.
+    //
+    // RESIDUAL, stated rather than hidden: HotSpot's value is fixed at
+    // construction, so two reads of one session agree; this one is `now` on
+    // every call for the narrow shapes, so two reads disagree by the elapsed
+    // millis. Making it stable needs a slot to stash it in (the 3-field shape
+    // has none) — see E22-1's NOMINATION to widen `NEW13_SSL_SESS_FIELDS`. A
+    // drifting real timestamp is still strictly better than a stable
+    // impossible one: age arithmetic (`now - creationTime`), which is what
+    // every consumer actually does, goes from "56 years old" to "~0 ms old".
     r.register(cls, "getCreationTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) > 5 {
             Ok(Some(ctx.get_field(this, 5)))
         } else {
-            Ok(Some(Value::Long(0)))
+            Ok(Some(Value::Long(crate::epoch_millis_now())))
         }
     });
     r.register(cls, "getLastAccessedTime", "()J", |ctx, args| {
@@ -11557,7 +12600,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) > 5 {
             Ok(Some(ctx.get_field(this, 5)))
         } else {
-            Ok(Some(Value::Long(0)))
+            Ok(Some(Value::Long(crate::epoch_millis_now())))
         }
     });
 
@@ -11582,7 +12625,11 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let slot = ctx.object_num_fields(this) - 1;
+            // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc.
+            let slot = match sslsess_attrs_slot(ctx, this) {
+                Some(s) => s,
+                None => return Ok(Some(Value::Object(None))),
+            };
             let map = match ctx.get_field(this, slot) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
@@ -11609,7 +12656,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let map = sslsess_attrs_map(ctx, this)?;
+            // E31: a shape with no dedicated attribute slot must NOT fall back
+            // to `num_fields - 1` — on the 3-field NEW-13 shape that slot is
+            // the stream id, and overwriting it with a HashMap flips
+            // `session_has_negotiated` to `true`, which is exactly how a
+            // `putValue` used to resurrect the 32-byte fabricated id and
+            // `isValid() == true` on a session that never handshaked. No-op
+            // instead; see `sslsess_attrs_slot`.
+            let slot = match sslsess_attrs_slot(ctx, this) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let map = sslsess_attrs_map(ctx, this, slot)?;
             ctx.invoke(
                 "java/util/HashMap",
                 "put",
@@ -11622,7 +12680,11 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     r.register(cls, "removeValue", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        let slot = ctx.object_num_fields(this) - 1;
+        // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc.
+        let slot = match sslsess_attrs_slot(ctx, this) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         let map = match ctx.get_field(this, slot) {
             Value::Object(Some(m)) => m,
             _ => return Ok(None),
@@ -11642,7 +12704,14 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
             ))))
         };
-        let slot = ctx.object_num_fields(this) - 1;
+        // E31: `sslsess_attrs_slot`, not `num_fields - 1` — see its doc. On the
+        // 3-field shape the old spelling read the STREAM ID as a map reference;
+        // it missed (an `Int`) and answered empty, so this arm is unchanged in
+        // effect and changed in correctness.
+        let slot = match sslsess_attrs_slot(ctx, this) {
+            Some(s) => s,
+            None => return empty(ctx),
+        };
         let map = match ctx.get_field(this, slot) {
             Value::Object(Some(m)) => m,
             _ => return empty(ctx),
@@ -11693,11 +12762,18 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
 /// Lazily allocate (and cache in the session's own last field) the
 /// `java.util.HashMap` backing `SSLSession.putValue`/`getValue`/etc — see the
 /// doc comment on its registration in `register_ssl_session_real`.
+///
+/// E31: `slot` is now a PARAMETER, resolved by `sslsess_attrs_slot` at the one
+/// caller that may write. It used to compute `num_fields - 1` itself, which is
+/// the attribute slot on only two of five shapes — see `sslsess_attrs_slot`
+/// for what the other three lost. Taking it as an argument is what makes the
+/// "does this shape even have an attribute slot?" question unskippable rather
+/// than something a future caller can forget to ask.
 fn sslsess_attrs_map(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
+    slot: usize,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let slot = ctx.object_num_fields(this) - 1;
     if let Value::Object(Some(map)) = ctx.get_field(this, slot) {
         return Ok(map);
     }

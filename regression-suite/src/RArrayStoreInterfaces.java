@@ -66,6 +66,29 @@ import java.util.Map;
  * asserted only on the cold pass — see
  * {@code docs/known-issues/jdk-only/W7-40-tier-parity-fixtures-and-fast-throw.md}
  * for why a message is not a tier-invariant.
+ *
+ * <h2>Reporting dialect — why every line is {@code CK }/{@code PASS }-prefixed</h2>
+ *
+ * {@code run.sh} reduces both VMs' output to its {@code ^PASS }/{@code ^CK }
+ * lines before diffing them ({@code extract()} in
+ * {@code regression-suite/harness-guard.sh}). Until 2026-08-13 this fixture
+ * printed its ITERS header, all twenty-seven per-row {@code cold=/hot=} lines
+ * and — worst of the three — the BALANCE line on no prefix, so 29 of 30 lines
+ * were deleted and the harness compared the constant banner alone. The balance
+ * line is the one that separates "the check works" from "the check is absent",
+ * which is the whole reason this fixture exists beside
+ * {@code RArrayStoreTiers}; discarding it left a 108-check vector whose extract
+ * was one constant string. Every row now goes out as
+ * {@code CK RArrayStoreInterfaces <row> cold=[..] hot=[..] moved=<i>} carrying
+ * the VM's OWN answers, so the two VMs diff their answers against each other.
+ * See
+ * {@code docs/known-issues/jdk-only/W8-E15-1-the-fourth-broken-oracle-the-unscheduled-vector-and-the-reach-ratchet.md}
+ * §NOM-2, and W8-E9-1 §1 for why {@code fails} and {@code checks} are on
+ * SEPARATE lines.
+ *
+ * <p>The two rows whose message is not a stable property ({@code s12}'s
+ * generated proxy name) are deliberately not published either: an unasserted
+ * value on a {@code CK } line becomes an assertion by way of the cross-VM diff.
  */
 public class RArrayStoreInterfaces {
 
@@ -271,20 +294,44 @@ public class RArrayStoreInterfaces {
         "no-throw", "no-throw", "no-throw",
     };
 
+    /**
+     * The one evidence funnel. Prints UNCONDITIONALLY and prints the VM's own
+     * answer, so a row's value reaches the cross-VM diff whether or not this
+     * file's table agrees with it.
+     */
+    static void ck(String row, String fields) {
+        System.out.printf("CK RArrayStoreInterfaces %-42s %s%n", row, fields);
+    }
+
+    /**
+     * Record a divergence AND make it visible on a kept prefix. The old code
+     * printed these as {@code DIVERGENCE <text>}, which extract() deletes — so
+     * on a red run the harness could see that something failed but not what.
+     */
+    static void diverge(String detail) {
+        DIVERGENCES.add(detail);
+        System.out.println("CK RArrayStoreInterfaces FAILED " + detail);
+    }
+
     public static void main(String[] args) {
-        System.out.println("RArrayStoreInterfaces ITERS=" + ITERS
-            + "  (C1 threshold 500; run this both with and without --nojit)");
+        // ITERS is a real parameter of the measurement, not decoration: read
+        // together with a moved= index it is what says whether the compiled
+        // tier was reached at all. It goes into the diff for that reason.
+        System.out.println("CK RArrayStoreInterfaces ITERS=" + ITERS);
 
         // Pass 1: cold. One execution per site, guaranteed interpreted because
         // nothing has run yet — the only tier where the message is meaningful.
         for (int id = 1; id <= N; id++) {
             if (coldSkip(id)) continue;
             String want = EXPECTED_COLD[id];
+            // null = "do not assert the message", and therefore also "do not
+            // publish it".
             if (want == null) continue;
             String got = observeWithMessage(id);
             checks++;
+            ck(NAMES[id], "coldmsg=[" + got + "]");
             if (!want.equals(got)) {
-                DIVERGENCES.add(NAMES[id] + " COLD-MESSAGE: want=[" + want + "] got=[" + got + "]");
+                diverge(NAMES[id] + " COLD-MESSAGE: want=[" + want + "] got=[" + got + "]");
             }
         }
 
@@ -308,17 +355,24 @@ public class RArrayStoreInterfaces {
             String name = NAMES[id];
             String want = EXPECTED_KIND[id];
 
+            // Evidence FIRST, verdicts after, so a FAILED line always follows
+            // the values it is about. `moved` is published on every row and not
+            // just on a transition: an absent field is not evidence, and the
+            // iteration at which an answer moved is precisely what a
+            // tier-dependent store check shows up as.
+            ck(name, "cold=[" + cold + "] hot=[" + hot + "] moved=" + movedAt);
+
             checks++;
             if (!want.equals(cold)) {
-                DIVERGENCES.add(name + " COLD: want=[" + want + "] got=[" + cold + "]");
+                diverge(name + " COLD: want=[" + want + "] got=[" + cold + "]");
             }
             checks++;
             if (!want.equals(hot)) {
-                DIVERGENCES.add(name + " HOT: want=[" + want + "] got=[" + hot + "]");
+                diverge(name + " HOT: want=[" + want + "] got=[" + hot + "]");
             }
             checks++;
             if (movedAt >= 0) {
-                DIVERGENCES.add(name + " TIER-SPLIT at i=" + movedAt
+                diverge(name + " TIER-SPLIT at i=" + movedAt
                     + ": cold=[" + cold + "] became=[" + moved + "] final=[" + hot + "]");
             }
 
@@ -328,27 +382,39 @@ public class RArrayStoreInterfaces {
             if ("no-throw".equals(want) && "no-throw".equals(hot)) {
                 legalAdmitted++;
             }
-
-            System.out.printf("%-42s cold=[%s] hot=[%s]%s%n",
-                name, cold, hot, movedAt >= 0 ? "  MOVED@" + movedAt : "");
         }
 
-        // The balance assertion. A predicate that has degenerated to "allow
+        // The balance assertion, and the single most important line this
+        // fixture prints: a predicate that has degenerated to "allow
         // everything" satisfies every LEGAL row above and nothing else catches
-        // it, because the legal rows are the majority. State the two counts
-        // separately so a green line can never mean "nothing was checked".
-        System.out.println("illegal stores refused: " + illegalRefused + "/12"
-            + "   legal stores admitted: " + legalAdmitted + "/15");
+        // it, because the legal rows are the majority. It was on a deleted
+        // prefix, i.e. the harness could not see the one number that separates
+        // "checked" from "not checked".
+        //
+        // The DENOMINATORS are counted off EXPECTED_KIND rather than written as
+        // literals: the old line said "/12" and "/15" by hand, so adding a row
+        // to the table would have silently made the ratio wrong rather than the
+        // run red.
+        int illegalTotal = 0, legalTotal = 0;
+        for (int id = 1; id <= N; id++) {
+            if ("ArrayStoreException".equals(EXPECTED_KIND[id])) illegalTotal++;
+            if ("no-throw".equals(EXPECTED_KIND[id])) legalTotal++;
+        }
+        System.out.println("CK RArrayStoreInterfaces illegalRefused=" + illegalRefused + "/" + illegalTotal);
+        System.out.println("CK RArrayStoreInterfaces legalAdmitted=" + legalAdmitted + "/" + legalTotal);
         checks++;
         if (illegalRefused == 0) {
-            DIVERGENCES.add("DEGENERATE: not one illegal interface store was refused - "
+            diverge("DEGENERATE: not one illegal interface store was refused - "
                 + "the component-type check is absent, not merely wrong");
         }
 
+        // SEPARATE lines, and in this order. harness_check_count does
+        // `sub(/^.*checks=/, ""); print`, so `checks=108 fails=0` would publish
+        // the "count" `108 fails=0` and the guard that reads it would no-op
+        // inside its own 2>/dev/null. One value per line.
+        System.out.println("CK RArrayStoreInterfaces fails=" + DIVERGENCES.size());
+        System.out.println("CK RArrayStoreInterfaces checks=" + checks);
         if (!DIVERGENCES.isEmpty()) {
-            for (String d : DIVERGENCES) {
-                System.out.println("DIVERGENCE " + d);
-            }
             throw new AssertionError(DIVERGENCES.size() + " divergence(s)");
         }
         System.out.println("PASS RArrayStoreInterfaces (" + checks + " checks)");

@@ -5316,6 +5316,154 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     jit_decode_ref_word(raw, "jit_aaload/element")
 }
 
+/// The JVMS §6.5 *aastore* covariance check, and NOTHING else — no null check,
+/// no bounds check, no barrier, no store.
+///
+/// # Why this exists separately from [`jit_aastore`]
+///
+/// `jit_aastore` is the complete opcode. Routing every reference array store
+/// through it (W7-38, landed) restored correctness at the cost of one helper
+/// call per store — precisely the cost R20's inline lowering had removed. This
+/// helper is the shape W7-38 §6 nominated so the emitter can put the inline
+/// `MOV [array + index*8 + HEADER_SIZE], val` back and call out only for the
+/// part that genuinely needs the VM: the type check.
+///
+/// It is an **extraction, not a copy**. `jit_aastore` below calls it and has no
+/// check of its own. Two independent implementations of one JVMS rule is
+/// exactly how this defect was born — a check in the helper, an inline store in
+/// the emitter, and a comment in each file asserting something about the other
+/// that the build could not verify.
+///
+/// # Contract
+///
+/// Returns `i64::MIN` — the standard deopt / pending-exception sentinel that
+/// `emit_post_invoke_exception_check` tests RAX against — when the store must be
+/// REFUSED and an `ArrayStoreException` has been published on this thread. The
+/// caller must then skip the store, the SATB pre-write barrier and the card
+/// mark. Returns `0` when the store may proceed.
+///
+/// The sentinel is a real, defined return value on purpose: a `-> ()` helper
+/// leaves RAX undefined, so an `emit_post_invoke_exception_check` after it is
+/// testing garbage and the exception surfaces only via the interpreter's
+/// post-JIT-return drain.
+///
+/// Fails **open** in three places, each deliberately: a null `val` (JVMS: always
+/// storable), an implausible `array_ptr` (the caller's null check has already
+/// run; dereferencing a stale word here would SIGSEGV inside Rust, which is
+/// strictly harder to diagnose than the store faulting at its own site), and a
+/// failure to construct the throwable (fall through and perform the store rather
+/// than corrupt VM state — the pre-W7-38 behaviour). `aastore_element_assignable`
+/// itself also fails open on imprecise type info, so no false
+/// `ArrayStoreException` can be produced from here.
+//
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm
+// pointer. array_ptr is a plausible heap pointer to a reference array or is
+// screened out below. val is 0 (null) or a raw pointer to a live heap object.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_aastore_check(vm_ptr: i64, array_ptr: i64, val: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary). Unconditional and first,
+    // like every sibling helper: the refusal path allocates a throwable, and a
+    // helper that bumps the generation only sometimes is a soundness argument
+    // no one will re-derive correctly later. `jit_aastore` bumps it too, so the
+    // delegated path bumps twice; a redundant bump only forces a re-scan and is
+    // never unsound in the other direction.
+    crate::jit::conservative_roots::note_jit_boundary();
+    // A null element is always storable (JVMS §6.5). Cheapest screen first.
+    if val == 0 {
+        return 0;
+    }
+    if !cratonvm_types::plausible_heap_pointer(array_ptr as u64) {
+        return 0;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
+    let value_ref = ObjectRef::from_raw(val as usize as *mut u8);
+    if vm.mem.heap.element_type_of(array_ref) != ArrayElementType::Reference
+        || crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref)
+    {
+        return 0;
+    }
+    // W8-E11-1: the raw `get_class(class_id_of(value_ref)).name` lookup that
+    // used to stand here was the THIRD twin of a defect that the interpreter's
+    // two `aastore` arms had already had fixed (W8-E6-1). On a reference array
+    // the header class id holds the COMPONENT's class BY DESIGN — stated in
+    // `typecheck::array_descriptor_of` and again on `cce_display_class_name`,
+    // where the same trap once produced `java.lang.String cannot be cast to
+    // java.lang.String` and cost a session as a supposed class-identity split.
+    // So for an array-valued element the message was off by exactly one array
+    // dimension, and right for everything else.
+    //
+    // HotSpot's rule is `Klass::external_name()` of the VALUE'S OWN class.
+    // MEASURED, JDK 25.0.3 (`scratchpad/e11/AseName.java`, one execution per
+    // shape so nothing is in the fast-throw regime):
+    //
+    //   String[]   <- Integer      java.lang.Integer
+    //   String[]   <- AseName$Inner  AseName$Inner      (binary-with-dots, `$` kept)
+    //   String[]   <- Plain        Plain                (default package)
+    //   String[][] <- Integer[]    [Ljava.lang.Integer;
+    //   String[][] <- String[][]   [[Ljava.lang.String;
+    //   String[]   <- Plain[]      [LPlain;
+    //   String[][] <- int[]        [I
+    //   String[][] <- int[][]      [[I
+    //   String[][] <- byte[]       [B
+    //
+    // Reuse `cce_display_class_name` rather than writing a fourth spelling of
+    // this parse: it is the same "Java-visible class name for a VM-minted type
+    // error" question `checkcast` and the two interpreter `aastore` arms ask,
+    // it reconstructs the descriptor via `array_descriptor_of`, and it carries
+    // the `UnmodifiableMap` storage-stamp translation that keeps a VM-internal
+    // class out of an app-visible message.
+    //
+    // It returns the INTERNAL (slashed) name and that is what we want here:
+    // `throw_runtime_error`'s funnel dots it, and its `rewritable` predicate
+    // (`contains('/') && no whitespace`) correctly leaves `[I` / `[[I` / `[B`
+    // and a default-package name such as `[LPlain;` alone.
+    //
+    // Two statements, not one: `cce_display_class_name` takes the class-manager
+    // read lock itself, so the guard from the name lookup must be dropped
+    // first.
+    let raw_elem_name = vm
+        .classes
+        .class_manager
+        .read()
+        .get_class(vm.mem.heap.class_id_of(value_ref))
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let elem_cls = crate::runtime::interpreter::cce_display_class_name(
+        vm,
+        value_ref,
+        &raw_elem_name,
+    );
+    // Build a real ArrayStoreException and stash it via the pending-exception
+    // channel; the interpreter's post-JIT-return drain
+    // (`take_jit_pending_exception`) routes it through this method's exception
+    // table.
+    //
+    // Raise it through `throw_runtime_error`, the single funnel every VM-minted
+    // `RuntimeError` passes through, instead of building the throwable here.
+    // The funnel is where an `ArrayStoreException` message is given HotSpot's
+    // EXTERNAL class name; a slashed name in this message is a real defect and
+    // not untidiness, because callers regex it and feed the capture to
+    // `Class.forName`.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        use crate::error::MethodCallFailed;
+        if let MethodCallFailed::ExceptionThrown(exc) =
+            crate::runtime::exceptions::throw_runtime_error(
+                vm,
+                thread,
+                crate::error::RuntimeError::ArrayStoreException { message: elem_cls },
+            )
+        {
+            set_jit_pending_exception(thread, exc);
+            return i64::MIN;
+        }
+    }
+    // No thread available, or the funnel degraded to an `InternalError`: fall
+    // through and let the store happen rather than corrupting VM state.
+    0
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // array_ptr must be 0 (null) or a valid heap pointer to a reference array.
 // val is 0 (null) or a raw pointer to a live heap object. Write barrier is issued
@@ -5355,79 +5503,34 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     }
     // JVMS §aastore covariance check: a non-null element whose runtime type is
     // NOT assignment-compatible with the array's component type must throw
-    // ArrayStoreException. Mirror the interpreter `aastore` opcode so JIT and
-    // interpreter agree. `aastore_element_assignable` fails open on imprecise
-    // type info, so this is additive (never a false ArrayStoreException) — the
-    // store still proceeds below for null elements and assignable references.
+    // ArrayStoreException. It runs AFTER the null and bounds checks above and
+    // BEFORE the barrier and store below — that order is the JVMS §6.5
+    // precedence (NPE → AIOOBE → ASE), and getting it wrong is not theoretical:
+    // `RArrayStoreTiers` s15 caught the interpreter fast path reporting ASE for
+    // a past-the-end index.
     //
-    // W7-37 residual, measured 2026-08-12: **on x64 this arm does not run at
-    // all**, because nothing calls this function. `jit/src/x64/bytecode_walk.rs`
-    // lowers `aastore` (0x53) inline — null check, bounds check, SATB pre-write
-    // barrier, `MOV [array + index*8 + HEADER_SIZE], val`, card mark — and never
-    // reaches `self.helpers.aastore`. The comment at that arm justified the
-    // inline path with "the current `jit_aastore` helper does NOT enforce the
-    // ASE check … no regression"; that premise was true when it was written and
-    // was falsified when this check landed here, silently, because a premise in
-    // a comment is not a compile-time link. `RExceptions`'s tier-parity
-    // assertion reads `cold=[java.lang.Integer] hot=[no-throw]` at i=500 as a
-    // result: the compiled store completes and raises nothing.
+    // The check itself is `jit_aastore_check`, immediately above, and this is
+    // its only in-tree caller today. It was EXTRACTED rather than copied,
+    // because the throughput follow-up (W7-38 §6, nominated) restores the
+    // emitter's inline store and calls that helper directly — and the way this
+    // whole defect arose was one JVMS rule implemented twice, each copy citing
+    // a property of the other that the build could not check. When the emitter
+    // change lands there must still be exactly ONE ArrayStoreException check
+    // and ONE message builder in this crate.
     //
-    // So do NOT read the funnel routing below as "the JIT and the interpreter
-    // now print the same text". They do — but only once the emitter calls this
-    // helper. See docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
-    // §"Part 4" for the codegen change that wires it up.
-    if val != 0 {
-        let vm = &*(vm_ptr as *const SharedVm);
-        let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
-        let value_ref = ObjectRef::from_raw(val as usize as *mut u8);
-        if vm.mem.heap.element_type_of(array_ref) == ArrayElementType::Reference
-            && !crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref)
-        {
-            // Build a real ArrayStoreException and stash it via the pending-
-            // exception channel; the void return cannot carry the `i64::MIN`
-            // deopt sentinel, so the interpreter's post-JIT-return drain
-            // (`take_jit_pending_exception`) routes it through this method's
-            // exception table. Skip the store (no element written on the
-            // exception path). If we cannot obtain a thread or build the
-            // throwable, fall through and perform the store rather than
-            // corrupting VM state (degrades to the pre-fix behaviour only in
-            // that rare construction-failure case).
-            let elem_cls = vm
-                .classes
-                .class_manager
-                .read()
-                .get_class(vm.mem.heap.class_id_of(value_ref))
-                .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            // W7-37 -- raise this through `throw_runtime_error`, the single
-            // funnel every VM-minted `RuntimeError` passes through, instead of
-            // building the throwable here. The funnel is where an
-            // `ArrayStoreException` message is given HotSpot's EXTERNAL class
-            // name; `class.name` above is the INTERNAL one, so minting the
-            // object directly printed `java/lang/Integer` where HotSpot (and
-            // the interpreter's own `aastore`, which does go through the
-            // funnel) print `java.lang.Integer`. A slashed name there is a
-            // real defect and not untidiness: callers regex the message and
-            // feed the capture to `Class.forName`.
-            //
-            // Behaviour on failure is unchanged -- if no thread is available,
-            // or the funnel cannot build the throwable and degrades to an
-            // `InternalError`, we fall through and perform the store rather
-            // than corrupting VM state.
-            if let Some((thread, _guard)) = jit_thread_mut() {
-                use crate::error::MethodCallFailed;
-                if let MethodCallFailed::ExceptionThrown(exc) =
-                    crate::runtime::exceptions::throw_runtime_error(
-                        vm,
-                        thread,
-                        crate::error::RuntimeError::ArrayStoreException { message: elem_cls },
-                    )
-                {
-                    set_jit_pending_exception(thread, exc);
-                    return;
-                }
-            }
-        }
+    // W7-38 (landed): the comment that used to stand here said "on x64 this arm
+    // does not run at all, because nothing calls this function". That was true
+    // when written and is now FALSE — `jit/src/x64/bytecode_walk.rs`'s `0x53`
+    // arm calls `self.helpers.aastore`, so this is a live path in compiled
+    // code. Its twin (the emitter's "the helper does NOT enforce the ASE
+    // check") has been corrected too. If either call is ever removed again,
+    // correct the prose in the same commit: a premise stated in a comment is
+    // not a compile-time link, and this pair of comments spent months
+    // asserting incompatible things about each other.
+    if jit_aastore_check(vm_ptr, array_ptr, val) == i64::MIN {
+        // Refused; an ArrayStoreException is pending on this thread. No
+        // element is written and no barrier runs on the exception path.
+        return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size()) as *mut u8;
     // Task #43 (HIGH soundness, deferred from #25/#26): SATB pre-write
@@ -11415,6 +11518,12 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
 /// `toLowerCase(TURKISH)` call silently changed its answer when its caller
 /// tiered up — the interpreter said `tıtle`, the compiled code `title`.
 ///
+/// That fix was one layer too shallow: the delegate called `string_case_impl`,
+/// BELOW the null-`Locale` check, so `toLowerCase((Locale) null)` threw
+/// interpreted and answered the default-locale string compiled. Measured on
+/// OpenJDK 25.0.3+9, the oracle throws on the 200 000th warm iteration too.
+/// See `docs/known-issues/jdk-only/E18-1-the-jit-facing-string-doors-and-the-fourth-copy-of-one-search-rule.md`.
+///
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     vm_ptr: i64,
@@ -11431,24 +11540,48 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     let Some(source) = vm.mem.heap.is_object_address(source as usize) else {
         return 0;
     };
-    // A null / non-heap Locale means "default locale", exactly as the
-    // interpreted native treats a missing argument.
+    // A `locale` of 0 is an explicit `null` Locale ARGUMENT, not "no argument":
+    // the only descriptor bound to this helper,
+    // `StringLatin1.toLowerCase(Ljava/lang/String;[BLjava/util/Locale;)`, has a
+    // MANDATORY third parameter, so "absent" is not a state this site can be
+    // in. `lang_string::jit_string_to_lower_case` now goes through the same
+    // `string_case_native` the interpreted native does and throws for it —
+    // E18-1 §1. It used to sit one layer below that check and answer the
+    // default-locale string, so the same source line threw while interpreted
+    // and stopped throwing once its caller tiered up.
     let locale_obj = if locale == 0 {
         None
     } else {
-        vm.mem.heap.is_object_address(locale as usize)
+        // A non-zero address the heap does not recognise gets the same
+        // treatment `source` gets six lines above: bail, do not guess.
+        let Some(obj) = vm.mem.heap.is_object_address(locale as usize) else {
+            return 0;
+        };
+        Some(obj)
     };
     let Some((thread, _guard)) = jit_thread_mut() else {
         return 0;
     };
-    let mut ctx = crate::vm::NativeContextImpl {
-        shared: vm,
-        thread: &mut *thread,
+    // Scoped so `thread` can be re-borrowed for the error path below, exactly
+    // as `jit_hashmap_get_direct` does.
+    let outcome = {
+        let mut ctx = crate::vm::NativeContextImpl {
+            shared: vm,
+            thread: &mut *thread,
+        };
+        cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
+            &mut ctx, source, locale_obj,
+        )
     };
-    let Some(result) = cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
-        &mut ctx, source, locale_obj,
-    ) else {
-        return 0;
+    let result = match outcome {
+        Ok(Some(Value::Object(Some(object)))) => object,
+        Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+        Ok(Some(_)) => return 0,
+        // The JDK's NullPointerException for a null Locale arrives here. The
+        // old code could only report it as `None`, i.e. as a null String.
+        Err(error) => {
+            return handle_jit_dispatch_error(vm, thread, error, &STRING_LATIN1_LOWER_DIRECT_INFO)
+        }
     };
     thread.native_pending_return = Some(result);
     result.as_ptr() as i64
@@ -15186,6 +15319,61 @@ mod tests {
         );
     }
 
+    /// `jit_aastore_check`'s three fail-open screens, pinned.
+    ///
+    /// The check-only helper exists so the emitter can restore the inline
+    /// reference store and call out only for the type check (W7-38 §6). Its
+    /// contract is a *defined* return value — `0` = proceed, `i64::MIN` =
+    /// refused with an `ArrayStoreException` pending — and every screen that
+    /// cannot decide must answer `0`. A screen that answered `i64::MIN` on
+    /// "don't know" would drop a legal store AND fabricate an exception, which
+    /// is worse than the defect the helper exists to prevent.
+    ///
+    /// None of these three cases may dereference `vm_ptr`, which is why they
+    /// can be asserted with a null one.
+    #[test]
+    fn jit_aastore_check_fails_open_and_never_derefs_vm_on_the_screens() {
+        // (a) null element: always storable (JVMS §6.5). Returns before
+        // vm_ptr, array_ptr or val is touched.
+        // SAFETY: val == 0 takes the first early return; no pointer is read.
+        assert_eq!(
+            unsafe { jit_aastore_check(0, 0, 0) },
+            0,
+            "a null element must always be storable"
+        );
+
+        // (b) implausible array pointer (1 is not 8-aligned): the caller's own
+        // null check has already run, so this is a stale/garbage word. Fail
+        // open rather than dereference it inside Rust.
+        // SAFETY: `plausible_heap_pointer(1)` is false, so the helper returns
+        // before constructing the `&SharedVm` from the null vm_ptr.
+        assert_eq!(
+            unsafe { jit_aastore_check(0, 1, 0x1234) },
+            0,
+            "an implausible array pointer must fail open, not raise"
+        );
+
+        // (c) a real reference array on a real heap, with no class graph behind
+        // it. Passing the array as its own element keeps `val` a live heap
+        // pointer without a second allocation. This one asserts the WHOLE
+        // helper runs to a "proceed" answer on a degenerate-but-live input:
+        // `aastore_element_assignable` fails open when it cannot resolve the
+        // component (it degrades to `[Ljava/lang/Object;`, which admits every
+        // reference), and even on the refusing branch there is no JIT thread in
+        // a unit-test thread, so the documented no-thread degradation returns
+        // `0` too. Either way the answer must be "store it" — this helper must
+        // never manufacture an ArrayStoreException out of missing information.
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 2);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: `vm_ptr` points at the live `SharedVm` owned by `vm` for the
+        // whole call, and `arr_ptr` is a live reference array on its heap.
+        assert_eq!(
+            unsafe { jit_aastore_check(vm_ptr, arr_ptr, arr_ptr) },
+            0,
+            "an unresolvable component type must fail open (never a false ASE)"
+        );
+    }
+
     // ----------------------------------------------------------------------
     // B1 fix (review `vm-runtime.md`): the array load/store helpers used to
     // silently swallow an out-of-bounds index (load returned a fabricated 0 /
@@ -16468,6 +16656,12 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         iastore: jit_iastore as *const () as usize,
         aaload: jit_aaload as *const () as usize,
         aastore: jit_aastore as *const () as usize,
+        // Check-only companion; see `jit_aastore_check`. ALWAYS wired in
+        // production, so the `0x53` lowering keeps its inline store and the
+        // `x64/driver.rs` `has_dispatch` computation sees the null-check and
+        // bounds-check stubs that arm emits. A `0` here (hand-built test
+        // tables only) routes the whole opcode back to `aastore`.
+        aastore_check: jit_aastore_check as *const () as usize,
         multianewarray_2d: jit_multianewarray_2d as *const () as usize,
         arraylength: jit_arraylength as *const () as usize,
         getfield: jit_getfield as *const () as usize,
@@ -16672,6 +16866,11 @@ const _: () = {
     let _: HelperFnIastore = jit_iastore;
     let _: HelperFnAaload = jit_aaload;
     let _: HelperFnAastore = jit_aastore;
+    // The compile-time link whose ABSENCE permitted the whole W7-38 /
+    // W8-E11-1 family: with this line, changing `jit_aastore_check`'s
+    // signature without the matching `helpers_abi.rs` row is a build error
+    // instead of a comment that quietly stops being true.
+    let _: HelperFnAastoreCheck = jit_aastore_check;
     let _: HelperFnArraylength = jit_arraylength;
 
     // Instance fields.

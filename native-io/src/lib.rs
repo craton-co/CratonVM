@@ -20092,12 +20092,33 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
-    // StandardWatchEventKinds constants. `watch_event_kind_object` prefers the
-    // REAL static constant when the class is present, so `event.kind() ==
-    // StandardWatchEventKinds.ENTRY_CREATE` (an identity comparison — these are
-    // singletons) holds instead of silently failing against a fresh synthetic
-    // stand-in.
-    let kinds = "java/nio/file/StandardWatchEventKinds";
+    // NO `StandardWatchEventKinds` CONSTANTS ARE REGISTERED HERE, and none can
+    // usefully be (E40-1 §2, answering E36-1 N5).
+    //
+    // What stood here until 2026-08-13 was a comment describing four
+    // registrations plus a `let kinds = "java/nio/file/StandardWatchEventKinds";`
+    // binding that nothing read — the mirror of E21-1 §2d's defect. That one
+    // claimed a removal that had not happened; this one claimed a presence that
+    // no longer existed, and cost the same reader-hour.
+    //
+    // The four rows the comment described live in
+    // `native-builtins/src/phases_late/nio_file.rs` (`register_p66_watch_service`),
+    // are field-shaped (`Ljava/nio/file/WatchEvent$Kind;` in the descriptor
+    // slot), and are dead: `getstatic` never consults the native registry in
+    // this VM, and `StandardWatchEventKinds.ENTRY_CREATE` compiles to a real
+    // `getstatic` (measured). They are also type-wrong — each body answers a
+    // `java/lang/String`. E36-1 §4d's verdict on them is DELETE.
+    //
+    // The reader of the constants is `watch_event_kind_object` below, and it
+    // does not go through the registry at all: it reads the class's STATIC
+    // (`static_field_index_by_name` + `get_static_field`), so in real-JDK mode
+    // `event.kind() == StandardWatchEventKinds.ENTRY_CREATE` is an identity
+    // comparison against the JDK's own
+    // `StandardWatchEventKinds$StdWatchEventKind` singleton. Only when that
+    // read comes back empty does it fall back to a synthetic one-field `Kind`
+    // carrying the `EVENT_*` bit. `watch_event_kind_bit` accepts all three
+    // shapes; `watch_event_kind_bit_translates_all_three_kind_shapes` and
+    // `watch_event_kind_object_round_trips_through_the_bit` pin that.
     r.set_category(__prev_cat);
 }
 
@@ -23571,6 +23592,91 @@ mod io_tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // WatchEvent.Kind translation (E40-1, replacing `vm/src/vm/tests.rs`'s
+    // deleted `watch_event_kinds_p66`).
+    //
+    // The three tests above measure the `notify` crate, not this VM. Nothing
+    // in this tree exercised the Kind translation itself, and the test that
+    // *claimed* to — `watch_event_kinds_p66` — drove four dead field-shaped
+    // registrations in another crate and asserted that a `WatchEvent$Kind`
+    // reads back as the java.lang.String "ENTRY_CREATE". Measured on the
+    // oracle (JDK 25.0.3+9-LTS):
+    //
+    //     StandardWatchEventKinds.ENTRY_CREATE.getClass().getName()
+    //       = java.nio.file.StandardWatchEventKinds$StdWatchEventKind
+    //     .name() = "ENTRY_CREATE"   .type() = interface java.nio.file.Path
+    //     (ENTRY_CREATE instanceof String) = false
+    //
+    // so the constant's `name()` — NOT its identity as a String — is the
+    // JDK-guaranteed handle, and `watch_event_kind_bit` is the code that
+    // consumes it.
+    // -------------------------------------------------------------------
+
+    /// All three `Kind` shapes `watch_event_kind_bit` must accept, and the
+    /// one it must reject.
+    #[test]
+    fn watch_event_kind_bit_translates_all_three_kind_shapes() {
+        let mut ctx = MockNativeContext::new();
+
+        // 1. Synthetic one-field Kind: the bit lives in slot 0.
+        let synth = ctx.alloc_object(1);
+        ctx.set_field(synth, 0, Value::Int(EVENT_MODIFY));
+        assert_eq!(
+            watch_event_kind_bit(&mut ctx, synth),
+            EVENT_MODIFY,
+            "synthetic Kind's slot-0 bit was not read; this is the decode that \
+             once yielded mask 0 and filtered out every event forever"
+        );
+
+        // 2. Real JDK `StdWatchEventKind`: no readable instance fields, and
+        //    `name()` is what identifies it. Quoted off the oracle above.
+        let real = ctx.alloc_object(0);
+        let name = ctx.create_string("ENTRY_CREATE");
+        ctx.script(
+            "name",
+            "()Ljava/lang/String;",
+            Ok(Some(Value::Object(Some(name)))),
+        );
+        assert_eq!(
+            watch_event_kind_bit(&mut ctx, real),
+            EVENT_CREATE,
+            "a real Kind must be identified by name(), not by being a String"
+        );
+
+        // 3. Legacy bare-String Kind (the shape the dead
+        //    `StandardWatchEventKinds` rows in `phases_late/nio_file.rs`
+        //    hand out). Accepted, but only via the `read_string` fallback.
+        let legacy = ctx.create_string("ENTRY_DELETE");
+        assert_eq!(watch_event_kind_bit(&mut ctx, legacy), EVENT_DELETE);
+
+        // 4. OVERFLOW is not one of the three entry kinds this VM surfaces,
+        //    so it must translate to 0 rather than to some entry bit.
+        let overflow = ctx.create_string("OVERFLOW");
+        assert_eq!(watch_event_kind_bit(&mut ctx, overflow), 0);
+    }
+
+    /// `watch_event_kind_object` -> `watch_event_kind_bit` is the round trip
+    /// `Path.register` and `detect_events` sit on either side of.
+    #[test]
+    fn watch_event_kind_object_round_trips_through_the_bit() {
+        // The mock's `static_field_index_by_name` answers `None`, so this
+        // exercises the SYNTHETIC arm — the one that runs whenever the real
+        // `StandardWatchEventKinds` statics are unreadable.
+        for bit in [EVENT_CREATE, EVENT_DELETE, EVENT_MODIFY] {
+            let mut ctx = MockNativeContext::new();
+            let obj = match watch_event_kind_object(&mut ctx, bit).unwrap() {
+                Value::Object(Some(o)) => o,
+                other => panic!("kind object for bit {bit} was {other:?}"),
+            };
+            assert_eq!(
+                watch_event_kind_bit(&mut ctx, obj),
+                bit,
+                "kind object for bit {bit} did not translate back"
+            );
+        }
+    }
+
     // ===================================================================
     // Phase 92.3: DatagramChannel (UDP) Tests
     // ===================================================================
@@ -25327,108 +25433,4 @@ mod abs_path_tests {
 /// `BB_FIELD_MARK` is index 4, and index 4 on a real-JDK `java.nio.Buffer` is
 /// `address`, not `mark`. These tests pin the two halves of the fix: mutators
 /// must not disturb an address the object already carries, and every allocator
-/// that hands back a heap-backed buffer must give it one.
-#[cfg(test)]
-mod nio_buffer_address_tests {
-    use super::*;
-    use crate::test_support::MockNativeContext;
-    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
-
-    #[test]
-    fn buf_set_mark_preserves_a_real_jdk_buffer_address() {
-        let mut ctx = MockNativeContext::new();
-        ctx.alias_nio_buffer_fields();
-        let buf = ctx.alloc_object_with_class(8, "java/nio/HeapCharBuffer");
-        // A SLICE: address is arrayBaseOffset + offset * scale, not the bare
-        // base offset, so a fix that rewrites a constant 16 would corrupt it.
-        ctx.set_field_by_name(buf, "address", Value::Long(116));
-
-        buf_set_mark(&mut ctx, buf, -1);
-
-        assert_eq!(
-            ctx.get_field_by_name(buf, "address"),
-            Value::Long(116),
-            "the mark write must not land on `address`"
-        );
-        assert_eq!(ctx.get_field_by_name(buf, "mark"), Value::Int(-1));
-        assert_eq!(
-            ctx.get_field(buf, BB_FIELD_MARK),
-            Value::Int(-1),
-            "the synthetic indexed slot still has to be written"
-        );
-    }
-
-    #[test]
-    fn buf_set_mark_leaves_a_synthetic_buffer_without_an_address() {
-        let mut ctx = MockNativeContext::new();
-        // Synthetic mode: no by-name `address` field exists at all. Nothing
-        // should be fabricated for it.
-        let buf = ctx.alloc_object(BB_NUM_FIELDS);
-
-        buf_set_mark(&mut ctx, buf, 7);
-
-        assert_eq!(ctx.get_field(buf, BB_FIELD_MARK), Value::Int(7));
-        assert_eq!(
-            ctx.get_field_by_name(buf, "address"),
-            Value::Object(None),
-            "no address field means no address write"
-        );
-    }
-
-    #[test]
-    fn buf_set_mark_survives_a_whole_mutator_sequence() {
-        let mut ctx = MockNativeContext::new();
-        ctx.alias_nio_buffer_fields();
-        let buf = ctx.alloc_object_with_class(8, "java/nio/HeapByteBuffer");
-        ctx.set_field_by_name(buf, "address", Value::Long(16));
-
-        // flip / clear / rewind / mark / reset all funnel through buf_set_mark;
-        // before the fix each one of them reset `address` to the mark value.
-        for v in [-1, 5, -1, 0, -1] {
-            buf_set_mark(&mut ctx, buf, v);
-            assert_eq!(
-                ctx.get_field_by_name(buf, "address"),
-                Value::Long(16),
-                "address survives mark={}",
-                v
-            );
-        }
-    }
-
-    #[test]
-    fn allocators_give_every_heap_buffer_family_an_address() {
-        let mut ctx = MockNativeContext::new();
-        ctx.alias_nio_buffer_fields();
-
-        let bb = alloc_byte_buffer(&mut ctx, 32);
-        assert_eq!(ctx.get_field_by_name(bb, "address"), Value::Long(16));
-
-        // The typed families used to skip this entirely, which left `address`
-        // reading as the mark (-1) and made every bulk put throw AIOOBE.
-        for (cls, et) in [
-            ("java/nio/HeapCharBuffer", ArrayElementType::Char),
-            ("java/nio/HeapShortBuffer", ArrayElementType::Short),
-            ("java/nio/HeapIntBuffer", ArrayElementType::Int),
-            ("java/nio/HeapLongBuffer", ArrayElementType::Long),
-            ("java/nio/HeapFloatBuffer", ArrayElementType::Float),
-            ("java/nio/HeapDoubleBuffer", ArrayElementType::Double),
-        ] {
-            let b = alloc_typed_buffer(&mut ctx, cls, et, 16);
-            assert_eq!(
-                ctx.get_field_by_name(b, "address"),
-                Value::Long(16),
-                "{} must carry the array base offset",
-                cls
-            );
-            assert_ne!(
-                ctx.get_field_by_name(b, "address"),
-                Value::Long(-1),
-                "{} must not read back the mark",
-                cls
-            );
-        }
-
-        let mbb = alloc_mapped_byte_buffer(&mut ctx, 32);
-        assert_eq!(ctx.get_field_by_name(mbb, "address"), Value::Long(16));
-    }
-}
+/// that hands back a heap-backed buffer must g

@@ -29,7 +29,27 @@
 //    probe that also depends on invokedynamic reports the union of two
 //    subsystems.
 //
-// Output is one `ok`/`FAIL` line per check plus a final `@@RESULT` line.
+// OUTPUT CONTRACT. One `CK RJdkStringCodePoints <label>=<actual>` line per
+// check, then `CK RJdkStringCodePoints fails=N`, `CK RJdkStringCodePoints
+// checks=N`, then `PASS RJdkStringCodePoints (N checks)`. Every line survives
+// `run.sh`'s extract() filter and nothing is printed on any other prefix.
+//
+// It did not used to. Until 2026-08-13 every check printed `ok <label>=<value>`
+// and the run ended on `@@RESULT checks=186 fails=0`, and extract() keeps ONLY
+// `PASS `/`CK ` lines — so all 187 lines were deleted and the cross-VM diff
+// compared TWO EMPTY STRINGS. All three of the surviving guards fired on the
+// ORACLE: G4 ("exited 0 but printed no PASS line"), G2 ("nothing survives
+// extract()") and G3 (no parseable check count). run.sh's own verdict greps
+// `^PASS RJdkStringCodePoints`, so the vector was scored FAIL on any VM
+// whatsoever, including a correct one. Measured on HotSpot 25.0.3+9: rc=0,
+// 186 checks, fails=0 — the expectations were right all along; only the
+// reporting dialect was wrong. This is precisely the W7-51/W7-60 vacuity shape
+// the guards exist to catch, caught on the vector's first scheduled run.
+//
+// The ACTUAL value goes on the CK line, not a bare `ok`: the two VMs then diff
+// their answers against each other directly, so a wrong answer is red even if
+// this file's own `expected` table were ever wrong. The expected value is
+// appended only when the check fails, for the human reading the log.
 // Every expectation was measured on Microsoft OpenJDK 25.0.3+9, not recalled.
 
 public class RJdkStringCodePoints {
@@ -44,13 +64,16 @@ public class RJdkStringCodePoints {
     static int checks = 0;
     static int fails = 0;
 
+    // The ONE funnel every check goes through, so the prefix is fixed in one
+    // place. `CK ` is not decoration: it is what run.sh's extract() keeps.
     static void eq(String label, String actual, String expected) {
         checks++;
         if (!expected.equals(actual)) {
             fails++;
-            System.out.println("FAIL " + label + " expected=" + expected + " actual=" + actual);
+            System.out.println("CK RJdkStringCodePoints " + label + "=" + actual
+                    + " WRONG-expected=" + expected);
         } else {
-            System.out.println("ok   " + label + "=" + actual);
+            System.out.println("CK RJdkStringCodePoints " + label + "=" + actual);
         }
     }
 
@@ -572,9 +595,21 @@ public class RJdkStringCodePoints {
         unicodeVersionSkew();
         sweep();
         regionMatches();
-        System.out.println("@@RESULT checks=" + checks + " fails=" + fails);
+        // `fails` first and on its own line: harness_check_count reads the
+        // REST OF THE LINE after `checks=`, so a combined
+        // `CK ... checks=186 fails=0` yields the count "186 fails=0" and G3's
+        // `[ "$count" -eq 0 ]` test then errors out invisibly instead of
+        // comparing a number. One value per line.
+        System.out.println("CK RJdkStringCodePoints fails=" + fails);
+        System.out.println("CK RJdkStringCodePoints checks=" + checks);
         if (fails != 0) {
             throw new RuntimeException(fails + " String code-point/intrinsic checks failed");
         }
+        // Last, and only on the clean path: run.sh treats this line as the
+        // vector's verdict. The `@@RESULT` line this replaces was invisible to
+        // extract() and to every consumer — nothing under regression-suite/
+        // parses `@@RESULT`; the app-suite runners that do (apps/hib-suite-runner)
+        // never run this class.
+        System.out.println("PASS RJdkStringCodePoints (" + checks + " checks)");
     }
 }
