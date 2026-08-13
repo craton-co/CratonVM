@@ -111,7 +111,10 @@ occasional NPE from the crossed slot, heap-size independence (8 GB BT12 was
 deterministically wrong with ~no GCs at all), corruption of even 30-node
 d=4 trees no GC could intersect, `--nojit` exact (interpreter is
 self-consistently legacy through the same G1 accessors), Gen exact (its
-accessors are compact-aware), ZGC exact (no TLABs → no compact marking),
+accessors are compact-aware), ZGC exact (no TLABs → no compact marking — true on 2026-07-10, and NOT a
+standing property: ZGC grew its own TLABs on 2026-08-08 and its accessors are
+compact-aware today, so this arm's exactness now rests on the accessors, not on
+the absence of a TLAB),
 and `CRATONVM_COMPACT_REF_FIELDS=0` exact. Diagnosed by proving the G1 and
 Gen disasm of `make`/`check` byte-identical (CRATONVM_DBG_JIT_DISASM), then
 a minimal probe (`gcprobes-0710/G1Probe.java`) showing JIT'd `chk()` reading

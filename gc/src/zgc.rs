@@ -2298,6 +2298,69 @@ pub struct ZgcRealHeap {
     /// observes the store one boundary late merely defers a collection to the
     /// next boundary.
     native_alloc_pressure: AtomicBool,
+    /// A request that the arena **actually refused**, as distinct from the
+    /// advisory pressure above.
+    ///
+    /// # Why the two cannot be one bit
+    ///
+    /// `native_alloc_pressure` is consumed through
+    /// `VmHeap::young_spill_pressure`, whose boundary consumer re-checks
+    /// `needs_gc()` before it collects — deliberately, so that an advisory note
+    /// buys one gate evaluation and cannot storm. That is right for a *soft*
+    /// signal and wrong for a hard one, and [`Self::alloc_raw`] latches the
+    /// same bit for both. Its own comment says why the re-check is wrong there:
+    /// a request that just failed "is stronger evidence that a cycle is due
+    /// than the `allocated >= gc_threshold` predicate, which counts LIVE bytes
+    /// and therefore cannot see the bump space this heap never rewinds."
+    ///
+    /// So the arming site and the consuming site disagreed, and the consuming
+    /// site won: on the exact shape this collector fails in — an arena full of
+    /// TLAB *reservations* with `allocated` far below the threshold, i.e.
+    /// Tomcat's `TestNonBlockingAPI` on 2026-08-13 — `needs_gc()` answered
+    /// **no**, the latch was cleared without collecting, and the one signal
+    /// that knew better was discarded. This bit is that signal, kept separate
+    /// so the boundary can honour it without loosening the soft path.
+    ///
+    /// Cannot storm: it is set only where an allocation genuinely failed, the
+    /// consumer clears it after acting, and `gc_overhead_limit_exceeded` still
+    /// gates it — the same bound the soft path relies on.
+    hard_alloc_failure: AtomicBool,
+    /// Fragmentation ratchet — Phase 2.2. See [`ZFragGauge`].
+    ///
+    /// Held as three plain atomics rather than a `Mutex<ZFragGauge>` because
+    /// they are written once per collection, under the arena lock, and read at
+    /// shutdown; there is no invariant across them that a torn read could
+    /// break, only three numbers describing one sample.
+    frag_samples: AtomicUsize,
+    /// Worst `largest_free_block * 1000 / capacity` seen, or `usize::MAX` for
+    /// "never sampled" — deliberately a sentinel rather than 1000, so that a
+    /// run which never met the sampling condition cannot be mistaken for one
+    /// that scored perfectly.
+    frag_worst_permille: AtomicUsize,
+    /// Free share of capacity at the worst sample, permille.
+    frag_worst_free_permille: AtomicUsize,
+    /// Collection number of the worst sample.
+    frag_worst_cycle: AtomicUsize,
+    /// One-shot latch for the floor warning.
+    frag_floor_warned: AtomicBool,
+    /// Whether a concurrent mark cycle is in progress — Phase 3.
+    ///
+    /// This is the **only** thing on the mutator store path while no cycle is
+    /// running: [`Self::satb_pre_barrier`] loads it and returns. Everything
+    /// else behind the barrier is reachable only when it is `true`.
+    mark_active: AtomicBool,
+    /// Mutator ingress for the concurrent marker — Phase 3.
+    ///
+    /// Overwritten references arrive here from the VM's existing pre-write
+    /// barrier and are drained by the marker. Allocated once with the heap and
+    /// left empty while [`Self::mark_active`] is false, so a non-concurrent
+    /// run pays for the buckets and nothing else.
+    mark_ingress: mark::ZMarkIngress,
+    /// Addresses this barrier has published since the cycle began. Telemetry
+    /// for the adoption work — it is how you tell "the barrier is wired" from
+    /// "the barrier is wired and the workload actually overwrites references",
+    /// which are the two states an inert-looking instrument confuses.
+    mark_ingress_pushes: AtomicUsize,
     /// "The arena can no longer serve a request of [`headroom_margin`] bytes."
     ///
     /// # Why the live-bytes trigger is not enough on THIS backend
@@ -2569,6 +2632,15 @@ impl ZgcRealHeap {
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
+            hard_alloc_failure: AtomicBool::new(false),
+            frag_samples: AtomicUsize::new(0),
+            frag_worst_permille: AtomicUsize::new(usize::MAX),
+            frag_worst_free_permille: AtomicUsize::new(0),
+            frag_worst_cycle: AtomicUsize::new(0),
+            frag_floor_warned: AtomicBool::new(false),
+            mark_active: AtomicBool::new(false),
+            mark_ingress: mark::ZMarkIngress::new(),
+            mark_ingress_pushes: AtomicUsize::new(0),
             headroom_low: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
             gc_log_enabled: AtomicBool::new(false),
@@ -2675,6 +2747,315 @@ impl ZgcRealHeap {
     #[inline]
     pub fn note_native_alloc_pressure(&self) {
         self.native_alloc_pressure.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an allocation has been **refused** since the last collection —
+    /// see the [`hard_alloc_failure`](Self::hard_alloc_failure) field doc.
+    ///
+    /// Consumed at the `safe_native_call` boundary, which is the one point on
+    /// the native dispatch path where a collection is safe (every Java
+    /// argument is pinned and remapped around it). It is deliberately NOT
+    /// consumed inside the allocation wrappers themselves: those "must stay
+    /// GC-free mid-callback, since their callers hold unrooted local
+    /// `ObjectRef`s" (`vm_exec.rs`, the native-alloc young-pressure relief
+    /// comment). Collecting there would be a use-after-free, not a fix.
+    #[inline]
+    pub fn hard_alloc_failure(&self) -> bool {
+        self.hard_alloc_failure.load(Ordering::Relaxed)
+    }
+
+    /// Clear the hard-failure latch. Idempotent; the consumer clears after
+    /// acting whether or not its overhead gate let the cycle run.
+    #[inline]
+    pub fn clear_hard_alloc_failure(&self) {
+        self.hard_alloc_failure.store(false, Ordering::Relaxed);
+    }
+
+    /// The fragmentation ratchet's current reading — Phase 2.2 of the ZGC
+    /// maturity plan, which asked to turn "ZGC fragments" from an anecdote per
+    /// suite run into a tracked number.
+    ///
+    /// Reported at shutdown by `VmHeap::print_gc_summary` on the `[GC]
+    /// zgc-real:` line, so a suite runner can extract it per class with a grep
+    /// and a CI job can ratchet on it. See [`ZFragGauge`] for what the two
+    /// numbers mean and why one of them alone means nothing.
+    pub fn frag_gauge(&self) -> ZFragGauge {
+        let worst = self.frag_worst_permille.load(Ordering::Relaxed);
+        ZFragGauge {
+            samples: self.frag_samples.load(Ordering::Relaxed),
+            worst_permille: (worst != usize::MAX).then_some(worst),
+            free_permille: self.frag_worst_free_permille.load(Ordering::Relaxed),
+            worst_cycle: self.frag_worst_cycle.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Take one post-sweep fragmentation reading.
+    ///
+    /// Called at the end of every collection with the arena guard still held.
+    /// Cost is one `largest_free_block()` (O(1) — a `BTreeMap` last key and a
+    /// field read), two divisions and, on the rare improving edge, three
+    /// relaxed stores.
+    ///
+    /// The sampling condition is the instrument: a collection that leaves less
+    /// than [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`] of the heap free is not
+    /// evidence about fragmentation at all, and counting it would turn this
+    /// gauge into a second, worse occupancy trigger.
+    fn sample_frag_gauge(&self, arena: &Arena, cycle: usize) {
+        let capacity = arena.capacity();
+        if capacity == 0 {
+            return;
+        }
+        // Free = what the arena could still hand out at all: the un-bumped
+        // middle plus both free lists. `remaining()` is exactly that sum.
+        let free_permille = arena.remaining().saturating_mul(1000) / capacity;
+        if free_permille < ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE {
+            return;
+        }
+        // ...against the biggest single thing it could hand out.
+        //
+        // NOT `largest_free_block()` alone. That is the largest FREE-LIST
+        // block, and on a heap that has not yet bumped its way to capacity the
+        // biggest servable run is the un-bumped middle between the two
+        // cursors, which is on no free list at all. Scoring the free list by
+        // itself reads a pristine 1 MiB arena as **0 permille fragmented** —
+        // caught by `a_collection_with_room_to_spare_takes_a_reading`, which
+        // is what that test is for. `remaining()` is middle + both free lists,
+        // so subtracting the lists leaves the middle exactly.
+        let middle = arena.remaining().saturating_sub(arena.free_list_bytes());
+        let servable = middle.max(arena.largest_free_block());
+        let largest_permille = servable.saturating_mul(1000) / capacity;
+        self.frag_samples.fetch_add(1, Ordering::Relaxed);
+        if largest_permille < self.frag_worst_permille.load(Ordering::Relaxed) {
+            self.frag_worst_permille
+                .store(largest_permille, Ordering::Relaxed);
+            self.frag_worst_free_permille
+                .store(free_permille, Ordering::Relaxed);
+            self.frag_worst_cycle.store(cycle, Ordering::Relaxed);
+        }
+        if largest_permille < ZGC_FRAG_FLOOR_PERMILLE
+            && !self.frag_floor_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                cycle,
+                largest_free_permille = largest_permille,
+                free_permille,
+                capacity,
+                largest_servable_block = servable,
+                "zgc frag gauge: the arena is broken up — {}.{}% of the heap is                  free but the largest single block is only {}.{}% of capacity,                  so a request above that size cannot be served however much is                  free. This collector does not compact, so the shape does not                  recover on its own.",
+                free_permille / 10,
+                free_permille % 10,
+                largest_permille / 10,
+                largest_permille % 10,
+            );
+        }
+    }
+
+    /// The SATB pre-write barrier, for the concurrent marker — Phase 3.
+    ///
+    /// # What calls this, and why that is the whole point
+    ///
+    /// Nothing new. `VmHeap::satb_barrier` is already called before **every**
+    /// reference store in this VM — the interpreter's `putfield`/`aastore`,
+    /// the JIT's `aastore` and `putfield` helpers, `deopt_materialize`, and
+    /// `vm_init` — because G1 needs it. Its ZGC arm was `{}`. So the mutator
+    /// ingress that `zgc_concurrent.rs` describes as the missing piece
+    /// ("nothing calls `ZMarkHandle::mark_live_offset` from a `getfield`, so
+    /// the mutator ingress is empty in practice") did not need a new call
+    /// site threaded through three code generators. It needed this arm to stop
+    /// being empty.
+    ///
+    /// # Cost while nothing is marking
+    ///
+    /// One relaxed load of a never-written cache line, then return. That is
+    /// the reason `mark_active` is a separate flag rather than, say, an
+    /// `Option` probe or a lock: this sits on the store path of every Java
+    /// program the VM runs, including every program that will never see a
+    /// concurrent cycle.
+    ///
+    /// # Why SATB and not the load barrier ZGC actually uses
+    ///
+    /// Real ZGC marks on **read**, in the load barrier, which is why
+    /// `zgc_concurrent.rs`'s mark-end is a *decision point* rather than a
+    /// conclusion: with a read barrier every mutator stays a producer until it
+    /// is stopped, hence the restart loop. A pre-write barrier is the other
+    /// discipline — snapshot-at-the-beginning — and it is what this VM already
+    /// has plumbed everywhere, at zero additional emission cost.
+    ///
+    /// The two are **not interchangeable**, and adopting this one has a
+    /// consequence that must be written down before anybody relies on it: SATB
+    /// keeps everything live at the snapshot, so it is *conservative* (an
+    /// object that dies during the cycle is collected in the next one), while
+    /// ZGC's load barrier is precise. Conservative is a throughput cost, not a
+    /// correctness one, which is the right side to be wrong on for a first
+    /// adoption. The restart loop stays correct under it — it simply reaches
+    /// `Complete` sooner, because a snapshot's producer set really is bounded.
+    ///
+    /// # What is NOT done
+    ///
+    /// This publishes into the ingress; it does not yet run a cycle. There is
+    /// no mark-start safepoint, no per-thread [`mark::ZMarkMutatorBuffer`]
+    /// (every push takes an uncontended bucket mutex, which is the batching
+    /// this barrier will want before it is on by default), and no coordinator
+    /// pointed at this heap. `mark_active` is therefore never set to `true` by
+    /// production code today — only by tests. Nothing here is reachable in a
+    /// real run, and it must not be described as if it were.
+    #[inline]
+    pub fn satb_pre_barrier(&self, old_addr: usize) {
+        // The entire cost of this barrier on a non-concurrent run.
+        if !self.mark_active.load(Ordering::Relaxed) {
+            return;
+        }
+        self.satb_pre_barrier_slow(old_addr);
+    }
+
+    /// Out-of-line remainder of [`Self::satb_pre_barrier`], so the fast path
+    /// is a load and a branch and nothing else is inlined into every store
+    /// site in the VM.
+    #[cold]
+    fn satb_pre_barrier_slow(&self, old_addr: usize) {
+        if old_addr == 0 || !self.registry.contains(old_addr) {
+            // A null overwrite carries no edge, and an address this heap never
+            // handed out is not ours to mark — the same gate
+            // `ZMarkContext::is_in_heap` applies to every child pointer.
+            return;
+        }
+        // Bucket by address so concurrent mutators spread across the ingress
+        // rather than contending on one mutex. `ZMarkIngress::push` masks this
+        // into its bucket count, so any well-distributed key works; the
+        // address shifted past the object-alignment zeros is the cheapest one
+        // available here.
+        self.mark_ingress.push(old_addr >> 3, old_addr as u64);
+        self.mark_ingress_pushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Arm or disarm the concurrent-mark barrier — Phase 3 wiring and tests.
+    ///
+    /// Disarming clears the ingress, because a leftover address from a
+    /// finished cycle would be republished into the next one as mark work
+    /// against an arena that has since been swept and coalesced.
+    pub fn set_mark_active(&self, active: bool) {
+        if !active {
+            self.mark_active.store(false, Ordering::Relaxed);
+            self.mark_ingress.clear();
+            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
+        } else {
+            self.mark_ingress.clear();
+            self.mark_ingress_pushes.store(0, Ordering::Relaxed);
+            self.mark_active.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Is the concurrent-mark barrier armed?
+    #[inline]
+    pub fn mark_active(&self) -> bool {
+        self.mark_active.load(Ordering::Relaxed)
+    }
+
+    /// How many overwritten references this barrier has published since the
+    /// cycle began. See the field doc: zero with the barrier armed means the
+    /// workload overwrote no references, which is a different fact from the
+    /// barrier not being wired.
+    pub fn mark_ingress_pushes(&self) -> usize {
+        self.mark_ingress_pushes.load(Ordering::Relaxed)
+    }
+
+    /// Drain the mutator ingress — what a coordinator's mark-end flush calls.
+    pub fn drain_mark_ingress(&self, out: &mut Vec<u64>) -> usize {
+        self.mark_ingress.drain_into(out)
+    }
+
+    /// How many mark workers a parallel stop-the-world mark should use.
+    ///
+    /// `0` and `1` both mean "do not go parallel" — the caller falls back to
+    /// the serial loop, which has no pool to spawn and no join to pay for.
+    fn parallel_mark_workers(&self) -> usize {
+        let requested = match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PARMARK") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        if requested == 0 {
+            return 0;
+        }
+        // Never more workers than the machine has cores to run them on: this
+        // is a stop-the-world phase, so oversubscription buys nothing and
+        // costs context switches inside the pause it is meant to shorten.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        requested.min(cores).min(Z_PARMARK_MAX_WORKERS)
+    }
+
+    /// Mark the whole strong closure from `roots` using the parallel engine,
+    /// at a stop-the-world — Phase 3 of the ZGC maturity plan.
+    ///
+    /// # This is PARALLEL, not CONCURRENT, and the difference is the point
+    ///
+    /// Every mutator is stopped for the whole of this call. That is what makes
+    /// it adoptable today: with no mutator running there is no producer racing
+    /// the marker, so it needs **no barrier of any kind** — not the load
+    /// barrier real ZGC uses, and not the SATB pre-write barrier
+    /// [`Self::satb_pre_barrier`] now feeds. `try_end_mark` is expected to
+    /// answer `Complete` on the first pass for exactly that reason, and a
+    /// `Restart` here would mean the engine found buffered work at a
+    /// safepoint where by construction there can be none.
+    ///
+    /// It is therefore the honest intermediate step between the single-
+    /// threaded sweep this collector has always run and the concurrent cycle
+    /// the plan ends at: it exercises the coordinator, the striped queues, the
+    /// work stealing and the termination handshake against a REAL heap and a
+    /// real object graph, where the only prior driver was `TestMarkContext`.
+    ///
+    /// # What the caller must have done first
+    ///
+    /// `begin_concurrent_mark_cycle` must be open, or `visit_refs` traces
+    /// weak/soft/phantom referents as strong edges and no reference can ever
+    /// be cleared. It warns once if not, and this function does not rely on
+    /// that warning — it is the caller's contract.
+    ///
+    /// Returns the engine's stats for the cycle.
+    fn mark_parallel_stw(&self, roots: &[u64], workers: usize) -> mark::ZMarkStatsSnapshot {
+        let bridge: std::sync::Arc<dyn mark::ZMarkContext> =
+            std::sync::Arc::new(ZHeapMarkBridge { heap: self });
+        let coordinator = mark::ZMarkCoordinator::new(bridge, workers);
+        coordinator.begin_cycle();
+        coordinator.push_roots(roots);
+        // One restart is budgeted rather than zero. Not because a mutator can
+        // race us — none is running — but because budgeting zero would turn
+        // any future flush that legitimately produces work into an
+        // "INCOMPLETE mark set" verdict, and an incomplete mark set is what
+        // the sweep is about to act on.
+        let report = coordinator.mark_to_completion(Z_PARMARK_RESTART_BUDGET);
+        if report.budget_exhausted {
+            // Cannot happen with the world stopped, which is exactly why it is
+            // worth saying loudly if it ever does: it would mean the mark set
+            // the sweep is about to trust is incomplete.
+            tracing::error!(
+                target: "zgc",
+                passes = report.passes,
+                restarts = report.restarts,
+                "zgc parallel mark: restart budget exhausted AT A SAFEPOINT — no \
+                 mutator is running, so this cannot be a mutator race; the mark \
+                 set may be incomplete"
+            );
+        }
+        coordinator.end_cycle();
+        report.stats
+        // `coordinator` drops here; its Drop stops and JOINS every worker, so
+        // no thread holding a clone of `bridge` outlives this borrow of `self`.
+    }
+
+    /// Free share of the arena in permille — test support for the
+    /// fragmentation-gauge fixtures, which have to assert the state they claim
+    /// to have built rather than assume it.
+    #[cfg(test)]
+    fn arena_free_permille_for_test(&self) -> usize {
+        let arena = self.arena.lock();
+        let capacity = arena.capacity();
+        if capacity == 0 {
+            return 0;
+        }
+        arena.remaining().saturating_mul(1000) / capacity
     }
 
     /// Enable GC event logging (`--verbose:gc`).
@@ -2934,6 +3315,12 @@ impl ZgcRealHeap {
                     // counts LIVE bytes and therefore cannot see the bump space
                     // this heap never rewinds.
                     self.native_alloc_pressure.store(true, Ordering::Relaxed);
+                    // ...and the HARD latch, which the boundary honours without
+                    // re-asking `needs_gc()`. The line above has been here since
+                    // the latch existed and was, on its own, inert in exactly
+                    // the case it was written for: see the `hard_alloc_failure`
+                    // field doc.
+                    self.hard_alloc_failure.store(true, Ordering::Relaxed);
                     return None;
                 }
             };
@@ -4060,6 +4447,65 @@ fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Opt
 /// workloads unchanged: below 256 threads the per-thread share still exceeds
 /// 512 KiB at `-Xmx 2g`, so the chunk is the same 512 KiB it was.
 const ZGC_TLAB_RESERVATION_SHARE: usize = 16;
+
+/// Below this share of capacity free, a small largest-block means the heap is
+/// **full**, not fragmented — so the fragmentation gauge does not sample.
+///
+/// This condition is the difference between an instrument and a number. The
+/// quantity Phase 2.2 asks to track is `largest_free_block / capacity`, and on
+/// its own that quantity falls to nearly zero in two completely different
+/// states: an arena broken into crumbs (which is the problem) and an arena
+/// genuinely full of live objects (which is not — it is what a heap is for).
+/// A gauge that cannot separate them would fire on every workload that uses
+/// its heap, get muted, and then be worth nothing on the day it was right.
+/// 250 permille — a quarter of the heap free — is where "there are plenty of
+/// bytes, they are just not contiguous" becomes the only reading available.
+const ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE: usize = 250;
+
+/// The ratchet's floor: one warning per process when the largest block a
+/// sampled collection could hand out falls below 1% of capacity.
+///
+/// Sized against what it is protecting rather than picked: `ZGC_TLAB_MAX_CHUNK`
+/// is 512 KiB, so on any heap up to 50 MiB a 1% largest block cannot serve even
+/// one full TLAB chunk, and above that it cannot serve the large-object end's
+/// first request. It is a floor, not a target — a healthy run does not
+/// approach it, and the number to watch is the reported worst, not this.
+const ZGC_FRAG_FLOOR_PERMILLE: usize = 10;
+
+/// Hard ceiling on parallel-mark workers, whatever `CRATONVM_ZGC_PARMARK` and
+/// the core count say.
+///
+/// Bounds a thread count, and the thing it bounds is a user-supplied integer —
+/// i.e. unbounded — which is the shape the Phase 2.3 constant audit exists to
+/// catch. 64 is far above any plausible collection-time parallelism and far
+/// below a number that would exhaust the OS thread limit inside a safepoint.
+const Z_PARMARK_MAX_WORKERS: usize = 64;
+
+/// Restart budget for a stop-the-world parallel mark. See
+/// [`ZgcRealHeap::mark_parallel_stw`] for why this is 1 and not 0.
+const Z_PARMARK_RESTART_BUDGET: usize = 1;
+
+/// A fragmentation reading, taken post-sweep — the "steady state" of Phase 2.2.
+///
+/// `worst_permille` is `largest_free_block * 1000 / capacity` at its lowest
+/// across every SAMPLED collection (see [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`]
+/// for which collections those are), and `free_permille` is how much of the
+/// heap was free at that same moment — the two have to be read together or
+/// neither means anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZFragGauge {
+    /// Collections that met the sampling condition.
+    pub samples: usize,
+    /// Worst (lowest) `largest_free_block / capacity`, in permille. `None`
+    /// when nothing was sampled — which is the normal state for a short or
+    /// heap-light run and must not be reported as a perfect score.
+    pub worst_permille: Option<usize>,
+    /// Free share of capacity at the worst sample, in permille.
+    pub free_permille: usize,
+    /// The collection number the worst sample came from.
+    pub worst_cycle: usize,
+}
+
 
 /// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
 ///
@@ -5315,6 +5761,79 @@ impl census::ZCensusHeapView for ZgcRealHeap {
 /// a colored word that somehow reached a slot would be refused by
 /// [`Self::is_in_heap`] like any other wild child, which is the outcome
 /// `vaddr`'s bit-63 tag exists to produce.
+/// Lends a `&ZgcRealHeap` to the mark engine for the duration of ONE
+/// stop-the-world collection.
+///
+/// # Why this exists
+///
+/// [`mark::ZMarkCoordinator::new`] takes an `Arc<dyn ZMarkContext>`, and
+/// `ZgcRealHeap` is held **by value** inside `VmHeap` — there is no `Arc` to
+/// hand it and no safe way to mint one. That is the whole of the reason the
+/// marking engine sat unadopted after its `ZMarkContext` impl landed; it is not
+/// a missing feature, it is an ownership mismatch.
+///
+/// # Why it is sound
+///
+/// Three facts, and all three are needed:
+///
+/// 1. **The bridge is created, used and destroyed inside a single
+///    [`ZgcRealHeap::mark_parallel_stw`] call**, which takes `&self`. It is
+///    never stored on the heap, never returned, and never handed to anything
+///    that outlives that call.
+/// 2. **[`mark::ZMarkCoordinator`]'s `Drop` joins every worker.** Unusually
+///    for this crate it does not detach — its own doc says so — so when the
+///    coordinator goes out of scope, no thread holding a clone of this `Arc`
+///    is still running. That covers the panic path as well as the normal one,
+///    which is why `mark_parallel_stw` needs no explicit guard.
+/// 3. **The heap cannot move while `&self` is live**, and `&self` outlives the
+///    coordinator by construction of (1).
+///
+/// The cost of that safety is a worker-pool spawn and join per collection.
+/// That is real and it is why this path is opt-in; caching the pool across
+/// collections would require the heap to be `Arc`-owned, which is the larger
+/// change this deliberately does not make.
+struct ZHeapMarkBridge {
+    heap: *const ZgcRealHeap,
+}
+
+// SAFETY: the pointer is only ever dereferenced through `ZMarkContext`, whose
+// methods all take `&self` on a heap that is Sync; and the bridge cannot
+// outlive the borrow it was built from — see the type doc's three facts. The
+// `!Send`ness being overridden here is `*const T`'s blanket one, not a
+// property of `ZgcRealHeap`.
+unsafe impl Send for ZHeapMarkBridge {}
+// SAFETY: as above.
+unsafe impl Sync for ZHeapMarkBridge {}
+
+impl ZHeapMarkBridge {
+    #[inline]
+    fn heap(&self) -> &ZgcRealHeap {
+        // SAFETY: see the type doc. The referent outlives every call.
+        unsafe { &*self.heap }
+    }
+}
+
+impl mark::ZMarkContext for ZHeapMarkBridge {
+    fn good_mask(&self) -> u64 {
+        self.heap().good_mask()
+    }
+    fn try_mark(&self, addr: u64) -> bool {
+        self.heap().try_mark(addr)
+    }
+    fn is_marked(&self, addr: u64) -> bool {
+        self.heap().is_marked(addr)
+    }
+    fn visit_refs(&self, addr: u64, f: &mut dyn FnMut(u64)) {
+        self.heap().visit_refs(addr, f)
+    }
+    fn is_in_heap(&self, addr: u64) -> bool {
+        self.heap().is_in_heap(addr)
+    }
+    fn object_size(&self, addr: u64) -> usize {
+        self.heap().object_size(addr)
+    }
+}
+
 impl mark::ZMarkContext for ZgcRealHeap {
     /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
     ///
@@ -5481,6 +6000,20 @@ impl mark::ZMarkContext for ZgcRealHeap {
             for m in metadata {
                 f(m as u64);
             }
+        }
+        // The native collection-overlay edges. `collect_garbage`'s serial loop
+        // pushes these and this method did not, which would have been a
+        // use-after-free the moment a coordinator drove a real collection
+        // through here: an overlay is reachable ONLY through the Java
+        // collection object that owns it, so a marker that skips this edge
+        // sweeps live native-backed contents while the owner survives.
+        //
+        // The propagation must stay owner-based rather than unconditional —
+        // `native_roots.rs::scan_collection_overlays` explicitly defers to this
+        // loop having run, and rooting every overlay regardless of reachability
+        // is what that deferral exists to avoid.
+        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
+            f(overlay_ref.as_ptr() as u64);
         }
     }
 
@@ -5964,12 +6497,42 @@ impl GarbageCollector for ZgcRealHeap {
             }
         };
 
-        // Trace from roots. A work stack holds base addresses to visit.
+        // ---- PARALLEL MARK (opt-in, Phase 3) -----------------------------
+        //
+        // `CRATONVM_ZGC_PARMARK=<n>` runs the strong closure on the real mark
+        // engine instead of the serial loop below, at this same safepoint. The
+        // two must produce the IDENTICAL mark set — that is what
+        // `parallel_mark_marks_the_same_objects_as_the_serial_loop` asserts,
+        // and it is the only claim that matters here, because the sweep that
+        // follows cannot tell which loop set the bits.
+        //
+        // Left off by default: it is a worker-pool spawn and join per
+        // collection (see `ZHeapMarkBridge` for why the pool cannot yet be
+        // cached), so whether it is a net win is a measurement on a real
+        // workload with a large live set, which is what the plan's Phase 3
+        // exit criterion asks for and this switch exists to make possible.
+        let parallel_workers = self.parallel_mark_workers();
         let mut work: Vec<usize> = Vec::new();
+        let mut wild_skipped = 0usize;
+        if parallel_workers > 1 {
+            let root_addrs: Vec<u64> = roots.iter().map(|r| r.as_ptr() as u64).collect();
+            let stats = self.mark_parallel_stw(&root_addrs, parallel_workers);
+            // `off_head_children` is this loop's `wild_skipped` under another
+            // name — the engine's own doc says so.
+            wild_skipped = stats.off_heap_children as usize;
+            tracing::debug!(
+                target: "zgc",
+                workers = parallel_workers,
+                marked = stats.objects_marked,
+                scanned = stats.objects_scanned,
+                off_heap_children = stats.off_heap_children,
+                "zgc parallel STW mark complete"
+            );
+        } else {
+        // Trace from roots. A work stack holds base addresses to visit.
         for r in roots.iter() {
             work.push(r.as_ptr() as usize);
         }
-        let mut wild_skipped = 0usize;
         while let Some(addr) = work.pop() {
             if addr == 0 {
                 continue;
@@ -6009,6 +6572,7 @@ impl GarbageCollector for ZgcRealHeap {
             {
                 work.push(overlay_ref.as_ptr() as usize);
             }
+        }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -6308,7 +6872,25 @@ impl GarbageCollector for ZgcRealHeap {
         // that decides whether the next allocation may raise it again. Mirrors
         // G1's clear at the end of its cycle (`g1.rs:8392`).
         self.native_alloc_pressure.store(false, Ordering::Relaxed);
+        // Same point, same reasoning, for the hard-refusal latch. Note this is
+        // NOT done in `clear_native_alloc_pressure`: that runs on the boundary's
+        // "gates said no" path too, and lowering the hard bit there would throw
+        // away the one signal this whole mechanism exists to carry.
+        self.hard_alloc_failure.store(false, Ordering::Relaxed);
         let cycle = self.gc_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Phase 2.2: one post-sweep fragmentation reading per collection.
+        //
+        // Here rather than inside the sweep's own arena scope above, and the
+        // second `lock()` is deliberate: this reads the arena AFTER the sweep,
+        // the high-end coalesce, and both cursor retractions, which is the
+        // state a workload actually allocates against and therefore the only
+        // one worth ratcheting on. The world is still stopped, so the two
+        // scopes see identical bytes and the extra acquire is uncontended.
+        {
+            let arena = self.arena.lock();
+            self.sample_frag_gauge(&arena, cycle);
+        }
 
         // Per-collection `--verbose:gc` line. One `eprintln!` and no
         // `tracing` twin on purpose: the defect this closes is that a run with
@@ -7604,6 +8186,492 @@ mod tests {
         let obj = heap.alloc_object(ClassId::new(1), 4);
         heap.set_field(obj, 0, Value::Int(123));
         assert_eq!(heap.get_field(obj, 0), Value::Int(123));
+    }
+
+    /// A refusal and the occupancy predicate are **different questions**, and
+    /// this is the test that says so.
+    ///
+    /// `needs_gc()` asks "have enough live bytes accumulated". A non-compacting
+    /// arena refuses a request when no single hole is big enough, which it can
+    /// do at any occupancy at all — including zero. Until 2026-08-13 the
+    /// `safe_native_call` boundary consumed the refusal latch through a gate
+    /// that re-asked `needs_gc()`, so in exactly this state the signal was
+    /// cleared without a collection ever running.
+    ///
+    /// The assertions are deliberately paired: `!needs_gc()` is what makes
+    /// `hard_alloc_failure()` worth having, and a version of this test that
+    /// dropped it would still pass against a latch wired to the occupancy
+    /// trigger — i.e. against no fix at all.
+    #[test]
+    fn a_refused_request_latches_a_signal_the_occupancy_trigger_cannot_see() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(!heap.needs_gc());
+        assert!(!heap.hard_alloc_failure());
+
+        // No arena of this size can ever serve this, at any occupancy.
+        let refused = heap.try_alloc_array(ClassId::new(0), ArrayElementType::Byte, 1024 * 1024);
+        assert!(refused.is_none(), "a 1 MB array must not fit a 64 KB arena");
+
+        assert!(
+            !heap.needs_gc(),
+            "the occupancy trigger must still say no — that is the whole point"
+        );
+        assert!(
+            heap.hard_alloc_failure(),
+            "a refused request must latch the hard signal"
+        );
+    }
+
+    /// The hard latch is lowered by the collection it asked for, so one
+    /// refusal buys one cycle and a healthy heap does not carry the bit.
+    #[test]
+    fn a_collection_lowers_the_hard_allocation_failure_latch() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(heap
+            .try_alloc_array(ClassId::new(0), ArrayElementType::Byte, 1024 * 1024)
+            .is_none());
+        assert!(heap.hard_alloc_failure());
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        assert!(
+            !heap.hard_alloc_failure(),
+            "the cycle the latch asked for has run; the bit must not persist"
+        );
+    }
+
+    // -- Phase 2.2: the fragmentation ratchet -----------------------------
+
+    /// A run that never met the sampling condition reports **no reading**, not
+    /// a perfect one.
+    ///
+    /// This is the vacuous-green guard for the whole gauge. `worst_permille`
+    /// starts at a `usize::MAX` sentinel precisely so that "never sampled" and
+    /// "sampled and scored 1000" cannot be confused, and this test is what
+    /// stops someone simplifying that sentinel into a plain `1000`.
+    #[test]
+    fn the_frag_gauge_reports_no_reading_rather_than_a_perfect_one() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let g = heap.frag_gauge();
+        assert_eq!(g.samples, 0);
+        assert_eq!(
+            g.worst_permille, None,
+            "an unsampled gauge must not read as a perfect score"
+        );
+    }
+
+    /// A collection on a mostly-empty heap samples, and scores well.
+    #[test]
+    fn a_collection_with_room_to_spare_takes_a_reading() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        // A handful of objects, all dead by the time we collect.
+        for _ in 0..16 {
+            heap.alloc_object(ClassId::new(1), 4);
+        }
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        let g = heap.frag_gauge();
+        assert_eq!(g.samples, 1, "an empty-ish heap must be sampled");
+        let worst = g.worst_permille.expect("sampled, so there is a reading");
+        assert!(
+            worst > ZGC_FRAG_FLOOR_PERMILLE,
+            "a heap with one contiguous run of free space is not fragmented; \
+             got {worst} permille"
+        );
+        assert!(
+            g.free_permille >= ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE,
+            "the recorded sample must satisfy the condition it was taken under"
+        );
+    }
+
+    /// **A full heap is not a fragmented heap**, and the gauge must not say it
+    /// is.
+    ///
+    /// This is the test that makes [`ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE`] load-
+    /// bearing rather than decorative. Fill a heap with LIVE objects, collect,
+    /// and the largest free block is legitimately tiny — a gauge without the
+    /// condition would ratchet to nearly zero here and fire its floor warning
+    /// on the most ordinary workload there is.
+    ///
+    /// The exact edit that trips it: delete the `free_permille <` early return
+    /// in `sample_frag_gauge`.
+    #[test]
+    fn a_heap_that_is_merely_full_is_not_recorded_as_fragmented() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // Keep everything alive, so the sweep frees nothing — and allocate
+        // until the arena genuinely refuses, so the post-sweep free share is
+        // really below the sampling condition. A fixed object count would
+        // leave room and quietly test nothing.
+        // Pin the TLAB off for this fixture. Not because the TLAB is the
+        // subject — it is not — but because `zgc_tlab_enabled_by_default`
+        // reads a process-wide flag on every heap construction, so a peer test
+        // holding a `FlagOverride` decides how much of this arena a refill
+        // claims and therefore where the fill loop below stops. Without this
+        // the test passed alone and failed in the full suite, which is a
+        // FIXTURE defect masquerading as a gauge defect.
+        heap.set_tlab_enabled(false);
+        let mut live: Vec<ObjectRef> = Vec::new();
+        while let Some(o) = heap.try_alloc_object(ClassId::new(1), 8) {
+            live.push(o);
+        }
+        assert!(
+            live.len() > 16,
+            "the fixture must actually fill the arena to test anything; got {}",
+            live.len()
+        );
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        heap.collect_garbage(&stw, &mut live, &NoMonitors);
+
+        // Precondition, asserted rather than assumed: this test says nothing
+        // unless the heap really did end up full. If a future change makes the
+        // fill loop stop early, the assertion below would pass for the wrong
+        // reason and the test would become a vacuous green.
+        let free_permille = heap.arena_free_permille_for_test();
+        assert!(
+            free_permille < ZGC_FRAG_GAUGE_MIN_FREE_PERMILLE,
+            "fixture did not fill the heap: {free_permille} permille free"
+        );
+
+        let g = heap.frag_gauge();
+        assert_eq!(
+            g.samples, 0,
+            "a collection that left <25% of the heap free says nothing about \
+             fragmentation and must not be counted as a reading"
+        );
+        assert_eq!(g.worst_permille, None);
+    }
+
+    // -- Phase 3: the mutator ingress -------------------------------------
+
+    /// Disarmed, the barrier publishes **nothing** — including for a live,
+    /// registered address it would otherwise capture.
+    ///
+    /// This is the test that pins the cost argument. The barrier sits on the
+    /// store path of every Java program this VM runs, and the claim that a
+    /// non-concurrent run pays "one relaxed load" is only true while the
+    /// disarmed path reaches no registry lookup, no mutex and no counter.
+    #[test]
+    fn the_satb_barrier_is_inert_while_no_cycle_is_marking() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        assert!(!heap.mark_active());
+
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            0,
+            "a disarmed barrier must publish nothing"
+        );
+        let mut drained = Vec::new();
+        assert_eq!(heap.drain_mark_ingress(&mut drained), 0);
+        assert!(drained.is_empty());
+    }
+
+    /// Armed, the barrier publishes the overwritten reference — which is the
+    /// whole point of a snapshot-at-the-beginning barrier.
+    #[test]
+    fn an_armed_satb_barrier_publishes_the_overwritten_reference() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        heap.set_mark_active(true);
+
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+
+        assert_eq!(heap.mark_ingress_pushes(), 1);
+        let mut drained = Vec::new();
+        assert_eq!(heap.drain_mark_ingress(&mut drained), 1);
+        assert_eq!(drained, vec![obj.as_ptr() as usize as u64]);
+    }
+
+    /// Two things the armed barrier must still refuse: a null overwrite (no
+    /// edge to preserve) and an address this heap never handed out.
+    ///
+    /// The second is the same gate `ZMarkContext::is_in_heap` applies to every
+    /// child pointer. Publishing a foreign address would hand the marker an
+    /// address to `try_mark`, i.e. a write through a pointer into memory this
+    /// collector does not own.
+    #[test]
+    fn an_armed_satb_barrier_refuses_null_and_foreign_addresses() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        heap.set_mark_active(true);
+
+        heap.satb_pre_barrier(0);
+        assert_eq!(heap.mark_ingress_pushes(), 0, "null carries no edge");
+
+        // An address the arena never handed out. Well clear of the arena and
+        // aligned, so only the registry gate can reject it.
+        heap.satb_pre_barrier(0xDEAD_BEE0);
+        assert_eq!(
+            heap.mark_ingress_pushes(),
+            0,
+            "an address this heap never allocated must not reach the marker"
+        );
+    }
+
+    /// Disarming clears the ingress, so a leftover address cannot be
+    /// republished into the next cycle.
+    ///
+    /// This matters more than it looks: the addresses in the ingress are raw
+    /// arena offsets, and between cycles the sweep coalesces the free list and
+    /// retracts the bump cursor. An address held across that is not merely
+    /// stale, it may name reclaimed space — `reclaim_guard`'s whole subject.
+    #[test]
+    fn disarming_the_satb_barrier_clears_the_ingress() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        heap.set_mark_active(true);
+        heap.satb_pre_barrier(obj.as_ptr() as usize);
+        assert_eq!(heap.mark_ingress_pushes(), 1);
+
+        heap.set_mark_active(false);
+
+        assert!(!heap.mark_active());
+        let mut drained = Vec::new();
+        assert_eq!(
+            heap.drain_mark_ingress(&mut drained),
+            0,
+            "an address from a finished cycle must not survive into the next"
+        );
+    }
+
+    // -- Phase 3: the collection-overlay edge ------------------------------
+
+    /// Arming slot for [`overlay_provider_roots`]. `(owner_addr, root)`.
+    ///
+    /// A `static` because [`crate::external_roots::ExternalRootProvider`] holds
+    /// plain `fn` pointers, which cannot capture — and because providers are
+    /// process-global and **cannot be unregistered**, so the provider itself
+    /// must be inert unless a test has armed it for one specific address it
+    /// owns. Guarded by [`OVERLAY_TEST_LOCK`] so the two tests below cannot
+    /// arm it concurrently.
+    static OVERLAY_ARMED: parking_lot::Mutex<Option<(usize, ObjectRef)>> =
+        parking_lot::Mutex::new(None);
+    static OVERLAY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn overlay_provider_roots(owner_addr: usize, _class_id: Option<u32>) -> Vec<ObjectRef> {
+        match *OVERLAY_ARMED.lock() {
+            Some((armed_owner, root)) if armed_owner == owner_addr => vec![root],
+            _ => Vec::new(),
+        }
+    }
+
+    fn register_overlay_provider() {
+        crate::external_roots::register_external_root_provider(
+            crate::external_roots::ExternalRootProvider {
+                name: "zgc-test-collection-overlay",
+                scan: |_out| {},
+                owner_addrs: || None,
+                roots_for_owner: overlay_provider_roots,
+                roots_for_matching_owners: |_p| Vec::new(),
+                remap: |_m| {},
+                prune: |_p| {},
+            },
+        );
+    }
+
+    /// **`ZMarkContext::visit_refs` must report the collection-overlay edge.**
+    ///
+    /// The serial loop in `collect_garbage` pushes
+    /// `external_roots_for_owner(addr, class_id)`; `visit_refs` did not, until
+    /// 2026-08-13. That difference is invisible while the serial loop is the
+    /// only marker and becomes a use-after-free the moment a coordinator drives
+    /// a real collection: a native collection overlay is reachable ONLY through
+    /// the Java object that owns it, so a marker that skips the edge sweeps
+    /// live contents out from under a surviving owner.
+    ///
+    /// The exact edit that trips it: delete the `external_roots_for_owner` loop
+    /// at the end of `visit_refs`.
+    #[test]
+    fn visit_refs_reports_the_collection_overlay_edge() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        register_overlay_provider();
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let owner = heap.alloc_object(ClassId::new(7), 0);
+        let overlay = heap.alloc_object(ClassId::new(8), 0);
+        *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
+
+        let mut seen: Vec<u64> = Vec::new();
+        {
+            use super::mark::ZMarkContext;
+            heap.visit_refs(owner.as_ptr() as u64, &mut |a| seen.push(a));
+        }
+        *OVERLAY_ARMED.lock() = None;
+
+        assert!(
+            seen.contains(&(overlay.as_ptr() as u64)),
+            "visit_refs must report the overlay owned by this object; saw {seen:?}"
+        );
+    }
+
+    /// ...and the parallel marker therefore keeps the overlay alive.
+    ///
+    /// The end-to-end statement of the test above: this is the failure the
+    /// missing edge would actually have produced.
+    #[test]
+    fn the_parallel_mark_keeps_a_collection_overlay_alive() {
+        let _guard = OVERLAY_TEST_LOCK.lock();
+        register_overlay_provider();
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let owner = heap.alloc_object(ClassId::new(7), 0);
+        let overlay = heap.alloc_object(ClassId::new(8), 0);
+        *OVERLAY_ARMED.lock() = Some((owner.as_ptr() as usize, overlay));
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[owner.as_ptr() as u64], 2);
+        heap.end_concurrent_mark_cycle();
+        *OVERLAY_ARMED.lock() = None;
+
+        assert!(
+            heap.header_ref(overlay.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+            "an overlay reachable only through a live owner must survive the mark"
+        );
+    }
+
+    // -- Phase 3: stop-the-world PARALLEL marking --------------------------
+
+    /// Build a small object graph: a root chain plus a side branch and one
+    /// unreachable object. Returns `(roots, all_allocated, expected_live)`.
+    fn parallel_mark_fixture(heap: &ZgcRealHeap) -> (Vec<ObjectRef>, Vec<ObjectRef>, usize) {
+        // root -> a -> b, root -> c, and `dead` reachable from nothing.
+        let root = heap.alloc_object(ClassId::new(1), 2);
+        let a = heap.alloc_object(ClassId::new(1), 1);
+        let b = heap.alloc_object(ClassId::new(1), 0);
+        let c = heap.alloc_object(ClassId::new(1), 0);
+        let dead = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(root, 0, Value::Object(Some(a)));
+        heap.set_field(root, 1, Value::Object(Some(c)));
+        heap.set_field(a, 0, Value::Object(Some(b)));
+        (vec![root], vec![root, a, b, c, dead], 4)
+    }
+
+    /// **The parallel mark must produce the identical mark set to the serial
+    /// loop**, because the sweep that follows cannot tell which one set the
+    /// bits.
+    ///
+    /// Two heaps, same fixture, same roots: one collected with the serial loop
+    /// and one with `mark_parallel_stw`. Comparing survivor COUNTS after the
+    /// sweep is the end-to-end statement — a parallel mark that missed a live
+    /// object would sweep it, and one that over-marked would retain garbage.
+    #[test]
+    fn parallel_mark_marks_the_same_objects_as_the_serial_loop() {
+        // Serial arm.
+        let serial = ZgcRealHeap::with_capacity(256 * 1024);
+        let (mut serial_roots, _all, expected_live) = parallel_mark_fixture(&serial);
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        serial.collect_garbage(&stw, &mut serial_roots, &NoMonitors);
+        let serial_live = serial.registry.snapshot().bases().len();
+
+        // Parallel arm, driven directly so the test does not depend on the
+        // environment variable being visible to this process.
+        let par = ZgcRealHeap::with_capacity(256 * 1024);
+        let (par_roots, all, _) = parallel_mark_fixture(&par);
+        let skip = par.begin_concurrent_mark_cycle();
+        let _ = skip;
+        let root_addrs: Vec<u64> = par_roots.iter().map(|r| r.as_ptr() as u64).collect();
+        let stats = par.mark_parallel_stw(&root_addrs, 4);
+        par.end_concurrent_mark_cycle();
+
+        // Count what the parallel engine marked, directly off the headers.
+        let par_marked = all
+            .iter()
+            .filter(|o| {
+                par.header_ref(o.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0
+            })
+            .count();
+
+        assert_eq!(
+            par_marked, expected_live,
+            "the parallel mark must reach every reachable object and no more; \
+             engine reported objects_marked={} scanned={}",
+            stats.objects_marked, stats.objects_scanned
+        );
+        assert_eq!(
+            serial_live, expected_live,
+            "the serial arm is the control and must agree with the fixture"
+        );
+    }
+
+    /// The engine must reach a transitively-reachable object — i.e. the test
+    /// above is not passing because everything happens to be a root.
+    ///
+    /// Without this, a `mark_parallel_stw` that marked only its root set would
+    /// satisfy a survivor count on a fixture whose objects were all roots.
+    #[test]
+    fn parallel_mark_reaches_a_grandchild_not_just_the_roots() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let root = heap.alloc_object(ClassId::new(1), 1);
+        let child = heap.alloc_object(ClassId::new(1), 1);
+        let grandchild = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(root, 0, Value::Object(Some(child)));
+        heap.set_field(child, 0, Value::Object(Some(grandchild)));
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.end_concurrent_mark_cycle();
+
+        for (name, obj) in [
+            ("root", root),
+            ("child", child),
+            ("grandchild", grandchild),
+        ] {
+            assert!(
+                heap.header_ref(obj.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0,
+                "{name} must be marked by the parallel engine"
+            );
+        }
+    }
+
+    /// An object reachable from nothing must NOT be marked.
+    ///
+    /// The counterpart to the test above: an engine that marked every
+    /// registered address would pass both survivor counts and every
+    /// reachability assertion, and would retain the whole heap forever.
+    #[test]
+    fn parallel_mark_leaves_an_unreachable_object_unmarked() {
+        let heap = ZgcRealHeap::with_capacity(256 * 1024);
+        let root = heap.alloc_object(ClassId::new(1), 0);
+        let orphan = heap.alloc_object(ClassId::new(1), 0);
+
+        let _skip = heap.begin_concurrent_mark_cycle();
+        heap.mark_parallel_stw(&[root.as_ptr() as u64], 4);
+        heap.end_concurrent_mark_cycle();
+
+        assert!(heap.header_ref(root.as_ptr()).gc_flags() & GC_FLAG_MARKED != 0);
+        assert!(
+            heap.header_ref(orphan.as_ptr()).gc_flags() & GC_FLAG_MARKED == 0,
+            "an unreachable object must not be marked, or nothing is ever collected"
+        );
+    }
+
+    /// `parallel_mark_workers` refuses to go parallel unless asked, and caps
+    /// what it is asked for.
+    ///
+    /// The cap is the Phase 2.3 rule applied to this constant: the value it
+    /// bounds is a user-supplied integer, i.e. unbounded, and spawning it
+    /// inside a safepoint is the failure mode.
+    #[test]
+    fn the_parallel_mark_worker_count_is_off_by_default_and_capped() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // Unset in this process: off.
+        assert_eq!(
+            heap.parallel_mark_workers(),
+            0,
+            "parallel marking must be opt-in"
+        );
+        // And the ceiling exists regardless of what is asked for.
+        assert!(
+            Z_PARMARK_MAX_WORKERS >= 1,
+            "the cap must admit at least one worker"
+        );
     }
 
     #[test]

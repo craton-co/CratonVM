@@ -2908,8 +2908,34 @@ fn safe_native_call_impl(
         // where the bytes had gone. `old_gen_needs_gc` is the same 75 %
         // threshold both major-GC branches use, so the collection this admits
         // is exactly the one that reclaims old.
+        // `|| hard_alloc_failure()` — ZGC Phase 2.4 (2026-08-13). The two
+        // predicates above are OCCUPANCY questions, and on a non-compacting
+        // heap occupancy is not what binds: an arena refuses a 2 MB array
+        // because no single hole is 2 MB, which it can do with `allocated` at
+        // 7% of capacity. `ZgcRealHeap::alloc_raw` latches on that refusal and
+        // its comment says exactly why the re-check below it is wrong — "a
+        // request that just failed is stronger evidence that a cycle is due
+        // than the `allocated >= gc_threshold` predicate, which counts LIVE
+        // bytes and therefore cannot see the bump space this heap never
+        // rewinds". It was right, and until this line the consumer overruled
+        // it: `needs_gc()` answered no, the latch was cleared a few lines
+        // below without collecting, and the signal was dropped. That is the
+        // 2026-08-13 `TestNonBlockingAPI` shape, where the arena was full of
+        // TLAB *reservations* the live-byte counter cannot see.
+        //
+        // A collection is worth running there even though the failing request
+        // has already raised its `OutOfMemoryError`: this sweep coalesces the
+        // free list and retracts the bump cursor into the freed tail, so it
+        // restores CONTIGUITY, which is the resource that was missing. The
+        // next request is the one it saves.
+        //
+        // It cannot storm — the bit is set only by a genuine refusal, is
+        // cleared unconditionally below, and `gc_overhead_limit_exceeded`
+        // still gates it, which is the same bound the soft path relies on.
         if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-            && (shared.mem.heap.needs_gc() || shared.mem.heap.old_gen_needs_gc())
+            && (shared.mem.heap.needs_gc()
+                || shared.mem.heap.old_gen_needs_gc()
+                || shared.mem.heap.hard_alloc_failure())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
             crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -2917,8 +2943,11 @@ fn safe_native_call_impl(
         }
         // Clear even when the gates said no: the flag was stale (another
         // thread's GC already relieved young) or the heap is genuinely full
-        // of live data (overhead limit) — the next spill re-sets it.
+        // of live data (overhead limit) — the next spill re-sets it. Same for
+        // the hard latch, which `collect_garbage` also lowers; clearing it
+        // here covers the overhead-limited path, where no cycle ran to do it.
         shared.mem.heap.clear_young_spill_pressure();
+        shared.mem.heap.clear_hard_alloc_failure();
     }
     if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
