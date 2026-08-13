@@ -1,8 +1,11 @@
 # JIT drops a constructor's side effects when the object does not escape
 
-**Status:** **FIXED 2026-08-12** on `fix/jit-ctor-side-effects-20260812`
-(see "Resolution" at the bottom). Found while triaging
-[investigate-batch-12.md](investigate-batch-12.md)
+**Status:** ✅ **FIXED / RETIRED 2026-08-13.** Fixed on
+`fix/jit-ctor-side-effects-20260812` (see "Resolution" at the bottom);
+re-verified on `dev` `ae2e1d9c8` and retired to `docs/internal` on 2026-08-13 —
+see "Re-verification" at the very bottom, which also re-homes the throughput
+residual this doc left open. Found while triaging
+[netty investigate index](../../../known-issues/netty/investigate-INDEX.md) (batch 12)
 (`io.netty.util.concurrent.FastThreadLocalTest`), but this is **not a netty
 bug and not netty-specific** — it is a general JIT correctness defect that
 silently produces wrong results in any compiled method.
@@ -176,8 +179,9 @@ test bug and not a JDK-behaviour difference.
 
 ## Related
 
-- `docs/known-issues/netty/jni-native-codec-sigsegv-20260812.md` — the other
-  open netty finding (unrelated mechanism).
+- The netty JNI-native-codec SIGSEGV, the other open netty finding at the time
+  (unrelated mechanism). Since fixed and retired to
+  `docs/internal/fixed-bugs/netty-jni-native-codec-sigsegv-FIXED-20260812.md`.
 - Fixed in the same session, for the same two batch pages:
   the `StackWalker$Option` enum defect and the synthetic `CyclicBarrier`
   lost-release defect (see the branch's commit messages).
@@ -240,4 +244,40 @@ was never expected to. `testConstructionWithIndex` loops
 `Integer.MAX_VALUE - 8` (~2.1 billion) times by construction; the counter now
 advances correctly, so the loop terminates in principle, but not inside the
 suite's wall cap. That remains a throughput item, tracked with the class in
-[investigate-batch-12.md](investigate-batch-12.md) — not a correctness one.
+[netty investigate index](../../../known-issues/netty/investigate-INDEX.md) (batch 12) — not a correctness one.
+
+---
+
+## Re-verification and retirement (2026-08-13)
+
+Re-run on `dev` `ae2e1d9c8` — a binary built from a `dev` that carries this fix
+plus three weeks of unrelated work — on the same Azure Linux host, JDK 25,
+real-jdk mode, `probes/EA.java` at n = 1 000 000:
+
+| counter | before the fix (2026-08-12) | HotSpot | dev `ae2e1d9c8` |
+|---|---|---|---|
+| `ATOMIC.get()` | 3 000 | 1 000 000 | **1 000 000** |
+| `plain` (bare `static int`) | **0** | 1 000 000 | **1 000 000** |
+
+Both exact, JIT on, no flags. The fix holds, so this page moves to
+`docs/internal`.
+
+### The residual is re-homed and its numbers are stale
+
+The "Still open" section above is now tracked on its own page,
+[`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](../../../known-issues/netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md),
+which was **re-measured on 2026-08-13** — every rate in it had moved, and the
+attribution changed:
+
+* the atomic half is **49x faster** (an `AtomicInteger.getAndIncrement`
+  intrinsic landed): 534 s → **11 s** for this loop's iteration count;
+* allocation improved 2.3x: 410 s → **169 s**, which is now *under* the netty
+  per-class wall on its own;
+* what is left is almost entirely the `<init>` **dispatch round trip** — ~915 ns
+  of ~1000 ns per iteration. The optimizing JIT tier's refusal to bind a
+  constructor site directly was removed on 2026-08-13 (worth 1.40x on an
+  ordinary call site), but it does not help an **OSR'd** loop, for a reason that
+  page now records precisely.
+
+That is a performance workstream, not a correctness residual of this defect, and
+it does not keep this page open.

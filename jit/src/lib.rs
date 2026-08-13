@@ -16165,13 +16165,50 @@ fn try_compile_inner(
                         // receiver is a fresh `Op::New`, so scalar replacement
                         // is unaffected — see `IrBuilder::build`'s `0xb7` arm.
                         //
-                        // What a `<init>` may NOT do is take the direct-call
-                        // path below: `direct_target` bakes an entry this
-                        // compile resolved by running `callee_compiler`, and
-                        // making every constructor site compile its callee is a
+                        // A `<init>` used to be barred from the direct-call
+                        // path below as well, on the grounds that
+                        // `direct_target` bakes an entry resolved by running
+                        // `callee_compiler`, so admitting constructors was "a
                         // compile-time and recursion-cycle change this lane did
-                        // not measure. Constructors keep helper dispatch.
-                        let is_ctor = is_special && mn == "<init>";
+                        // not measure". It is measured now, and the cost of NOT
+                        // admitting them is the larger number.
+                        //
+                        // A non-empty constructor is the one statically bound
+                        // call every allocation site pays, and the OPTIMIZING
+                        // tier was the only backend refusing to bind it — the
+                        // single-pass ladder has always direct-called
+                        // `matches!(invoke_kind, 1 | 3)` without excluding
+                        // `<init>`. On the Azure host, `for (…) sink = new X()`
+                        // in an OSR-compiled loop (JDK 25, real-jdk mode):
+                        //
+                        //   ctor body `i = ATOMIC.getAndIncrement()`   917 ns/op
+                        //   ctor body `i = ++staticInt`                312 ns/op
+                        //   ctor body `i = param`                      749 ns/op
+                        //   empty ctor (elided) / bare `new Object()`   99 ns/op
+                        //
+                        // i.e. 200–800 ns of pure `jit_invoke_dispatch` round
+                        // trip per allocation, against a 99 ns allocation, on
+                        // the path that compiles every hot loop. `jit_entries`
+                        // (CRATONVM_DBG_JIT_SCAN_PROF=1) reported exactly one
+                        // entry per iteration, which is the tell.
+                        //
+                        // The two stated hazards are both already handled on
+                        // this path and are NOT special to constructors:
+                        // `note_jit_recursive_compile_cycle` keeps a
+                        // cycle-closing edge on dispatch, and
+                        // `jit_direct_call_requires_dispatch` is consulted
+                        // after the callee compiles. The background compile
+                        // worker — which compiles the OSR bodies these loops
+                        // run in — passes a LOOKUP-ONLY callee resolver
+                        // (`direct_callee_lookup` in `jit_bridge.rs`), so there
+                        // it binds an already-compiled callee and compiles
+                        // nothing new at all.
+                        //
+                        // Scalar replacement is untouched: the IR builder still
+                        // prefers ELISION for an elidable pc on a fresh
+                        // `Op::New`, and an elided site emits no `Op::Call` for
+                        // this entry to lower.
+                        let _is_ctor = is_special && mn == "<init>";
                         let (desc_args, ret) = match static_call_shape(&desc) {
                             Some(t) => t,
                             None => {
@@ -16289,7 +16326,7 @@ fn try_compile_inner(
                         // binds one look like the use-after-free window that
                         // check exists to catch.
                         let mut direct_target_is_thin_helper = false;
-                        if ir_direct && (is_static || is_special) && !is_ctor && !is_self_recursive {
+                        if ir_direct && (is_static || is_special) && !is_self_recursive {
                             let special_owner: Option<String> = if is_special {
                                 cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
                             } else {
