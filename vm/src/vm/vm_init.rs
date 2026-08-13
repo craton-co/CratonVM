@@ -1411,7 +1411,7 @@ impl SharedVm {
         // mean — a recorded violation plus a WARN naming the consequence, not
         // a silent `None`.
         let enum_impl_id =
-            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 3);
+            ensure_bootstrap_compat_class(&mut class_manager, "java/util/Enumeration$Impl", 4);
         // Wire up the synthetic `Enumeration$Impl` so that real-JDK code which
         // does `Enumeration<URL> e = classLoader.getResources(...)` (e.g.
         // `org.apache.commons.logging.LogFactory.getResources`) can perform

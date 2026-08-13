@@ -5384,12 +5384,12 @@ fn lazy_enumeration_from_url_strings(
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(spec)));
     }
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 3) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
         Ok(enm) => {
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(enm, 0, Value::Object(Some(arr)));
             ctx.set_field(enm, 1, Value::Int(0));
-            ctx.set_field(enm, 2, Value::Int(ENUM_ELEMENTS_URL_SPECS));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_URL_SPECS));
             Ok(enm)
         }
         Err(_) => enumeration_from_url_strings(ctx, urls),
@@ -6134,14 +6134,20 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
 /// §1.1 violation the policy refuses, which is why it needs the landing below.
 pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
 
-/// Slot 2 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds the values the
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds the values the
 /// enumeration yields, verbatim. Every producer except `getResources` uses
 /// this, and it is what a zero-initialized instance already means, so an
 /// `Enumeration$Impl` built by `new_object` (which writes no slots) behaves
-/// exactly as it did before slot 2 existed.
+/// exactly as it did before slot 3 existed.
+///
+/// Slot 3, not slot 2: `Hashtable.keys()`/`elements()` already stamp a
+/// keys-vs-values discriminator into slot 2, and 1 is its `keys` value — so a
+/// marker there turned every `Hashtable` key into a `java.net.URL`
+/// (`ClassCastException: java.net.URL cannot be cast to java.lang.String`,
+/// xerces reading SAX features, PomProfileReposEffectivePomTest).
 pub(crate) const ENUM_ELEMENTS_AS_IS: i32 = 0;
 
-/// Slot 2 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds URL *spec
+/// Slot 3 of [`ENUMERATION_IMPL_CLASS`]: element slot 0 holds URL *spec
 /// strings*, and each is turned into a `java.net.URL` by `nextElement`/`next`
 /// at the moment it is handed out.
 ///
@@ -6218,12 +6224,12 @@ pub(crate) fn make_snapshot_enumeration(
     // both and read it back through the pin, the same contract
     // `make_iterator_from_array` documents.
     let pin = ctx.pin_native_root(array);
-    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 3) {
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 4) {
         Ok(enm) => {
             let array = ctx.read_native_pin(pin, array);
             ctx.set_field(enm, 0, Value::Object(Some(array)));
             ctx.set_field(enm, 1, Value::Int(0));
-            ctx.set_field(enm, 2, Value::Int(ENUM_ELEMENTS_AS_IS));
+            ctx.set_field(enm, 3, Value::Int(ENUM_ELEMENTS_AS_IS));
             Ok(enm)
         }
         Err(refusal) => {
@@ -6245,7 +6251,7 @@ pub(crate) fn make_snapshot_enumeration(
 /// `Enumeration$Impl.nextElement()` / `.next()` — one body, because the two
 /// have always been the same code and only one of them may now materialize.
 ///
-/// Slot 2 says how to read slot 0's element: verbatim
+/// Slot 3 says how to read slot 0's element: verbatim
 /// ([`ENUM_ELEMENTS_AS_IS`], what every producer but `getResources` stores and
 /// what a zero-initialized instance already means) or as a URL spec string to
 /// be turned into a `java.net.URL` right here ([`ENUM_ELEMENTS_URL_SPECS`]).
@@ -6262,7 +6268,7 @@ fn enum_impl_next_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let elem = ctx.get_array_element(arr, idx);
     ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-    if ctx.get_field(this, 2).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) != ENUM_ELEMENTS_URL_SPECS {
+    if ctx.get_field(this, 3).as_int().unwrap_or(ENUM_ELEMENTS_AS_IS) != ENUM_ELEMENTS_URL_SPECS {
         return Ok(Some(elem));
     }
     let Value::Object(Some(spec_obj)) = elem else {

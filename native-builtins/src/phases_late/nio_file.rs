@@ -18206,7 +18206,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let addrs = ctx.get_field(this, 2);
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let enum_obj = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3)?;
+            let enum_obj = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 4)?;
             match addrs {
                 Value::Object(Some(a)) => {
                     ctx.set_field(enum_obj, 0, Value::Object(Some(a)));
