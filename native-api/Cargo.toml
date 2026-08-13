@@ -31,6 +31,12 @@ libc = "0.2"
 # cover the single-byte / Unicode families; encoding_rs (the Gecko/Servo
 # Encoding Standard implementation) backs the multi-byte ones.
 encoding_rs = "0.8"
+# `layout_alias` reports its census on the same channel the funnel-only detector
+# used, so a consumer's filter is unchanged by the move out of `native-builtins`.
+# The workspace pin carries `release_max_level_info`, which keeps `warn!`
+# compiled in release — a census that vanished from the build people actually
+# run would be worse than no census.
+tracing.workspace = true
 
 [lints]
 workspace = true

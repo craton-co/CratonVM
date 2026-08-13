@@ -1,0 +1,116 @@
+# W7-40 — SUPERSEDED. The differential is 9, not 14
+
+> # RETIRED-SUPERSEDED 2026-08-12 — moved out of docs/known-issues/jdk-only/
+>
+> **Evidence:** RETIREMENT-20260812B.md §1.3. Superseded by
+> W7-42-differential-instrument-holes.md, and — the check a supersession can
+> quietly fail — **no row loses its owner on the way out**:
+> `stream.reuseThrows` is W7-65's (closed there), and `format.*` ×5,
+> `Enum.valueOfBadName`, `NumberFormat.currencyNegativeUS` and
+> `Random.nextGaussian` are all carried by
+> W7-44-numberformat-enum-and-double-tostring.md and by W7-42.
+> Nothing in this file is a current measurement.
+
+> # SUPERSEDED 2026-08-12 by W7-42-differential-instrument-holes.md
+>
+> **DO NOT WORK FROM THE NUMBER 14. IT IS WRONG AND THIS RECORD IS THE REASON
+> IT CIRCULATES.** The live figure is **9**, in W7-42. Five of the fourteen
+> rows below are the instrument, not the VM — this record measured a harness
+> defect and published it as VM divergence, which is the species the campaign
+> keeps re-buying. The title, the `96 → 43 → 14` line and the fourteen-row diff
+> are all kept **only** so a reader holding an old transcript can find their way
+> here; none of them is a current measurement.
+>
+> Anything re-derived from this file must be re-derived from W7-42's transcript
+> and its `PROBE-MANIFEST-DIGEST` instead. Do not diff a fresh run against
+> W7-4's retired oracle either (RETIREMENT-20260812.md): it predates the probe's
+> manifest ledger, so diffing against it manufactures divergence out of rows the
+> probe has since gained.
+>
+
+> The "same class files" claim in the next paragraph is false. The CratonVM
+> side was compiled from the scratchpad copy W7-33 Part 3 made with five
+> `line(..)` statements excised; HotSpot was compiled from the tree. The five
+> absent rows (`ArrayDeque.addNull`, `addFirstNull`, `offerNull`,
+> `sizeAfterRefusedNulls`, `COW.addAllAbsent`) are statements one side never
+> executed, not values CratonVM got wrong — run from one compile they match
+> HotSpot exactly. The seven `[SUREFIRE-NPE]` lines were never on stdout
+> either: the emitter is `eprintln!` and the capture merged the streams.
+>
+> **The differential is at 9.** Everything under "the genuine value
+> divergences" below still stands; nothing else here should be read as a
+> property of the VM.
+
+**Status: SUPERSEDED. Measured 2026-08-12** on the 50-branch binary. HotSpot
+25.0.3.9 vs CratonVM `--real-jdk`, ~~same class files~~ (**false — the two sides
+were compiled from different source; that is hole 1**), both sides pinned to
+UTF-8 / en-US.
+
+**96 → 43 → ~~14~~ divergent observables. The live number is 9 (W7-42).**
+0 sections died (was 2) — and W7-42's whole point is that "0 sections died" was
+true and still hid five lost rows, because absence is not a throw.
+
+## The ~~14~~ — five of these are the instrument, not the VM
+
+```diff
+< stream.reuseThrows=java.lang.IllegalStateException
+> stream.reuseThrows=no-throw
+< ArrayDeque.addNull=java.lang.NullPointerException
+< ArrayDeque.addFirstNull=java.lang.NullPointerException
+< ArrayDeque.offerNull=java.lang.NullPointerException
+< ArrayDeque.sizeAfterRefusedNulls=0
+< Enum.valueOfBadName=java.lang.IllegalArgumentException: No enum constant ShadowDifferentialProbe.Color.MAUVE
+> Enum.valueOfBadName=java.lang.IllegalArgumentException: No enum constant MAUVE
+> [SUREFIRE-NPE] Name is null thrown; top Java frames:
+> [SUREFIRE-NPE]   #0 ShadowDifferentialProbe.main (ShadowDifferentialProbe.java:237)
+> [SUREFIRE-NPE]   #1 ShadowDifferentialProbe.section (ShadowDifferentialProbe.java:2131)
+> [SUREFIRE-NPE]   #2 ShadowDifferentialProbe.enumCollections (ShadowDifferentialProbe.java:1244)
+> [SUREFIRE-NPE]   #3 ShadowDifferentialProbe.thrownBy (ShadowDifferentialProbe.java:2140)
+> [SUREFIRE-NPE]   #4 ShadowDifferentialProbe.lambda$enumCollections$2 (ShadowDifferentialProbe.java:1244)
+> [SUREFIRE-NPE]   #5 ShadowDifferentialProbe$Color.valueOf (ShadowDifferentialProbe.java:1289)
+< COW.addAllAbsent=1:[a, b, zz, qq]
+< format.unknownConversion=java.util.UnknownFormatConversionException: Conversion = 'q'
+< format.missingArgument=java.util.MissingFormatArgumentException
+< format.wrongArgumentType=java.util.IllegalFormatConversionException
+< format.illegalFlagCombination=java.util.IllegalFormatFlagsException
+< format.precisionOnInteger=java.util.IllegalFormatPrecisionException
+> format.unknownConversion=java.lang.IllegalArgumentException: Conversion = 'q'
+> format.missingArgument=java.lang.IllegalArgumentException
+> format.wrongArgumentType=java.lang.IllegalArgumentException
+> format.illegalFlagCombination=java.lang.IllegalArgumentException
+> format.precisionOnInteger=java.lang.IllegalArgumentException
+< NumberFormat.currencyNegativeUS=-$1,234.50
+> NumberFormat.currencyNegativeUS=($1,234.50)
+< Random.nextGaussian=1.1419053154730547
+> Random.nextGaussian=1.141905315473055
+```
+
+## Two of these are instrument holes, not value divergences
+
+**1. Four observables vanish with no `SECTION-DIED`.** `ArrayDeque.addNull`, `addFirstNull`,
+`offerNull` and `sizeAfterRefusedNulls` appear on HotSpot at lines 481-484 and are **absent**
+from CratonVM's transcript — while the same section runs to completion on both sides
+(`toArray`, `clearThenIsEmpty`, `growsPastInitialCapacity`, `getFirstOnEmpty`, `popOnEmpty` all
+present). `COW.addAllAbsent` is missing the same way. Verified against the raw, unfiltered
+output, so it is not the `grep -v` that drops them.
+
+The per-section fence exists precisely so that a failure prints one `SECTION-DIED` line instead
+of removing every line after it. **Here lines are lost while the fence stays silent and the
+section finishes**, which is worse than the case the fence was built for: a truncated transcript
+at least ends. This is the campaign's blind-instrument species inside the instrument.
+Find out whether the probe has a conditional path or output is being lost, before reading any
+of those four rows as a defect.
+
+**2. `[SUREFIRE-NPE]` diagnostic frames leak into stdout** — 7 lines, from `enumCollections`.
+A transcript meant for diffing must carry only observables; VM diagnostics belong on stderr or
+behind a flag.
+
+## The genuine value divergences
+
+| observable | HotSpot | CratonVM | note |
+|---|---|---|---|
+| `stream.reuseThrows` | `IllegalStateException` | `no-throw` | **declined deliberately** — needs a `linkedOrConsumed` flag in a funnel with 99 call sites in one file; a flag set once too often turns a working stream into a throw on the most pervasive path in the SB/Tomcat arms. **CLOSED 2026-08-12 — W7-65-stream-reuse-throws.md.** The 99 were substring matches over three functions that all bottom out in ONE, `stream_elements`, so it took one check-and-set. The risk this row named is real, and is why that record leaves six residuals unset rather than guessing at them. |
+| `format.*` ×5 | `UnknownFormatConversionException`, `MissingFormatArgumentException`, `IllegalFormatConversionException`, `IllegalFormatFlagsException`, `IllegalFormatPrecisionException` | `java.lang.IllegalArgumentException` | the refusals landed; the **subclass** does not. All five extend `IllegalArgumentException`, so we raise the base. A mistyped refusal sends a caller down the wrong `catch` |
+| `Enum.valueOfBadName` | `No enum constant ShadowDifferentialProbe.Color.MAUVE` | `No enum constant MAUVE` | message omits the qualified type |
+| `NumberFormat.currencyNegativeUS` | `-$1,234.50` | `($1,234.50)` | US locale renders negative currency with a minus, not parentheses |
+| `Random.nextGaussian` | `1.1419053154730547` | `1.141905315473055` | 16 vs 17 significant digits — a `Double.toString` shortest-representation difference, not a different number |

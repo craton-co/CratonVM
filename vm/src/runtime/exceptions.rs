@@ -1094,6 +1094,255 @@ fn trace_already_captured_at_current_depth(
     )
 }
 
+/// HotSpot's `Klass::external_name()` for an already-loaded class: the internal
+/// name with `/` → `.`, **arrays left in descriptor form**.
+///
+/// Deliberately NOT `npe_message::class_external`, which renders the *JEP 358*
+/// spelling (`int[]`, `java.lang.Object[]`, `String`/`Object` shortened).
+/// `ClassCastException` / `ArrayStoreException` use the other one: measured on
+/// JDK 25, `(String[]) (Object) new int[1]` reports
+/// `class [I cannot be cast to class [Ljava.lang.String;`, and
+/// `Object[] o = new String[1]; o[0] = new Integer[1];` reports
+/// `ArrayStoreException: [Ljava.lang.Integer;` — descriptors, not `int[]`.
+fn hotspot_external_name(internal: &str) -> String {
+    internal.replace('/', ".")
+}
+
+/// Where HotSpot says a class lives, for the parenthetical half of a
+/// `ClassCastException` message.
+struct KlassOrigin {
+    /// Named module (`java.base`), or `None` for the unnamed module.
+    module: Option<String>,
+    /// `ClassLoaderData::loader_name_and_id()` text, quotes included.
+    loader: &'static str,
+    /// The loader itself. Two *unnamed* modules of different loaders are
+    /// different modules, so the joint/split decision needs more than the name.
+    loader_id: cratonvm_types::ClassLoaderId,
+}
+
+/// HotSpot's `ClassLoaderData::loader_name_and_id()` for the three built-in
+/// loaders, measured on JDK 25: `'bootstrap'`, `'platform'`, `'app'`. The
+/// built-ins all carry a loader `name`, so HotSpot prints the quoted-name form
+/// with no `@<hash>` suffix — verified against
+/// `class ThrProbe cannot be cast to class java.lang.String (ThrProbe is in
+/// unnamed module of loader 'app'; java.lang.String is in module java.base of
+/// loader 'bootstrap')`.
+///
+/// `None` for a user-defined loader **on purpose**: HotSpot renders those as
+/// `<loader class name> @<identity hash>` (or `'<name>' @<hash>`), and that hash
+/// is a value we cannot reproduce. Fabricating one would put a wrong address in
+/// a message log-scrapers read, so the caller keeps today's plain wording
+/// instead. Recorded as the one uncovered case in
+/// docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md.
+fn loader_name_and_id(loader: cratonvm_types::ClassLoaderId) -> Option<&'static str> {
+    use cratonvm_types::ClassLoaderId;
+    match loader {
+        ClassLoaderId::Bootstrap => Some("'bootstrap'"),
+        ClassLoaderId::Extension => Some("'platform'"),
+        ClassLoaderId::Application => Some("'app'"),
+        ClassLoaderId::UserDefined(_) => None,
+    }
+}
+
+/// Resolve a class *display* name (dotted, possibly an array descriptor) to the
+/// module/loader pair HotSpot names it by.
+///
+/// The name is all we have: `RuntimeError::ClassCastException`'s whole payload
+/// is a pre-rendered `message: String`, and `types/src/error.rs` — where a
+/// two-`ClassId` variant would have to live — is another lane's file. So
+/// resolve with `ClassManager::find_unique_class_by_name`, whose own doc marks
+/// it as the lookup that is safe for diagnostics carrying no initiating loader
+/// *because* it answers `None` rather than guessing when two loaders defined
+/// the name. Only when that is inconclusive do we ask the current frame's
+/// loader — the loader that resolved the `checkcast` constant-pool entry.
+///
+/// Nothing dispatches on this answer; it decorates a message. But the rule this
+/// campaign keeps re-learning is that a by-name binding has to be a narrowed,
+/// deliberate choice rather than a convenience, so it is one here.
+fn klass_origin(shared: &SharedVm, thread: &JvmThread, display_name: &str) -> Option<KlassOrigin> {
+    let cm = shared.classes.class_manager.read();
+    let class_id = cm.find_unique_class_by_name(display_name).or_else(|| {
+        let frame_class = thread.frames.last()?.class_id;
+        cm.find_class_by_name_for_class(display_name, frame_class)
+    })?;
+    let class = cm.get_class(class_id)?;
+    let loader_id = class.loader_id;
+    let loader = loader_name_and_id(loader_id)?;
+
+    // HotSpot reads the module off the array's *bottom* klass
+    // (`Klass::class_in_module_of_loader` walks `ObjArrayKlass::bottom_klass`)
+    // and hard-codes java.base for a primitive-component array — which is why
+    // `int[].class.getModule().getName()` measures as `java.base` on both VMs.
+    let name = class.name.to_string();
+    let dims = name.bytes().take_while(|b| *b == b'[').count();
+    if dims == 0 {
+        return Some(KlassOrigin {
+            module: class.module_name.clone(),
+            loader,
+            loader_id,
+        });
+    }
+    let module = match name[dims..].strip_prefix('L') {
+        // Reference-component array: the component carries the module.
+        Some(component) => {
+            let component = component.trim_end_matches(';');
+            let component_id = cm
+                .find_unique_class_by_name(component)
+                .or_else(|| cm.find_class_by_name_for_class(component, class_id))?;
+            cm.get_class(component_id)?.module_name.clone()
+        }
+        // Primitive-component array — java.base, per HotSpot's own comment
+        // ("klass is an array of primitives, module is java.base").
+        None => Some("java.base".to_string()),
+    };
+    Some(KlassOrigin {
+        module,
+        loader,
+        loader_id,
+    })
+}
+
+/// HotSpot's `Klass::class_in_module_of_loader`, minus the module `@version`
+/// clause — JDK 25 prints no version for `java.base` (measured), and CratonVM
+/// records none for any module.
+fn class_in_module_of_loader(display_name: &str, origin: &KlassOrigin, use_are: bool) -> String {
+    let verb = if use_are { "are" } else { "is" };
+    match &origin.module {
+        Some(module) => format!(
+            "{display_name} {verb} in module {module} of loader {}",
+            origin.loader
+        ),
+        None => format!(
+            "{display_name} {verb} in unnamed module of loader {}",
+            origin.loader
+        ),
+    }
+}
+
+/// Rebuild a cast refusal in HotSpot's wording, or `None` when we cannot name
+/// both operands' module and loader.
+///
+/// Mirrors `SharedRuntime::generate_class_cast_message`: one joint clause when
+/// both klasses are in the same module (`Klass::joint_in_module_of_loader`),
+/// two `; `-separated clauses otherwise. Both shapes are measured rather than
+/// recalled — the JDK 25 transcript is in the record.
+fn hotspot_class_cast_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    from_display: &str,
+    to_display: &str,
+) -> Option<String> {
+    let from = klass_origin(shared, thread, from_display)?;
+    let to = klass_origin(shared, thread, to_display)?;
+    // "Same module" in HotSpot's sense: it compares `ModuleEntry*`, so two
+    // classes that are both in *an* unnamed module only share a module when
+    // they share a loader.
+    let same_module =
+        from.module == to.module && (from.module.is_some() || from.loader_id == to.loader_id);
+    let parenthetical = if same_module {
+        format!(
+            "{from_display} and {}",
+            class_in_module_of_loader(to_display, &to, true)
+        )
+    } else {
+        format!(
+            "{}; {}",
+            class_in_module_of_loader(from_display, &from, false),
+            class_in_module_of_loader(to_display, &to, false)
+        )
+    };
+    Some(format!(
+        "class {from_display} cannot be cast to class {to_display} ({parenthetical})"
+    ))
+}
+
+/// Split `X cannot be cast to Y` / `class X cannot be cast to class Y` into its
+/// two operands, or `None` when the message is not exactly that shape.
+///
+/// Deliberately strict. `RuntimeError::ClassCastException` is also raised with
+/// free text — the checked-collection refusals, and the JIT-panic bridge in
+/// `interpreter/jit_bridge.rs` whose payload string merely *contains*
+/// `ClassCastException` — and rewriting one of those would be a fabrication.
+/// Requiring both operands to be whitespace-free, with nothing else in the
+/// message, also makes the rewrite idempotent: an already-normalised message
+/// ends in ` (…)`, so its right operand contains a space and it is left alone.
+fn split_cast_operands(message: &str) -> Option<(&str, &str)> {
+    let (lhs, rhs) = message.split_once(" cannot be cast to ")?;
+    let lhs = lhs.strip_prefix("class ").unwrap_or(lhs);
+    let rhs = rhs.strip_prefix("class ").unwrap_or(rhs);
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    if lhs.contains(char::is_whitespace) || rhs.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((lhs, rhs))
+}
+
+/// Give a VM-minted `ClassCastException` / `ArrayStoreException` the message
+/// HotSpot mints for the same failure.
+///
+/// Both are *generated by the VM* rather than written by a JDK author, so
+/// nothing else in the system can get them right — and their exact text is
+/// load-bearing. Measured 2026-08-12 against JDK 25 (both VMs running the same
+/// class file): HotSpot prints
+/// `class java.lang.String cannot be cast to class java.lang.Integer
+/// (java.lang.String and java.lang.Integer are in module java.base of loader
+/// 'bootstrap')` where CratonVM printed `java.lang.String cannot be cast to
+/// java.lang.Integer`, and `ArrayStoreException: java.lang.Integer` where
+/// CratonVM printed the *internal* name `java/lang/Integer`.
+///
+/// A slashed name is not merely ugly. The same defect in the `checkcast`
+/// message once made mockk's `JvmAutoHinter` regex capture `String` instead of
+/// `java.lang.String` (see the comment at the `checkcast` raise site in
+/// `interpreter/opcodes.rs`); every caller that feeds an `ArrayStoreException`
+/// message to `Class.forName` has that hole today.
+///
+/// Applied here — at the single funnel every VM-raised `RuntimeError` passes
+/// through — rather than at the raise sites, because the interpreter
+/// `checkcast`/`aastore` opcodes, `interpreter/lambda.rs`'s argument check and
+/// the JIT cast helper all live in other lanes' files.
+///
+/// **Which paths newly print a different string:** exactly those whose
+/// `ClassCastException` message is already a bare two-operand cast refusal
+/// (interpreter `checkcast`, `lambda.rs`'s `cannot be cast to`, the JIT's
+/// `class … cannot be cast to class …`), plus `ArrayStoreException`s whose
+/// message is a slashed internal class name (interpreter `aastore`, and the
+/// `arraycopy` element check in `interpreter.rs`). Everything else — checked
+/// collections, the JIT panic bridge, any message with whitespace in an operand
+/// — is returned byte-identical.
+fn hotspot_vm_type_error_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    error: RuntimeError,
+) -> RuntimeError {
+    match error {
+        RuntimeError::ClassCastException { message } => {
+            let rebuilt = split_cast_operands(&message)
+                .and_then(|(from, to)| hotspot_class_cast_message(shared, thread, from, to));
+            RuntimeError::ClassCastException {
+                message: rebuilt.unwrap_or(message),
+            }
+        }
+        RuntimeError::ArrayStoreException { message } => {
+            // The raise sites store the offending element's *class name*, so
+            // only rewrite something that still looks like one. A message with
+            // no `/` is either already external (`[I`, a default-package class)
+            // or free text; in both cases `replace` would be a no-op or a
+            // corruption.
+            let rewritable = message.contains('/') && !message.contains(char::is_whitespace);
+            RuntimeError::ArrayStoreException {
+                message: if rewritable {
+                    hotspot_external_name(&message)
+                } else {
+                    message
+                },
+            }
+        }
+        other => other,
+    }
+}
+
 /// Resolve `Throwable.cause` (or any inherited Throwable field by that
 /// name) and write `cause_ref` to it. Same by-name hierarchy walk as
 /// `set_detail_message_by_name` just above, reused so a cause can be
@@ -1369,9 +1618,125 @@ pub fn create_exception_object_for_class(
         );
     }
 
+    // 5. Mirror the two `Throwable` *instance-field initialisers* the JDK
+    //    source declares but that our partially-emulated construction can miss.
+    let obj_ref = thread.native_pin_roots[pin_base];
+    mirror_throwable_field_initialisers(shared, obj_ref);
+
     let obj_ref = thread.native_pin_roots[pin_base];
     thread.native_pin_roots.truncate(pin_base);
     Ok(obj_ref)
+}
+
+/// Mirror `Throwable`'s two declared instance-field initialisers —
+/// `private Throwable cause = this;` and
+/// `private List<Throwable> suppressedExceptions = SUPPRESSED_SENTINEL;` — on a
+/// throwable this module built.
+///
+/// Only ever reached right after step 3, so no user code has observed the object
+/// yet and there is nothing to clobber. Only `()V` and `(String)V` are invoked
+/// above, and the four-arg suppression-disabling constructor is unreachable from
+/// here, so no state this writes is state HotSpot would have left alone.
+///
+/// Both fields are now *read as decisions*, which is why the gap had to close:
+///
+/// * `Throwable.initCause` refuses with `IllegalStateException` unless
+///   `cause == this`. A VM-minted throwable whose `cause` never got the
+///   sentinel would refuse a first, legitimate `initCause`.
+/// * `Throwable.addSuppressed` treats a **null** `suppressedExceptions` as
+///   "suppression disabled" and silently drops the call — that is the JDK's own
+///   rule, and it is what makes the four-arg constructor work. Measured
+///   2026-08-12 on `--real-jdk`: a VM-minted `NullPointerException` and a
+///   `ClassNotFoundException` both came out with a **null** list where HotSpot
+///   has the empty-list sentinel, so honouring that rule without this mirror
+///   would silently lose the `close()` failure from every try-with-resources
+///   whose body threw a VM-minted exception.
+///
+/// The `cause` half deliberately fills in only a slot that was never written
+/// (`Int(0)` — an *unset* reference slot reads back as that rather than as
+/// `Object(None)`). A genuine stored null must be left alone: several JDK
+/// throwables null their cause on purpose — `ClassNotFoundException()` and
+/// `InvocationTargetException()` both chain to `super((Throwable) null)` — and
+/// HotSpot then correctly refuses `initCause` on them, which was measured on
+/// both VMs. Overwriting that null with the sentinel would turn a specified
+/// refusal into a silent success.
+///
+/// The suppressed half is the `create_exception_object` sibling of
+/// `capture_throwable_trace`'s `init_suppressed_sentinel` in `native-builtins`'
+/// `lang_misc.rs`, which does the same mirroring for the constructor shadows.
+/// Reading the real static (rather than parking any empty list) keeps the JDK
+/// bytecode's own `== SUPPRESSED_SENTINEL` identity tests valid on the rare
+/// paths that still reach it. Before `Throwable.<clinit>` has populated the
+/// static there is nothing faithful to write, so a bootstrap-era throwable is
+/// left as-is.
+fn mirror_throwable_field_initialisers(shared: &SharedVm, obj: ObjectRef) {
+    if let Some(idx) = instance_field_index_by_name(shared, obj, "cause") {
+        if matches!(shared.mem.heap.get_field(obj, idx), Value::Int(0)) {
+            shared
+                .mem
+                .heap
+                .set_field(obj, idx, Value::Object(Some(obj)));
+        }
+    }
+    let Some(idx) = instance_field_index_by_name(shared, obj, "suppressedExceptions") else {
+        return;
+    };
+    if matches!(shared.mem.heap.get_field(obj, idx), Value::Object(Some(_))) {
+        return;
+    }
+    let Some(sentinel) = throwable_suppressed_sentinel(shared) else {
+        return;
+    };
+    shared.mem.heap.set_field(obj, idx, sentinel);
+}
+
+/// `java.lang.Throwable.SUPPRESSED_SENTINEL` — the shared immutable empty list
+/// the JDK parks in `suppressedExceptions` to mean "suppression enabled, none
+/// recorded yet". `None` until `Throwable.<clinit>` has run.
+///
+/// The `(ClassId, static index)` pair is cached across calls because exception
+/// construction is a per-throw cost and framework code throws as control flow —
+/// the same reason the `CRATONVM_DBG_*` reads above are cached. Cached lazily
+/// rather than in a `OnceLock<Option<_>>`: the first VM-raised throw can precede
+/// `Throwable.<clinit>`, and a `OnceLock` would freeze that `None` forever.
+fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    const UNRESOLVED: u32 = u32::MAX;
+    static CLASS: AtomicU32 = AtomicU32::new(UNRESOLVED);
+    static INDEX: AtomicUsize = AtomicUsize::new(0);
+
+    // `CLASS` is the publication flag: it is stored last, with `Release`, so a
+    // thread that sees a resolved class id also sees the matching `INDEX`.
+    let cached = CLASS.load(Ordering::Acquire);
+    let (class_id, index) = if cached != UNRESOLVED {
+        (ClassId::new(cached), INDEX.load(Ordering::Relaxed))
+    } else {
+        let cm = shared.classes.class_manager.read();
+        let class_id = cm.find_bootstrap_class_by_name("java/lang/Throwable")?;
+        let class = cm.get_class(class_id)?;
+        let mut static_idx = 0usize;
+        let mut found = None;
+        for f in &class.fields {
+            if !f.is_static() {
+                continue;
+            }
+            if &*f.name == "SUPPRESSED_SENTINEL" {
+                found = Some(static_idx);
+                break;
+            }
+            static_idx += 1;
+        }
+        let index = found?;
+        drop(cm);
+        INDEX.store(index, Ordering::Relaxed);
+        CLASS.store(class_id.as_u32(), Ordering::Release);
+        (class_id, index)
+    };
+    match crate::vm::get_static_shared(shared, class_id, index) {
+        v @ Value::Object(Some(_)) => Some(v),
+        // `<clinit>` has not populated it yet — nothing faithful to write.
+        _ => None,
+    }
 }
 
 /// Convert a `RuntimeError` into a `MethodCallFailed::ExceptionThrown`.
@@ -1689,6 +2054,13 @@ pub fn throw_runtime_error(
             }
         }
     }
+    // Give the two type errors the VM *mints itself* HotSpot's wording before
+    // the message becomes a `detailMessage` String. Done after every debug dump
+    // above so `CRATONVM_DBG_RTERR` still shows the raise site's own text, and
+    // before `as_java_throwable` because that is what reads the message out.
+    // See `hotspot_vm_type_error_message` for exactly which raise sites this
+    // changes and which are returned byte-identical.
+    let error = hotspot_vm_type_error_message(shared, thread, error);
     // One table, shared with the reflective `Method.invoke` /
     // `Constructor.newInstance` wrapper in `native-builtins` — see
     // `RuntimeError::as_java_throwable`. `None` means "not a Java exception"
@@ -1983,6 +2355,13 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
             "java/lang/ClassFormatError",
             format!("{}: {}", class_name, message),
         ),
+        // Deliberately NOT `format!("{class_name}: {message}")` like the arm
+        // above: HotSpot's wording already names the class, mid-sentence
+        // ("Preview features are not enabled for P (class file version
+        // 69.65535)..."), so prefixing would print it twice.
+        LinkageError::UnsupportedClassVersionError { message, .. } => {
+            ("java/lang/UnsupportedClassVersionError", message.clone())
+        }
         LinkageError::UnsupportedClassRedefinitionError {
             class_name,
             message,

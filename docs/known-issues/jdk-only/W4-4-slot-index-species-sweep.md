@@ -1,7 +1,89 @@
 # W4-4 — the "synthetic slot index on a real JDK object" species: sweep record
 
-Status: two MISMATCHes fixed, the rest of the lane's surface verified safe with
-a reason per site. Wave 4, lane W4-4.
+Status: two MISMATCHes fixed, the rest of **this lane's enumerated surface**
+verified safe with a reason per site. Wave 4, lane W4-4.
+
+> **2026-08-12 (SECOND PASS) — this record's value is its CENSUS, and the census
+> is stale in the good direction. Read this note before quoting any number
+> below, including the numbers in the note under it.**
+>
+> Two of the three instrument holes every table here is bounded by have since
+> been closed, so the figures below are a *snapshot of a narrower instrument*
+> rather than a measurement of the species.
+>
+> 1. **The detector is no longer on one funnel.** It lives in
+>    `native-api/src/layout_alias.rs` with two observation points —
+>    `NativeContextImpl::alloc_object` (`vm/src/vm/vm_exec.rs:12058`), which every
+>    native object allocation in every native crate reaches, and the fabrication
+>    funnel, kept because it clamps `n = requested.max(real)` before allocating
+>    and is therefore the only place an `under` request is still visible. One
+>    implementation, two callers. The note below this one says the "intersect list
+>    1 with lists 2 and 3" procedure has a list 1 that cannot contain
+>    `AsynchronousSocketChannel`; **that is no longer true**, and the procedure in
+>    "Visible, not fatal" is now sound as written.
+> 2. **`declared == 0` is no longer silent.** It was `None` — the same bytes on
+>    the wire as clean — and is now `direction = "undeclared"`
+>    (`W7-73-short-object-blind-spot.md`). This matters more than it sounds:
+>    the base allocator clamps two lines *after* it observes, so `under` describes
+>    a mis-request and **never a short object**, and `undeclared` is the only
+>    direction in which a genuinely short object can appear. The `real == 0`
+>    column below — 152 pairs / 339 sites here, 197 / 447 in W7-49 — was the
+>    "unmeasured, not cleared" bucket and is now reportable.
+> 3. **Still open, and it bounds everything:** no figure in this file or in W7-49
+>    has ever been produced by a *run*. They are `javap`-plus-source upper bounds.
+>    The commands that produce the real numbers are in the closing section of this
+>    note's parent record and in W7-49 §9.4.
+>
+> The source-level counts that ARE current, because they are held by gates rather
+> than by prose: the `ClassId::new(0)` fallback population is **28** sites, 14 of
+> them naming a class whose real layout is wider (so those objects are short),
+> ratcheted downward-only by
+> `native-api/tests/layout_alias_coverage.rs::the_unresolved_class_fallback_population_only_shrinks`.
+> Everything else in this file needs the run.
+
+> **2026-08-12 — re-censused against the un-blinded detector; the status line
+> above is narrower than it reads, and three paragraphs below are wrong on the
+> facts.** `W7-49-slot-index-recensus.md` re-derives this census with
+> `report_layout_alias` reporting both directions, and adds the census this one
+> never took: not how wide each object was allocated, but which slot INDICES are
+> written past a class's declared width (174 such writes, 23 classes). Four LIVE
+> sites repaired there. The corrections that land on this document:
+>
+> * **The repair is genuinely present** — verified in source, not taken on
+>   trust — but the census it enables is still partial in a way not recorded
+>   here: it sits on ONE funnel, and **511 direct `alloc_object` call sites in
+>   the native crates never reach it**. The widest LIVE over-allocation in the
+>   workspace (`AsynchronousSocketChannel`, 4 slots against a class declaring 1,
+>   allocated by `native-io/src/async_socket.rs`) is invisible to this
+>   instrument, so the "intersect list 1 with lists 2 and 3" procedure the
+>   closing section prescribes has a list 1 that cannot contain it.
+> * **"Only slots 0 and 1 are ever written"** (the `CompletableFuture` paragraph
+>   under "Visible, not fatal") is false for the workspace:
+>   `phases_late/concurrent.rs` writes slot 2 at 39 sites and `http_client.rs`
+>   wrote slots 2 and 3 on a LIVE essential-path native. The paragraph's
+>   conclusion survives; its premise does not.
+> * **The "Latent, not currently live" `HashSet` paragraph** names four sites.
+>   The population is 20 allocation sites across 14 files, three of them LIVE.
+> * **The `register_p67_async_channels` row** below is a right verdict for a
+>   wrong reason, and it is the fifth row in this document to be that. "The
+>   receiver is always CratonVM-fabricated" does not make a slot write safe — the
+>   object still carries the REAL class's `ClassId`, so slot 0 is `provider`, a
+>   reference the collector scans, whoever allocated it. What actually makes the
+>   row harmless is that seven of its eight triples are **dead**: `native-io`
+>   registers the same class later and registration is last-write-wins. The
+>   surviving eighth uses a slot map that disagrees with its owner's on the
+>   meaning of slots 0, 1 and 2.
+> * `java/util/concurrent/ConcurrentHashMap` is **16 vs 12**, not 16 vs 10 — the
+>   two `java.util.AbstractMap` fields are inherited and count.
+
+> **2026-08-11 — the instrument this record's closing paragraph prescribes was
+> blind in the direction that matters.** `report_layout_alias` was reporting
+> only under-allocation; over-allocation, the direction §5 of
+> `docs/architecture/natives-over-real-jdk-classes.md` calls heap corruption,
+> was silent. It now reports both. **What every prior lane read as a clean
+> census over this funnel was a half census.** See "The detector was blind"
+> below, which also carries the first crate-wide requested-vs-declared count
+> and corrects one row of W7-9 §5.
 
 ## The species
 
@@ -260,6 +342,236 @@ Two more of the same shape remain in `reflect_invoke.rs`'s
 `register_p59_module` (lines ~2471 and ~2498: `m_obj` held across
 `create_string`). Left alone — that registrar is synthetic-jdk-only and the
 change belongs with whoever next touches it.
+
+## The detector was blind in the dangerous direction (2026-08-11)
+
+Branch `fix/jdk-only-slot-index-detector-blindness-20260811`. Nothing here is
+built or run; every field count is `javap -p` against the JDK 25.0.3.9 image on
+the Windows host (`C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot`),
+`javap -version` = `25.0.3`.
+
+### What the condition was, and what it is now
+
+`native-builtins/src/util_concurrent_ext.rs::try_alloc_concurrent_synthetic`,
+before:
+
+```rust
+let real = ctx.class_num_total_fields(cid);
+if num_fields > 0 && num_fields < real {
+    report_layout_alias(class_name, num_fields, real);
+}
+let n = num_fields.max(real);
+```
+
+after:
+
+```rust
+let real = ctx.class_num_total_fields(cid);
+if num_fields > 0 && real > 0 && num_fields != real {
+    report_layout_alias(class_name, num_fields, real);
+}
+let n = num_fields.max(real);
+```
+
+`report_layout_alias` now branches on the direction and emits a `direction =
+"under"` / `direction = "over"` field. Same function, same
+`CRATONVM_DBG_LAYOUT_ALIAS=1` gate, same `(class, requested, file, line)` dedup
+key, same `#[track_caller]` chain — **one channel, not two**, so the intersection
+procedure the closing section of this record prescribes still works unchanged and
+simply has more to intersect.
+
+### Why the silent direction was the sharp one
+
+The clamp `n = num_fields.max(real)` is what made under-allocation reportable
+and survivable at once: the object gets the real width, so every access stays in
+bounds and the damage is aliasing — a wrong answer. Over-allocation has no such
+floor:
+
+* The object comes back with `num_fields` slots while its class declares `real`,
+  so its header disagrees with `num_total_fields`. That is verbatim the condition
+  `vm/src/memory/gc.rs::validate_object_sizes` (`CRATONVM_DBG_VALIDATE_NEW=1`)
+  prints as `[young-validate] BAD <class> num_slots=N EXPECTED=M`. That validator
+  was written for a JIT `new` emitting a wrong-size header (the JUnitCore.main
+  miscompile → heap-walk desync); this funnel manufactures the identical shape,
+  deliberately, and the two instruments have never been read together.
+* The wide slot map is not confined to the objects this funnel made. A request
+  of 4 against a class declaring 2 is the caller asserting a four-entry map for
+  that class name, and the same natives receive instances they did not allocate.
+  `util_concurrent_ext.rs::native_cf_complete` proves the receivers arrive: its
+  whole body is a discriminator on slot 1's value *type*, because a real-JDK
+  `CompletableFuture` reaches it with `stack` there and a synthetic one with an
+  `Int` done-flag. Applied to a real 2-slot object, indices 2 and 3 are past the
+  end.
+
+So the pre-existing state of this instrument was the campaign's other recurring
+failure mode, not a bug in a native: an instrument that cannot report the thing
+it exists to catch reads exactly like a clean measurement. Every earlier lane
+that ran `CRATONVM_DBG_LAYOUT_ALIAS=1` and found nothing found nothing about
+over-allocation.
+
+### `real == 0` is excluded from both directions, and that is a hole
+
+The new test carries `real > 0`. `class_num_total_fields` returns 0 for two
+different facts — "class not loaded yet" (the reason the `max` exists at all)
+and "genuinely no instance fields", which is every interface and
+`java/lang/Object`. This funnel is asked for interface names routinely; two are
+in this very file (`java/util/concurrent/locks/Condition` at 1 slot,
+`java/util/concurrent/Flow$Subscription` at 2), where a non-zero request is the
+intended fabrication and not an alias. Crate-wide that is **152 distinct
+(class, requested) pairs across 339 call sites** which this census can say
+nothing about. They are unmeasured, not cleared. Separating the two meanings of
+0 needs a `class_is_loaded`-style predicate that does not exist on
+`NativeContext` today.
+
+### The three named instances, confirmed — and one of them is misfiled
+
+Reported to this lane as three silent over-allocations. Two confirm; the third
+is the opposite direction and was already being reported by the old condition.
+Counts are total instance fields including inherited (CratonVM's
+`num_total_fields`: `first_field_index = superclass.num_total_fields`, so the
+count is the transitive one), `static` excluded.
+
+| class | requested | declared (`javap -p`, transitive) | direction | where |
+|---|---|---|---|---|
+| `java/nio/channels/SelectionKey` | 4 | **1** — `private volatile Object attachment` | **over by 3** | `phases_late/net_channels.rs:706`, `servlet.rs:7080` |
+| `java/util/concurrent/CompletableFuture` | 4 | **2** — `volatile Object result`, `volatile Completion stack` | **over by 2** | `util_concurrent_ext.rs` ×4, `http_client.rs` ×2 |
+| `java/util/concurrent/CompletableFuture` | 3 | 2 | **over by 1** | `phases_late/concurrent.rs` ×12 |
+| `java/nio/channels/DatagramChannel` | 5 | **10** — 0 own + 6 `AbstractSelectableChannel` (`provider`, `keys`, `keyCount`, `keyLock`, `regLock`, `nonBlocking`) + 0 `SelectableChannel` + 4 `AbstractInterruptibleChannel` (`closeLock`, `closed`, `interruptor`, `interruptedTarget`) | **UNDER by 5** | `phases_late/net_channels.rs:3253` |
+
+**W7-9 §5's table lists `DatagramChannel` under *"When `num_fields > real` — the
+case for every row below"*. It is not.** That row gives no number for the real
+side (*"inherited from `AbstractSelectableChannel` / `AbstractInterruptibleChannel`"*),
+and the number is 10 against a request of 5 — the under direction, which the old
+detector already reported. The other two rows of that table stand. This is the
+census methodology warning in this campaign's README landing on a record that
+was otherwise careful: the row that was not resolved to a number is the row that
+was wrong.
+
+`SelectionKey` is already diagnosed in place, at
+`native-builtins/src/phases_late/net_channels.rs:614-631`, by the W7-9 lane,
+including its reason for not repairing it (that registrar is synthetic-only, the
+live surface is `native-io/src/nio_selector.rs::register_nio_selector_real`, and
+a one-sided renumbering only moves the disagreement). **This lane does not
+propose a patch there and there is no out-of-file patch to apply** — the fix
+needs a lane owning `native-io` and `servlet.rs`, exactly as W7-9 §5 says.
+
+### Every call site in `util_concurrent_ext.rs`, resolved
+
+Call sites, not grep hits: each row is the literal pair actually passed at that
+line.
+
+| line | class | requested | declared | direction |
+|---|---|---|---|---|
+| 2332, 2342 | `java/util/ArrayList$Itr` | 3 | 4 (`cursor`, `lastRet`, `expectedModCount`, `this$0`) | under by 1 — already reported |
+| 3375 | `java/util/concurrent/Flow$Subscription` | 2 | 0 — **interface** | unmeasurable (`real == 0`) |
+| 3714 | `java/util/concurrent/locks/Condition` | 1 | 0 — **interface** | unmeasurable (`real == 0`) |
+| 4789 | `java/util/ArrayList` | 2 | 3 (`AbstractList.modCount`, `elementData`, `size`) | under by 1 — already reported |
+| 5203, 5210, 5369, 5424 | `java/util/concurrent/CompletableFuture` | 4 | 2 | **over by 2 — newly visible** |
+| 10341 | `…locks/ReentrantReadWriteLock$ReadLock` / `$WriteLock` (via `class_name`) | 1 | 1 (`sync`) each | exact |
+
+Test-only (`#[cfg(test)]` begins at line 8532; a mock `ctx` answers `real == 0`,
+so none of these ever reported and none will):
+`ReentrantLock` 3 vs **1** (`sync`) ×11 — over by 2; `Semaphore` 2 vs **1** ×5 —
+over by 1; `CompletableFuture` 4 vs 2 ×1 — over by 2; `CountDownLatch` 1 vs 1,
+`CopyOnWriteArrayList` 2 vs 2, `AtomicInteger`/`AtomicLong`/`AtomicReference`
+1 vs 1 — exact.
+
+The four live `CompletableFuture` sites are **not** repaired here. Only slots 0
+and 1 are ever written (`FUT_FIELD_RESULT = 0`, `FUT_FIELD_DONE = 1`, in
+`native-builtins/src/lib.rs:33625-33626`), so the two extra slots are dead width
+rather than a write past the real layout — but they are dead width that made the
+object header disagree with its class, and narrowing 4 to 2 is an allocation
+change. This lane changed the reporting only, on purpose: the two must not move
+in one step, because if the report is wrong the allocation change has already
+shipped.
+
+The separate, worse thing sitting under those sites — `FUT_FIELD_DONE = 1`
+writing an `Int` into what a real `CompletableFuture` declares as the reference
+`stack`, a bogus pointer for the collector — is not new and is already stated in
+`native_cf_complete`'s own doc comment (*"clobbered `stack`@1 with the `done`
+int"*), which is why that function discriminates on slot 1's value type. It is
+the `MethodHandles$Lookup`/`allowedModes` shape from §5 of the architecture
+reference, in a fourth place.
+
+### The first crate-wide count, and what it is not
+
+Resolved over `native-builtins/src/**.rs` by extracting the literal
+`try_alloc_concurrent_synthetic(ctx, "<class>", <n>)` pair at each call site and
+running `javap -p` transitively over the superclass chain for every JDK class
+named. **1,543 call sites resolved this way, out of 1,895 total** — the
+remaining ~350 pass the class or the count through a constant, a variable or a
+multi-line call and are **not in these numbers**.
+
+| direction | distinct (class, requested) pairs | call sites |
+|---|---|---|
+| **over** (requested > declared) | 48 | 162 |
+| under (requested < declared) | 179 | 442 |
+| exact | 78 | 320 |
+| `real == 0` (interface / no instance fields) | 152 | 339 |
+| class not on the JDK 25 image (shims, `org/…`, test fixtures) | 158 | 280 |
+
+Widest over-allocations, by absolute excess: `java/util/Locale` 32 vs 4
+(`locale_bootstrap.rs`), `java/lang/invoke/MethodHandle` 17 vs 6
+(`lang_invoke.rs`), `javax/net/ssl/SSLContext` 12 vs 3 (`tls.rs`),
+`java/lang/Package` 12 vs 4 (`lang_class.rs`), `java/util/HashSet` 8 vs 1
+(`spring_startup_bootstrap.rs`),
+`java/util/concurrent/ConcurrentHashMap` 16 vs 10 (9 sites across
+`classloader.rs`, `classloader_real.rs`), `java/util/Date` 4 vs 2 (23 sites).
+
+**Three things this table is not.** (1) It is not a bug list — see the next
+paragraph. (2) It is not what the detector will print: the detector compares
+against whatever CratonVM has loaded, so in synthetic-JDK mode a fabricated
+class declares exactly `num_fields` and nothing fires. This is the population
+that would report **in real-JDK mode with the class loaded**, i.e. an upper
+bound. (3) It is not complete, by ~350 call sites and by the 339 `real == 0`
+sites.
+
+**A legitimate sub-population is inside the `over` column and must be
+subtracted before anyone counts it as a defect count.** `jca/kem.rs`,
+`jca/signature.rs`, `jca/key_factory.rs` and `jca/key_agreement.rs` over-allocate
+*on purpose*, through `synthetic_base_offset` (27 uses): it asks
+`class_num_total_fields` for the real width and appends private slots **above**
+it, *"so reference writes never land on a slot the real layout declares with an
+incompatible descriptor"*. That is the correct remedy for this species and it
+necessarily reports as `over`. The funnel receives one integer and cannot tell
+the idiom from a hard-coded wide guess.
+
+### Visible, not fatal — and what a follow-up must measure to go further
+
+Made visible. Not made fatal, and not narrowed: allocation behaviour is
+byte-identical (`max` still wins in both directions).
+
+The reason is that the `over` population had never been counted before the table
+above, and the table above is an upper bound containing a known-legitimate
+idiom. The 49-class / 75-site measurement quoted in `report_layout_alias`'s body
+— the one that argued this census stays off by default — was taken while the
+function only saw `under`, so it says nothing about `over`. Turning `over` into
+a refusal would convert an unknown number of working call sites into
+`NoClassDefFoundError` at boot, across a funnel with ~1,900 call sites.
+
+To go further, a follow-up needs three lists off one workload and their
+intersections:
+
+1. `CRATONVM_DBG_LAYOUT_ALIAS=1`, filtered to `direction = "over"` — distinct
+   (class, site) pairs.
+2. `CRATONVM_DBG_VALIDATE_NEW=1`'s `[young-validate] BAD … num_slots=N
+   EXPECTED=M` lines — the objects whose header already disagrees with their
+   class.
+3. The `cratonvm::gc::guard` out-of-bounds field reads, exactly as this record's
+   closing section already prescribes for the `under` direction.
+
+A pair in list 1 only, and reachable from `synthetic_base_offset`, is the
+intended idiom. A pair in list 1 only, otherwise, is wide-but-unused and can be
+narrowed at the call site — cheap and local. A pair in 1 ∩ 3 is a live defect of
+this species. List 2 is the cross-check that the funnel, not the JIT, produced
+the shape.
+
+Two questions the follow-up must answer that no instrument in the tree currently
+can: whether any of these classes is ever allocated at BOTH widths in one run
+(the two-layouts-on-one-class condition that made `java.lang.Process` a bug),
+and what the ~350 non-literal call sites request. The first needs the census
+keyed by class rather than by site; the second needs the count evaluated at the
+funnel, which it already is — those sites simply cannot be read from source.
 
 ## Confidence, and the observation that would falsify this
 

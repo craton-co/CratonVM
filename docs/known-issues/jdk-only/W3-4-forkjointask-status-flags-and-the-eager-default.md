@@ -1,11 +1,81 @@
 # W3-4 — `ForkJoinTask.isCompletedAbnormally()` was unregistered, and what still
 # gates the `CRATONVM_FJP_EAGER_FORK` default
 
-Status: **fix landed (unbuilt, unmeasured)** for the assertion. **The default
-flip LANDED 2026-08-07** — see §3, which is kept as the record of what was
-measured before it moved. §4 (`quietly*`) was closed by
-`W6-7-forkjointask-quietly-family.md`; it is kept as the record of what that
-lane was handed. Wave 3, lane W3-4.
+<!-- merge: both sides kept; the lane's finding and the reconciliation's commit attribution are complementary -->
+Status: **everything this record specifies is applied; nothing here is pending.**
+§2's four coordinated edits are in the tree; the default flip LANDED 2026-08-07;
+§4 (`quietly*`) was closed by `W6-7-forkjointask-quietly-family.md`. §3 and §4
+are kept as the record of what was measured and what W6-7 was handed. Wave 3,
+lane W3-4.
+
+> **2026-08-12 — re-audited by W7-48, and the eager-fork flag is genuinely
+> read.** `CRATONVM_FJP_EAGER_FORK` was traced flag-to-consumer, because this
+> codebase has shipped levers that moved a number nothing read:
+> `types/src/flag_groups.rs:1224` -> `runtime_var_os` -> `fjt_fork_mode()` ->
+> `register_forkjointask_eager_fork_gate`, which re-registers the `fork()` triple
+> on all three task classes with `fjt_fork_counted_completer_eager` (or
+> `fjt_fork_always_eager`), and that callback reaches
+> `phases_early::fjp_compute_for_submit` — it really runs `compute()` at fork
+> time. The gate is also the LAST writer for that triple on both boot paths
+> (`register_phase51_natives` :23581 before `register_new15_loom` :23677;
+> `register_real_jdk_forkjoin_essentials` :9959 before
+> `register_t19_k3_forkjoinpool_common` :9978, both `native-builtins/src/lib.rs`),
+> and no other registrar in the tree claims
+> `("fork", "()Ljava/util/concurrent/ForkJoinTask;")` — every other `"fork"`
+> registration is `StructuredTaskScope`-family, a different class and descriptor.
+> All four flag-surface obligations are met and unchanged.
+>
+> **What is still NOT closed is §3's condition (2): the Spring/H2 A/B has never
+> been run.** The lever is wired; its cost on the only workload that can observe
+> it is unmeasured. See `W7-48-fjp-unapplied-patches.md` §4.
+>
+> §2's `isCompletedAbnormally` now also has a neighbour that discriminates it:
+> `regression-suite/src/RJdkForkJoin.java::completionRecord()` asserts the
+> abnormal RECORD, not just the flags — `:294`'s
+> `isCancelled() && isCompletedAbnormally()` was green throughout the W6-9
+> defects, which is exactly why it could not catch them.
+**Status (reconciled 2026-08-12 — W7-55-record-reconciliation.md):**
+
+* **§2, the `isCompletedAbnormally` assertion: CLOSED.** All four coordinated
+  edits landed 2026-08-07 in commit `d2f5ee6c0` —
+  `native-builtins/src/phases_early.rs:9553` (synthetic registrar) and `:10054`
+  (`register_real_jdk_forkjoin_essentials`); `native-api/src/registry.rs:6058`
+  (`keep_real_forkjointask_bridge`); and
+  `vm/src/runtime/interpreter/native_override.rs:1705`
+  (`is_forkjoin_native_override`). Both allow-list entries carry this record's
+  own rationale comment.
+* **§3, the eager-fork default: FLIPPED. The tree no longer matches the
+  "prepared, not applied" reading.** Commit `256d119b4`, one line at
+  `native-builtins/src/phases_late/concurrent.rs:7667`. `fjt_fork_mode()`
+  (`:7636`) now returns `FjtForkMode::CountedCompleterEager` from its env-unset
+  arm; **lazy is the opt-OUT**, via `CRATONVM_FJP_EAGER_FORK=0` or
+  `CRATONVM_THREADS=-fjp-eager-fork`, which fall through the match at
+  `:7670-7676` to `_ => FjtForkMode::Lazy`. The flag is declared at
+  `types/src/flag_groups.rs:1224`. Both doc comments this record demanded move
+  did move (`concurrent.rs:7598`, `:7605-7607`). **§3's closing sentence — "It
+  was not applied in this lane, by instruction" — is superseded** by the boxed
+  note near the head of §3; read §3 only as the inventory the flipping commit
+  worked from.
+* **§4, the `quietly*` family: CLOSED** by `W6-7-forkjointask-quietly-family.md` —
+  `register_forkjointask_quietly_bridge` in
+  `native-builtins/src/phases_late/concurrent.rs`, with all six triples named in
+  `keep_real_forkjointask_bridge` and `is_forkjoin_native_override`.
+* **Residual: STILL OPEN — the flip's blast radius on the Spring/H2 slice.**
+  This is the one genuinely live item in the record. Its unverified state is
+  written into the source itself at `concurrent.rs:7659-7662`. Settling it needs
+  the A-B-B-A recipe in §3, with the Spring/H2 suite as the B arm.
+* **Residual: STILL OPEN — the two Rust guards are VACUOUS.** `apps/fjp_probe/`
+  does not exist in the tree, so `vm/tests/fjp_recursive.rs` and
+  `vm/tests/rfjp1_recursive.rs` both early-return. Lazy fork's original
+  justification therefore has **no live guard at all** — and lazy is now the
+  non-default path, which makes a regression there cheaper to introduce and
+  harder to notice.
+* **Cannot adjudicate without a run:** §3's conditions (1) and (3) are asserted
+  in an in-source note (`concurrent.rs:7648-7649`, `:7656-7657`) but are not
+  re-measurable from source. `cratonvm --jdk-only -cp out RJdkForkJoin`, and the
+  same with `--real-jdk`.
+
+Wave 3, lane W3-4.
 
 Predecessors: `L12-forkjoinpool-no-workers-awaitdone-hang.md`,
 `L19-countedcompleter-lazy-fork-starvation.md`,

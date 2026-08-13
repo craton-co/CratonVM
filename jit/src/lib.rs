@@ -360,6 +360,11 @@ pub struct ExecutableBuffer {
     ptr: *mut u8,
     len: usize,
     capacity: usize,
+    /// Named codegen invariant that discarded this method when the discard was
+    /// NOT a capacity problem — see
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable). `None`
+    /// alongside a set `overflowed` means the buffer really was too small.
+    codegen_failed: Option<&'static str>,
     /// Set when an `emit`/`emit_byte` call could not fit in the buffer.
     /// `estimated_size` in the x64 backend is a heuristic, so a pathological
     /// method can exceed it. Rather than panicking the whole process, the
@@ -413,6 +418,7 @@ impl ExecutableBuffer {
             len: 0,
             capacity,
             overflowed: false,
+            codegen_failed: None,
             wanted: 0,
             published: false,
             tag: "untagged",
@@ -498,15 +504,58 @@ impl ExecutableBuffer {
 
     /// Force the buffer into the [`overflowed`](Self::overflowed) state.
     ///
-    /// Used by codegen sites that detect a hard codegen invariant break
-    /// (e.g. a branch displacement that does not fit its encoding) and
-    /// cannot return `Result` to their caller. Setting this flag causes
-    /// the surrounding compile driver to discard the half-emitted method
-    /// and fall back to the interpreter via the existing
-    /// `if buf.overflowed() { return None; }` check in `compile`.
+    /// Reserved for a genuine CAPACITY problem — a write that did not fit, or a
+    /// patch offset past the emitted length. A codegen site that discards the
+    /// method for any OTHER reason must use
+    /// [`mark_codegen_unencodable`](Self::mark_codegen_unencodable) instead:
+    /// see that method for why the distinction is load-bearing.
     #[inline]
     pub fn mark_overflowed(&mut self) {
         self.overflowed = true;
+    }
+
+    /// Discard the method because codegen hit a hard invariant it cannot encode
+    /// — a `rel8`/`rel32` displacement out of range, a frame offset with no
+    /// ModRM form, a deopt stub whose frame reserved no register-save area.
+    ///
+    /// These sites used to call [`mark_overflowed`](Self::mark_overflowed),
+    /// which made the driver report every one of them as
+    /// *"code buffer estimate too small; retrying at the measured size"*. That
+    /// was wrong twice over:
+    ///
+    /// * **It named the wrong defect.** The buffer was not too small; `wanted`
+    ///   on such a bail is typically well UNDER `capacity`, so the printed
+    ///   diagnostic contradicted itself and no reader could tell which of the
+    ///   ten sites had fired.
+    /// * **It retried forever.** The overflow bail is the one bail
+    ///   `try_compile` exempts from the permanent bail list, on the theory that
+    ///   the next attempt allocates from a measurement instead of the
+    ///   heuristic. But the hint is derived from `wanted`, and when `wanted` is
+    ///   below the heuristic the recomputed size is IDENTICAL — so the method
+    ///   was re-lowered in full, and failed in exactly the same place, on every
+    ///   warmup-gate re-attempt for the life of the process, while never
+    ///   becoming compiled.
+    ///
+    /// A bigger buffer cannot fix any of these, so they are permanent: the
+    /// driver reports `reason` by name and lets `try_compile` bail-list the
+    /// method after ONE attempt.
+    ///
+    /// Also sets `overflowed`, so every existing
+    /// `if buf.overflowed() { return None; }` discard keeps working unchanged.
+    #[inline]
+    pub fn mark_codegen_unencodable(&mut self, reason: &'static str) {
+        if self.codegen_failed.is_none() {
+            self.codegen_failed = Some(reason);
+        }
+        self.overflowed = true;
+    }
+
+    /// The named codegen invariant that discarded this method, if the discard
+    /// was NOT a capacity problem. `None` means a genuine buffer overflow (or
+    /// no failure at all — check [`overflowed`](Self::overflowed) first).
+    #[inline]
+    pub fn codegen_failure_reason(&self) -> Option<&'static str> {
+        self.codegen_failed
     }
 
     /// Current write position (offset from start).
@@ -652,7 +701,7 @@ impl ExecutableBuffer {
             Ok(v) => {
                 self.try_patch_byte(patch, v as u8).ok();
             }
-            Err(_) => self.mark_overflowed(),
+            Err(_) => self.mark_codegen_unencodable("rel8-displacement-out-of-range"),
         }
     }
 
@@ -7304,6 +7353,80 @@ pub struct StringFieldLayout {
     pub string_class_id: u32,
 }
 
+/// Where `java.util.concurrent.atomic.AtomicInteger.value` lives, for the
+/// ATOMIC_INT intrinsic region.
+///
+/// Same two-offsets-per-field discipline as [`StringFieldLayout`], and for the
+/// same reason: a class with a registered `CompactLayout` may still have
+/// LEGACY-laid-out instances, so the codegen dispatches per object on the
+/// `GC_FLAG_COMPACT` header bit rather than assuming one layout.
+///
+/// `value` is an `int`, so both arms address a 4-byte payload — there is no
+/// reference/narrow-oop case to get wrong here, which is why this layout is a
+/// good deal simpler than the String one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtomicIntFieldLayout {
+    /// Abstract field slot index of `AtomicInteger.value`.
+    pub value_field_index: usize,
+    /// Byte offset of `value`'s 4-byte payload in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 4-byte payload in a LEGACY instance.
+    pub value_legacy_offset: i32,
+    /// `ObjectHeader` class id of `java/util/concurrent/atomic/AtomicInteger`,
+    /// used as the receiver guard. `AtomicInteger` is not final and its methods
+    /// are not final, so a subclass could override them — the guard is what
+    /// makes inlining the field access sound, and a mismatch falls back to
+    /// ordinary dispatch (which runs the override).
+    pub class_id: u32,
+}
+
+impl AtomicIntFieldLayout {
+    /// Build a layout from the raw field index, precomputing the COMPACT and
+    /// LEGACY payload addresses exactly the way [`StringFieldLayout::new`]
+    /// does for its `hash` field (the identical shape: a 4-byte `int`).
+    ///
+    /// Returns `None` when no compact layout is registered AND the legacy
+    /// address cannot be formed — the caller then simply does not offer the
+    /// intrinsic and the call keeps its native dispatch.
+    pub fn new(value_field_index: usize, class_id: u32) -> Option<Self> {
+        if class_id == 0 {
+            return None;
+        }
+        // LEGACY: uniform 16-byte `Value` cell, 4-byte int payload inside it.
+        let legacy = (cratonvm_types::HEADER_SIZE
+            + value_field_index * cratonvm_types::SLOT_SIZE) as i32
+            + cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32;
+        // COMPACT: the registered `CompactLayout` body offset IS the payload
+        // address. Same fallback rule as `StringFieldLayout::new` — with no
+        // registered layout no instance can carry `GC_FLAG_COMPACT`, so
+        // pointing the compact arm at the legacy address keeps it harmless
+        // rather than wild if that invariant ever slips.
+        //
+        // REFUSE anything that is not exactly 4 bytes wide: this intrinsic
+        // emits a 32-bit `LOCK XADD`, so a narrower or wider storage width
+        // would read and write the wrong bytes. Falling back to `None` here
+        // keeps the call on native dispatch instead.
+        let mut compact = legacy;
+        if cratonvm_types::compact_ref_fields_enabled() {
+            match cratonvm_types::compact_field_storage(class_id, value_field_index) {
+                Some((body_off, storage)) => {
+                    if storage.size_runtime() != 4 {
+                        return None;
+                    }
+                    compact = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+                }
+                None => {}
+            }
+        }
+        Some(Self {
+            value_field_index,
+            value_compact_offset: compact,
+            value_legacy_offset: legacy,
+            class_id,
+        })
+    }
+}
+
 impl StringFieldLayout {
     /// Build a layout from raw field indices, precomputing, for each of
     /// `value`/`coder`/`hash`, the two byte offsets the codegen needs: the
@@ -7547,6 +7670,36 @@ pub enum JitIntrinsic {
     LongRotateLeft,
     LongRotateRight,
     // ===== INTRINSIC REGION END: LONG_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+    // `java.util.concurrent.atomic.AtomicInteger` read-modify-write family.
+    //
+    // All six are ONE instruction — `LOCK XADD [value], r32` — differing only
+    // in the addend and in whether the result is the pre- or post-add value.
+    // `XADD` returns the OLD value in the source register, so the `*AndGet`
+    // forms just add the delta back afterwards.
+    //
+    // Why these matter: `getAndIncrement` is a REGISTERED NATIVE
+    // (`native-builtins/src/phases_early.rs`), so every increment from compiled
+    // code paid a full native dispatch — measured at ~250 ns/op against
+    // HotSpot's ~11 ns, i.e. one uncontended `lock xadd` behind ~1000x of call
+    // overhead. See
+    // `docs/known-issues/netty/fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`.
+    //
+    // The native keeps its state in the receiver's field slot 0 via
+    // `get_field_volatile` / `compare_and_swap_field` — the SAME memory this
+    // intrinsic addresses — so an interpreted caller and a compiled caller
+    // still agree. That is what makes the swap sound; if the native had used a
+    // side table these could not be intrinsified at all.
+    //
+    // Variant ordering within this region is local and not externally observed.
+    AtomicIntGetAndIncrement,  // getAndIncrement()I  -> old
+    AtomicIntGetAndDecrement,  // getAndDecrement()I  -> old
+    AtomicIntIncrementAndGet,  // incrementAndGet()I  -> old + 1
+    AtomicIntDecrementAndGet,  // decrementAndGet()I  -> old - 1
+    AtomicIntGetAndAdd,        // getAndAdd(I)I       -> old
+    AtomicIntAddAndGet,        // addAndGet(I)I       -> old + delta
+    // ===== INTRINSIC REGION END: ATOMIC_INT =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
     /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
@@ -8624,6 +8777,86 @@ pub fn try_resolve_intrinsic(
 /// "registered" decision and the codegen's "can emit" decision are always
 /// consistent within one compilation — a registered String sentinel is
 /// never left for the plain direct-call path to mis-`CALL`.
+/// Matcher for the ATOMIC_INT region.
+///
+/// Mirrors [`try_resolve_string_intrinsic`]: returns the intrinsic entry, the
+/// parameter count (excluding the receiver), the return type tag, and the
+/// receiver class id to guard on. Returns `None` — leaving the call to ordinary
+/// native dispatch — whenever the layout did not resolve.
+///
+/// The guard is ALWAYS emitted for this family. Unlike `java/lang/String`,
+/// `AtomicInteger` is not final, so a receiver could be a subclass that
+/// overrides `getAndIncrement`; only an exact class-id match may take the
+/// inline path.
+/// Number of call sites the ATOMIC_INT matcher has admitted this process.
+/// `CRATONVM_DBG_ATOMIC_INTRINSIC=1` prints each one. A perf claim about this
+/// family is not believable without checking that this is non-zero — the
+/// intrinsic answering the same values as the native it replaced proves
+/// nothing about whether it actually ran.
+pub static ATOMIC_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `CRATONVM_JIT_NO_ATOMIC_INTRINSIC=1` — keep every `AtomicInteger` RMW call
+/// on ordinary native dispatch. The kill switch for bisecting a suspected
+/// miscompile, and the B arm of an in-binary A/B (cross-run wall time on a
+/// shared host is not a measurement).
+fn atomic_intrinsic_disabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ATOMIC_INTRINSIC").is_some()
+}
+
+pub fn try_resolve_atomic_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    guard_class_id: u32,
+) -> Option<(usize, usize, u8, u32)> {
+    if class != "java/util/concurrent/atomic/AtomicInteger" {
+        return None;
+    }
+    if atomic_intrinsic_disabled() {
+        return None;
+    }
+    // The layout is derived from the SITE's declared class id (via
+    // `cp_invoke_class_id_resolver`) and field slot 0 — the same slot the
+    // registered native addresses (`get_field_volatile(this, 0)`). Deriving it
+    // here and again in the codegen from the same two inputs keeps the
+    // matcher's "registered" decision and the codegen's "can emit" decision
+    // from ever disagreeing, without threading a layout through `try_compile`.
+    //
+    // `AtomicIntFieldLayout::new` returns `None` when the compact storage
+    // width is not exactly 4 bytes, so a layout this 32-bit `LOCK XADD` could
+    // not address never reaches codegen — the call keeps its native dispatch.
+    let layout = AtomicIntFieldLayout::new(0, guard_class_id)?;
+    if layout.class_id == 0 {
+        return None;
+    }
+    // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+    let hit: Option<(JitIntrinsic, usize)> = match (name, descriptor) {
+        ("getAndIncrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndIncrement, 0)),
+        ("getAndDecrement", "()I") => Some((JitIntrinsic::AtomicIntGetAndDecrement, 0)),
+        ("incrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntIncrementAndGet, 0)),
+        ("decrementAndGet", "()I") => Some((JitIntrinsic::AtomicIntDecrementAndGet, 0)),
+        ("getAndAdd", "(I)I") => Some((JitIntrinsic::AtomicIntGetAndAdd, 1)),
+        ("addAndGet", "(I)I") => Some((JitIntrinsic::AtomicIntAddAndGet, 1)),
+        _ => None,
+    };
+    // ===== INTRINSIC REGION END: ATOMIC_INT =====
+    let (intrinsic, num_params) = hit?;
+    ATOMIC_INTRINSIC_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ATOMIC_INTRINSIC").is_some() {
+        eprintln!(
+            "[atomic-intrinsic] {}.{}{} class_id={} compact_off={} legacy_off={}",
+            class,
+            name,
+            descriptor,
+            layout.class_id,
+            layout.value_compact_offset,
+            layout.value_legacy_offset,
+        );
+    }
+    Some((intrinsic.as_entry(), num_params, b'I', layout.class_id))
+}
+
 pub fn try_resolve_string_intrinsic(
     class: &str,
     name: &str,
@@ -12769,37 +13002,67 @@ pub const CODE_BUFFER_TOO_SMALL_SITE: &str = "code-buffer-estimate-too-small";
 /// receives as `method_key`. Small and write-once-per-overflow: only methods
 /// that actually overflowed ever appear, which on the workloads measured here
 /// is none at all.
+/// `(measured, attempts)` per overflowing method.
+type CodeBufferShortfall = (usize, u32);
+
 static CODE_BUFFER_SHORTFALLS: std::sync::OnceLock<
-    parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>>,
+    parking_lot::RwLock<rustc_hash::FxHashMap<String, CodeBufferShortfall>>,
 > = std::sync::OnceLock::new();
 
-fn code_buffer_shortfalls() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<String, usize>> {
+fn code_buffer_shortfalls(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<String, CodeBufferShortfall>> {
     CODE_BUFFER_SHORTFALLS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
-/// Record that compiling `method_key` wanted `wanted` bytes of code buffer.
+/// How many times one method may be re-lowered to chase a bigger code buffer
+/// before the refusal becomes permanent.
+///
+/// Each doubling is a full single-pass lowering plus an `mmap`/`munmap` of the
+/// estimate, paid on the calling thread at the warmup gate. Three doublings take
+/// the buffer to 8x the first failing capacity; a method that still does not fit
+/// is not going to, and retrying it forever is the failure mode this cap exists
+/// to bound (see [`ExecutableBuffer::mark_codegen_unencodable`], which removed
+/// the OTHER way this loop used to become infinite).
+pub const MAX_CODE_BUFFER_RETRIES: u32 = 3;
+
+/// Record that compiling `method_key` wanted `wanted` bytes and failed at a
+/// buffer of `failed_capacity` bytes.
 ///
 /// Keeps the LARGEST observation: a later attempt can take a shorter path
 /// through the same method (a callee that has since become inlinable, a guard
 /// that de-speculated), and sizing the next buffer from that smaller number
 /// would overflow again.
-pub fn note_code_buffer_shortfall(method_key: &str, wanted: usize) {
-    if method_key.is_empty() || wanted == 0 {
+///
+/// `failed_capacity` is part of that maximum, and it is what makes the retry
+/// CONVERGE. `wanted` alone does not: an overflow can be recorded with `wanted`
+/// well below the capacity that failed (`try_patch_*` overruns add nothing to
+/// it), and `code_buffer_hint`'s doubling of such a `wanted` produces a size the
+/// heuristic already beat — so `estimated_size.max(hint)` re-allocated exactly
+/// the capacity that had just failed, and the next attempt failed identically.
+/// Taking `failed_capacity` into the maximum guarantees each attempt allocates
+/// strictly more than the last.
+pub fn note_code_buffer_shortfall(method_key: &str, wanted: usize, failed_capacity: usize) {
+    if method_key.is_empty() {
+        return;
+    }
+    let measured = wanted.max(failed_capacity);
+    if measured == 0 {
         return;
     }
     let mut map = code_buffer_shortfalls().write();
-    let slot = map.entry(method_key.to_string()).or_insert(0);
-    *slot = (*slot).max(wanted);
+    let slot = map.entry(method_key.to_string()).or_insert((0, 0));
+    slot.0 = slot.0.max(measured);
+    slot.1 = slot.1.saturating_add(1);
 }
 
 /// The measured buffer size to use for `method_key`, if a previous attempt
 /// overflowed.
 ///
-/// Doubled, because `wanted` UNDER-reports: it accumulates the bytes `emit`
-/// asked for, and an out-of-bounds `try_patch_*` adds nothing to it — so the
-/// true requirement is at least `wanted` and possibly more. Doubling converges
-/// in one step for every shape seen so far instead of burning a second
-/// `tier_fail_count` retry to discover the same thing again.
+/// Doubled, because the recorded measurement UNDER-reports: `wanted` accumulates
+/// the bytes `emit` asked for, and an out-of-bounds `try_patch_*` adds nothing to
+/// it — so the true requirement is at least the measurement and possibly more.
+/// Doubling converges in one step for every shape seen so far instead of burning
+/// a second `tier_fail_count` retry to discover the same thing again.
 pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
     if method_key.is_empty() {
         return None;
@@ -12807,7 +13070,23 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
     code_buffer_shortfalls()
         .read()
         .get(method_key)
-        .map(|w| w.saturating_mul(2))
+        .map(|(measured, _)| measured.saturating_mul(2))
+}
+
+/// Has `method_key` used up its [`MAX_CODE_BUFFER_RETRIES`] re-lowerings?
+///
+/// `try_compile` exempts the code-buffer bail from the permanent bail list so
+/// the next attempt can run at the measured size. That exemption is only sound
+/// while the retries are bounded — otherwise a method that can never fit is
+/// re-lowered on every warmup-gate re-attempt for the life of the process.
+pub fn code_buffer_retries_exhausted(method_key: &str) -> bool {
+    if method_key.is_empty() {
+        return false;
+    }
+    code_buffer_shortfalls()
+        .read()
+        .get(method_key)
+        .is_some_and(|(_, attempts)| *attempts >= MAX_CODE_BUFFER_RETRIES)
 }
 
 /// Render a taken bail site for a diagnostic line.
@@ -13952,7 +14231,18 @@ pub fn try_compile_with_invokespecial_resolver(
     // the two attempts, the retry is exactly the experiment worth running.
     // Every other backend-attempted `None` is a property of the class file and
     // stays permanent.
-    let retryable = matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _)));
+    //
+    // BOUNDED, though. Each retry is a full re-lowering plus an `mmap`/`munmap`
+    // of the estimate, on the calling thread, and the exemption used to have no
+    // stopping condition at all: a method the estimate could never satisfy was
+    // re-lowered on every warmup-gate re-attempt for the whole run and never
+    // became compiled. After `MAX_CODE_BUFFER_RETRIES` doublings (8x the first
+    // failing capacity) the refusal becomes permanent like any other.
+    let retryable = matches!(site, Some((CODE_BUFFER_TOO_SMALL_SITE, _, _)))
+        && !code_buffer_retries_exhausted(&format!(
+            "{}.{}:{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        ));
     if result.is_none() && backend_attempted && !retryable {
         // The heavy backend path ran and returned None — treat as
         // permanent.  Future try_compile calls for this method
@@ -18072,6 +18362,34 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                // `AtomicInteger` read-modify-write family. Registered only
+                // with a resolved receiver class id: `AtomicInteger` is not
+                // final and its methods are not final, so the inline field
+                // access is sound only behind an exact class-id guard, and
+                // without one the site must keep ordinary dispatch (which runs
+                // any subclass override).
+                if let Some((entry, num_params, ret, guard_class_id)) = cp_invoke_class_id_resolver
+                    .and_then(|r| r(cp_idx))
+                    .and_then(|cid| {
+                        try_resolve_atomic_intrinsic(&class_name, &method_name, &descriptor, cid)
+                    })
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                            guard_class_id,
+                        },
+                    ));
+                    continue;
+                }
+                // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                 // Then the `java/lang/String` intrinsics — registered only
                 // when the String field layout has resolved (and carries a
                 // `coder` field). `string_layout` is resolved ONCE per
@@ -18409,6 +18727,25 @@ fn try_compile_inner(
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
+    // The single-pass backend may elide an `<init>` only where the constant-pool
+    // resolver PROVED the constructor body empty — the same
+    // `cp_elidable_init_resolver` the IR builder uses for its `trivial_init_pcs`
+    // (see `set_new_info` above). Without a resolver the set is `None` and the
+    // backend elides nothing, which is the safe direction.
+    //
+    // Deriving it from the descriptor instead is the miscompile fixed here: a
+    // no-arg constructor that writes global state had that write dropped once
+    // the method was compiled. See
+    // `docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md`.
+    let elidable_init_pcs: Option<std::collections::HashSet<usize>> =
+        cp_elidable_init_resolver.map(|resolver| {
+            scan.invoke_ops
+                .iter()
+                .filter(|&&(_, _, opcode)| opcode == 0xb7)
+                .filter(|&&(_, cp_idx, _)| resolver(cp_idx))
+                .map(|&(pc, _, _)| pc)
+                .collect()
+        });
     note_jit_pipeline_stage(JIT_STAGE_SINGLE_PASS);
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
@@ -18448,6 +18785,7 @@ fn try_compile_inner(
         compact_field_info,
         &despec_method_key,
         indy_info,
+        elidable_init_pcs,
     )?;
     drop(metrics_single_pass);
 
@@ -19308,7 +19646,8 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 #[cfg(test)]
 mod code_buffer_retry_tests {
     use super::{
-        code_buffer_hint, note_code_buffer_shortfall, CODE_BUFFER_TOO_SMALL_SITE,
+        code_buffer_hint, code_buffer_retries_exhausted, note_code_buffer_shortfall,
+        ExecutableBuffer, CODE_BUFFER_TOO_SMALL_SITE, MAX_CODE_BUFFER_RETRIES,
     };
 
     /// A method nobody ever measured has no hint, so the heuristic estimate
@@ -19318,8 +19657,9 @@ mod code_buffer_retry_tests {
         assert_eq!(code_buffer_hint("com/example/Never.touched:()V"), None);
         // An empty key is what the legacy `compile()` test wrapper passes; it
         // must not collide with a real method under the empty string.
-        note_code_buffer_shortfall("", 99_999);
+        note_code_buffer_shortfall("", 99_999, 99_999);
         assert_eq!(code_buffer_hint(""), None);
+        assert!(!code_buffer_retries_exhausted(""));
     }
 
     /// The recorded shortfall comes back doubled — `wanted` under-reports,
@@ -19327,7 +19667,7 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_measured_shortfall_comes_back_doubled() {
         let key = "com/example/Big.method:(I)V";
-        note_code_buffer_shortfall(key, 6238);
+        note_code_buffer_shortfall(key, 6238, 4096);
         assert_eq!(code_buffer_hint(key), Some(12_476));
     }
 
@@ -19339,8 +19679,8 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_smaller_later_measurement_does_not_shrink_the_hint() {
         let key = "com/example/Bimodal.method:()V";
-        note_code_buffer_shortfall(key, 15_519);
-        note_code_buffer_shortfall(key, 4_000);
+        note_code_buffer_shortfall(key, 15_519, 4096);
+        note_code_buffer_shortfall(key, 4_000, 4096);
         assert_eq!(code_buffer_hint(key), Some(31_038));
     }
 
@@ -19350,8 +19690,94 @@ mod code_buffer_retry_tests {
     #[test]
     fn a_zero_measurement_is_not_recorded() {
         let key = "com/example/Zero.method:()V";
-        note_code_buffer_shortfall(key, 0);
+        note_code_buffer_shortfall(key, 0, 0);
         assert_eq!(code_buffer_hint(key), None);
+    }
+
+    /// THE NON-CONVERGENCE THIS FIXED. `wanted` can be recorded well BELOW the
+    /// capacity that failed (`try_patch_*` overruns add nothing to it), and the
+    /// driver sizes the next buffer as `max(heuristic, hint)`. With the hint
+    /// derived from `wanted` alone, a `wanted` under half the failing capacity
+    /// produced a hint the failing capacity already beat — so the "retry"
+    /// allocated the SAME number of bytes and failed in the same place, on every
+    /// warmup-gate re-attempt, forever. Folding the failed capacity into the
+    /// measurement makes each attempt strictly larger than the last.
+    #[test]
+    fn the_hint_always_exceeds_the_capacity_that_failed() {
+        let key = "com/example/UnderReported.method:()V";
+        let failed_capacity = 171_424;
+        note_code_buffer_shortfall(key, 12_000, failed_capacity);
+        let hint = code_buffer_hint(key).expect("a measured method has a hint");
+        assert!(
+            hint > failed_capacity,
+            "hint {hint} must exceed the capacity {failed_capacity} that just failed, \
+             or the retry re-runs the identical compile"
+        );
+    }
+
+    /// The bail-list exemption is bounded. Each retry is a full re-lowering plus
+    /// an mmap/munmap on the calling thread; without a cap a method the estimate
+    /// can never satisfy pays that on every re-attempt for the whole run.
+    #[test]
+    fn the_retry_exemption_runs_out() {
+        let key = "com/example/Hopeless.method:()V";
+        for i in 0..MAX_CODE_BUFFER_RETRIES {
+            assert!(
+                !code_buffer_retries_exhausted(key),
+                "attempt {i} must still be allowed to retry"
+            );
+            note_code_buffer_shortfall(key, 8192, 8192);
+        }
+        assert!(
+            code_buffer_retries_exhausted(key),
+            "after {MAX_CODE_BUFFER_RETRIES} doublings the refusal must become permanent"
+        );
+    }
+
+    /// A codegen invariant that has no encoding is NOT a sizing problem, and it
+    /// must not be reported or retried as one: `mark_codegen_unencodable` still
+    /// discards the method (so every `if buf.overflowed()` bail keeps working)
+    /// but names its own reason, which the driver reports instead of the
+    /// code-buffer message and which `try_compile` bail-lists permanently.
+    #[test]
+    fn an_unencodable_codegen_invariant_is_not_reported_as_a_short_buffer() {
+        let mut buf = ExecutableBuffer::new(4096).expect("allocate");
+        assert!(!buf.overflowed());
+        assert_eq!(buf.codegen_failure_reason(), None);
+        buf.mark_codegen_unencodable("rel8-displacement-out-of-range");
+        assert!(
+            buf.overflowed(),
+            "the existing overflowed() discards must still fire"
+        );
+        assert_eq!(
+            buf.codegen_failure_reason(),
+            Some("rel8-displacement-out-of-range")
+        );
+
+        // A genuine capacity overflow reports NO named reason, so the driver
+        // keeps taking the measure-and-retry path for it.
+        let mut small = ExecutableBuffer::new(4096).expect("allocate");
+        small.emit(&[0u8; 8192]);
+        assert!(small.overflowed());
+        assert_eq!(small.codegen_failure_reason(), None);
+        assert!(
+            small.wanted() > small.capacity(),
+            "a real overflow's `wanted` exceeds its capacity; that is what the retry measures"
+        );
+    }
+
+    /// The FIRST reason wins. A codegen site that bails mid-instruction can
+    /// leave later emitters running against a sticky-overflowed buffer, and
+    /// whichever of them marks next must not overwrite the diagnosis.
+    #[test]
+    fn the_first_named_reason_is_the_one_reported() {
+        let mut buf = ExecutableBuffer::new(4096).expect("allocate");
+        buf.mark_codegen_unencodable("deopt-stub-without-saved-regs");
+        buf.mark_codegen_unencodable("rel8-displacement-out-of-range");
+        assert_eq!(
+            buf.codegen_failure_reason(),
+            Some("deopt-stub-without-saved-regs")
+        );
     }
 
     /// The exemption in `try_compile` matches on this constant, and the
@@ -27128,7 +27554,17 @@ mod layout_constant_inventory {
         // `cell()` closure it replaced biased BOTH branches by payload64 and
         // never mentioned payload32, which is precisely how the compact arm
         // ended up 4 bytes past `coder` and `hash`.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 1]),
+        //
+        // 2026-08-12: `AtomicIntFieldLayout::new` (the ATOMIC_INT intrinsic
+        // region) adds the same two-offsets-per-field pair as the String one,
+        // for `AtomicInteger.value`: `HEADER_SIZE` 3 -> 5, `SLOT_SIZE` 2 -> 3
+        // and `FIELD_CELL_PAYLOAD32_OFFSET` 1 -> 2 (the legacy arm's
+        // header-plus-cell-plus-payload32 address), and `HEADER_SIZE` again
+        // for the compact arm's header-plus-body-offset. `value` is an `int`,
+        // so there is no payload64 arm and no ref/narrow-oop case. Both sites
+        // are disp32 in the emitted `LOCK XADD [RAX+disp32], ECX`, so neither
+        // shares the disp8 hazard.
+        ("lib.rs", [5, 1, 3, 1, 0, 0, 2, 1]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
@@ -27844,4 +28280,35 @@ mod invalidate_early_out {
         assert!(!cache.any_body_inlined_from("Helper"));
         assert_eq!(cache.invalidate_for_class("Helper"), 0);
     }
+}
+
+/// Census of `execute()`'s static JIT-eligibility gate: how often the positive
+/// memo (`JitRealm::jit_gate_pass`) answered, versus how often the full gate —
+/// including `jit_method_calls_native_shadowed`'s O(method-bytecode) decode —
+/// had to run and fill it.
+///
+/// `fills` is bounded by the number of distinct eligible methods; `hits` is the
+/// number of `execute()` entries that would previously have re-run the whole
+/// gate. The ratio is the fix's whole justification, so it is measured rather
+/// than asserted. Always on: two relaxed increments on a path that already
+/// takes an `RwLock`.
+static JIT_GATE_PASS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JIT_GATE_PASS_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn note_jit_gate_pass_hit() {
+    JIT_GATE_PASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn note_jit_gate_pass_fill() {
+    JIT_GATE_PASS_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(hits, fills)` for the stats dump.
+pub fn jit_gate_pass_census() -> (u64, u64) {
+    (
+        JIT_GATE_PASS_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        JIT_GATE_PASS_FILLS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }

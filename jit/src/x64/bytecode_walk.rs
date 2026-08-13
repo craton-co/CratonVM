@@ -7313,6 +7313,141 @@ impl Compiler {
                         #[allow(unused_mut)]
                         let mut intrinsic_handled = false;
 
+                        // ===== INTRINSIC REGION BEGIN: ATOMIC_INT =====
+                        // `AtomicInteger` RMW family, emitted as ONE
+                        // `LOCK XADD [value], ECX`.
+                        //
+                        // `XADD` atomically adds the source register to the
+                        // destination and leaves the PRE-add value in the
+                        // source, which is exactly `getAndAdd` semantics; the
+                        // `*AndGet` forms add the delta back afterwards. That
+                        // replaces a full native dispatch (~250 ns/op measured)
+                        // with a single locked instruction.
+                        //
+                        // Soundness rests on three things:
+                        //   * the registered native keeps its state in the SAME
+                        //     memory (`get_field_volatile(this, 0)` /
+                        //     `compare_and_swap_field(this, 0, ..)`), so an
+                        //     interpreted caller and a compiled caller still
+                        //     agree on one location;
+                        //   * the receiver class-id guard below — AtomicInteger
+                        //     is not final, so a subclass override must NOT take
+                        //     this path;
+                        //   * the per-object COMPACT/LEGACY branch, the same one
+                        //     `emit_load_string_i32_field` uses, because a class
+                        //     with a registered `CompactLayout` may still have
+                        //     legacy-laid-out instances.
+                        // Every uncertain case (null receiver, class mismatch)
+                        // goes to the shared uncommon-trap stub and re-runs in
+                        // the interpreter, which reproduces the NPE exactly.
+                        if !intrinsic_handled {
+                            // (delta_imm, return_post_add, delta_is_arg)
+                            let plan: Option<(i32, bool, bool)> = if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndIncrement.as_entry()
+                            {
+                                Some((1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndDecrement.as_entry()
+                            {
+                                Some((-1, false, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntIncrementAndGet.as_entry()
+                            {
+                                Some((1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntDecrementAndGet.as_entry()
+                            {
+                                Some((-1, true, false))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntGetAndAdd.as_entry()
+                            {
+                                Some((0, false, true))
+                            } else if callee_entry
+                                == crate::JitIntrinsic::AtomicIntAddAndGet.as_entry()
+                            {
+                                Some((0, true, true))
+                            } else {
+                                None
+                            };
+                            if let Some((delta_imm, return_post_add, delta_is_arg)) = plan {
+                                // Recomputed from the same two inputs the
+                                // matcher used; `None` here cannot happen for a
+                                // registered site, and bailing keeps the plain
+                                // direct-call path rather than emitting a CALL
+                                // to an intrinsic sentinel.
+                                if let Some(layout) =
+                                    crate::AtomicIntFieldLayout::new(0, guard_class_id)
+                                {
+                                    self.flush_scratch_registers();
+                                    if crate::deopt_real_enabled() {
+                                        self.snapshot_pre_intrinsic_call(
+                                            pc,
+                                            crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                        );
+                                    }
+                                    let mut bail: Vec<usize> = Vec::new();
+                                    // Operands: delta (if any) is shallower,
+                                    // the receiver is deepest.
+                                    let delta_slot =
+                                        if delta_is_arg { Some(self.pop_stack()) } else { None };
+                                    let recv_slot = self.pop_stack();
+
+                                    // RAX = receiver; null → deopt.
+                                    self.load_slot_to_reg(RAX, recv_slot);
+                                    self.emit_test_r64_r64(RAX);
+                                    bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                    // Exact receiver class guard:
+                                    // CMP DWORD [RAX + 0], guard_class_id ; JNE
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                    // EDX = delta (kept for the *AndGet fixup,
+                                    // since XADD overwrites its source with the
+                                    // pre-add value).
+                                    match delta_slot {
+                                        Some(slot) => self.load_slot_to_reg(RDX, slot),
+                                        None => {
+                                            self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                                            self.buf.emit(&delta_imm.to_le_bytes());
+                                        }
+                                    }
+                                    self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
+
+                                    // Per-object layout branch.
+                                    self.emit_test_mem8_imm8(
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                                        cratonvm_types::GC_FLAG_COMPACT,
+                                    );
+                                    let legacy = self.emit_jcc_rel32_patch(0x84); // JZ
+                                                                                  // LOCK XADD [RAX + compact], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_compact_offset.to_le_bytes());
+                                    let done = self.emit_jmp_rel32_patch();
+                                    self.patch_rel32_to_here(legacy);
+                                    // LOCK XADD [RAX + legacy], ECX
+                                    self.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]);
+                                    self.buf.emit(&layout.value_legacy_offset.to_le_bytes());
+                                    self.patch_rel32_to_here(done);
+
+                                    // ECX now holds the PRE-add value.
+                                    if return_post_add {
+                                        self.buf.emit(&[0x01, 0xD1]); // ADD ECX, EDX
+                                    }
+                                    self.buf.emit(&[0x48, 0x63, 0xC1]); // MOVSXD RAX, ECX
+                                    self.push_from_rax();
+
+                                    for p in bail {
+                                        self.deopt_stubs.push((p, pc, 6));
+                                    }
+                                    intrinsic_handled = true;
+                                }
+                            }
+                        }
+                        // ===== INTRINSIC REGION END: ATOMIC_INT =====
+
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
                         // java.lang.String access intrinsics (Phase 3a):
                         // length()I, isEmpty()Z, charAt(I)C, hashCode()I.
@@ -9981,7 +10116,7 @@ impl Compiler {
                                 "[cratonvm-jitc] compile-bail unresumable-indy-trap bci={pc}"
                             );
                         }
-                        self.buf.mark_overflowed();
+                        self.buf.mark_codegen_unencodable("unresumable-indy-trap");
                     }
 
                     let patch = self.emit_jmp_rel32_patch();

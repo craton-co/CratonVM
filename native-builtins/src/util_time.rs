@@ -30,6 +30,26 @@
 //! T2.5 unit tests in the bottom of this file exercise the synthetic
 //! path directly; in real-JDK mode the JDK's own JCK-equivalent
 //! test suite exercises the same contract through the bytecode path.
+//!
+//! ## This module holds ZERO contract §1.4 shadow rows, and cannot hold any
+//!
+//! Checked 2026-08-11 against a `--dump-native-registry` census of the shipped
+//! `cratonvm-cli` build: **not one** of its 11,665 registrations names this
+//! file. That is the `#[cfg(feature = "synthetic-jdk")]` on `pub mod
+//! util_time;` doing exactly what it says — the module is not compiled into
+//! the default build at all, and its three registrars are reached only from
+//! `register_builtins`, the synthetic arm. All three shadow ratchets
+//! (`bridge_shadows_bytecode`, `bridge_without_acc_native`,
+//! `BASELINE_SYNTHETIC_STUBS`) take their census in Compatible mode, so
+//! nothing here can move any of them by any amount — the same scoping trap
+//! `docs/architecture/natives-over-real-jdk-classes.md` §7 records for
+//! `regression-suite/bridge-ratchet.sh`.
+//!
+//! A shadow-retirement wave should therefore skip this file rather than
+//! re-derive that from a grep of its `registry.register` calls, which finds
+//! hundreds. The disposition this module actually wants is T2.5.15's — delete
+//! it — not a per-triple retirement. See
+//! docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md §0.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
@@ -5116,6 +5136,20 @@ fn os_default_zone_id() -> String {
     }
     #[cfg(windows)]
     {
+        // JDK-ONLY-NOTE (W7-91): this arm answers `UTC` on every Windows host,
+        // and REPAIRING IT ALONE IS INERT. It is only
+        // `jvm_default_zone_id`'s fallback for a failed real-`TimeZone`
+        // round-trip, and that round-trip succeeds: it reaches
+        // `TimeZone.setDefaultZone()`, which — `user.timezone` being empty,
+        // `vm_init` seeding it from `$TZ` alone — calls
+        // `TimeZone.getSystemTimeZoneID`, i.e.
+        // `native_timezone_get_system_id` in `native-builtins/src/lib.rs`,
+        // which hard-codes `"UTC"` and is the producer a fix has to start
+        // from. Measured consequence: `ZoneId.systemDefault()` is UTC here, so
+        // `SimpleFormatter` dates run three hours behind HotSpot's on this
+        // UTC+3 host — two of the four characters `RJdkLogging`'s cross-VM
+        // diff reports. See W7-91-format-date-symbols-hardcoded-english.md §4.
+        //
         // On Windows the timezone display key is under
         // HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation.
         // Reading the registry would pull in a dependency (winreg);
@@ -5460,6 +5494,31 @@ fn native_year_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // ---------------------------------------------------------------------------
 // java.time.Month is an enum with 12 constants. We model each instance
 // as a 1-field synthetic (field 0 = int value 1..=12).
+//
+// THIS MAP IS THE SECOND OF TWO AND IT IS DEAD (W7-77-guarded-slot-maps.md).
+// `phases_early.rs`'s `register_phase52_time_enums` registers the same class
+// with the same slot 0, and it registers LATER:
+// `register_synthetic_overrides` calls `register_t25_natives` at
+// `native-builtins/src/lib.rs:23852` and `register_phase52_natives` at
+// `:23869`, and `NativeMethodRegistry::register` is last-write-wins. All FIVE
+// triples registered from `register_t25_natives` below — `of`, `getValue`,
+// `length(Z)I`, `maxLength`, `minLength` — are overwritten, so not one of the
+// bodies in this section ever executes in a real run. The only callers left
+// are this file's own `#[cfg(test)]` block.
+//
+// It is dead by call ORDER, not by construction. Swap those two lines in
+// `register_synthetic_overrides` and this becomes the winner, which is why it
+// is documented rather than trusted to stay harmless. `phases_early.rs`'s
+// header carries the layout analysis, the JDK 25 oracle and the class-side
+// witness (`month_slot0_is_synthetic`); nothing here has any of them, so if
+// this section is ever revived it must be revived through that funnel.
+//
+// W7-69-read-side-alias-instrument.md's census never saw this run at all — it
+// classified one `MONTH_FIELD_VALUE` and there are two, identically named, in
+// the same crate. That is the same shape as the `alloc_time_synthetic`
+// duplicate (`lib.rs` and this file both declare one, same signature, same
+// body), and it is why §4.3's "Nothing is dead in this population" does not
+// hold for `java/time/Month`.
 
 const MONTH_FIELD_VALUE: usize = 0;
 const MONTH_NUM_FIELDS: usize = 1;

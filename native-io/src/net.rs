@@ -2418,7 +2418,20 @@ fn net_poll_raw(_raw: NetRawHandle, _events: i32, timeout: i32) -> std::io::Resu
 ///
 /// Shared with `socket_channel.rs`, whose `SocketChannel` registry is separate
 /// from this file's but whose blocking read needs the same park-in-poll shape.
-pub(crate) fn poll_stream_readable(
+///
+/// # Why this is `pub` and not `pub(crate)`
+///
+/// W2-2-blocked-reader-async-close-wakeup.md's out-of-file patch. The synthetic
+/// `java.net.Socket` reader in `native-builtins/src/net_phase_e.rs` needs
+/// exactly this three-state contract and, unable to reach a `pub(crate)` item
+/// across the crate boundary, restated the whole `WSAPoll`/`poll(2)` binding a
+/// second time as `re1_socket_poll_readable`. `native-builtins` already depends
+/// on this crate and already calls `cratonvm_native_io::net::take_stream_for_tls`,
+/// so exporting costs no new dependency edge. **Exporting is only half the
+/// collapse** — deleting the duplicate arms is an edit to `net_phase_e.rs`, and
+/// is recorded, not applied, in that record. Until it is applied this crate has
+/// one exported primitive and that file still has its own copy.
+pub fn poll_stream_readable(
     stream: &TcpStream,
     timeout_ms: i32,
 ) -> Option<std::io::Result<bool>> {
@@ -2463,6 +2476,134 @@ const NET_POLLNVAL: i32 = 0x0020;
 #[cfg(not(windows))]
 const NET_POLLCONN: i32 = NET_POLLOUT;
 
+/// Wait up to `timeout_ms` for `stream` to become writable.
+///
+/// The writable sibling of [`poll_stream_readable`], with the identical
+/// three-state contract: `Some(Ok(true))` writable (or errored/hung up, which
+/// the following `send` then surfaces), `Some(Ok(false))` the timeout expired,
+/// `None` this build has no poll primitive at all.
+///
+/// Deliberately NOT a fourth binding of `WSAPoll`/`poll(2)`: it goes through
+/// the same [`net_poll_stream`] the readable side uses, with `NET_POLLOUT`
+/// instead of `NET_POLLIN`.
+///
+/// `pub` for the same reason as [`poll_stream_readable`], and exported with it
+/// rather than after it: `net_phase_e.rs`'s duplicate binding grew a *direction*
+/// parameter, so collapsing it needs both halves of the pair available at once.
+/// Exporting only the readable one would have left that file no choice but to
+/// keep its own copy for the write direction, which is how a four-site idiom
+/// grows back.
+pub fn poll_stream_writable(
+    stream: &TcpStream,
+    timeout_ms: i32,
+) -> Option<std::io::Result<bool>> {
+    #[cfg(any(windows, unix))]
+    {
+        Some(net_poll_stream(stream, NET_POLLOUT, timeout_ms))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (stream, timeout_ms);
+        None
+    }
+}
+
+/// How long a blocking `write0` parks inside one poll before re-asking the
+/// registry whether the socket was closed under it. Same role and same value as
+/// [`NET_READ_CLOSE_POLL_MS`] on the read side.
+const NET_WRITE_CLOSE_POLL_MS: i32 = 25;
+
+/// Largest payload handed to one `send` while a blocking write is being sliced.
+///
+/// A blocking-mode `send` of N bytes does not return until all N are queued, so
+/// a single unsliced `send` parks for an unbounded time and observes no close.
+/// Slicing keeps the probe cadence — the same reasoning, and the same 8 KiB,
+/// as `socket_channel::WRITE_SLICE_MAX`, whose doc comment carries the measured
+/// `SendWake.java` evidence for why `shutdown` does not wake a parked `send`.
+const NET_WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// One `send`, reissued for as long as it reports EINTR.
+///
+/// Lifted verbatim out of [`net_write0`]'s AUDIT 2026-07-26 loop so the
+/// close-aware path and the fallback share one copy.
+fn write_retry_eintr(stream: &TcpStream, buf: &[u8]) -> std::io::Result<usize> {
+    let mut w = stream;
+    loop {
+        match w.write(buf) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    || error.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A blocking `write0` that observes an asynchronous `close()` — the write twin
+/// of [`net_read_close_aware`], and the hole the 2026-08-07 pass left.
+///
+/// `socket_channel.rs` grew `write_close_aware` on the channel side; this file
+/// did not, so a thread parked in `Socket.getOutputStream().write(..)` behind a
+/// stalled peer stayed parked through `Socket.close()` for exactly the reason
+/// its reader twin did: `close_net_fd` marks the slot `Closed` and issues
+/// `shutdown(Both)`, but cannot close the OS handle while this writer holds an
+/// `Arc` clone of the `TcpStream`.
+///
+/// # What a partial transfer answers
+///
+/// A close that lands after some bytes are out returns the PARTIAL COUNT rather
+/// than an error, which is what `NioSocketImpl.implWrite`'s caller sees from
+/// HotSpot for the same race and what `socket_channel::write_close_aware`
+/// already reproduces (`AbstractInterruptibleChannel.end(completed)` sees
+/// `completed == true` once any byte has gone out). Only a close with zero bytes
+/// transferred reports [`net_read_closed_err`]'s `Interrupted`, which
+/// `NioSocketImpl.endWrite` then retypes to `SocketException("Socket closed")`.
+///
+/// # On expiry
+///
+/// The `NET_WRITE_CLOSE_POLL_MS` slice expiring is not an outcome — it is the
+/// point at which the registry is re-asked, and the loop continues. There is no
+/// second deadline here because `java.net.Socket` has no write timeout;
+/// `NioSocketImpl` has no `SO_SNDTIMEO` equivalent to honour.
+fn net_write_close_aware(fd: i32, stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written);
+        }
+        let ready = match poll_stream_writable(stream, NET_WRITE_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-12 blocking
+            // write, which cannot see the close but at least still transfers.
+            None => return write_retry_eintr(stream, &data[written..]),
+        };
+        // Asked AFTER the poll so a close landing while we are parked is seen
+        // on the next pass, and a close racing a writability edge still wins.
+        if !net_stream_still_registered(fd) {
+            if written > 0 {
+                return Ok(written);
+            }
+            return Err(net_read_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        let end = (written + NET_WRITE_SLICE_MAX).min(data.len());
+        match write_retry_eintr(stream, &data[written..end]) {
+            Ok(0) => continue,
+            Ok(n) => written += n,
+            // `WouldBlock` after a positive writability probe means a
+            // concurrent writer took the room. Park again rather than report a
+            // short write the caller did not ask for — unless nothing has gone
+            // out yet, in which case the caller's own -2 protocol applies.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && written > 0 => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// `write0(FileDescriptor fd, long address, int len) -> int`
 fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
@@ -2502,28 +2643,36 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             }
         };
         let n = {
-            let mut w = &*stream_handle;
             // A blocking write can park behind socket backpressure just like
             // read0 parks waiting for peer data. Keep it in the same
             // GC-blocking protocol as accept/read so STW does not wait for a
             // thread that is asleep in the OS.
+            //
+            // The region stays UNCONDITIONAL here, unlike `net_read0`'s
+            // `can_park` gating. That gating is a measured perf change with its
+            // own rationale (2026-08-06, ~16 us of a ~17 us call) and it is not
+            // this change's business; `can_park` below decides only which write
+            // path runs, so the GC protocol is left exactly as it was.
+            let can_park = !net_fd_is_nonblocking(fd);
             ctx.begin_blocking_region();
             // AUDIT 2026-07-26 (native-io-audit): retry EINTR — same
             // rationale as `read0` above. An interrupted write has
             // transferred nothing, so retrying is safe and is what
             // `socket_channel::try_write_nb` already does; propagating it
             // made routine signal delivery indistinguishable from a real
-            // write failure to the Java caller.
-            let res = loop {
-                match w.write(buf) {
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::Interrupted
-                            || error.raw_os_error() == Some(4) =>
-                    {
-                        continue
-                    }
-                    other => break other,
-                }
+            // write failure to the Java caller. That retry now lives in
+            // `write_retry_eintr`.
+            //
+            // ASYNCHRONOUS CLOSE (2026-08-12): a bare blocking `send` here is
+            // the write twin of the read hole fixed on 2026-08-07 — a thread
+            // parked in `Socket.getOutputStream().write(..)` behind a stalled
+            // peer never noticed `Socket.close()` on another thread.
+            // `net_write_close_aware` polls for writability, re-checks the
+            // registry, and slices; see its doc comment.
+            let res = if can_park {
+                net_write_close_aware(fd, &stream_handle, buf)
+            } else {
+                write_retry_eintr(&stream_handle, buf)
             };
             ctx.end_blocking_region();
             // `SocketChannelImpl` deliberately switches an fd to non-blocking

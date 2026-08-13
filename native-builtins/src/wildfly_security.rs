@@ -933,11 +933,45 @@ fn native_subject_get_principals(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
 
     let principals = subject.get_principals();
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-    // Field 1 = size; track how many we synthesize so downstream code
-    // that reflectively reads .size works.
-    ctx.set_field(set, 1, Value::Int(principals.len() as i32));
+    let set = count_carrying_hash_set(ctx, principals.len())?;
     Ok(Some(Value::Object(Some(set))))
+}
+
+/// A `java.util.HashSet` that carries a synthetic element count.
+///
+/// W7-49 (2026-08-12). The form this replaces allocated THREE slots and wrote
+/// the count into slot 1. Real `java.util.HashSet` (JDK 25.0.3.9, `javap -p`)
+/// declares exactly ONE instance field, `private transient HashMap<E, Object>
+/// map`, so on the real layout that object came back with `map == null` and the
+/// count one slot past the end of everything the class declares. Every real
+/// `Set` method — `size`, `isEmpty`, `iterator`, `contains` — dereferences
+/// `map`, so the caller got an NPE, and nothing could read the count back
+/// either: no `size` field exists on a real `HashSet` for reflection to find.
+/// Both these natives are registered on the essential path
+/// (`register_jdk_security_natives`, `register_wildfly_security_natives`), and
+/// `javax.security.auth.Subject` is a real JDK class, so this is a live
+/// Compatible-mode path, not a synthetic-only one.
+///
+/// On the real layout, build a real, well-formed (empty) set through the
+/// existing remedy helper — `size()` answers 0 through the JDK's own bytecode
+/// instead of throwing. The Rust-side count is not representable there without
+/// materialising Java `Principal` objects, which is a larger change than this
+/// lane; losing it costs nothing, because on the real layout it was never
+/// readable in the first place.
+///
+/// On a fabricated stub the 3-slot shape IS the layout and slot 1 is where
+/// synthetic-mode readers look, so that arm is unchanged.
+fn count_carrying_hash_set(
+    ctx: &mut dyn NativeContext,
+    count: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if ctx.is_class_synthetic_stub("java/util/HashSet") {
+        let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+        // Field 1 = size; synthetic-mode readers look here.
+        ctx.set_field(set, 1, Value::Int(count as i32));
+        return Ok(set);
+    }
+    crate::build_real_layout_string_hashset(ctx, &[])
 }
 
 fn native_subject_get_private_credentials(
@@ -1596,8 +1630,9 @@ fn native_security_identity_get_roles(
             }
             .into()
         })?;
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
-    ctx.set_field(set, 1, Value::Int(count as i32));
+    // W7-49: same three-slot-HashSet-over-a-one-field-class shape as
+    // `native_subject_get_principals`; see `count_carrying_hash_set`.
+    let set = count_carrying_hash_set(ctx, count)?;
     Ok(Some(Value::Object(Some(set))))
 }
 

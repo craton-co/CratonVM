@@ -1,6 +1,29 @@
 # W7-2 — `IntStream.summaryStatistics()` killed the run because the whole file
 # that implements it is compiled out of the default binary
 
+> **RECONCILED 2026-08-12 (W7-55-record-reconciliation.md) — "PARTLY UNWIRED"
+> IS STALE. THE WIRING LANDED.** Section 7.1, the one line marked REQUIRED, is
+> in the tree:
+> `crate::phases_late::register_phase56_primitive_stream_terminals(registry);`
+> at `native-builtins/src/reflect_annotations.rs:548`, commit `4752a00a4` —
+> landed by the W7-5 lane, not this one, which is why this record never learned
+> of it. The section 6 bodies are present too: `p56_int_stream_summary_stats` at
+> `native-builtins/src/phases_late/streams.rs:1764`, `p56_double_stats_store` at
+> `:1909`, registrar at `:469`, commit `1fcbd9060`.
+>
+> * **Headline: CLOSED in source, still unverified against a binary.**
+> * **Residual: WRITTEN 2026-08-12 except `spliterator()` and the static
+>   `concat`.** Section 7.2's `DoubleStream`/`LongStream` holes — `anyMatch`,
+>   both `reduce` overloads, `findFirst`/`findAny`, `sorted`, `distinct` — plus
+>   `distinct` on `IntStream` are now registered in
+>   `native-collections/src/lib.rs`, and the `iterator()Ljava/util/Iterator;`
+>   bridge boxes. `spliterator()` is **REFUSED, not deferred**: §9 says why, and
+>   it strikes §3's "one registration closes four more members". Source only —
+>   nothing built, nothing run.
+> * **Cannot adjudicate without a run:** `cargo build --release -p cratonvm-cli`
+>   then `cratonvm --real-jdk ... ShadowDifferentialProbe`; the
+>   `IntStream.rangeClosed(1,5).summaryStatistics()` row must stop dying.
+
 Status: **fix written (unbuilt, unmeasured, and PARTLY UNWIRED)**. Wave 7, lane
 W7-2. Takes the fourth family of
 `W7-1-treemap-views-and-iterator-remove-contract.md` (status OPEN); the other
@@ -289,7 +312,14 @@ extracting all 82 of their triples, §2), so running before
 `register_collections_natives` — which is last-write-wins over the essentials —
 cannot make it inert and cannot overwrite anything.
 
-### 7.2 The rest of §3, in `native-collections/src/lib.rs` — NOT written
+### 7.2 The rest of §3, in `native-collections/src/lib.rs` — WRITTEN 2026-08-12, except `spliterator`
+
+**This section is superseded by §9.** Its work list was right; its closing
+claim — that `spliterator` "is the load-bearing one … so one registration closes
+four more members" — is struck. Read §9 before acting on anything below.
+
+The original text, kept because the reasoning about *why* it was deferred is
+the reasoning §9 acts on:
 
 Owned by another agent this session, so not attempted, and not sketched as a
 patch either: each of these needs that file's own constructors
@@ -325,3 +355,221 @@ Everything. No build, no test, no VM run — the lane's constraint. Specifically
 * Nothing here re-ran `probes/ShadowDifferentialProbe.java`. The section that
   named this defect is `streamsSurface`; a run that reports it as passing is the
   first real evidence, and it needs §7.1.
+
+## 9. §7.2 closed out, 2026-08-12 — what landed, and the one that is refused
+
+All in `native-collections/src/lib.rs` (`register_int_stream_natives`,
+`register_long_stream_natives`, `register_double_stream_natives`) and
+`native-builtins/src/streams.rs`. **Source only: not built, not run.** Every
+triple below was checked against
+`native-builtins/src/phases_late/streams.rs::register_phase56_stream_extras`
+first — none collides, so nothing here silently re-registers or is re-registered,
+and `register_collections_natives` runs last in both modes anyway.
+
+### 9.1 Landed
+
+| member | IntStream | LongStream | DoubleStream |
+|---|---|---|---|
+| `anyMatch` | was present | was present | **added** |
+| `reduce(seed,op)` / `reduce(op)` | was present | was present | **added, both** |
+| `findFirst()` / `findAny()` | was present | **added** | **added** |
+| `sorted()` | was present | **added** | **added** |
+| `distinct()` | **added** | **added** | **added** |
+
+Three things worth stating because they are not obvious from the table:
+
+* **`DoubleStream.sorted()` and `.distinct()` cannot be written with `<` and
+  `==`.** `Arrays.sort(double[])` is `Double.compare` order and
+  `distinct()` is `Double.equals`, and both differ from `f64`'s in the same two
+  places: `-0.0` sorts strictly BELOW `+0.0` and compares UNEQUAL to it, and all
+  NaNs are one value that sorts last. `f64::total_cmp` is a third order again —
+  it puts a negatively-signed NaN below `-inf`. Hence `java_double_compare` and
+  `java_double_to_long_bits` (the canonicalising `doubleToLongBits`, not Rust's
+  `to_bits`, which is `doubleToRawLongBits`). The two `-0.0` rows in
+  `RJdkViews.primitiveStreamSurface` are there to fail the naive version, which
+  passes everything else.
+* **`DoubleStream.min()`/`max()` still use `f64::min`/`f64::max` and are still
+  wrong for NaN** — §5 measured `min=NaN` on HotSpot for
+  `DoubleStream.of(1.0, NaN, 3.0)` and fixed the *summary-statistics* fold for
+  it; the two stream terminals in `native-collections` were never fixed and are
+  not fixed here. Adjacent, unmeasured, stated rather than deferred silently.
+* **The vectors have to use a SYNTHETIC stream or they measure the real JDK.**
+  `IntStream.of(int...)` and `Arrays.stream` return a real `IntPipeline$Head`
+  that implements all of this in its own bytecode. Only `range`/`rangeClosed`
+  and the intermediate ops built on them mint the interface-stamped object this
+  record is about. `RJdkViews` builds every one of its streams that way and says
+  so in place.
+
+### 9.2 The `iterator()Ljava/util/Iterator;` bridge — §3's row was half stale
+
+§3 records this as "answers EMPTY". **It does not, and has not for some time:**
+`native_stream_empty_iterator` (`native-builtins/src/streams.rs`) already reads
+the receiver's backing array — that was the Hibernate `JoinedList` fix, whose
+rationale is written out in the function's doc comment.
+
+What survived is the other half, and it is worse than an empty answer. A
+primitive stream's backing store is a primitive `int[]`/`long[]`/`double[]`
+(`make_int_stream` allocates one deliberately, because a reference array coerces
+`Value::Int` to null). `ServiceLoader$Itr.next` is declared
+`()Ljava/lang/Object;`, so those elements went back to the caller as bare
+`Value::Int`s — an **untyped word where a reference is declared**, which is
+`W7-84-primitive-in-reference-store`'s species, not a wrong value. It is silent
+at the source: it misbehaves at the caller's `checkcast` or `intValue()`, a
+frame away.
+
+`box_primitive_iterator_source` now boxes through `Integer`/`Long`/`Double`/
+`Float`.`valueOf` — but only after a scan finds a primitive, so a REFERENCE
+stream (the overwhelmingly common receiver, and the case the function exists
+for) keeps its own array and allocates nothing.
+
+**§9.2 fixed a function that does not run on this path. See §9.5.**
+
+### 9.5 The bridge, MEASURED — §9.2 boxed the shadowed half
+
+First section of this record with a VM run behind it. Binary: the frozen
+`cratonvm-wave-full.exe`, `--jdk-only`, `--java-home` = jdk-25.0.3.9 on this
+host; HotSpot 25 as the oracle, same session.
+
+`RJdkViews.primitiveStreamSurface` fails at line 483:
+
+```
+AssertionError: BaseStream.iterator() must yield boxed Integers (element 1 was not an Integer)
+```
+
+`seen++` runs before the check, so **"element 1" is the FIRST element, not the
+second.** There is no element-0-worked asymmetry to explain: nothing is boxed.
+
+#### What the run shows
+
+A standalone probe (`Object o = it.next()` over
+`((BaseStream<?,?>) IntStream.rangeClosed(1,3)).iterator()`):
+
+| observable | CratonVM `--jdk-only` | HotSpot 25 |
+|---|---|---|
+| `it.getClass().getName()` | `java.util.Arrays$ArrayItr` | `java.util.Spliterators$2Adapter` |
+| element count | 3 | 3 |
+| `o == null` | **false** | false |
+| `o.getClass()` | **NullPointerException** | `java.lang.Integer` |
+| `o instanceof Integer` | **false** | true |
+
+`o != null` and `o.getClass()` NPEs on the same word: that is the signature of
+an untyped primitive in a reference slot, not of a null. (It is not even
+uniformly null-shaped — `ifnonnull` reads `Value::Int(1)` as non-null, so an
+element that happened to be `0` would read as null and one that was not would
+not. Two different wrong answers from one store.) Across the four stream kinds:
+
+| receiver | n | typed elements |
+|---|---|---|
+| `IntStream.rangeClosed(1,3)` | 3 | **0** |
+| `LongStream.range(1,3)` | 2 | **0** |
+| `DoubleStream.of(1.5,2.5)` | 2 | 2 |
+| `Stream.of("a","b")` | 2 | 2 |
+| `IntStream.rangeClosed(1,3).map(i->i*10)` | 3 | **0** |
+| `IntStream.rangeClosed(1,3).boxed()` | 3 | 3 |
+
+#### Why §9.2's fix was invisible
+
+The iterator handed back is `Arrays$ArrayItr`, which is
+`native-collections`' `make_iterator_from_array` landing — **not** the
+`java/util/ServiceLoader$Itr` that `native_stream_empty_iterator` builds. The
+descriptor `iterator()Ljava/util/Iterator;` is registered TWICE:
+
+* `native-builtins/src/streams.rs` → `native_stream_empty_iterator`, on all
+  five of `BaseStream`/`Stream`/`IntStream`/`LongStream`/`DoubleStream`;
+* `native-collections/src/lib.rs` → `native_stream_iterator`, on `BaseStream`
+  and `Stream` only.
+
+`register_collections_natives` runs after `register_builtins`
+(`vm/src/vm/vm_init.rs`) and registration is last-writer-wins, so for
+`BaseStream` and `Stream` the native-collections one wins — and a call site
+whose static type is `BaseStream` (which is how every `IntStream` reaches this
+descriptor, since `BaseStream` is where it is declared) lands exactly there.
+§9.2 boxed the copy that only serves the three primitive-interface keys.
+
+The last row of the table is the proof the boxing itself is sound:
+`boxed()` already routes through `box_primitive_stream_elements`, on the same
+synthetic `IntStream` elements, and yields real `java.lang.Integer`s.
+
+#### The fix
+
+`native_stream_iterator` (`native-collections/src/lib.rs`) now runs
+`box_primitive_stream_elements` over `stream_elements`' output before storing
+into the `Object[]` the iterator reads. Reference elements pass through
+untouched and allocate nothing, so the Hibernate `JoinedList` case this function
+exists for is unchanged.
+
+Three supporting changes in the same file:
+
+* `box_primitive_stream_elements` is now fallible and delegates each element to
+  `box_primitive_result` instead of open-coding three `valueOf` calls. Its old
+  `.ok().flatten().unwrap_or(Value::Object(None))` converted a refusal into a
+  silent `null` element — the W7-65 shape, in the boxing helper itself. Its four
+  call sites all sit in `-> MethodCallResult` functions and take a `?`.
+* **Is the new raise reachable? Not on this path.** `box_primitive_result`
+  raises only if `Integer/Long/Double/Float.valueOf` fails to return an object
+  AND the `try_alloc_synthetic` fallback is refused (which it is, under
+  `--jdk-only`). The `boxed()` row above measures `valueOf` succeeding on this
+  exact receiver in this exact mode, so the fallback is not entered. It is a
+  real raise reserved for an image with no wrapper classes, and it propagates —
+  `native_stream_iterator` returns `MethodCallResult` and its caller is the
+  interpreter, not one of W7-65's 25 `unwrap_or_default` swallowers (those are
+  on `int_stream_elements`, which this path does not use — `stream_elements` is
+  the fallible one and already carries a `?`).
+* `box_primitive_result` grew a `Float` arm. There is no `FloatStream`, but a
+  `Value::Float` reaching a reference-typed surface is the same untyped word,
+  and the arm was simply missing beside the other three.
+
+#### Not done
+
+`DoubleStream` already answered typed elements before this change, and no run
+established which mechanism did that. `spliterator()` is still refused (§9.3),
+so `takeWhile`/`dropWhile`/`mapMulti`/`concat` are unchanged. The fix is source
+only — this lane could run the frozen binary but not rebuild it, so the fix
+itself has not been observed passing.
+
+### 9.3 `spliterator()` — REFUSED, and §3's claim about it is struck
+
+§3 says: *"`spliterator` is the load-bearing one — `takeWhile`, `dropWhile`,
+`mapMulti` and the static `concat` are default/static methods whose real JDK
+bodies drive it, so one registration closes four more members."* The benefit is
+real. **The cost is a registration on `java/util/Spliterator$OfInt`,
+`$OfLong` and `$OfDouble`, and that is not a contained change.**
+
+  * `tryAdvance(IntConsumer)` and `forEachRemaining(IntConsumer)` are
+    **abstract** on those interfaces. So the escape hatch the sibling
+    `java/util/Spliterator` natives rely on does not apply: their own comments
+    record that *"the dispatcher in `invoke_on_class_shared_inner` now prefers
+    default-method bytecode over this native when the receiver is a non-synthetic
+    class"* — there is no default-method bytecode to prefer here.
+  * Which means every real JDK primitive spliterator in the image —
+    `Spliterators$IntArraySpliterator`, the `*Pipeline` sources, every
+    `Spliterator.OfInt` an application declares — becomes a candidate receiver
+    for a native written for a 3-slot synthetic shape. That is the
+    interface-registration hazard the `java/util/Spliterator` block already
+    guards against with a "field 0 is not an array → bail" test, and **the bail
+    branch has no correct answer for `tryAdvance`**: `false` silently truncates
+    the caller's stream, `true` without calling the consumer corrupts it, and
+    re-dispatching through `invoke_virtual` re-enters the same native.
+
+A registration whose failure mode is "every primitive spliterator in the process
+silently reports empty" is not one to land from a lane that cannot build, cannot
+run, and cannot take a census of the receivers. `takeWhile`/`dropWhile`/
+`mapMulti`/`concat` therefore remain dead on a synthetic primitive stream, one
+frame deeper than they used to be.
+
+**What a future lane needs, and it is a measurement not a patch:** a
+`--dump-native-registry` census of who actually implements `Spliterator.OfInt`
+in the corpus arms, and a decision on whether the three primitive spliterators
+should be a distinct synthetic class name (so the receiver test is exact and the
+bail branch is unreachable) rather than the interface name. The rest of this
+record's shape — allocate through `try_alloc_synthetic` on the interface — is
+what makes the guard impossible, so that is the thing to change first.
+
+### 9.4 Coverage
+
+`regression-suite/src/RJdkViews.java`, new `primitiveStreamSurface()` section,
+run by `CORE_CLASSES` on a default invocation. Fifteen checks plus three `CK`
+lines; every one of them fails on the old behaviour (an `AbstractMethodError`
+that kills the run, or the `-0.0` rows above). `RJdkViews` is deliberately not
+also in `JDKONLY_CLASSES` — under `CRATONVM_ARGS=--jdk-only` the CORE list runs
+with those args too, so the one file covers both modes.

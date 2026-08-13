@@ -1200,9 +1200,17 @@ pub(crate) fn inet_addr_resolve(
                             _ => 0,
                         };
                     }
-                    Some(hotspot_ip_string(
-                        &std::net::Ipv6Addr::from(octets).to_string(),
-                    ))
+                    // NOT `hotspot_ip_string`: that folds a v4-mapped address
+                    // to its dotted quad, which is right for `getByName` and
+                    // `InetAddress.getByAddress` (both hand back an
+                    // `Inet4Address`) and WRONG here. This branch only runs
+                    // for an object the real JDK already built as an
+                    // `Inet6Address` — `Inet6Address.getByAddress(String,
+                    // byte[], int)` is not intercepted — and the JDK
+                    // specifies that factory to keep the 16-byte form.
+                    // Folding it left `getAddress()` handing back 4 bytes for
+                    // an `instanceof Inet6Address` receiver.
+                    Some(ipv6_uncompressed_text(&std::net::Ipv6Addr::from(octets)))
                 }
                 _ => None,
             },
@@ -2081,16 +2089,34 @@ fn hotspot_ip_string(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
-            None => v6
-                .segments()
-                .iter()
-                .map(|seg| format!("{seg:x}"))
-                .collect::<Vec<_>>()
-                .join(":"),
+            None => ipv6_uncompressed_text(&v6),
         },
         Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
         Err(_) => ip.to_string(),
     }
+}
+
+/// HotSpot's `Inet6Address.numericToTextFormat` — eight 16-bit groups as
+/// minimal lowercase hex joined by `:`, with NO `::` zero-compression and
+/// **no v4-mapped fold**.
+///
+/// Split out of [`hotspot_ip_string`] because the fold is a property of the
+/// *entry point*, not of the address: `getByName` / `InetAddress.getByAddress`
+/// fold a v4-mapped address to an `Inet4Address`, but an object that is
+/// ALREADY an `Inet6Address` — one the real JDK built via
+/// `Inet6Address.getByAddress(String, byte[], int)`, which is not intercepted
+/// — must keep all sixteen bytes. Folding its text made
+/// `inet_addr_address_bytes` re-parse four bytes out of a v6 object, so
+/// `getAddress().length` was 4 on an `instanceof Inet6Address` receiver:
+/// internally inconsistent, and `io.netty.util.NetUtil.toAddressString`
+/// indexes 16 (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for
+/// length 4`, `NetUtilTest.testIpv4MappedIp6GetByName`).
+fn ipv6_uncompressed_text(v6: &std::net::Ipv6Addr) -> String {
+    v6.segments()
+        .iter()
+        .map(|seg| format!("{seg:x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
@@ -3967,6 +3993,192 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
 // RE.1 — java.net.Socket
 // ===========================================================================
 
+/// How long a parked `SocketInputStream.read` waits inside one poll before
+/// re-asking the registry whether its socket was closed under it.
+///
+/// A liveness bound, not a latency cost: the poll returns the instant the
+/// socket becomes readable, so payload is never delayed by it — it only bounds
+/// how long a reader stays parked after another thread calls `Socket.close()`.
+/// Same value and same role as `native-io/src/net.rs`'s
+/// `NET_READ_CLOSE_POLL_MS` and `socket_channel.rs`'s `READ_CLOSE_POLL_MS`,
+/// because this is the same loop.
+const RE1_READ_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked read reports once its socket has been closed from
+/// another thread. [`re1_socket_read_stream`] maps it to a real
+/// `java.net.SocketException`.
+///
+/// `ErrorKind::Interrupted` is unambiguous at this site because
+/// [`re1_read_retry_eintr`] reissues every real EINTR and
+/// [`re1_socket_poll_readable`] reports one as "not ready" rather than as an
+/// error, so nothing else in this path can produce it. That is the same
+/// argument `socket_channel.rs::channel_async_closed_err` makes for the
+/// channel side.
+fn re1_socket_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "socket closed")
+}
+
+/// Is `sid` still a live stream?
+///
+/// [`re1_close_socket`] *removes* the entry from `s2_registry().streams` (and
+/// `take_raw_socket_stream_for_tls` moves it out), so this flips exactly when
+/// Java closed the socket. The `net.rs` twin, `net_stream_still_registered`,
+/// tests for a `NetSocketHandle::Closed` marker instead only because that
+/// registry keeps closed slots; the question asked is identical.
+///
+/// The lock is taken for the map lookup alone and is never held across the
+/// poll or the read — the whole reason [`re1_socket_read_stream`] clones the
+/// `Arc` out in the first place (BUG-04 loopback hang).
+fn re1_stream_still_registered(sid: i32) -> bool {
+    s2_registry().lock().streams.contains_key(&sid)
+}
+
+/// One `recv`, reissued for as long as it reports EINTR.
+///
+/// EINTR must never escape to Java: this VM signals its own threads
+/// (`jit::xt_root_scan` SIGUSR2s every thread for a cross-thread root scan),
+/// so a bare `read` surfacing `Interrupted` would look to callers like a
+/// random mid-request connection abort.
+fn re1_read_retry_eintr(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    // The std impl is `impl Read for &TcpStream`, so this reads through a
+    // shared stream without excluding a peer writer on the same fd.
+    let mut r = stream;
+    loop {
+        match r.read(buf) {
+            Err(e) if is_eintr(&e) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// A blocking `SocketInputStream.read` that observes an asynchronous
+/// `Socket.close()`.
+///
+/// # Why the plain blocking read could not
+///
+/// `Socket.close()` on another thread reaches [`re1_close_socket`], which drops
+/// the registry's `Arc` and issues `shutdown(Both)` — but it does **not** close
+/// the OS handle, because this reader is holding an `Arc` clone of the very
+/// `TcpStream` the map dropped. HotSpot's answer to the same situation is
+/// `closesocket()` underneath the blocked `recv` (Windows) or `dup2` of a
+/// pre-closed descriptor plus a signal (Unix, `NativeDispatcher.preClose`).
+/// Neither is expressible over an `Arc<TcpStream>` without closing a handle
+/// another thread is mid-syscall on, which is a use-after-close the moment the
+/// OS recycles the number.
+///
+/// `shutdown` is not a substitute, and the platform split is what made this
+/// look like it was already fixed: on Linux `SHUT_RD` does wake a parked `recv`
+/// — with EOF, so the reader answered `-1` rather than throwing — while Winsock
+/// has no `shutdown` that aborts a pending blocking call at all, so on Windows
+/// the reader simply never returned.
+///
+/// So park in `poll` instead of in `recv` and re-ask the registry every
+/// [`RE1_READ_CLOSE_POLL_MS`]. That is not a new mechanism: it is the loop
+/// `net.rs::net_read_close_aware` and `socket_channel.rs::read_close_aware`
+/// landed on 2026-08-07 for the two *real* socket surfaces, and the loop
+/// [`re2_accept_into`] in this same file has used on the accept side since the
+/// MockWebServer teardown fix. This is the third reader that needed it and the
+/// one the 2026-08-07 pass missed, because it is the *synthetic*
+/// `java.net.Socket` surface (`CRATONVM_SYNTHETIC_NET_SOCKETS`) rather than
+/// either of the two the failing tests reached.
+///
+/// # `deadline` is not optional decoration
+///
+/// `Some(dl)` is a live `SO_TIMEOUT`. A wakeup that silently swallowed the
+/// caller's timeout would be the same defect pointed the other way: a
+/// `setSoTimeout(n)` reader would park past its own deadline forever. So the
+/// poll slice is clamped to the time remaining and an expired deadline returns
+/// `TimedOut` — which [`re1_socket_read_stream`] already maps to
+/// `SocketTimeoutException` — rather than merely declining to poll again. The
+/// socket's own `SO_RCVTIMEO` (applied at connect) stays set and remains the
+/// first line; this deadline is what still ends the park on a platform or a
+/// socket state where `SO_RCVTIMEO` does not fire.
+/// `pub(crate)` for `phases_early.rs`'s `java/net/SocketInputStream`, which is
+/// the FOURTH surface of this defect (W2-2). It keys the same `s2_registry()`
+/// `streams` map with the same `sid`, so the mechanism transfers with no
+/// adaptation — which is the reason that surface was converged onto this
+/// function rather than growing a fifth copy of the loop or being deleted.
+pub(crate) fn re1_read_close_aware(
+    sid: i32,
+    stream: &TcpStream,
+    buf: &mut [u8],
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<usize> {
+    loop {
+        let slice = match deadline {
+            None => RE1_READ_CLOSE_POLL_MS,
+            Some(dl) => {
+                let left = dl.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Socket read timed out",
+                    ));
+                }
+                // Floor of 1 ms so a sub-millisecond remainder polls once more
+                // instead of spinning on a 0 ms timeout.
+                left.as_millis().clamp(1, RE1_READ_CLOSE_POLL_MS as u128) as i32
+            }
+        };
+        let ready = match re1_socket_poll_readable(stream, slice) {
+            Some(result) => result?,
+            // No poll primitive on this target: fall back to the pre-fix
+            // blocking read, which cannot see the close but at least still
+            // transfers bytes. Spinning on a stub that can never report
+            // readiness would be strictly worse than the bug.
+            None => return re1_read_retry_eintr(stream, buf),
+        };
+        // Asked AFTER the poll, so a close landing while we are parked is seen
+        // on the very next pass — and a close that raced a readiness edge still
+        // wins. That race is safe by construction rather than by luck:
+        // `re1_close_socket` removes the registry entry FIRST and only then
+        // issues `shutdown(Both)`, so by the time the shutdown's own readiness
+        // edge wakes this poll the entry is already gone. Without this check
+        // the Linux path would answer such a read with `-1` — a clean
+        // end-of-stream — where `Socket.close()` mandates a `SocketException`.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        return re1_read_retry_eintr(stream, buf);
+    }
+}
+
+/// Build a real `java.net.SocketException` carrying `message`.
+///
+/// The concrete type is load-bearing, not decoration. JDK 25's
+/// `java.net.Socket.close()` specifies that "Any thread currently blocked in an
+/// I/O operation upon this socket will throw a SocketException", and callers
+/// catch that type; a `java.io.IOException` whose message merely mentions the
+/// name walks straight past `catch (SocketException e)`. `RuntimeError` has no
+/// `SocketException` variant — only its `ConnectException`/`BindException`/
+/// `SocketTimeoutException` subclasses — so the object has to be constructed,
+/// exactly as [`re1_socket_write_stream`] below already does for a peer reset.
+/// Falls back to a plain IOException if the class cannot be built.
+/// `pub(crate)` for the same reason as [`re1_read_close_aware`]: the close
+/// carrier is worthless without the concrete `java.net.SocketException` at the
+/// end of it, and `RuntimeError` has no variant for that type.
+pub(crate) fn re1_socket_exception(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+) -> MethodCallFailed {
+    let jmsg = ctx.create_string(message);
+    match ctx.new_object_initialized(
+        "java/net/SocketException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(jmsg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let exc_pin = ctx.pin_native_root(exc);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => ioex(message.to_string()),
+    }
+}
+
 fn re1_socket_read_stream(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -3989,10 +4201,18 @@ fn re1_socket_read_stream(
             "read out of range: off={off} len={ln} cap={cap}"
         )));
     }
-    let stream_id = sock_get(ctx, this).stream_id;
+    let side = sock_get(ctx, this);
+    let stream_id = side.stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
+    // A live `SO_TIMEOUT` has to bound the park, not just the recv — see
+    // `re1_read_close_aware`'s note on why the deadline is not optional.
+    // Computed here because `sock_get` needs `ctx`, which is not available
+    // inside the blocking region below.
+    let deadline = (side.read_timeout_ms > 0).then(|| {
+        std::time::Instant::now() + Duration::from_millis(side.read_timeout_ms as u64)
+    });
     // Clone the cheap Arc<TcpStream> out under a SHORT lock, then release
     // s2_registry BEFORE the blocking read(). Holding the global registry lock
     // across a blocking read deadlocks every other synthetic-socket operation
@@ -4013,40 +4233,63 @@ fn re1_socket_read_stream(
     };
     let dbg = crate::nbflags().dbg_sock;
     if dbg {
-        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
+        // "parking in poll", not "blocking on recv": since the asynchronous-close
+        // fix this read waits on readiness and re-asks the registry every
+        // RE1_READ_CLOSE_POLL_MS. A `[dbg-sock] read:` line with no matching
+        // `got=`/exception is therefore a reader that outlived its close, which
+        // is the exact symptom this line is used to hunt.
+        eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (parking in poll...)");
     }
     let mut tmp = vec![0u8; ln];
     let mut blocked_refs = [Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let read_result = loop {
-        match (&*stream).read(&mut tmp) {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
-            {
-                continue
-            }
-            result => break result,
-        }
-    };
+    // Parks in `poll` rather than in `recv`, so a `Socket.close()` on another
+    // thread ends the park. The EINTR retry that used to be written out here
+    // now lives in `re1_read_retry_eintr`, which this calls once the poll says
+    // the socket is readable.
+    let read_result = re1_read_close_aware(stream_id, &stream, &mut tmp, deadline);
     ctx.end_blocking_region_refs(&mut blocked_refs);
 
     let buf = match blocked_refs[0] {
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read_result.map_err(|e| match e.kind() {
+    let n = match read_result {
+        Ok(n) => n,
+        // The socket was closed from another thread while this read was parked.
+        // JDK 25 `java.net.Socket.close()`: "Any thread currently blocked in an
+        // I/O operation upon this socket will throw a SocketException." The
+        // message matches what HotSpot actually produces, which is
+        // `NioSocketImpl.endRead`'s `throw new SocketException("Socket closed")`
+        // once the close has moved the impl to `ST_CLOSING`.
+        //
+        // That retyping is why the `net.rs` twin of this fix could get away with
+        // returning a generic error: on the real-JDK surface `endRead` runs in
+        // the `finally` of `implRead` and overwrites whatever text arrived. Here
+        // it cannot — these synthetic natives ARE the impl, `NioSocketImpl` is
+        // never on the path, and nothing downstream will name the type for us.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // SO_RCVTIMEO is reported as TimedOut on Windows and often as
-        // WouldBlock on Unix. Both are Java SocketTimeoutException, not EOF
-        // and not a generic IOException; callers deliberately catch this
-        // concrete type to retry their protocol operation.
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            RuntimeError::SocketTimeoutException {
+        // WouldBlock on Unix, and `re1_read_close_aware` raises TimedOut itself
+        // when the `SO_TIMEOUT` deadline expires with the socket still quiet.
+        // All three are Java SocketTimeoutException, not EOF and not a generic
+        // IOException; callers deliberately catch this concrete type to retry
+        // their protocol operation.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Err(RuntimeError::SocketTimeoutException {
                 message: format!("Socket read timed out: {e}"),
             }
-            .into()
+            .into());
         }
-        _ => ioex(format!("Socket read failed: {e}")),
-    })?;
+        Err(e) => return Err(ioex(format!("Socket read failed: {e}"))),
+    };
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
         if crate::nbflags().dbg_sock_bytes && n != 0 {
@@ -4061,6 +4304,92 @@ fn re1_socket_read_stream(
     }
     copy_bytes_into_java_array(ctx, buf, offset, &tmp[..n])?;
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// Largest payload handed to one `send` while a blocking write is sliced.
+///
+/// A blocking-mode `send` of N bytes does not return until all N are queued, so
+/// an unsliced `write_all` parks inside the syscall for an unbounded time and
+/// observes neither the close nor the poll cadence. 8 KiB matches
+/// `socket_channel::WRITE_SLICE_MAX`, whose doc comment carries the measured
+/// evidence (`SendWake.java`, Windows 11, JDK 25.0.3: a writer parked in a
+/// blocking `send` was still parked 6 s after `shutdown(SHUT_WR)`; only closing
+/// the handle woke it). The common protocol frame is smaller than one slice and
+/// is therefore still issued whole.
+const RE1_WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// A blocking `SocketOutputStream.write` that observes an asynchronous
+/// `Socket.close()` — the write twin of [`re1_read_close_aware`].
+///
+/// The reader on this surface was fixed on 2026-08-11 and the writer beside it
+/// was not, which left the symmetric hole: a thread parked in `write_all`
+/// behind a peer that has stopped reading stays parked through
+/// `Socket.close()`, for exactly the reason the reader did —
+/// [`re1_close_socket`] removes the registry entry and issues `shutdown(Both)`,
+/// but cannot close the OS handle while this writer holds an `Arc` clone of the
+/// `TcpStream`.
+///
+/// # Mechanism, not a second mechanism
+///
+/// Identical loop to [`re1_read_close_aware`]: poll with a bounded slice,
+/// re-ask [`re1_stream_still_registered`] after the poll, return
+/// [`re1_socket_closed_err`] once the slot is gone. Only the direction of the
+/// poll and the slicing differ.
+///
+/// # What a partial transfer answers
+///
+/// A close that lands after some bytes are out returns `Ok(written)`. The
+/// caller's contract here is `write(byte[], int, int)`, which the JDK specifies
+/// as "writes len bytes" — so a short answer is reported to Java as the
+/// `SocketException` the close mandates, not silently swallowed. `written` is
+/// carried in the error path only for the debug line.
+///
+/// # On expiry
+///
+/// The `RE1_READ_CLOSE_POLL_MS` slice expiring is not an outcome — it is the
+/// point at which the registry is re-asked, and the loop continues. There is no
+/// second deadline: `java.net.Socket` has no write timeout, and this surface
+/// records only a `read_timeout_ms`.
+fn re1_write_close_aware(sid: i32, stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    let mut written: usize = 0;
+    loop {
+        if written == data.len() {
+            return Ok(written);
+        }
+        let ready = match re1_socket_poll_writable(stream, RE1_READ_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-12 blocking
+            // write, which cannot see the close but at least still transfers.
+            None => {
+                let mut w = stream;
+                w.write_all(&data[written..])?;
+                return Ok(data.len());
+            }
+        };
+        // Asked AFTER the poll for the reason `re1_read_close_aware` sets out
+        // at length: `re1_close_socket` removes the entry BEFORE it issues the
+        // shutdown, so by the time the shutdown's own readiness edge wakes this
+        // poll the entry is already gone.
+        if !re1_stream_still_registered(sid) {
+            return Err(re1_socket_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        let end = (written + RE1_WRITE_SLICE_MAX).min(data.len());
+        let mut w = stream;
+        match w.write(&data[written..end]) {
+            Ok(0) => continue,
+            Ok(n) => written += n,
+            // EINTR has written nothing; retry. Same rationale as
+            // `re1_read_retry_eintr`.
+            Err(e) if is_eintr(&e) => continue,
+            // Writable, then not: a concurrent writer on this socket took the
+            // room. Park again rather than report a short write.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn re1_socket_write_stream(
@@ -4090,13 +4419,28 @@ fn re1_socket_write_stream(
             .clone()
     };
     ctx.begin_blocking_region();
+    // ASYNCHRONOUS CLOSE (2026-08-12): a bare `write_all` here is the write
+    // twin of the read hole fixed on this surface on 2026-08-11 — a thread
+    // parked behind a peer that has stopped reading never noticed
+    // `Socket.close()`. `re1_write_close_aware` polls for writability, re-asks
+    // the registry, and slices; see its doc comment.
     let write_result = (|| -> std::io::Result<()> {
-        (&*stream).write_all(&data)?;
+        re1_write_close_aware(stream_id, &stream, &data)?;
         (&*stream).flush()?;
         Ok(())
     })();
     ctx.end_blocking_region();
     if let Err(e) = write_result {
+        // A close observed by the loop above arrives as `Interrupted`, which no
+        // other step on this path can produce (`re1_write_close_aware` reissues
+        // every real EINTR and the poll reports one as "not ready"). JDK 25's
+        // `Socket.close()` specifies that a thread blocked in an I/O operation
+        // on the socket throws a `SocketException` — "will", not "may" — and
+        // the concrete type is load-bearing because callers catch it above
+        // `catch (IOException)`.
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            return Err(re1_socket_exception(ctx, "Socket closed"));
+        }
         // Real java.net.Socket write path: a peer-reset/broken-pipe write
         // failure must surface as a real, catchable java.net.SocketException
         // (matching real JDK's SocketOutputStream.socketWrite0) -- callers
@@ -4259,6 +4603,63 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
     None
 }
 
+/// Wait up to `timeout_ms` for `stream` to become **readable**.
+///
+/// `Some(Ok(true))` — readable, or errored/hung up (which the read that
+/// follows then surfaces as the concrete socket error); `Some(Ok(false))` —
+/// the timeout expired; `Some(Err(_))` — the poll itself failed. `None` means
+/// this build has NO poll primitive at all, and is the caller's signal to fall
+/// back to a plain blocking read rather than spin on a stub that answers "not
+/// ready" forever. **That `None` arm is the one a "simplification" deletes and
+/// the one that prevents a livelock**; it is preserved verbatim by
+/// `cratonvm_native_io::net::poll_stream_readable`, which is where the three
+/// `#[cfg]` arms that used to live here now are.
+///
+/// COLLAPSED 2026-08-12, W2-2's out-of-file patch. This file used to carry its
+/// own `poll(2)`/`WSAPoll` binding — inherited from the zero-timeout readiness
+/// probe `SocketInputStream.available()` needs — because the `native-io`
+/// primitive both halves of the asynchronous-close wakeup park in
+/// (`net.rs::net_read_close_aware`, `socket_channel.rs::read_close_aware`) was
+/// `pub(crate)` to that crate and unreachable from here. It is now `pub`, along
+/// with its write twin, so the duplicate is gone rather than kept in agreement
+/// by hand. `native-builtins` already depends on the crate and already calls
+/// `cratonvm_native_io::net::take_stream_for_tls`, so no dependency edge is new.
+///
+/// Three properties survive the collapse unchanged, each of which is a real
+/// difference and not noise:
+///
+/// * the three-state contract above, `None` arm included;
+/// * readiness is `rc > 0`, **not** a `revents & POLLIN` mask test —
+///   POLLERR/POLLHUP/POLLNVAL are delivered whether or not they were requested
+///   and must count as ready, or a reader parks forever on a socket that can
+///   never become readable. `net_poll_raw` answers `Ok(count > 0)` for exactly
+///   that reason. Do not "restore" a mask test on either side;
+/// * EINTR is reported as "not ready", never as an error and never as an
+///   in-place re-poll. `poll(2)` is never auto-restarted by `SA_RESTART` and
+///   this VM signals parked threads on purpose (`jit::xt_root_scan` SIGUSR2s
+///   every thread for a cross-thread root scan), so re-polling in place with the
+///   same `timeout_ms` would restart the whole wait on every GC and silently
+///   defeat [`re1_read_close_aware`]'s `SO_TIMEOUT` deadline.
+///
+/// Still outstanding, and deliberately not attempted here: `servlet.rs` and
+/// `xnio_conduits.rs` hold the crate's other two bindings. `servlet.rs`'s is
+/// `selector_poll` over a `PollReq` **slice**, which the selector needs and this
+/// two-argument primitive cannot express — a genuine third shape rather than a
+/// fourth copy.
+fn re1_socket_poll_readable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    cratonvm_native_io::net::poll_stream_readable(stream, timeout_ms)
+}
+
+/// Wait up to `timeout_ms` for `stream` to become **writable**. Same
+/// three-state contract as [`re1_socket_poll_readable`], and the reason the
+/// collapse needed the pair exported: this file's own binding had grown a
+/// direction parameter, so exporting only the readable half would have forced it
+/// to keep a private copy for the write direction — one site of a two-direction
+/// idiom converted, which is how a duplicate grows back.
+fn re1_socket_poll_writable(stream: &TcpStream, timeout_ms: i32) -> Option<std::io::Result<bool>> {
+    cratonvm_native_io::net::poll_stream_writable(stream, timeout_ms)
+}
+
 /// Zero-timeout OS readability query for a TCP stream.
 ///
 /// Used by `SocketInputStream.available()`, which must never block. A `peek`
@@ -4267,68 +4668,11 @@ fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R
 /// kernel socket state that neither consumes bytes nor flips the socket's
 /// persistent blocking mode (flipping it would race a concurrent blocking
 /// `read` on the same fd into a spurious `WouldBlock`; see the same rewrite in
-/// `native-api/src/fd_table.rs::tcp_available`). A failed probe reports
-/// not-readable, so `available()` degrades to 0 — the answer it gave
-/// unconditionally before.
-#[cfg(unix)]
+/// `native-api/src/fd_table.rs::tcp_available`). A failed probe — and a target
+/// with no poll at all — reports not-readable, so `available()` degrades to 0,
+/// the answer it gave unconditionally before.
 fn re1_socket_read_ready(stream: &TcpStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let mut pfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
-    // matches the one-element buffer; timeout 0 returns immediately.
-    let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 0) };
-    if rc <= 0 {
-        return false;
-    }
-    pfd.revents & libc::POLLIN != 0
-}
-
-#[cfg(windows)]
-fn re1_socket_read_ready(stream: &TcpStream) -> bool {
-    use std::os::windows::io::AsRawSocket;
-
-    // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
-    // and signature below are byte-identical to the other `WSAPoll` bindings
-    // in this crate (`servlet.rs`, `xnio_conduits.rs`) —
-    // `clashing_extern_declarations` is a deny-lint here, so any divergence
-    // would fail the build.
-    #[repr(C)]
-    struct Wsapollfd {
-        fd: usize,
-        events: i16,
-        revents: i16,
-    }
-    const WSAPOLLRDNORM: i16 = 0x0100;
-
-    #[link(name = "Ws2_32")]
-    extern "system" {
-        fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
-    }
-
-    let mut pfd = Wsapollfd {
-        fd: stream.as_raw_socket() as usize,
-        events: WSAPOLLRDNORM,
-        revents: 0,
-    };
-    // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
-    // buffer length; timeout 0 returns immediately.
-    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, 0) };
-    if rc <= 0 {
-        return false;
-    }
-    pfd.revents & WSAPOLLRDNORM != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn re1_socket_read_ready(_stream: &TcpStream) -> bool {
-    // No readiness primitive on this target — report not-readable so
-    // `available()` returns 0 rather than risking a blocking peek.
-    false
+    matches!(re1_socket_poll_readable(stream, 0), Some(Ok(true)))
 }
 
 fn re1_connect_socket(
@@ -11957,7 +12301,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
 // RE.6 — javax.net.ssl.SSLContext
 // ===========================================================================
 
-fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
+/// `pub(crate)` since 2026-08-12 (W7-61) so `tls.rs`'s registrar-ordering
+/// ratchet can name this exact registrar rather than the whole
+/// `register_phase_e_networking` umbrella. It is the LAST writer of
+/// `javax/net/ssl/SSLContext.createSSLEngine` on the Compatible/strict boot
+/// path (lib.rs 18191 `register_p68_ssl`, then 18214 this), and that is what
+/// makes `phases_late::ssl_security::ssleng_alloc` — a 7-slot allocation on a
+/// class declaring 2 — unreachable in that mode. Reordering the two silently
+/// re-arms the over-allocation, so the fact is pinned by a test rather than
+/// left to this comment.
+pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     let ctx_cls = "javax/net/ssl/SSLContext";
     r.register(
         ctx_cls,
@@ -15904,6 +16257,16 @@ fn re10_dispatch_pending(
                             "(IJ)V",
                             &[Value::Int(code), Value::Long(-1)],
                         );
+                        //
+                        // KEPT SWALLOW. Same reasoning as that backstop — no
+                        // JDK body to copy a `catch` from — plus one this site
+                        // adds: it sits inside the pending-exchange dispatch
+                        // LOOP, holding `ex_pin`. Propagating would abort
+                        // serving every remaining pending exchange because one
+                        // rejected request failed to close, which is a worse
+                        // defect than the one being removed. The `Error`
+                        // residual is recorded rather than traded for that.
+                        // W7-57-close-flush-swallow-sweep.md
                         let ex = ctx.read_native_pin(ex_pin, ex0);
                         let _ = ctx.invoke_virtual(ex, "close", "()V", &[]);
                     }
@@ -15913,16 +16276,57 @@ fn re10_dispatch_pending(
                 let ex = ctx.read_native_pin(ex_pin, ex0);
                 let status = ctx.get_field(ex, 5).as_int().unwrap_or(200);
                 let mut body_bytes: Vec<u8> = Vec::new();
+                // W7-24: index of the real-JDK response buffer, if the strict
+                // policy refused the `ResponseBody` stand-in and
+                // `re10_real_jdk_response_body` parked a
+                // `java.io.ByteArrayOutputStream` here instead of chunks.
+                // Draining it means an `invoke_virtual`, which allocates, so it
+                // happens AFTER this walk rather than inside it — the walk's own
+                // invariant is that nothing in it allocates.
+                let mut real_sink: Option<usize> = None;
                 if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
                     // array_length / get_array_element do not allocate, so the
                     // chunk array and each `ba` stay valid through the walk.
                     let n = ctx.array_length(chunks);
                     for i in 0..n {
                         if let Value::Object(Some(ba)) = ctx.get_array_element(chunks, i) {
+                            // `object_is_array` is a heap object-kind check, not
+                            // a class-name test — a reference array reports its
+                            // COMPONENT class, so a name test cannot tell these
+                            // apart. Compatible mode never parks a non-array
+                            // here, so this arm is strict-only and the two can
+                            // never interleave: whether the mint is refused is a
+                            // property of the run, not of the call.
+                            if !ctx.object_is_array(ba) {
+                                real_sink.get_or_insert(i);
+                                continue;
+                            }
                             let ln = ctx.array_length(ba);
                             for j in 0..ln {
                                 if let Value::Int(b) = ctx.get_array_element(ba, j) {
                                     body_bytes.push(b as i8 as u8);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(i) = real_sink {
+                    // Re-read the exchange AND its chunk array from the pin
+                    // rather than reusing the locals above: `toByteArray()` runs
+                    // a method and can move both.
+                    let ex = ctx.read_native_pin(ex_pin, ex0);
+                    if let Value::Object(Some(chunks)) = ctx.get_field(ex, 6) {
+                        if let Value::Object(Some(sink)) = ctx.get_array_element(chunks, i) {
+                            if let Ok(Some(Value::Object(Some(arr)))) =
+                                ctx.invoke_virtual(sink, "toByteArray", "()[B", &[])
+                            {
+                                // `arr` is the invoke's own result, so it is
+                                // current, and nothing below allocates.
+                                let ln = ctx.array_length(arr);
+                                for j in 0..ln {
+                                    if let Value::Int(b) = ctx.get_array_element(arr, j) {
+                                        body_bytes.push(b as i8 as u8);
+                                    }
                                 }
                             }
                         }
@@ -16044,6 +16448,50 @@ fn re10_spawn_dispatcher(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let dbg = crate::nbflags().dbg_httpsrv;
     for idx in 0..HS_DISPATCHER_POOL {
+        // W7-24 — `ensure_vm_internal_class`, not the compatibility door.
+        //
+        // `CratonVM$HttpServerLoop` is a shape this VM invents to carry
+        // `server_id` from here to `re10_serve_loop_run` on a real VM thread.
+        // `javap CratonVM.HttpServerLoop` against the JDK 25 image answers
+        // "class not found", the name is in no JDK namespace at all, and no
+        // class file can ever back it — contract §1 item 6's shape, which
+        // `ensure_vm_internal_class` exists to mint in every mode. Through
+        // `try_alloc_concurrent_synthetic` alone it acquired
+        // `ClassOrigin::CompatibilityStub`, which `--jdk-only` correctly
+        // refuses, and the refusal killed the whole server:
+        //
+        //     $ cratonvm --jdk-only … HttpServerWildcardAddressProbe
+        //     NoClassDefFoundError: CratonVM$HttpServerLoop
+        //         at HttpServerWildcardAddressProbe.main(…:49)
+        //
+        // i.e. `com.sun.net.httpserver.HttpServer.start()` could not start
+        // under strict mode. `bind()` and `getAddress()` were already fine —
+        // this is the one call the door took out.
+        //
+        // The natives are the OTHER gate, and here it is already open,
+        // measured rather than assumed: `--dump-native-registry` taken once
+        // per mode reports this class's single `run()V` as `kind":"bridge"` in
+        // Compatible AND under `--jdk-only`. The name is on none of
+        // `no_image_receiver.rs`'s tables — it does not start with `cratonvm/`
+        // so `VM_MINTED_STAND_IN_RECEIVERS` is not consulted, and it is in
+        // neither `NO_IMAGE_JDK_RECEIVERS` nor `VM_SERVICE_RECEIVERS` — so
+        // `receiver_declared_by_no_supported_image` answers false and nothing
+        // re-tags it `SyntheticStub`. That check is per class and is not a
+        // general licence: flipping the door on a receiver whose natives ARE
+        // dropped in strict buys an `UnsatisfiedLinkError` at the first call
+        // instead of a `NoClassDefFoundError` at the mint, which is a moved
+        // symptom rather than a fix (measured on
+        // `cratonvm/internal/LinkedListSnapshotListItr`).
+        //
+        // Pre-mint rather than replace, so the allocation below keeps its
+        // real-vs-requested field-count widening and its GC-safe retry:
+        // `fabricate_class` returns the existing `ClassId` for an
+        // already-loaded name before it reaches `admit_compatibility_class`,
+        // so `Compatible` is byte-for-byte unchanged and only the recorded
+        // ORIGIN moves (`compatibility-stub` → `vm-internal` in
+        // `--dump-class-origins`, and `vm_exec.rs`'s `stub_hint` stops
+        // suggesting a missing jar for a class no jar has).
+        ctx.ensure_vm_internal_class(HS_LOOP_CLASS, 1);
         let runner = try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?;
         ctx.set_field(runner, 0, Value::Int(server_id));
 
@@ -16425,6 +16873,125 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `HttpExchange.getResponseBody()`'s real-JDK stand-in, built **only** when the
+/// policy has already refused the VM-minted `HttpExchange$ResponseBody`.
+///
+/// W7-24. `com/sun/net/httpserver/HttpExchange$ResponseBody` is a *behaviour
+/// carrier* in W7-17's classification, not a door defect, and the distinction
+/// decides the fix. `javap com.sun.net.httpserver.HttpExchange$ResponseBody`
+/// against the JDK 25 image answers "class not found", so it passes the
+/// guardrail — but `--dump-native-registry` taken once per mode reports its five
+/// natives (`write(I)`, `write([B)`, `write([BII)`, `flush`, `close`, all
+/// registered a few lines below) as `synthetic-stub` in Compatible and **absent**
+/// under `--jdk-only`. `CompatibilityStub` is therefore the CORRECT origin: the
+/// class exists only to carry an implementation strict mode is deliberately
+/// retiring, and the class and its natives are refused together on purpose.
+/// Re-minting it through `ensure_vm_internal_class` — the fix
+/// `CratonVM$HttpServerLoop` needed, three functions up — would put back a class
+/// strict mode has no implementation for and buy an `UnsatisfiedLinkError` at
+/// the handler's first `write` instead of the `NoClassDefFoundError` at the
+/// mint. What is missing here is not a door but a **fallback at the refusal**,
+/// which is the shape `craton_alloc_system_logger` already implements for
+/// `cratonvm/internal/SystemLogger`.
+///
+/// **Why `java.io.ByteArrayOutputStream`, and not what HotSpot returns.**
+/// Measured on this host, HotSpot 25's `getResponseBody()` hands back a
+/// `sun.net.httpserver.PlaceholderOutputStream`; that class cannot serve — it is
+/// package-private, its only constructor takes the `OutputStream` it wraps, and
+/// every write goes through a `checkWrap()` that throws until a real
+/// `ExchangeImpl` has called `setWrappedStream`. There is no `ExchangeImpl` on
+/// this path. `java.io.ByteArrayOutputStream` can: it is a real, public
+/// `java.base` class; every method this stream needs is registered `bridge` in
+/// BOTH modes (`native-io/src/lib.rs` — `<init>()V`, the three `write`s,
+/// `flush`, `close`, `toByteArray`), so nothing about it is dropped by the
+/// strict policy; and it has exactly the semantics the carrier had — accumulate
+/// now, hand the bytes to the dispatcher after `handle()` returns. It is not the
+/// name HotSpot reports, and this VM's Compatible answer
+/// (`com.sun.net.httpserver.HttpExchange$ResponseBody`) is not that name either,
+/// so the fallback costs no fidelity that was there to lose and buys a working
+/// response body where strict mode had none.
+///
+/// **Where it is parked.** In the exchange's own chunk array (slot 6), not in a
+/// Rust side table: the array is GC-traced from the exchange for exactly as long
+/// as the exchange lives, and `re10_dispatch_pending`'s drain already looks
+/// there, in order, for the response bytes. A side table keyed on an `ObjectRef`
+/// would need pinning across the whole handler call and would inherit a
+/// recycled address's state.
+fn re10_real_jdk_response_body(
+    ctx: &mut dyn NativeContext,
+    ex_pin: usize,
+    ex0: ObjectRef,
+    refusal: MethodCallFailed,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Keep the refusal itself alive across the allocations below.
+    // `MethodCallFailed::ExceptionThrown` carries a raw `ObjectRef`, and
+    // re-raising one that a young collection moved in the meantime is the same
+    // stale-local family every other site in this function's neighbourhood pins
+    // against. The pin batch belongs to the caller's `this_pin`, so the caller's
+    // single `unpin_native_roots` releases this one too — do not unpin here.
+    let refusal_pin = match &refusal {
+        MethodCallFailed::ExceptionThrown(exc) => Some((ctx.pin_native_root(*exc), *exc)),
+        _ => None,
+    };
+    // Same order as `real_jdk_system_logger`: ask whether the real class is
+    // there BEFORE trying to build it, so a missing image class leaves the
+    // refusal standing rather than turning it into a second, less informative
+    // failure.
+    let have_real = ctx.class_id_by_name("java/io/ByteArrayOutputStream").is_some()
+        || ctx
+            .ensure_class_initialized("java/io/ByteArrayOutputStream")
+            .is_ok();
+    let built = if have_real {
+        ctx.new_object_initialized("java/io/ByteArrayOutputStream", "()V", &[])
+    } else {
+        Ok(None)
+    };
+    let sink = match built {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    // No allocation between the create above and the park below — `get_field`,
+    // `array_length`, `get_array_element` and `set_array_element` do not
+    // allocate — so `sink` needs no pin of its own; the exchange does, because
+    // `new_object_initialized` ran a constructor.
+    let ex = ctx.read_native_pin(ex_pin, ex0);
+    let chunks = match ctx.get_field(ex, 6) {
+        Value::Object(Some(c)) => c,
+        _ => return Err(re10_reraise(ctx, refusal, refusal_pin)),
+    };
+    let cap = ctx.array_length(chunks);
+    for i in 0..cap {
+        if let Value::Object(None) = ctx.get_array_element(chunks, i) {
+            ctx.set_array_element(chunks, i, Value::Object(Some(sink)));
+            return Ok(sink);
+        }
+    }
+    // Chunk array full. The three `write` natives below silently drop a chunk in
+    // this case; a fallback stream that the drain will never read must NOT be
+    // silent about it — a response body dropped without a word is the
+    // "refusal laundered into a wrong answer" failure W7-17 §8 names as worse
+    // than either gate.
+    Err(ioex(
+        "HttpExchange.getResponseBody: no free response chunk slot for the \
+         real-JDK response body",
+    ))
+}
+
+/// Re-raise a refusal that has been held across allocations, reading it back
+/// from its pin first. Split out because the fallback above has three exits that
+/// must all do it and a copy that forgets the `read_native_pin` is invisible
+/// until a young collection happens to move the exception.
+fn re10_reraise(
+    ctx: &dyn NativeContext,
+    refusal: MethodCallFailed,
+    refusal_pin: Option<(usize, ObjectRef)>,
+) -> MethodCallFailed {
+    match refusal_pin {
+        Some((handle, exc)) => MethodCallFailed::ExceptionThrown(ctx.read_native_pin(handle, exc)),
+        None => refusal,
+    }
+}
+
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
     // The JDK factory contract returns this concrete implementation, not the
@@ -16783,14 +17350,33 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // response body. Pin it across the alloc and read it back forwarded.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let out = try_alloc_concurrent_synthetic(
+            let out = match try_alloc_concurrent_synthetic(
                 ctx,
                 "com/sun/net/httpserver/HttpExchange$ResponseBody",
                 2,
-            )?;
-            let this = ctx.read_native_pin(this_pin, this0);
-            ctx.set_field(out, 0, Value::Object(Some(this)));
-            ctx.set_field(out, 1, Value::Int(0));
+            ) {
+                Ok(out) => {
+                    let this = ctx.read_native_pin(this_pin, this0);
+                    ctx.set_field(out, 0, Value::Object(Some(this)));
+                    ctx.set_field(out, 1, Value::Int(0));
+                    out
+                }
+                // W7-24 — the real-JDK fallback, taken ONLY at the refusal.
+                // `Compatible` never refuses this mint (measured: the class is
+                // fabricated once per run in every Compatible HttpServer run,
+                // and the `--jdk-only-report` row for it is the only
+                // `net_phase_e` row on the serve path besides the dispatcher's),
+                // so this arm cannot run there and Compatible is unchanged.
+                Err(refusal) => match re10_real_jdk_response_body(ctx, this_pin, this0, refusal) {
+                    Ok(out) => out,
+                    Err(err) => {
+                        // Unpin before unwinding: an early return past
+                        // `unpin_native_roots` leaks the frame.
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(err);
+                    }
+                },
+            };
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(out))))
         },
@@ -17264,6 +17850,46 @@ mod tests {
         // Plain IPv4 and non-IP hosts: untouched.
         assert_eq!(hotspot_ip_string("127.0.0.1"), "127.0.0.1");
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
+    }
+
+    /// The v4-mapped fold belongs to the ENTRY POINT, not to the address.
+    ///
+    /// `getByName` / `InetAddress.getByAddress(byte[])` hand back an
+    /// `Inet4Address` for `::ffff:a.b.c.d` and HotSpot agrees — that is
+    /// [`hotspot_ip_string`], asserted above. But
+    /// `Inet6Address.getByAddress(String, byte[], int)` is specified to KEEP
+    /// all sixteen bytes, and CratonVM does not intercept it: the real JDK
+    /// bytecode builds the object, and the only CratonVM code that touches it
+    /// afterwards is `inet_addr_resolve`'s `holder6` branch, which reads the
+    /// 16 real octets back out. Folding there produced an object that answered
+    /// `instanceof Inet6Address` while `getAddress()` returned four bytes, and
+    /// `io.netty.util.NetUtil.toAddressString` indexes 16
+    /// (`ArrayIndexOutOfBoundsException: Index 4 out of bounds for length 4`,
+    /// `NetUtilTest.testIpv4MappedIp6GetByName` — HotSpot 14/14, CratonVM
+    /// 13/14 until this split).
+    #[test]
+    fn ipv6_uncompressed_text_never_folds_a_v4_mapped_address() {
+        let mapped: std::net::Ipv6Addr = "::ffff:192.168.0.1".parse().unwrap();
+        // The reader form keeps the v6 shape …
+        assert_eq!(ipv6_uncompressed_text(&mapped), "0:0:0:0:0:ffff:c0a8:1");
+        // … and re-parses to sixteen octets, which is the property netty needs.
+        assert_eq!(
+            ipv6_uncompressed_text(&mapped)
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .len(),
+            16
+        );
+        // … while the entry-point form still folds, byte-identical to HotSpot.
+        assert_eq!(hotspot_ip_string("::ffff:192.168.0.1"), "192.168.0.1");
+        // A genuine IPv6 address renders the same through both.
+        let real: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ipv6_uncompressed_text(&real), "2001:db8:0:0:0:0:0:1");
+        assert_eq!(
+            ipv6_uncompressed_text(&real),
+            hotspot_ip_string("2001:db8::1")
+        );
     }
 
     #[test]

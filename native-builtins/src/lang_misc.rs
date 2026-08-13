@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -466,6 +466,48 @@ fn init_suppressed_sentinel(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
 }
 
+/// Whether `this` was built with suppression turned off — the JDK encodes that
+/// as `suppressedExceptions == null`, written only by the four-arg protected
+/// `Throwable(String, Throwable, boolean enableSuppression, boolean)`.
+///
+/// Every clause here exists to keep a *null we cannot explain* from being read
+/// as a deliberate "disabled", because that reading makes `addSuppressed` a
+/// silent no-op and try-with-resources loses the `close()` failure with nothing
+/// looking wrong:
+///
+/// 1. The receiver's class must actually declare/inherit the field. A synthetic
+///    stub that has no such field also answers `Object(None)` through
+///    `read_throwable_field`'s slot fallback — that is a missing field, not a
+///    disabled one.
+/// 2. `Throwable.<clinit>` must have populated `SUPPRESSED_SENTINEL`. Before it
+///    has, no throwable in the process can carry the sentinel, so a null field
+///    means "too early to mirror the initialiser" rather than "disabled".
+/// 3. Only `Object(None)` counts. An *unset* reference slot reads back as
+///    `Int(0)` (see `init_suppressed_sentinel`), which is again not a verdict.
+///
+/// Each failing clause fails OPEN — append the suppressed exception — because
+/// an extra entry in `getSuppressed()` is visible and a dropped one is not.
+fn suppression_disabled(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(this);
+    if ctx
+        .resolve_field_index_by_class_id(class_id, "suppressedExceptions")
+        .is_none()
+    {
+        return false;
+    }
+    if !matches!(
+        ctx.get_field_by_name(this, "suppressedExceptions"),
+        Value::Object(None)
+    ) {
+        return false;
+    }
+    let sentinel = ctx.class_id_by_name("java/lang/Throwable").and_then(|cid| {
+        ctx.static_field_index_by_name(cid, "SUPPRESSED_SENTINEL")
+            .map(|idx| ctx.get_static_field(cid, idx))
+    });
+    matches!(sentinel, Some(Value::Object(Some(_))))
+}
+
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
 ///
 /// JDK semantics: `Throwable.cause` is declared `private Throwable cause = this;`
@@ -548,6 +590,251 @@ pub(crate) fn native_exc_init_cause(
         };
         write_throwable_detail_message(ctx, *this, detail_msg);
         capture_throwable_trace(ctx, *this);
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// The constructors the blanket four-descriptor set did not cover
+// ---------------------------------------------------------------------------
+//
+// Every message below is the string JDK 25 actually produces, measured by
+// constructing the real exception and reading `getMessage()`
+// (`probes/ThrowableCtorCensusProbe.java`'s sibling run) — not inferred from
+// the javadoc. Where the JDK's message is a format ("Index out of range: 3"),
+// reproducing it matters: these are the strings that end up in a user's log.
+
+/// `AssertionError(Object)` — the single most reachable constructor in the
+/// census, and the one that was missing everywhere.
+///
+/// `AssertionError`'s `(String)V` is **private** in the JDK, so BOTH
+/// `throw new AssertionError(msg)` and `assert cond : msg` compile to
+/// `<init>:(Ljava/lang/Object;)V`. Neither the registry nor the synthetic stub
+/// declared it, so in synthetic-JDK mode the error path of anything using
+/// `assert` raised `NoSuchMethodError` — replacing the assertion's own message
+/// with a dispatch failure at exactly the moment the program was trying to
+/// report what went wrong.
+///
+/// JDK semantics (`AssertionError(Object detailMessage)`):
+/// ```text
+///     this(String.valueOf(detailMessage));
+///     if (detailMessage instanceof Throwable)
+///         initCause((Throwable) detailMessage);
+/// ```
+/// Measured: `new AssertionError((Object) null)` → message `null` (the JDK
+/// stores `String.valueOf(null)`, i.e. the four-character string "null" —
+/// `getMessage()` reports it as such), and a `Throwable` argument yields both
+/// `getMessage() == cause.toString()` and `getCause() == cause`.
+pub(crate) fn native_assertion_error_init_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let detail = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `String.valueOf(Object)` — through the JDK so a custom `toString()` is
+    // honoured, exactly as the real constructor does.
+    let message = match detail {
+        Value::Object(Some(obj)) => {
+            let this_pin = ctx.pin_native_root(this);
+            let rendered = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
+            let _ = this;
+            match rendered {
+                Ok(Some(v @ Value::Object(Some(_)))) => v,
+                _ => Value::Object(None),
+            }
+        }
+        // `String.valueOf((Object) null)` is the STRING "null", not a null ref.
+        _ => Value::Object(Some(ctx.create_string("null"))),
+    };
+    write_throwable_detail_message(ctx, this, message);
+    // A Throwable argument becomes the cause as well as the message.
+    let cause_is_throwable = match detail {
+        Value::Object(Some(obj)) => {
+            let obj_class = ctx.class_id_of_object(obj);
+            ctx.class_id_by_name("java/lang/Throwable")
+                .is_some_and(|throwable| {
+                    obj_class == throwable || ctx.is_subclass(obj_class, throwable)
+                })
+        }
+        _ => false,
+    };
+    if cause_is_throwable {
+        write_throwable_cause(ctx, this, detail);
+    } else {
+        // Self-sentinel, so a later `initCause()` still succeeds — the same
+        // contract `native_exc_init_message` maintains.
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+    }
+    capture_throwable_trace(ctx, this);
+    Ok(None)
+}
+
+/// Which primitive an `AssertionError(<primitive>)` overload was handed, so the
+/// message is `String.valueOf` of the RIGHT type: the interpreter delivers a
+/// `boolean`, a `char` and an `int` all as `Value::Int`, and
+/// `String.valueOf(true)` is "true" where `String.valueOf(1)` is "1".
+#[derive(Clone, Copy)]
+pub(crate) enum ScalarKind {
+    Boolean,
+    Char,
+    Int,
+    Long,
+    Float,
+    Double,
+}
+
+fn scalar_to_string(kind: ScalarKind, value: Option<&Value>) -> String {
+    match (kind, value) {
+        (ScalarKind::Boolean, Some(Value::Int(v))) => (*v != 0).to_string(),
+        (ScalarKind::Char, Some(Value::Int(v))) => char::from_u32(*v as u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        (ScalarKind::Int, Some(Value::Int(v))) => v.to_string(),
+        (ScalarKind::Long, Some(Value::Long(v))) => v.to_string(),
+        (ScalarKind::Long, Some(Value::Int(v))) => (*v as i64).to_string(),
+        // Java renders 1.5f as "1.5" and 1.0f as "1.0"; Rust's `{}` agrees for
+        // both, and `{:?}` would not.
+        (ScalarKind::Float, Some(Value::Float(v))) => format_java_float(*v as f64),
+        (ScalarKind::Double, Some(Value::Double(v))) => format_java_float(*v),
+        _ => String::new(),
+    }
+}
+
+/// Java's `Double.toString`/`Float.toString` always carry a decimal point;
+/// Rust's `Display` prints `1` for `1.0`.
+fn format_java_float(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let s = v.to_string();
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+fn assertion_error_init_scalar(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    kind: ScalarKind,
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let text = scalar_to_string(kind, args.get(1));
+        let message = ctx.create_string(&text);
+        write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `IndexOutOfBoundsException(int|long)` and its two subclasses, whose messages
+/// differ by one word each — measured on JDK 25:
+///
+/// ```text
+///   new IndexOutOfBoundsException(3)        Index out of range: 3
+///   new ArrayIndexOutOfBoundsException(3)   Array index out of range: 3
+///   new StringIndexOutOfBoundsException(3)  String index out of range: 3
+/// ```
+fn index_exception_init_index(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    prefix: &str,
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let index = match args.get(1) {
+            Some(Value::Int(v)) => i64::from(*v),
+            Some(Value::Long(v)) => *v,
+            _ => 0,
+        };
+        let message = ctx.create_string(&format!("{prefix}{index}"));
+        write_throwable_detail_message(ctx, this, Value::Object(Some(message)));
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `UncheckedIOException(IOException)` — message is the cause's `toString()`,
+/// and a null cause is a `NullPointerException` (`Objects.requireNonNull`),
+/// not a silently message-less exception. Measured.
+pub(crate) fn native_unchecked_io_init_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("cause".to_string()),
+        }
+        .into());
+    }
+    native_exc_init_cause(ctx, args)
+}
+
+/// `UncheckedIOException(String, IOException)` — same null-cause refusal, with
+/// the caller's own message.
+pub(crate) fn native_unchecked_io_init_message_cause(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
+        return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+            message: Some("cause".to_string()),
+        }
+        .into());
+    }
+    native_exc_init_message_cause(ctx, args)
+}
+
+/// `ParseException(String, int)` — message is the string; the offset also goes
+/// to the JDK's `errorOffset` field.
+///
+/// NOTE the boundary: this constructor is what was missing, and it is what this
+/// change fixes. `getErrorOffset()` is a separate method on a separate surface —
+/// the write below reaches it only if the class model declares the field, and
+/// nothing here fabricates the accessor.
+pub(crate) fn native_parse_exception_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        write_throwable_detail_message(ctx, this, msg);
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        if let Some(offset @ Value::Int(_)) = args.get(2) {
+            ctx.set_field_by_name(this, "errorOffset", *offset);
+        }
+        capture_throwable_trace(ctx, this);
+    }
+    Ok(None)
+}
+
+/// `MissingResourceException(String s, String className, String key)` — the
+/// message is `s`; `className`/`key` are the JDK's own named fields. Same
+/// accessor boundary as `ParseException` above.
+pub(crate) fn native_missing_resource_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let msg = args.get(1).copied().unwrap_or(Value::Object(None));
+        write_throwable_detail_message(ctx, this, msg);
+        write_throwable_cause(ctx, this, Value::Object(Some(this)));
+        if let Some(class_name) = args.get(2) {
+            ctx.set_field_by_name(this, "className", *class_name);
+        }
+        if let Some(key) = args.get(3) {
+            ctx.set_field_by_name(this, "key", *key);
+        }
+        capture_throwable_trace(ctx, this);
     }
     Ok(None)
 }
@@ -1032,7 +1319,101 @@ pub(crate) fn native_throwable_get_cause(
     Ok(Some(Value::Object(None)))
 }
 
-/// initCause(Throwable) — set the cause field, return this.
+/// Build the exception a `Throwable` state-machine check refuses with.
+///
+/// The JDK's own refusals carry the receiver as their cause — `throw new
+/// IllegalStateException(msg, this)` / `new IllegalArgumentException(msg,
+/// exception)` — and that cause is observable (`ise.getCause()` measured as
+/// `java.lang.RuntimeException: m` on JDK 25). A bare
+/// `RuntimeError::IllegalStateException` cannot carry one, so construct the
+/// throwable properly and fall back to the message-only variant if that fails;
+/// the *type* is the load-bearing half and must survive either way.
+fn throwable_refusal(
+    ctx: &mut dyn NativeContext,
+    exc_class: &str,
+    message: &str,
+    cause: Option<ObjectRef>,
+) -> cratonvm_types::error::MethodCallFailed {
+    use cratonvm_types::error::{MethodCallFailed, RuntimeError};
+    let message_only = || -> MethodCallFailed {
+        match exc_class {
+            "java/lang/IllegalStateException" => RuntimeError::IllegalStateException {
+                message: message.to_string(),
+            }
+            .into(),
+            "java/lang/NullPointerException" => RuntimeError::NullPointerException {
+                message: Some(message.to_string()),
+            }
+            .into(),
+            _ => RuntimeError::IllegalArgumentException {
+                message: message.to_string(),
+            }
+            .into(),
+        }
+    };
+    let Some(cause) = cause else {
+        return message_only();
+    };
+    // `create_string` and the constructor both allocate, so the receiver we were
+    // handed can move underneath us.
+    let pin = ctx.pin_native_root(cause);
+    let msg_ref = ctx.create_string(message);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg_pin = ctx.pin_native_root(msg_ref);
+    let cause = ctx.read_native_pin(pin, cause);
+    let msg_ref = ctx.read_native_pin(msg_pin, msg_ref);
+    let built = ctx.new_object_initialized(
+        exc_class,
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[
+            Value::Object(Some(msg_ref)),
+            Value::Object(Some(cause)),
+        ],
+    );
+    ctx.unpin_native_roots(pin);
+    match built {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => message_only(),
+    }
+}
+
+/// `initCause(Throwable)` — the JDK's `Throwable.initCause` **state machine**,
+/// not a bare field write.
+///
+/// This native SHADOWS the real `Throwable.initCause` bytecode for **every**
+/// instance — registering a native on a real JDK class does not add a fallback,
+/// it replaces the method — so the two refusals `initCause` is specified to
+/// raise only exist if they are written here. Until 2026-08-12 neither was, and
+/// `initCause` was an unconditional setter — the
+/// differential probe measured `Throwable.initCauseAfterCtorThrows`,
+/// `Throwable.initCauseTwiceThrows` and `Throwable.selfCauseThrows` all as
+/// `no-throw` where HotSpot raises.
+///
+/// The javadoc, verbatim:
+///
+/// > `@throws IllegalStateException` if this throwable was created with
+/// > `Throwable(Throwable)` or `Throwable(String,Throwable)`, or this method has
+/// > already been called on this throwable.
+///
+/// > `@throws IllegalArgumentException` if `cause` is this throwable. (A
+/// > throwable cannot be its own cause.)
+///
+/// **Order matters and is the JDK's**: the already-set test runs *first*, which
+/// is why `new RuntimeException().initCause(itself)` is an
+/// `IllegalArgumentException` (the sentinel still says "unset") rather than an
+/// `IllegalStateException`. Reversing the two would produce the right kind of
+/// failure with the wrong type, and a mistyped refusal sends a caller down the
+/// wrong `catch` branch just as surely as a missing one.
+///
+/// "Already set" is `this.cause != this`: the JDK declares `private Throwable
+/// cause = this;` as a sentinel for "no cause yet", so a constructor-supplied
+/// cause, a previous `initCause` — *including* `initCause(null)`, which is why a
+/// null check would not do — and a deserialised throwable whose `cause` is
+/// genuinely null all read as set. HotSpot refuses all three. Measured
+/// 2026-08-12 on `--real-jdk`: CratonVM's `cause` field already tracks HotSpot's
+/// exactly (`isSelf` after `new RuntimeException("m")`, not-self after
+/// `(String,Throwable)`, null after `initCause(null)`), so testing the raw field
+/// is testing the same thing HotSpot tests.
 pub(crate) fn native_throwable_init_cause(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1042,6 +1423,78 @@ pub(crate) fn native_throwable_init_cause(
         _ => return Ok(Some(Value::Object(None))),
     };
     let cause_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+
+    // `if (this.cause != this) throw new IllegalStateException(...)`, read raw:
+    // `read_throwable_cause`'s self-reference guard is exactly what must NOT be
+    // applied here, because the sentinel is the whole signal.
+    //
+    // Every arm that is not a verdict fails OPEN (proceed with the write). An
+    // over-throw here would refuse a legitimate first `initCause` — the two
+    // dead sections this same probe turned up on 2026-08-12 were both real JDK
+    // code refusing state *we* had corrupted, so a refusal added on a signal we
+    // cannot read is the specific way this goes wrong.
+    let class_id = ctx.class_id_of_object(this);
+    let declares_cause = ctx
+        .resolve_field_index_by_class_id(class_id, "cause")
+        .is_some();
+    let already_set = match read_throwable_field(ctx, this, "cause") {
+        // A live reference that is not the sentinel: a constructor-supplied
+        // cause, or a previous `initCause`.
+        Value::Object(Some(c)) => c != this,
+        // A genuine null is "set" too — `initCause(null)` is a valid first call
+        // and HotSpot refuses the second (measured). Trust the null only when
+        // the receiver really has the field: `read_throwable_field`'s slot
+        // fallback answers the same `Object(None)` for a class that has none.
+        Value::Object(None) => declares_cause,
+        // An unset reference slot reads back as `Int(0)` — no verdict.
+        _ => false,
+    };
+    if already_set {
+        // `"Can't overwrite cause with " + Objects.toString(cause, "a null")`.
+        // Rendering the argument re-enters Java (`toString()`), so the receiver
+        // has to survive a collection across it.
+        let (this, rendered) = match cause_val {
+            Value::Object(Some(c)) => {
+                let pin = ctx.pin_native_root(this);
+                let cause_pin = ctx.pin_native_root(c);
+                // `Objects.toString` dispatches the argument's OWN `toString()`,
+                // which a Throwable subclass may override; only fall back to
+                // this file's `Throwable.toString()` reconstruction if that
+                // dispatch cannot answer.
+                let text = match ctx.invoke_virtual(c, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                let text = match text {
+                    Some(t) => t,
+                    None => {
+                        let c = ctx.read_native_pin(cause_pin, c);
+                        throwable_to_string_text(ctx, c).1
+                    }
+                };
+                let this = ctx.read_native_pin(pin, this);
+                ctx.unpin_native_roots(pin);
+                (this, text)
+            }
+            _ => (this, "a null".to_string()),
+        };
+        return Err(throwable_refusal(
+            ctx,
+            "java/lang/IllegalStateException",
+            &format!("Can't overwrite cause with {rendered}"),
+            Some(this),
+        ));
+    }
+    if let Value::Object(Some(c)) = cause_val {
+        if c == this {
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Self-causation not permitted",
+                Some(this),
+            ));
+        }
+    }
     write_throwable_cause(ctx, this, cause_val);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -1428,6 +1881,36 @@ fn print_throwable_chain_to_stream_obj(
 /// resolving `suppressedExceptions` **by name** instead of a hardcoded
 /// index, matching the pattern `init_suppressed_sentinel` already used
 /// correctly for the same field.
+///
+/// 2026-08-12 — the three rules the JDK states for this method, none of which
+/// this native implemented (the differential probe measured
+/// `Throwable.addSuppressedSelfThrows` as `no-throw` and
+/// `Throwable.suppressionDisabled` as `1:0` against HotSpot's `0:0`). The
+/// javadoc, verbatim:
+///
+/// > `@throws IllegalArgumentException` if `exception` is this throwable; a
+/// > throwable cannot suppress itself.
+///
+/// > `@throws NullPointerException` if `exception` is `null`.
+///
+/// > If suppression is disabled, this method does nothing other than to
+/// > validate its argument.
+///
+/// "other than to validate its argument" is load-bearing and measured: with
+/// suppression disabled, HotSpot *still* raises `IllegalArgumentException` for
+/// `addSuppressed(this)` and `NullPointerException` for `addSuppressed(null)`.
+/// Both checks therefore run BEFORE the disabled test — silently returning on a
+/// null argument, as this native used to, hides a caller bug in exactly the
+/// place (a failed `close()`) where it is hardest to notice.
+///
+/// Suppression is disabled iff `suppressedExceptions == null` — that is the
+/// JDK's own encoding, written by the four-arg protected constructor. Measured
+/// on `--real-jdk`: CratonVM already reproduces both states exactly
+/// (`Collections$EmptyList` by default, `null` after
+/// `new RuntimeException(m, null, false, false)`), because the real constructor
+/// bytecode runs. VM-*minted* throwables are the case that had to be closed
+/// alongside this, or the new rule would drop suppressions on them — see
+/// `mirror_throwable_field_initialisers` in `vm/src/runtime/exceptions.rs`.
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1437,12 +1920,33 @@ pub(crate) fn native_throwable_add_suppressed(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // `if (exception == this) throw new IllegalArgumentException(
+    //      SELF_SUPPRESSION_MESSAGE, exception);`
+    // then `Objects.requireNonNull(exception, NULL_CAUSE_MESSAGE);` — in that
+    // order, so a self-argument is an IAE even though it is also non-null.
     let suppressed = match args.get(1) {
+        Some(Value::Object(Some(r))) if *r == this => {
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/IllegalArgumentException",
+                "Self-suppression not permitted",
+                Some(this),
+            ));
+        }
         Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(None),
+        _ => {
+            // `Objects.requireNonNull` produces a message-only NPE with no
+            // cause — measured: `npe.getCause()` is null on HotSpot.
+            return Err(throwable_refusal(
+                ctx,
+                "java/lang/NullPointerException",
+                "Cannot suppress a null exception.",
+                None,
+            ));
+        }
     };
-    // Don't allow self-suppression
-    if this == suppressed {
+    // `if (suppressedExceptions == null) return;` — suppression disabled.
+    if suppression_disabled(ctx, this) {
         return Ok(None);
     }
     // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
@@ -1484,6 +1988,14 @@ pub(crate) fn native_throwable_add_suppressed(
 /// empty array if none were added. See `native_throwable_add_suppressed`'s
 /// doc comment for why this reads by field NAME rather than a hardcoded
 /// index.
+///
+/// The suppression-disabled case needs nothing extra here: the four-arg
+/// constructor leaves `suppressedExceptions` **null**, which is not an array, so
+/// the empty-array tail below is already the specified answer ("if suppression
+/// was disabled … an empty array will be returned"). It only started reporting
+/// that correctly once `addSuppressed` stopped writing an array into the null
+/// field — the probe's `Throwable.suppressionDisabled` measured `1:0` because of
+/// that write, not because of anything on this path.
 pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2183,13 +2695,13 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
 // behavior is uniform across the family — `register` is last-write-wins
 // and the new closure is a strict superset of the existing native (it
 // reads slot 0, validates it's a string, and falls back to null).
-pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
-    // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
-    // Error/Exception families that any defensive catch will see.
-    let throwable_classes = [
+/// The throwable-family classes whose Throwable surface this file bridges.
+///
+/// Module-level so the gate at the bottom of this file can walk it: every
+/// constructor descriptor `cratonvm_classloading::throwable_ctor_descriptors`
+/// declares for one of these must have a native here, or the synthetic stub
+/// declares a method that resolves to nothing.
+pub(crate) const THROWABLE_FAMILY_CLASSES: &[&str] = &[
         "java/lang/Throwable",
         "java/lang/Exception",
         "java/lang/RuntimeException",
@@ -2278,35 +2790,117 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         "java/lang/AbstractMethodError",
         "java/lang/InternalError",
         "java/lang/UnsatisfiedLinkError",
-    ];
+];
+
+/// The native body for one `(class, constructor descriptor)` pair from
+/// [`cratonvm_classloading::throwable_ctor_descriptors`].
+///
+/// `None` means the table names a descriptor this file cannot implement, which
+/// is a bug in one of the two — the caller `debug_assert!`s on it rather than
+/// registering a declaration with no body.
+///
+/// Most rows are class-independent: the four `Throwable` shapes mean the same
+/// thing everywhere. The exceptions are the point of the table — the SAME
+/// descriptor means different things on different classes. `(I)V` is
+/// `String.valueOf(int)` on `AssertionError` and "Array index out of range: N"
+/// on `ArrayIndexOutOfBoundsException`, so the body is chosen by class here
+/// rather than sniffed from the receiver at call time.
+fn throwable_ctor_native(cls: &str, descriptor: &str) -> Option<NativeCallback> {
+    // Class-specific rows first: a later generic arm must not shadow them.
+    match (cls, descriptor) {
+        ("java/lang/AssertionError", "(Ljava/lang/Object;)V") => {
+            return Some(native_assertion_error_init_object)
+        }
+        ("java/lang/AssertionError", "(Z)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Boolean))
+        }
+        ("java/lang/AssertionError", "(C)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Char))
+        }
+        ("java/lang/AssertionError", "(I)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Int))
+        }
+        ("java/lang/AssertionError", "(J)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Long))
+        }
+        ("java/lang/AssertionError", "(F)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Float))
+        }
+        ("java/lang/AssertionError", "(D)V") => {
+            return Some(|ctx, args| assertion_error_init_scalar(ctx, args, ScalarKind::Double))
+        }
+        ("java/lang/ArrayIndexOutOfBoundsException", "(I)V") => {
+            return Some(|ctx, args| {
+                index_exception_init_index(ctx, args, "Array index out of range: ")
+            })
+        }
+        ("java/lang/StringIndexOutOfBoundsException", "(I)V") => {
+            return Some(|ctx, args| {
+                index_exception_init_index(ctx, args, "String index out of range: ")
+            })
+        }
+        ("java/lang/IndexOutOfBoundsException", "(I)V" | "(J)V") => {
+            return Some(|ctx, args| index_exception_init_index(ctx, args, "Index out of range: "))
+        }
+        ("java/io/UncheckedIOException", "(Ljava/io/IOException;)V") => {
+            return Some(native_unchecked_io_init_cause)
+        }
+        ("java/io/UncheckedIOException", "(Ljava/lang/String;Ljava/io/IOException;)V") => {
+            return Some(native_unchecked_io_init_message_cause)
+        }
+        ("java/text/ParseException", "(Ljava/lang/String;I)V") => {
+            return Some(native_parse_exception_init)
+        }
+        (
+            "java/util/MissingResourceException",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        ) => return Some(native_missing_resource_init),
+        // `InvocationTargetException` keeps the wrapped throwable in its own
+        // `target` field, not in `Throwable.cause` — see those bodies.
+        ("java/lang/reflect/InvocationTargetException", "(Ljava/lang/Throwable;)V") => {
+            return Some(native_invocation_target_exception_init_target)
+        }
+        (
+            "java/lang/reflect/InvocationTargetException",
+            "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+        ) => return Some(native_invocation_target_exception_init_target_message),
+        _ => {}
+    }
+
+    match descriptor {
+        "()V" => Some(native_exc_init_noargs),
+        "(Ljava/lang/String;)V" => Some(native_exc_init_message),
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V" => Some(native_exc_init_message_cause),
+        "(Ljava/lang/Throwable;)V" => Some(native_exc_init_cause),
+        _ => None,
+    }
+}
+
+pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
+    // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
+    // Error/Exception families that any defensive catch will see.
+    let throwable_classes = THROWABLE_FAMILY_CLASSES;
 
     for cls in throwable_classes.iter() {
+        // The CONSTRUCTORS come from the measured per-class table, shared with
+        // the synthetic stub's method table so the two cannot disagree about
+        // which ones exist. See
+        // `cratonvm_classloading::throwable_ctor_descriptors`.
+        for descriptor in cratonvm_classloading::throwable_ctor_descriptors(cls) {
+            if let Some(body) = throwable_ctor_native(cls, descriptor) {
+                r.register(cls, "<init>", descriptor, body);
+            } else {
+                debug_assert!(
+                    false,
+                    "{cls} declares <init>{descriptor} with no native to back it"
+                );
+            }
+        }
+
         if *cls == "java/lang/reflect/InvocationTargetException" {
-            r.register(cls, "<init>", "()V", native_exc_init_noargs);
-            r.register(
-                cls,
-                "<init>",
-                "(Ljava/lang/String;)V",
-                native_exc_init_message,
-            );
-            r.register(
-                cls,
-                "<init>",
-                "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-                native_exc_init_message_cause,
-            );
-            r.register(
-                cls,
-                "<init>",
-                "(Ljava/lang/Throwable;)V",
-                native_invocation_target_exception_init_target,
-            );
-            r.register(
-                cls,
-                "<init>",
-                "(Ljava/lang/Throwable;Ljava/lang/String;)V",
-                native_invocation_target_exception_init_target_message,
-            );
             r.register(
                 cls,
                 "getMessage",
@@ -2363,34 +2957,11 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
             );
             continue;
         }
-        // Constructor overloads for synthetic Throwable-family stubs.
-        // Some bootstrap paths instantiate subclasses directly (for example
-        // InternalError and NoSuchMethodError wrappers). Register all common
-        // ctor descriptors here so both synthetic and real-JDK flows can
-        // initialize message/cause consistently.
-        // audit-2026-05-16: previously this registered the generic
-        // `native_noop_with_this`, which left `cause` un-initialised; the
-        // (String) ctor uses the JDK sentinel `cause = this`, so a later
-        // `initCause()` succeeded for (String) ctors but failed for noargs.
-        r.register(cls, "<init>", "()V", native_exc_init_noargs);
-        r.register(
-            cls,
-            "<init>",
-            "(Ljava/lang/String;)V",
-            native_exc_init_message,
-        );
-        r.register(
-            cls,
-            "<init>",
-            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-            native_exc_init_message_cause,
-        );
-        r.register(
-            cls,
-            "<init>",
-            "(Ljava/lang/Throwable;)V",
-            native_exc_init_cause,
-        );
+        // The constructors were registered from the per-class table at the top
+        // of this loop. They used to be four hard-coded `r.register` calls
+        // here — `()V`, `(String)V`, `(String,Throwable)V`, `(Throwable)V` —
+        // for EVERY class in the list, which is 103 descriptors the real JDK
+        // class does not declare and 16 it does that nobody registered.
 
         // getMessage()Ljava/lang/String; — read slot 0 (detailMessage).
         r.register(
@@ -2618,6 +3189,75 @@ mod tests {
         assert_eq!(
             native_enum_name(&mut ctx, &[Value::Object(Some(obj))]).unwrap(),
             Some(Value::Object(None)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod throwable_ctor_table_tests {
+    use super::{throwable_ctor_native, THROWABLE_FAMILY_CLASSES};
+    use cratonvm_classloading::{throwable_ctor_descriptors, THROWABLE_DEFAULT_CTORS};
+
+    /// The stub's method table and the native registry are built from ONE list,
+    /// but they are in different crates and only this gate says so out loud: a
+    /// descriptor the stub declares with no native here is a method that
+    /// resolves and then has no body, which is worse than the
+    /// `NoSuchMethodError` it replaces because it fails later and less clearly.
+    #[test]
+    fn every_declared_throwable_ctor_has_a_native() {
+        for class in THROWABLE_FAMILY_CLASSES {
+            for descriptor in throwable_ctor_descriptors(class) {
+                assert!(
+                    throwable_ctor_native(class, descriptor).is_some(),
+                    "{class} declares <init>{descriptor} but no native backs it",
+                );
+            }
+        }
+    }
+
+    /// The measured facts this change is built on, kept where a reader can see
+    /// them fail. Re-derive with `probes/ThrowableCtorCensusProbe.java` after a
+    /// JDK bump — these are JDK 25 numbers, not invariants.
+    #[test]
+    fn the_measured_census_still_describes_the_table() {
+        // `AssertionError(String)` is PRIVATE in the JDK, so registering it
+        // fabricates a constructor javac will never emit — and `(Object)V`,
+        // which javac emits for BOTH `new AssertionError(msg)` and
+        // `assert cond : msg`, is the one that must be there.
+        let assertion_error = throwable_ctor_descriptors("java/lang/AssertionError");
+        assert!(assertion_error.contains(&"(Ljava/lang/Object;)V"));
+        assert!(!assertion_error.contains(&"(Ljava/lang/String;)V"));
+        assert!(!assertion_error.contains(&"(Ljava/lang/Throwable;)V"));
+
+        // `UncheckedIOException` is the worst in kind: all four blanket
+        // descriptors are dead on it, and neither of its two real constructors
+        // was registered.
+        let unchecked_io = throwable_ctor_descriptors("java/io/UncheckedIOException");
+        assert_eq!(
+            unchecked_io,
+            [
+                "(Ljava/io/IOException;)V",
+                "(Ljava/lang/String;Ljava/io/IOException;)V"
+            ]
+        );
+        for dead in THROWABLE_DEFAULT_CTORS {
+            assert!(!unchecked_io.contains(dead), "{dead} is dead on UncheckedIOException");
+        }
+
+        // `NoClassDefFoundError` has no cause-taking constructor at all — the
+        // one in-tree caller that used `(String,Throwable)V` on it was fixed to
+        // message-plus-`initCause`, which is what the JDK's own ClassLoader does.
+        assert_eq!(
+            throwable_ctor_descriptors("java/lang/NoClassDefFoundError"),
+            ["()V", "(Ljava/lang/String;)V"]
+        );
+
+        // A class this table has never measured still gets the common four:
+        // the caller's `is_throwable_like` test is a NAME heuristic and fires
+        // for application classes.
+        assert_eq!(
+            throwable_ctor_descriptors("com/example/TotallyUnknownException"),
+            THROWABLE_DEFAULT_CTORS
         );
     }
 }

@@ -199,11 +199,50 @@ pub const SYNTHETIC_THREAD_VIRTUAL_SLOT: usize = 5;
 ///   slot 0 = name, slot 1 = priority, slot 2 = tid, slot 3 = Runnable,
 ///   slot 4 = `contextClassLoader` (REAL, shared with the image),
 ///   slot 5 = virtual flag.
+///
+/// W7-77-guarded-slot-maps.md, against `javap -p java.lang.Thread` on Eclipse
+/// Adoptium 25.0.3.9 (19 instance fields, static excluded, declaration order):
+///
+///     0 eetop  1 tid  2 name  3 interrupted  4 contextClassLoader  5 holder
+///
+/// so **four** of this run's five slots disagree with the real class, not one:
+/// `NAME`(0) is `eetop`, `PRIORITY`(1) is `tid`, `TARGET`(3) is `interrupted`,
+/// `VIRTUAL`(5) is `holder`. Only slot 4 agrees, and it agrees on purpose --
+/// that is the 2026-08-05 alignment the `SYNTHETIC_THREAD_VIRTUAL_SLOT` doc
+/// above describes.
+///
+/// W7-69-read-side-alias-instrument.md's census listed only slot 5 for this
+/// file, because its scraper keyed on the run containing
+/// `SYNTHETIC_THREAD_VIRTUAL_SLOT` and the `THREAD_FIELD_*` run is a separate
+/// one carrying no class name in its own comment. The three extra rows are not
+/// a new defect -- they are the same fabricated-layout map, and the same
+/// class-side `eetop` witness in `vm_exec.rs::thread_start` decides whether any
+/// of them may be applied. They are recorded because "the census listed one"
+/// reads as "the other four agree", and they do not.
 const THREAD_SYNTHETIC_NUM_FIELDS: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT + 1;
 const THREAD_FIELD_NAME: usize = 0;
 const THREAD_FIELD_PRIORITY: usize = 1;
 const THREAD_FIELD_TARGET: usize = 3;
 const THREAD_FIELD_VIRTUAL: usize = SYNTHETIC_THREAD_VIRTUAL_SLOT;
+
+/// What the fabricated `java/lang/Thread` model believes, published for
+/// `read_alias::verify_declared_slot_maps` (W7-77).
+///
+/// States the BELIEF, not the real layout. Slot 4 is included even though it
+/// agrees: a census with no clean rows is an instrument that fires on
+/// everything, and this map's one deliberate agreement is worth sweeping.
+pub static SYNTHETIC_THREAD_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/lang/Thread",
+        slots: &[
+            (THREAD_FIELD_NAME, "name"),
+            (THREAD_FIELD_PRIORITY, "priority"),
+            (THREAD_FIELD_TARGET, "target"),
+            (4, "contextClassLoader"),
+            (THREAD_FIELD_VIRTUAL, "isVirtual"),
+        ],
+        origin: "native-builtins/src/jdk25_concurrency.rs THREAD_FIELD_*",
+    };
 
 // ===========================================================================
 // 15.1 — ScopedValue natives
@@ -851,7 +890,12 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // synthetic layout that means leaving the slot-4 virtual flag at 0; for the
     // real-JDK layout it means NOT constructing a BaseVirtualThread subtype.
     let worker_fields = ctx.object_num_fields(worker);
-    let synthetic_thread = worker_fields <= 8;
+    // The shared cutoff, not a fourth copy of it. `<= 8` was open-coded here
+    // because `is_synthetic_thread_layout` was nested inside
+    // `register_essential_natives_with_shims` and unreachable from any other
+    // module; it is at module scope since 2026-08-12
+    // (W7-74-short-object-repairs.md). Same value, one declaration.
+    let synthetic_thread = crate::thread_mirror_is_synthetic_layout(worker_fields);
     if synthetic_thread {
         ctx.set_field(worker, THREAD_FIELD_NAME, Value::Object(Some(name)));
         ctx.set_field(worker, THREAD_FIELD_PRIORITY, Value::Int(5));
@@ -2002,6 +2046,16 @@ fn native_sts_close_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-77: publish the fabricated Thread model's map. This registrar is
+    // synthetic-only (`lib.rs:24110`, inside `register_synthetic_overrides`),
+    // and that is the right scope rather than a limitation: in real-JDK mode
+    // `vm_exec.rs::thread_start`'s `eetop` witness refuses the fabricated read
+    // outright, so a sweep row there would be noise. In SYNTHETIC mode the
+    // sweep asks the question that matters -- does the fabricated
+    // `java/lang/Thread` still declare what these constants believe? -- which
+    // is exactly the drift that put the virtual flag at slot 4 until
+    // 2026-08-05.
+    cratonvm_native_api::read_alias::declare_slot_map(&SYNTHETIC_THREAD_SLOT_MAP);
     // --- ScopedValue ---
     r.register(CLS_SCOPED_VALUE, "<init>", "()V", native_sv_init);
     r.register(
@@ -2163,6 +2217,50 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ShutdownOnFailure ---
+    //
+    // JDK-ONLY-NOTE (W7-18): every registration between here and the `Joiner`
+    // block below is on a class or a method that **no JDK 25 declares**, and
+    // that is measured rather than inferred. `javap` on Adoptium 25.0.3.9
+    // answers "class not found" for `StructuredTaskScope$ShutdownOnSuccess` and
+    // `$ShutdownOnFailure` — JEP 505 deleted both — and `Class.forName` answers
+    // `ClassNotFoundException` for each on HotSpot 25, `cratonvm --real-jdk` and
+    // `cratonvm --jdk-only` alike. `StructuredTaskScope$Config` is a name no JDK
+    // ever shipped (`$Configuration` is the real one, registered by
+    // `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`), and
+    // `Joiner.policy()I` is not on the JDK's `Joiner` either. Transcript:
+    // docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §1/§3.
+    //
+    // WHY THEY ARE STILL HERE, named as a decision rather than left as an
+    // oversight. Two things have to be true at once for the deletion to be
+    // worth taking, and only one is:
+    //
+    //   * It cannot move either shipping mode. TRUE — this registrar is reached
+    //     only from `register_synthetic_overrides`, so in `--real-jdk` and
+    //     `--jdk-only` real JDK bytecode serves the whole API with zero
+    //     fabrication (W7-18 §5: `compatibility_classes: 0`,
+    //     `synthetic_stub_invocations: 0`, no StructuredTaskScope violation in
+    //     1,454). So the deletion is also worth exactly nothing there.
+    //   * The deletion is checkable. FALSE without a run. Roughly twenty
+    //     `#[test]`s in this file's own test module PIN these registrations by
+    //     triple — `test_register_sof_*` and `test_register_sos_*` (nine),
+    //     `test_all_shutdown_on_failure_methods_registered` and its
+    //     `_success_` twin, `s52_joiner_policy_registered`,
+    //     `s52_total_registration_count`, and the fork/join/close/shutdown
+    //     lists — and the only mode the change could be observed in —
+    //     `--synthetic-jdk` — has never been executed once. Deleting the
+    //     registrations therefore means rewriting a blocking gate's assertions
+    //     to match an unmeasured expectation, which is how a divergence gets
+    //     frozen in rather than removed.
+    //
+    // What DID land instead, because it was both checkable and load-bearing:
+    // `util_concurrent_ext.rs::register_pd_structured_concurrency` — the third
+    // registrar of these same classes, with an INCOMPATIBLE `$Subtask` slot
+    // convention — is retired to a tombstone. Read its doc comment: it explains
+    // why every triple it held was already overwritten by this registrar, and
+    // why leaving it in place was a landmine for whoever finally deletes the
+    // block below. See also `w7_18_jep505_surface_is_not_shadowed_here`, the
+    // ratchet that keeps this registrar from growing a second body for the JEP
+    // 505 triples that live in `phases_late/concurrent.rs`.
     r.register(CLS_SHUTDOWN_ON_FAILURE, "<init>", "()V", native_sof_init);
     r.register(
         CLS_SHUTDOWN_ON_FAILURE,
@@ -4369,7 +4467,85 @@ mod jdk25_concurrency_tests {
     fn s52_joiner_policy_registered() {
         let mut r = NativeMethodRegistry::new();
         register_jdk25_concurrency_natives(&mut r);
+        // NOTE (W7-18): `policy()I` is not on JDK 25's `Joiner`. This test pins
+        // a triple no JDK declares; see the JDK-ONLY-NOTE at the
+        // `ShutdownOnFailure` registration block for why it is still here.
         assert!(r.find(CLS_JOINER, "policy", "()I").is_some());
+    }
+
+    /// RATCHET (W7-18 patch B), not a coverage claim: this registrar must not
+    /// grow a second body for the JEP 505 triples that
+    /// `phases_late/concurrent.rs::register_p67_structured_task_scope_j25` owns.
+    ///
+    /// The hazard is an ordering one and it is silent. All three
+    /// `StructuredTaskScope` registrars sit inside `register_synthetic_overrides`,
+    /// and the call order there is `register_phase67_natives` (which reaches the
+    /// JEP 505 registrar), then `register_phase_d_natives`, then
+    /// `register_jdk25_concurrency_natives` — this one, LAST. `register()` is
+    /// last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+    /// §3), so any triple added here silently replaces the JEP 505 body with the
+    /// JDK-21-shaped one, with no warning, no duplicate-registration row, and no
+    /// visible diff at the call site. That is the exact mechanism this record's
+    /// residual names as the dangerous one.
+    ///
+    /// Checked as of 2026-08-12 by comparing the two triple sets: the JEP 505
+    /// surface is NOT shadowed today. This test is what keeps that true.
+    #[test]
+    fn w7_18_jep505_surface_is_not_shadowed_here() {
+        let mut r = NativeMethodRegistry::new();
+        register_jdk25_concurrency_natives(&mut r);
+        let owned_by_the_jep505_registrar: &[(&str, &str, &str)] = &[
+            (CLS_TASK_SCOPE, "join", "()Ljava/lang/Object;"),
+            (CLS_TASK_SCOPE, "isCancelled", "()Z"),
+            (
+                CLS_TASK_SCOPE,
+                "fork",
+                "(Ljava/lang/Runnable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
+            ),
+            (
+                CLS_TASK_SCOPE,
+                "open",
+                "(Ljava/util/concurrent/StructuredTaskScope$Joiner;Ljava/util/function/Function;)Ljava/util/concurrent/StructuredTaskScope;",
+            ),
+            (
+                CLS_JOINER,
+                "allUntil",
+                "(Ljava/util/function/Predicate;)Ljava/util/concurrent/StructuredTaskScope$Joiner;",
+            ),
+            (
+                CLS_JOINER,
+                "onFork",
+                "(Ljava/util/concurrent/StructuredTaskScope$Subtask;)Z",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withName",
+                "(Ljava/lang/String;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withThreadFactory",
+                "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+            (
+                "java/util/concurrent/StructuredTaskScope$Configuration",
+                "withTimeout",
+                "(Ljava/time/Duration;)Ljava/util/concurrent/StructuredTaskScope$Configuration;",
+            ),
+        ];
+        for (cls, name, desc) in owned_by_the_jep505_registrar {
+            assert!(
+                r.find(cls, name, desc).is_none(),
+                "W7-18: `{}.{}{}` is registered HERE as well. This registrar runs \
+                 LAST inside `register_synthetic_overrides`, so it silently \
+                 replaces the JEP 505 body in \
+                 `phases_late/concurrent.rs::register_p67_structured_task_scope_j25`. \
+                 Either delete this registration or move the implementation.",
+                cls,
+                name,
+                desc
+            );
+        }
     }
 
     // -- 52.3: Joiner.onComplete behavior --

@@ -269,6 +269,68 @@ pub fn kept_seeds_rejected() -> usize {
     KEPT_SEED_REJECTED.load(Ordering::Relaxed)
 }
 
+/// How many CSet-resident ROOTS the evacuator was handed that are not the start
+/// of a live object.
+///
+/// The root array is deliberately over-approximate: `collect_roots`' operand-
+/// stack filter is `is_heap_addr` (a RANGE check), widened from the strict
+/// `is_object_address` on 2026-08-04 because the strict probe dropped genuine
+/// young / mid-initialisation roots. A `long` on the operand stack, or a
+/// computed interior address, whose bits land in the heap range is therefore a
+/// root. That is safe for a non-moving sweep, where a false positive only
+/// over-retains — the moving collectors have to screen it themselves.
+pub static NON_OBJECT_ROOT_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// How many of [`NON_OBJECT_ROOT_SEEN`] were nevertheless COPIED to a new
+/// address by `evacuate_object` — i.e. how many times the evacuator computed a
+/// size from garbage, memcpy'd that many bytes, installed a forwarding entry
+/// for the address, and rewrote the root to point at the copy.
+pub static NON_OBJECT_ROOT_COPIED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`NON_OBJECT_ROOT_SEEN`] and [`NON_OBJECT_ROOT_COPIED`].
+pub fn non_object_root_counts() -> (usize, usize) {
+    (
+        NON_OBJECT_ROOT_SEEN.load(Ordering::Relaxed),
+        NON_OBJECT_ROOT_COPIED.load(Ordering::Relaxed),
+    )
+}
+
+/// Which step of [`G1Collector::classify_candidate_header`] decided an address
+/// is not the start of a live object.
+///
+/// The distinctions matter to whoever reads the rejection warnings:
+/// `AboveCursor` says the word is inside a live region but past everything ever
+/// allocated in it (a stale or recycled address), while `BadKindTag` says it is
+/// *below* the cursor and still not an object (a walk that lost the object
+/// grid). They have different upstream producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderVerdict {
+    /// Passed every check: this is the start of a live object.
+    Object,
+    /// Null, or not 8-aligned.
+    NullOrUnaligned,
+    /// Not inside `[arena_base, arena_end)`.
+    OutsideArena,
+    /// `region_size == 0` — the collector has no region geometry.
+    NoRegionGeometry,
+    /// The computed region index is past the end of the region table.
+    NoSuchRegion,
+    /// The owning region is `Free`.
+    RegionFree,
+    /// Below the owning region's data base (region table / arena disagreement).
+    BelowRegionBase,
+    /// Inside the region's span but at or above its allocation cursor.
+    AboveCursor,
+    /// The `kind` tag byte does not decode to an `ObjectKind`.
+    BadKindTag,
+    /// The element-type tag byte does not decode to an `ArrayElementType`.
+    BadElementTag,
+    /// A humongous filler, which is not walkable.
+    HumongousFiller,
+    /// Tags decode, but the shape word claims an impossible slot/element count.
+    ImplausibleShape,
+}
+
 /// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
 pub fn evacuation_holder_counts() -> (usize, usize) {
     (
@@ -2255,8 +2317,62 @@ impl G1Collector {
             //     regions.
             {
                 let mut regions = self.regions.lock();
+                let mut rejected: Vec<usize> = Vec::new();
                 for &seed in &seeds {
-                    self.record_outgoing_rset_edges(&mut regions, seed);
+                    if !self.record_outgoing_rset_edges(&mut regions, seed) {
+                        rejected.push(seed);
+                    }
+                }
+                // A seed is an identity entry in the pause's own forwarding map,
+                // so "it is not an object" is a statement about the map, not
+                // just about the heap. Ask the map what else it says about the
+                // address before the pause ends and the answer is gone: an
+                // address that is ALSO another key's destination was evacuated
+                // INTO, which makes the identity entry stale rather than a live
+                // self-forward. One O(map) pass, only on a pause that already
+                // rejected something, and only while the warnings are still
+                // being printed.
+                if !rejected.is_empty()
+                    && KEPT_SEED_REJECTED.load(Ordering::Relaxed) <= rejected.len().max(8)
+                {
+                    for seed in rejected {
+                        let inbound = acc
+                            .pointer_map
+                            .iter()
+                            .filter(|(k, v)| **v == seed && **k != seed)
+                            .count();
+                        // Deliberately does NOT consult `kept_unresolved_*`:
+                        // those are behind their own mutexes and this runs
+                        // under the regions lock — the deadlock hazard
+                        // `candidate_header_is_plausible` already documents.
+                        let bytes = self
+                            .lookup_region_for_addr(seed)
+                            .and_then(|i| regions.get(i))
+                            .map(|r| {
+                                hexdump_around(
+                                    r.data.as_ptr() as *mut u8,
+                                    r.cursor,
+                                    seed.wrapping_sub(r.data.as_ptr() as usize),
+                                )
+                            })
+                            .unwrap_or_default();
+                        // Provenance. A seed that is an INTERIOR pointer had to
+                        // enter the pause as one, and there are only two doors:
+                        // the root array the caller handed us, and the
+                        // conservative JIT-root snapshot.
+                        let in_roots = roots.iter().any(|r| r.as_ptr() as usize == seed);
+                        let jit_roots = crate::gc_quiescence::pinned_jit_roots_snapshot();
+                        let in_jit_roots = jit_roots.contains(&seed);
+                        tracing::warn!(
+                            "[g1] rejected seed 0x{seed:x}: seeds={} map={} inbound_forwards={inbound} \
+                             passes={passes} in_roots={in_roots} roots={} in_jit_roots={in_jit_roots} \
+                             jit_roots={} {bytes}",
+                            seeds.len(),
+                            acc.pointer_map.len(),
+                            roots.len(),
+                            jit_roots.len(),
+                        );
+                    }
                 }
             }
             let mut kept_regions = self.kept_unresolved_regions.lock();
@@ -2294,9 +2410,12 @@ impl G1Collector {
     /// counterpart of `post_write_barrier_rset` for slots the collector
     /// itself rewrote. See the unresolved-kept block in
     /// [`Self::retry_after_evacuation_failure`].
-    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) {
+    ///
+    /// Returns `false` iff the seed was refused as not-an-object, so the caller
+    /// can report on the ones it rejected.
+    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) -> bool {
         let Some(src_idx) = self.lookup_region_for_addr(obj_addr) else {
-            return;
+            return false;
         };
         let obj_ptr = obj_addr as *mut u8;
         // `lookup_region_for_addr` only answers "is this word inside some
@@ -2319,13 +2438,14 @@ impl G1Collector {
         if !self.candidate_header_is_plausible(regions, obj_addr) {
             let n = KEPT_SEED_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_addr);
                 tracing::warn!(
                     "[g1] kept-seed rset recording REJECTED a non-object SEED (#{n}): \
-                     obj=0x{obj_addr:x} — walking its slots would have read outside any \
+                     obj=0x{obj_addr:x} {why} — walking its slots would have read outside any \
                      live region. Skipped; the pause continues."
                 );
             }
-            return;
+            return false;
         }
         // SAFETY: `candidate_header_is_plausible` validated the tag bytes and
         // placed the address inside a live region's committed span.
@@ -2367,6 +2487,7 @@ impl G1Collector {
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
         }
+        true
     }
 
     /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
@@ -2563,7 +2684,7 @@ impl G1Collector {
         // JIT). Map each published root address to its region and exclude those
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         if gc_flags().g1_dbg_pins {
             eprintln!(
                 "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
@@ -2641,6 +2762,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -2654,6 +2776,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, young): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -3027,7 +3160,7 @@ impl G1Collector {
         // place) — see `young_collection` / `jit_pinned_region_set`. A mixed GC
         // can also select the (now promoted) region of a long-lived JIT-rooted
         // object, so this guard matters for both young and old CSet members.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
 
         // Build CSet: all young regions + worst old regions (skip pinned + any
         // region holding a conservative JIT root)
@@ -3115,6 +3248,7 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(region_idx) = self.region_for_ptr(&regions, old_ptr) {
                 if cset_set.contains(&region_idx) {
+                    let plausible = self.note_root_object_plausibility(&regions, old_ptr as usize);
                     // Step 9: `fresh` is ignored here — the root loop keeps its
                     // existing unconditional push (a duplicate root re-scans
                     // idempotently). Gating it on `fresh` is deferred to the
@@ -3128,6 +3262,17 @@ impl G1Collector {
                         &mut bytes_copied,
                         &cset_set,
                     ) {
+                        if !plausible && new_ptr != old_ptr {
+                            let n = NON_OBJECT_ROOT_COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                tracing::warn!(
+                                    "[g1] a NON-OBJECT root was COPIED (#{n}, mixed): \
+                                     0x{:x} -> 0x{:x}",
+                                    old_ptr as usize,
+                                    new_ptr as usize,
+                                );
+                            }
+                        }
                         *root = unsafe { ObjectRef::from_raw(new_ptr) };
                         work_list.push(new_ptr);
                     }
@@ -3643,7 +3788,7 @@ impl G1Collector {
         // move. Empty (free) unless a thread is in JIT, and the young path
         // only dispatches here when none is — this keeps the invariant even
         // if that gate is ever loosened or the fn is called directly.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -3811,7 +3956,7 @@ impl G1Collector {
         // bounded by both the percentage cap and the Step-7 pause budget —
         // identical selection to the serial `mixed_collection`.
         // Conservative-JIT-root region exclusion — see young_collection_parallel.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -4397,29 +4542,49 @@ impl G1Collector {
     /// direction for this guard: a false accept is only the pre-guard
     /// behaviour, whereas a false reject would drop a live reference.
     fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        self.classify_candidate_header(regions, addr).0 == HeaderVerdict::Object
+    }
+
+    /// [`Self::candidate_header_is_plausible`], but returning WHICH check said
+    /// no, plus the owning region index when there is one.
+    ///
+    /// The bool wrapper is what the hot guards call. This variant exists so the
+    /// two rejection warnings can name the failing step instead of reporting an
+    /// undifferentiated "not an object": "in-span but above the cursor" and
+    /// "in-span, below the cursor, but the tag bytes are garbage" are different
+    /// defects with different upstream producers, and a counter that cannot
+    /// tell them apart cannot start an investigation.
+    fn classify_candidate_header(
+        &self,
+        regions: &[G1Region],
+        addr: usize,
+    ) -> (HeaderVerdict, Option<usize>) {
         if addr == 0 || addr & 0x7 != 0 {
-            return false;
+            return (HeaderVerdict::NullOrUnaligned, None);
         }
         if addr < self.arena_base || addr >= self.arena_end {
-            return false;
+            return (HeaderVerdict::OutsideArena, None);
         }
         let region_size = self.config.region_size;
         if region_size == 0 {
-            return false;
+            return (HeaderVerdict::NoRegionGeometry, None);
         }
         let idx = (addr - self.arena_base) / region_size;
         let Some(r) = regions.get(idx) else {
-            return false;
+            return (HeaderVerdict::NoSuchRegion, None);
         };
         match r.region_type {
-            RegionType::Free => return false,
+            RegionType::Free => return (HeaderVerdict::RegionFree, Some(idx)),
             // A humongous continuation slice is live in its entirety; only the
             // start region carries the object's full `cursor`.
             RegionType::HumongousContinuation => {}
             _ => {
                 let base = r.data.as_ptr() as usize;
-                if addr < base || addr >= base + r.cursor {
-                    return false;
+                if addr < base {
+                    return (HeaderVerdict::BelowRegionBase, Some(idx));
+                }
+                if addr >= base + r.cursor {
+                    return (HeaderVerdict::AboveCursor, Some(idx));
                 }
             }
         }
@@ -4430,23 +4595,147 @@ impl G1Collector {
         // `is_object_address` does — this is the step that rejects a word which
         // is in-span but is not an object.
         let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
-            return false;
+            return (HeaderVerdict::BadKindTag, Some(idx));
         };
         if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
         {
-            return false;
+            return (HeaderVerdict::BadElementTag, Some(idx));
         }
         if kind == ObjectKind::HumongousFiller {
-            return false;
+            return (HeaderVerdict::HumongousFiller, Some(idx));
         }
         // SAFETY: tags validated above.
         let header = unsafe { &*(ptr as *const ObjectHeader) };
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
-        if kind == ObjectKind::Array {
+        let sane_shape = if kind == ObjectKind::Array {
             header.array_length() <= i32::MAX as u32
         } else {
             header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        };
+        if !sane_shape {
+            return (HeaderVerdict::ImplausibleShape, Some(idx));
         }
+        (HeaderVerdict::Object, Some(idx))
+    }
+
+    /// One line of context for a rejected address: the verdict, and what the
+    /// owning region looks like right now.
+    fn describe_rejected_address(&self, regions: &[G1Region], addr: usize) -> String {
+        let (verdict, idx) = self.classify_candidate_header(regions, addr);
+        match idx.and_then(|i| regions.get(i).map(|r| (i, r))) {
+            Some((i, r)) => {
+                let base = r.data.as_ptr() as usize;
+                format!(
+                    "verdict={verdict:?} region={i} type={:?} base=0x{base:x} cursor=0x{:x} \
+                     off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={} {}",
+                    r.region_type,
+                    r.cursor,
+                    addr.wrapping_sub(base),
+                    r.age,
+                    r.pinned,
+                    r.reuse_epoch,
+                    r.recycled_in_generation,
+                    self.locate_in_object_grid(r, addr),
+                )
+            }
+            None => format!("verdict={verdict:?} region=none"),
+        }
+    }
+
+    /// Count (and, for the first few, describe) a CSet-resident root that is not
+    /// the start of a live object. Returns whether it IS one, so the caller can
+    /// report what the evacuator then did with it.
+    ///
+    /// Measurement only — the caller's behaviour is unchanged.
+    fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
+        if self.candidate_header_is_plausible(regions, addr) {
+            return true;
+        }
+        let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] CSet ROOT is not an object (#{n}): addr=0x{addr:x} {}",
+                self.describe_rejected_address(regions, addr),
+            );
+        }
+        false
+    }
+
+    /// Where `addr` falls in its region's OWN object grid, walked linearly from
+    /// the region base exactly as `scan_source_region_for_cset_refs` walks it.
+    ///
+    /// This is the question that separates the candidate explanations for a
+    /// rejected address. "It is 0x18 bytes inside a live `class_id=42` object"
+    /// means someone produced an INTERIOR pointer; "it is inside a TLAB skip
+    /// span" means the address is in memory no object grid covers; "the walk
+    /// desynced before reaching it" means the region's own grid is broken and
+    /// the address is a symptom rather than the cause.
+    fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
+        let base = region.data.as_ptr() as usize;
+        if addr < base {
+            return "grid=below-base".to_string();
+        }
+        let target = addr - base;
+        let jit_skips = self.jit_tlab_skip_spans();
+        let mut offset = 0usize;
+        let mut objects = 0usize;
+        while offset < region.cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                if target < offset + skip {
+                    return format!("grid=IN-JIT-TLAB-SKIP span_start=0x{offset:x} len=0x{skip:x}");
+                }
+                offset += skip;
+                continue;
+            }
+            if let Some(gap) = gap_filler_len(obj_ptr) {
+                if target < offset + gap {
+                    return format!("grid=IN-TLAB-GAP-FILLER gap_start=0x{offset:x} len=0x{gap:x}");
+                }
+                offset += gap;
+                continue;
+            }
+            // The tag half of the real walk's validation (the region-bounds half
+            // is implied by the loop). A desync here is itself the answer, so
+            // report where it happened rather than guessing past it.
+            let ptr = obj_ptr as *const u8;
+            let kind_ok = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }.is_some();
+            let elem_ok =
+                unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }
+                    .is_some();
+            if !kind_ok || !elem_ok {
+                return format!(
+                    "grid=DESYNC-BEFORE-TARGET at=0x{offset:x} after={objects} objects \
+                     (target=0x{target:x})"
+                );
+            }
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if is_humongous_filler(header) {
+                return format!("grid=HUMONGOUS-FILLER at=0x{offset:x}");
+            }
+            let obj_size = object_total_size(header);
+            if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
+                return format!(
+                    "grid=WALK-BROKE at=0x{offset:x} obj_size=0x{obj_size:x} after={objects} \
+                     objects (target=0x{target:x})"
+                );
+            }
+            if target == offset {
+                return format!("grid=OBJECT-START idx={objects} size=0x{obj_size:x}");
+            }
+            if target < offset + obj_size {
+                return format!(
+                    "grid=INTERIOR of=0x{offset:x} delta=0x{:x} size=0x{obj_size:x} cid={} \
+                     kind={:?} idx={objects}",
+                    target - offset,
+                    header.class_id.as_u32(),
+                    header.kind(),
+                );
+            }
+            offset += obj_size;
+            objects += 1;
+        }
+        format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x}")
     }
 
     fn scan_and_evacuate_refs(
@@ -4467,8 +4756,9 @@ impl G1Collector {
         if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
             let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_ptr as usize);
                 tracing::warn!(
-                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} {why} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
                     obj_ptr as usize,
                 );
             }
@@ -7996,6 +8286,9 @@ impl G1Collector {
         }
         let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
         self.set_field(wrapper, 0, value);
+        // Arm the process-wide wrapper latch — see the matching note in
+        // `GenerationalHeap::set_array_element` and `crate::autobox`.
+        crate::autobox::note_wrapper_created();
         Value::Object(Some(wrapper))
     }
 
@@ -8026,6 +8319,70 @@ impl G1Collector {
     /// from inside one.
     fn refuse_evacuation(coverage_incomplete: Option<usize>, lever_on: bool) -> Option<usize> {
         coverage_incomplete.filter(|_| lever_on)
+    }
+
+    /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
+    /// not the start of a live object.
+    ///
+    /// The root array is over-approximate by design. `collect_roots` filters
+    /// operand-stack slots with `is_heap_addr` — a RANGE check — because the
+    /// strict `is_object_address` probe dropped genuine young / mid-init roots
+    /// when it was used there (2026-08-04). So a primitive `long` (a file size,
+    /// a hash, a computed interior address) whose bits land in the heap range is
+    /// handed to the collector as a root. For a NON-MOVING sweep that is safe:
+    /// a false positive only over-retains, which is what that comment says.
+    ///
+    /// A MOVING collector cannot leave it at that. The root loops screened a
+    /// root for CSet membership and nothing else, so `evacuate_object` read a
+    /// header at whatever address arrived, sized a memcpy from those bytes and
+    /// copied them (measured: 6-8 such roots per affected H2 pause, all COPIED,
+    /// and the copy then broke the destination region's object grid), installed
+    /// old→new in the pointer map — which the VM's post-GC remap then applies to
+    /// the very operand-stack slot the address came from, rewriting a Java
+    /// `long` — and, when to-space ran out instead, self-forwarded it into an
+    /// identity entry that `retry_after_evacuation_failure` picked up as a
+    /// "live self-forwarded seed".
+    ///
+    /// Evacuating such a root is unsound and so is skipping it, for the same
+    /// reason: the collector cannot tell a real reference from a long, so it may
+    /// neither rewrite the slot nor drop what it might point at. Pin the region
+    /// instead — precisely what this collector already does with a conservative
+    /// JIT root it cannot rewrite.
+    ///
+    /// **What this does not catch.** The screen reads the bytes AT the address,
+    /// so an interior pointer whose bytes happen to decode as a header is
+    /// indistinguishable from an object start — a zeroed field cell is the
+    /// standard example (`class_id=0, num_slots=0, kind=Object` sizes to exactly
+    /// `HEADER_SIZE`), and the rset-source walk documents the same hole. Every
+    /// non-object root measured on H2 was of the shape this DOES catch
+    /// (`BadElementTag`, `ImplausibleShape`), but "no such root reached the
+    /// evacuator" is not what this guarantees; "no root whose bytes are not a
+    /// header did" is.
+    fn pinned_region_set_including_non_object_roots(
+        &self,
+        regions: &[G1Region],
+        roots: &[ObjectRef],
+    ) -> std::collections::HashSet<usize> {
+        let mut set = self.jit_pinned_region_set();
+        for root in roots {
+            let addr = root.as_ptr() as usize;
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            if set.contains(&idx) || self.candidate_header_is_plausible(regions, addr) {
+                continue;
+            }
+            let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] root is not an object (#{n}): addr=0x{addr:x} {} — pinning region \
+                     {idx} instead of evacuating it.",
+                    self.describe_rejected_address(regions, addr),
+                );
+            }
+            set.insert(idx);
+        }
+        set
     }
 
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
@@ -8427,8 +8784,150 @@ impl G1Collector {
 }
 
 // ---------------------------------------------------------------------------
-// GarbageCollector trait implementation
+// Field-read primitive shared by the trait impl and the SATB pre-barrier
 // ---------------------------------------------------------------------------
+
+impl G1Collector {
+    /// `get_field` WITHOUT the auto-box un-wrap — the raw contents of the
+    /// slot, reference word and all.
+    ///
+    /// Two callers, and the split is load-bearing rather than tidy. The trait
+    /// `get_field` un-boxes, because a wrapper must never escape to Java. The
+    /// SATB pre-barrier must NOT un-box: a boxed primitive is a real object
+    /// reachable only from the slot being overwritten, so logging the
+    /// primitive instead of the wrapper drops the edge the barrier exists to
+    /// keep. The reference-ARRAY store in this same file reads `old_raw` for
+    /// exactly that reason (`set_array_element`, G1MAT-3); this is the field
+    /// half of the same rule (W7-84-primitive-in-reference-store.md).
+    pub(crate) fn get_field_raw(&self, obj: ObjectRef, index: usize) -> Value {
+        // C2b (round-12 gc): runtime bounds + suspect-header guard, mirroring
+        // `GenerationalHeap::get_field` (gen_heap.rs). A corrupted/oversized
+        // header or an out-of-layout index must NOT dereference arbitrary
+        // memory — return a benign null read instead, matching gen_heap.
+        let header = self.get_header(obj);
+        let num_slots = header.num_slots() as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: suspect header (returning null)",
+            );
+            return Value::Object(None);
+        }
+        if index >= num_slots {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: out-of-bounds field read dropped (returning null)",
+            );
+            return Value::Object(None);
+        }
+
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // returns `None` for TWO different reasons and the `unwrap_or` below
+        // treats them as one: "this is a legacy object" (correct — the uniform
+        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) whose
+        // `(class_id, num_slots)` no longer resolves to a registered layout"
+        // (its `class_layout_for_fields(..)?` early return — e.g. a class
+        // redefinition racing the layout registry).
+        //
+        // For the second, `alloc_object` above sized this object's body with
+        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
+        // `num_slots()` on a compact object is the FIELD COUNT — so the
+        // `index >= num_slots` screen above does not bound the legacy stride,
+        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
+        // the allocation. That is the read half of the `SIGSEGV` observed
+        // against the real `DefaultCatalogAndSchemaTest` workload.
+        //
+        // `is_compact_object(header)` is the per-object header bit, read
+        // independently of the registry, and is exactly how this collector's
+        // own walkers already separate the two cases — see
+        // `for_each_flat_object_reference` and the concurrent mark's object
+        // arm, both of which then simply skip the object when
+        // `with_class_layout` misses. An accessor cannot skip, so it degrades
+        // as this function's neighbouring guards do: benign null read, loud
+        // `cratonvm::gc::guard` record, no panic. Matches
+        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
+        // rationale and the open `TODO` about the unchecked `layout_domain` on
+        // the read path.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
+        let (payload_off, payload_size) = compact
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
+            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
+        let total_size = object_total_size(header);
+
+        // C2 (round-12 gc): humongous objects are region-fragmented; translate
+        // the flat payload offset to the owning continuation region's buffer so
+        // the read can never escape the object's backing memory.
+        {
+            let regions = self.regions.lock();
+            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
+                let mut tmp = [0u64; 2];
+                if self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    tmp.as_mut_ptr().cast(),
+                    payload_size,
+                    false,
+                ) {
+                    return if let Some((_, storage)) = compact {
+                        unsafe {
+                            cratonvm_types::read_compact_field(
+                                tmp.as_ptr().cast(),
+                                storage,
+                                Ordering::Relaxed,
+                            )
+                        }
+                    } else {
+                        let bytes =
+                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
+                        value_from_bytes(bytes)
+                    };
+                }
+                return Value::Object(None);
+            }
+        }
+
+        // SAFETY: `index < num_slots` (checked above) so the slot lies within
+        // the object's allocated, single-region backing store.
+        //
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
+        // a non-atomic 16-byte copy that could tear against a concurrent
+        // plain `set_field` from another mutator thread -- see
+        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
+        // which covered g1::scan_object_refs but not this mutator-side path).
+        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
+        if let Some((_, storage)) = compact {
+            unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
+        } else {
+            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
+        }
+    }
+}
 
 impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
@@ -8565,132 +9064,27 @@ impl GarbageCollector for G1Collector {
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        // C2b (round-12 gc): runtime bounds + suspect-header guard, mirroring
-        // `GenerationalHeap::get_field` (gen_heap.rs). A corrupted/oversized
-        // header or an out-of-layout index must NOT dereference arbitrary
-        // memory — return a benign null read instead, matching gen_heap.
-        let header = self.get_header(obj);
-        let num_slots = header.num_slots() as usize;
-        if num_slots > (1 << 24) {
-            tracing::debug!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: suspect header (returning null)",
-            );
-            return Value::Object(None);
-        }
-        if index >= num_slots {
-            tracing::warn!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: out-of-bounds field read dropped (returning null)",
-            );
-            return Value::Object(None);
-        }
-
-        let compact = cratonvm_types::compact_object_field_storage(header, index);
-        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
-        // returns `None` for TWO different reasons and the `unwrap_or` below
-        // treats them as one: "this is a legacy object" (correct — the uniform
-        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
-        // object (`GC_FLAG_COMPACT`, set at allocation) whose
-        // `(class_id, num_slots)` no longer resolves to a registered layout"
-        // (its `class_layout_for_fields(..)?` early return — e.g. a class
-        // redefinition racing the layout registry).
+        // Un-box the wrapper `set_field` installs for a non-reference value
+        // stored into a declared-REFERENCE slot. G1 used to hand such a value
+        // straight to `write_compact_field`, whose `FieldStorageKind::Reference`
+        // arm maps every non-`Object` value to raw 0, so the write was silently
+        // dropped to null while `gen_heap` boxed it and the legacy 16-byte cell
+        // kept it verbatim (W7-84-primitive-in-reference-store.md).
         //
-        // For the second, `alloc_object` above sized this object's body with
-        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
-        // `num_slots()` on a compact object is the FIELD COUNT — so the
-        // `index >= num_slots` screen above does not bound the legacy stride,
-        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
-        // the allocation. That is the read half of the `SIGSEGV` observed
-        // against the real `DefaultCatalogAndSchemaTest` workload.
-        //
-        // `is_compact_object(header)` is the per-object header bit, read
-        // independently of the registry, and is exactly how this collector's
-        // own walkers already separate the two cases — see
-        // `for_each_flat_object_reference` and the concurrent mark's object
-        // arm, both of which then simply skip the object when
-        // `with_class_layout` misses. An accessor cannot skip, so it degrades
-        // as this function's neighbouring guards do: benign null read, loud
-        // `cratonvm::gc::guard` record, no panic. Matches
-        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
-        // rationale and the open `TODO` about the unchecked `layout_domain` on
-        // the read path.
-        if compact.is_none() && cratonvm_types::is_compact_object(header) {
-            tracing::warn!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                "g1::get_field: compact receiver has no registered layout for \
-                 its (class_id, field_count) — returning null rather than \
-                 striding its packed compact body as legacy 16-byte cells \
-                 (HIB-DCAST-LATEPHASE.1)",
-            );
-            return Value::Object(None);
-        }
-        let (payload_off, payload_size) = compact
-            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
-            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
-        let total_size = object_total_size(header);
-
-        // C2 (round-12 gc): humongous objects are region-fragmented; translate
-        // the flat payload offset to the owning continuation region's buffer so
-        // the read can never escape the object's backing memory.
-        {
-            let regions = self.regions.lock();
-            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
-                let mut tmp = [0u64; 2];
-                if self.humongous_copy(
-                    &regions,
-                    start,
-                    total_payload,
-                    payload_off,
-                    tmp.as_mut_ptr().cast(),
-                    payload_size,
-                    false,
-                ) {
-                    return if let Some((_, storage)) = compact {
-                        unsafe {
-                            cratonvm_types::read_compact_field(
-                                tmp.as_ptr().cast(),
-                                storage,
-                                Ordering::Relaxed,
-                            )
-                        }
-                    } else {
-                        let bytes =
-                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
-                        value_from_bytes(bytes)
-                    };
-                }
-                return Value::Object(None);
-            }
-        }
-
-        // SAFETY: `index < num_slots` (checked above) so the slot lies within
-        // the object's allocated, single-region backing store.
-        //
-        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
-        // a non-atomic 16-byte copy that could tear against a concurrent
-        // plain `set_field` from another mutator thread -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
-        // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
-        // which covered g1::scan_object_refs but not this mutator-side path).
-        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
-        if let Some((_, storage)) = compact {
-            unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
-        } else {
-            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
-        }
+        // `autobox_payload` is the same validated read the reference-ARRAY path
+        // here has always used; `crate::autobox` puts it behind the process-wide
+        // latch so a run that never boxes never reaches it.
+        let v = self.get_field_raw(obj, index);
+        crate::autobox::unbox_reference_slot(
+            v,
+            |r| {
+                self.is_object_address(r.as_ptr() as usize)?;
+                // SAFETY: `is_object_address` confirmed `r` points at a valid
+                // object header inside one of this collector's regions.
+                Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+            },
+            |r| self.get_field_raw(r, 0),
+        )
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
@@ -8739,15 +9133,42 @@ impl GarbageCollector for G1Collector {
         // mid-cycle young pause, tainting the bitmap verdicts remark-time
         // reference processing depends on. The TLS read is gated behind the
         // marking-active check, so the non-marking hot path pays nothing.
+        // W7-84: resolve the layout BEFORE the barrier decisions, because a
+        // non-reference value bound for a declared-REFERENCE slot is boxed into
+        // an `AUTOBOX_CLASS_ID` wrapper — and once boxed the store IS a
+        // reference store, so both barriers have to see the boxed value.
+        // Handing it to `write_compact_field` unboxed is what used to drop it
+        // to raw 0, i.e. to null, while `gen_heap` boxed it and the legacy
+        // 16-byte cell kept it verbatim
+        // (W7-84-primitive-in-reference-store.md).
+        //
+        // The allocation happens here, BEFORE the `regions` lock is taken
+        // below — the same ordering constraint `autobox_for_reference_array`
+        // records for the array half.
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        let value = match compact {
+            Some((_, storage)) if storage.is_reference() => {
+                crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
+                    let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                    self.set_field(wrapper, 0, v);
+                    wrapper
+                })
+            }
+            _ => value,
+        };
+
         let is_ref_store = matches!(value, Value::Object(_));
         if is_ref_store && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
-            let old = self.get_field(obj, index);
+            // `get_field_raw`, NOT `get_field`: if the slot currently holds a
+            // wrapper, the wrapper is the object the marker must not lose, and
+            // `get_field` would hand back the primitive inside it. See
+            // `get_field_raw`'s own note.
+            let old = self.get_field_raw(obj, index);
             if let Value::Object(Some(old_ref)) = old {
                 self.satb_pre_barrier(old_ref.as_ptr() as usize);
             }
         }
 
-        let compact = cratonvm_types::compact_object_field_storage(header, index);
         // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
         // on the matching guard in `get_field` above for why this `None` is
         // two different states and why only the legacy one may reach the
@@ -8756,8 +9177,8 @@ impl GarbageCollector for G1Collector {
         // 16-byte `Value` cell over whatever follows the object.
         //
         // The SATB pre-barrier above has already run, and in this state its
-        // `self.get_field(obj, index)` returned `Value::Object(None)` through
-        // that same guard — so no bogus edge was logged, and the second
+        // `self.get_field_raw(obj, index)` returned `Value::Object(None)`
+        // through that same guard — so no bogus edge was logged, and the second
         // `cratonvm::gc::guard` record it emits for this object is expected.
         if compact.is_none() && cratonvm_types::is_compact_object(header) {
             tracing::warn!(
@@ -10162,6 +10583,118 @@ mod tests {
         assert!(
             matches!(gc.get_field(obj, 1), Value::Int(2)),
             "the dropped write must not have reached the object at all"
+        );
+    }
+
+    /// The root array is over-approximate on purpose (`collect_roots` screens
+    /// operand-stack slots with the RANGE check `is_heap_addr`, because the
+    /// strict probe dropped genuine young / mid-init roots), so a word that is
+    /// not an object start reaches the evacuator. It must neither be evacuated —
+    /// `evacuate_object` would size a memcpy from those bytes and install a
+    /// forwarding entry the VM's post-GC remap applies to the slot, rewriting a
+    /// Java `long` — nor be dropped, since the collector cannot prove it is not
+    /// a reference. Its region is pinned instead.
+    ///
+    /// Measured shape, on `org.h2.test.unit.TestValueMemory`: 6-8 such roots per
+    /// affected pause, every one of them COPIED before this fix.
+    #[test]
+    fn an_interior_pointer_root_pins_its_region_instead_of_being_evacuated() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 4);
+        let interior_addr = holder.as_ptr() as usize + HEADER_SIZE;
+
+        // Fabricate a header at the interior address whose TAG byte does not
+        // decode — the measured verdicts were `BadElementTag` /
+        // `ImplausibleShape`, i.e. bytes that are not a header at all.
+        // `object_total_size` still returns >= HEADER_SIZE for it, which is all
+        // the pre-fix evacuator checked before copying.
+        //
+        // SAFETY: `interior_addr` is the first field cell of a live 4-slot
+        // object this test owns, so both writes are in-bounds.
+        unsafe {
+            std::ptr::write(
+                interior_addr as *mut ObjectHeader,
+                ObjectHeader::new(
+                    ClassId::new(2),
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                ),
+            );
+            (interior_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let interior = unsafe { ObjectRef::from_raw(interior_addr as *mut u8) };
+
+        let mut roots = vec![holder, interior];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            roots[1].as_ptr() as usize,
+            interior_addr,
+            "a root that is not an object must not be rewritten: the collector \
+             cannot tell it from a primitive long, and rewriting it changes a \
+             Java value"
+        );
+        assert!(
+            !result.pointer_map.contains_key(&interior_addr),
+            "no forwarding entry may be installed for a non-object address — the \
+             VM's post-GC remap applies the map to the very slot it came from"
+        );
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            holder.as_ptr() as usize,
+            "the cost of the pin, stated: the real object in that region does \
+             not move either"
+        );
+    }
+
+    /// The other arm: an ordinary root must NOT pin its region, or the fix above
+    /// would be satisfied by pinning everything and G1 would stop collecting.
+    #[test]
+    fn an_ordinary_object_root_does_not_pin_its_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let idx = gc
+            .lookup_region_for_addr(obj.as_ptr() as usize)
+            .expect("the allocation is in a region");
+        let regions = gc.regions.lock();
+        assert!(
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[obj])
+                .contains(&idx),
+            "a real object root must leave its region collectable"
+        );
+        // The limitation, pinned so it cannot be forgotten: the screen reads the
+        // BYTES at the address, so an interior pointer whose bytes happen to
+        // decode is indistinguishable from an object start. A zeroed field cell
+        // is the standard example — `class_id=0, num_slots=0, kind=Object`
+        // yields exactly `HEADER_SIZE`, which is why the rset-source walk
+        // documents the same hole.
+        let zeroed_cell =
+            unsafe { ObjectRef::from_raw((obj.as_ptr() as usize + HEADER_SIZE) as *mut u8) };
+        assert!(
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[zeroed_cell])
+                .contains(&idx),
+            "a zeroed cell decodes as a plausible header — this screen cannot \
+             see it, and a test claiming otherwise would be describing a \
+             collector we do not have"
+        );
+
+        // What it DOES catch is the measured shape: bytes that do not decode.
+        let garbage_addr = obj.as_ptr() as usize + HEADER_SIZE;
+        // SAFETY: the first field cell of a live 1-slot object this test owns.
+        unsafe {
+            (garbage_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let garbage = unsafe { ObjectRef::from_raw(garbage_addr as *mut u8) };
+        assert!(
+            gc.pinned_region_set_including_non_object_roots(&regions, &[garbage])
+                .contains(&idx),
+            "an address whose tag bytes do not decode is not an object start"
         );
     }
 

@@ -1569,7 +1569,7 @@ fn jni_call_nonvirtual(
     with_jni_context(|shared, thread| {
         let oref = jobject_to_obj(obj)?;
         let dispatch_class_id = if clazz != 0 {
-            ClassId::new(clazz as u32)
+            jclass_class_id(clazz)
         } else {
             let (dcid, _) = decode_method_id(mid);
             dcid
@@ -1608,7 +1608,7 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
     with_jni_context(|shared, thread| {
         let (decl_class_id, method_index) = decode_method_id(mid);
         let class_id = if clazz != 0 {
-            ClassId::new(clazz as u32)
+            jclass_class_id(clazz)
         } else {
             decl_class_id
         };
@@ -2181,7 +2181,7 @@ extern "C" fn jni_find_class(_env: JNIEnv, name: *const c_char) -> JClass {
     };
     with_shared_vm(|shared| {
         let class_id = shared.load_class_concurrent(name_str).ok()?;
-        Some(class_id.as_u32() as JClass)
+        Some(class_id_to_jclass(class_id))
     })
     .flatten()
     .unwrap_or(0)
@@ -2193,10 +2193,10 @@ extern "C" fn jni_get_superclass(_env: JNIEnv, clazz: JClass) -> JClass {
         return 0;
     }
     with_shared_vm(|shared| {
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
-        class.superclass.map(|sc| sc.as_u32() as JClass)
+        class.superclass.map(class_id_to_jclass)
     })
     .flatten()
     .unwrap_or(0)
@@ -2208,8 +2208,8 @@ extern "C" fn jni_is_assignable_from(_env: JNIEnv, sub: JClass, sup: JClass) -> 
         return JNI_FALSE;
     }
     with_shared_vm(|shared| {
-        let sub_id = ClassId::new(sub as u32);
-        let sup_id = ClassId::new(sup as u32);
+        let sub_id = jclass_class_id(sub);
+        let sup_id = jclass_class_id(sup);
         if sub_id == sup_id {
             return JNI_TRUE;
         }
@@ -2264,7 +2264,7 @@ extern "C" fn jni_throw_new(_env: JNIEnv, clazz: JClass, msg: *const c_char) -> 
     };
 
     let result = with_jni_context(|shared, thread| {
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         let class_name = {
             let cm = shared.classes.class_manager.read();
             cm.get_class(class_id).map(|class| class.name.to_string())
@@ -2380,15 +2380,189 @@ extern "C" fn jni_pop_local_frame(_env: JNIEnv, result: JObject) -> JObject {
     pop_local_frame(result)
 }
 
+/// Tag bit that lifts a `ClassId` out of the range where `0` means JNI NULL.
+///
+/// **The defect this closes.** A `jclass` in this table IS a `ClassId` — that is
+/// what `FindClass` returns and what `GetSuperclass`, `GetFieldID`,
+/// `RegisterNatives` and eighteen others decode with `ClassId::new(clazz as
+/// u32)`. But `jclass` is a `jobject`, and in JNI a NULL `jobject` means
+/// *failure*. So whichever class happened to be `ClassId(0)` was unreachable
+/// through `FindClass`: the call returned 0 and every caller read it as "no such
+/// class".
+///
+/// `java.lang.Object` is the first class this VM loads, so `ClassId(0)` is
+/// `java.lang.Object` — the one class essentially every JNI library asks for
+/// first. Measured with a C probe calling `FindClass` from both `JNI_OnLoad` and
+/// a registered native: `FindClass(java/lang/Object) = (nil)` on both, against
+/// a live handle on HotSpot.
+///
+/// Downstream that surfaced as nothing resembling a JNI defect. JNA's
+/// `libjnidispatch` aborts its id cache with `JNA: Problems loading core IDs:
+/// java.lang.Object`, then never caches `classString`/`MID_String_init`, so
+/// every `jstring` it later builds is NULL — and `com.sun.jna.Native.<clinit>`
+/// dies on `NullPointerException: Cannot invoke "String.split(String)" because
+/// "nativeVersion" is null`, which reads like a JNA/version problem.
+///
+/// **Why a HIGH tag and not a +1 bias.** The tag lives entirely above bit 31, so
+/// the low 32 bits stay exactly the `ClassId` and all twenty-one existing
+/// `ClassId::new(clazz as u32)` decode sites keep working untouched — the
+/// truncation discards the tag. A bias would have needed every one of them
+/// changed in lockstep, and a single missed site would silently decode the WRONG
+/// class rather than fail.
+///
+/// **Why these particular bits.** Bits 48-62 are set, which no x86-64 or AArch64
+/// user-space pointer can have (canonical user addresses are below
+/// `0x0000_8000_0000_0000`). So a tagged `jclass` cannot be mistaken for either
+/// of the two object-handle encodings — a raw heap pointer or a tagged
+/// `Box<ObjectRef>` — and [`is_jclass_handle`] is an exact test rather than a
+/// guess that has to be tried second.
+const JCLASS_TAG: JObject = 0x7F51_0000_0000_0000;
+
+/// Mask selecting the tag half of a `jclass` handle.
+const JCLASS_TAG_MASK: JObject = 0xFFFF_FFFF_0000_0000;
+
+/// Encode a `ClassId` as the `jclass` handle native code receives.
+pub fn class_id_to_jclass(id: ClassId) -> JClass {
+    (id.as_u32() as JObject) | JCLASS_TAG
+}
+
+/// Does this handle carry the `jclass` encoding at all? Cheap, allocation-free
+/// and lock-free — no class-manager lookup, so it is safe to consult FIRST, in
+/// paths that would otherwise log a spurious "not found in global ref table".
+fn is_jclass_handle(h: JObject) -> bool {
+    h & JCLASS_TAG_MASK == JCLASS_TAG
+}
+
+/// Is this handle a `jclass` (as produced by [`class_id_to_jclass`]) naming a
+/// live class?
+///
+/// A confirmed class is its own permanent reference: classes are never unloaded
+/// here, so "a global ref to a class" is the same handle again. That identity is
+/// what makes the round trip work, because native code stores the RESULT of
+/// `NewGlobalRef`/`NewWeakGlobalRef` and later passes it back as a `jclass` to
+/// `GetMethodID`/`NewObject`.
+fn jclass_id_handle(h: JObject) -> bool {
+    if !is_jclass_handle(h) {
+        return false;
+    }
+    with_shared_vm(|shared| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(ClassId::new(h as u32))
+            .is_some()
+    })
+    .unwrap_or(false)
+}
+
+/// Normalise ANY handle that names a class into its `ClassId`.
+///
+/// A class reaches native code through two encodings, and until this helper
+/// existed only one of them was decodable:
+///
+/// * `FindClass`, `GetObjectClass`, `GetSuperclass` and the `jclass` argument
+///   of a static native all hand back [`class_id_to_jclass`] — a `ClassId` under
+///   [`JCLASS_TAG`]. Every `jclass`-consuming entry point decodes that with
+///   `ClassId::new(h as u32)`, which works because the truncation drops the tag;
+/// * a `java.lang.Class` that arrives as an ordinary **parameter** — the native
+///   is declared `foo(int, Class<?>, Object)` — is marshalled like any other
+///   reference, as `obj_to_jobject` of its mirror. Truncating THAT to a `u32`
+///   yields a fragment of a heap address, i.e. an arbitrary unrelated class or
+///   no class at all.
+///
+/// Nothing reconciled the two, so a `Class` parameter was unusable: measured on
+/// JDK 25 against a purpose-built JNI fixture, `IsSameObject(param, FindClass)`,
+/// `GetMethodID`, `GetStaticFieldID`, `IsAssignableFrom` and `IsInstanceOf` all
+/// answered "no"/NULL where HotSpot answered yes. The library that surfaced it
+/// is barchart-udt, whose `SocketUDT.setOption0(int code, Class<?> klaz, Object
+/// value)` dispatches on `IsSameObject(klaz, <cached Boolean.class>)` and
+/// therefore rejected EVERY option — netty's `NioUdtProvider` could not open a
+/// channel at all ("unsupported option class in OptionUDT").
+///
+/// The fix is at consumption rather than at marshalling on purpose: re-encoding
+/// `Class` arguments as `jclass` handles would fix the reads and break the
+/// writes, because a native that hands the same reference back to Java (or to
+/// `GetObjectClass`) needs the mirror `ObjectRef`, which a `jclass` handle does
+/// not carry. Reconciling here leaves both encodings intact and makes both
+/// decodable.
+///
+/// Falls back to today's truncation for anything that is not a class, so no
+/// existing decode changes: a handle that is neither a `jclass` nor a mirror
+/// produced a truncated id before and produces the same one now.
+fn jclass_class_id(h: JObject) -> ClassId {
+    if is_jclass_handle(h) {
+        return ClassId::new(h as u32);
+    }
+    if let Some(id) = jclass_mirror_class_id(h) {
+        return id;
+    }
+    ClassId::new(h as u32)
+}
+
+/// The `ClassId` a handle names IF it is a `java.lang.Class` mirror reference.
+/// `None` for a `jclass` handle (already decodable), for a non-class object,
+/// and for a primitive/void mirror, which has no `ClassId`.
+fn jclass_mirror_class_id(h: JObject) -> Option<ClassId> {
+    if h == 0 || is_jclass_handle(h) {
+        return None;
+    }
+    let oref = jobject_to_obj(h)?;
+    with_shared_vm(|shared| crate::vm::class_id_from_mirror(shared, oref)).flatten()
+}
+
+/// The identity a handle has for `IsSameObject` purposes: a class compares by
+/// `ClassId` regardless of which of the two encodings it arrived in.
+enum JniIdentity {
+    Class(ClassId),
+    Object(ObjectRef),
+    Null,
+}
+
+fn jni_identity(h: JObject) -> JniIdentity {
+    if h == 0 {
+        return JniIdentity::Null;
+    }
+    if is_jclass_handle(h) {
+        return JniIdentity::Class(ClassId::new(h as u32));
+    }
+    if let Some(id) = jclass_mirror_class_id(h) {
+        return JniIdentity::Class(id);
+    }
+    match jobject_to_obj(h) {
+        Some(r) => JniIdentity::Object(r),
+        None => JniIdentity::Null,
+    }
+}
+
 // ---- Index 22: NewGlobalRef ----
 extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
         return 0;
     }
+    // A `jclass` is checked FIRST: it is an exact, lock-free bit test
+    // (`is_jclass_handle`), and routing it through `jobject_to_obj` would log a
+    // spurious "handle … not found in global ref table" for every odd ClassId.
+    if jclass_id_handle(obj) {
+        return obj;
+    }
     // Resolve the object whether it's a local ref or another global ref.
     let oref = match jobject_to_obj(obj) {
         Some(r) => r,
-        None => return 0,
+        None => {
+            // `NewGlobalRef(FindClass(env, "..."))` is the first thing almost
+            // every `JNI_OnLoad` does, and a `jclass` here is a raw `ClassId`,
+            // not an object handle — so this returned 0 and the library
+            // concluded the JVM had no `java.lang.Object`. Measured on JNA
+            // 5.13.0: `libjnidispatch`'s init prints `JNA: Problems loading
+            // core IDs: java.lang.Object`, gives up caching `classString` /
+            // `MID_String_init`, and every later `jstring` it builds is NULL —
+            // surfacing as `Native.<clinit>` throwing
+            // `NullPointerException: Cannot invoke "String.split(String)"
+            // because "nativeVersion" is null`, which reads like a missing JNA
+            // feature and is in fact a dead JNI primitive.
+            return 0;
+        }
     };
     with_shared_vm(|shared| {
         let handle = shared.natives.jni_global_refs.lock().add(oref);
@@ -2406,6 +2580,12 @@ extern "C" fn jni_delete_global_ref(_env: JNIEnv, gref: JObject) {
     if gref == 0 || gref & 1 == 0 {
         return; // not a global ref handle
     }
+    // A `jclass` handed back from `NewGlobalRef` above can have bit 0 set (it is
+    // the low bit of the ClassId). Deleting it must be a no-op — the class
+    // outlives every ref to it — and must not disturb the ref table.
+    if is_jclass_handle(gref) {
+        return;
+    }
     with_shared_vm(|shared| {
         shared.natives.jni_global_refs.lock().remove(gref);
     });
@@ -2418,17 +2598,35 @@ extern "C" fn jni_delete_local_ref(_env: JNIEnv, lref: JObject) {
 
 // ---- Index 25: IsSameObject ----
 extern "C" fn jni_is_same_object(_env: JNIEnv, a: JObject, b: JObject) -> JBoolean {
-    // Resolve both sides through the global-ref layer so that comparing a
-    // local ref and a global ref to the same object returns true.
-    match (jobject_to_obj(a), jobject_to_obj(b)) {
-        (None, None) => JNI_TRUE,
-        (Some(ra), Some(rb)) if ra == rb => JNI_TRUE,
+    // A `jclass` does not resolve through `jobject_to_obj` (it is a tagged
+    // `ClassId`, see `JCLASS_TAG`), so both sides fell into the
+    // `(None, None) => JNI_TRUE` arm and EVERY pair of distinct classes
+    // compared equal. Class handles are canonical — the same class always
+    // yields the same tagged id — so compare them by id.
+    //
+    // Both sides go through `jni_identity` so that the two encodings a class
+    // can arrive in compare equal: a `jclass` from `FindClass` and the same
+    // class arriving as a `Class` PARAMETER are one object on HotSpot, and
+    // `IsSameObject` between them is the idiom a native uses to dispatch on a
+    // caller-supplied type. See `jclass_class_id` for what depended on it.
+    match (jni_identity(a), jni_identity(b)) {
+        (JniIdentity::Null, JniIdentity::Null) => JNI_TRUE,
+        (JniIdentity::Class(ca), JniIdentity::Class(cb)) if ca == cb => JNI_TRUE,
+        // Resolved through the global-ref layer, so a local ref and a global
+        // ref to the same object compare equal.
+        (JniIdentity::Object(ra), JniIdentity::Object(rb)) if ra == rb => JNI_TRUE,
         _ => JNI_FALSE,
     }
 }
 
 // ---- Index 26: NewLocalRef ----
 extern "C" fn jni_new_local_ref(_env: JNIEnv, obj: JObject) -> JObject {
+    // A `jclass` is permanent and canonical; handing back a "local ref" to it
+    // means handing back the same tagged id. Resolving it as an object would
+    // yield 0 and lose the class.
+    if is_jclass_handle(obj) {
+        return obj;
+    }
     // Resolve to a raw local-ref pointer (unwrap global-ref tag if present).
     match jobject_to_obj(obj) {
         Some(oref) => {
@@ -2453,7 +2651,7 @@ extern "C" fn jni_get_object_class(_env: JNIEnv, obj: JObject) -> JClass {
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let class_id = shared.mem.heap.class_id_of(oref);
-        Some(class_id.as_u32() as JClass)
+        Some(class_id_to_jclass(class_id))
     })
     .flatten()
     .unwrap_or(0)
@@ -2470,7 +2668,7 @@ extern "C" fn jni_is_instance_of(_env: JNIEnv, obj: JObject, clazz: JClass) -> J
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let obj_class_id = shared.mem.heap.class_id_of(oref);
-        let target_id = ClassId::new(clazz as u32);
+        let target_id = jclass_class_id(clazz);
         if obj_class_id == target_id {
             return Some(JNI_TRUE);
         }
@@ -2526,7 +2724,7 @@ extern "C" fn jni_get_method_id(
     // walk + the per-class linear `methods` position scan.
     with_shared_vm(|shared| {
         use cratonvm_classloading::resolution::ResolvedMember;
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         let resolved = {
             let cm = shared.classes.class_manager.read();
             shared
@@ -2983,7 +3181,7 @@ extern "C" fn jni_get_field_id(
     // Round 8 audit fix (CRIT #2): probe the per-VM `LinkResolver`.
     with_shared_vm(|shared| {
         use cratonvm_classloading::resolution::ResolvedMember;
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         let resolved = {
             let cm = shared.classes.class_manager.read();
             shared
@@ -3545,7 +3743,7 @@ extern "C" fn jni_new_object_array(
         return 0;
     }
     with_shared_vm(|shared| {
-        let component_id = ClassId::new(clazz as u32);
+        let component_id = jclass_class_id(clazz);
         let arr =
             shared
                 .mem
@@ -4213,7 +4411,7 @@ extern "C" fn jni_define_class(
                     n.to_string(),
                 ));
         }
-        Some(cid.as_u32() as JClass)
+        Some(class_id_to_jclass(cid))
     })
     .flatten();
 
@@ -4355,7 +4553,7 @@ extern "C" fn jni_to_reflected_method(
     with_shared_vm(|shared| {
         let (decl_class_id, method_index) = decode_method_id(method_id);
         let class_id = if clazz != 0 {
-            ClassId::new(clazz as u32)
+            jclass_class_id(clazz)
         } else {
             decl_class_id
         };
@@ -4403,7 +4601,7 @@ extern "C" fn jni_to_reflected_field(
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
         let class_id = if clazz != 0 {
-            ClassId::new(clazz as u32)
+            jclass_class_id(clazz)
         } else {
             decl_class_id
         };
@@ -4792,6 +4990,12 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     if obj == 0 {
         return 0;
     }
+    // Same `jclass`-is-a-ClassId round trip as `NewGlobalRef` — and this is the
+    // overload JNA's `LOAD_CREF` actually calls, so it is the one that decided
+    // whether `com.sun.jna.Native` could initialise at all.
+    if jclass_id_handle(obj) {
+        return obj;
+    }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let mut refs = shared.natives.jni_global_refs.lock();
@@ -4804,6 +5008,10 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
 // ---- Index 227: DeleteWeakGlobalRef ----
 extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
     if wref == 0 {
+        return;
+    }
+    // A class handle is permanent; dropping it is a no-op (see DeleteGlobalRef).
+    if is_jclass_handle(wref) {
         return;
     }
     with_shared_vm(|shared| {
@@ -4819,6 +5027,13 @@ extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
 extern "C" fn jni_get_object_ref_type(_env: JNIEnv, obj: JObject) -> JInt {
     if obj == 0 {
         return 0; // JNIInvalidRefType
+    }
+    // A `jclass` handle carries `JCLASS_TAG`, not the global-ref bit-0 tag, and
+    // its low bit is just the low bit of the ClassId — so without this it
+    // answered global-or-local at random per class. `FindClass` hands back a
+    // local ref on HotSpot.
+    if is_jclass_handle(obj) {
+        return 1; // JNILocalRefType
     }
     if obj & 1 == 1 {
         2 // JNIGlobalRefType (global or weak — we treat weak as global)
@@ -6016,9 +6231,10 @@ extern "C" fn jni_register_natives(
     }
 
     // A `JClass` in this table IS a `ClassId` — that is what `FindClass`
-    // returns (`class_id.as_u32() as JClass`) and what GetSuperclass,
-    // IsAssignableFrom, GetFieldID, CallStaticXxxMethod and a dozen others
-    // decode with `ClassId::new(clazz as u32)`.
+    // returns (`class_id_to_jclass`, a `ClassId` in the low 32 bits under
+    // `JCLASS_TAG`) and what GetSuperclass, IsAssignableFrom, GetFieldID,
+    // CallStaticXxxMethod and a dozen others decode with
+    // `ClassId::new(clazz as u32)` — the truncation drops the tag.
     //
     // This function decoded it as an OBJECT HANDLE instead, which is the one
     // convention `FindClass` never produces. Every odd-numbered ClassId took
@@ -6030,12 +6246,16 @@ extern "C" fn jni_register_natives(
     // invisible because the library still loads, the symbol-bound natives
     // still resolve by name, and only the methods a library binds
     // exclusively through RegisterNatives raise UnsatisfiedLinkError.
+    // Resolved BEFORE the class-manager read: `jclass_class_id` may take the
+    // mirror-reverse lock, and nesting that inside a `class_manager` reader is
+    // a lock order this file does not otherwise establish.
+    let class_id = jclass_class_id(clazz);
     let class_name = with_shared_vm(|shared| {
         shared
             .classes
             .class_manager
             .read()
-            .get_class(ClassId::new(clazz as u32))
+            .get_class(class_id)
             .map(|c| c.name.clone())
     })
     .flatten();
@@ -6080,7 +6300,7 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
     // permanent no-op for anything `FindClass` returned, which paired with the
     // same defect in RegisterNatives: neither half of the pair worked.
     let class_info = with_shared_vm(|shared| {
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         shared
             .classes
             .class_manager
@@ -6140,7 +6360,7 @@ extern "C" fn jni_alloc_object(_env: JNIEnv, clazz: JClass) -> JObject {
         return 0;
     }
     with_shared_vm(|shared| {
-        let class_id = ClassId::new(clazz as u32);
+        let class_id = jclass_class_id(clazz);
         // `clazz` must resolve to a real class. If it does not (stale or
         // bogus handle), return null rather than allocating an object against
         // an unresolved/`ClassId(0)` class: a wrongly-classed object whose
@@ -6211,7 +6431,7 @@ extern "C" fn jni_new_object_a(
         let result = invoke_on_class_shared(
             shared,
             thread,
-            ClassId::new(clazz as u32),
+            jclass_class_id(clazz),
             &method_name,
             &descriptor,
             &jvm_args,
@@ -7101,6 +7321,90 @@ extern "C" fn jni_new_direct_byte_buffer(
     .unwrap_or(0)
 }
 
+/// Turn the `long` a direct buffer carries in its `address` field into
+/// something a native library can actually dereference.
+///
+/// `Unsafe.allocateMemory` on this VM does NOT return an OS pointer: it returns
+/// a *handle* into a Rust-side arena, carrying `ARENA_TAG` (bit 62) precisely so
+/// it can never be confused with a real pointer. `ByteBuffer.allocateDirect`
+/// runs the real JDK's bytecode, which allocates through `Unsafe`, so every
+/// direct buffer this VM hands to Java has a tagged handle in `Buffer.address`.
+///
+/// Inside the VM that is invisible — the `Unsafe` get/put natives route a tagged
+/// address back to the arena. It stops being invisible at the JNI boundary,
+/// because `GetDirectBufferAddress` returns a bare `void*` that the native
+/// *itself* dereferences. lz4-java's `XXH32BB` is one line —
+/// `XXH32(GetDirectBufferAddress(env, buf) + off, len, seed)` — and zstd-jni's
+/// `getDirectByteBufferFrameContentSize` is another; returning a handle to
+/// either is an immediate SIGSEGV in third-party C, with no CratonVM frame at
+/// the fault to say why.
+///
+/// So a tagged handle is translated to the real address of the arena block's
+/// backing bytes. Writes by the native land in the arena directly, which is the
+/// aliasing a direct buffer is defined to have, and a subsequent `Unsafe` read
+/// through the handle sees them. An untagged address is already a real pointer
+/// (a native's own `NewDirectByteBuffer` allocation) and is passed through.
+///
+/// A tagged address that no *live* block contains — a use-after-free, or an
+/// offset past the end — resolves to `None` and the caller answers JNI NULL.
+/// NULL is what the JNI spec already reserves for "not a direct buffer", so
+/// natives that check at all check for it; returning the raw handle instead
+/// would trade a null check for a wild store.
+/// Is this object a DIRECT buffer — the only kind `GetDirectBufferAddress` and
+/// `GetDirectBufferCapacity` may answer for?
+///
+/// This used to be inferred from `Buffer.address != 0`, and that inference was
+/// correct on JDK 8 and is WRONG on JDK 21+. `Buffer.address` was repurposed:
+/// a heap buffer now carries `ARRAY_BYTE_BASE_OFFSET` there — literally `16` —
+/// as the base for the `Unsafe` accesses that pair it with `hb`. Measured on
+/// Temurin 25.0.3.9, `ByteBuffer.allocate(16).address == 16` on HotSpot AND on
+/// CratonVM; the two agree about the field, so the divergence was entirely in
+/// reading it as a pointer. `GetDirectBufferAddress(heapBuffer)` therefore
+/// answered `(void*)16` where HotSpot answers NULL — a wild pointer handed to
+/// any native that trusts it, which is the same crash family as the arena
+/// handle this function's sibling comment describes, from a different cause.
+///
+/// The rule is the JDK's own: a direct buffer is one that implements
+/// `sun.nio.ch.DirectBuffer`. The class-name check on `java/nio/DirectByteBuffer`
+/// is checked alongside it because a buffer minted by `NewDirectByteBuffer`
+/// under `--synthetic-jdk` has that class but need not have the interface.
+fn is_direct_buffer(shared: &SharedVm, oref: ObjectRef) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let mut current = shared.mem.heap.class_id_of(oref);
+    // Bounded: a malformed or cyclic hierarchy must not spin inside a JNI call.
+    for _ in 0..64 {
+        let Some(class) = cm.get_class(current) else {
+            return false;
+        };
+        if &*class.name == "java/nio/DirectByteBuffer"
+            || &*class.name == "java/nio/MappedByteBuffer"
+        {
+            return true;
+        }
+        if class.interfaces.iter().any(|&i| {
+            cm.get_class(i)
+                .is_some_and(|c| &*c.name == "sun/nio/ch/DirectBuffer")
+        }) {
+            return true;
+        }
+        match class.superclass {
+            Some(sc) => current = sc,
+            None => return false,
+        }
+    }
+    false
+}
+
+fn direct_buffer_native_address(raw: i64) -> Option<*mut u8> {
+    if raw == 0 {
+        return None;
+    }
+    if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(raw) {
+        return cratonvm_native_builtins::unsafe_arena_real_ptr(raw).map(|(ptr, _len)| ptr);
+    }
+    Some(raw as *mut u8)
+}
+
 // Index 230: GetDirectBufferAddress
 extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut u8 {
     if buf == 0 {
@@ -7108,6 +7412,11 @@ extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut 
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
+        // Non-direct buffers answer NULL — see `is_direct_buffer` for why the
+        // address field alone cannot decide this on JDK 21+.
+        if !is_direct_buffer(shared, oref) {
+            return None;
+        }
         let class_id = shared.mem.heap.class_id_of(oref);
         // The same resolution the setter used, so setter and getter always
         // address the same slot. The `or_else` covers exactly one drift case:
@@ -7122,8 +7431,7 @@ extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut 
                 .or_else(|| dbb_read_integral(shared, oref, 0)),
             None => dbb_read_integral(shared, oref, 0),
         }
-        .filter(|&a| a != 0)
-        .map(|a| a as *mut u8)
+        .and_then(direct_buffer_native_address)
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -7136,6 +7444,13 @@ extern "C" fn jni_get_direct_buffer_capacity(_env: JNIEnv, buf: JObject) -> JLon
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
+        // -1 for a non-direct buffer, symmetric with the address getter. A heap
+        // buffer has a perfectly good `capacity` field, so without this the
+        // capacity said "yes, a direct buffer of N bytes" about the very object
+        // the address getter refuses — which is worse than either answer alone.
+        if !is_direct_buffer(shared, oref) {
+            return None;
+        }
         let class_id = shared.mem.heap.class_id_of(oref);
         // A capacity of 0 is legal (`NewDirectByteBuffer(addr, 0)`), so unlike
         // the address there is no "non-zero means present" test available.
@@ -7186,7 +7501,7 @@ extern "C" fn jni_is_virtual_thread(env: JNIEnv, obj: JObject) -> JBoolean {
     })
     .flatten();
     match base {
-        Some(b) => jni_is_assignable_from(env, clazz, b.as_u32() as JClass),
+        Some(b) => jni_is_assignable_from(env, clazz, class_id_to_jclass(b)),
         None => JNI_FALSE,
     }
 }
@@ -8299,7 +8614,7 @@ mod tests {
         set_jni_context(&vm.shared);
         set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
-            jni_throw_new(get_jni_env(), class_id.as_u32() as JClass, message.as_ptr(),),
+            jni_throw_new(get_jni_env(), class_id_to_jclass(class_id), message.as_ptr(),),
             JNI_OK
         );
 
@@ -9885,6 +10200,46 @@ mod tests {
         );
     }
 
+    /// A `jclass` must never be 0, because in JNI a NULL `jobject` means
+    /// FAILURE.
+    ///
+    /// The encoding was the bare `ClassId`, so `ClassId(0)` — the FIRST class
+    /// the VM loads, i.e. `java.lang.Object` — was unreachable through
+    /// `FindClass`: the call returned 0 and every native library read it as
+    /// "no such class". Measured with a C probe:
+    /// `FindClass(java/lang/Object) = (nil)` from both `JNI_OnLoad` and a
+    /// registered native, against a live handle on HotSpot.
+    ///
+    /// The tag also has to stay TRANSPARENT to the twenty-one decode sites that
+    /// read a `jclass` as `ClassId::new(clazz as u32)`.
+    #[test]
+    fn jclass_encoding_is_never_null_and_survives_the_u32_decode() {
+        for raw in [0u32, 1, 2, 255, 0x7fff_ffff, u32::MAX] {
+            let handle = class_id_to_jclass(ClassId::new(raw));
+            assert_ne!(
+                handle, 0,
+                "ClassId({raw}) encoded to a NULL jclass — FindClass would report \
+                 'no such class' for it"
+            );
+            assert_eq!(
+                handle as u32,
+                raw,
+                "the tag must vanish under the `clazz as u32` decode every \
+                 jclass consumer uses"
+            );
+            assert!(is_jclass_handle(handle), "the tag must be present");
+            assert!(
+                handle > 0x0000_8000_0000_0000,
+                "the tag must sit above every canonical user-space address, so a                  jclass can never be confused with a heap pointer"
+            );
+        }
+        // Distinct classes must stay distinct handles.
+        assert_ne!(
+            class_id_to_jclass(ClassId::new(0)),
+            class_id_to_jclass(ClassId::new(1))
+        );
+    }
+
     #[test]
     fn jni_get_object_ref_type_at_slot_232() {
         let env = get_jni_env();
@@ -10519,7 +10874,9 @@ mod tests {
             }
             assert_eq!((a, b, c), (11, 22, 33), "named args");
             assert_eq!(i1, 40, "first variadic integer");
-            assert!((d - 1.5).abs() < f64::EPSILON, "variadic double: {d}");
+            // Bit equality: this asserts a varargs ABI round trip, so any
+            // difference at all is a marshalling defect.
+            assert_eq!(d.to_bits(), 1.5f64.to_bits(), "variadic double: {d}");
             assert_eq!(tail, 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8, "spilled integers");
         }
         42
@@ -10534,7 +10891,7 @@ mod tests {
             let i2 = cur.next(false);
             assert_eq!((a, b, c, d), (11, 22, 33, 44), "named args");
             assert_eq!((i1, i2), (40, 2), "variadic integers");
-            assert!((f - 2.5).abs() < f64::EPSILON, "variadic double: {f}");
+            assert_eq!(f.to_bits(), 2.5f64.to_bits(), "variadic double: {f}");
         }
         43
     }

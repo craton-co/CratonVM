@@ -20,6 +20,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * JDK-only corpus: executors -- fixed pool, scheduled executor, shutdown,
@@ -338,12 +339,145 @@ public class RJdkExecutors {
         }
     }
 
+    /**
+     * The VM must give a terminating thread its Java-side cleanup --
+     * `Thread.exit()` -- and it must do it on the ABNORMAL path too.
+     *
+     * Why this is assertable from public API at all. `Thread.exit()` ends in
+     * `clearReferences()`, which nulls the per-instance
+     * `uncaughtExceptionHandler` field. `getUncaughtExceptionHandler()` reads
+     * that field and falls back to the ThreadGroup when it is null, so a
+     * terminated thread that still hands back the handler somebody installed on
+     * it is a thread whose `exit()` never ran. Nothing here needs
+     * `--add-opens`, reflection, `StructuredTaskScope` or a ThreadFlock.
+     *
+     * Why the ABNORMAL path and not the normal one, which is the whole point.
+     * A cleanup wired only into the happy path is the specific defect to look
+     * for, and it is also the path that matters: a task that ends by throwing
+     * is exactly when a structured-concurrency owner is parked waiting for a
+     * container count to fall. Two assertions, in this order, because the
+     * second is meaningless without the first: the handler must FIRE (proving
+     * the uncaught dispatch consulted it while it was still installed), and
+     * only then must it be GONE.
+     *
+     * Why the normal-return thread is deliberately NOT asserted the same way.
+     * CratonVM keeps per-thread handlers in a side table as well as in the real
+     * field, and the entry is removed only by the uncaught dispatch -- so after
+     * a CLEAN death the side table still holds it, and whether
+     * `getUncaughtExceptionHandler()` sees the side table or the (nulled) real
+     * field depends on which of the two wins dispatch, which differs per mode.
+     * Asserting it here would encode a mode-dependent answer. The clean thread
+     * is still started and joined below, so the section covers both paths for
+     * everything that IS mode-independent.
+     */
+    static void threadExitCleanup() throws Exception {
+        // --- abnormal termination: run() throws ---
+        final AtomicInteger fired = new AtomicInteger();
+        final AtomicReference<String> caught = new AtomicReference<>("none");
+        Thread.UncaughtExceptionHandler ueh = (t, e) -> {
+            fired.incrementAndGet();
+            caught.set(e.getClass().getName() + ":" + e.getMessage());
+        };
+        Thread bad = new Thread(() -> {
+            throw new IllegalStateException("exit-boom");
+        }, "rjdk-exit-abnormal");
+        bad.setUncaughtExceptionHandler(ueh);
+        check(bad.getUncaughtExceptionHandler() == ueh,
+                "a live thread must report the handler that was installed on it");
+        bad.start();
+        bad.join(T * 1000);
+        check(!bad.isAlive(), "the throwing thread must have terminated");
+        // `>= 1`, not `== 1`, and the looseness is deliberate rather than lazy:
+        // CratonVM dispatches through a side table AND lets the real
+        // `Thread.dispatchUncaughtException` bytecode run on some paths, so the
+        // exact count is a per-mode fact. What this assertion needs is only that
+        // the handler was consulted WHILE STILL INSTALLED, which is what makes
+        // the "and now it is gone" check below mean something. The exact-count
+        // question is asked below instead, as a DELTA across the clean thread,
+        // where it is mode-independent.
+        int firedAfterAbnormal = fired.get();
+        check(firedAfterAbnormal >= 1,
+                "the per-thread handler must fire on an uncaught exception: " + firedAfterAbnormal);
+        check("java.lang.IllegalStateException:exit-boom".equals(caught.get()),
+                "the handler must receive the original throwable: " + caught.get());
+        // THE discriminator. Before Thread.exit() was wired up this answered the
+        // handler itself, on both VMs' abnormal path; HotSpot answers the
+        // ThreadGroup (or null for a terminated thread), never the handler.
+        check(bad.getUncaughtExceptionHandler() != ueh,
+                "Thread.exit() must clear a terminated thread's uncaught handler; got "
+                        + bad.getUncaughtExceptionHandler());
+
+        // --- normal termination: the clean path must still not be disturbed ---
+        final AtomicInteger ran = new AtomicInteger();
+        Thread ok = new Thread(ran::incrementAndGet, "rjdk-exit-normal");
+        ok.setUncaughtExceptionHandler(ueh);
+        ok.start();
+        ok.join(T * 1000);
+        check(!ok.isAlive(), "the clean thread must have terminated");
+        check(ran.get() == 1, "the clean thread's body must have run once: " + ran.get());
+        check(fired.get() == firedAfterAbnormal,
+                "a clean exit must not dispatch an uncaught handler: " + fired.get()
+                        + " != " + firedAfterAbnormal);
+        // A terminated thread is not restartable, and this is asserted here
+        // rather than anywhere else because running Java teardown on a dying
+        // thread is exactly the change that could plausibly resurrect one.
+        boolean threw = false;
+        try {
+            ok.start();
+        } catch (IllegalThreadStateException expected) {
+            threw = true;
+        }
+        check(threw, "restarting a terminated thread must throw IllegalThreadStateException");
+        // The exception is the SYMPTOM; this is the damage. Measured on
+        // CratonVM before the fix: the second `start()` did not merely fail to
+        // throw, it RE-RAN the body, so `ran` went 1 -> 2 and a Runnable the
+        // application had already retired executed a second time on a second
+        // OS thread. A guard that throws but still spawns would pass the check
+        // above and fail this one. `join` rather than a sleep: if the thread
+        // was wrongly resurrected this waits for that second run to finish, and
+        // if `start()` correctly threw the thread is already dead so it returns
+        // at once — no elapsed-time assertion either way.
+        ok.join(T * 1000);
+        check(ran.get() == 1,
+                "a refused restart must not run the body again: " + ran.get());
+
+        // The other half of the same JVMS rule, and the half a state check that
+        // only looks for TERMINATED would miss: `start()` on a thread that is
+        // still RUNNING must throw too. Held live by a latch rather than a
+        // sleep so the window is deterministic.
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch entered = new CountDownLatch(1);
+        Thread live = new Thread(() -> {
+            entered.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }, "rjdk-exit-live");
+        live.start();
+        check(entered.await(T, TimeUnit.SECONDS), "the live thread must have entered its body");
+        boolean threwLive = false;
+        try {
+            live.start();
+        } catch (IllegalThreadStateException expected) {
+            threwLive = true;
+        }
+        release.countDown();
+        live.join(T * 1000);
+        check(threwLive, "starting an already-running thread must throw IllegalThreadStateException");
+        check(!live.isAlive(), "the live thread must have terminated after release");
+        System.out.println("CK RJdkExecutors threadExit fired=" + fired.get()
+                + " caught=" + caught.get());
+    }
+
     public static void main(String[] args) throws Exception {
         fixedPool();
         factoryAndRejection();
         scheduled();
         interruption();
         completableFutures();
+        threadExitCleanup();
         System.out.println("CK RJdkExecutors checks=" + checks);
         System.out.println("PASS RJdkExecutors (" + checks + " checks)");
     }

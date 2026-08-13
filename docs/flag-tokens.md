@@ -39,7 +39,7 @@ a knob with an on/off sense.
 | `CRATONVM_JAVA_HOME` | JDK to boot from; overrides `JAVA_HOME` for the boot probe. |
 | `CRATONVM_BIN` | Path to the `cratonvm` binary, for harnesses that re-exec it. |
 | `CRATONVM_MAVEN_REPO_LOCAL` | Local Maven repository root. |
-| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements. Set for you by an unscoped `-ea` on the command line; setting it directly is only needed for a launcher that cannot pass VM flags. |
 | `CRATONVM_DISABLE_JIT` | Interpreter-only execution. Also set by `--nojit`. |
 
 ## Legacy names
@@ -64,6 +64,7 @@ export inherited from a parent shell.
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
+| `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
 | `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
@@ -503,7 +504,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-171 tokens.
+172 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -572,6 +573,7 @@ export inherited from a parent shell.
 | `ir-isel-emit` | `CRATONVM_JIT_IR_ISEL_EMIT` |
 | `ir-isel-verify` | `CRATONVM_JIT_IR_ISEL_VERIFY` |
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
+| `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
 | `ir-reloc-emit` | `CRATONVM_JIT_IR_RELOC_EMIT` |
@@ -817,6 +819,7 @@ export inherited from a parent shell.
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
 | `stress-thread-states` | `CRATONVM_STRESS_THREAD_STATES` |
 | `striped-counters` | `CRATONVM_STRIPED_COUNTERS_OFF` |
+| `thread-containers` | `CRATONVM_THREAD_CONTAINERS` |
 | `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
 
 ## `CRATONVM_SECURITY`

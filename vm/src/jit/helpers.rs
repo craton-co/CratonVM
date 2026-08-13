@@ -3623,6 +3623,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // common-case cost of the original helper.
     if heap.try_alloc_young_probe(total_size).is_some() {
         if let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            jit_note_external_alloc(total_size);
             return jit_newarray_finish(obj_ref, atype, length);
         }
     }
@@ -3640,6 +3641,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // probe above is unchanged, so a healthy heap never reaches this line and
     // pays nothing.
     if let Some(obj_ref) = heap.try_alloc_array_full(ClassId::new(0), elem_type, length as usize) {
+        jit_note_external_alloc(total_size);
         return jit_newarray_finish(obj_ref, atype, length);
     }
     // Slow path: young gen full (or the probe-then-alloc race lost the slot).
@@ -3711,7 +3713,38 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
             }
         }
     };
+    jit_note_external_alloc(total_size);
     jit_newarray_finish(obj_ref, atype, length)
+}
+
+/// Charge `bytes` to the calling thread's allocation counter — the one behind
+/// `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`.
+///
+/// Only for allocations that **bypassed the TLAB**. TLAB-served allocations,
+/// including the ones compiled code performs with its own inline bump, are
+/// already accounted for by [`cratonvm_gc::Tlab::thread_allocated_bytes`],
+/// which reads the live cursor; charging them here as well would double-count.
+///
+/// The JIT keeps its own copies of the interpreter's slow allocation paths
+/// (`jit_newarray`, `jit_new_object`, `jit_anewarray_object`), so the
+/// accounting `alloc_object_shared` / `gc_alloc_array` do has to be repeated
+/// here — otherwise a compiled thread's counter would silently omit every
+/// humongous object it allocated, which is the direction that reads as good
+/// news to a caller asserting "we allocated less than N".
+///
+/// Best-effort: no `JvmThread` (a foreign/unattached caller) means no counter
+/// to charge, and monitoring must never be the thing that fails an allocation.
+///
+/// # Safety
+/// Same contract as [`jit_thread_mut`]: call only from a JIT helper running on
+/// the thread that installed `JIT_THREAD`, with no other `&mut JvmThread` (and
+/// no live `JitThreadGuard`) outstanding. Every call site below sits after the
+/// allocation's own guards have been dropped.
+#[inline]
+unsafe fn jit_note_external_alloc(bytes: usize) {
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.note_external_allocation(bytes);
+    }
 }
 
 /// W1-vm: surface an allocation failure from `jit_newarray` as a catchable
@@ -4227,6 +4260,9 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             }
         }
     };
+    // Every arm reaching here allocated outside the TLAB (the TLAB arm above
+    // returns early), so the thread's allocation counter has to be told.
+    jit_note_external_alloc(total_size);
     // Initialize primitive-typed fields to proper JVM default values (zero
     // memory reads as Object(None) which is wrong for int/long/float/double
     // fields) + JLS §12.6 finalizer registration.
@@ -4885,6 +4921,8 @@ pub unsafe extern "C" fn jit_anewarray_object(
             }
         }
     };
+    // Non-TLAB arm (the guarded-refill TLAB arm above returns early).
+    jit_note_external_alloc(total_size);
     arr.as_ptr() as i64
 }
 
@@ -5359,6 +5397,23 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     // interpreter agree. `aastore_element_assignable` fails open on imprecise
     // type info, so this is additive (never a false ArrayStoreException) — the
     // store still proceeds below for null elements and assignable references.
+    //
+    // W7-37 residual, measured 2026-08-12: **on x64 this arm does not run at
+    // all**, because nothing calls this function. `jit/src/x64/bytecode_walk.rs`
+    // lowers `aastore` (0x53) inline — null check, bounds check, SATB pre-write
+    // barrier, `MOV [array + index*8 + HEADER_SIZE], val`, card mark — and never
+    // reaches `self.helpers.aastore`. The comment at that arm justified the
+    // inline path with "the current `jit_aastore` helper does NOT enforce the
+    // ASE check … no regression"; that premise was true when it was written and
+    // was falsified when this check landed here, silently, because a premise in
+    // a comment is not a compile-time link. `RExceptions`'s tier-parity
+    // assertion reads `cold=[java.lang.Integer] hot=[no-throw]` at i=500 as a
+    // result: the compiled store completes and raises nothing.
+    //
+    // So do NOT read the funnel routing below as "the JIT and the interpreter
+    // now print the same text". They do — but only once the emitter calls this
+    // helper. See docs/known-issues/jdk-only/W7-37-differential-throwable-and-vm.md
+    // §"Part 4" for the codegen change that wires it up.
     if val != 0 {
         let vm = &*(vm_ptr as *const SharedVm);
         let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
@@ -5382,13 +5437,30 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
                 .get_class(vm.mem.heap.class_id_of(value_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            // W7-37 -- raise this through `throw_runtime_error`, the single
+            // funnel every VM-minted `RuntimeError` passes through, instead of
+            // building the throwable here. The funnel is where an
+            // `ArrayStoreException` message is given HotSpot's EXTERNAL class
+            // name; `class.name` above is the INTERNAL one, so minting the
+            // object directly printed `java/lang/Integer` where HotSpot (and
+            // the interpreter's own `aastore`, which does go through the
+            // funnel) print `java.lang.Integer`. A slashed name there is a
+            // real defect and not untidiness: callers regex the message and
+            // feed the capture to `Class.forName`.
+            //
+            // Behaviour on failure is unchanged -- if no thread is available,
+            // or the funnel cannot build the throwable and degrades to an
+            // `InternalError`, we fall through and perform the store rather
+            // than corrupting VM state.
             if let Some((thread, _guard)) = jit_thread_mut() {
-                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                    vm,
-                    thread,
-                    "java/lang/ArrayStoreException",
-                    Some(&elem_cls),
-                ) {
+                use crate::error::MethodCallFailed;
+                if let MethodCallFailed::ExceptionThrown(exc) =
+                    crate::runtime::exceptions::throw_runtime_error(
+                        vm,
+                        thread,
+                        crate::error::RuntimeError::ArrayStoreException { message: elem_cls },
+                    )
+                {
                     set_jit_pending_exception(thread, exc);
                     return;
                 }
@@ -7764,12 +7836,29 @@ pub unsafe extern "C" fn jit_checkcast(
                 obj_cls_name,
                 class_name.replace('/', ".")
             );
-            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
-                vm,
-                thread,
-                "java/lang/ClassCastException",
-                Some(&msg),
-            ) {
+            // W7-37 -- and this one is a correction to that record, which
+            // listed "the JIT cast helper's `class ... cannot be cast to
+            // class ...`" among the paths its funnel rewrite newly covers. It
+            // did not: this site builds the throwable itself and so never
+            // reaches `throw_runtime_error`, which is where the message gains
+            // HotSpot's module/loader parenthetical
+            // (`(java.lang.String and java.lang.Integer are in module
+            // java.base of loader 'bootstrap')`). The interpreter's `checkcast`
+            // raises a `RuntimeError` and does get it, so the two execution
+            // modes printed different text for the same refusal.
+            //
+            // `msg` is already in the two-operand shape `split_cast_operands`
+            // requires, and the rewrite fails open: when either operand's
+            // module/loader cannot be named -- a user-defined loader, most
+            // of all -- the funnel returns `msg` byte-identical.
+            use crate::error::MethodCallFailed;
+            if let MethodCallFailed::ExceptionThrown(exc) =
+                crate::runtime::exceptions::throw_runtime_error(
+                    vm,
+                    thread,
+                    crate::error::RuntimeError::ClassCastException { message: msg },
+                )
+            {
                 set_jit_pending_exception(thread, exc);
                 return i64::MIN;
             }
@@ -15958,6 +16047,55 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
+/// How much stack one thread may burn on COMPILED recursion before the guard
+/// converts it into a catchable `StackOverflowError` — the JIT-side analogue of
+/// `-Xss`, and the compiled counterpart of the interpreter's
+/// `JvmConfig::max_stack_depth` frame cap.
+///
+/// Without this bound the two tiers disagree by more than an order of
+/// magnitude on WHEN a program overflows, because they measure different
+/// things: the interpreter counts frames in a heap `Vec` and stops at
+/// `max_stack_depth` (8192 by default), while compiled frames live on the
+/// native stack and were allowed to consume all of it. Measured on this host
+/// with an 8 MiB carrier stack, one trivially recursive method reached:
+///
+/// | tier | depth before StackOverflowError |
+/// |---|---|
+/// | CratonVM interpreter (`--nojit`) | 8 191 |
+/// | CratonVM JIT (before this bound) | 232 417 |
+/// | HotSpot JDK 25 (interpreted → C2) | 11 820 → 23 306 |
+///
+/// A 28x tier-dependent answer is a fidelity bug on its own — the depth at
+/// which a program overflows should not hinge on whether a method happened to
+/// get compiled — and HotSpot's own two numbers differ by only ~2x because
+/// both of ITS tiers are bounded by the same `-Xss`.
+///
+/// It also breaks real tests. `io.netty.util.concurrent.DefaultPromiseTest`
+/// sizes its work from the depth it measures (`stackOverflowDepth << 1`), then
+/// gives that work a fixed 2-second deadline; at 232k the chain was ~465 000
+/// promises where HotSpot builds ~24 000–47 000, so
+/// `testNoStackOverflowWithDefaultEventExecutorA/B` timed out with the JIT on
+/// and passed with `--nojit`. It was never a promise or notification defect:
+/// CratonVM completes HotSpot's own chain lengths in 343 ms / 798 ms against
+/// that 2 s budget.
+///
+/// 4 MiB, set by measurement rather than by analogy. A byte budget does not
+/// translate to a fixed depth — that depends on the compiled frame size, which
+/// is exactly how HotSpot behaves too — so the number is chosen to land the
+/// depth ABOVE the interpreter's own 8192-frame cap and inside HotSpot's range.
+/// On the probe above, 4 MiB gives ~10k-21k frames against HotSpot's
+/// 11.8k-23.3k.
+///
+/// 1 MiB (HotSpot's default `-Xss`) was tried first and is WRONG here: it
+/// produced 2434-5305 frames, i.e. STRICTER than the interpreter, which only
+/// re-opens the tier gap from the other side and could reject recursion that
+/// runs fine under `--nojit`. CratonVM's compiled frames are simply larger than
+/// HotSpot's, so matching HotSpot's byte budget does not match its depth.
+///
+/// 4 MiB is also what the no-OS-bounds fallback below has always assumed, so
+/// the two paths now agree instead of differing by the whole stack size.
+const SELF_CALL_STACK_BUDGET: usize = 4 << 20; // 4 MiB
+
 /// Compute the guard floor for this thread: the lowest stack pointer at which
 /// a compiled self-recursive site may still CALL one level deeper.
 ///
@@ -15967,10 +16105,15 @@ fn thread_stack_bounds() -> Option<(usize, usize)> {
 /// interpreter/exception-table routing above. 1 MiB is generous for all of
 /// those; it is clamped to a quarter of the stack (min 64 KiB) so small
 /// carrier stacks keep most of their space usable.
+///
+/// The result is then raised to at most [`SELF_CALL_STACK_BUDGET`] below the
+/// first observed SP — see that constant for why the whole-stack floor is the
+/// wrong bound. Taking the HIGHER (tighter) of the two keeps the guard-page
+/// headroom guarantee intact: this only ever trips EARLIER, never later.
 #[cold]
 fn compute_self_call_stack_floor(sp_now: usize) -> usize {
     const HEADROOM: usize = 1 << 20; // 1 MiB
-    match thread_stack_bounds() {
+    let guard_floor = match thread_stack_bounds() {
         Some((low, high)) => {
             let size = high - low;
             let margin = HEADROOM.min(size / 4).max(64 * 1024);
@@ -15981,7 +16124,8 @@ fn compute_self_call_stack_floor(sp_now: usize) -> usize {
         // converts unbounded recursion into a catchable error well before
         // a typical guard page.
         None => sp_now.saturating_sub(4 << 20),
-    }
+    };
+    guard_floor.max(sp_now.saturating_sub(SELF_CALL_STACK_BUDGET))
 }
 
 /// Leaf floor query for the INLINE self-recursion check: get-or-compute the

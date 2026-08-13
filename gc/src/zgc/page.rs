@@ -2238,7 +2238,9 @@ mod tests {
         // The chosen denominator: 100% occupied, zero garbage, so no threshold
         // short of 1.0 admits it.
         assert_eq!(page.garbage_bytes(), 0);
-        assert!((page.live_ratio() - 1.0).abs() < 1e-12);
+        // Exact: 512/512. The comment above says "no threshold short of 1.0
+        // admits it", which a tolerance quietly contradicts.
+        assert_eq!(page.live_ratio().to_bits(), 1.0f64.to_bits());
         assert!(!page.is_relocation_candidate(0.25));
         assert!(!page.is_relocation_candidate(0.99));
 
@@ -2300,7 +2302,8 @@ mod tests {
 
         page.set_live_bytes(512);
         page.set_state(ZPageState::Relocatable);
-        assert!((page.live_ratio() - 512.0 / 8192.0).abs() < 1e-12);
+        // Exact: 512/8192 is 2^-4, representable with no rounding.
+        assert_eq!(page.live_ratio().to_bits(), (512.0f64 / 8192.0).to_bits());
         assert_eq!(page.garbage_bytes(), 8192 - 512);
         assert!(
             page.is_relocation_candidate(0.25),

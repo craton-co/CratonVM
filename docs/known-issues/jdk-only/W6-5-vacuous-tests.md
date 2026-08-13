@@ -7,11 +7,100 @@ HotSpot 25.0.3 and mutation-checked. **Two further findings reported, not fixed*
 
 > **2026-08-11 — §3.1 is CLOSED.** `RPriorityQueueGc` and `RTreeRangeGc` are in
 > `CORE_CLASSES`, with the `class_cv_args` hook they are inert without already
-> in place; §4's proposed patch has fully landed. §3.2 (`apps/` is gitignored,
-> eleven missing probe fixtures) and §3.3 (`CRATONVM_REQUIRE_E2E` is set by no
-> workflow) **remain open** and are still the larger findings by count.
-> Neither the registration nor the new vector added in §3.4 has been run under
-> CratonVM.
+> in place; §4's proposed patch has fully landed.
+>
+> **2026-08-12 — §3.2 and §3.3 are CLOSED; see `W7-51-vacuous-sweep-round-2.md`,
+> which also widens this record into a measured sweep.** Short form:
+>
+> * **§3.2.** The count here was **low by half**: 23 of 27 referenced fixtures
+>   were missing, not eleven of twelve — this section's census matched only the
+>   single-line `.join("apps").join(<probe>)` spelling and missed the multi-line
+>   builder form most harnesses use. **Two entries in the table below are also
+>   wrong**: `scanner_probe` and `xml_probe` are annotated "self-generates its
+>   source — likely OK" and neither does. Both read their `.java` off disk and
+>   skip when it is absent; `wave1_d`'s `write_fixture()` writes the XML *data*,
+>   not the probe source. Seven fixtures are rebuilt and force-added, and
+>   `vm/tests/probe_fixture_census.rs` now fails a default `cargo test
+>   --workspace` when a fixture is missing and unbaselined, when a baselined one
+>   is restored without its row being deleted, or when a new `apps/`-reaching
+>   test appears in neither table. 16 remain, each with its reason; two of those
+>   need third-party jars and are not reconstructible.
+> * **§3.3.** `.github/workflows/ci.yml` now sets `CRATONVM_REQUIRE_E2E` on a
+>   step that runs three fixture-gated targets, and `vm/tests/require_e2e_gate.rs`
+>   asserts both ends — that the harness branches on the variable (with a
+>   positive control, so an unconditionally-panicking helper cannot pass it) and
+>   that a workflow sets it (a mention inside a comment does not count). The
+>   workflow-side predicate is mutation-checked. The same defect was then found
+>   a second time, in `STRICT_COVERAGE`, and armed.
+> * **§3.4.** `RJdkViews` is scheduled in `CORE_CLASSES` and is **proved capable
+>   of failing** — five mutants, one per defect family plus the negative
+>   control, each producing a named `AssertionError` and rc=1 on HotSpot 25.
+>   It has still **never been run under CratonVM**; that remains ahead.
+
+> **2026-08-12 — ROUND 3, and it adds a THIRD shape to §0's table.** W7-51
+> re-asked this record's question with mutation as the instrument and found 67.
+> Round 3 re-asked it of fifteen fixtures W7-51 had listed as *sound* and found
+> the species in nine, which means neither round's method was the whole
+> instrument. What both missed, stated as a row for §0:
+>
+> | shape | how it reads | how it fails |
+> | --- | --- | --- |
+> | **C — one load-bearing assertion satisfied by the wrong answer, among many that are not** | a long, careful, high-count vector in which exactly one line stands for the property the record names, and that line is `!= null`, `> 0`, or a negated predicate against a constant | the vector is green before and after the fix, at any count. `RJdkModule` is the worked example: **155 checks**, and the one that stands for W2-3 is `check(!d.isAutomatic())` against a hardcoded `false` that happens to be the right answer for the one module the fixture has. |
+>
+> Shape C is invisible to every census either earlier round ran. W7-51's Java
+> pass measured whether a vector's assertions were `!= null`-**majority** —
+> `RSocketChannelInterrupt` at 3/10 was the worst it found — and majority is the
+> wrong statistic: 1 in 155 is worse than 3 in 10, because the 154 create the
+> confidence. §3.4's own sweep of this file has the same blind spot, and says so
+> in its own terms without drawing the conclusion: *"no vector's assertions are
+> majority `!= null`-shaped."*
+>
+> **The nine, with what makes each one pass on the broken path:**
+> `RJdkModule` (`isAutomatic()` vs a hardcoded false — NOT repairable from the
+> fixture, see W2-3); `RJdkHello` (three `getProperty(...) != null` rows a VM
+> answering `""` for every key satisfies); `RJdkJmx` (nine `!= null` / `> 0` rows
+> on platform beans, which is exactly what its own header says it exists to rule
+> out); `RJdkFieldModule` (`Field.get(null) != null` for `System.out`, where the
+> recorded failure mode is a plausible wrong object); `RJdkRecords` (a record
+> accessor asserted `!= null`, where the recorded failure mode is a boxed `0`);
+> `RJdkProxy` (`s.getClass() != null` standing for "getClass is not routed", a
+> line that cannot fail on any VM); `RJdkServices` (`greet().length() > 0` for
+> the `findFirst` product); `RJdkLambdas` (`ctor.get().isEmpty()`, true of one
+> memoised instance handed back forever); `RJdkJni` (`t > 0` for a reflective
+> `currentTimeMillis`). Eight are repaired; the ninth is `RJdkModule`'s and is
+> recorded rather than papered over, because telling the fix from the hardcode
+> needs an automatic module the harness does not have — the honest marker is left
+> visible in the vector. Disposition and the exact old-behaviour reading for each
+> are in `W7-51-vacuous-sweep-round-2.md` §3's box.
+>
+> **§3.1 is closed twice over now.** `RPriorityQueueGc` and `RTreeRangeGc` were
+> its subject; both publish check counts as of 2026-08-12 and their rows are gone
+> from `regression-suite/harness-uncounted.txt` (`W7-60` §7.3).
+>
+> **2026-08-12 — the predicted red arrived on `RJdkJmx`, and it was worth three
+> defects, not one.** Round 3 called `RJdkJmx` "most likely first to red" when
+> its nine `!= null` / `> 0` rows were replaced with cross-accessor invariants.
+> It redded on the first row that has a second accessor — `os.name` — and the
+> value behind it settles the shape question: the bean answered **`"windows"`**
+> where `System.getProperty("os.name")` answered **`"Windows 11"`**. Not a
+> fabricated shell; a REAL reading taken from the WRONG source
+> (`std::env::consts::OS` instead of the property the getter is specified to
+> return). `!= null` could never have seen that, and neither could a "is this a
+> stub?" census — the old row was satisfied by a true fact about the host.
+>
+> Because `check` throws on the first failure, the red named one defect and hid
+> two. Replaying the whole block with soft checks (every assertion evaluated,
+> failures collected) found **three**: `os.name`, `os.arch`
+> (`"x86_64"` vs `"amd64"` — same mechanism, same line pair), and
+> `RuntimeMXBean.getName()` (`"cratonvm@<pid>"` direct vs `"<pid>@CARBON"` from
+> the server's `java.lang:type=Runtime` `Name` attribute, which real JDK
+> bytecode answers). HotSpot: 0 failures on the same source, same host.
+>
+> **The generalisable part.** When a vacuity repair reds, run the repaired block
+> with the assertions made non-fatal BEFORE fixing the first failure. The cost of
+> not doing so is one full rebuild per hidden defect, and this block hid two
+> behind the first. The soft-check replay is a scratch fixture, not a change to
+> the vector: the vector must keep failing fast.
 
 Predecessors: `L10-rjdkprocess-vector-overassertion.md` (the opposite failure —
 an over-asserting vector), `W3-4-forkjointask-status-flags-and-the-eager-default.md`

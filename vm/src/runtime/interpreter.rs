@@ -1637,8 +1637,45 @@ pub fn execute(
         // this process (mirrors the `mark_jit_bail_listed` invariant this
         // same session's other fix relies on), so none of this is needed
         // when `already_skipped` is true — skip straight to cheap defaults.
+        // The POSITIVE half of the same short-circuit. `already_skipped` covers
+        // methods that FAIL this gate; a method that PASSES was recorded
+        // nowhere, so it re-ran the whole computation on every `execute()`
+        // entry — forever, and *before* the `JitCache` consult in the `else`
+        // branch below, so a fully compiled hot method paid it too. The
+        // expensive term is `jit_method_calls_native_shadowed`: an
+        // O(method-bytecode) decode with a three-string-hash `slot_for_exact`
+        // probe per invoke instruction in the body. Measured on netty
+        // `AdaptiveByteBufAllocatorTest`, that scan reached 2.15% of CPU
+        // through `slot_for_exact` alone while only 637 methods were ever
+        // sealed for the reason it computes — it was re-running, not running
+        // once per method.
+        //
+        // Stamped with `redefine_epoch()` because a stale PASS is unsafe in a
+        // way a stale seal is not: see `JitRealm::jit_gate_pass`.
+        // Keyed on `ClassId`, not on the class name the negative set uses — see
+        // `JitRealm::jit_gate_pass` for why the name is safe there and unsafe
+        // here. The two `Arc` clones are refcount bumps, not allocations.
+        let gate_pass_key = (skip_key.1.clone(), skip_key.2.clone());
+        let gate_pass_memo = if already_skipped || !crate::runtime::env_cache::jit_gate_pass_memo() {
+            None
+        } else {
+            let epoch = cratonvm_jit::redefine_epoch();
+            shared
+                .jit
+                .jit_gate_pass
+                .read()
+                .get(&(class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()))
+                .copied()
+                .and_then(|(e, iface)| (e == epoch).then_some(iface))
+        };
         let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped {
             (false, None, false, false)
+        } else if let Some(is_interface_default) = gate_pass_memo {
+            // Recorded eligible under the current redefine epoch: all three
+            // skip reasons were false when it was recorded, and each is a pure
+            // function of this method's static bytecode and metadata.
+            cratonvm_jit::note_jit_gate_pass_hit();
+            (is_interface_default, None, false, false)
         } else {
             // Static eligibility check — see vm/src/jit/skip_list.rs for the full
             // policy mapping (each entry is documented against a roadmap item in
@@ -1722,6 +1759,23 @@ pub fn execute(
                     code_attr.code.len(),
                 )
             };
+            // Record the ELIGIBLE verdict so the next entry short-circuits.
+            // Scoped to exactly the three static per-method facts the seal
+            // block below scopes itself to — `env_disable_jit` /
+            // `redefine_jit_quiesced` / `gpu_gate_skip` / `clinit_skip` are
+            // runtime or call-site-dependent and are deliberately NOT folded
+            // in, in either direction.
+            if crate::runtime::env_cache::jit_gate_pass_memo()
+                && static_skip_reason.is_none()
+                && !fjp_skip
+                && !native_skip
+            {
+                cratonvm_jit::note_jit_gate_pass_fill();
+                shared.jit.jit_gate_pass.write().insert(
+                    (class_id, gate_pass_key.0.clone(), gate_pass_key.1.clone()),
+                    (cratonvm_jit::redefine_epoch(), is_interface_default),
+                );
+            }
             (
                 is_interface_default,
                 static_skip_reason,
@@ -2392,6 +2446,13 @@ pub fn execute(
                     // freshly zeroed object if the elision somehow did not fire —
                     // is identical to running `C.<init>`.)
                     let dbg_ctor = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    // Pcs whose `<init>()V` target `is_elidable_construction` PROVED empty. The
+                    // backend may elide only these; a no-arg constructor that is NOT proven empty
+                    // keeps both its allocation and its call, because eliding it would drop
+                    // whatever the body writes to global state (see
+                    // docs/known-issues/netty/jit-elided-constructor-side-effects-20260812.md).
+                    let mut elidable_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     for (pc, tclass, pcount) in pending_ctor_sites {
                         let elidable = shared
                             .load_class_concurrent(&tclass)
@@ -2401,6 +2462,9 @@ pub fn execute(
                                 is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
+                        if elidable {
+                            elidable_init_pcs.insert(pc);
+                        }
                         if dbg_ctor {
                             eprintln!(
                                 "[ctor-fix] {}.{}{} ctor site pc={} target={} elidable={}",
@@ -2883,6 +2947,7 @@ pub fn execute(
                         // de-spec consult (inert in production).
                         &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
                         indy_info,
+                        Some(elidable_init_pcs),
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;

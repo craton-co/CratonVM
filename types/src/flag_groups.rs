@@ -233,6 +233,7 @@ pub struct E {
 #[rustfmt::skip]
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "a5-census", on_key: Some("CRATONVM_DBG_A5_CENSUS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
     // Declared 2026-08-06: these nine were read by `runtime_var`/`runtime_var_os`
     // but named nowhere, so each was served by a live `getenv` instead of the
@@ -809,6 +810,10 @@ pub const INVENTORY: &[E] = &[
     // CORRECTNESS; off is a measurement configuration only, for pricing the
     // seal's ceiling. Never ship with it off.
     E { group: Group::JIT, token: "native-shadow-caller-seal", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL"), off_key: None, off_word: Some("0") },
+    // The POSITIVE half of `execute()`'s static-eligibility short-circuit.
+    // Default ON; `-gate-pass-memo` restores the pre-fix re-run-every-entry
+    // behaviour so the fix can be A/B'd in one binary. Correct either way.
+    E { group: Group::JIT, token: "gate-pass-memo", on_key: Some("CRATONVM_JIT_GATE_PASS_MEMO"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "full-self-call-spill", on_key: Some("CRATONVM_JIT_FULL_SELF_CALL_SPILL"), off_key: None, off_word: None },
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
@@ -858,6 +863,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-isel-emit", on_key: Some("CRATONVM_JIT_IR_ISEL_EMIT"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-isel-verify", on_key: Some("CRATONVM_JIT_IR_ISEL_VERIFY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "precise-field-ops", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_FIELD_OPS"), off_word: None },
+    // Declared 2026-08-11 with the pre-push hook that would have caught it.
+    // `jit::precise_getstatic_checkcast_enabled` withdraws the RBC.6 admission
+    // of `getstatic`/`checkcast` so one binary can be A/B'd against its own
+    // pre-change behaviour. Opt-out spelling only, same as its
+    // `precise-field-ops` neighbour, so the token is stated positively and
+    // enabling it means removing the key. The read site already goes through
+    // `runtime_var_os`, which serves a DECLARED name from the latched snapshot
+    // and only falls through to a live `getenv` for an undeclared one — so
+    // this row is the whole fix.
+    E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None },
     E { group: Group::JIT, token: "ir-linear-scan", on_key: Some("CRATONVM_JIT_IR_LINEAR_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None },
     // Default-ON A/B lever: `ir_lower::reloc_emit_enabled` reads `0`/`false`.
@@ -1198,6 +1213,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "await-shortcircuit", on_key: None, off_key: Some("CRATONVM_AWAIT_NO_SHORTCIRCUIT"), off_word: None },
     E { group: Group::THREADS, token: "default-watchdog", on_key: None, off_key: Some("CRATONVM_DISABLE_DEFAULT_WATCHDOG"), off_word: None },
     E { group: Group::THREADS, token: "default-watchdog-sec", on_key: Some("CRATONVM_DEFAULT_WATCHDOG_SEC"), off_key: None, off_word: None },
+    // W7-23/W7-27: the A/B for the thread-container pair. Registration (adding a
+    // thread to its ThreadContainer on start) and de-registration (Thread.exit
+    // removing it) are two halves that MUST ship together -- the add alone turns
+    // "join() waits for nothing" into "join() waits forever", measured. This
+    // selects both halves at once so the pair can be A/B'd in one binary.
+    E { group: Group::THREADS, token: "thread-containers", on_key: Some("CRATONVM_THREAD_CONTAINERS"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "eqe-sync-execute", on_key: Some("CRATONVM_EQE_SYNC_EXECUTE"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "exec-depth-ceiling", on_key: Some("CRATONVM_EXEC_DEPTH_CEILING"), off_key: None, off_word: None },
     // L19 — `ForkJoinTask.fork()` runs the body inline instead of only marking

@@ -93,9 +93,30 @@ public class RDataInputFastPull {
         return acc;
     }
 
+    /** Observables reach run.sh's cross-VM diff only on a `CK ` line. */
+    static int checks;
+
+    static void ck(String key, String value) {
+        System.out.println("CK RDataInputFastPull " + key + "=" + value);
+    }
+
+    /**
+     * Print an observable AND assert it, against the value MEASURED on
+     * Adoptium 25.0.3.9. The print feeds the cross-VM diff; the assertion is
+     * what keeps this armed on a host with no HotSpot, where run.sh skips the
+     * diff for every class and says so out loud.
+     */
+    static void ckEq(String key, String want, String got) {
+        ck(key, got);
+        checks++;
+        if (!want.equals(got)) {
+            throw new AssertionError("RDataInputFastPull: " + key + " = " + got + ", want " + want);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         byte[] data = record();
-        System.out.println("data.length=" + data.length);
+        ckEq("data.length", "1470", String.valueOf(data.length));
 
         // 1. Typed round trip through buffers of many sizes. Every size that is
         //    not a multiple of a record field straddles the boundary somewhere,
@@ -103,13 +124,16 @@ public class RDataInputFastPull {
         for (int size : new int[] {1, 2, 3, 5, 7, 13, 64, 97, 1024, 8192}) {
             DataInputStream in =
                     new DataInputStream(new BufferedInputStream(new ByteArrayInputStream(data), size));
-            System.out.println("typed buf=" + size + " acc=" + typedPass(in));
+            // Every buffer size must produce the SAME accumulator: that is
+            // the property, and a partial fast pull breaks it at exactly the
+            // sizes that straddle a field boundary.
+            ckEq("typed.buf" + size + ".acc", "-2285467307761758651", String.valueOf(typedPass(in)));
         }
 
         // 2. No BufferedInputStream at all - DataInputStream straight onto a
         //    ByteArrayInputStream, the other class the fast path accepts.
-        System.out.println(
-                "typed bais acc=" + typedPass(new DataInputStream(new ByteArrayInputStream(data))));
+        ckEq("typed.bais.acc", "-2285467307761758651",
+                String.valueOf(typedPass(new DataInputStream(new ByteArrayInputStream(data)))));
 
         // 3. Position coherence: the SAME BufferedInputStream is read both
         //    through the DataInputStream and directly. If a typed read advances
@@ -127,7 +151,7 @@ public class RDataInputFastPull {
             mixed.append(got).append(':').append(Arrays.toString(three)).append(';');
             mixed.append(typed.readInt()).append('|');
         }
-        System.out.println("mixed=" + mixed.toString().hashCode());
+        ckEq("mixed", "1848228255", String.valueOf(mixed.toString().hashCode()));
 
         // 4. mark/reset must survive typed reads. Serving from the buffer never
         //    touches markpos, so a reset after a typed read has to replay the
@@ -145,7 +169,8 @@ public class RDataInputFastPull {
         for (int i = 0; i < 8; i++) {
             second = second * 31 + mdis.readLong();
         }
-        System.out.println("markreset equal=" + (first == second) + " v=" + first);
+        ckEq("markreset.equal", "true", String.valueOf(first == second));
+        ckEq("markreset.v", "2563681903699097980", String.valueOf(first));
 
         // 5. An overridden read() must be honoured. FlipStream is NOT exactly
         //    java.io.BufferedInputStream, so the fast path must decline and let
@@ -157,7 +182,7 @@ public class RDataInputFastPull {
         for (int i = 0; i < 60; i++) {
             facc = facc * 31 + flipped.readInt();
         }
-        System.out.println("flipped=" + facc);
+        ckEq("flipped", "-8812924044269038387", String.valueOf(facc));
 
         // 6. readUTF with a payload far larger than the buffer, so one call
         //    spans many refills.
@@ -173,16 +198,17 @@ public class RDataInputFastPull {
         DataInputStream udis =
                 new DataInputStream(new BufferedInputStream(new ByteArrayInputStream(ub.toByteArray()), 37));
         String back = udis.readUTF();
-        System.out.println(
-                "utf ok=" + back.equals(big.toString()) + " len=" + back.length()
-                        + " tail=" + Integer.toHexString(udis.readInt()));
+        ckEq("utf.ok", "true", String.valueOf(back.equals(big.toString())));
+        ckEq("utf.len", "4000", String.valueOf(back.length()));
+        ckEq("utf.tail", "5a5a5a5a", Integer.toHexString(udis.readInt()));
 
         // 7. skipBytes has to move the same position the typed reads use.
         DataInputStream sdis =
                 new DataInputStream(new BufferedInputStream(new ByteArrayInputStream(data), 29));
         sdis.readByte();
         int skipped = sdis.skipBytes(50);
-        System.out.println("skipped=" + skipped + " next=" + sdis.readInt());
+        ckEq("skipped", "50", String.valueOf(skipped));
+        ckEq("skipped.next", "-1077936128", String.valueOf(sdis.readInt()));
 
         // 8. EOF must still be EOF - a fast path that over-reports available
         //    bytes would return zeros instead of throwing.
@@ -196,8 +222,9 @@ public class RDataInputFastPull {
         } catch (EOFException e) {
             eof = "EOFException";
         }
-        System.out.println("eof=" + eof);
+        ckEq("eof", "EOFException", eof);
 
-        System.out.println("PASS RDataInputFastPull");
+        System.out.println("CK RDataInputFastPull checks=" + checks);
+        System.out.println("PASS RDataInputFastPull (" + checks + " checks)");
     }
 }

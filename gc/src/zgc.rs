@@ -5191,9 +5191,34 @@ impl GarbageCollector for ZgcRealHeap {
             cratonvm_types::compact_object_field_storage(header, index)
         {
             let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
-            return unsafe {
-                cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed)
-            };
+            let v = unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) };
+            if !storage.is_reference() {
+                return v;
+            }
+            // Un-box the wrapper `set_field` installs for a non-reference value
+            // stored into a declared-REFERENCE slot. This heap's `set_field`
+            // used to hand such a value to `write_compact_field`, whose
+            // `FieldStorageKind::Reference` arm maps every non-`Object` value
+            // to raw 0 — so the write was silently dropped to null while
+            // `gen_heap` boxed it and the legacy 16-byte cell kept it verbatim.
+            // ZGC has been the default since 2026-08-10, so the discarding
+            // answer was the one most code actually got
+            // (W7-84-primitive-in-reference-store.md).
+            //
+            // `autobox_payload` is the same validated read the reference-ARRAY
+            // path here has always used; `crate::autobox` puts it behind the
+            // process-wide latch so a run that never boxes never reaches it.
+            return crate::autobox::unbox_reference_slot(
+                v,
+                |r| {
+                    self.is_object_address(r.as_ptr() as usize)?;
+                    // SAFETY: `is_object_address` confirmed `r` is a registered
+                    // live allocation base, so its first HEADER_SIZE bytes are
+                    // a header.
+                    Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+                },
+                |r| <Self as GarbageCollector>::get_field(self, r, 0),
+            );
         }
         // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
         // answers `None` for TWO reasons and only the first licenses the
@@ -5248,6 +5273,27 @@ impl GarbageCollector for ZgcRealHeap {
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(header, index)
         {
+            // A non-reference value into a declared-REFERENCE slot: box it,
+            // rather than let `write_compact_field`'s `Reference` arm map it to
+            // raw 0 and drop the write to null. Boxing is what `gen_heap` has
+            // always done for fields, what all four heaps (this one included)
+            // have always done for reference ARRAY elements, and what the
+            // legacy 16-byte cell does by construction
+            // (W7-84-primitive-in-reference-store.md).
+            //
+            // The allocation happens BEFORE `ptr` is taken. It does not have to
+            // on this heap — ZGC does not move an object under its own mutator
+            // — but the four implementations are kept in the same order so a
+            // reader diffing them sees no difference to explain.
+            let value = if storage.is_reference() {
+                crate::autobox::box_for_reference_slot(value, header.class_id, index, |v| {
+                    let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                    <Self as GarbageCollector>::set_field(self, wrapper, 0, v);
+                    wrapper
+                })
+            } else {
+                value
+            };
             let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
             unsafe {
                 cratonvm_types::write_compact_field(
@@ -5357,6 +5403,9 @@ impl GarbageCollector for ZgcRealHeap {
                         // matching `Heap::set_array_element`.
                         let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, other);
+                        // Arm the process-wide wrapper latch — see the matching
+                        // note in `GenerationalHeap::set_array_element`.
+                        crate::autobox::note_wrapper_created();
                         // Re-fetch base: alloc_object cannot move existing
                         // objects (non-moving heap), so `base` is still valid,
                         // but reads are clearer with the explicit comment.
@@ -5510,6 +5559,18 @@ impl GarbageCollector for ZgcRealHeap {
             if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
                 work.extend(metadata);
             }
+            // Same owner-based propagation Generational's non-moving young
+            // marker and old-gen BFS already do (`gen_heap.rs`): a native
+            // side-table entry is only reachable through the Java collection
+            // object that owns it, so it must be traced from a CONFIRMED-live
+            // owner, not rooted unconditionally for every overlay regardless
+            // of reachability. `native_roots.rs`'s `scan_collection_overlays`
+            // relies on this loop running before it defers to us.
+            for overlay_ref in
+                crate::external_roots::external_roots_for_owner(addr, Some(class_id))
+            {
+                work.push(overlay_ref.as_ptr() as usize);
+            }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -5561,6 +5622,14 @@ impl GarbageCollector for ZgcRealHeap {
                         cratonvm_types::metadata_pin::roots_for_loader(a)
                     {
                         work.extend(metadata);
+                    }
+                    // Same owner-based overlay propagation as the main mark
+                    // loop above — a resurrected finalizable object's own
+                    // side-table entries must survive with it.
+                    for overlay_ref in
+                        crate::external_roots::external_roots_for_owner(a, Some(class_id))
+                    {
+                        work.push(overlay_ref.as_ptr() as usize);
                     }
                 }
             }

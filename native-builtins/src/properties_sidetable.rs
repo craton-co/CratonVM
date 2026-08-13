@@ -3444,10 +3444,13 @@ fn build_store_text(
     // `System.lineSeparator()`. Match it so callers that re-split the output on
     // the platform separator (e.g. Spring's `SortedProperties.store`, which does
     // `contents.split(System.lineSeparator())`) see the right line boundaries.
+    // The fallback is the platform default, not LF: an unseeded property here
+    // used to make `store` write LF-terminated lines that
+    // `split(System.lineSeparator())` then failed to split on Windows.
     let eol = ctx
         .get_system_property("line.separator")
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "\n".to_string());
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     // Pin `this` across the Date allocation so the entry walk below sees the
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);
@@ -3498,10 +3501,17 @@ fn native_properties_store_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
     let out_cur = ctx.read_native_pin(out_pin, out);
     let write_res = ctx.invoke_virtual(out_cur, "write", "([B)V", &[Value::Object(Some(arr))]);
+    // The flush PROPAGATES. `Properties.store(OutputStream, String)` is
+    // `store0(new BufferedWriter(new OutputStreamWriter(out, ISO_8859_1)), …)`
+    // and `store0` ends in a bare `bw.flush()` under `throws IOException` with
+    // no `catch`. On a BufferedWriter that flush IS the byte delivery, so
+    // dropping its failure made `store` report success over a file that was
+    // never written. W7-57-close-flush-swallow-sweep.md
     let out_cur = ctx.read_native_pin(out_pin, out);
-    let _ = ctx.invoke_virtual(out_cur, "flush", "()V", &[]);
+    let flush_res = ctx.invoke_virtual(out_cur, "flush", "()V", &[]);
     ctx.unpin_native_roots(this_pin);
     write_res?;
+    flush_res?;
     Ok(None)
 }
 
@@ -3535,10 +3545,16 @@ fn native_properties_store_writer(ctx: &mut dyn NativeContext, args: &[Value]) -
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(str_obj))],
     );
+    // The flush PROPAGATES, exactly as in the `OutputStream` overload above:
+    // `store(Writer, String)` wraps the writer in a `BufferedWriter` when it
+    // is not already one and calls the same `store0`, whose last statement is
+    // a bare `bw.flush()` under `throws IOException`.
+    // W7-57-close-flush-swallow-sweep.md
     let writer_cur = ctx.read_native_pin(writer_pin, writer);
-    let _ = ctx.invoke_virtual(writer_cur, "flush", "()V", &[]);
+    let flush_res = ctx.invoke_virtual(writer_cur, "flush", "()V", &[]);
     ctx.unpin_native_roots(this_pin);
     write_res?;
+    flush_res?;
     Ok(None)
 }
 

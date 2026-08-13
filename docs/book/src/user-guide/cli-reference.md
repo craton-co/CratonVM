@@ -215,7 +215,7 @@ Not wired to a CLI flag, but relevant when running GPU-offloaded code:
 | Flag | Description |
 |------|-------------|
 | `-D<key>=<value>` / `-D<key>` | Set a Java system property. Extracted before option parsing. |
-| `-ea` / `-da` / `-esa` / `-dsa` (and `-enableassertions`, etc.) | Assertion flags. **Accepted and ignored** — CratonVM does not currently evaluate `assert` from these flags (use `CRATONVM_ENABLE_ASSERTIONS`). |
+| `-ea` / `-da` / `-esa` / `-dsa` (and `-enableassertions`, etc.) | Assertion flags, **honoured**: the unscoped spellings set `CRATONVM_ENABLE_ASSERTIONS` for the run, so real `assert` bytecode throws. `-ea` and `-esa` enable, `-da` and `-dsa` disable, and an explicit `-da` also overrides an inherited `CRATONVM_ENABLE_ASSERTIONS`. The **scoped** forms (`-ea:some.pkg...`, `-da:some.Class`) are still accepted and ignored — the switch is JVM-wide with no per-package granularity, and reading `-ea:some.pkg` as global-enable would turn assertions on for classes the caller left out. `CRATONVM_DBG_ARGS=1` names each one it skips. |
 
 ## Accepted-and-ignored HotSpot flags
 

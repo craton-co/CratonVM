@@ -58,6 +58,12 @@ pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {
 
 pub mod a2dbg;
 pub mod arena;
+// The ONE implementation of "a non-reference value was stored into a slot the
+// class declares as a reference" (W7-84-primitive-in-reference-store.md).
+// Crate-private on purpose: it exists so `gen_heap`, `zgc`, `g1` and `heap`
+// cannot drift apart again, and a public re-export would invite a fifth
+// caller with a fifth opinion.
+mod autobox;
 pub mod blocked_access_debug;
 pub mod card_table;
 pub mod class_unloading;

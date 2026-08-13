@@ -1261,9 +1261,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // FileSystemProvider.isSameFile(Path, Path) — abstract on the base, so the
     // synthetic provider lacking it made `Files.isSameFile` dispatch to the
-    // abstract method ("no Code attribute" AbstractMethodError). The default
-    // provider's same-file check is path equality (real-path resolution for
-    // symlinks omitted); approximate with `Path.equals`.
+    // abstract method ("no Code attribute" AbstractMethodError).
+    //
+    // The comment that used to sit here said the default provider's same-file
+    // check *is* path equality. It is not: equality is the provider's FAST PATH.
+    // Both default providers return early on `file1.equals(obj2)` and otherwise
+    // read the IDENTITY of both files — `st_dev`/`st_ino` on Unix, volume serial
+    // plus file index via `GetFileInformationByHandle` on Windows — and compare
+    // that. So the JDK answers `true` and this answered `false` for every pair
+    // naming one file by two spellings: a hard link, a symlink and its target,
+    // `dir/x` versus `dir/sub/../x`, an absolute versus a relative path, and on
+    // Windows two spellings differing only in case or in 8.3 shortening.
+    //
+    // That is not a harmless approximation. `Files.isSameFile` is how a caller
+    // asks "am I about to copy this file onto itself", so `false` is the answer
+    // that lets the destructive branch run — W7-8's species, not an exception to
+    // it. The identity read is `native-io`'s `paths_name_the_same_file`, which
+    // carries the JDK's equality fast path itself.
     r.register(
         fsp,
         "isSameFile",
@@ -1277,11 +1291,37 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(p))) => *p,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let eq = matches!(
-                ctx.invoke_virtual(p1, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(p2))]),
-                Ok(Some(Value::Int(n))) if n != 0
-            );
-            Ok(Some(Value::Int(i32::from(eq))))
+            let s1 = p57_read_path(ctx, p1);
+            let s2 = p57_read_path(ctx, p2);
+            // The VFS screen is at the CALL SITE and not in the helper, and it
+            // has to be: a jar/jrt-encoded path names no host file, so handing
+            // it to an identity read would `stat` a path that cannot exist and
+            // turn a legitimate `false` into a `NoSuchFileException`. Inside an
+            // archive, two entries are the same entry exactly when they spell
+            // the same entry — there are no links and no `..` to resolve — so
+            // equality is the whole answer there rather than a fast path.
+            if vfs_decode(&s1).is_some() || vfs_decode(&s2).is_some() {
+                return Ok(Some(Value::Int(i32::from(s1 == s2))));
+            }
+            match cratonvm_native_io::file_channel::paths_name_the_same_file(
+                std::path::Path::new(&s1),
+                std::path::Path::new(&s2),
+            ) {
+                Ok(same) => Ok(Some(Value::Int(i32::from(same)))),
+                // `Files.isSameFile` is declared `throws IOException` and the
+                // JDK's `NoSuchFileException` is what a caller gets when either
+                // path is absent — only reachable for two DIFFERENT spellings,
+                // because equal ones never touch the disk.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let missing = if std::path::Path::new(&s1).symlink_metadata().is_err() {
+                        s1
+                    } else {
+                        s2
+                    };
+                    Err(p57_no_such_file(ctx, &missing)?)
+                }
+                Err(e) => Err(p57_io_error(&e)),
+            }
         },
     );
 
@@ -2132,7 +2172,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // instrumenting both allocators and watching which one fires): `vm/src/vm/
     // vm_init.rs` calls `cratonvm_native_builtins::phases_late::
     // register_phase57_nio_file` DIRECTLY, in both the synthetic and the
-    // real-JDK arm (vm_init.rs:1788 and :2273). Everything registered in this
+    // real-JDK arm (vm_init.rs:2217 and :2763 as of 2026-08-12 — the two cited
+    // here had rotted by ~480 lines, so re-read them rather than trusting
+    // either pair). Everything registered in this
     // function — Path/Paths/Files, the p57 allocator — is live in the shipping
     // CLI, and it OVERRIDES `native-io`'s same-key registrations. What IS
     // synthetic-only is the phase-61 block (`register_p61_files_path`), which
@@ -5891,8 +5933,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
             // Legacy synthetic fallback (only if the real FileChannelImpl
             // construction is unavailable — keeps prior behavior intact).
-            let fc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1)?;
-            ctx.set_field(fc, 0, Value::Int(fd_id as i32));
+            //
+            // This is the ONE producer of a literal `java/nio/channels/FileChannel`
+            // that is live in real-JDK mode: `native_fc_open` is dropped there by
+            // the `drop_real_layout_synthetic` filter in `native-api`'s registry,
+            // scoped to `open` by name. The width and the slot both come from
+            // `synthetic_file_channel` so this fallback and every accessor in both
+            // crates share one map — W7-72-ssc-socket-and-filechannel.md. Writing
+            // the fd into slot 0 here used to put an `Int` in the real `closeLock`
+            // reference, where the descriptor coercion degraded it to null and the
+            // fd was lost outright.
+            let fc_slots = cratonvm_native_api::synthetic_file_channel::alloc_slots(ctx);
+            let fc =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", fc_slots)?;
+            cratonvm_native_api::synthetic_file_channel::set_fd_value(
+                ctx,
+                fc,
+                Value::Int(fd_id as i32),
+            );
             Ok(Some(Value::Object(Some(fc))))
         },
     );
@@ -5905,164 +5963,45 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // outer `Throwable` catch + `Exit.exit(1)`. Register a minimal set
     // of FileChannel natives that drive the synthetic via fd_table.
     let fc_cls = "java/nio/channels/FileChannel";
-    r.register(fc_cls, "size", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
-            Value::Int(v) if v >= 0 => v as u32,
-            _ => return Ok(Some(Value::Long(0))),
-        };
-        let sz = ctx.fd_table().file_size(fd_id).unwrap_or(0);
-        Ok(Some(Value::Long(sz as i64)))
-    });
-    r.register(fc_cls, "position", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
-            Value::Int(v) if v >= 0 => v as u32,
-            _ => return Ok(Some(Value::Long(0))),
-        };
-        let pos = ctx
-            .fd_table()
-            .rw_seek(fd_id, std::io::SeekFrom::Current(0))
-            .unwrap_or(0);
-        Ok(Some(Value::Long(pos as i64)))
-    });
+    // THE SEVEN SHARED TRIPLES. This registrar is the one `vm/src/vm/vm_init.rs`
+    // calls directly in BOTH shipping arms (`:2217` and `:2763`), so in
+    // `--real-jdk` and `--jdk-only` these registrations are the ONLY ones that
+    // exist for these seven triples. `register_phase57_file_channel` registers
+    // the same seven, later within `register_phase57_natives` (line 21 vs line
+    // 36), and that registrar is reachable ONLY from `register_synthetic_overrides`
+    // — so it exists at all only under `--synthetic-jdk`, where it therefore
+    // WINS by running last.
+    //
+    // Per mode, stated because getting this backwards is what left W7-8 §3.1's
+    // fixes in a registrar neither shipping mode calls:
+    //
+    //   `--real-jdk`, `--jdk-only`  → only THIS registrar's copies exist.
+    //   `--synthetic-jdk`           → both exist; the file-channel one wins.
+    //
+    // Both now name the SAME functions, so the outcome no longer depends on the
+    // ordering at all. That is the fix, and it is why neither registration was
+    // deleted: deleting this one would change the shipping modes' behaviour to
+    // whatever the synthetic registrar does *only if that registrar existed*,
+    // which in a default build it does not; deleting the other would change only
+    // `--synthetic-jdk`, which is not the mode that had the defect.
+    //
+    // The bodies live next to `register_phase57_file_channel` (`p57_fc_*`),
+    // beside the five triples that are still synthetic-only.
+    r.register(fc_cls, "size", "()J", p57_fc_size);
+    r.register(fc_cls, "position", "()J", p57_fc_position);
     r.register(
         fc_cls,
         "position",
         "(J)Ljava/nio/channels/FileChannel;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let pos = match args.get(1) {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            let fd_id = match ctx.get_field(this, 0) {
-                Value::Int(v) if v >= 0 => v as u32,
-                _ => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let _ = ctx
-                .fd_table()
-                .rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64));
-            Ok(Some(Value::Object(Some(this))))
-        },
+        p57_fc_position_set,
     );
-    r.register(fc_cls, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
-        // this native is registered on the literal "java/nio/channels/FileChannel"
-        // class to service a synthetic single-field FileChannel, but native
-        // overrides shadow ALL dispatch for that class name -- including a real
-        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
-        // declared in the grandparent AbstractInterruptibleChannel, not
-        // FileChannel itself) through a FileChannel-typed call site. Detect a
-        // real instance and replicate AbstractInterruptibleChannel.close()'s
-        // contract by calling the real implCloseChannel() bytecode instead of
-        // treating field 0 as a synthetic fd.
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                return Ok(None);
-            }
-            ctx.set_field_by_name(this, "closed", Value::Int(1));
-            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
-            return Ok(None);
-        }
-        if let Value::Int(v) = ctx.get_field(this, 0) {
-            if v >= 0 {
-                let _ = ctx.fd_table().close(v as u32);
-            }
-        }
-        Ok(None)
-    });
-    r.register(fc_cls, "isOpen", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                    0
-                } else {
-                    1
-                },
-            )));
-        }
-        Ok(Some(Value::Int(1)))
-    });
-    // write(ByteBuffer)I — `FileChannel.write` is abstract; cassandra's
+    r.register(fc_cls, "close", "()V", p57_fc_close);
+    r.register(fc_cls, "isOpen", "()Z", p57_fc_is_open);
+    // `FileChannel.write` is abstract; cassandra's
     // BufferedDataOutputStreamPlus.doFlush drives a synthetic FileChannel
-    // (from `newFileChannel`) through it. ByteBuffer layout:
-    // field 0 = backing array, 1 = position, 2 = limit.
-    r.register(fc_cls, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
-            Value::Int(v) if v >= 0 => v as u32,
-            _ => {
-                return Err(RuntimeError::IOException {
-                    message: "Channel closed".into(),
-                }
-                .into())
-            }
-        };
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let remaining = bb_lim.saturating_sub(bb_pos);
-        if remaining == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut data = vec![0u8; remaining];
-        if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-            for (i, d) in data.iter_mut().enumerate() {
-                *d = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
-            }
-        }
-        let n = ctx
-            .fd_table()
-            .rw_write(fd_id, &data)
-            .map_err(|e| RuntimeError::IOException {
-                message: e.to_string(),
-            })?;
-        ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-        Ok(Some(Value::Int(n as i32)))
-    });
-    // read(ByteBuffer)I — counterpart of write above.
-    r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = match ctx.get_field(this, 0) {
-            Value::Int(v) if v >= 0 => v as u32,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let remaining = bb_lim.saturating_sub(bb_pos);
-        if remaining == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut buf = vec![0u8; remaining];
-        match ctx.fd_table().rw_read(fd_id, &mut buf) {
-            Ok(0) => Ok(Some(Value::Int(-1))),
-            Ok(n) => {
-                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                    for (i, b) in buf.iter().take(n).enumerate() {
-                        ctx.set_array_element(arr, bb_pos + i, Value::Int(*b as i8 as i32));
-                    }
-                }
-                ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                Ok(Some(Value::Int(n as i32)))
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
-        }
-    });
+    // (from `newFileChannel`) through it.
+    r.register(fc_cls, "write", "(Ljava/nio/ByteBuffer;)I", p57_fc_write);
+    r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", p57_fc_read);
 
     // --- Files additional methods ---
     r.register(
@@ -6236,6 +6175,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // distinguishes the two: when slot 0 is not an `Int`, the object is a
     // real BufferedWriter and the native forwards to its wrapped `out`
     // Writer so the genuine OutputStreamWriter/StreamEncoder bytecode runs.
+    //
+    // Two things every arm below now gets right, both of which used to answer a
+    // plausible success:
+    //
+    //   * The delegating arms discarded the delegate's outcome
+    //     (`let _ = ctx.invoke_virtual(out, "write", …)`). The wrapped
+    //     `OutputStreamWriter` raising `IOException` — a full disk, a broken
+    //     pipe, a closed underlying stream — was therefore invisible: the
+    //     write returned normally with nothing written, and a caller inside
+    //     `try (BufferedWriter w = …)` had no failure to catch. `Writer.write`
+    //     is specified "@throws IOException If an I/O error occurs", and a
+    //     BufferedWriter that does not report its delegate's error is a
+    //     BufferedWriter that cannot report any error at all.
+    //   * `bw_delegate_out` returning `None` in the default build means
+    //     `out == null`, and `BufferedWriter.close()` is exactly what nulls
+    //     `out` ("finally { out = null; cb = null; }"). Every write method in
+    //     the real class opens with `ensureOpen()` —
+    //     "if (out == null) throw new IOException("Stream closed")" — so the
+    //     `None => return Ok(None)` arms were silently DISCARDING writes to a
+    //     closed writer, the exact use-after-close the JDK raises on.
     let bw_class = "java/io/BufferedWriter";
     r.register(bw_class, "write", "(Ljava/lang/String;II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -6243,44 +6202,85 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let s = args.get(1).cloned().unwrap_or(Value::Object(None));
             let off = args.get(2).cloned().unwrap_or(Value::Int(0));
             let len = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len]);
+            ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len])?;
             return Ok(None);
         }
         let text = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or_default() as usize;
+        // Keep these as the signed Java `int`s they are: casting to `usize`
+        // first turns a negative offset into a colossal positive one, which the
+        // clamp below then quietly turned into "write nothing".
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or_default();
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
             Some(fd) => fd,
-            None => return Ok(None),
+            None => return Err(bw_stream_closed()),
         };
-        let end = off.saturating_add(len).min(text.chars().count());
-        let sub: String = text
-            .chars()
-            .skip(off)
-            .take(end.saturating_sub(off))
-            .collect();
-        let _ = ctx.fd_table().write_string(fd, &sub);
+        // `BufferedWriter.write(String,int,int)` is the one overload in this
+        // class whose bounds contract is asymmetric, and the old
+        // `.min(text.chars().count())` collapsed both halves of it into a
+        // silent truncation. Its @implSpec: "While the specification of this
+        // method in the superclass recommends that an IndexOutOfBoundsException
+        // be thrown if len is negative or off + len is negative, the
+        // implementation in this class does not throw such an exception in
+        // these cases but instead simply writes no characters." Its @throws:
+        // "IndexOutOfBoundsException If off is negative, or off + len is
+        // greater than the length of the given string."
+        //
+        // So a negative `len` is a no-op and a run past the end is an
+        // exception — `w.write("ab", 0, 5)` MUST throw. The units are UTF-16
+        // code units, because that is what `String.length()` and the
+        // `s.getChars(b, b + d, …)` the real method performs both count; the
+        // old code measured in code POINTS, so the check and the slice
+        // disagreed for any supplementary character.
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let total = units.len() as i64;
+        let end = i64::from(off) + i64::from(len);
+        // `StringIndexOutOfBoundsException`, not the bare supertype: the real
+        // method reaches this through `String.getChars`, whose
+        // `checkBoundsBeginEnd` raises the String-specific subclass, and a
+        // `catch (StringIndexOutOfBoundsException)` does not match a supertype
+        // instance while `catch (IndexOutOfBoundsException)` matches both.
+        if len > 0 && (off < 0 || end > total) {
+            return Err(RuntimeError::StringIndexOutOfBoundsException {
+                index: off,
+                message: Some(format!("begin {off}, end {end}, length {total}")),
+            }
+            .into());
+        }
+        if len <= 0 {
+            return Ok(None);
+        }
+        let sub = String::from_utf16_lossy(&units[off as usize..end as usize]);
+        ctx.fd_table()
+            .write_string(fd, &sub)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(bw_class, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(out) = bw_delegate_out(ctx, this) {
             let c = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(out, "write", "(I)V", &[c]);
+            ctx.invoke_virtual(out, "write", "(I)V", &[c])?;
             return Ok(None);
         }
         let c = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u32;
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
             Some(fd) => fd,
-            None => return Ok(None),
+            None => return Err(bw_stream_closed()),
         };
         if let Some(ch) = char::from_u32(c) {
             let mut buf = [0u8; 4];
             let bytes = ch.encode_utf8(&mut buf).as_bytes();
-            let _ = ctx.fd_table().write_bytes(fd, bytes);
+            ctx.fd_table()
+                .write_bytes(fd, bytes)
+                .map_err(|e| RuntimeError::IOException {
+                    message: e.to_string(),
+                })?;
         }
         Ok(None)
     });
@@ -6290,69 +6290,112 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let arr = args.get(1).cloned().unwrap_or(Value::Object(None));
             let off = args.get(2).cloned().unwrap_or(Value::Int(0));
             let len = args.get(3).cloned().unwrap_or(Value::Int(0));
-            let _ = ctx.invoke_virtual(out, "write", "([CII)V", &[arr, off, len]);
+            ctx.invoke_virtual(out, "write", "([CII)V", &[arr, off, len])?;
             return Ok(None);
         }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("BufferedWriter.write: null char[]".into()),
+                }
+                .into())
+            }
         };
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
             Some(fd) => fd,
-            None => return Ok(None),
+            None => return Err(bw_stream_closed()),
         };
-        let cap = ctx.array_length(arr);
-        let end = off.saturating_add(len).min(cap);
-        let mut chars: Vec<u16> = Vec::with_capacity(end.saturating_sub(off));
-        for i in off..end {
+        let cap = ctx.array_length(arr) as i64;
+        // Unlike the `String` overload above, the `char[]` one range-checks
+        // BOTH ends: "@throws IndexOutOfBoundsException If off is negative, or
+        // len is negative, or off + len is negative or greater than the length
+        // of the given array" — the real body is a straight
+        // `Objects.checkFromIndexSize(off, len, cbuf.length)`. The two
+        // contracts differing by one clause is precisely why clamping cannot
+        // stand in for either of them.
+        let end = i64::from(off) + i64::from(len);
+        if off < 0 || len < 0 || end > cap {
+            return Err(RuntimeError::ioobe(
+                cratonvm_types::error::out_of_bounds_message::check_from_index_size(
+                    i64::from(off),
+                    i64::from(len),
+                    cap,
+                ),
+            )
+            .into());
+        }
+        let mut chars: Vec<u16> = Vec::with_capacity(len as usize);
+        for i in off as usize..end as usize {
             if let Value::Int(v) = ctx.get_array_element(arr, i) {
                 chars.push((v & 0xFFFF) as u16);
             }
         }
         let s = String::from_utf16_lossy(&chars);
-        let _ = ctx.fd_table().write_string(fd, &s);
+        ctx.fd_table()
+            .write_string(fd, &s)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(bw_class, "newLine", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sep = ctx
-            .get_system_property("line.separator")
-            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
+        let sep = p57_line_separator(ctx);
         if let Some(out) = bw_delegate_out(ctx, this) {
             let s = ctx.create_string(&sep);
-            let _ = ctx.invoke_virtual(
+            ctx.invoke_virtual(
                 out,
                 "write",
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(s))],
-            );
+            )?;
             return Ok(None);
         }
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
             Some(fd) => fd,
-            None => return Ok(None),
+            None => return Err(bw_stream_closed()),
         };
-        let _ = ctx.fd_table().write_string(fd, &sep);
+        ctx.fd_table()
+            .write_string(fd, &sep)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(bw_class, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(out) = bw_delegate_out(ctx, this) {
-            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            // A flush that reports success without the delegate having
+            // succeeded is the worst answer this class can give: `flush()` is
+            // exactly the call a caller makes to find out whether the bytes
+            // landed before it acts on that belief.
+            ctx.invoke_virtual(out, "flush", "()V", &[])?;
             return Ok(None);
         }
-        // BufWriter<File> flushes automatically on drop; explicit
-        // flush is a no-op in the direct-fd mode since each write
-        // already hits the buffered writer inside fd_table.
-        Ok(None)
+        // No delegate: either the synthetic-jdk fd-backed writer (nothing to do
+        // — `BufWriter<File>` flushes on drop and every write above already
+        // reached the buffered writer inside `fd_table`), or a null `out`,
+        // which in the default build means the writer is CLOSED. Real
+        // `BufferedWriter.flush()` opens with `ensureOpen()`, so the second
+        // case is a refusal, not a no-op. Probe the fd first so the
+        // synthetic-jdk arm keeps its no-op.
+        match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(_) => Ok(None),
+            None => Err(bw_stream_closed()),
+        }
     });
     r.register(bw_class, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(out) = bw_delegate_out(ctx, this) {
-            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
-            let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+            // `close()` flushes first and the real class lets that flush throw
+            // (`try (Writer w = out) { flushBuffer(); }`). Swallowing it is how
+            // a full disk turns into a clean `try`-with-resources exit and a
+            // truncated file nobody hears about.
+            ctx.invoke_virtual(out, "flush", "()V", &[])?;
+            ctx.invoke_virtual(out, "close", "()V", &[])?;
             return Ok(None);
         }
         let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
@@ -7318,6 +7361,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
         };
         let it_pin = ctx.pin_native_root(it);
+        // `Files.write(Path, Iterable<? extends CharSequence>, …)` terminates
+        // EVERY element with `System.lineSeparator()` — the JDK's own
+        // implementation is `for (CharSequence line : lines) { writer.append(line);
+        // writer.newLine(); }`, and `BufferedWriter.newLine()` is the platform
+        // separator. This used to push a bare `'\n'`, so on Windows CratonVM
+        // wrote `alpha\nbeta\n` where HotSpot writes `alpha\r\nbeta\r\n`.
+        //
+        // The sibling `Files.writeString`/`Files.write(byte[])` deliberately
+        // append NOTHING, and that asymmetry is the whole reason this is easy to
+        // get backwards: only the Iterable overload has lines to terminate.
+        //
+        // Read once, before the loop: the iteration below re-enters Java, and a
+        // property lookup per element would be both slower and — if some
+        // element's `toString` changed the property — inconsistent within a
+        // single file.
+        let sep = p57_line_separator(ctx);
         let mut out = String::new();
         loop {
             let it = ctx.read_native_pin(it_pin, it);
@@ -7347,7 +7406,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 }
             });
             out.push_str(&s);
-            out.push('\n');
+            out.push_str(&sep);
         }
         // The iteration above re-entered Java (`hasNext`/`next`/`toString`), so
         // the pinned `Path` is the only reference still safe to return.
@@ -7379,6 +7438,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.set_category(__prev_cat);
     ()
+}
+
+/// The platform line separator, as `System.lineSeparator()` reports it.
+///
+/// One function rather than the open-coded copies this module and its
+/// neighbours grew: `Files.write(Path, Iterable)`, `BufferedWriter.newLine()`
+/// and `Properties.store` must all terminate a line the same way, and the way
+/// they came to disagree is that each read the property — or failed to — on its
+/// own. The `line.separator` property is the authority, because a
+/// `-Dline.separator=` override has to be honoured and a bare `cfg!(windows)`
+/// cannot see one; the compile-time platform default is the fallback for a VM
+/// so early in bootstrap that no property map exists yet, and it must be
+/// `"\r\n"` on Windows rather than the `"\n"` three of these fallbacks carried.
+pub(crate) fn p57_line_separator(ctx: &dyn NativeContext) -> String {
+    ctx.get_system_property("line.separator")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string())
 }
 
 pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
@@ -8303,6 +8379,71 @@ pub(crate) struct P57OpenFlags {
     /// `CopyOption`, so it is legal in every `open`/`newXStream` varargs list —
     /// see [`p57_nofollow_reject`] for what it obliges us to do.
     pub nofollow: bool,
+    /// `StandardOpenOption.READ`. Harmless on the input side (it is what an
+    /// input stream is), and a **refusal** on the output side — see
+    /// [`fsp_output_stream_option_refusal`].
+    pub read: bool,
+    /// `StandardOpenOption.WRITE`. Implied on the output side and a **refusal**
+    /// on the input side — see [`fsp_input_stream_option_refusal`].
+    pub write: bool,
+}
+
+/// The refusal `FileSystemProvider.newInputStream` owes an option list that
+/// asks for writing:
+///
+/// ```java
+/// for (OpenOption opt: options) {
+///     if (opt == StandardOpenOption.APPEND || opt == StandardOpenOption.WRITE)
+///         throw new UnsupportedOperationException("'" + opt + "' not allowed");
+/// }
+/// ```
+///
+/// — "All `OpenOption` values except for `APPEND` and `WRITE` are allowed."
+///
+/// Note the type: `UnsupportedOperationException` here and
+/// `IllegalArgumentException` in [`fsp_output_stream_option_refusal`], for the
+/// mirror-image mistake. That is not an inconsistency to tidy up; it is what the
+/// two JDK methods do, and a caller distinguishing them by `catch` clause sees
+/// the difference.
+///
+/// Accepting these silently was the same defect as the scanner reading only
+/// `nofollow`: an unrecognised or illegal option was taken as consent, so
+/// `Files.newInputStream(p, WRITE)` handed back a read-only stream and the
+/// caller's first write failed somewhere unrelated.
+fn fsp_input_stream_option_refusal(flags: P57OpenFlags) -> Option<MethodCallFailed> {
+    // The JDK reports whichever comes first in the caller's array; this scan
+    // has already collapsed the order, so APPEND is reported when both are
+    // present. Only the type and the fact of the refusal are load-bearing.
+    let bad = if flags.append {
+        "APPEND"
+    } else if flags.write {
+        "WRITE"
+    } else {
+        return None;
+    };
+    Some(
+        RuntimeError::UnsupportedOperationException {
+            message: format!("'{bad}' not allowed"),
+        }
+        .into(),
+    )
+}
+
+/// The refusal `FileSystemProvider.newOutputStream` owes `READ`:
+/// `if (opt == StandardOpenOption.READ) throw new IllegalArgumentException("READ not allowed");`
+///
+/// A *different* exception type from its sibling, deliberately — see
+/// [`fsp_input_stream_option_refusal`].
+fn fsp_output_stream_option_refusal(flags: P57OpenFlags) -> Option<MethodCallFailed> {
+    if !flags.read {
+        return None;
+    }
+    Some(
+        RuntimeError::IllegalArgumentException {
+            message: "READ not allowed".to_string(),
+        }
+        .into(),
+    )
 }
 
 /// Inspect a `Set<OpenOption>` or `OpenOption[]` for APPEND / CREATE_NEW /
@@ -8355,15 +8496,23 @@ pub(crate) fn fsp_scan_open_options(
                 if n.eq_ignore_ascii_case("NOFOLLOW_LINKS") {
                     flags.nofollow = true;
                 }
+                if n.eq_ignore_ascii_case("READ") {
+                    flags.read = true;
+                }
+                if n.eq_ignore_ascii_case("WRITE") {
+                    flags.write = true;
+                }
             }
         }
         return flags;
     }
     // Set: rely on toString() — `HashSet.toString()` yields `[APPEND, WRITE]`
     // etc. Substring match is robust enough and avoids invoking iterator().
-    // NB none of the three tokens is a substring of another StandardOpenOption
-    // name (in particular `TRUNCATE_EXISTING` does not contain `CREATE`), so
-    // the substring test cannot over-match.
+    // NB none of the five tokens is a substring of another StandardOpenOption
+    // or LinkOption name (in particular `TRUNCATE_EXISTING` does not contain
+    // `CREATE`, and no name contains `READ` or `WRITE` as a part), so the
+    // substring test cannot over-match. Re-check that claim before adding a
+    // sixth token — it is the property the whole branch rests on.
     if let Ok(Some(Value::Object(Some(s)))) =
         ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
     {
@@ -8372,6 +8521,8 @@ pub(crate) fn fsp_scan_open_options(
             flags.append = n.contains("APPEND");
             flags.create_new = n.contains("CREATE_NEW");
             flags.nofollow = n.contains("NOFOLLOW_LINKS");
+            flags.read = n.contains("READ");
+            flags.write = n.contains("WRITE");
         }
     }
     flags
@@ -8452,6 +8603,18 @@ pub(crate) fn fsp_new_input_stream(
 ) -> MethodCallResult {
     let path_obj = obj_arg(args, path_index)?;
     let p = p57_read_path(ctx, path_obj);
+    // ONE walk of the option list, every verdict taken from it. The scanner used
+    // to be asked only about `nofollow`, so an option list was read and then
+    // three quarters of it discarded — which is how `WRITE` came to be accepted
+    // here. Options sit one slot past the Path.
+    let opts = fsp_scan_open_options(ctx, args.get(path_index + 1).copied());
+    // Ahead of everything else, including the VFS branch: the JDK's check is the
+    // first statement of `FileSystemProvider.newInputStream`, before any path is
+    // resolved or any descriptor reserved, so a refusal leaves nothing behind
+    // and does not depend on the file existing.
+    if let Some(refused) = fsp_input_stream_option_refusal(opts) {
+        return Err(refused);
+    }
     // Jar/VFS entries have no file descriptor to hand out: they are already
     // decoded in memory and bounded by the entry size, so a snapshot is both
     // correct and the only option there.
@@ -8464,8 +8627,8 @@ pub(crate) fn fsp_new_input_stream(
     }
     // NOFOLLOW_LINKS is legal on the READ side too (`O_RDONLY|O_NOFOLLOW` still
     // ELOOPs), and callers use it to be sure they read the file they named and
-    // not whatever a link now points at. Options sit one slot past the Path.
-    if fsp_scan_open_options(ctx, args.get(path_index + 1).copied()).nofollow {
+    // not whatever a link now points at.
+    if opts.nofollow {
         if let Some(refused) = p57_nofollow_reject(&p) {
             return Err(refused);
         }
@@ -8561,6 +8724,13 @@ pub(crate) fn fsp_new_output_stream(
         .into());
     }
     let flags = fsp_scan_open_options(ctx, args.get(2).copied());
+    // `READ` is an `IllegalArgumentException` here, and the mirror-image mistake
+    // on the input side is an `UnsupportedOperationException` — the JDK means
+    // the difference. Checked before the open, like the JDK's own check, so a
+    // refusal creates and truncates nothing.
+    if let Some(refused) = fsp_output_stream_option_refusal(flags) {
+        return Err(refused);
+    }
     let (append, create_new) = (flags.append, flags.create_new);
     // NOFOLLOW_LINKS must refuse a symlink final component BEFORE the open —
     // otherwise we follow the link and truncate/overwrite its target, which is
@@ -8788,6 +8958,82 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Resu
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
     Ok(MethodCallFailed::ExceptionThrown(exc))
+}
+
+/// Build a *typed* `java.nio.channels.ClosedChannelException`.
+///
+/// Every `FileChannel` operation below is specified to raise this — not a bare
+/// `IOException` — once the channel is closed ("@throws ClosedChannelException
+/// If this channel is closed", `FileChannel.java`, on `position`, `position(J)`,
+/// `size`, `truncate`, `read`, `write`, `transferTo`, `transferFrom` and
+/// `force`). The type is what callers key on: a retry/reopen branch guarded by
+/// `catch (ClosedChannelException)` does not match a supertype instance, so
+/// reporting `IOException` deletes the branch the same way answering `-1` did.
+///
+/// It carries no payload — the JDK's constructor is the no-arg one and the
+/// class declares no fields — so this runs the real `<init>()V` rather than
+/// populating a field the way [`p57_no_such_file`] does. `new_object` failing
+/// (no such class in a synthetic image) falls back to the `IOException` this
+/// used to be, which is strictly no worse than before.
+pub(crate) fn p57_closed_channel(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/channels/ClosedChannelException")
+    {
+        let _ = ctx.invoke(
+            "java/nio/channels/ClosedChannelException",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(exc))],
+        );
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IOException {
+        message: "Channel closed".into(),
+    }
+    .into()
+}
+
+/// The exception `java.io.BufferedWriter.ensureOpen()` raises, verbatim:
+/// `if (out == null) throw new IOException("Stream closed")`. Every write,
+/// `newLine` and `flush` in the real class opens with that check, so a
+/// BufferedWriter whose `out` is null must refuse rather than accept the
+/// characters and drop them.
+fn bw_stream_closed() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Stream closed".into(),
+    }
+    .into()
+}
+
+/// `java.io.UTFDataFormatException`, the refusal `DataOutput.writeUTF` owes an
+/// over-long string: "First, the total number of bytes needed to represent all
+/// the characters of `s` is calculated. If this number is larger than `65535`,
+/// then a `UTFDataFormatException` is thrown."
+///
+/// Built through the real class so `catch (UTFDataFormatException)` matches. It
+/// extends `IOException`, so the fallback for an image that does not declare it
+/// is a weakening of the type rather than a different contract.
+fn raf_utf_data_format(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object("java/io/UTFDataFormatException") {
+        // Pin across `create_string` — a moving young GC there would relocate
+        // the fresh exception (native stale-local family).
+        let exc_pin = ctx.pin_native_root(exc);
+        let msg = ctx.create_string(message);
+        let exc_cur = ctx.read_native_pin(exc_pin, exc);
+        let _ = ctx.invoke(
+            "java/io/UTFDataFormatException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc_cur)), Value::Object(Some(msg))],
+        );
+        let exc_cur = ctx.read_native_pin(exc_pin, exc);
+        ctx.unpin_native_roots(exc_pin);
+        return MethodCallFailed::ExceptionThrown(exc_cur);
+    }
+    RuntimeError::IOException {
+        message: format!("UTFDataFormatException: {message}"),
+    }
+    .into()
 }
 
 /// Remove a single filesystem entry, choosing `remove_dir` vs `remove_file` the
@@ -11027,6 +11273,57 @@ pub(crate) fn copy_options_replace_existing(
     found
 }
 
+/// The first `CopyOption` that `Files.copy(InputStream, Path, CopyOption...)`
+/// does not support, as its own `toString()`.
+///
+/// JDK 25's body refuses **every** option but `REPLACE_EXISTING`:
+///
+/// ```java
+/// for (CopyOption opt: options) {
+///     if (opt == StandardCopyOption.REPLACE_EXISTING) replaceExisting = true;
+///     else throw new UnsupportedOperationException(opt + " not supported");
+/// }
+/// ```
+///
+/// Reading only `REPLACE_EXISTING` and ignoring the rest is the same defect as
+/// an option scanner that reads only `nofollow`: an option the caller passed to
+/// change the behaviour was taken as consent and then dropped. In particular
+/// `Files.copy(in, target, NOFOLLOW_LINKS)` is the one `NOFOLLOW_LINKS`
+/// assertion that needs no symlink and no privilege, so it is the only such
+/// assertion that can run on Windows.
+pub(crate) fn copy_options_unsupported(
+    ctx: &mut dyn NativeContext,
+    opts: Option<&Value>,
+) -> Option<String> {
+    let arr = match opts {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return None,
+    };
+    // Pin: the `toString()` probe re-enters Java and a moving young GC there
+    // would relocate the option array (native stale-local family).
+    let pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    let mut bad: Option<String> = None;
+    for i in 0..len {
+        let arr_cur = ctx.read_native_pin(pin, arr);
+        let Value::Object(Some(opt)) = ctx.get_array_element(arr_cur, i) else {
+            continue;
+        };
+        let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+        else {
+            continue;
+        };
+        let name = ctx.read_string(s).unwrap_or_default();
+        if !name.contains("REPLACE_EXISTING") {
+            bad = Some(name);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    bad
+}
+
 /// The `FS_ACCESS_*` bits named by a `java.nio.file.AccessMode[]` argument.
 ///
 /// An empty (or absent) array is the JDK's "existence only" request, which the
@@ -11408,7 +11705,16 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-            Err(_) => Ok(Some(Value::Int(-1))),
+            // `-1` is `RandomAccessFile.read`'s "the end of the file has been
+            // reached", and the same method declares "@throws IOException If
+            // the first byte cannot be read for any reason other than end of
+            // file". Answering EOF for a failure merged the two states the
+            // contract exists to keep apart, so a read loop stopped early and
+            // its caller kept the truncated result.
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -11455,7 +11761,16 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(_) => Ok(Some(Value::Int(-1))),
+            // `-1` is `RandomAccessFile.read`'s "the end of the file has been
+            // reached", and the same method declares "@throws IOException If
+            // the first byte cannot be read for any reason other than end of
+            // file". Answering EOF for a failure merged the two states the
+            // contract exists to keep apart, so a read loop stopped early and
+            // its caller kept the truncated result.
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -11480,7 +11795,16 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(_) => Ok(Some(Value::Int(-1))),
+            // `-1` is `RandomAccessFile.read`'s "the end of the file has been
+            // reached", and the same method declares "@throws IOException If
+            // the first byte cannot be read for any reason other than end of
+            // file". Answering EOF for a failure merged the two states the
+            // contract exists to keep apart, so a read loop stopped early and
+            // its caller kept the truncated result.
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
 
@@ -11665,8 +11989,21 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
             _ => 0,
         };
+        // "@throws IOException if pos is less than 0 or if an I/O error
+        // occurs" (`RandomAccessFile.seek`) — an `IOException`, not the
+        // `IllegalArgumentException` `FileChannel.position(long)` raises for
+        // the same input; the two classes genuinely differ here. The
+        // `pos.max(0)` this replaces answered a successful seek to the START of
+        // the file, so the next read returned the first record rather than the
+        // one the caller's (bad) arithmetic had asked for.
+        if pos < 0 {
+            return Err(RuntimeError::IOException {
+                message: format!("Negative seek offset: {pos}"),
+            }
+            .into());
+        }
         ctx.fd_table()
-            .rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
+            .rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos as u64))
             .map_err(|e| RuntimeError::IOException {
                 message: e.to_string(),
             })?;
@@ -11694,12 +12031,25 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let new_len = match args.get(1) {
-            Some(Value::Long(v)) => *v as u64,
-            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()) as u64,
+            Some(Value::Long(v)) => *v,
+            Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
             _ => 0,
         };
+        // `as u64` on a negative length wrapped to an enormous positive one and
+        // handed it to `rw_set_length`, so `setLength(-1)` asked the host to
+        // grow the file to 16 exabytes; whether that failed or succeeded, the
+        // answer the caller got back was not the refusal the contract names.
+        // `RandomAccessFile.setLength`: "@throws IOException If an I/O error
+        // occurs", and HotSpot's `SetFileLength`/`ftruncate` rejects a negative
+        // length as one.
+        if new_len < 0 {
+            return Err(RuntimeError::IOException {
+                message: format!("Negative file length: {new_len}"),
+            }
+            .into());
+        }
         ctx.fd_table()
-            .rw_set_length(fd_id as u32, new_len)
+            .rw_set_length(fd_id as u32, new_len as u64)
             .map_err(|e| RuntimeError::IOException {
                 message: e.to_string(),
             })?;
@@ -11804,7 +12154,19 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let len = u16::from_be_bytes(len_buf) as usize;
         let mut str_buf = vec![0u8; len];
         raf_read_fully(ctx, fd_id, &mut str_buf)?;
-        let s = String::from_utf8_lossy(&str_buf).to_string();
+        // MODIFIED UTF-8, not UTF-8. `DataInput.readUTF` reads "a string that
+        // has been encoded using a modified UTF-8 format", and it specifies
+        // `UTFDataFormatException` for "bytes [that] do not represent a valid
+        // modified UTF-8 encoding of a string". `String::from_utf8_lossy`
+        // answered `U+FFFD` for exactly those bytes — a silent substitution
+        // where the spec mandates a refusal — and got `U+0000` (`C0 80` in
+        // modified UTF-8) and every supplementary character (a SIX-byte
+        // surrogate pair, not one four-byte sequence) wrong even on valid input.
+        // `decode_modified_utf8` is `native-io`'s codec, the one
+        // `DataOutputStream.writeUTF` already uses, so the tree now has ONE
+        // spelling of this wire format instead of one per crate.
+        let s = cratonvm_native_io::decode_modified_utf8(&str_buf)
+            .map_err(|e| raf_utf_data_format(ctx, &e))?;
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11839,11 +12201,23 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
 
     // --- DataOutput interface methods ---
+    // Every `DataOutput` method below is `void` and declares "@throws
+    // IOException if an I/O error occurs", so the exception is the only channel
+    // it has to report a failed write. `let _ = ctx.fd_table().rw_write(..)`
+    // therefore made the whole family incapable of saying "no": a record-append
+    // loop against a full volume, a read-only reopen or a stale descriptor ran
+    // to completion, and the caller's next act was to record the rows as
+    // durable. The sibling `write([B)V` a hundred lines up already propagated,
+    // which is the tell that this was accident rather than policy.
     r.register(raf, "writeInt", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeLong", "(J)V", |ctx, args| {
@@ -11853,37 +12227,55 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Long(l)) => *l,
             _ => 0,
         };
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeShort", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeChar", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u16;
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeByte", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &[v]);
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &[v])
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeBoolean", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        let _ = ctx
-            .fd_table()
-            .rw_write(fd_id as u32, &[if v != 0 { 1 } else { 0 }]);
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &[if v != 0 { 1 } else { 0 }])
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeFloat", "(F)V", |ctx, args| {
@@ -11893,7 +12285,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Float(f)) => *f,
             _ => 0.0,
         };
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeDouble", "(D)V", |ctx, args| {
@@ -11903,7 +12299,11 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Double(d)) => *d,
             _ => 0.0,
         };
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &v.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeUTF", "(Ljava/lang/String;)V", |ctx, args| {
@@ -11913,12 +12313,39 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
             _ => String::new(),
         };
-        let bytes = s.as_bytes();
-        let len = bytes.len().min(65535) as u16;
-        let _ = ctx.fd_table().rw_write(fd_id as u32, &len.to_be_bytes());
-        let _ = ctx
-            .fd_table()
-            .rw_write(fd_id as u32, &bytes[..len as usize]);
+        // MODIFIED UTF-8, the wire format `DataOutput.writeUTF` names: `U+0000`
+        // is `C0 80` (never the one-byte `00`, so the payload can carry no NUL
+        // and a C reader cannot truncate it), and a supplementary character is a
+        // SIX-byte surrogate pair rather than one four-byte sequence.
+        // `s.as_bytes()` was plain UTF-8, which gets BOTH the length prefix and
+        // the payload wrong on those two inputs — and `readUTF` cannot tell,
+        // because the prefix it reads is the one this wrote. Same codec as
+        // `native-io`'s `native_raf_write_utf` and as `DataOutputStream.writeUTF`.
+        let bytes = cratonvm_native_io::encode_modified_utf8(&s);
+        // `.min(65535)` was the same defect as the `let _ =`s above wearing a
+        // different hat: the length prefix is a `u16`, so an over-long string
+        // was silently TRUNCATED — and cut at a byte index, so the tail could
+        // land mid-sequence — and `writeUTF` returned normally. The spec's
+        // answer is a refusal, quoted on `raf_utf_data_format`. `readUTF` next
+        // to this then read a short, possibly invalid record back with nothing
+        // to say it had ever been complete.
+        if bytes.len() > 65535 {
+            return Err(raf_utf_data_format(
+                ctx,
+                &format!("encoded string too long: {} bytes", bytes.len()),
+            ));
+        }
+        let len = bytes.len() as u16;
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &len.to_be_bytes())
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
+        ctx.fd_table()
+            .rw_write(fd_id as u32, &bytes)
+            .map_err(|e| RuntimeError::IOException {
+                message: e.to_string(),
+            })?;
         Ok(None)
     });
     r.register(raf, "writeBytes", "(Ljava/lang/String;)V", |ctx, args| {
@@ -11938,10 +12365,20 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
             _ => String::new(),
         };
-        for ch in s.chars() {
-            let _ = ctx
-                .fd_table()
-                .rw_write(fd_id as u32, &(ch as u16).to_be_bytes());
+        // `DataOutput.writeChars` writes "two bytes … for each character",
+        // i.e. one big-endian UTF-16 CODE UNIT per `char` of the Java string —
+        // so a supplementary character is TWO of them, the surrogate pair.
+        // `for ch in s.chars()` iterates Rust `char`s, i.e. code POINTS, and
+        // `ch as u16` then truncated every supplementary character to one wrong
+        // unit: the record went out one unit short with a mangled character in
+        // it, and nothing downstream could tell. `encode_utf16()` is the same
+        // sequence `String.charAt` walks.
+        for unit in s.encode_utf16() {
+            ctx.fd_table()
+                .rw_write(fd_id as u32, &unit.to_be_bytes())
+                .map_err(|e| RuntimeError::IOException {
+                    message: e.to_string(),
+                })?;
         }
         Ok(None)
     });
@@ -14287,71 +14724,351 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
 // Real file operations via fd_table (same API as RandomAccessFile)
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// The SEVEN FileChannel triples both registrars serve — one body each
+// ===========================================================================
+//
+// `size()J`, `position()J`, `position(J)FileChannel`, `close()V`, `isOpen()Z`,
+// `read(Ljava/nio/ByteBuffer;)I` and `write(Ljava/nio/ByteBuffer;)I` are
+// registered TWICE, and which copy exists depends on the MODE, not on this file:
+//
+//   * `register_phase57_nio_file` is called DIRECTLY by `vm/src/vm/vm_init.rs`
+//     in both SHIPPING arms — `:2217` (a `--features synthetic-jdk` binary run
+//     `--real-jdk`) and `:2763` (the default build) — so in `--real-jdk` and
+//     `--jdk-only` its copies are the only ones that exist at all.
+//   * `register_phase57_file_channel` (below) is reachable from exactly one
+//     place: `register_phase57_natives` (line 36 of this file), itself reachable
+//     from exactly one place, `lib.rs`'s `register_synthetic_overrides`, which is
+//     `#[cfg(feature = "synthetic-jdk")]` and which `vm_init.rs:1839` reaches
+//     only through `register_builtins`, inside `if config.use_synthetic_jdk`.
+//     Within `register_phase57_natives` it runs AFTER `register_phase57_nio_file`
+//     (lines 21 and 36), and last-write-wins, so in `--synthetic-jdk` ITS copies
+//     are the live ones.
+//
+// W7-8 §3.1 hardened the second registrar only — i.e. only the mode that did not
+// have the defect. Rows 1, 2 and 19 of that census stayed LIVE in both shipping
+// modes for as long as the two copies had separate bodies.
+//
+// Deleting either registration is the wrong repair: it changes a different mode
+// than the one being fixed. So the seven shared triples now point at ONE
+// function each and BOTH registrars register that same function pointer.
+// Last-write-wins stops being load-bearing for them — whichever copy wins, the
+// body is this one. Keep it that way: if you edit one of these, you are editing
+// both modes, which is the property that was missing.
+//
+// `truncate(J)`, the positional `read`/`write`, `transferTo`, `transferFrom` and
+// `force(Z)` stay registered by `register_phase57_file_channel` ALONE, and that
+// asymmetry is deliberate rather than an oversight. In a shipping mode a real
+// `sun.nio.ch.FileChannelImpl` serves those from its own bytecode; registering
+// them on the literal `java/nio/channels/FileChannel` there would put a native
+// in front of triples nothing currently intercepts, which is a much larger
+// change than hardening seven bodies that are already intercepted. `size()` is
+// the precedent for why they were ever added on the synthetic side at all
+// (Round 63: without it the abstract declaration raised AbstractMethodError).
+
+/// What the private fd slot of a `FileChannel` receiver says. **Three** states,
+/// and the third is the whole reason this type exists.
+///
+/// `synthetic_file_channel::fd_value` answers `Value::Object(None)` — not an
+/// `Int` — for any receiver whose class is not literally
+/// `java/nio/channels/FileChannel`; the screen lives inside the accessor
+/// (`native-api/src/synthetic_file_channel.rs`, "the screen moved INSIDE the
+/// accessors"). A real `sun.nio.ch.FileChannelImpl` arriving through a
+/// `FileChannel`-typed call site is therefore distinguishable from a synthetic
+/// channel that has been closed, and the two must NOT share an arm:
+///
+/// * `Closed` can only be a synthetic receiver — `-1` is what `close()` below
+///   writes into the slot — so it takes the hardened `ClosedChannelException`
+///   arm W7-8 §3.1 specifies.
+/// * `Foreign` keeps each site's pre-W7-8 answer **verbatim**. Whether a native
+///   on `FileChannel` intercepts a real `FileChannelImpl` for these triples is
+///   the one thing W7-8 §3.6/§7.1 records as unsettleable from source (`close()V`
+///   demonstrably IS intercepted and has carried a class-name screen for it since
+///   the H2 file-lock bug; `read(ByteBuffer)` is a different dispatch shape).
+///   Turning a `-1` into a throw on that path without a run is exactly the
+///   hazard that row names, so this arm changes nothing until someone measures
+///   it.
+enum P57FcFd {
+    /// A synthetic channel with a live `fd_table` id.
+    Open(u32),
+    /// A synthetic channel whose `close()` has run (slot holds a negative `Int`).
+    Closed,
+    /// Not one of ours — the accessor declined the receiver.
+    Foreign,
+}
+
+/// Classify `this`'s fd slot for the seven shared bodies below.
+fn p57_fc_fd(ctx: &mut dyn NativeContext, this: ObjectRef) -> P57FcFd {
+    match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => P57FcFd::Open(v as u32),
+        Value::Int(_) => P57FcFd::Closed,
+        _ => P57FcFd::Foreign,
+    }
+}
+
+/// `FileChannel.size()J`. Closed answered `0` — a legal size, and the one a
+/// caller reads as "empty file" — where the JDK specifies
+/// `ClosedChannelException`.
+pub(crate) fn p57_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let fd_id = match p57_fc_fd(ctx, this) {
+        P57FcFd::Open(fd) => fd,
+        P57FcFd::Closed => return Err(p57_closed_channel(ctx)),
+        P57FcFd::Foreign => return Ok(Some(Value::Long(0))),
+    };
+    let sz = ctx
+        .fd_table()
+        .file_size(fd_id)
+        .map_err(|e| RuntimeError::IOException {
+            message: e.to_string(),
+        })?;
+    Ok(Some(Value::Long(sz as i64)))
+}
+
+/// `FileChannel.position()J`. Closed answered `0`, indistinguishable from a
+/// channel positioned at the start of the file.
+pub(crate) fn p57_fc_position(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let fd_id = match p57_fc_fd(ctx, this) {
+        P57FcFd::Open(fd) => fd,
+        P57FcFd::Closed => return Err(p57_closed_channel(ctx)),
+        P57FcFd::Foreign => return Ok(Some(Value::Long(0))),
+    };
+    let pos = ctx
+        .fd_table()
+        .rw_position(fd_id)
+        .map_err(|e| RuntimeError::IOException {
+            message: e.to_string(),
+        })?;
+    Ok(Some(Value::Long(pos as i64)))
+}
+
+/// `FileChannel.position(J)FileChannel`, which returns `this` — so a refusal has
+/// no return value to ride on and must be an exception or nothing.
+///
+/// "@throws IllegalArgumentException If the new position is negative"; `.max(0)`
+/// answered a successful seek to 0 instead. A negative position is how a
+/// caller's own arithmetic reports a bug (commons-compress computes seek-from-EOF
+/// offsets this way); clamping hides it and then reads or writes the wrong region
+/// of the file.
+pub(crate) fn p57_fc_position_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let pos = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    if pos < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Negative position: {pos}"),
+        }
+        .into());
+    }
+    let fd_id = match p57_fc_fd(ctx, this) {
+        P57FcFd::Open(fd) => fd,
+        P57FcFd::Closed => return Err(p57_closed_channel(ctx)),
+        P57FcFd::Foreign => return Ok(Some(Value::Object(Some(this)))),
+    };
+    ctx.fd_table()
+        .rw_seek(fd_id, std::io::SeekFrom::Start(pos as u64))
+        .map_err(|e| RuntimeError::IOException {
+            message: e.to_string(),
+        })?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `FileChannel.read(ByteBuffer)I`.
+///
+/// Was `Ok(Int(-1))` on a closed channel. `-1` from a channel read is the
+/// end-of-file indication, so a read of a CLOSED channel was reported as a
+/// clean, complete end of stream: every copy loop of the form
+/// `while ((n = ch.read(buf)) != -1)` terminated normally and its caller wrote
+/// out a truncated file believing it had the whole thing.
+/// `ReadableByteChannel.read` specifies `ClosedChannelException` here.
+pub(crate) fn p57_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let fd_id = match p57_fc_fd(ctx, this) {
+        P57FcFd::Open(fd) => fd,
+        P57FcFd::Closed => return Err(p57_closed_channel(ctx)),
+        P57FcFd::Foreign => return Ok(Some(Value::Int(-1))),
+    };
+    let bb = match args.get(1) {
+        Some(Value::Object(Some(b))) => *b,
+        // A null destination buffer is a `NullPointerException`, not an
+        // end-of-file — same reason as above.
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("FileChannel.read: null destination buffer".into()),
+            }
+            .into())
+        }
+    };
+    // ByteBuffer: field 0 = backing array, 1 = position, 2 = limit.
+    let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+    let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+    let remaining = bb_lim.saturating_sub(bb_pos);
+    if remaining == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let mut buf = vec![0u8; remaining];
+    match ctx.fd_table().rw_read(fd_id, &mut buf) {
+        Ok(0) => Ok(Some(Value::Int(-1))),
+        Ok(n) => {
+            if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                for (i, b) in buf.iter().take(n).enumerate() {
+                    ctx.set_array_element(arr, bb_pos + i, Value::Int(*b as i8 as i32));
+                }
+            }
+            ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
+            Ok(Some(Value::Int(n as i32)))
+        }
+        Err(e) => Err(RuntimeError::IOException {
+            message: e.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// `FileChannel.write(ByteBuffer)I`.
+///
+/// The closed arm reported the failure with the WRONG TYPE — a bare
+/// `IOException("Channel closed")` — which is W7-8 §3.1 row 19: a
+/// `catch (ClosedChannelException)` reopen branch does not match a supertype
+/// instance, so the recovery path was deleted rather than taken. That is why
+/// `Foreign` shares the arm here and nowhere else: this site already failed for
+/// a foreign receiver, so tightening the type cannot turn a success into a
+/// failure, and `ClosedChannelException extends IOException`.
+pub(crate) fn p57_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let fd_id = match p57_fc_fd(ctx, this) {
+        P57FcFd::Open(fd) => fd,
+        P57FcFd::Closed | P57FcFd::Foreign => return Err(p57_closed_channel(ctx)),
+    };
+    let bb = match args.get(1) {
+        Some(Value::Object(Some(b))) => *b,
+        // `0` is a legal return from `write` (a buffer with no remaining
+        // bytes), so answering it for a null source hid the NPE the JDK
+        // raises behind an outcome the caller reads as "nothing to do".
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("FileChannel.write: null source buffer".into()),
+            }
+            .into())
+        }
+    };
+    let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+    let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+    let remaining = bb_lim.saturating_sub(bb_pos);
+    if remaining == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let mut data = vec![0u8; remaining];
+    if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+        for (i, d) in data.iter_mut().enumerate() {
+            *d = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
+        }
+    }
+    let n = ctx
+        .fd_table()
+        .rw_write(fd_id, &data)
+        .map_err(|e| RuntimeError::IOException {
+            message: e.to_string(),
+        })?;
+    ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
+    Ok(Some(Value::Int(n as i32)))
+}
+
+/// `FileChannel.close()V`.
+///
+/// Registered on the literal `java/nio/channels/FileChannel` to service the
+/// synthetic single-field channel, but native overrides shadow ALL dispatch for
+/// that class name — including a real `sun/nio/ch/FileChannelImpl` reaching an
+/// INHERITED method (`close()V` is declared in the grandparent
+/// `AbstractInterruptibleChannel`, not on `FileChannel`) through a
+/// `FileChannel`-typed call site. That interception is measured, not inferred:
+/// docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md.
+/// So a real instance is detected and
+/// `AbstractInterruptibleChannel.close()`'s contract replicated by calling the
+/// real `implCloseChannel()` bytecode instead of treating the private slot as an
+/// fd.
+///
+/// Idempotent by contract — "Closing a previously closed stream has no effect" —
+/// and the descriptor release stays unconditional and unchecked so an error
+/// cannot strand a handle.
+pub(crate) fn p57_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+    if class_name.as_deref() != Some(cratonvm_native_api::synthetic_file_channel::CLASS) {
+        if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+            return Ok(None);
+        }
+        ctx.set_field_by_name(this, "closed", Value::Int(1));
+        ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+        return Ok(None);
+    }
+    if let P57FcFd::Open(fd_id) = p57_fc_fd(ctx, this) {
+        let _ = ctx.fd_table().close(fd_id);
+    }
+    // Mark the REAL `AbstractInterruptibleChannel.closed` field, exactly as the
+    // foreign-receiver arm above does. It is the field `isOpen()` — ours and the
+    // JDK's — reads, and it is now free to hold the truth: the file position
+    // used to occupy it (W7-72-ssc-socket-and-filechannel.md), which is why the
+    // old body could not use it and answered a constant instead. A no-op on a
+    // fabricated stub that declares no such field, which is the synthetic-JDK
+    // arm's previous behaviour unchanged.
+    cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, this, Value::Int(-1));
+    ctx.set_field_by_name(this, "closed", Value::Int(1));
+    Ok(None)
+}
+
+/// `FileChannel.isOpen()Z` — one body for both receiver kinds, deliberately.
+///
+/// `!closed` is what the real `AbstractInterruptibleChannel.isOpen()` bytecode
+/// answers, and now that no native writes the file position into `closed` the
+/// synthetic channel can be asked the same question as a real one. The old
+/// literal-class arm returned a constant `1`, so `close(); isOpen()` reported the
+/// channel open forever.
+///
+/// Safe in BOTH directions, which is the property to preserve if this is ever
+/// touched again: an ordinary open channel has `closed` unset and answers TRUE
+/// (nothing writes that field except `close()`), and a closed one answers FALSE.
+/// It does NOT consult the fd, so a channel minted without one cannot be
+/// reported closed by mistake — and that is also why it needs no [`P57FcFd`]
+/// arm.
+pub(crate) fn p57_fc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(
+        if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+            0
+        } else {
+            1
+        },
+    )))
+}
+
 pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let fc = "java/nio/channels/FileChannel";
 
-    // position()J
-    r.register(fc, "position", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "Channel closed".into(),
-            }
-            .into());
-        }
-        let pos =
-            ctx.fd_table()
-                .rw_position(fd_id as u32)
-                .map_err(|e| RuntimeError::IOException {
-                    message: e.to_string(),
-                })?;
-        Ok(Some(Value::Long(pos as i64)))
-    });
+    // `close()V` below writes -1 into slot 0, so `fd_id < 0` is exactly "this
+    // channel is closed" (or was never opened). Every method here is specified
+    // to raise `ClosedChannelException` in that state; the arms that instead
+    // answered `-1` (read), `0` (transfer) or `this` (position/truncate) were
+    // handing back a value the caller cannot tell from a real end-of-file, a
+    // real empty transfer, or a real seek. See `p57_closed_channel`.
 
-    // position(J)FileChannel — returns this
+    // position()J, position(J)FileChannel and size()J — three of the seven
+    // triples `register_phase57_nio_file` ALSO registers. One body each, shared
+    // with that registrar; see the banner above this function for why sharing
+    // rather than deleting is the repair.
+    r.register(fc, "position", "()J", p57_fc_position);
     r.register(
         fc,
         "position",
         "(J)Ljava/nio/channels/FileChannel;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-            let pos = match args.get(1) {
-                Some(Value::Long(v)) => *v,
-                _ => 0,
-            };
-            if fd_id >= 0 {
-                ctx.fd_table()
-                    .rw_seek(fd_id as u32, std::io::SeekFrom::Start(pos.max(0) as u64))
-                    .map_err(|e| RuntimeError::IOException {
-                        message: e.to_string(),
-                    })?;
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
+        p57_fc_position_set,
     );
-
-    // size()J
-    r.register(fc, "size", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "Channel closed".into(),
-            }
-            .into());
-        }
-        let sz = ctx
-            .fd_table()
-            .file_size(fd_id as u32)
-            .map_err(|e| RuntimeError::IOException {
-                message: e.to_string(),
-            })?;
-        Ok(Some(Value::Long(sz as i64)))
-    });
+    r.register(fc, "size", "()J", p57_fc_size);
 
     // truncate(J)FileChannel
     r.register(
@@ -14360,108 +15077,71 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(J)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let new_len = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            if fd_id >= 0 {
-                ctx.fd_table()
-                    .rw_set_length(fd_id as u32, new_len.max(0) as u64)
-                    .map_err(|e| RuntimeError::IOException {
-                        message: e.to_string(),
-                    })?;
+            // "@throws IllegalArgumentException If the new size is negative"
+            // (`FileChannel.truncate(long)`). This is the most destructive
+            // clamp in the file: `new_len.max(0)` turned `truncate(-1)` — the
+            // shape a caller's off-by-one length computation produces — into
+            // `rw_set_length(0)`, i.e. it DELETED the file's entire contents
+            // and returned `this` as if that had been asked for.
+            if new_len < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Negative size: {new_len}"),
+                }
+                .into());
             }
+            if fd_id < 0 {
+                return Err(p57_closed_channel(ctx));
+            }
+            ctx.fd_table()
+                .rw_set_length(fd_id as u32, new_len as u64)
+                .map_err(|e| RuntimeError::IOException {
+                    message: e.to_string(),
+                })?;
             Ok(Some(Value::Object(Some(this))))
         },
     );
 
-    // read(ByteBuffer)I
-    r.register(fc, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Ok(Some(Value::Int(-1)));
-        }
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        // ByteBuffer: field 0=backing array, field 1=position, field 2=limit
-        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let remaining = bb_lim.saturating_sub(bb_pos);
-        if remaining == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut buf = vec![0u8; remaining];
-        match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
-            Ok(0) => Ok(Some(Value::Int(-1))),
-            Ok(n) => {
-                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-                    for i in 0..n {
-                        ctx.set_array_element(arr, bb_pos + i, Value::Int(buf[i] as i8 as i32));
-                    }
-                }
-                ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-                Ok(Some(Value::Int(n as i32)))
-            }
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
-        }
-    });
-
-    // write(ByteBuffer)I
-    r.register(fc, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "Channel closed".into(),
-            }
-            .into());
-        }
-        let bb = match args.get(1) {
-            Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
-        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
-        let remaining = bb_lim.saturating_sub(bb_pos);
-        if remaining == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let mut data = vec![0u8; remaining];
-        if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
-            for i in 0..remaining {
-                data[i] = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
-            }
-        }
-        let n = ctx.fd_table().rw_write(fd_id as u32, &data).map_err(|e| {
-            RuntimeError::IOException {
-                message: e.to_string(),
-            }
-        })?;
-        ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
-        Ok(Some(Value::Int(n as i32)))
-    });
+    // read(ByteBuffer)I and write(ByteBuffer)I — shared with
+    // `register_phase57_nio_file`; bodies and rationale at [`p57_fc_read`] /
+    // [`p57_fc_write`].
+    r.register(fc, "read", "(Ljava/nio/ByteBuffer;)I", p57_fc_read);
+    r.register(fc, "write", "(Ljava/nio/ByteBuffer;)I", p57_fc_write);
 
     // read(ByteBuffer, long position)I — positional read
     r.register(fc, "read", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         let position = match args.get(2) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
+        // "@throws IllegalArgumentException If the position is negative or the
+        // buffer is read-only" (`FileChannel.read(ByteBuffer,long)`). The
+        // `position.max(0)` below read from offset 0 instead and reported the
+        // bytes as if they had come from the requested offset.
+        if position < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Negative position: {position}"),
+            }
+            .into());
+        }
+        // See the non-positional `read` above: `-1` here is end-of-file.
         if fd_id < 0 {
-            return Ok(Some(Value::Int(-1)));
+            return Err(p57_closed_channel(ctx));
         }
         let bb = match args.get(1) {
             Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(-1))),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("FileChannel.read: null destination buffer".into()),
+                }
+                .into())
+            }
         };
         let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
         let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
@@ -14472,7 +15152,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let mut buf = vec![0u8; remaining];
         match ctx
             .fd_table()
-            .pread_at(fd_id as u32, &mut buf, position.max(0) as u64)
+            .pread_at(fd_id as u32, &mut buf, position as u64)
         {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
@@ -14494,20 +15174,33 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // write(ByteBuffer, long position)I — positional write
     r.register(fc, "write", "(Ljava/nio/ByteBuffer;J)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         let position = match args.get(2) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "Channel closed".into(),
+        // "@throws IllegalArgumentException If the position is negative"
+        // (`FileChannel.write(ByteBuffer,long)`). `position.max(0)` did not
+        // merely lose the refusal: it OVERWROTE the first `remaining` bytes of
+        // the file and returned that byte count as a successful write at the
+        // offset the caller asked for.
+        if position < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Negative position: {position}"),
             }
             .into());
         }
+        if fd_id < 0 {
+            return Err(p57_closed_channel(ctx));
+        }
         let bb = match args.get(1) {
             Some(Value::Object(Some(b))) => *b,
-            _ => return Ok(Some(Value::Int(0))),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("FileChannel.write: null source buffer".into()),
+                }
+                .into())
+            }
         };
         let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
         let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
@@ -14523,7 +15216,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         }
         let n = ctx
             .fd_table()
-            .pwrite_at(fd_id as u32, &data, position.max(0) as u64)
+            .pwrite_at(fd_id as u32, &data, position as u64)
             .map_err(|e| RuntimeError::IOException {
                 message: e.to_string(),
             })?;
@@ -14538,7 +15231,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(JJLjava/nio/channels/WritableByteChannel;)J",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let position = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
@@ -14549,9 +15242,29 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             };
             let target = match args.get(3) {
                 Some(Value::Object(Some(t))) => *t,
-                _ => return Ok(Some(Value::Long(0))),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("FileChannel.transferTo: null target channel".into()),
+                    }
+                    .into())
+                }
             };
-            if fd_id < 0 || count <= 0 {
+            // "@throws IllegalArgumentException If the preconditions on the
+            // parameters do not hold", where both `position` and `count` "must
+            // be non-negative". `count <= 0` folded the illegal case in with
+            // the legal `count == 0`, and both answered `0` — which is also
+            // what a successful transfer of an empty region returns, so the
+            // caller could not tell a rejected request from a completed one.
+            if position < 0 || count < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("transferTo: position={position}, count={count}"),
+                }
+                .into());
+            }
+            if fd_id < 0 {
+                return Err(p57_closed_channel(ctx));
+            }
+            if count == 0 {
                 return Ok(Some(Value::Long(0)));
             }
             // BUG nb-phases-late(2): a huge `count` (up to Long.MAX_VALUE) was fed
@@ -14560,7 +15273,8 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             // (file_size - position) and streams through a bounded buffer. Clamp
             // `count` to what remains in the source file, then loop in chunks so
             // the per-iteration allocation is bounded regardless of `count`.
-            let position = position.max(0);
+            // (`position` is already known non-negative — the range check above
+            // replaced the `position.max(0)` that used to sit here.)
             let file_size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0) as i64;
             let available = (file_size - position).max(0);
             // Clamp to the bytes available in the source file when we have a real
@@ -14587,10 +15301,23 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             while to_transfer > 0 {
                 let chunk = to_transfer.min(FC_XFER_CHUNK) as usize;
                 let mut buf = vec![0u8; chunk];
-                let n = ctx
-                    .fd_table()
-                    .pread_at(fd_id as u32, &mut buf, cur_pos as u64)
-                    .unwrap_or(0);
+                // `unwrap_or(0)` turned a failed source read into `n == 0`,
+                // which this loop treats as end-of-file: the method then
+                // returned the bytes copied so far as a normal short transfer.
+                // A short transfer is legal ("the number of bytes, possibly
+                // zero, that were actually transferred"), so the caller had no
+                // way to see that the rest of the file was never read. The
+                // spec's answer for a source-read failure is `IOException`.
+                let n = match ctx.fd_table().pread_at(fd_id as u32, &mut buf, cur_pos as u64) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        ctx.unpin_native_roots(target_pin);
+                        return Err(RuntimeError::IOException {
+                            message: e.to_string(),
+                        }
+                        .into());
+                    }
+                };
                 if n == 0 {
                     break;
                 }
@@ -14606,14 +15333,28 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(bb, 1, Value::Int(0));
                 ctx.set_field(bb, 2, Value::Int(n as i32));
                 let target_cur = ctx.read_native_pin(target_pin, target);
-                let written = match ctx.invoke_virtual(
+                let write_res = ctx.invoke_virtual(
                     target_cur,
                     "write",
                     "(Ljava/nio/ByteBuffer;)I",
                     &[Value::Object(Some(bb))],
-                ) {
+                );
+                let written = match write_res {
                     Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
-                    _ => n as i64,
+                    // The old `_ => n as i64` arm counted the whole chunk as
+                    // transferred when the TARGET's `write` threw — so a full
+                    // disk or a closed target produced a return value equal to
+                    // the bytes requested, i.e. the exact signature of a
+                    // complete transfer, with the exception discarded.
+                    // `transferTo` propagates whatever the target raised.
+                    Err(e) => {
+                        ctx.unpin_native_roots(target_pin);
+                        return Err(e);
+                    }
+                    // Anything else is a target that did not answer an `int`;
+                    // count nothing and let the short-write break below stop
+                    // the loop rather than claiming `n` bytes landed.
+                    _ => 0,
                 };
                 ctx.unpin_native_roots(byte_arr_pin);
                 total_written += written;
@@ -14637,10 +15378,15 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/channels/ReadableByteChannel;JJ)J",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+            let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
             let src = match args.get(1) {
                 Some(Value::Object(Some(s))) => *s,
-                _ => return Ok(Some(Value::Long(0))),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("FileChannel.transferFrom: null source channel".into()),
+                    }
+                    .into())
+                }
             };
             let position = match args.get(2) {
                 Some(Value::Long(v)) => *v,
@@ -14650,7 +15396,22 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            if fd_id < 0 || count <= 0 {
+            // Same contract as `transferTo`: both parameters "must be
+            // non-negative", and violating them is `IllegalArgumentException`.
+            // A negative `position` was worse here than on the read side —
+            // `position.max(0)` below started WRITING the source's bytes over
+            // the front of the destination file and returned that count as a
+            // successful transfer to the requested offset.
+            if position < 0 || count < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("transferFrom: position={position}, count={count}"),
+                }
+                .into());
+            }
+            if fd_id < 0 {
+                return Err(p57_closed_channel(ctx));
+            }
+            if count == 0 {
                 return Ok(Some(Value::Long(0)));
             }
             // BUG nb-phases-late(2): `count` (a long) was used to size the
@@ -14666,7 +15427,9 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             // family).
             let src_pin = ctx.pin_native_root(src);
             let mut remaining = count;
-            let mut cur_pos = position.max(0);
+            // `position` is already known non-negative (range-checked above,
+            // where the `position.max(0)` that used to live here was).
+            let mut cur_pos = position;
             let mut total_written: i64 = 0;
             while remaining > 0 {
                 let chunk = remaining.min(FC_XFER_CHUNK) as usize;
@@ -14681,13 +15444,22 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
                 ctx.set_field(bb, 2, Value::Int(chunk as i32));
                 let src_cur = ctx.read_native_pin(src_pin, src);
-                let read_n = match ctx.invoke_virtual(
+                let read_res = ctx.invoke_virtual(
                     src_cur,
                     "read",
                     "(Ljava/nio/ByteBuffer;)I",
                     &[Value::Object(Some(bb))],
-                ) {
+                );
+                let read_n = match read_res {
                     Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+                    // The `_ => 0` arm swallowed an exception from the SOURCE's
+                    // `read` and fed it into the `read_n == 0` break below,
+                    // which this method reports as end-of-source — a legal
+                    // short transfer. `transferFrom` propagates it instead.
+                    Err(e) => {
+                        ctx.unpin_native_roots(src_pin);
+                        return Err(e);
+                    }
                     _ => 0,
                 };
                 let bb = ctx.read_native_pin(bb_pin, bb);
@@ -14702,10 +15474,21 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                         data[i] = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
                     }
                 }
-                let written = ctx
-                    .fd_table()
-                    .pwrite_at(fd_id as u32, &data, cur_pos as u64)
-                    .unwrap_or(0);
+                // `unwrap_or(0)` here lost the bytes AND the reason: the loop
+                // kept consuming the source (`remaining -= read_n`) while
+                // `cur_pos` stood still, so a destination that stopped
+                // accepting writes produced a silent partial copy whose return
+                // value looked like an ordinary short transfer.
+                let written = match ctx.fd_table().pwrite_at(fd_id as u32, &data, cur_pos as u64) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        ctx.unpin_native_roots(src_pin);
+                        return Err(RuntimeError::IOException {
+                            message: e.to_string(),
+                        }
+                        .into());
+                    }
+                };
                 total_written += written as i64;
                 cur_pos += written as i64;
                 remaining -= read_n as i64;
@@ -14722,7 +15505,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // force(boolean metadata)V
     r.register(fc, "force", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this).as_int().unwrap_or(-1);
         // FIX (finding 2): honor durability instead of being a silent no-op.
         // `clone_file` flushes any buffered writer for the fd and hands back a
         // std::fs::File referring to the same kernel file; sync_data/sync_all then
@@ -14730,72 +15513,43 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         // `metadata == true` → flush file contents AND metadata (sync_all); false →
         // at least the file contents (sync_data). We only fall back to best-effort
         // (no error surfaced) when the fd genuinely isn't a real file (e.g. a pipe).
-        if fd_id >= 0 {
-            let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-            if let Ok(file) = ctx.fd_table().clone_file(fd_id as u32) {
-                let res = if metadata {
-                    file.sync_all()
-                } else {
-                    file.sync_data()
-                };
-                if let Err(e) = res {
-                    return Err(RuntimeError::IOException {
-                        message: format!("FileChannel.force failed: {e}"),
-                    }
-                    .into());
+        //
+        // The `if fd_id >= 0` guard used to have no else: `force()` on a CLOSED
+        // channel returned normally, which is the one answer a durability
+        // barrier must never fabricate — the caller's next act is to record the
+        // data as committed. "@throws ClosedChannelException If this channel is
+        // closed" (`FileChannel.force`).
+        if fd_id < 0 {
+            return Err(p57_closed_channel(ctx));
+        }
+        let metadata = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        if let Ok(file) = ctx.fd_table().clone_file(fd_id as u32) {
+            let res = if metadata {
+                file.sync_all()
+            } else {
+                file.sync_data()
+            };
+            if let Err(e) = res {
+                return Err(RuntimeError::IOException {
+                    message: format!("FileChannel.force failed: {e}"),
                 }
+                .into());
             }
-            // Non-file-backed fd (pipe/socket/etc.): nothing to sync — best effort.
         }
+        // Non-file-backed fd (pipe/socket/etc.): nothing to sync — best effort.
         Ok(None)
     });
 
-    // close()V
-    r.register(fc, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // See docs/known-issues/h2/!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
-        // this native is registered on the literal "java/nio/channels/FileChannel"
-        // class to service a synthetic single-field FileChannel, but native
-        // overrides shadow ALL dispatch for that class name -- including a real
-        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
-        // declared in the grandparent AbstractInterruptibleChannel, not
-        // FileChannel itself) through a FileChannel-typed call site. Detect a
-        // real instance and replicate AbstractInterruptibleChannel.close()'s
-        // contract by calling the real implCloseChannel() bytecode instead of
-        // treating field 0 as a synthetic fd.
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                return Ok(None);
-            }
-            ctx.set_field_by_name(this, "closed", Value::Int(1));
-            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
-            return Ok(None);
-        }
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let _ = ctx.fd_table().close(fd_id as u32);
-            ctx.set_field(this, 0, Value::Int(-1));
-        }
-        Ok(None)
-    });
-
-    // isOpen()Z
-    r.register(fc, "isOpen", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
-        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
-            return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
-                    0
-                } else {
-                    1
-                },
-            )));
-        }
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-        Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
-    });
+    // close()V and isOpen()Z — the last two of the seven shared triples.
+    //
+    // This registrar's copies used to be described as "the LOSING copy … nothing
+    // here is reachable", which was true of the two SHIPPING modes and false of
+    // `--synthetic-jdk`, where this registrar runs after `register_phase57_nio_file`
+    // and therefore wins. Both copies now name the same function, so the
+    // last-write-wins outcome for these triples is not load-bearing in any mode —
+    // which is the only version of "it does not matter which wins" that is true.
+    r.register(fc, "close", "()V", p57_fc_close);
+    r.register(fc, "isOpen", "()Z", p57_fc_is_open);
     r.set_category(__prev_cat);
 }
 
@@ -19039,6 +19793,16 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
                 }
             };
             let target = obj_arg(args, 1)?;
+            // The option list is refused BEFORE the source is drained, exactly
+            // as the JDK refuses it before opening anything: an unsupported
+            // option must not consume the caller's stream on its way to
+            // throwing. Every option but REPLACE_EXISTING is unsupported here.
+            if let Some(bad) = copy_options_unsupported(ctx, args.get(2)) {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("{bad} not supported"),
+                }
+                .into());
+            }
             let replace = copy_options_replace_existing(ctx, args.get(2));
             // Pin `target` across the drain and the option probe: both re-enter
             // Java and a moving young GC there would relocate it (native

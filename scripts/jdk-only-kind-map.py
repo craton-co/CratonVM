@@ -77,7 +77,17 @@ product: the failure mode being closed is a thousand-row change nobody saw.
         --update-baseline --note "L?: reclassified native-collections"
     python3 scripts/jdk-only-kind-map.py --selftest     # hermetic
 
-`regression-suite/native-kind-map.sh` is the runner that takes the census.
+`regression-suite/bridge-ratchet.sh` is the runner: it takes ONE census and
+scores both this gate and the bridge ratchet from it, self-tests first, and
+passes `--update-baseline --note` through to both. (This line used to name
+`regression-suite/native-kind-map.sh`, which has never existed in the tree.)
+
+That sharing has a consequence worth knowing before you re-freeze: an
+`--update-baseline` run REGENERATES this baseline's header from the census,
+so any hand-written `# amended:` block in it is replaced. Two such blocks
+exist on the linux baseline as of 2026-08-12; if a re-freeze drops them that
+is correct, because a re-measured file no longer needs them — but read them
+first, they say which rows were derived rather than measured and why.
 
 ## Exit codes
 

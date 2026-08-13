@@ -10,6 +10,102 @@
 # rows: 11636
 # unchosen: 0
 # note: Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.
+# amended: 2026-08-12, W7-56-infercaller-strict.md. FIVE rows edited by hand,
+#   not re-measured: java/util/logging/LogRecord {get,set}Source{Class,Method}Name
+#   and <init>(Level,String), all ordinal 0, intrinsic -> synthetic-stub,
+#   kind_stated 0 -> 1.
+#
+#   The <init> row is the one that closes the vector, and it is NOT a new table
+#   entry: that triple has been in RETIRED_SHADOW_TRIPLES since 2026-08-11 and
+#   was INERT, because the retag fires only on an effective category of Bridge
+#   and this registration's ambient category was Intrinsic. Its ordinal-1
+#   sibling has read `synthetic-stub 1 1` here all along -- the two rows
+#   disagreeing was the visible trace of the defect.
+#
+#   Those are the triples this branch retires, and the retag in
+#   NativeMethodRegistry::register is deterministic (effective category Bridge +
+#   retired => SyntheticStub, kind_stated true), so the value is derived rather
+#   than guessed -- it is byte-identical in shape to the sibling retired rows
+#   already here (LogRecord.getSequenceNumber ordinal 1, and every
+#   java/util/logging row the 2026-08-11 wave retired).
+#
+#   PRE-EXISTING DRIFT this does NOT fix, and a linux re-freeze should: commit
+#   3b20b83b5 (2026-08-11 22:34) retagged SIX rows Bridge, and this file was
+#   frozen at 12:20 the same day, so it still calls all six `intrinsic`. Four
+#   of them are the rows above. The other two -- Formatter.formatMessage and
+#   its neighbour -- are untouched here and still read `intrinsic 0 1` where
+#   the tree now produces `bridge`.
+# amended: 2026-08-12, W7-62-ratchets-and-dead-code.md. TWELVE more rows edited
+#   by hand, not re-measured, on the same convention as the block above: the
+#   value of each is DERIVED from a deterministic rule in
+#   NativeMethodRegistry::register, not guessed. The amendment discharges the
+#   drift the block above names -- and corrects its arithmetic: 3b20b83b5
+#   retagged FIVE rows, not six (its message says six; the diff is four
+#   LogRecord source-pair rows plus Formatter.formatMessage). The "other two"
+#   are therefore ONE row from that commit, plus two from 4eaa5d321 which the
+#   block above did not look for.
+#
+#   Every commit below is an ancestor of HEAD and NOT an ancestor of 1c4377b5f
+#   (the 12:20 freeze), checked with `git merge-base --is-ancestor`.
+#
+#   (a) NINE rows, cratonvm/internal/LinkedListSnapshotListItr ordinal 0
+#       (add, hasNext, hasPrevious, next, nextIndex, previous, previousIndex,
+#       remove, set): synthetic-stub -> bridge. Commit 6ae3ca634
+#       (2026-08-11 20:35) moved the receiver from VM_MINTED_STAND_IN_RECEIVERS
+#       to VM_SERVICE_RECEIVERS in native-api/src/no_image_receiver.rs, so
+#       `receiver_declared_by_no_supported_image` now answers false for it and
+#       `register()`'s re-tag arm no longer fires. What is left is the ambient
+#       `Bridge` of `register_linked_list_natives`. LEGITIMATE: it is the
+#       measured half of the fix W7-20-refusal-laundered-into-wrong-answer.md
+#       required to land in one commit with the VM-internal mint.
+#
+#       kind_stated STAYS 1, and that is not what the tree produced when this
+#       was written. The exclusion restored the ambient category, and an
+#       ambient category is kind_stated=0 -- so the tree produced `bridge 0 1`
+#       and the gate's one-way adjudication rule would have FIRED on the lost
+#       bit, correctly. Freezing 0 would have been a re-freeze of a REGRESSION.
+#       The nine registrations were converted to `register_with_kind(...,
+#       NativeKind::Bridge)` in the same change instead, which restores
+#       kind_stated=1 with no change to the kind, to dispatch, or to either
+#       runtime mode. THIS ROW'S VALUE THEREFORE DEPENDS ON THAT SOURCE EDIT --
+#       if it is reverted, these nine must read `bridge 0 1` and the gate must
+#       be allowed to fire.
+#
+#   (b) ONE row, java/util/logging/Formatter.formatMessage ordinal 0:
+#       intrinsic -> bridge. Commit 3b20b83b5 (2026-08-11 22:34) wrapped it in
+#       `with_category(NativeKind::Bridge)`. kind_stated stays 0: a
+#       `with_category` scope is a CHOSEN category, not a STATED one, which is
+#       the distinction scripts/jdk-only-kind-map.py's header sets out.
+#       It is NOT in RETIRED_SHADOW_TRIPLES (the source comment at
+#       native-builtins/src/phases_early.rs says so in as many words), so the
+#       retirement re-tag does not fire and the kind stays `bridge`.
+#       LEGITIMATE: an intrinsic cannot give an answer the bytecode would not,
+#       and this one did -- measured `one={0} two={1}` against HotSpot's
+#       `one=A two=B` in BOTH modes.
+#
+#   (c) TWO rows, java/util/logging/LogManager.{getLogManager, getLogger}
+#       ordinal 0: intrinsic -> synthetic-stub, kind_stated 0 -> 1. Commit
+#       4eaa5d321 (2026-08-11 21:19) wrapped them in
+#       `with_category(NativeKind::Bridge)`; both triples are ALREADY in
+#       RETIRED_SHADOW_TRIPLES, so `register()`'s retired-shadow arm fires on
+#       the way past and lands them on SyntheticStub with kind_stated true --
+#       the same deterministic rule the W7-56 block above cites. LEGITIMATE,
+#       and it is the point of that commit: Intrinsic is exempt from the
+#       java/util/logging retirement, so tagging them Bridge is what lets the
+#       retirement SEE them.
+#
+#       These two are ordinal 0 of three (ordinals 1 and 2 are already
+#       synthetic-stub); ordinal 2 owns the slot under last-write-wins, so this
+#       amendment also removes two rows from the bridge ratchet's
+#       `superseded.kind_disagreements` population. That is a movement DOWN,
+#       which that gate passes.
+#
+#   NOT AMENDED, deliberately: scripts/baselines/jdk-only-bridge-ratchet.json.
+#   Its five ratchets are COUNTS over an image adjudication this session could
+#   not take (no build was run), and a hand-written count that comes out too
+#   HIGH widens a slack-free ratchet -- the one direction a hand edit here can
+#   do damage. See that file's own `note`, and W7-62-ratchets-and-dead-code.md
+#   for the derived movement and the command that settles it.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -280,15 +376,15 @@ cratonvm/internal/ArrayListSubList	toArray	([Ljava/lang/Object;)[Ljava/lang/Obje
 cratonvm/internal/ArrayListSubList	toString	()Ljava/lang/String;	0	synthetic-stub	1	1
 cratonvm/internal/ConfigEnhancerSupport	enhanceFactoryBeanReference	(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;	0	synthetic-stub	0	1
 cratonvm/internal/FactoryBeanEnhancerHandler	invoke	(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;	0	synthetic-stub	0	1
-cratonvm/internal/LinkedListSnapshotListItr	add	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	hasNext	()Z	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	hasPrevious	()Z	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	next	()Ljava/lang/Object;	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	nextIndex	()I	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	previous	()Ljava/lang/Object;	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	previousIndex	()I	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	remove	()V	0	synthetic-stub	1	1
-cratonvm/internal/LinkedListSnapshotListItr	set	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
+cratonvm/internal/LinkedListSnapshotListItr	add	(Ljava/lang/Object;)V	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	hasNext	()Z	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	hasPrevious	()Z	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	next	()Ljava/lang/Object;	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	nextIndex	()I	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	previous	()Ljava/lang/Object;	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	previousIndex	()I	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	remove	()V	0	bridge	1	1
+cratonvm/internal/LinkedListSnapshotListItr	set	(Ljava/lang/Object;)V	0	bridge	1	1
 cratonvm/internal/SnapshotEnumeration	hasMoreElements	()Z	0	synthetic-stub	1	1
 cratonvm/internal/SnapshotEnumeration	nextElement	()Ljava/lang/Object;	0	synthetic-stub	1	1
 cratonvm/internal/StreamChainCollector	accept	(Ljava/lang/Object;)V	0	synthetic-stub	1	1
@@ -8193,7 +8289,7 @@ java/util/logging/FileHandler	<init>	(Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/util/logging/FileHandler	close	()V	0	synthetic-stub	1	1
 java/util/logging/FileHandler	flush	()V	0	synthetic-stub	1	1
 java/util/logging/FileHandler	publish	(Ljava/util/logging/LogRecord;)V	0	synthetic-stub	1	1
-java/util/logging/Formatter	formatMessage	(Ljava/util/logging/LogRecord;)Ljava/lang/String;	0	intrinsic	0	1
+java/util/logging/Formatter	formatMessage	(Ljava/util/logging/LogRecord;)Ljava/lang/String;	0	bridge	0	1
 java/util/logging/Handler	<init>	()V	0	synthetic-stub	1	1
 java/util/logging/Handler	close	()V	0	intrinsic	0	1
 java/util/logging/Handler	flush	()V	0	intrinsic	0	1
@@ -8218,10 +8314,10 @@ java/util/logging/LogManager	<init>	()V	0	synthetic-stub	1	1
 java/util/logging/LogManager	addConfigurationListener	(Ljava/lang/Runnable;)Ljava/util/logging/LogManager;	0	synthetic-stub	1	1
 java/util/logging/LogManager	addLogger	(Ljava/util/logging/Logger;)Z	0	synthetic-stub	1	1
 java/util/logging/LogManager	checkAccess	()V	0	synthetic-stub	1	1
-java/util/logging/LogManager	getLogManager	()Ljava/util/logging/LogManager;	0	intrinsic	0	1
+java/util/logging/LogManager	getLogManager	()Ljava/util/logging/LogManager;	0	synthetic-stub	1	1
 java/util/logging/LogManager	getLogManager	()Ljava/util/logging/LogManager;	1	synthetic-stub	1	1
 java/util/logging/LogManager	getLogManager	()Ljava/util/logging/LogManager;	2	synthetic-stub	1	1
-java/util/logging/LogManager	getLogger	(Ljava/lang/String;)Ljava/util/logging/Logger;	0	intrinsic	0	1
+java/util/logging/LogManager	getLogger	(Ljava/lang/String;)Ljava/util/logging/Logger;	0	synthetic-stub	1	1
 java/util/logging/LogManager	getLogger	(Ljava/lang/String;)Ljava/util/logging/Logger;	1	synthetic-stub	1	1
 java/util/logging/LogManager	getLogger	(Ljava/lang/String;)Ljava/util/logging/Logger;	2	synthetic-stub	1	1
 java/util/logging/LogManager	getLoggerNames	()Ljava/util/Enumeration;	0	synthetic-stub	1	1
@@ -8234,7 +8330,7 @@ java/util/logging/LogManager	updateConfiguration	(Ljava/io/InputStream;Ljava/uti
 java/util/logging/LogManager	updateConfiguration	(Ljava/util/function/Function;)V	0	synthetic-stub	1	1
 java/util/logging/LogManager$StringEnumeration	hasMoreElements	()Z	0	synthetic-stub	1	1
 java/util/logging/LogManager$StringEnumeration	nextElement	()Ljava/lang/Object;	0	synthetic-stub	1	1
-java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	0	intrinsic	0	1
+java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/util/logging/LogRecord	<init>	(Ljava/util/logging/Level;Ljava/lang/String;)V	1	synthetic-stub	1	1
 java/util/logging/LogRecord	getLevel	()Ljava/util/logging/Level;	0	intrinsic	0	1
 java/util/logging/LogRecord	getLevel	()Ljava/util/logging/Level;	1	synthetic-stub	1	1
@@ -8249,8 +8345,8 @@ java/util/logging/LogRecord	getResourceBundle	()Ljava/util/ResourceBundle;	0	int
 java/util/logging/LogRecord	getResourceBundleName	()Ljava/lang/String;	0	intrinsic	0	1
 java/util/logging/LogRecord	getSequenceNumber	()J	0	intrinsic	0	1
 java/util/logging/LogRecord	getSequenceNumber	()J	1	synthetic-stub	1	1
-java/util/logging/LogRecord	getSourceClassName	()Ljava/lang/String;	0	intrinsic	0	1
-java/util/logging/LogRecord	getSourceMethodName	()Ljava/lang/String;	0	intrinsic	0	1
+java/util/logging/LogRecord	getSourceClassName	()Ljava/lang/String;	0	synthetic-stub	1	1
+java/util/logging/LogRecord	getSourceMethodName	()Ljava/lang/String;	0	synthetic-stub	1	1
 java/util/logging/LogRecord	getThreadID	()I	0	intrinsic	0	1
 java/util/logging/LogRecord	getThrown	()Ljava/lang/Throwable;	0	intrinsic	0	1
 java/util/logging/LogRecord	setLoggerName	(Ljava/lang/String;)V	0	intrinsic	0	1
@@ -8260,8 +8356,8 @@ java/util/logging/LogRecord	setParameters	([Ljava/lang/Object;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setResourceBundle	(Ljava/util/ResourceBundle;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setResourceBundleName	(Ljava/lang/String;)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setSequenceNumber	(J)V	0	intrinsic	0	1
-java/util/logging/LogRecord	setSourceClassName	(Ljava/lang/String;)V	0	intrinsic	0	1
-java/util/logging/LogRecord	setSourceMethodName	(Ljava/lang/String;)V	0	intrinsic	0	1
+java/util/logging/LogRecord	setSourceClassName	(Ljava/lang/String;)V	0	synthetic-stub	1	1
+java/util/logging/LogRecord	setSourceMethodName	(Ljava/lang/String;)V	0	synthetic-stub	1	1
 java/util/logging/LogRecord	setThreadID	(I)V	0	intrinsic	0	1
 java/util/logging/LogRecord	setThrown	(Ljava/lang/Throwable;)V	0	intrinsic	0	1
 java/util/logging/Logger	addHandler	(Ljava/util/logging/Handler;)V	0	synthetic-stub	1	1

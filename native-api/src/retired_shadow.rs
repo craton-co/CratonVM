@@ -36,7 +36,7 @@
 //! left them failing for a NEW reason would be a regression this comparison
 //! catches.
 //!
-//! The 84 triples below are every LIVE (`owns_slot`) `Bridge` registration on a
+//! The first 84 triples below are every LIVE (`owns_slot`) `Bridge` registration on a
 //! `java/util/logging/` receiver whose image target carries a `Code` attribute,
 //! declared or inherited — i.e. exactly the rows the dial would yield. They are
 //! re-tagged [`NativeKind::SyntheticStub`](crate::registry::NativeKind::SyntheticStub)
@@ -54,6 +54,138 @@
 //! there is no bytecode for it to yield to. Refusing it would replace a shadow
 //! with an `UnsatisfiedLinkError`, which is the shape the 2026-08-10 wave hit
 //! when four of 43 re-tagged receivers had to be held back.
+//!
+//! # `LogRecord`'s source pair — four more, retired 2026-08-12
+//!
+//! The wave above left `getSourceClassName`, `getSourceMethodName` and their
+//! two setters live, because they were tagged `Intrinsic` and the census scores
+//! `Bridge`. Re-tagging them `Bridge` on 2026-08-11 made the census REPORT them
+//! (`bridge-ran-over-bytecode`) but retired nothing — retirement is this table,
+//! and a category change alone is not an entry in it.
+//!
+//! What they were is the reason they have to go rather than improve. JDK 25:
+//!
+//! ```text
+//!   getSourceClassName() { if (needToInferCaller) inferCaller(); return sourceClassName; }
+//!   setSourceClassName(s) { this.sourceClassName = s; needToInferCaller = false; }
+//! ```
+//!
+//! The shadow getters are that getter with the `inferCaller()` call deleted —
+//! a bare field read — and the shadow setters are that setter with the
+//! `needToInferCaller` clear deleted. So under `--jdk-only` the real
+//! `inferCaller()` was never reached by anybody, and every
+//! `logger.warning(...)` record reached `SimpleFormatter` with a null pair,
+//! which that formatter renders as the LOGGER NAME.
+//!
+//! Measured, one binary, three arms (probes/SrcProbe3.java):
+//!
+//! ```text
+//!                  explicit set/get   pair during publish   StackWalker frames
+//!   HotSpot        A_CLASS/a_method   SrcProbe3/main        Logger.log, doLog, log, warning
+//!   --real-jdk     A_CLASS/a_method   SrcProbe3/main        (chain is native: none)
+//!   --jdk-only     A_CLASS/a_method   null/null             IDENTICAL to HotSpot
+//! ```
+//!
+//! That rules out both of the causes the handoff proposed: the setters stick,
+//! and our `StackWalker` hands `LogRecord$CallerFinder` exactly the frame list
+//! HotSpot's walks. Nothing was broken except that the code which would have
+//! CALLED them never ran.
+//!
+//! ## Necessary and NOT sufficient — read this before trusting a table entry
+//!
+//! Retiring these four was measured to take effect —
+//! `CRATONVM_DBG_DROPPED_STUBS=1` prints `[JDK-ONLY-REFUSED]` for all four —
+//! and the vector still failed. With the real lazy getter running, the flag it
+//! consults was false: `needToInferCaller` is `true` on HotSpot and `false`
+//! here on a fresh record, because a shadow CONSTRUCTOR never wrote it.
+//!
+//! `LogRecord.<init>(Level,String)` was already in the table below, and had
+//! been INERT since the 2026-08-11 wave. The retag in
+//! `NativeMethodRegistry::register` fires only on an effective category of
+//! `Bridge`, and the triple's OTHER registration
+//! (`native-builtins/src/phases_early.rs`) sat under an ambient `Intrinsic`.
+//! Strict refused the `Bridge` one and the `Intrinsic` one owned the slot —
+//! which is why retiring the `Bridge` one measured verdict-neutral.
+//!
+//! **An entry in this table is not evidence that a triple has no live native.**
+//! It retires the registrations whose effective category is `Bridge`, and says
+//! nothing about a second registration of the same triple under `Intrinsic`.
+//! `getLevel`, `getMessage` and `getSequenceNumber` are in that position today.
+//! Two instruments, and they answer different questions:
+//! `CRATONVM_DBG_DROPPED_STUBS=1` lists REFUSALS, not surviving natives; the
+//! census kind is what distinguishes them — `synthetic-native-registered` is a
+//! refusal record, `native-shadows-bytecode` is a live dispatching shadow.
+//! W7-56-infercaller-strict.md
+//!
+//! **All four or none.** Retiring only the getters would be a NEW defect:
+//! the real getter would then honour `needToInferCaller`, which the surviving
+//! shadow setter never clears, so an explicit `setSourceClassName("X")` would
+//! be silently overwritten by the inferred caller on the next read. The two
+//! halves are one state machine and only move together.
+//!
+//! `Compatible` is untouched, and not by argument: a `SyntheticStub` registers
+//! and dispatches normally in `Compatible`, so all four natives still answer
+//! there exactly as they did, over records the JUL bridge already stamped.
+//! Retiring them in BOTH modes would have been a regression, and that is
+//! measured too: probes/SrcProbe4.java runs `CallerFinder` at `inferCaller`'s
+//! real depth and gets `EMPTY` under `--real-jdk`, because the native chain
+//! leaves no `java.util.logging.Logger` frame to trip its latch. Compatible is
+//! correct only via the eager stamp. W7-56-infercaller-strict.md
+//!
+//! # `java/io/PrintWriter` — measured retirable, HELD, and why the hold is not a doubt
+//!
+//! Seven `java/io/PrintWriter` triples (`<init>(Ljava/io/OutputStream;)V`,
+//! `println` ×4, `write` ×2) were measured verdict-neutral in
+//! W7-22-shadow-retirement-logging-and-time.md §2 — including the arm that
+//! matters, a NATIVE-built receiver meeting retired methods — because
+//! `native_printwriter_init_outputstream` chains into the real
+//! `PrintWriter(OutputStream, boolean)` bytecode and leaves `lock`, `out`,
+//! `charOut` and `textOut` populated. Its `java/io/PrintStream` sibling does
+//! not, which is the whole verdict split between §2 and §3 of that record.
+//!
+//! **The reinstatement check has been run and comes back clean**, which is the
+//! part a future lane should not have to redo. All seven registrations sit in
+//! `register_printstream_fallback_natives`
+//! (`native-builtins/src/logging_shims.rs`) between its
+//! `set_category(NativeKind::Bridge)` and the matching restore, so the retag
+//! below would fire on them. The only other registrar holding any of the seven
+//! is in `register_synthetic_overrides` under an ambient `Intrinsic` — and that
+//! function is `#[cfg(feature = "synthetic-jdk")]` and reached only from
+//! `register_builtins` on the `use_synthetic_jdk` arm, so it registers nothing
+//! on either shipping mode and cannot hand the triple back the way
+//! `phases_early.rs` handed back `LogManager.getLogManager()`
+//! (W7-25-jul-getlogger-regression.md §1).
+//!
+//! **What holds it is arithmetic on frozen artefacts, not the verdict.**
+//! `java/io/Print*` is Compatible-visible, so seven rows moving
+//! `Bridge` → `SyntheticStub` move `bridge_shadows_bytecode`
+//! (`scripts/baselines/jdk-only-bridge-ratchet.json`), `BASELINE_SYNTHETIC_STUBS`
+//! (`native-builtins/tests/stub_ratchet.rs`, `SLACK = 0`) and the per-row kind
+//! freeze (`scripts/baselines/jdk-only-kind-map-25-linux.tsv`). All three are
+//! keyed `25/linux` and must be re-frozen from one real run on that platform in
+//! the same commit as the seven entries. Adding the entries alone turns three
+//! gates red for a change that is otherwise correct. **Land them together or
+//! not at all.**
+//!
+//! **The ordered recipe is W7-22-shadow-retirement-logging-and-time.md §2.1** —
+//! eight steps with the exact commands, including the two the arithmetic cannot
+//! give you: `stub_ratchet.rs` now holds **two** baselines (`…_MANAGEMENT` and
+//! `…_NO_MANAGEMENT`), each of which must be pasted from its own configuration's
+//! printed recount line rather than derived as +7, and
+//! `sh regression-suite/bridge-ratchet.sh --update-baseline --note "…"` re-freezes
+//! the bridge ratchet AND the kind map from ONE census because they are two
+//! readings of one measurement. On a non-Linux host both gate scripts exit **2**
+//! ("REFUSING") rather than failing, so a Windows lane cannot even discover
+//! whether it got the numbers right — which is why this is held rather than
+//! attempted.
+//!
+//! Two edits, not one, and they only work together: the seven entries go in
+//! SORTED position (`java/io/…` sorts before every `java/util/…` row, so at the
+//! HEAD of the table) **and** [`triple_is_retired_shadow`]'s prefix
+//! discriminator has to admit `java/io/Print`. An entry under a prefix the
+//! discriminator rejects answers `false`, which reads as "not retired" and is
+//! invisible; `every_entry_is_reachable_through_the_predicate` is the test that
+//! catches exactly that.
 //!
 //! # Why this is applied centrally
 //!
@@ -118,6 +250,15 @@ static RETIRED_SHADOW_TRIPLES: &[(&str, &str, &str)] = &[
     ("java/util/logging/LogRecord", "getLevel", "()Ljava/util/logging/Level;"),
     ("java/util/logging/LogRecord", "getMessage", "()Ljava/lang/String;"),
     ("java/util/logging/LogRecord", "getSequenceNumber", "()J"),
+    // The source pair, retired 2026-08-12 as a SET. See the "the source pair"
+    // section of this module's docs: the getters are the real getters with
+    // `inferCaller()` deleted, and the setters are the real setters with
+    // `needToInferCaller = false` deleted. Retiring either half alone is worse
+    // than retiring neither.
+    ("java/util/logging/LogRecord", "getSourceClassName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "getSourceMethodName", "()Ljava/lang/String;"),
+    ("java/util/logging/LogRecord", "setSourceClassName", "(Ljava/lang/String;)V"),
+    ("java/util/logging/LogRecord", "setSourceMethodName", "(Ljava/lang/String;)V"),
     ("java/util/logging/Logger", "addHandler", "(Ljava/util/logging/Handler;)V"),
     ("java/util/logging/Logger", "config", "(Ljava/lang/String;)V"),
     ("java/util/logging/Logger", "config", "(Ljava/util/function/Supplier;)V"),
@@ -242,13 +383,37 @@ mod tests {
     }
 
     /// A vacuity floor. An empty table would make every test above pass and
-    /// retire nothing — the measurement recorded 84 triples.
+    /// retire nothing — the 2026-08-11 measurement recorded 84 triples, and the
+    /// 2026-08-12 source-pair retirement added four.
     #[test]
     fn the_table_is_not_empty() {
         assert!(
             RETIRED_SHADOW_TRIPLES.len() >= 80,
-            "expected the measured java.util.logging population (84), got {}",
+            "expected the measured java.util.logging population (88), got {}",
             RETIRED_SHADOW_TRIPLES.len()
         );
+    }
+
+    /// `LogRecord`'s source pair is retired as a SET of four.
+    ///
+    /// Not a restatement of the table: it is the property that keeps a later
+    /// edit from retiring the getters and leaving the setters, which is
+    /// strictly worse than retiring neither. The real getter honours
+    /// `needToInferCaller`; the shadow setter never clears it; so a getter-only
+    /// retirement makes an explicit `setSourceClassName("X")` get silently
+    /// overwritten by the inferred caller on the next read.
+    #[test]
+    fn the_log_record_source_pair_is_retired_as_a_set() {
+        for (m, d) in [
+            ("getSourceClassName", "()Ljava/lang/String;"),
+            ("getSourceMethodName", "()Ljava/lang/String;"),
+            ("setSourceClassName", "(Ljava/lang/String;)V"),
+            ("setSourceMethodName", "(Ljava/lang/String;)V"),
+        ] {
+            assert!(
+                triple_is_retired_shadow("java/util/logging/LogRecord", m, d),
+                "the source pair retires as a set; {m}{d} is missing"
+            );
+        }
     }
 }

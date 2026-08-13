@@ -63,9 +63,13 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{layout_alias, read_alias, NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::ArrayElementType;
+// The heap's own object-kind discriminant. `bb_resolve_heap_array` uses it to
+// refuse a non-array where a backing array is required — see
+// W7-83-segment-as-backing-array.md.
+use cratonvm_types::ObjectKind;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // EINTR-transparent socket I/O — the shared retry primitive the blocking
@@ -894,6 +898,80 @@ fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCa
             RuntimeError::aioobe_index_only(off.saturating_add(len)),
         ))),
     }
+}
+
+/// The `StringIndexOutOfBoundsException` `String.getChars` raises, which is how
+/// every `Writer.write(String, int, int)` bounds check is actually reached.
+fn writer_region_out_of_bounds(off: i32, begin: i64, end: i64, total: i64) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: off,
+            message: Some(format!("begin {begin}, end {end}, length {total}")),
+        },
+    ))
+}
+
+/// Slice the `[off, off + len)` region of a `Writer.write(String, int, int)`
+/// argument, in the units the JDK counts.
+///
+/// Two things the call sites all had wrong before this existed.
+///
+/// **The check.** `java.io.Writer.write(String,int,int)` performs
+/// `str.getChars(off, (off + len), cbuf, 0)`, and `getChars`'
+/// `checkBoundsBeginEnd` refuses `begin < 0 || begin > end || end > length` —
+/// documented as "@throws IndexOutOfBoundsException ... if off is negative, or
+/// len is negative, or off + len is negative or greater than the length of the
+/// given string". The sites clamped with `.min(text.len())` instead, so
+/// `w.write(s, 0, 500)` on a 3-character string wrote 3 characters and returned
+/// normally: a caller that had mis-computed `len` saw a completed write and a
+/// short file, with nothing anywhere to say the two disagreed.
+///
+/// **The unit.** `off` and `len` are `String.length()` indices, i.e. UTF-16
+/// code units; `text.len()` is Rust BYTES. For any non-ASCII content the window
+/// silently moved, and `&text[off..end]` could land inside a multi-byte
+/// sequence and panic the VM rather than write the wrong text.
+fn writer_string_region(text: &str, off: i32, len: i32) -> Result<String, MethodCallFailed> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let total = units.len() as i64;
+    let begin = i64::from(off);
+    let end = begin + i64::from(len);
+    if begin < 0 || begin > end || end > total {
+        return Err(writer_region_out_of_bounds(off, begin, end, total));
+    }
+    Ok(String::from_utf16_lossy(&units[begin as usize..end as usize]))
+}
+
+/// The same region, under `java.io.BufferedWriter`'s deliberately weaker
+/// contract for this one overload — `Ok(None)` means "write nothing, raise
+/// nothing".
+///
+/// Its @implSpec: "While the specification of this method in the superclass
+/// recommends that an IndexOutOfBoundsException be thrown if len is negative or
+/// off + len is negative, the implementation in this class does not throw such
+/// an exception in these cases but instead simply writes no characters."
+/// Its @throws is still "IndexOutOfBoundsException If off is negative, or
+/// off + len is greater than the length of the given string", which is what the
+/// `while (b < t) { s.getChars(b, b + d, …) }` loop enforces when the region is
+/// non-empty. Keeping the two apart is the whole point: a single clamp deletes
+/// the mandated half along with the tolerated one.
+fn buffered_writer_string_region(
+    text: &str,
+    off: i32,
+    len: i32,
+) -> Result<Option<String>, MethodCallFailed> {
+    if len <= 0 {
+        return Ok(None);
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let total = units.len() as i64;
+    let begin = i64::from(off);
+    let end = begin + i64::from(len);
+    if begin < 0 || end > total {
+        return Err(writer_region_out_of_bounds(off, begin, end, total));
+    }
+    Ok(Some(String::from_utf16_lossy(
+        &units[begin as usize..end as usize],
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2530,8 +2608,13 @@ fn native_isr_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     isr_pending().lock().remove(&isr_key);
     // Close underlying InputStream via virtual dispatch if we have one;
     // otherwise attempt the legacy fd-slot path.
+    //
+    // The delegated close PROPAGATES: `InputStreamReader.close()` is a bare
+    // `sd.close()` under `throws IOException`, and `StreamDecoder.implClose()`
+    // is a bare `in.close()` / `ch.close()`. No `catch` on the chain.
+    // W7-57-close-flush-swallow-sweep.md
     if let Value::Object(Some(stream)) = ctx.get_field(this, 1) {
-        let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+        ctx.invoke_virtual(stream, "close", "()V", &[])?;
         return Ok(None);
     }
     if let Value::Int(fd) = ctx.get_field(this, 0) {
@@ -2807,20 +2890,24 @@ fn native_osw_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => String::new(),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
-        _ => text.len(),
+        Some(Value::Int(l)) => *l,
+        _ => text.encode_utf16().count() as i32,
     };
+    // `OutputStreamWriter` inherits `Writer`'s bounds contract unweakened (it
+    // is `BufferedWriter` that documents the exception below it away), so the
+    // strict helper applies. Check BEFORE touching the fd: the JDK's
+    // `getChars` runs before anything is handed to the encoder, so a rejected
+    // region must leave the stream untouched.
+    let sub = writer_string_region(&text, off, len)?;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let end = (off + len).min(text.len());
-    let sub = &text[off..end];
-    ctx.fd_table().write_string(fd, sub).map_err(io_err)?;
+    ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
     Ok(None)
 }
 
@@ -2846,8 +2933,18 @@ fn native_osw_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
+    // The FLUSH is reported, the CLOSE is not, and the asymmetry is the point.
+    // `Writer.close()` is specified "Closes the stream, flushing it first ...
+    // @throws IOException If an I/O error occurs", so the buffered bytes
+    // failing to reach the disk on the way out — a full volume, a broken pipe
+    // — is the caller's to hear about; `let _ =` on it meant a
+    // `try (Writer w = …) { w.write(everything); }` block exited cleanly with
+    // the tail of the file missing. Releasing the descriptor afterwards stays
+    // best-effort and unconditional: "Closing a previously closed stream has
+    // no effect", and a leaked fd would outlive the error either way.
+    let flushed = ctx.fd_table().flush(fd);
     let _ = ctx.fd_table().close(fd);
+    flushed.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2881,20 +2978,26 @@ fn native_bw_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => String::new(),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
-        _ => text.len(),
+        Some(Value::Int(l)) => *l,
+        _ => text.encode_utf16().count() as i32,
+    };
+    // The WEAK half of the pair — `BufferedWriter` is the one class that
+    // documents the negative-`len` exception away, so `None` here is a
+    // spec-mandated no-op rather than a swallowed refusal. Everything else
+    // (`off < 0`, or a region running past the end) still throws.
+    let sub = match buffered_writer_string_region(&text, off, len)? {
+        Some(s) => s,
+        None => return Ok(None),
     };
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let end = (off + len).min(text.len());
-    let sub = &text[off..end];
-    ctx.fd_table().write_string(fd, sub).map_err(io_err)?;
+    ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
     Ok(None)
 }
 
@@ -2924,9 +3027,17 @@ fn native_bw_new_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
+    // The platform separator, not LF. This registration is OVERWRITTEN by
+    // `phases_late::nio_file`'s `BufferedWriter.newLine` — registration is
+    // last-write-wins and `register_phase57_nio_file` runs after
+    // `register_io_natives` in every mode — so the wrong fallback here was
+    // never observable. It is corrected rather than deleted because "the losing
+    // registrar disagrees with the winner" is how a later registration-order
+    // change turns a dead defect into a live one.
     let line_sep = ctx
         .get_system_property("line.separator")
-        .unwrap_or_else(|| "\n".to_string());
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
     ctx.fd_table().write_string(fd, &line_sep).map_err(io_err)?;
     Ok(None)
 }
@@ -2953,8 +3064,12 @@ fn native_bw_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
+    // Same split as `native_osw_close`: the real class closes with
+    // `try (Writer w = out) { flushBuffer(); }`, so the final flush's failure
+    // propagates and the descriptor is released either way.
+    let flushed = ctx.fd_table().flush(fd);
     let _ = ctx.fd_table().close(fd);
+    flushed.map_err(io_err)?;
     Ok(None)
 }
 
@@ -3266,11 +3381,28 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    if len == 0 {
-        return Ok(Some(Value::Int(0)));
-    }
+    // ORDER MATTERS. `ByteArrayInputStream.read(byte[],int,int)` tests EOF
+    // FIRST and the zero-length request SECOND:
+    //
+    //     if (pos >= count) return -1;
+    //     int avail = count - pos; if (len > avail) len = avail;
+    //     if (len <= 0) return 0;
+    //
+    // so a `read(b, off, 0)` on an ALREADY-EXHAUSTED stream answers -1, not
+    // 0. The reversed order answered 0, which is what broke netty's
+    // `AbstractByteBufTest.testStreamTransfer1`: after draining the stream it
+    // asserts `assertEquals(-1, buffer.setBytes(i, in, 0))`, and that test
+    // failed on all 10 concrete ByteBuf test classes.
+    //
+    // The ordering is BAIS-specific. `InputStream.read(byte[],int,int)`'s
+    // default implementation genuinely returns 0 for `len == 0` before it
+    // ever calls `read()` -- that is the `!has_bais_layout` branch above.
+    // Do not "unify" the two.
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
+    }
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
     }
     let avail = (count - pos) as usize;
     let to_read = len.min(avail);
@@ -3864,13 +3996,34 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // flush() (DataOutputStream/BufferedOutputStream flush their own buffer), then
     // close the wrapped stream so its close()/finish() runs. `flush()` is
     // virtual and can collect; refresh `this` before reading its `out` slot.
+    //
+    // Both delegations PROPAGATE, in the JDK's own precedence. Its body is:
+    //
+    //     try { flush(); }
+    //     catch (Throwable e) { flushException = e; throw e; }
+    //     finally { out.close() — suppressing its own failure into
+    //               flushException when there was one }
+    //
+    // so the flush failure wins, the close is attempted either way, and a
+    // close failure surfaces only when the flush succeeded. Dropping both,
+    // as this did, turned a full disk into a clean `try`-with-resources exit
+    // over a truncated file — the exact defect this native was written to
+    // avoid one level down. W7-57-close-flush-swallow-sweep.md
+    //
+    // (The JDK's `addSuppressed` link between the two is not reproduced;
+    // recorded as a residual in that record.)
     let this_pin = ctx.pin_native_root(this);
-    let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+    let flushed = ctx.invoke_virtual(this, "flush", "()V", &[]).map(|_| ());
     let this = ctx.read_native_pin(this_pin, this);
-    if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
-    }
+    let closed = if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
+        ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[])
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
     ctx.unpin_native_roots(this_pin);
+    flushed?;
+    closed?;
     Ok(None)
 }
 
@@ -5473,6 +5626,14 @@ fn real_filewriter_enabled() -> bool {
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // W7-69: publish this crate's ByteBuffer slot map so the read-side alias
+    // sweep can check it against the loaded class. Unconditional and outside
+    // the flag check on purpose — the list is one `&'static` push per process,
+    // and gating it would leave a run that enables the flag later with nothing
+    // to sweep. `register_io_natives` is called in BOTH arms of `vm_init`'s
+    // `if config.use_synthetic_jdk` fork, so the map is published in Compatible
+    // mode too, where it is exactly the mode the census is about.
+    read_alias::declare_slot_map(&BB_SLOT_MAP);
     // SECURITY FIX (V12): apply the requested hardening deployment profile
     // before any I/O natives are registered, so a deployment that requests it
     // (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) fails closed — CWD
@@ -6248,7 +6409,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
                     Value::Int(fd) => fd as u32,
                     _ => return Ok(None),
                 };
-                let _ = ctx.fd_table().write_string(fd, &text);
+                // `let _ =` here made `FileWriter.write(String)` the only
+                // write in this crate that could not fail: "@throws IOException
+                // If an I/O error occurs" (`Writer.write(String)`), and a
+                // caller that got no exception has been told the characters
+                // are in the file.
+                ctx.fd_table().write_string(fd, &text).map_err(io_err)?;
                 Ok(None)
             },
         );
@@ -6267,19 +6433,24 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
                     _ => String::new(),
                 };
                 let off = match args.get(2) {
-                    Some(Value::Int(v)) => *v as usize,
+                    Some(Value::Int(v)) => *v,
                     _ => 0,
                 };
                 let len = match args.get(3) {
-                    Some(Value::Int(v)) => *v as usize,
-                    _ => text.len(),
+                    Some(Value::Int(v)) => *v,
+                    _ => text.encode_utf16().count() as i32,
                 };
+                // `FileWriter` extends `OutputStreamWriter` and does not
+                // redeclare this method, so `Writer`'s unweakened bounds
+                // contract applies — see `writer_string_region`. Clamping BOTH
+                // ends made `fw.write(s, 0, s.length() + 1)` write the whole
+                // string and return normally.
+                let sub = writer_string_region(&text, off, len)?;
                 let fd = match ctx.get_field(this, 0) {
                     Value::Int(fd) => fd as u32,
                     _ => return Ok(None),
                 };
-                let sub = &text[off.min(text.len())..(off + len).min(text.len())];
-                let _ = ctx.fd_table().write_string(fd, sub);
+                ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
                 Ok(None)
             },
         );
@@ -6307,8 +6478,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // fully real-bytecode path, analogous to the FileInputStream open0/read0
     // surface. The old synthetic ISR natives are kept only under
     // `synthetic-jdk`.
+    //
+    // 2026-08-12 (W7-50): the cfg alone was the WRONG GUARD here, for exactly
+    // the reason spelled out on the `FileOutputStream` block above — it asks
+    // what was COMPILED, and what decides whether a real `InputStreamReader`
+    // is on the other end is which CLASS LIBRARY was LOADED. A
+    // `--features synthetic-jdk` binary run `--jdk-only` (or `--real-jdk`)
+    // satisfied the cfg and registered these over the real class, where slot 0
+    // is `Reader.lock` and slot 1 is `Reader.skipBuffer`. `native_isr_init`
+    // then clobbers the monitor object, writes an `InputStream` into a
+    // `char[]` slot, and never creates the `sd` StreamDecoder.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         registry.register(
             "java/io/InputStreamReader",
             "<init>",
@@ -6371,8 +6552,36 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // synthetic 1-3-field layouts (fd at slot 0) and corrupt state
     // when invoked on real JDK instances (BufferedReader: in + cb +
     // nChars + nextChar + ...).  Keep them gated.
+    //
+    // 2026-08-12 (W7-50): "gated" meant the cfg alone, which is the wrong
+    // guard (see the `FileOutputStream` and `InputStreamReader` notes above).
+    // Measured on a `--features synthetic-jdk` binary under `--jdk-only`,
+    // where every class here is a REAL JDK class:
+    //
+    //  * `native_br_read_line` reads slot 0 expecting a `Value::Int` fd. On a
+    //    real `BufferedReader` slot 0 is `in`, a reference, so the match falls
+    //    to `_` and `readLine()` returns Java `null` on the FIRST call, with
+    //    no I/O attempted and nothing thrown. That is `RJdkNet`'s
+    //    "echo reply: null" and `RJdkServices`' "discovered providers: []" --
+    //    the latter because real `ServiceLoader$LazyClassPathLookupIterator`
+    //    parses its `META-INF/services` descriptor through exactly this
+    //    `readLine`, so it collects zero provider names and the for-each body
+    //    never runs.
+    //  * `native_osw_init` / `native_bw_init` park a value on slot 0 and never
+    //    build the `se` StreamEncoder or set `out`. JDK 25's `PrintStream`
+    //    ctor builds `charOut = new OutputStreamWriter(this, charset)` and
+    //    `textOut = new BufferedWriter(charOut)`, so `print(char[])` reaches
+    //    `BufferedWriter.ensureOpen()` with a null `out`, which throws
+    //    `IOException("Stream closed")`; `PrintStream`'s own exception table
+    //    catches it and sets `trouble = true`. That is `RJdkHello`'s
+    //    "PrintStream reported an error" -- `checkError()` is not registered
+    //    anywhere, so it faithfully reported a flag we caused.
+    //
+    // The runtime flag is the correct guard and is already set in exactly the
+    // arms that matter. The cfg stays too: a default build should not compile
+    // these in at all.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         // --- java.io.BufferedReader ---
         registry.register(
             "java/io/BufferedReader",
@@ -6584,8 +6793,33 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // overrides on a real instance panics with a layout mismatch.  Gate
     // them behind the synthetic-jdk feature so real-JDK mode uses the
     // JDK's own bytecode implementations.
+    //
+    // 2026-08-12 (W7-50): the comment says "real-JDK mode", the guard said
+    // "real-JDK build" -- the same wrong guard as the `FileOutputStream` and
+    // Reader/Writer blocks above. A `--features synthetic-jdk` binary run
+    // `--jdk-only` registered this whole ~60-method surface over the real
+    // `java.nio.ByteBuffer`, and because it runs AFTER the order-aware `s2`
+    // family from `native-builtins`' `register_s2_bytebuffer_essentials` and
+    // registration is last-write-wins, it WON. Two measured consequences:
+    //
+    //  * `native_bb_put_int`/`get_int`/`put_short`/... are hard-coded
+    //    `to_be_bytes`/`from_be_bytes` and never read `bigEndian`, while
+    //    `order(ByteOrder)` is not re-registered here at all. So the order
+    //    write lands, `order()` reports LITTLE_ENDIAN, and `putInt` writes
+    //    big-endian anyway. That asymmetry is `RJdkNio`'s "little-endian
+    //    layout" (big-endian passed, which is what made it look narrow).
+    //  * `native_bb_remaining` goes through `bb_state`, which resolves the
+    //    backing array as `hb`-by-name, then slot 5, then slot 0 -- and has
+    //    no direct-buffer arm. On the real `DirectByteBuffer` that
+    //    `ByteBuffer.allocateDirect` returns, slot 0 is `Buffer.mark`, whose
+    //    initial value is -1. That is `RJdkDefineClass`'s "ByteBuffer missing
+    //    backing array (field 0 returned Int(-1))", raised from the
+    //    `int len = b.remaining()` that opens real
+    //    `ClassLoader.defineClass(String,ByteBuffer,ProtectionDomain)`.
     #[cfg(feature = "synthetic-jdk")]
-    register_nio_natives(registry);
+    if !registry.drops_real_layout_synthetic() {
+        register_nio_natives(registry);
+    }
 
     // --- Phase 26: Extended I/O ---
     register_string_rw_natives(registry);
@@ -7081,17 +7315,195 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
 // java.nio — ByteBuffer, Channels (Phase 23)
 // ===========================================================================
 
-/// ByteBuffer layout: 5-field synthetic
+// ByteBuffer layout: CratonVM's 5-field SYNTHETIC one. It is not
+// `java/nio/ByteBuffer`'s layout and never was — the real one, `javap -p` on
+// Eclipse Adoptium 25.0.3.9, transitive, `static` excluded, superclass first
+// (W7-76-bytebuffer-alias-residuals.md re-derived it independently of W7-58
+// and W7-69 and agrees with both):
+//
+//     java.nio.Buffer:      mark(0) position(1) limit(2) capacity(3)
+//                           address(4) segment(5)
+//     java.nio.ByteBuffer:  hb(6) offset(7) isReadOnly(8) bigEndian(9)
+//                           nativeByteOrder(10)
+//     java.nio.HeapByteBuffer: declares NO instance fields — the 11 above are
+//                           the whole of it.
+//
+// So of the five below, only `position` and `limit` mean the same thing on
+// both layouts, and that is a coincidence of declaration order.
+//
+// Every production reader in this module resolves BY NAME first and reaches
+// these indices only when the name does not resolve — the standing W4-4
+// remedy, and the reason these constants have survived. W7-76 established
+// per slot whether a real receiver can reach the numeric arm at all; the
+// verdicts live on the constants themselves, so the next reader does not
+// re-derive them and, in particular, does not renumber one crate's copy.
 const BB_FIELD_ARRAY: usize = 0; // byte[] backing array
 const BB_FIELD_POS: usize = 1; // Int position
 const BB_FIELD_LIMIT: usize = 2; // Int limit
 const BB_FIELD_CAPACITY: usize = 3; // Int capacity
+/// Synthetic-layout `mark`. **On the real layout slot 4 is
+/// `java.nio.Buffer.address`, a `long`** — see [`BB_ADDRESS_SLOT`], which is
+/// the same index under the name of what is really there.
+///
+/// Reachability, W7-76: `buf_read_mark`'s by-name read of `mark` resolves on
+/// every real receiver (`Buffer.mark` is a declared `int`), so this fallback
+/// is DEAD on the real layout and live only on the synthetic one, where it is
+/// correct. `buf_set_mark`'s write is not dead — it is unconditional — which
+/// is why that function saves and restores `address` around it.
 const BB_FIELD_MARK: usize = 4; // Int mark (-1 = not set)
 const BB_NUM_FIELDS: usize = 5;
 
-/// FileChannel layout: 2-field synthetic
-const FC_FIELD_FD: usize = 0; // Int file descriptor id
-const FC_FIELD_POS: usize = 1; // Long position in file
+/// Slot 4 again, under the name of what is really there on the real layout:
+/// `java.nio.Buffer.address`.
+///
+/// **Deliberately the same index as [`BB_FIELD_MARK`], and deliberately not a
+/// renumber.** W7-76 chose name-resolution over renumbering here for a reason
+/// that is a property of the tree rather than a preference:
+///
+/// * On the REAL layout slot 4 *is* `address`, so `bb_resolve_direct_address`'s
+///   numeric fallback is right — and it is the one fallback in this family a
+///   real receiver genuinely reaches, because a real `HeapByteBuffer` carries
+///   `address = ARRAY_BYTE_BASE_OFFSET = 16`, which
+///   [`is_plausible_native_addr`] refuses, dropping through to this read.
+/// * On `native-builtins`' six-slot synthetic layout slot 4 is *also* the
+///   direct address: `servlet.rs`'s independently-declared `BB_MARK = 4`
+///   carries the `NativeMemoryTable` pointer that `s2_bb_alloc_direct` seeds,
+///   and those buffers are precisely the receivers this module's direct arm
+///   exists to serve.
+///
+/// So moving `mark` off 4 in this crate alone would move the disagreement
+/// rather than close it — W7-68-live-under-allocations.md §3.2's `FileChannel`
+/// rule, met here in the direction where the shared index is the CORRECT one.
+/// What was actually wrong was that one index carried one name while three
+/// call sites held two different beliefs about it; both beliefs are now named,
+/// and both are published in [`BB_SLOT_MAP`] so the census reports the wrong
+/// one and stays clean on the right one.
+///
+/// The two readers are separated only by VALUE TYPE — `Value::Int` is a mark,
+/// `Value::Long` past [`is_plausible_native_addr`] is an address. That is
+/// thin, and it is what the census row is for.
+const BB_ADDRESS_SLOT: usize = BB_FIELD_MARK;
+
+/// The slot [`bb_resolve_heap_offset`]'s numeric fallback reads, expecting
+/// `ByteBuffer.offset`. It was a bare `6` until W7-76; naming it is the point
+/// of the exercise, because on the real layout **slot 6 is `hb`** — the
+/// backing `byte[]` — and `offset` is 7.
+///
+/// W7-76's verdict: right on NO layout, and reachable on none of them.
+///
+/// * Real layout: 6 is `hb`, a reference. The `Value::Int` match is the only
+///   thing between it and a fabricated offset — and it is unreachable anyway,
+///   because `offset` is a declared `int` on every real `ByteBuffer` subclass,
+///   so the by-name arm above always answers.
+/// * CratonVM's five-slot synthetic layout: there is no slot 6.
+/// * `native-builtins`' six-slot synthetic layout: slot 6 is `BB_NATIVE_ID`,
+///   a `Long` alloc id — refused by the same match. Its typed views encode
+///   their byte start at slot 4 as `-(start + 1)` (`s2_bb_int_byte_off`), not
+///   here.
+///
+/// Not renumbered to 7, because a second numeric guess buys nothing the
+/// by-name arm does not already answer on every receiver that has the field.
+/// Not deleted, because `bb_get_bulk_reads_real_heap_layout_slot_hb` in this
+/// file's test module drives exactly this arm, and retiring a live test on a
+/// branch that cannot run `cargo` is how a silent behaviour change ships.
+const BB_HEAP_OFFSET_FALLBACK_SLOT: usize = 6;
+
+/// The constants above, restated as a machine-readable `(slot, field name)`
+/// table for the READ-side alias census.
+///
+/// W7-59-layout-detector-coverage.md section 6 named exactly this gap: the
+/// per-native slot maps are `const F_x: usize = k` constants "with no
+/// machine-readable link to a field name", so no instrument could say "slot 0
+/// is `mark`, not `hb`". This is that link, and it is `const` data — it costs
+/// nothing at runtime and nothing when the flag is off.
+///
+/// **W7-76 corrected the shape this table publishes**, which was wrong in two
+/// ways that pull in opposite directions:
+///
+/// 1. It was INCOMPLETE and did not say so. `bb_resolve_heap_offset`'s slot-6
+///    read — the third wrong slot, and the one
+///    W7-69-read-side-alias-instrument.md §6.3 files as a defect — was not in
+///    the table at all, so `verify_declared_slot_maps` could sweep the map
+///    clean of it forever. A table that looks total and is not reads as
+///    coverage.
+/// 2. It gave slot 4 ONE name where three call sites hold TWO beliefs.
+///    `buf_read_mark`/`buf_set_mark` believe `mark` (true on the synthetic
+///    layout, false on the real one); `bb_resolve_direct_address` believes
+///    `address` (true on both, and the live one). Publishing only `mark` made
+///    the sweep print one wrong-field row for slot 4, which reads as "the
+///    reader that reaches slot 4 is broken" when the reader that reaches it on
+///    a real receiver is correct. Both are published now: `slots` is a slice,
+///    not a map, so a slot may legitimately appear twice, and
+///    `already_reported` dedupes on `(class, slot, expected, site)` and so
+///    keeps them apart.
+///
+/// Swept against the loaded `java/nio/ByteBuffer` it should therefore report
+/// exactly three `wrong-field` rows — `0 hb→mark`, `4 mark→address`,
+/// `6 offset→hb` — and stay clean on the other five, including the second
+/// slot-4 row. Nothing here is repaired by renumbering; see [`BB_ADDRESS_SLOT`]
+/// and [`BB_HEAP_OFFSET_FALLBACK_SLOT`] for why, per slot.
+pub static BB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/nio/ByteBuffer",
+        slots: &[
+            // WRONG on the real class: 0 is `Buffer.mark`. The calibration
+            // case — a real `DirectByteBuffer` reaches it, because `hb`
+            // resolves by name to NULL rather than failing to resolve.
+            (BB_FIELD_ARRAY, "hb"),
+            (BB_FIELD_POS, "position"),
+            (BB_FIELD_LIMIT, "limit"),
+            (BB_FIELD_CAPACITY, "capacity"),
+            // WRONG on the real class: 4 is `Buffer.address`. Dead on a real
+            // receiver for the READ (`buf_read_mark` resolves `mark` by name);
+            // live for the WRITE (`buf_set_mark` is unconditional and
+            // compensates with a save/restore).
+            (BB_FIELD_MARK, "mark"),
+            // The same slot, the other belief, and this one is CORRECT — the
+            // deliberate non-firing control W7-69 §3 built the instrument
+            // around, now published rather than only wired at the call site.
+            (BB_ADDRESS_SLOT, "address"),
+            (BB_SEGMENT_SLOT, "segment"),
+            // WRONG on the real class: 6 is `ByteBuffer.hb`, an array, where
+            // an `Int` offset is read. Unreachable on every layout this tree
+            // has; see the constant.
+            (BB_HEAP_OFFSET_FALLBACK_SLOT, "offset"),
+        ],
+        origin: "native-io/src/lib.rs BB_FIELD_*",
+    };
+
+// FileChannel: the private `{fd, position}` map used to be slots 0 and 1 of a
+// class that declares FOUR, and it MOVED — W7-72-ssc-socket-and-filechannel.md.
+// It now lives above every declared field,
+// owned by `cratonvm_native_api::synthetic_file_channel`, which both this crate
+// and `native-builtins` call. The constants that used to sit here are gone on
+// purpose: a map with two owners drifts, and two crates owned this one.
+//
+// `javap -p java.nio.channels.FileChannel` on JDK 25.0.3.9 gives the
+// transitive order
+//
+//     0 closeLock (Object, final)   1 closed (boolean, volatile)
+//     2 interruptor (Interruptible) 3 interruptedTarget (Object, volatile)
+//
+// all four inherited from `java.nio.channels.spi.AbstractInterruptibleChannel`.
+// So the fd was an `Int` in `closeLock` — a reference-typed slot, where
+// `gc::coerce_field_value_by_descriptor` degrades it to null, so the fd never
+// persisted at all in real-JDK mode — and the file position was a `Long` in
+// `closed`, the boolean `AbstractInterruptibleChannel.isOpen()` returns the
+// negation of. The object was never SHORT (the base allocator clamps
+// `slots = requested.max(declared)`); it was mis-mapped.
+//
+// W7-68-live-under-allocations.md left this alone on the reading that
+// `nio_file.rs`'s surviving `isOpen` reads slot 0 as the fd, so moving the map
+// would make `isOpen()` answer FALSE for every open channel. **That reading of
+// which registration survives is inverted** — see
+// W7-72-ssc-socket-and-filechannel.md for the ordering, established by reading
+// `vm_init.rs`'s two arms: the copy that reads slot 0 is registered only from
+// `register_phase57_file_channel`, which is reachable only through
+// `register_synthetic_overrides` (`#[cfg(feature = "synthetic-jdk")]`) and is
+// overwritten even there. The winner in every configuration is the copy that
+// never reads a private slot. Its body now answers `!closed` on both arms, so
+// the two registrations agree and the last-write-wins outcome stops mattering
+// for that triple.
 
 // RA.1: When a real JDK `java.nio.Buffer` (or subclass) is loaded, its
 // declared-field order is `mark, position, limit, capacity, address` on
@@ -7159,6 +7571,20 @@ fn buf_set_limit(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
 /// non-`Long`, and nothing is restored.
 fn buf_set_mark(ctx: &mut dyn NativeContext, obj: ObjectRef, v: i32) {
     let saved_address = ctx.get_field_by_name(obj, "address");
+    // W7-69, observation only. A WRITE through an aliased slot is the same
+    // species and the same call — the finding is about what slot 4 MEANS, not
+    // about the direction of the access. On a real Buffer this `Int` lands on
+    // `address`, which is why the save/restore below exists at all; the census
+    // row names the field the restore is compensating for.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            &*ctx,
+            obj,
+            BB_FIELD_MARK,
+            "mark",
+            "native-io/src/lib.rs::buf_set_mark (write)",
+        );
+    }
     ctx.set_field(obj, BB_FIELD_MARK, Value::Int(v));
     ctx.set_field_by_name(obj, "mark", Value::Int(v));
     if let Value::Long(_) = saved_address {
@@ -7193,10 +7619,59 @@ fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
     if let Value::Int(v) = ctx.get_field_by_name(obj, "mark") {
         return v;
     }
+    // W7-69, observation only. On a REAL java.nio.Buffer slot 4 is `address`
+    // (a long), not `mark` — `mark` is slot 0. Reaching here on a real receiver
+    // means the by-name read above did not resolve, so this fallback is about to
+    // read `address` and call it `mark`. The `Value::Int` match below stops it
+    // returning a pointer as a mark, which is why this has never been a visible
+    // bug; the census row is the point.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            obj,
+            BB_FIELD_MARK,
+            "mark",
+            "native-io/src/lib.rs::buf_read_mark",
+        );
+    }
     if let Value::Int(v) = ctx.get_field(obj, BB_FIELD_MARK) {
         return v;
     }
     -1
+}
+
+/// Read `capacity`, preferring real JDK slot when present.
+///
+/// This same two-step name-then-slot fallback existed inline in three places
+/// (`bb_state`, `bb_storage_view`, `native_bb_set_limit`). Named once so a
+/// future layout correction has one place to land instead of three.
+fn buf_read_capacity(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    if let Value::Int(v) = ctx.get_field_by_name(obj, "capacity") {
+        return v;
+    }
+    if let Value::Int(v) = ctx.get_field(obj, BB_FIELD_CAPACITY) {
+        return v;
+    }
+    0
+}
+
+/// `(position, limit, capacity)` for any buffer, **without requiring backing
+/// storage**.
+///
+/// This is the half of `bb_state` that `remaining()`, `hasRemaining()` and the
+/// typed `toString()` actually wanted. All three asked for the whole state
+/// tuple, discarded the array with `_`, and inherited its refusal — so
+/// `remaining()` on a `ByteBuffer.allocateDirect(n)` raised
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// while computing `limit - position`, two fields it had already read
+/// correctly. The `-1` is `java.nio.Buffer.mark`, which is what slot 0 is on
+/// the real layout; see `bb_state` for the species.
+fn buf_metadata(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32) {
+    (
+        buf_read_position(ctx, this),
+        buf_read_limit(ctx, this),
+        buf_read_capacity(ctx, this),
+    )
 }
 
 fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
@@ -7213,43 +7688,399 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // copy bytecode relies on this value when ScopedMemoryAccess hands the
     // backing byte[] and offset to Unsafe.copyMemory.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
+    // W7-76 — HotSpot parity, and the one behaviour change in that lane.
+    //
+    // `java.nio.ByteBuffer` declares `boolean bigEndian = true` as a FIELD
+    // INITIALISER (checked in `lib/src.zip` on 25.0.3.9), so javac compiles
+    // the write into every `ByteBuffer` constructor and nothing else writes
+    // it. This allocator mints the object with a raw `alloc_object` and runs
+    // no constructor, so without the two writes below the field stays at the
+    // Java default `false`. Real `ByteBuffer.order()` is
+    //
+    //     public final ByteOrder order() {
+    //         return bigEndian ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+    //     }
+    //
+    // — `final`, reading the field directly — so no per-subclass native can
+    // correct it after the fact. HotSpot answers BIG_ENDIAN for
+    // `ByteBuffer.allocate(n)` at every size
+    // (`probes/DirectByteBufferStateProbe.java`, `fresh.allocate8.order`,
+    // measured on Eclipse Adoptium 25.0.3.9).
+    //
+    // This is NOT synthetic-only, which is why it is a parity fix rather than
+    // a synthetic-mode tidy-up. `register_nio_natives` — the registrar for
+    // `ByteBuffer.allocate`/`wrap`/`slice`/`duplicate`, all of which land here
+    // — is gated off the real-JDK arm, but `stream_decoder.rs`'s
+    // `Channels.newReader` branch calls this allocator too and
+    // `register_stream_decoder_natives` is registered unconditionally. So a
+    // Compatible-mode run mints these buffers over the real 11-field
+    // `java/nio/ByteBuffer`, where `bigEndian` resolves BY NAME, reads back
+    // `Int(0)`, and `native-builtins`' `s2_bb_order` decodes that as
+    // LITTLE_ENDIAN. s2 owns `ByteBuffer.order()` in both modes — native-io
+    // registers `order` for the six typed classes and never for ByteBuffer —
+    // so it is the reader that sees this.
+    //
+    // Same two writes for the same reason as `native-builtins/src/servlet.rs`'s
+    // `bb_write_hb` and `native-io/src/direct_buffer.rs`'s
+    // `dbb_allocate_direct0`; a third divergent copy of this seed is exactly
+    // what a shared helper would prevent, and is noted in
+    // W7-76-bytebuffer-alias-residuals.md rather than fixed here.
+    //
+    // `nativeByteOrder` is `bigEndian == (native order is big)`, i.e. false on
+    // every little-endian target — the same value as the default. Written
+    // anyway so the pair cannot drift if a big-endian target ever appears.
+    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        obj,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
     obj
 }
 
-fn bb_state(
-    ctx: &dyn NativeContext,
-    this: ObjectRef,
-) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
-    // Prefer the real-JDK `hb` field. Some real heap-buffer subclasses land
-    // here without superclass by-name field resolution, so fall back to the
-    // real-JDK HeapByteBuffer slot (`hb` @ 5) before synthetic slot 0.
-    let arr = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => a,
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => a,
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => a,
-                other => {
-                    return Err(MethodCallFailed::InternalError(VmError::Internal {
-                        message: format!(
-                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY, other, this
-                    ),
-                    }))
-                }
+/// Element-indexed storage view of a typed NIO buffer — `bb_storage_view`'s
+/// twin for the `CharBuffer` / `IntBuffer` / `LongBuffer` / `FloatBuffer` /
+/// `DoubleBuffer` / `ShortBuffer` families, **and the direct-buffer arm this
+/// function spent its whole life without**.
+///
+/// ## What it used to be, and why that was a defect
+///
+/// It returned `(backing_array, pos, lim, cap)` and resolved the array as
+/// `hb`-by-name → slot 5 → slot 0, with no fourth arm. A buffer that has no
+/// backing array — every `ByteBuffer.allocateDirect` result, and every typed
+/// view over one — therefore fell through to slot 0, which on the real
+/// `java.nio.Buffer` layout is
+///
+/// ```text
+///   mark(0) position(1) limit(2) capacity(3) address(4) segment(5)
+///     then ByteBuffer's own:  hb(6) offset(7) isReadOnly(8) bigEndian(9) nativeByteOrder(10)
+/// ```
+///
+/// i.e. `mark`, initialised to `-1`. That produced
+/// `internal error: ByteBuffer missing backing array (field 0 returned Int(-1))`
+/// — a CratonVM slot index applied to a real JDK object, landing on a field
+/// with an unrelated meaning. Note in passing that the old comment's "real-JDK
+/// HeapByteBuffer slot (`hb` @ 5)" was wrong twice over: on JDK 25 `hb` is
+/// index 6 and index 5 is `Buffer.segment`. The slot-5 probe is kept anyway,
+/// with its real justification: `segment` is the only Object-typed field
+/// `Buffer` declares, so it is where `native-builtins`' typed-buffer views
+/// (`s2_view_buf_fn!`, `BB_SEGMENT_SLOT`) deliberately stash their backing
+/// array. Reading it as "maybe an array" is right for that population and was
+/// claimed to be "harmless for a real buffer, where `segment` is null" — which
+/// W7-83-segment-as-backing-array.md measured and falsified: `segment` is null
+/// on `allocate` and `allocateDirect` receivers, and is a live
+/// `NativeMemorySegmentImpl` on an `Arena…allocate(n).asByteBuffer()` one. The
+/// arm now screens the value's KIND; see `bb_resolve_heap_array`.
+///
+/// ## What it is now
+///
+/// The same three-arm array resolution, then a **direct arm** reading
+/// `address` (by name, else slot 4) exactly as `bb_storage_view` does, and
+/// only then the refusal. The result is element-indexed: a heap receiver's
+/// array already is, and a direct receiver's byte-addressed block is scaled by
+/// [`TbView::elem`]'s width.
+///
+/// The return type changed from a tuple to `TbView` deliberately. This is the
+/// second migration of this family — the first
+/// (spring-bytebuffer-backing-storage-FIXED.md) moved the byte-oriented half
+/// to `bb_storage_view` and left the rest behind, and a partial migration is
+/// invisible until a non-heap buffer reaches one of the stragglers. A changed
+/// return type means any site left behind fails the BUILD instead.
+fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<TbView, MethodCallFailed> {
+    let (pos, lim, cap) = buf_metadata(ctx, this);
+
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
             },
-        },
-    };
-    let pos = buf_read_position(ctx, this);
-    let lim = buf_read_limit(ctx, this);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v
+            // The backing array knows its own element kind, so a HEAP receiver
+            // never has to be asked what class it is stamped with.
+            elem: ctx.heap_element_type_of(arr),
+            big_endian: true, // unused: a heap element read is not byte-decoded
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    if let Some(addr) = bb_resolve_direct_address(ctx, this) {
+        return Ok(TbView {
+            storage: BbStorage::Direct { addr },
+            elem: tb_direct_element_kind(ctx, this),
+            big_endian: tb_receiver_is_big_endian(ctx, this),
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    Err(MethodCallFailed::InternalError(VmError::Internal {
+        message: format!(
+            "Buffer has no backing storage: hb/slot{BB_SEGMENT_SLOT}/slot{BB_FIELD_ARRAY} \
+             resolved no array and address/slot{BB_ADDRESS_SLOT} no native block \
+             (slot{BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+            ctx.get_field(this, BB_FIELD_ARRAY),
+            ctx.get_field_by_name(this, "address"),
+        ),
+    }))
+}
+
+/// Real `java.nio.Buffer.segment` — the only Object-typed field `Buffer`
+/// declares, and therefore the slot `native-builtins`' typed-buffer views use
+/// to carry a backing array that has no `hb` field to go in. Same constant as
+/// `native-builtins/src/servlet.rs`'s `BB_SEGMENT_SLOT`, restated here rather
+/// than shared because the two crates do not depend on each other; if one
+/// moves, the census in W7-58-bytebuffer-direct-arm.md names both.
+///
+/// The slot carries TWO populations, which is why every read of it needs a kind
+/// screen: `native-builtins`' views put a real backing array here, and a real
+/// JDK 25 `Buffer` puts a `MemorySegment` here (non-null on every
+/// `MemorySegment.asByteBuffer()` receiver). See
+/// W7-83-segment-as-backing-array.md.
+const BB_SEGMENT_SLOT: usize = 5;
+
+/// `hb`-by-name → `segment` slot → synthetic slot 0. Extracted from the two
+/// independent copies in `bb_state` and `bb_storage_view` so the two cannot
+/// drift; they had already drifted in their error messages.
+///
+/// ## The slot-5 kind screen (W7-83-segment-as-backing-array.md)
+///
+/// The slot-5 arm is reached on any receiver whose `hb` is null, and on JDK 25
+/// slot 5 is `java.nio.Buffer.segment` — a `MemorySegment`, not an array.
+/// Measured on Eclipse Adoptium 25.0.3.9:
+///
+/// | receiver | `hb` | `segment` |
+/// |---|---|---|
+/// | `ByteBuffer.allocate(16)` | the array | `null` |
+/// | `ByteBuffer.allocateDirect(16)` | `null` | `null` |
+/// | `Arena.ofAuto().allocate(16).asByteBuffer()` | `null` | `jdk.internal.foreign.NativeMemorySegmentImpl` |
+///
+/// On that third receiver the arm used to return the `MemorySegment` and hand
+/// it to `heap_element_type_of` / `get_array_element` as a backing array. That
+/// is a wrong-KIND object where an array is required — a species the read-side
+/// slot census has no vocabulary for, because the slot index is right and the
+/// field name is right; only the value's kind is wrong.
+///
+/// Two things the screen must not disturb, both load-bearing:
+///
+/// * **The slot-5 read stays a non-firing census control.**
+///   `read_alias::observe_read` is keyed on what slot 5 MEANS on the loaded
+///   class, and it means `segment` — which is what this site declares. The
+///   screen is applied to the VALUE after the read, so the census row is
+///   unchanged and still expected clean (W7-69 §3).
+/// * **`is_plausible_native_addr` is not touched.** Rejecting the segment lets
+///   control reach `bb_resolve_direct_address`, and on an `Arena` buffer
+///   `address` is a genuine process pointer, so the receiver resolves as
+///   DIRECT — which is what it is. The `>= 0x1_0000` screen is what still stops
+///   a heap buffer's `address = 16` from being dereferenced there
+///   (`addr=0x10`, 51 of the 53 crashes in the 2026-08-10 H2 sweep).
+///
+/// The screen is on slot 5 ALONE, deliberately. `hb`-by-name resolves a field
+/// the class declares as `byte[]`, so the VM's own typing covers it; slot 0 is
+/// `Buffer.mark`, an `int`, already refused by the `Value::Object` match, and
+/// is the backing array on the synthetic layout. Slot 5 is the only index in
+/// this family that is a REFERENCE field of non-array type on a real receiver,
+/// so it is the only one where an in-bounds, correctly-named read can still
+/// yield the wrong kind.
+fn bb_resolve_heap_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
+        return Some(a);
+    }
+    // W7-69, observation only. Slot 5 really is `Buffer.segment`, and this
+    // probe is deliberate — see the constant's own doc — so the census is
+    // expected to answer CLEAN here. That matters: an instrument that fires on
+    // every slot read is a probe that cannot fail, and this is the arm that
+    // proves it can stay quiet.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_SEGMENT_SLOT,
+            "segment",
+            "native-io/src/lib.rs::bb_resolve_heap_array",
+        );
+    }
+    if let Value::Object(Some(a)) = ctx.get_field(this, BB_SEGMENT_SLOT) {
+        // W7-83. The census row above is about the SLOT; this is about the
+        // VALUE. `native-builtins`' typed buffer views park a real backing
+        // array here (there being no other Object-typed field on `Buffer`),
+        // and a real JDK 25 receiver parks a `MemorySegment` here. Only the
+        // first is a backing array, and only a kind question can tell them
+        // apart — the class name cannot, because a heap reference array
+        // reports its COMPONENT class.
+        //
+        // Falling through rather than returning `None` is deliberate: the
+        // synthetic layout's array lives at slot 0, and a receiver that has
+        // both a segment at 5 and an array at 0 must still resolve.
+        if ctx.heap_kind_of(a) == ObjectKind::Array {
+            return Some(a);
+        }
+    }
+    // THE CALIBRATION CASE. This is the read W7-58-bytebuffer-direct-arm.md
+    // repaired: slot 0 of a real java.nio.DirectByteBuffer is
+    // `java.nio.Buffer.mark` = -1, not the backing array `hb` (which is 6).
+    // The read is perfectly IN BOUNDS, so the gc::guard out-of-bounds list
+    // never saw it and the allocation-width census had no vocabulary for it.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_FIELD_ARRAY,
+            "hb",
+            "native-io/src/lib.rs::bb_resolve_heap_array",
+        );
+    }
+    match ctx.get_field(this, BB_FIELD_ARRAY) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// `ByteBuffer.offset` — the element index of logical element 0 inside the
+/// backing array, non-zero only for an aliasing view. Layouts with no such
+/// field (bare synthetics, typed views) answer 0.
+fn bb_resolve_heap_offset(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    if let Value::Int(v) = ctx.get_field_by_name(this, "offset") {
+        if v >= 0 {
+            return v as usize;
+        }
+    }
+    // W7-69, observation only. On JDK 25 slot 6 is `ByteBuffer.hb` — the
+    // backing ARRAY — and `offset` is 7. So this fallback names a reference
+    // field and reads it as an `Int`; the `Value::Int` match is the only thing
+    // between it and a fabricated offset.
+    //
+    // W7-76 named the literal and settled the verdict rather than leaving it
+    // to "a different lane": the arm is right on no layout and reachable on
+    // none, and is neither renumbered nor deleted. Both refusals are argued at
+    // `BB_HEAP_OFFSET_FALLBACK_SLOT`.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_HEAP_OFFSET_FALLBACK_SLOT,
+            "offset",
+            "native-io/src/lib.rs::bb_resolve_heap_offset",
+        );
+    }
+    match ctx.get_field(this, BB_HEAP_OFFSET_FALLBACK_SLOT) {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// A `Buffer.address` below the first mappable page is never a process
+/// pointer: Linux refuses to map below `vm.mmap_min_addr` (65536 by default)
+/// and Windows reserves the low 64 KiB of every address space. What DOES live
+/// down there is an array-relative `Unsafe` offset — `ARRAY_BYTE_BASE_OFFSET +
+/// offset` — which is exactly what `alloc_byte_buffer` seeds into every HEAP
+/// buffer it mints (`Value::Long(16)`), and what the real `HeapByteBuffer`
+/// constructor seeds too.
+///
+/// So this is not defensive padding. Without it, any heap buffer whose array
+/// failed to resolve — the precise condition that brings control here — hands
+/// `16` to `copy_from_native_memory` as a pointer. `addr=0x10` was 51 of the
+/// 53 crashes in the 2026-08-10 three-GC-variant H2 sweep; refusing the read
+/// degrades instead to this module's "no backing storage" error, which a
+/// caller can see and report. `native-builtins/src/servlet.rs`'s
+/// `is_plausible_native_addr` is the same guard for the same reason; this
+/// family did not have it.
+fn is_plausible_native_addr(v: i64) -> bool {
+    v >= 0x1_0000
+}
+
+/// `address`-by-name → slot 4, screened by [`is_plausible_native_addr`].
+fn bb_resolve_direct_address(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i64> {
+    if let Value::Long(v) = ctx.get_field_by_name(this, "address") {
+        if is_plausible_native_addr(v) {
+            return Some(v);
+        }
+    }
+    // W7-69, observation only. Slot 4 on the REAL layout is `address`, so this
+    // fallback is right — and W7-76 stopped it being spelled with a constant
+    // whose name denies that: it reads [`BB_ADDRESS_SLOT`], which is the same
+    // index under the name of what is there. The census answers CLEAN here,
+    // and that is the second non-firing control: the instrument is keyed on
+    // what the slot MEANS, not on what the constant is called.
+    //
+    // This is also the ONE numeric fallback in this family a real receiver
+    // genuinely reaches. A real `HeapByteBuffer` carries
+    // `address = ARRAY_BYTE_BASE_OFFSET = 16`; `is_plausible_native_addr`
+    // refuses it above, control arrives here, and slot 4 hands back the same
+    // `Long(16)`, which is refused again. Correct on both passes, and the
+    // refusal is what keeps `addr=0x10` out of `copy_from_native_memory`.
+    if layout_alias::enabled() {
+        read_alias::observe_read(
+            ctx,
+            this,
+            BB_ADDRESS_SLOT,
+            "address",
+            "native-io/src/lib.rs::bb_resolve_direct_address",
+        );
+    }
+    match ctx.get_field(this, BB_ADDRESS_SLOT) {
+        Value::Long(v) if is_plausible_native_addr(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Element kind of a DIRECT typed buffer.
+///
+/// Only a direct receiver needs this — a heap one is asked through
+/// `heap_element_type_of`, which is the object's own truth. A direct block is
+/// untyped bytes, so the element width has to come from somewhere else, and
+/// the JDK itself puts it in the class: `DirectIntBufferU`,
+/// `ByteBufferAsIntBufferL`, `HeapIntBuffer`. This reads the receiver's class
+/// to decide how wide its elements are — it does NOT pick which native to run
+/// by name, which is the defect this codebase keeps re-finding.
+///
+/// Unknown names answer `Byte` (width 1), which is what a bare
+/// `java/nio/ByteBuffer` receiver is and the only safe default: it can never
+/// scale an index past the end of a block that a wider guess would.
+fn tb_direct_element_kind(ctx: &dyn NativeContext, this: ObjectRef) -> ArrayElementType {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.contains("CharBuffer") {
+        ArrayElementType::Char
+    } else if name.contains("ShortBuffer") {
+        ArrayElementType::Short
+    } else if name.contains("IntBuffer") {
+        ArrayElementType::Int
+    } else if name.contains("LongBuffer") {
+        ArrayElementType::Long
+    } else if name.contains("FloatBuffer") {
+        ArrayElementType::Float
+    } else if name.contains("DoubleBuffer") {
+        ArrayElementType::Double
     } else {
-        0
-    };
-    Ok((arr, pos, lim, cap))
+        ArrayElementType::Byte
+    }
+}
+
+/// Byte order of a DIRECT typed buffer's elements.
+///
+/// Same source the already-registered `order()` native for these classes uses
+/// (`tb_abstract_view_fns!`'s `$order_fn`): real JDK 25 compiles one concrete
+/// view class per endianness — `ByteBufferAsIntBufferB` / `...L`,
+/// `DirectIntBufferU` (native order) — so the class name IS where the order
+/// lives for a view buffer, there being no field to hold it. Factored out so
+/// the accessor and the reported `order()` cannot disagree; before the direct
+/// arm existed there was no accessor that could.
+///
+/// Every CratonVM target is little-endian, so the unsuffixed "native order"
+/// case answers little-endian.
+fn tb_receiver_is_big_endian(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name.ends_with('B') || name.ends_with("RB") {
+        return true;
+    }
+    if name.ends_with('L') || name.ends_with("RL") {
+        return false;
+    }
+    cfg!(target_endian = "big")
 }
 
 #[derive(Clone, Copy)]
@@ -7266,57 +8097,172 @@ struct BbView {
     cap: i32,
 }
 
+/// Element-indexed view returned by [`bb_state`]: `pos`/`lim`/`cap` are in
+/// ELEMENTS (as every typed-buffer accessor uses them), and `storage` is
+/// whichever of the two kinds the receiver actually has.
+#[derive(Clone, Copy)]
+struct TbView {
+    storage: BbStorage,
+    /// Element kind, so a DIRECT read knows both how many bytes to move and
+    /// which `Value` variant to produce. Read from the backing array for a
+    /// heap receiver; from the receiver's class for a direct one.
+    elem: ArrayElementType,
+    /// Element byte order — consulted only on the direct arm. A heap element
+    /// read goes through `get_array_element`, which is not byte-decoded.
+    big_endian: bool,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+}
+
+/// Bytes per element of `elem`. `Reference` cannot occur in a typed NIO buffer
+/// and answers 1 rather than panicking; a wrong-but-narrow scale mis-reads,
+/// where a panic takes the VM down.
+fn tb_elem_width(elem: ArrayElementType) -> usize {
+    match elem {
+        ArrayElementType::Boolean | ArrayElementType::Byte | ArrayElementType::Reference => 1,
+        ArrayElementType::Char | ArrayElementType::Short => 2,
+        ArrayElementType::Int | ArrayElementType::Float => 4,
+        ArrayElementType::Long | ArrayElementType::Double => 8,
+    }
+}
+
+/// Read element `index` (an ELEMENT index, not a byte offset) from either
+/// storage kind, in the `Value` variant the element's kind calls for — the
+/// same variant `ctx.get_array_element` yields for a heap array of that kind,
+/// so a caller cannot tell the two arms apart.
+fn tb_read_elem(
+    ctx: &dyn NativeContext,
+    view: TbView,
+    index: usize,
+) -> Result<Value, MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => Ok(ctx.get_array_element(arr, offset + index)),
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let mut raw = [0u8; 8];
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if !ctx.copy_from_native_memory(addr.saturating_add(byte_off), &mut raw[..width]) {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element read failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }));
+            }
+            let bits: u64 = if view.big_endian {
+                raw[..width].iter().fold(0u64, |a, &b| (a << 8) | b as u64)
+            } else {
+                raw[..width]
+                    .iter()
+                    .rev()
+                    .fold(0u64, |a, &b| (a << 8) | b as u64)
+            };
+            Ok(match view.elem {
+                ArrayElementType::Long => Value::Long(bits as i64),
+                ArrayElementType::Double => Value::Double(f64::from_bits(bits)),
+                ArrayElementType::Float => Value::Float(f32::from_bits(bits as u32)),
+                // Char is UNSIGNED and Short is SIGNED — the two differ only
+                // here, and getting it wrong is invisible until a value with
+                // the high bit set goes through.
+                ArrayElementType::Char => Value::Int(bits as u16 as i32),
+                ArrayElementType::Short => Value::Int(bits as u16 as i16 as i32),
+                ArrayElementType::Int => Value::Int(bits as u32 as i32),
+                _ => Value::Int(bits as u8 as i8 as i32),
+            })
+        }
+    }
+}
+
+/// Write element `index` through either storage kind. The inverse of
+/// [`tb_read_elem`], and deliberately tolerant of the `Value` variant a caller
+/// hands over (`Int` where a `Float` was expected, etc.) because the typed
+/// natives forward whatever the interpreter pushed.
+fn tb_write_elem(
+    ctx: &mut dyn NativeContext,
+    view: TbView,
+    index: usize,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            ctx.set_array_element(arr, offset + index, value);
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            let width = tb_elem_width(view.elem);
+            let bits: u64 = match value {
+                Value::Long(v) => v as u64,
+                Value::Double(v) => v.to_bits(),
+                Value::Float(v) => v.to_bits() as u64,
+                Value::Int(v) => v as u32 as u64,
+                _ => 0,
+            };
+            let mut raw = [0u8; 8];
+            for i in 0..width {
+                let shift = if view.big_endian {
+                    8 * (width - 1 - i)
+                } else {
+                    8 * i
+                };
+                raw[i] = (bits >> shift) as u8;
+            }
+            let byte_off = (index as i64).saturating_mul(width as i64);
+            if ctx.copy_to_native_memory(addr.saturating_add(byte_off), &raw[..width]) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "Buffer direct element write failed at address 0x{:x} (+{} bytes)",
+                        addr, byte_off
+                    ),
+                }))
+            }
+        }
+    }
+}
+
+/// Byte-indexed storage view — the `ByteBuffer` half of the same resolution
+/// [`bb_state`] does for the typed families. Both now share
+/// `bb_resolve_heap_array` / `bb_resolve_heap_offset` /
+/// `bb_resolve_direct_address` rather than each carrying its own copy; the two
+/// copies had already drifted apart in their error text, and one of them
+/// (`bb_state`'s) had no direct arm at all.
+///
+/// The one behaviour change here is the address screen: this used to accept
+/// any non-zero `address`, including the `16` that `alloc_byte_buffer` seeds
+/// into every HEAP buffer as `ARRAY_BYTE_BASE_OFFSET`. See
+/// [`is_plausible_native_addr`] for why dereferencing that is not a wrong
+/// answer but a SIGSEGV.
 fn bb_storage_view(ctx: &dyn NativeContext, this: ObjectRef) -> Result<BbView, MethodCallFailed> {
     let pos = buf_read_position(ctx, this).max(0);
     let lim = buf_read_limit(ctx, this).max(pos);
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v.max(0)
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v.max(0)
-    } else {
-        lim
+    let cap = match buf_read_capacity(ctx, this) {
+        0 => lim,
+        v => v.max(0),
     };
 
-    if let Some(arr) = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => Some(a),
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => Some(a),
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => Some(a),
-                _ => None,
-            },
-        },
-    } {
-        let offset = match ctx.get_field_by_name(this, "offset") {
-            Value::Int(v) if v >= 0 => v as usize,
-            _ => match ctx.get_field(this, 6) {
-                Value::Int(v) if v >= 0 => v as usize,
-                _ => 0,
-            },
-        };
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
         return Ok(BbView {
-            storage: BbStorage::Heap { arr, offset },
+            storage: BbStorage::Heap {
+                arr,
+                offset: bb_resolve_heap_offset(ctx, this),
+            },
             pos,
             lim,
             cap,
         });
     }
 
-    let addr = match ctx.get_field_by_name(this, "address") {
-        Value::Long(v) if v != 0 => v,
-        _ => match ctx.get_field(this, 4) {
-            Value::Long(v) if v != 0 => v,
-            _ => {
-                return Err(MethodCallFailed::InternalError(VmError::Internal {
-                    message: format!(
-                        "ByteBuffer missing backing storage (hb/slot5/address absent; field {} returned {:?} for object {:?})",
-                        BB_FIELD_ARRAY,
-                        ctx.get_field(this, BB_FIELD_ARRAY),
-                        this
-                    ),
-                }))
-            }
-        },
+    let Some(addr) = bb_resolve_direct_address(ctx, this) else {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!(
+                "ByteBuffer missing backing storage (hb/slot{BB_SEGMENT_SLOT}/address absent; \
+                 field {BB_FIELD_ARRAY} returned {:?}, address {:?}) for object {this:?}",
+                ctx.get_field(this, BB_FIELD_ARRAY),
+                ctx.get_field_by_name(this, "address"),
+            ),
+        }));
     };
     Ok(BbView {
         storage: BbStorage::Direct { addr },
@@ -8019,10 +8965,15 @@ fn native_bb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let bb = alloc_byte_buffer(ctx, len);
-    let (arr, _, _, _) = bb_state(ctx, bb)?;
+    // STRUCTURALLY HEAP-ONLY: the receiver is the buffer `alloc_byte_buffer`
+    // just minted two lines up, which always installs a `byte[]` in both `hb`
+    // and slot 0. It is never a caller-supplied buffer, so the direct arm is
+    // unreachable here — but the write still goes through `tb_write_elem` so
+    // this site cannot become a straggler if that ever stops being true.
+    let view = bb_state(ctx, bb)?;
     for i in 0..len {
         let v = ctx.get_array_element(src, i);
-        ctx.set_array_element(arr, i, v);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_position(ctx, bb, 0);
     buf_set_limit(ctx, bb, len as i32);
@@ -8044,10 +8995,12 @@ fn native_bb_wrap_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let arr_len = ctx.array_length(src);
     let bb = alloc_byte_buffer(ctx, arr_len);
-    let (arr, _, _, _) = bb_state(ctx, bb)?;
+    // STRUCTURALLY HEAP-ONLY, same as `native_bb_wrap` above: the receiver is
+    // the freshly minted buffer, not the caller's.
+    let view = bb_state(ctx, bb)?;
     for i in 0..arr_len {
         let v = ctx.get_array_element(src, i);
-        ctx.set_array_element(arr, i, v);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_position(ctx, bb, offset as i32);
     buf_set_limit(ctx, bb, (offset + length) as i32);
@@ -8074,9 +9027,22 @@ fn native_bb_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     let lim = buf_read_limit(ctx, this);
-    let clamped = new_pos.clamp(0, lim);
-    buf_set_position(ctx, this, clamped);
-    if buf_read_mark(ctx, this) > clamped {
+    // `java.nio.Buffer.position(int)` range-CHECKS, it does not clamp:
+    // "if (newPosition > limit | newPosition < 0) throw
+    // createPositionException(newPosition)", specified as "@throws
+    // IllegalArgumentException If the preconditions on newPosition do not
+    // hold". `new_pos.clamp(0, lim)` returned `this` for every out-of-range
+    // call, so a caller that mis-computed an offset got a buffer silently
+    // parked at `limit` (or 0) and read the wrong bytes from it, instead of
+    // the exception that names the bad offset.
+    if new_pos < 0 || new_pos > lim {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("newPosition {new_pos} out of range [0, {lim}]"),
+        }
+        .into());
+    }
+    buf_set_position(ctx, this, new_pos);
+    if buf_read_mark(ctx, this) > new_pos {
         buf_set_mark(ctx, this, -1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -8099,19 +9065,25 @@ fn native_bb_set_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        v
-    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
-        v
-    } else {
-        0
-    };
-    let clamped = new_lim.clamp(0, cap);
-    buf_set_limit(ctx, this, clamped);
-    if buf_read_position(ctx, this) > clamped {
-        buf_set_position(ctx, this, clamped);
+    let cap = buf_read_capacity(ctx, this);
+    // Same contract as `position(int)` one function up:
+    // "if (newLimit > capacity | newLimit < 0) throw
+    // createLimitException(newLimit)", "@throws IllegalArgumentException If
+    // the preconditions on newLimit do not hold". A clamped `limit(cap + 1)`
+    // is the more dangerous of the pair — it hands back a buffer whose
+    // `remaining()` is smaller than the caller asked for, so the short read
+    // that follows reads as a short read from the CHANNEL.
+    if new_lim < 0 || new_lim > cap {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("newLimit {new_lim} out of range [0, {cap}]"),
+        }
+        .into());
     }
-    if buf_read_mark(ctx, this) > clamped {
+    buf_set_limit(ctx, this, new_lim);
+    if buf_read_position(ctx, this) > new_lim {
+        buf_set_position(ctx, this, new_lim);
+    }
+    if buf_read_mark(ctx, this) > new_lim {
         buf_set_mark(ctx, this, -1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -8122,14 +9094,7 @@ fn native_bb_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
-        return Ok(Some(Value::Int(v)));
-    }
-    let cap = match ctx.get_field(this, BB_FIELD_CAPACITY) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(cap)))
+    Ok(Some(Value::Int(buf_read_capacity(ctx, this))))
 }
 
 fn native_bb_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8137,8 +9102,18 @@ fn native_bb_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (_, pos, lim, _) = bb_state(ctx, this)?;
-    Ok(Some(Value::Int(lim - pos)))
+    // MIGRATED. This is the site that produced `RJdkDefineClass`'s
+    // "ByteBuffer missing backing array (field 0 returned Int(-1))", from the
+    // `int len = b.remaining()` that opens real
+    // `ClassLoader.defineClass(String, ByteBuffer, ProtectionDomain)`. It
+    // asked `bb_state` for the whole tuple and threw the array away — the
+    // refusal it inherited was over storage it never touched. `remaining()` is
+    // `limit - position` and is defined on `java.nio.Buffer`, above any notion
+    // of storage; it must answer for a direct buffer, a heap buffer, and a
+    // read-only view alike. `.max(0)` matches `Buffer.remaining()`'s
+    // `Math.max(lim - pos, 0)`.
+    let (pos, lim, _) = buf_metadata(ctx, this);
+    Ok(Some(Value::Int((lim - pos).max(0))))
 }
 
 fn native_bb_has_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8146,7 +9121,9 @@ fn native_bb_has_remaining(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (_, pos, lim, _) = bb_state(ctx, this)?;
+    // MIGRATED, same reason as `native_bb_remaining` above: `hasRemaining()`
+    // is `position < limit`, storage-free by definition.
+    let (pos, lim, _) = buf_metadata(ctx, this);
     Ok(Some(Value::Int(if pos < lim { 1 } else { 0 })))
 }
 
@@ -8841,12 +9818,17 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
     })?;
 
+    // The width and the accessors' base come from ONE function
+    // (`synthetic_file_channel`), so the allocator and every reader cannot
+    // disagree about where the private map starts. `alloc_object` still clamps
+    // UP, so the declared fields are always present too.
+    let fc_slots = cratonvm_native_api::synthetic_file_channel::alloc_slots(ctx);
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
-        Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
+        Ok(cid) => ctx.alloc_object(cid, fc_slots),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), fc_slots),
     };
-    ctx.set_field(fc, FC_FIELD_FD, Value::Int(fd_id as i32));
-    ctx.set_field(fc, FC_FIELD_POS, Value::Long(0));
+    cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, fc, Value::Int(fd_id as i32));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, fc, Value::Long(0));
     Ok(Some(Value::Object(Some(fc))))
 }
 
@@ -8859,8 +9841,8 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -8888,11 +9870,11 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     buf_set_position(ctx, bb, pos + n as i32);
     // Update file position
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -8905,8 +9887,8 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Int(0))),
     };
     let view = bb_storage_view(ctx, bb)?;
@@ -8928,11 +9910,11 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.fd_table().write_bytes(fd_id, &buf).map_err(io_err)?;
     let n = buf.len();
     buf_set_position(ctx, bb, pos + n as i32);
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(fc_pos + n as i64));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(fc_pos + n as i64));
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -8941,7 +9923,7 @@ fn native_fc_position(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -8957,7 +9939,7 @@ fn native_fc_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, FC_FIELD_POS, Value::Long(new_pos));
+    cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_pos));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -8966,8 +9948,8 @@ fn native_fc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(Some(Value::Long(0))),
     };
     // Simplified: return 0 (a full impl would query the underlying file)
@@ -9027,11 +10009,21 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(None);
     }
 
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(None),
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
+        _ => {
+            // Still flip `closed`: an already-fd-less synthetic channel is
+            // closed, and `isOpen()` reads that field on both receiver kinds.
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            return Ok(None);
+        }
     };
     let _ = ctx.fd_table().close(fd_id);
+    cratonvm_native_api::synthetic_file_channel::set_fd_value(ctx, this, Value::Int(-1));
+    // The real `AbstractInterruptibleChannel.closed`, which is what every
+    // `isOpen()` — ours and the JDK's — answers the negation of. It could not be
+    // used while the file position aliased it; W7-72-ssc-socket-and-filechannel.md.
+    ctx.set_field_by_name(this, "closed", Value::Int(1));
     Ok(None)
 }
 
@@ -9501,9 +10493,28 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(s) => s,
         None => return Err(ioe_stream_closed()),
     };
-    let remaining = (state.units.len() - state.pos) as i64;
-    let skip = n.clamp(0, remaining);
-    state.pos = (state.pos as i64 + skip) as usize;
+    // `StringReader.skip` is the one `skip` in `java.io` that accepts a
+    // negative argument, and the lower half of `n.clamp(0, remaining)` deleted
+    // that whole half of the contract: "The n parameter may be negative, even
+    // though the skip method of the Reader superclass throws an exception in
+    // this case. Negative values of n cause the stream to skip backwards.
+    // Negative return values indicate a skip backwards. It is not possible to
+    // skip backwards past the beginning of the string."
+    //
+    // Clamping to 0 answered "skipped nothing" — a legal, unremarkable return
+    // — for a rewind the caller had every right to expect, so a lookahead
+    // parser that skips forward and then backs up read the same region twice
+    // rather than the region before it. The real body is
+    // `r = Math.min(length - next, n); r = Math.max(-next, r);` behind the
+    // "If the entire string has been read or skipped, then this method has no
+    // effect and always returns 0" guard, which is what this now mirrors.
+    let pos = state.pos as i64;
+    let length = state.units.len() as i64;
+    if pos >= length {
+        return Ok(Some(Value::Long(0)));
+    }
+    let skip = (length - pos).min(n).max(-pos);
+    state.pos = (pos + skip) as usize;
     Ok(Some(Value::Long(skip)))
 }
 
@@ -9613,8 +10624,14 @@ fn native_reader_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // afterwards pointing at a stale address (native stale-local family).
         // Clearing first also keeps `close()` idempotent when the nested call
         // throws.
+        // The delegated close PROPAGATES. Every `java.io` decorator whose
+        // `close()` this stands in for — `FilterReader` (`in.close()`),
+        // `BufferedReader` (`in.close()` in a `try`/`finally` that only nulls
+        // fields), `InputStreamReader` (`sd.close()`) — declares
+        // `throws IOException` and catches nothing.
+        // W7-57-close-flush-swallow-sweep.md
         ctx.set_field_by_name(this, "in", Value::Object(None));
-        let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+        ctx.invoke_virtual(inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -10463,7 +11480,22 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// round-tripping surrogate pairs through the matching supplementary
 /// code point. Every error branch identifies a byte offset so the
 /// error message is precise enough for diagnostics.
-fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
+///
+/// # Why this is exported
+///
+/// `readUTF`/`writeUTF` are a **wire format**, not a string conversion, and
+/// this crate is not the only one that implements them: the synthetic
+/// `java.io.RandomAccessFile` in `native-builtins/src/phases_late/nio_file.rs`
+/// has its own pair, and that pair reads and writes **plain** UTF-8
+/// (`String::from_utf8_lossy` / `s.as_bytes()`). Plain and modified UTF-8 differ
+/// on exactly two inputs — `U+0000`, which modified UTF-8 spells `C0 80` and
+/// plain spells `00`, and every supplementary character, which modified UTF-8
+/// spells as a six-byte surrogate PAIR and plain spells as one four-byte
+/// sequence — so a record written by one implementation and read by the other is
+/// silently mis-framed rather than rejected. Exporting the codec is what lets
+/// that second implementation converge onto this one instead of growing a third
+/// spelling. See W7-8-fabricated-success-io-sweep.md.
+pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -10552,7 +11584,12 @@ fn decode_modified_utf8(bytes: &[u8]) -> Result<String, String> {
 
 /// Encode a Rust `&str` into modified UTF-8 (JVMS §4.4.7) and return
 /// the byte buffer. Use from `native_dos_write_utf`.
-fn encode_modified_utf8(s: &str) -> Vec<u8> {
+///
+/// Exported for the reason spelled out on [`decode_modified_utf8`]: the length
+/// prefix `DataOutput.writeUTF` writes is the length of THIS encoding, so a
+/// caller that measures `s.as_bytes().len()` and then writes plain UTF-8 is
+/// wrong twice — in the count and in the payload — and `readUTF` cannot tell.
+pub fn encode_modified_utf8(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for c in s.chars() {
         let cp = c as u32;
@@ -10978,11 +12015,24 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // Family-1 fix (cce0079): the `flush` dispatch is GC-capable —
         // refresh `inner` before the `close` dispatch, or close() runs on a
         // stale/wrong stream (leaking the real one).
+        //
+        // The flush PROPAGATES too, and its failure wins: `FilterOutputStream
+        // .close()` rethrows the flush exception from its `catch (Throwable)`
+        // and only *suppresses* a close failure into it. The close beneath was
+        // already propagating; the flush beside it was not, so a
+        // `DataOutputStream` over a full disk reported a clean close.
+        // W7-57-close-flush-swallow-sweep.md
         let inner_pin = ctx.pin_native_root(inner);
-        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        let flushed = ctx
+            .invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])
+            .map(|_| ());
         let inner = ctx.read_native_pin(inner_pin, inner);
         ctx.unpin_native_roots(inner_pin);
-        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
+        let closed = ctx
+            .invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])
+            .map(|_| ());
+        flushed?;
+        closed?;
     }
     Ok(None)
 }
@@ -12485,8 +13535,18 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             native_raf_read_line,
         );
-        registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line);
-        // simplified
+        // `readUTF` was bound to `native_raf_read_line` with the one-word
+        // comment "simplified". It is not a simplification of `readLine`, it is
+        // a different wire format — see `native_raf_read_utf`, which reads the
+        // 2-byte length prefix and decodes modified UTF-8, and `writeUTF`, which
+        // had no registration here at all and so could not round-trip.
+        registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_utf);
+        registry.register(
+            raf,
+            "writeUTF",
+            "(Ljava/lang/String;)V",
+            native_raf_write_utf,
+        );
     } // end !real_raf_enabled()
 
     // RDR-MIGRATION 2026-06-01: CharArrayReader synthetic natives (3-field
@@ -12582,8 +13642,13 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(inner)) = ctx.get_field(this, 0) {
                 // Clear before dispatching — the nested `close()` can trigger a
                 // moving GC that relocates `this`, stranding a later write.
+                // …and `BufferedReader.close()` is `in.close()` in a
+                // `try`/`finally` that only nulls its own fields, under
+                // `throws IOException` with no `catch`, so the delegated
+                // failure PROPAGATES.
+                // W7-57-close-flush-swallow-sweep.md
                 ctx.set_field(this, 0, Value::Object(None));
-                let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+                ctx.invoke_virtual(inner, "close", "()V", &[])?;
             }
             Ok(None)
         });
@@ -12664,10 +13729,14 @@ fn native_raf_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = [0u8; 1];
+    // Same as `native_raf_read_bulk`: `-1` is `RandomAccessFile.read()`'s
+    // "the end of the file has been reached", and the method separately
+    // declares "@throws IOException if an I/O error occurs". Answering EOF for
+    // a failed read merges the two states the contract keeps apart.
     match ctx.fd_table().rw_read(fd, &mut buf) {
         Ok(0) => Ok(Some(Value::Int(-1))),
         Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-        Err(_) => Ok(Some(Value::Int(-1))),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -12696,10 +13765,17 @@ fn native_raf_read_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(Value::Int(0)));
     }
     let mut tmp = vec![0u8; len];
+    // `Err(_) => -1` reported an I/O FAILURE as end-of-file, the one value a
+    // read loop is built to stop on: "@return the total number of bytes read
+    // into the buffer, or -1 if there is no more data because the end of the
+    // file has been reached" (`RandomAccessFile.read(byte[],int,int)`), which
+    // also declares "@throws IOException If the first byte cannot be read for
+    // any reason other than end of file". A caller cannot tell the two apart,
+    // so a truncated read looked like a complete file.
     let n = match ctx.fd_table().rw_read(fd, &mut tmp) {
         Ok(0) => return Ok(Some(Value::Int(-1))),
         Ok(n) => n,
-        Err(_) => return Ok(Some(Value::Int(-1))),
+        Err(e) => return Err(io_err(e)),
     };
     for i in 0..n {
         ctx.set_array_element(buf, off + i, Value::Int(tmp[i] as i8 as i32));
@@ -12720,7 +13796,12 @@ fn native_raf_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().rw_write(fd, &[b]);
+    // Every `RandomAccessFile` write in this file declares "@throws IOException
+    // if an I/O error occurs" and returns void — the exception is the ONLY
+    // channel it has, so `let _ =` left the method literally unable to report
+    // anything. A record-appending loop against a full volume completed
+    // silently.
+    ctx.fd_table().rw_write(fd, &[b]).map_err(io_err)?;
     Ok(None)
 }
 
@@ -12751,7 +13832,7 @@ fn native_raf_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             bytes.push(b as u8);
         }
     }
-    let _ = ctx.fd_table().rw_write(fd, &bytes);
+    ctx.fd_table().rw_write(fd, &bytes).map_err(io_err)?;
     Ok(None)
 }
 
@@ -12771,13 +13852,28 @@ fn native_raf_seek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
         _ => 0,
     };
+    // `RandomAccessFile.seek(long)`: "@throws IOException if pos is less than 0
+    // or if an I/O error occurs." Note the refusal is an `IOException` here,
+    // not the `IllegalArgumentException` `FileChannel.position(long)` raises
+    // for the same input — the two classes genuinely differ, so this cannot be
+    // shared with the channel-side check. `pos.max(0)` answered a successful
+    // seek to the start of the file, which is exactly what commons-compress's
+    // seek-from-EOF arithmetic produces when its length source is wrong: the
+    // next `read` then returned the FIRST record instead of the one asked for.
+    if pos < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IOException {
+                message: format!("Negative seek offset: {pos}"),
+            },
+        )));
+    }
     let fd = match ctx.get_field(this, RAF_FIELD_FD) {
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx
-        .fd_table()
-        .rw_seek(fd, std::io::SeekFrom::Start(pos.max(0) as u64));
+    ctx.fd_table()
+        .rw_seek(fd, std::io::SeekFrom::Start(pos as u64))
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -12867,7 +13963,12 @@ fn native_raf_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().write_bytes(fd, &v.to_be_bytes());
+    // `DataOutput.writeInt`/`writeLong` are void and declare "@throws
+    // IOException if an I/O error occurs"; discarding the result left them
+    // unable to say anything but success. See `native_raf_write`.
+    ctx.fd_table()
+        .write_bytes(fd, &v.to_be_bytes())
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -12884,7 +13985,12 @@ fn native_raf_write_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().write_bytes(fd, &v.to_be_bytes());
+    // `DataOutput.writeInt`/`writeLong` are void and declare "@throws
+    // IOException if an I/O error occurs"; discarding the result left them
+    // unable to say anything but success. See `native_raf_write`.
+    ctx.fd_table()
+        .write_bytes(fd, &v.to_be_bytes())
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -12943,6 +14049,132 @@ fn native_raf_read_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
         _ => Ok(Some(Value::Object(None))),
     }
+}
+
+/// `RandomAccessFile.readUTF()` — `DataInput`'s framed record, not a line.
+///
+/// # The registration this replaces
+///
+/// `readUTF()Ljava/lang/String;` was bound to [`native_raf_read_line`], with the
+/// word `simplified` for a comment. The two methods do not read the same shape
+/// of data: `readLine` scans to the next `\n`/`\r` and returns everything before
+/// it, while `readUTF` reads a **2-byte big-endian unsigned length** and then
+/// exactly that many bytes of modified UTF-8. So the old binding consumed the
+/// length prefix as though it were text, stopped at whichever payload byte
+/// happened to be `0x0A`, and returned a string that shares no bytes with the
+/// record that was written — and, having left the file position mid-record, it
+/// corrupted every subsequent read on the same handle rather than only its own.
+/// `DataInput.readUTF` is documented to throw `EOFException` "if this input
+/// stream reaches the end before reading all the bytes" and
+/// `UTFDataFormatException` "if the bytes do not represent a valid modified
+/// UTF-8 encoding of a string"; the old binding could produce neither.
+///
+/// The decode is [`decode_modified_utf8`], the same one `DataInputStream.readUTF`
+/// uses in this file — one spelling of the wire format per crate is the whole
+/// point of the export. See W7-8-fabricated-success-io-sweep.md.
+fn native_raf_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
+        Value::Int(v) => v as u32,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut len_buf = [0u8; 2];
+    raf_read_exact(ctx, fd, &mut len_buf)?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    raf_read_exact(ctx, fd, &mut payload)?;
+    let s = decode_modified_utf8(&payload).map_err(|e| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
+            message: format!("readUTF: {e}"),
+        }))
+    })?;
+    let obj = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Fill `buf` completely or fail, the way `DataInput.readFully` is specified to.
+///
+/// A short read here is an `EOFException` in the JDK, never a short answer:
+/// `readUTF`'s length prefix has already committed the caller to a record of a
+/// stated size, so returning fewer bytes would hand back a truncated string
+/// indistinguishable from a complete one. `RuntimeError` has no `EOFException`
+/// variant, so this reports the supertype with the JDK's own wording; a caller
+/// catching `IOException` — which is every caller of a `DataInput` — is
+/// unaffected, and one catching `EOFException` specifically was getting a
+/// silently truncated string before, not a narrower exception.
+fn raf_read_exact(
+    ctx: &mut dyn NativeContext,
+    fd: u32,
+    buf: &mut [u8],
+) -> Result<(), MethodCallFailed> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = ctx
+            .fd_table()
+            .read_bytes(fd, &mut buf[filled..])
+            .map_err(io_err)?;
+        if n == 0 {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::IOException {
+                    message: "readUTF: end of file".to_string(),
+                },
+            )));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// `RandomAccessFile.writeUTF(String)` — the encoding half of the same record.
+///
+/// This triple had **no** registration in this file at all while `readUTF` had a
+/// wrong one, which is the asymmetry that let the defect stand: nothing this
+/// crate wrote could be read back through its own reader, so no round trip
+/// existed to fail.
+///
+/// Two things the JDK specifies and a naive body gets wrong, both of which the
+/// `nio_file.rs` twin still gets wrong (recorded, not fixed here — that file
+/// belongs to another lane):
+///
+/// * the payload is **modified** UTF-8, so `U+0000` is `C0 80` and a
+///   supplementary character is a six-byte surrogate pair, not `s.as_bytes()`;
+/// * the 2-byte prefix is the length of THAT encoding, and
+///   `DataOutput.writeUTF` says "If this number is larger than 65535, then a
+///   `UTFDataFormatException` is thrown" — a refusal, never a truncation, since
+///   a truncated record cuts at a byte index and can land mid-sequence.
+fn native_raf_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let s = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let fd = match ctx.get_field(this, RAF_FIELD_FD) {
+        Value::Int(v) => v as u32,
+        _ => return Ok(None),
+    };
+    let bytes = encode_modified_utf8(&s);
+    if bytes.len() > 65535 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IOException {
+                message: format!(
+                    "writeUTF: encoded string too long ({} bytes, max 65535)",
+                    bytes.len()
+                ),
+            },
+        )));
+    }
+    let len = bytes.len() as u16;
+    ctx.fd_table()
+        .write_bytes(fd, &len.to_be_bytes())
+        .map_err(io_err)?;
+    ctx.fd_table().write_bytes(fd, &bytes).map_err(io_err)?;
+    Ok(None)
 }
 
 // --- CharArrayReader ---
@@ -14341,13 +15573,18 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (arr, pos, lim, _cap) = bb_state(ctx, this)?;
-            let remaining = (lim - pos).max(0) as usize;
+            // MIGRATED — receiver is caller-supplied and may be a direct view
+            // (`ByteBuffer.allocateDirect(n).asIntBuffer()` is direct on
+            // HotSpot). `new_buf` is the freshly minted heap buffer, so its
+            // own view is structurally heap; it still goes through the same
+            // element accessor so the two halves cannot drift apart.
+            let view = bb_state(ctx, this)?;
+            let remaining = (view.lim - view.pos).max(0) as usize;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, remaining);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..remaining {
-                let v = ctx.get_array_element(arr, pos as usize + i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, view.pos as usize + i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -14365,13 +15602,14 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            let (arr, _, _, cap) = bb_state(ctx, this)?;
-            buffer_check_from_index_size(index, length, cap)?;
+            // MIGRATED — same reasoning as `$slice_fn` above.
+            let view = bb_state(ctx, this)?;
+            buffer_check_from_index_size(index, length, view.cap)?;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, length as usize);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..length as usize {
-                let v = ctx.get_array_element(arr, index as usize + i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, index as usize + i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
             Ok(Some(Value::Object(Some(new_buf))))
         }
@@ -14381,16 +15619,17 @@ macro_rules! tb_abstract_view_fns {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+            // MIGRATED — receiver is caller-supplied and may be direct.
+            let view = bb_state(ctx, this)?;
             let mark = buf_read_mark(ctx, this);
-            let cap_usize = cap.max(0) as usize;
+            let cap_usize = view.cap.max(0) as usize;
             let new_buf = alloc_typed_buffer(ctx, $cls, $elem, cap_usize);
-            let (new_arr, _, _, _) = bb_state(ctx, new_buf)?;
+            let new_view = bb_state(ctx, new_buf)?;
             for i in 0..cap_usize {
-                let v = ctx.get_array_element(arr, i);
-                ctx.set_array_element(new_arr, i, v);
+                let v = tb_read_elem(ctx, view, i)?;
+                tb_write_elem(ctx, new_view, i, v)?;
             }
-            buf_write_metadata(ctx, new_buf, pos, lim, cap, mark);
+            buf_write_metadata(ctx, new_buf, view.pos, view.lim, view.cap, mark);
             Ok(Some(Value::Object(Some(new_buf))))
         }
 
@@ -14509,9 +15748,10 @@ fn native_cb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, cb, len as i32);
     Ok(Some(Value::Object(Some(cb))))
@@ -14525,9 +15765,9 @@ fn native_cb_wrap_charseq(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let chars: Vec<u16> = s.encode_utf16().collect();
     let len = chars.len();
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, i, Value::Int(ch as i32))?;
     }
     buf_set_limit(ctx, cb, len as i32);
     Ok(Some(Value::Object(Some(cb))))
@@ -14549,9 +15789,9 @@ fn native_cb_wrap_charseq_range(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let chars: Vec<u16> = s.encode_utf16().collect();
     let len = chars.len();
     let cb = alloc_typed_buffer(ctx, "java/nio/CharBuffer", ArrayElementType::Char, len);
-    let (arr, _, _, _) = bb_state(ctx, cb)?;
+    let view = bb_state(ctx, cb)?;
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, i, Value::Int(ch as i32))?;
     }
     buf_set_position(ctx, cb, start as i32);
     buf_set_limit(ctx, cb, end.min(len) as i32);
@@ -14563,11 +15803,12 @@ fn native_cb_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -14581,11 +15822,12 @@ fn native_cb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14597,9 +15839,10 @@ fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, Value::Int(ch));
+        tb_write_elem(ctx, view, pos as usize, Value::Int(ch))?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -14618,11 +15861,12 @@ fn native_cb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, Value::Int(ch));
+    tb_write_elem(ctx, view, idx as usize, Value::Int(ch))?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -14635,12 +15879,13 @@ fn native_cb_put_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let (arr, mut pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (mut pos, lim) = (view.pos, view.lim);
     for ch in s.encode_utf16() {
         if pos >= lim {
             break;
         }
-        ctx.set_array_element(arr, pos as usize, Value::Int(ch as i32));
+        tb_write_elem(ctx, view, pos as usize, Value::Int(ch as i32))?;
         pos += 1;
     }
     buf_set_position(ctx, this, pos);
@@ -14652,10 +15897,11 @@ fn native_cb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     let mut chars = Vec::new();
     for i in pos..lim {
-        if let Value::Int(v) = ctx.get_array_element(arr, i as usize) {
+        if let Value::Int(v) = tb_read_elem(ctx, view, i as usize)? {
             chars.push(v as u16);
         }
     }
@@ -14672,8 +15918,9 @@ fn native_cb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, (pos + idx) as usize)))
+    let view = bb_state(ctx, this)?;
+    let pos = view.pos;
+    Ok(Some(tb_read_elem(ctx, view, (pos + idx) as usize)?))
 }
 
 fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14681,11 +15928,12 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, (pos + i) as usize);
-        ctx.set_array_element(arr, i as usize, v);
+        let v = tb_read_elem(ctx, view, (pos + i) as usize)?;
+        tb_write_elem(ctx, view, i as usize, v)?;
     }
     buf_set_position(ctx, this, remaining);
     buf_set_limit(ctx, this, cap);
@@ -14694,12 +15942,39 @@ fn native_cb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 // --- Typed buffer shared helpers ---
+
+/// `CharBuffer.array()` / `IntBuffer.array()` / … — registered for all six
+/// typed families.
+///
+/// This read raw slot 0 and returned whatever was there. Same species as
+/// `bb_state`'s old fall-through, but reachable from Java rather than only via
+/// an internal error: on a real-layout receiver slot 0 is
+/// `java.nio.Buffer.mark`, so `array()` handed back `Int(-1)` where its
+/// descriptor promises `[C`/`[I`/…; on a DIRECT view it invented a backing
+/// array for a buffer that has none. HotSpot throws
+/// `UnsupportedOperationException` for that case (`Buffer.array()`:
+/// "@throws UnsupportedOperationException If this buffer is not backed by an
+/// accessible array").
+///
+/// The storage-less case keeps its historic benign null rather than becoming
+/// an error: `native-builtins`' typed views can legitimately arrive here with
+/// neither array nor address, and turning that into a throw is a behaviour
+/// change this lane has no vector to measure.
 fn native_tb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, BB_FIELD_ARRAY)))
+    if let Some(arr) = bb_resolve_heap_array(ctx, this) {
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+    if bb_resolve_direct_address(ctx, this).is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "direct buffer has no backing array".into(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 fn native_tb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14707,7 +15982,7 @@ fn native_tb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (_, pos, lim, cap) = bb_state(ctx, this)?;
+    let (pos, lim, cap) = buf_metadata(ctx, this);
     let s = format!("Buffer[pos={} lim={} cap={}]", pos, lim, cap);
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
@@ -14717,11 +15992,12 @@ fn native_tb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim, cap) = (view.pos, view.lim, view.cap);
     let remaining = lim - pos;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, (pos + i) as usize);
-        ctx.set_array_element(arr, i as usize, v);
+        let v = tb_read_elem(ctx, view, (pos + i) as usize)?;
+        tb_write_elem(ctx, view, i as usize, v)?;
     }
     buf_set_position(ctx, this, remaining);
     buf_set_limit(ctx, this, cap);
@@ -14746,9 +16022,10 @@ fn native_ib_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/IntBuffer", ArrayElementType::Int, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -14759,11 +16036,12 @@ fn native_tb_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -14777,11 +16055,12 @@ fn native_tb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14790,9 +16069,10 @@ fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -14808,11 +16088,12 @@ fn native_tb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -14833,9 +16114,10 @@ fn native_lb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/LongBuffer", ArrayElementType::Long, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -14846,11 +16128,12 @@ fn native_tb_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Long(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -14864,11 +16147,12 @@ fn native_tb_get_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14877,9 +16161,10 @@ fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Long(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -14895,11 +16180,12 @@ fn native_tb_put_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Long(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -14920,9 +16206,10 @@ fn native_fb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/FloatBuffer", ArrayElementType::Float, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -14933,11 +16220,12 @@ fn native_tb_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Float(0.0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Float(0.0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -14951,11 +16239,12 @@ fn native_tb_get_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14964,9 +16253,10 @@ fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Float(0.0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -14982,11 +16272,12 @@ fn native_tb_put_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Float(0.0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15007,9 +16298,10 @@ fn native_db_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/DoubleBuffer", ArrayElementType::Double, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15020,11 +16312,12 @@ fn native_tb_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Double(0.0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15038,11 +16331,12 @@ fn native_tb_get_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15051,9 +16345,10 @@ fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Double(0.0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15069,11 +16364,12 @@ fn native_tb_put_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Double(0.0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15094,9 +16390,10 @@ fn native_sb_wrap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let len = ctx.array_length(src);
     let buf = alloc_typed_buffer(ctx, "java/nio/ShortBuffer", ArrayElementType::Short, len);
-    let (arr, _, _, _) = bb_state(ctx, buf)?;
+    let view = bb_state(ctx, buf)?;
     for i in 0..len {
-        ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
+        let v = ctx.get_array_element(src, i);
+        tb_write_elem(ctx, view, i, v)?;
     }
     buf_set_limit(ctx, buf, len as i32);
     Ok(Some(Value::Object(Some(buf))))
@@ -15107,11 +16404,12 @@ fn native_tb_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos >= lim {
         return Ok(Some(Value::Int(0)));
     }
-    let val = ctx.get_array_element(arr, pos as usize);
+    let val = tb_read_elem(ctx, view, pos as usize)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(val))
 }
@@ -15125,11 +16423,12 @@ fn native_tb_get_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    Ok(Some(ctx.get_array_element(arr, idx as usize)))
+    Ok(Some(tb_read_elem(ctx, view, idx as usize)?))
 }
 
 fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15138,9 +16437,10 @@ fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let val = args.get(1).cloned().unwrap_or(Value::Int(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let (pos, lim) = (view.pos, view.lim);
     if pos < lim {
-        ctx.set_array_element(arr, pos as usize, val);
+        tb_write_elem(ctx, view, pos as usize, val)?;
         buf_set_position(ctx, this, pos + 1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -15156,11 +16456,12 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_state(ctx, this)?;
+    let cap = view.cap;
     if !tb_index_in_bounds(idx, cap) {
         return Err(buffer_index_out_of_bounds());
     }
-    ctx.set_array_element(arr, idx as usize, val);
+    tb_write_elem(ctx, view, idx as usize, val)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -15169,7 +16470,34 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // FileLock, MappedByteBuffer, FileChannel additions, Files.walk/list
 // ===========================================================================
 
-// --- FileLock layout: 6-field synthetic ---
+// --- FileLock layout: 4 real fields + 2 appended private slots ---
+//
+// MEASURED, so the next census does not re-derive it and does not read the
+// 6-vs-4 `direction=over` row `CRATONVM_DBG_LAYOUT_ALIAS` prints here as a
+// defect. `javap -p java.nio.channels.FileLock` on JDK 25.0.3.9 declares
+// exactly four instance fields, in this order, on a class whose superclass is
+// `java.lang.Object`:
+//
+//     private final java.nio.channels.Channel channel;   // 0
+//     private final long position;                       // 1
+//     private final long size;                           // 2
+//     private final boolean shared;                      // 3
+//
+// Slots 0..3 below therefore ALIAS the real fields exactly, by index and by
+// type, which is what makes the real `final` accessors `channel()`,
+// `position()`, `size()` and `isShared()` return our values when they run.
+// `FL_FIELD_VALID` and `FL_FIELD_TOKEN` are CratonVM's own state and start at
+// 4, above everything the class declares — i.e. this is already the
+// appended-slot idiom W7-49 §8 named (`try_alloc_with_appended_slots`),
+// written out by hand. The over-allocation is deliberate and safe, and it is
+// the reason the `over` direction is not on its own a defect predicate: the
+// landed remedy for an over-allocation IS an over-allocation.
+//
+// Left as literal indices rather than a computed base on purpose: these
+// natives also run on receivers they did not allocate (in real-JDK mode
+// `<init>` lands on a real `sun.nio.ch.FileLockImpl`, five fields wide), and
+// W7-49 §8 records why a per-receiver base cannot be recovered from a foreign
+// object's width. W7-66-live-over-allocations.md.
 const FL_FIELD_CHANNEL: usize = 0; // Object: owning FileChannel
 const FL_FIELD_POSITION: usize = 1; // Long: lock start position
 const FL_FIELD_SIZE: usize = 2; // Long: lock region size
@@ -15693,20 +17021,65 @@ fn release_file_lock(token: i64) {
 
 /// Extract the FdId from a FileChannel `this`. Returns 0 if the channel
 /// has no associated fd (e.g. synthetic mode without a real open).
-fn fd_from_file_channel(ctx: &dyn NativeContext, fc: ObjectRef) -> i64 {
-    match ctx.get_field(fc, FC_FIELD_FD) {
+fn fd_from_file_channel(ctx: &mut dyn NativeContext, fc: ObjectRef) -> i64 {
+    match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, fc) {
         Value::Int(v) => v as i64,
         Value::Long(v) => v,
         _ => 0,
     }
 }
 
-// --- MappedByteBuffer: uses BB layout + extra fields ---
-// Field 10 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
-// Field 11 = Int: 1 = writable (read-write or private), 0 = read-only
-const MBB_FIELD_MAPPED_ADDR: usize = 10;
-const MBB_FIELD_WRITABLE: usize = 11;
-const MBB_NUM_FIELDS: usize = 12;
+/// The class `alloc_mapped_byte_buffer` allocates and every `native_mbb_*` and
+/// `native_fc_map` native reads.
+const MBB_CLASS: &str = "java/nio/MappedByteBuffer";
+
+// --- MappedByteBuffer PRIVATE state: two slots, indexed from `mbb_base` ---
+//
+// Offset 0 = Long: stable id into MMAP_REGISTRY (0 = not mapped)
+// Offset 1 = Int:  1 = writable (read-write or private), 0 = read-only
+//
+// W7-68-live-under-allocations.md. These were the ABSOLUTE indices 10 and 11
+// against a request of 12, on a class that declares THIRTEEN fields.
+// `javap -p java.nio.MappedByteBuffer` on JDK 25.0.3.9, transitively:
+//
+//     0 mark      1 position  2 limit    3 capacity  4 address  5 segment
+//     6 hb        7 offset    8 isReadOnly  9 bigEndian  10 nativeByteOrder
+//    11 fd        12 isSync
+//
+// so the mapping id landed on `nativeByteOrder` and the writable flag landed
+// on `fd` — a `java.io.FileDescriptor` reference. Unlike this census's other
+// `under` rows, that field HAS a real-JDK-bytecode reader that CratonVM does
+// not intercept: `MappedByteBuffer.force(int,int)` is `public final`, is not
+// registered by any crate here (only the no-arg `force()` is), and its body
+// short-circuits on `fd == null` before touching `MappedMemoryUtils`. With an
+// `Int` sitting in `fd` that guard does not fire, and the call proceeds into
+// the mapped-memory path with a non-`FileDescriptor` in hand. Measured on
+// HotSpot 25.0.3.9 (`probes/UnderAllocationProbe.java` §3): `force(0,8)`
+// returns the buffer.
+//
+// The remedy is the appended-slot idiom (W7-49 §8): start the private map
+// ABOVE every field the real class declares, and collapse the base to 0 when
+// the class is a fabricated stub, where the private map IS the layout. No
+// other crate reads these two slots — grepped `"java/nio/MappedByteBuffer"`
+// across `native-builtins`, `native-collections` and `vm`: the only other
+// mentions register `session()`/`checkSession()` over a buffer-class list and
+// name the class in a `toString` test — so unlike
+// `java/nio/channels/FileChannel` (same census, NOT repaired) this map has a
+// single owner and can move in one step.
+const MBB_PRIVATE_MAPPED_ADDR: usize = 0;
+const MBB_PRIVATE_WRITABLE: usize = 1;
+const MBB_PRIVATE_WIDTH: usize = 2;
+
+// The base is `cratonvm_native_api::appended_slots::base_for_class(ctx,
+// MBB_CLASS)`, bound to a local at each site rather than wrapped in a helper
+// that takes `&dyn`: one base function, called the same way by the allocator
+// and by every accessor, is what keeps the two from ever disagreeing.
+//
+// Sound as a per-CLASS base — rather than per-receiver, which W7-49 §8 shows is
+// unanswerable — because every receiver reaching these slots is one
+// `alloc_mapped_byte_buffer` produced: `native_fc_map` is its only caller, and
+// the real image's mapped buffers are `java.nio.DirectByteBuffer`, a different
+// class that never resolves to `MBB_CLASS`'s registrations.
 
 // ---------------------------------------------------------------------------
 // mmap registry (T2.4.5 / T2.4.6)
@@ -15714,11 +17087,11 @@ const MBB_NUM_FIELDS: usize = 12;
 // Real `mmap`/`MapViewOfFile` is provided by memmap2. Because the JVM heap
 // cannot hold Rust smart pointers, we maintain a process-wide registry
 // keyed by a stable 64-bit id and store that id in the MappedByteBuffer's
-// `MBB_FIELD_MAPPED_ADDR` slot. Dropping the registry entry calls
+// `MBB_PRIVATE_MAPPED_ADDR` slot. Dropping the registry entry calls
 // `munmap` / `UnmapViewOfFile` via `memmap2::Mmap`'s Drop impl.
 //
 // Invariants:
-//   - Every alive `MappedByteBuffer` whose `MBB_FIELD_MAPPED_ADDR != 0` has a
+//   - Every alive `MappedByteBuffer` whose mapping-id slot is non-zero has a
 //     corresponding registry entry.
 //   - The registry outlives the JVM heap objects that reference it: the
 //     Java-level `unmap0` native removes the entry before the MBB is
@@ -15775,9 +17148,17 @@ fn alloc_file_lock(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
-    let obj = match ctx.ensure_class_initialized("java/nio/MappedByteBuffer") {
-        Ok(cid) => ctx.alloc_object(cid, MBB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), MBB_NUM_FIELDS),
+    // W7-68: `base + MBB_PRIVATE_WIDTH`, not a flat 12. Asking for 12 on a
+    // class declaring 13 put the mapping id in `nativeByteOrder` and the
+    // writable flag in `fd`, which real `MappedByteBuffer.force(int,int)`
+    // bytecode dereferences.
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
+    let obj = match ctx.ensure_class_initialized(MBB_CLASS) {
+        Ok(cid) => ctx.alloc_object(cid, mbb_base + MBB_PRIVATE_WIDTH),
+        Err(_) => ctx.alloc_object(
+            cratonvm_types::ClassId::new(0),
+            mbb_base + MBB_PRIVATE_WIDTH,
+        ),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -15786,10 +17167,10 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
     // Same as `alloc_byte_buffer`: this stand-in is heap-backed (`hb` is a real
     // byte[]), so `Buffer.address` must be the array base offset, not the mark
     // that the indexed slot-4 write would otherwise leave behind. The separate
-    // `MBB_FIELD_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
+    // `MBB_PRIVATE_MAPPED_ADDR` slot below is CratonVM's own mapping id and is
     // NOT the JDK's `address` field.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
-    ctx.set_field(obj, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+    ctx.set_field(obj, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     obj
 }
 
@@ -15933,11 +17314,16 @@ fn native_file_lock_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// may have swapped pages out, but they are still "loaded" in the JLS
 /// sense — `java.nio.MappedByteBuffer.isLoaded` is explicitly a hint).
 fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // The base FIRST, before any ObjectRef is in a bare local: it goes
+    // through `ensure_class_initialized`, which is GC-capable in principle
+    // even though the class is loaded by construction on every path that
+    // can reach here (you cannot hold a MappedByteBuffer otherwise).
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -15960,11 +17346,12 @@ fn native_mbb_is_loaded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// both POSIX and Windows; the compiler-fence prevents the read from
 /// being elided.
 fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
@@ -16002,17 +17389,18 @@ fn native_mbb_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `FlushViewOfFile` (memmap2 abstracts both). No-op for read-only
 /// mappings and for the array-backed fallback.
 fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
-    let id = match ctx.get_field(this, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(this, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => 0,
     };
     if id != 0 {
         // 1. Sync Java byte[] → kernel mapping for writable maps.
-        mmap_sync_back_from_java(ctx, this).map_err(|e| RuntimeError::IOException {
+        mmap_sync_back_from_java(ctx, this, mbb_base).map_err(|e| RuntimeError::IOException {
             message: format!("MappedByteBuffer.force: sync back: {e}"),
         })?;
         // 2. Flush kernel mapping to disk.
@@ -16029,6 +17417,7 @@ fn native_mbb_force(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// FileChannel.unmap0(MappedByteBuffer) — drops the kernel mapping.
 /// Safe to call more than once.
 fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     // Accept either (this, mbb) from instance form or (mbb) from static form.
     let target = match args.iter().rev().find_map(|v| match v {
         Value::Object(Some(o)) => Some(*o),
@@ -16037,7 +17426,7 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(None),
     };
-    let id = match ctx.get_field(target, MBB_FIELD_MAPPED_ADDR) {
+    let id = match ctx.get_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(None),
     };
@@ -16045,7 +17434,7 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let mut registry = mmap_registry().lock();
         // Drop the MmapEntry, which calls munmap / UnmapViewOfFile.
         let _ = registry.remove(&id);
-        ctx.set_field(target, MBB_FIELD_MAPPED_ADDR, Value::Long(0));
+        ctx.set_field(target, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
     }
     Ok(None)
 }
@@ -16160,7 +17549,7 @@ enum FcMapMode {
 /// Real `mmap` / `MapViewOfFile` via memmap2. The resulting
 /// MappedByteBuffer is still backed by a Java `byte[]` so existing
 /// `ByteBuffer.get(i)` / `put(i, v)` opcodes keep working unchanged —
-/// but a sentinel id in `MBB_FIELD_MAPPED_ADDR` keeps the real kernel
+/// but a sentinel id in `MBB_PRIVATE_MAPPED_ADDR` keeps the real kernel
 /// mapping alive in `MMAP_REGISTRY` so `force()`, `load()`, `isLoaded()`
 /// and `unmap0()` see the real mapping.
 ///
@@ -16208,8 +17597,8 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         .into());
     }
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => {
             return Err(RuntimeError::IOException {
                 message: "FileChannel.map: invalid fd".into(),
@@ -16295,11 +17684,12 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     mmap_registry().lock().insert(id, entry);
 
     let writable = matches!(mode, FcMapMode::ReadWrite | FcMapMode::Private);
+    let mbb_base = cratonvm_native_api::appended_slots::base_for_class(ctx, MBB_CLASS);
     let mbb = alloc_mapped_byte_buffer(ctx, size);
-    ctx.set_field(mbb, MBB_FIELD_MAPPED_ADDR, Value::Long(id));
+    ctx.set_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(id));
     ctx.set_field(
         mbb,
-        MBB_FIELD_WRITABLE,
+        mbb_base + MBB_PRIVATE_WRITABLE,
         Value::Int(if writable { 1 } else { 0 }),
     );
     let arr = match ctx.get_field(mbb, BB_FIELD_ARRAY) {
@@ -16317,15 +17707,24 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 /// Synchronize the Java byte[] view into the kernel mapping for
 /// read-write / private mappings. Invoked by `force` prior to msync.
-fn mmap_sync_back_from_java(ctx: &mut dyn NativeContext, mbb: ObjectRef) -> std::io::Result<()> {
-    let id = match ctx.get_field(mbb, MBB_FIELD_MAPPED_ADDR) {
+///
+/// `mbb_base` is passed in rather than resolved here: resolving it would put a
+/// GC-capable `ensure_class_initialized` between this function's entry and its
+/// first read of `mbb`, which arrives as a bare `ObjectRef` local from the
+/// caller. The caller already has the base.
+fn mmap_sync_back_from_java(
+    ctx: &mut dyn NativeContext,
+    mbb: ObjectRef,
+    mbb_base: usize,
+) -> std::io::Result<()> {
+    let id = match ctx.get_field(mbb, mbb_base + MBB_PRIVATE_MAPPED_ADDR) {
         Value::Long(v) => v,
         _ => return Ok(()),
     };
     if id == 0 {
         return Ok(());
     }
-    let writable = matches!(ctx.get_field(mbb, MBB_FIELD_WRITABLE), Value::Int(1));
+    let writable = matches!(ctx.get_field(mbb, mbb_base + MBB_PRIVATE_WRITABLE), Value::Int(1));
     if !writable {
         return Ok(());
     }
@@ -16363,8 +17762,8 @@ fn native_fc_force_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
-        Value::Int(v) => v as u32,
+    let fd_id = match cratonvm_native_api::synthetic_file_channel::fd_value(ctx, this) {
+        Value::Int(v) if v >= 0 => v as u32,
         _ => return Ok(None),
     };
     let _ = ctx.fd_table().flush(fd_id);
@@ -16384,12 +17783,12 @@ fn native_fc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let fc_pos = match ctx.get_field(this, FC_FIELD_POS) {
+    let fc_pos = match cratonvm_native_api::synthetic_file_channel::position_value(ctx, this) {
         Value::Long(v) => v,
         _ => 0,
     };
     if fc_pos > new_size {
-        ctx.set_field(this, FC_FIELD_POS, Value::Long(new_size));
+        cratonvm_native_api::synthetic_file_channel::set_position_value(ctx, this, Value::Long(new_size));
     }
     Ok(Some(Value::Object(Some(this))))
 }
@@ -16962,10 +18361,29 @@ const WE_FIELD_KIND: usize = 0;
 const WE_FIELD_CONTEXT: usize = 1;
 const WE_NUM_FIELDS: usize = 2;
 
-/// DatagramChannel layout: 3 fields
-/// [0] = fd (Int) — UDP socket fd in fd_table
-/// [1] = bound_addr (Object — String local address)
-/// [2] = open (Int) — 1=open, 0=closed
+/// DatagramChannel allocation width — and a slot map that no longer exists.
+///
+/// The three-slot comment this replaces described `[0] = fd, [1] = bound_addr,
+/// [2] = open`. **Nothing writes any of them.** Every piece of
+/// `DatagramChannel` state moved into the identity-keyed side tables below
+/// (`dc_fds`, `dc_nonblocking_channels`, `dc_connected`), which is the remedy
+/// W7-49 §8 names as the sound one for state that must not sit in a real
+/// class's declared fields. `native_dc_open` allocates and then calls
+/// `dc_set_blocking` / `set_dc_fd`; neither touches a slot.
+///
+/// So the `3` was a vestigial number, and the layout-alias census
+/// (W7-59 §5.2) read it as a live 3-vs-10 `under` row against
+/// `java.nio.channels.DatagramChannel`, which declares ten fields transitively
+/// (`javap -p`, JDK 25.0.3.9). It is the emptiest kind of finding this census
+/// produces: a narrow request with an empty slot map cannot alias anything, and
+/// the base allocator clamps the object up to the declared width anyway.
+///
+/// Left at 3 rather than raised to 10: `try_alloc_synthetic` needs *some*
+/// count, and in synthetic-JDK mode — the only mode where the number decides
+/// anything — the class is a fabricated stub and 3 IS its declared width.
+/// Raising it would allocate seven dead slots per channel in that mode to
+/// silence one census row in the other, which is paying in the wrong currency.
+/// The row is real; it is just empty.
 const DC_NUM_FIELDS: usize = 3;
 
 /// Key for the `DatagramChannel` side tables below.
@@ -17102,25 +18520,140 @@ fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
     dc_fds().lock().remove(&dc_key(ctx, channel))
 }
 
-/// Selector layout: 3 fields
-/// [0] = registrations (Object — array of SelectionKey objects)
-/// [1] = count (Int)
-/// [2] = open (Int)
-const SEL_FIELD_REGS: usize = 0;
-const SEL_FIELD_COUNT: usize = 1;
-const SEL_FIELD_OPEN: usize = 2;
-const SEL_NUM_FIELDS: usize = 3;
+/// One channel's `socket()` answer.
+///
+/// Both members are `add_global_root` HANDLES, not `ObjectRef`s. That is what
+/// keeps this table out of the collector's root-provider list: a global root
+/// is already scanned AND remapped by the moving collector (it is the table
+/// behind JNI `NewGlobalRef`), so a handle stays valid across a compaction
+/// where a stored `ObjectRef` would dangle. The `ssc_socket_cache_*` twin in
+/// `socket_channel.rs` stores raw refs and therefore needs two hand-written
+/// hooks in `vm/src/memory/native_roots.rs`; this one needs none.
+///
+/// `channel` is the row's discriminator, because `DcKey`'s identity hash is
+/// not unique — two live channels may share a bucket.
+struct DcSocketRow {
+    channel: usize,
+    socket: usize,
+}
 
-/// SelectionKey layout: 4 fields
-/// [0] = channel (Object)
-/// [1] = interest_ops (Int)
-/// [2] = ready_ops (Int)
-/// [3] = valid (Int)
-const SK_FIELD_CHANNEL: usize = 0;
-const SK_FIELD_INTEREST: usize = 1;
-const SK_FIELD_READY: usize = 2;
-const SK_FIELD_VALID: usize = 3;
-const SK_NUM_FIELDS: usize = 4;
+/// `DatagramChannel.socket()`'s adaptor cache.
+///
+/// # Why a side table and not an object slot
+///
+/// `native_dc_open` allocates `DC_NUM_FIELDS` slots on the REAL
+/// `java.nio.channels.DatagramChannel`, whose low slots belong to
+/// `AbstractSelectableChannel`'s own layout — the same reason
+/// `dc_nonblocking_channels` above is a table. Stashing the adaptor in one of
+/// them is exactly the `ServerSocketChannel.socket()` bug that wrote over
+/// `AbstractSelectableChannel.keys` (W7-72-ssc-socket-and-filechannel.md).
+///
+/// # Why there is a cache at all
+///
+/// `socket()` must answer the SAME object every time or the adaptor's own
+/// state resets under the caller. `sun.nio.ch.DatagramSocketAdaptor` keeps its
+/// SO_TIMEOUT in a private `timeout` field, so a fresh adaptor per call would
+/// make `socket().setSoTimeout(n); socket().getSoTimeout()` read back `0` —
+/// "no timeout" — which is precisely the laundered value
+/// `native_dc_set_so_timeout`'s refusal exists to prevent.
+fn dc_socket_cache() -> &'static Mutex<HashMap<DcKey, Vec<DcSocketRow>>> {
+    static CACHE: OnceLock<Mutex<HashMap<DcKey, Vec<DcSocketRow>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The adaptor `socket()` already answered for `channel`, if any.
+///
+/// The lock is released before any `ctx` call: nothing in `NativeContext`
+/// touches this table, but the handles are copied out anyway so the two never
+/// have to be ordered against each other.
+fn dc_socket_cache_get(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<ObjectRef> {
+    let handles: Vec<(usize, usize)> = {
+        let table = dc_socket_cache().lock();
+        table
+            .get(&dc_key(ctx, channel))?
+            .iter()
+            .map(|row| (row.channel, row.socket))
+            .collect()
+    };
+    for (channel_root, socket_root) in handles {
+        if ctx.resolve_global_root(channel_root) == Some(channel) {
+            return ctx.resolve_global_root(socket_root);
+        }
+    }
+    None
+}
+
+fn dc_socket_cache_put(ctx: &mut dyn NativeContext, channel: ObjectRef, socket: ObjectRef) {
+    let key = dc_key(ctx, channel);
+    let channel_root = ctx.add_global_root(channel);
+    let socket_root = ctx.add_global_root(socket);
+    let existing = dc_socket_cache().lock().remove(&key).unwrap_or_default();
+    let (mut kept, released) = dc_socket_rows_without(ctx, existing, channel);
+    kept.push(DcSocketRow {
+        channel: channel_root,
+        socket: socket_root,
+    });
+    dc_socket_cache().lock().insert(key, kept);
+    for handle in released {
+        ctx.remove_global_root(handle);
+    }
+}
+
+/// Drop `channel`'s adaptor row. Called from `native_dc_close`, so a closed
+/// channel stops pinning its adaptor — and so the identity hash it releases
+/// cannot hand a later channel someone else's socket, which is the same
+/// staleness `dc_set_blocking` is reset for there.
+fn dc_socket_cache_clear(ctx: &mut dyn NativeContext, channel: ObjectRef) {
+    let key = dc_key(ctx, channel);
+    let existing = match dc_socket_cache().lock().remove(&key) {
+        Some(rows) => rows,
+        None => return,
+    };
+    let (kept, released) = dc_socket_rows_without(ctx, existing, channel);
+    if !kept.is_empty() {
+        dc_socket_cache().lock().insert(key, kept);
+    }
+    for handle in released {
+        ctx.remove_global_root(handle);
+    }
+}
+
+/// Split `rows` into the ones to keep and the global-root handles to release.
+///
+/// A row is dropped when it is `channel`'s own — a replacement, or a close —
+/// or when its channel handle does not resolve, which after a
+/// `remove_global_root` race means the row is already dead. A row whose
+/// channel resolves to a DIFFERENT object is kept: `DcKey`'s identity hash
+/// collides, and dropping those would silently evict a live sibling's adaptor.
+///
+/// A global root pins, so a channel abandoned WITHOUT `close()` keeps its
+/// adaptor (and itself) alive until the VM exits. That is the same lifetime
+/// the `ssc_socket_cache_*` twin gives a listener, and the reason
+/// `native_dc_close` clears eagerly rather than relying on the collector.
+fn dc_socket_rows_without(
+    ctx: &dyn NativeContext,
+    rows: Vec<DcSocketRow>,
+    channel: ObjectRef,
+) -> (Vec<DcSocketRow>, Vec<usize>) {
+    let mut kept: Vec<DcSocketRow> = Vec::with_capacity(rows.len());
+    let mut released: Vec<usize> = Vec::new();
+    for row in rows {
+        match ctx.resolve_global_root(row.channel) {
+            Some(other) if other != channel => kept.push(row),
+            _ => {
+                released.push(row.channel);
+                released.push(row.socket);
+            }
+        }
+    }
+    (kept, released)
+}
+
+// The legacy `Selector` / `SelectionKey` slot maps (`SEL_FIELD_*`, `SK_FIELD_*`)
+// were deleted with `register_selector` below; `nio_selector.rs` owns both
+// classes. The `OP_*` bits stay because they are NIO-spec constants, not a
+// layout. W7-66-live-over-allocations.md.
+
 
 /// SelectionKey operation bits
 const OP_READ: i32 = 1;
@@ -17447,10 +18980,24 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         };
     }
 
+    // `AsynchronousFileChannel.truncate(long)` carries the same clause as its
+    // synchronous twin: "@throws IllegalArgumentException If the new size is
+    // negative". Note where this check has to sit — AFTER the closed and
+    // not-writable refusals above, because the JDK checks those first and a
+    // caller distinguishing the three by type would otherwise see the wrong
+    // one. `(*v).max(0)` truncated the file to EMPTY for a negative size and
+    // returned the channel as though that had been the request.
     let new_len = match args.get(1) {
-        Some(Value::Long(v)) => (*v).max(0) as u64,
+        Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    if new_len < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Negative size: {new_len}"),
+        }
+        .into());
+    }
+    let new_len = new_len as u64;
     // STW-TAKEOVER guard -- see the matching comment in native_afc_read.
     // `this` isn't touched again after this call, but the ObjectRef we
     // ultimately return must reflect any relocation from a GC that ran
@@ -18974,20 +20521,44 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // concrete EPoll implementation then allocates a separate channel whose
     // local-address fields CratonVM does not maintain. Keep the provider
     // result on the same fd-table-backed DatagramChannel path.
-    r.register(
+    //
+    // BOTH descriptors, and this is the point. `openDatagramChannel()` is a
+    // SEPARATE METHOD, not a default-argument form of the one below it, and it
+    // is the one netty takes: `NioDatagramChannel()` calls
+    // `DEFAULT_SELECTOR_PROVIDER.openDatagramChannel()`. While only the
+    // `(ProtocolFamily)` row existed, the no-arg call fell through to real
+    // `DatagramChannelImpl` construction, which this VM cannot complete — so the
+    // channel arrived ALREADY CLOSED (`isOpen()==false`,
+    // `socket().isClosed()==true`), and every `DatagramSocket` accessor on a
+    // fresh netty datagram channel reported "Socket is closed" while
+    // `DefaultDatagramChannelConfig.setBroadcast` NPE'd on the null local
+    // address a closed adaptor returns.
+    //
+    // Registered on the concrete platform providers as well as on the abstract
+    // base and `SelectorProviderImpl`, matching what `socket_channel.rs` does
+    // for `openServerSocketChannel`/`openSocketChannel`: native dispatch may key
+    // on the receiver's concrete class (`sun.nio.ch.EPollSelectorProvider` on
+    // Linux, `WEPollSelectorProvider` on Windows) or on the declaring class of
+    // the resolved method, and the pair covers both.
+    for prov in [
         "java/nio/channels/spi/SelectorProvider",
-        "openDatagramChannel",
-        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
-        native_dc_open,
-    );
-    // Linux's default EPoll provider inherits the concrete implementation from
-    // SelectorProviderImpl, so its real bytecode must be overridden as well.
-    r.register(
         "sun/nio/ch/SelectorProviderImpl",
-        "openDatagramChannel",
-        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
-        native_dc_open,
-    );
+        "sun/nio/ch/EPollSelectorProvider",
+        "sun/nio/ch/WEPollSelectorProvider",
+    ] {
+        r.register(
+            prov,
+            "openDatagramChannel",
+            "()Ljava/nio/channels/DatagramChannel;",
+            native_dc_open,
+        );
+        r.register(
+            prov,
+            "openDatagramChannel",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
+            native_dc_open,
+        );
+    }
 
     // bind(SocketAddress) → DatagramChannel
     r.register(
@@ -19071,125 +20642,697 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         native_dc_local_addr,
     );
+    // Package-private `localAddress()` — the SAME bridge `SocketChannel` and
+    // `ServerSocketChannel` already register (see `socket_channel.rs`), and for
+    // the same reason: it is declared on `sun.nio.ch.DatagramChannelImpl`, not
+    // on the abstract `java.nio.channels.DatagramChannel` this VM actually
+    // instantiates, while `channel.socket()` hands back the REAL
+    // `sun.nio.ch.DatagramSocketAdaptor` whose JDK bytecode calls it.
+    //
+    // Without this row every DatagramSocket accessor that goes through the
+    // adaptor dies with
+    //   NoSuchMethodError: java.nio.channels.DatagramChannel.localAddress()
+    // — `isBound()`, and through it `getLocalAddress()` answering null, which
+    // is what NPEs `DefaultDatagramChannelConfig.setBroadcast` (netty
+    // `NioDatagramChannelTest.testBindMultiple`) and makes `isBroadcast()`
+    // report `SocketException: Socket is closed` on an open socket
+    // (`testGetOptions`, `testNioChannelOption`).
+    //
+    // NOTE THE DESCRIPTOR. `DatagramChannelImpl.localAddress()` returns the
+    // NARROWER `java.net.InetSocketAddress`, unlike `SocketChannelImpl`'s
+    // `java.net.SocketAddress`. Registering the SocketChannel spelling here
+    // resolves nothing -- the NoSuchMethodError just comes back naming
+    // `()Ljava/net/InetSocketAddress;`. Register both spellings so either
+    // resolution wins; `native_dc_local_addr` already builds a real
+    // `java.net.InetSocketAddress`, so both are type-correct.
+    r.register(
+        dc,
+        "localAddress",
+        "()Ljava/net/InetSocketAddress;",
+        native_dc_local_addr,
+    );
+    r.register(
+        dc,
+        "localAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_local_addr,
+    );
+    // The remote twin of the pair above, and it had NO registration at all —
+    // so `socket().getRemoteSocketAddress()` and `socket().getPort()` both died
+    // with `NoSuchMethodError: DatagramChannel.remoteAddress()`. Same two
+    // spellings, same reason. See `native_dc_remote_addr`.
+    r.register(
+        dc,
+        "remoteAddress",
+        "()Ljava/net/InetSocketAddress;",
+        native_dc_remote_addr,
+    );
+    r.register(
+        dc,
+        "remoteAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_remote_addr,
+    );
+    r.register(
+        dc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_remote_addr,
+    );
 
-    // socket() → DatagramSocket (stub for compat)
-    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", |_ctx, args| {
-        // Return self as the socket (simplified)
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(Value::Object(Some(this))))
-    });
+    // The generic `SocketOption` surface. It has to land together with the
+    // no-arg `openDatagramChannel()` above: with the factory bridged and this
+    // still missing, netty's `NioDatagramChannelTest` goes from 1 passing / 3
+    // failing to 0/4, because a channel that now opens successfully gets far
+    // enough to reach `getOption`/`setOption`/`supportedOptions` — and those
+    // were the abstract declarations. Two descriptors for `setOption`: real
+    // bytecode emits the COVARIANT `…)Ljava/nio/channels/DatagramChannel;`,
+    // while a caller holding a `NetworkChannel` emits the other.
+    r.register(
+        dc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;",
+        dc_set_option,
+    );
+    r.register(
+        dc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/NetworkChannel;",
+        dc_set_option,
+    );
+    r.register(
+        dc,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        dc_get_option,
+    );
+    r.register(dc, "supportedOptions", "()Ljava/util/Set;", dc_supported_options);
+
+    // socket() → DatagramSocket
+    r.register(dc, "socket", "()Ljava/net/DatagramSocket;", native_dc_socket);
 
     // DatagramSocket-surface adaptor methods.
     //
-    // `socket()` (above) returns the channel itself, so callers that do
-    // `datagramChannel.socket().<datagramSocketMethod>()` resolve those
-    // `java/net/DatagramSocket` methods against THIS class. The real abstract
-    // `DatagramChannel` declares none of them, so they reach native lookup
-    // here. Concretely, Tomcat's `NioReceiver.configureDatagramChannel()` calls
+    // These are registered on TWO receivers, and the pair is the point.
+    //
+    //  * `java/nio/channels/DatagramChannel`, because `socket()` used to answer
+    //    the channel itself, so `datagramChannel.socket().<datagramSocketMethod>()`
+    //    resolved these `java/net/DatagramSocket` methods against THIS class.
+    //    The real abstract `DatagramChannel` declares none of them, so they
+    //    reached native lookup here.
+    //  * `sun/nio/ch/DatagramSocketAdaptor`, because `socket()` now answers the
+    //    real adaptor (see `native_dc_socket` for why that had to change). The
+    //    adaptor's own bodies would NOT do: its `setSoTimeout` writes a private
+    //    Java field and nothing else, and its four option setters delegate to
+    //    `DatagramChannelImpl.setOption`, which THIS crate does not register —
+    //    `net_channels`'s `setOption` is backed by a different, unpopulated
+    //    socket registry. Letting the adaptor's bytecode run would therefore
+    //    turn every one of these into a silent no-op against the channel's
+    //    real UDP fd, which is the regression the double registration prevents.
+    //
+    // Concretely, Tomcat's `NioReceiver.configureDatagramChannel()` calls
     // `socket().{setSendBufferSize,setReceiveBufferSize,setReuseAddress,
     // setSoTimeout,setTrafficClass}` and `ReceiverBase.bindUdp()` calls
     // `socket().bind(addr)` — the void `DatagramSocket.bind(SocketAddress)`.
     // Buffer/option setters are best-effort against the channel's UDP fd;
     // `bind(SocketAddress)V` performs the real bind so UDP receive works.
+    // `dc_receiver_channel` is what makes one body serve both receivers.
+    let dsa = "sun/nio/ch/DatagramSocketAdaptor";
 
-    r.register(dc, "setSendBufferSize", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_send_buffer_size(fd, size);
-        }
-        Ok(None)
-    });
-    r.register(dc, "setReceiveBufferSize", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_recv_buffer_size(fd, size);
-        }
-        Ok(None)
-    });
-    r.register(dc, "setReuseAddress", "(Z)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_reuse_address(fd, on);
-        }
-        Ok(None)
-    });
+    r.register(dc, "setSendBufferSize", "(I)V", native_dc_set_send_buffer_size);
+    r.register(
+        dsa,
+        "setSendBufferSize",
+        "(I)V",
+        native_dc_set_send_buffer_size,
+    );
+    r.register(
+        dc,
+        "setReceiveBufferSize",
+        "(I)V",
+        native_dc_set_recv_buffer_size,
+    );
+    r.register(
+        dsa,
+        "setReceiveBufferSize",
+        "(I)V",
+        native_dc_set_recv_buffer_size,
+    );
+    r.register(dc, "setReuseAddress", "(Z)V", native_dc_set_reuse_address);
+    r.register(dsa, "setReuseAddress", "(Z)V", native_dc_set_reuse_address);
+    // `isConnected()Z` is a `DatagramSocket` method whose name and descriptor
+    // happen to match `DatagramChannel`'s, so it worked while `socket()`
+    // answered the channel. The adaptor's own body reads
+    // `DatagramChannelImpl.remoteAddress()`, which is not registered anywhere,
+    // so without this row the swap would turn a working answer into a
+    // NoSuchMethodError.
+    r.register(dsa, "isConnected", "()Z", native_dc_is_connected);
     // Was accepted and discarded on the grounds that a non-blocking channel
     // ignores SO_TIMEOUT — but this method is reached through
     // `channel.socket()`, i.e. by callers using the BLOCKING DatagramSocket
     // surface, where the timeout is the only thing stopping `receive()` from
     // blocking forever. Apply it to the channel's UDP fd like the sibling
     // buffer/reuse setters above.
-    r.register(dc, "setSoTimeout", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as u64;
-        // JDK contract: 0 means "no timeout" (block indefinitely).
-        let timeout = if millis == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(millis))
-        };
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
-        }
-        Ok(None)
-    });
-    // ESCALATED wave 4 (2026-07-28) — this IS implementable, but not from this
-    // crate. `socket2` (already a dependency of `native-api`, `features =
-    // ["all"]`) exposes `SockRef::set_tos(u32)`, which is exactly IP_TOS /
-    // the JDK's `setTrafficClass`. What is missing is the fd-table accessor:
-    // `native-api/src/fd_table.rs` needs
-    //
-    //     pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error>
-    //
-    // written like its neighbour `udp_set_send_buffer_size` (match
-    // `FileEntry::UdpSocket(s)` → `socket2::SockRef::from(s).set_tos(tos)`).
-    // The `FileEntry` enum and `get_entry` are both private to that module and
-    // native-io does not depend on socket2, so the option cannot be reached
-    // from here. Once the accessor lands this becomes the same three lines as
-    // `setSoTimeout` above: `if let Some(fd) = dc_fd(ctx, this) { let _ =
-    // ctx.fd_table().udp_set_tos(fd, (tc & 0xff) as u32); }`.
-    //
-    // Until then, accepting and discarding is spec-legal rather than a silent
-    // failure: `DatagramSocket.setTrafficClass` is documented as advisory
-    // ("the underlying platform may ignore the value"), and the JDK's own
-    // contract only requires an IllegalArgumentException for values outside
-    // 0..=255 — which real callers (Tomcat's `NioReceiver`) never pass.
-    //
-    // IMPLEMENTED wave 4 (2026-07-28): `FdTable::udp_set_tos` was added for
-    // exactly this, so the escalation above is resolved and the body is now
-    // the same shape as `setSoTimeout`. The advisory-ness of IP_TOS is a
-    // statement about the network, not a licence to skip the syscall — "the
-    // platform may ignore it" and "we never asked" are different claims, and
-    // only the second was true before. The spec'd IllegalArgumentException is
-    // now enforced rather than waived on the grounds that today's callers
-    // happen not to trip it.
-    r.register(dc, "setTrafficClass", "(I)V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let tc = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if !(0..=255).contains(&tc) {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("tc is not in range 0 -- 255: {tc}"),
-            }
-            .into());
-        }
-        if let Some(fd) = dc_fd(ctx, this) {
-            let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
-        }
-        Ok(None)
-    });
+    r.register(dc, "setSoTimeout", "(I)V", native_dc_set_so_timeout);
+    r.register(dsa, "setSoTimeout", "(I)V", native_dc_set_so_timeout);
+    r.register(dc, "setTrafficClass", "(I)V", native_dc_set_traffic_class);
+    r.register(dsa, "setTrafficClass", "(I)V", native_dc_set_traffic_class);
 
     // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
     // channel's own real bind (close old fd, open a fresh UDP fd bound to the
     // requested address) and discards the channel return value.
-    r.register(dc, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
-        native_dc_bind(ctx, args)?;
-        Ok(None)
-    });
+    r.register(
+        dc,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        native_dc_socket_bind,
+    );
+    r.register(
+        dsa,
+        "bind",
+        "(Ljava/net/SocketAddress;)V",
+        native_dc_socket_bind,
+    );
 
     r.set_category(__prev_cat);
+}
+
+/// The `DatagramChannel` a `DatagramSocket`-surface native was reached through.
+///
+/// Since [`native_dc_socket`] answers a real `sun.nio.ch.DatagramSocketAdaptor`
+/// rather than the channel, these bodies see one of two receivers. The adaptor
+/// keeps the channel in its private `dc` field, so one lookup normalises both.
+///
+/// The non-object arm is the CHANNEL arm, not an error path: a channel has no
+/// `dc` field, and `get_field_by_name` answers `Int(0)` for a field the class
+/// does not declare rather than failing. The fallback is therefore "the
+/// receiver already is the channel", which is also what the pre-adaptor
+/// `socket()` handed out and what [`native_dc_socket`]'s own fallback still
+/// returns when the adaptor cannot be built.
+fn dc_receiver_channel(ctx: &dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
+    match ctx.get_field_by_name(receiver, "dc") {
+        Value::Object(Some(channel)) => channel,
+        _ => receiver,
+    }
+}
+
+fn native_dc_set_send_buffer_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_send_buffer_size(fd, size);
+    }
+    Ok(None)
+}
+
+fn native_dc_set_recv_buffer_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_recv_buffer_size(fd, size);
+    }
+    Ok(None)
+}
+
+fn native_dc_set_reuse_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_reuse_address(fd, on);
+    }
+    Ok(None)
+}
+
+/// `DatagramSocket.bind(SocketAddress)`, reached through `socket()`.
+///
+/// Rebuilds the argument list rather than forwarding `args` untouched: slot 0
+/// may be the adaptor, and `native_dc_bind` keys the fd table on the channel.
+fn native_dc_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let channel = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let addr = args.get(1).copied().unwrap_or(Value::Object(None));
+    native_dc_bind(ctx, &[Value::Object(Some(channel)), addr])?;
+    Ok(None)
+}
+
+fn native_dc_set_so_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let receiver = obj_arg92(args, 0)?;
+    let this = dc_receiver_channel(ctx, receiver);
+    let requested = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    // W7-8-fabricated-success-io-sweep.md recorded the `.max(0)` that stood
+    // here as UNMEASURED, on the grounds that "not a method
+    // `java.nio.channels.DatagramChannel` declares, so there is no javadoc to
+    // quote". That framing was wrong, and this method's two registrations are
+    // what refute it: the only way to reach this body is
+    // `channel.socket().setSoTimeout(..)`, i.e. a caller using the
+    // **DatagramSocket** surface, and that class does specify the answer.
+    //
+    // JDK 25 `java.net.DatagramSocket.setSoTimeout(int)`:
+    //     @throws IllegalArgumentException if {@code timeout} is negative
+    // and the implementation `socket()` actually returns,
+    // `sun.nio.ch.DatagramSocketAdaptor.setSoTimeout` (JDK 25 src.zip:231):
+    //     if (isClosed()) throw new SocketException("Socket is closed");
+    //     if (timeout < 0) throw new IllegalArgumentException("timeout < 0");
+    //
+    // `.max(0)` turned `setSoTimeout(-1)` — the usual spelling of a
+    // miscomputed deadline — into `setSoTimeout(0)`, and `0` is not a small
+    // timeout, it is **no timeout**: the next `receive()` blocks forever
+    // where the caller asked it to be bounded. That is the failure the
+    // refusal exists to prevent, laundered into the one value that cannot be
+    // distinguished from a healthy configuration.
+    //
+    // The message is HotSpot's own. NOT added here: the `isClosed()` refusal
+    // that precedes it upstream. `dc_fd` answering `None` covers "closed"
+    // AND "never bound", so raising `SocketException` on it would refuse a
+    // channel the JDK accepts; the ordering consequence is stated rather
+    // than guessed at — on a CLOSED channel with a negative timeout this
+    // raises `IllegalArgumentException` where HotSpot raises
+    // `SocketException`, which is one wrong exception type in place of a
+    // silent success, not a new silence.
+    if requested < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "timeout < 0".to_string(),
+        }
+        .into());
+    }
+    let millis = requested as u64;
+    // JDK contract: 0 means "no timeout" (block indefinitely).
+    let timeout = if millis == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(millis))
+    };
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
+    }
+    // Keep `sun.nio.ch.DatagramSocketAdaptor.timeout` in step when that is the
+    // receiver. Its `getSoTimeout()` is NOT intercepted — it reads that private
+    // field — so without this write an accepted timeout would read back as a
+    // permanent `0`, i.e. "no timeout", which is the exact value this method's
+    // refusal above exists to stop a caller from being handed by accident.
+    if receiver != this {
+        ctx.set_field_by_name(receiver, "timeout", Value::Int(requested));
+    }
+    Ok(None)
+}
+
+// ESCALATED wave 4 (2026-07-28) — this IS implementable, but not from this
+// crate. `socket2` (already a dependency of `native-api`, `features =
+// ["all"]`) exposes `SockRef::set_tos(u32)`, which is exactly IP_TOS /
+// the JDK's `setTrafficClass`. What is missing is the fd-table accessor:
+// `native-api/src/fd_table.rs` needs
+//
+//     pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error>
+//
+// written like its neighbour `udp_set_send_buffer_size` (match
+// `FileEntry::UdpSocket(s)` → `socket2::SockRef::from(s).set_tos(tos)`).
+// The `FileEntry` enum and `get_entry` are both private to that module and
+// native-io does not depend on socket2, so the option cannot be reached
+// from here. Once the accessor lands this becomes the same three lines as
+// `setSoTimeout` above: `if let Some(fd) = dc_fd(ctx, this) { let _ =
+// ctx.fd_table().udp_set_tos(fd, (tc & 0xff) as u32); }`.
+//
+// Until then, accepting and discarding is spec-legal rather than a silent
+// failure: `DatagramSocket.setTrafficClass` is documented as advisory
+// ("the underlying platform may ignore the value"), and the JDK's own
+// contract only requires an IllegalArgumentException for values outside
+// 0..=255 — which real callers (Tomcat's `NioReceiver`) never pass.
+//
+// IMPLEMENTED wave 4 (2026-07-28): `FdTable::udp_set_tos` was added for
+// exactly this, so the escalation above is resolved and the body is now
+// the same shape as `setSoTimeout`. The advisory-ness of IP_TOS is a
+// statement about the network, not a licence to skip the syscall — "the
+// platform may ignore it" and "we never asked" are different claims, and
+// only the second was true before. The spec'd IllegalArgumentException is
+// now enforced rather than waived on the grounds that today's callers
+// happen not to trip it.
+fn native_dc_set_traffic_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let tc = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    if !(0..=255).contains(&tc) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("tc is not in range 0 -- 255: {tc}"),
+        }
+        .into());
+    }
+    if let Some(fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// DatagramChannel — the generic `SocketOption` surface
+// ---------------------------------------------------------------------------
+
+/// Every `setOption` value Java has requested on a `DatagramChannel`, by option
+/// name.
+///
+/// The individual setters above (`setReuseAddress`, `setReceiveBufferSize`, …)
+/// write straight through to the fd and keep nothing, which is fine for a
+/// write-only surface. `getOption` is a READER, and two of the options it must
+/// answer cannot be read back off the socket at all in the shape the JDK
+/// promises: `IP_MULTICAST_IF`'s value is a `NetworkInterface`, and the socket
+/// only knows an address. So the requested value is recorded here as well, and
+/// used when the socket cannot answer.
+///
+/// Keyed like every other `DatagramChannel` side table — see [`DcKey`] for why
+/// identity hash plus VM identity, and why no collector hook is needed: the
+/// values are ints and Strings, never `ObjectRef`s.
+fn dc_option_state() -> &'static Mutex<HashMap<DcKey, HashMap<String, i32>>> {
+    static OPTS: OnceLock<Mutex<HashMap<DcKey, HashMap<String, i32>>>> = OnceLock::new();
+    OPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dc_option_set(ctx: &dyn NativeContext, channel: ObjectRef, name: &str, value: i32) {
+    dc_option_state()
+        .lock()
+        .entry(dc_key(ctx, channel))
+        .or_default()
+        .insert(name.to_string(), value);
+}
+
+fn dc_option_get(ctx: &dyn NativeContext, channel: ObjectRef, name: &str) -> Option<i32> {
+    dc_option_state()
+        .lock()
+        .get(&dc_key(ctx, channel))?
+        .get(name)
+        .copied()
+}
+
+/// Drop a closed channel's recorded options, so the identity hash it releases
+/// cannot hand a later channel this one's settings — the same staleness
+/// `dc_set_blocking` and `dc_socket_cache_clear` are reset for in `native_dc_close`.
+fn dc_option_clear(ctx: &dyn NativeContext, channel: ObjectRef) {
+    dc_option_state().lock().remove(&dc_key(ctx, channel));
+}
+
+/// The option name carried by a `java.net.SocketOption` argument. Shares the
+/// stream-channel reader, which knows that not every `SocketOption` the JDK's
+/// own adaptors pass declares a `name` FIELD — see
+/// `socket_channel::socket_option_name`.
+fn dc_option_name(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
+    let option = match arg {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    crate::socket_channel::socket_option_name(ctx, option)
+}
+
+/// The first IPv4 address of a `java.net.NetworkInterface`, as the socket-level
+/// `IP_MULTICAST_IF` value.
+///
+/// The JDK option is typed `SocketOption<NetworkInterface>` while the socket
+/// option is an address, so the interface has to be resolved. Answering `None`
+/// (IPv6-only or unresolvable interface) means the OS write is skipped and only
+/// the Java-visible record is kept — which is still the value `getOption` will
+/// return, so the round-trip the caller can observe stays consistent.
+fn dc_interface_ipv4(ctx: &mut dyn NativeContext, ni: ObjectRef) -> Option<std::net::Ipv4Addr> {
+    let addresses = match ctx.invoke_virtual(ni, "getInetAddresses", "()Ljava/util/Enumeration;", &[])
+    {
+        Ok(Some(Value::Object(Some(e)))) => e,
+        _ => return None,
+    };
+    // Bounded: an interface with a pathological address list must not spin.
+    for _ in 0..64 {
+        match ctx.invoke_virtual(addresses, "hasMoreElements", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => return None,
+        }
+        let addr = match ctx.invoke_virtual(addresses, "nextElement", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => return None,
+        };
+        let text = match ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => continue,
+        };
+        if let Ok(v4) = text.parse::<std::net::Ipv4Addr>() {
+            return Some(v4);
+        }
+    }
+    None
+}
+
+/// `DatagramChannel.setOption(SocketOption, Object)`.
+///
+/// The individual `DatagramSocket`-surface setters registered above cover the
+/// four options Tomcat's `NioReceiver` uses by name. This is the GENERIC
+/// surface — the one `sun.nio.ch.DatagramSocketAdaptor` and netty's
+/// `NioChannelOption` go through — and it had no registration at all, so it
+/// resolved to the abstract declaration:
+///
+/// ```text
+///   AbstractMethodError: java/nio/channels/DatagramChannel.setOption(
+///       Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;
+///       has no Code attribute
+/// ```
+fn dc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let name = dc_option_name(ctx, args.get(1));
+    let fd = dc_fd(ctx, this);
+
+    // `IP_MULTICAST_IF` is the one option whose value is neither a Boolean nor
+    // an Integer, so it cannot go through `socket_option_value`.
+    if name == "IP_MULTICAST_IF" {
+        let ni = match args.get(2) {
+            Some(Value::Object(Some(ni))) => *ni,
+            // The JDK rejects a null interface; nothing here can act on one
+            // either, and silently recording "interface 0" would make
+            // `getOption` answer a different object than was set.
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "IP_MULTICAST_IF requires a NetworkInterface".to_string(),
+                }
+                .into())
+            }
+        };
+        let index = match ctx.invoke_virtual(ni, "getIndex", "()I", &[]) {
+            Ok(Some(Value::Int(i))) => i,
+            _ => 0,
+        };
+        if let (Some(fd), Some(v4)) = (fd, dc_interface_ipv4(ctx, ni)) {
+            let _ = ctx.fd_table().udp_set_multicast_if_v4(fd, &v4);
+        }
+        dc_option_set(ctx, this, &name, index);
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
+    let value = crate::socket_channel::socket_option_value(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Int(0)),
+    );
+
+    // Range checks first: `setOption` must refuse an out-of-range value rather
+    // than record it and hand back a channel that reads it straight out again.
+    match name.as_str() {
+        "IP_TOS" | "IP_MULTICAST_TTL" if !(0..=255).contains(&value) => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid value '{value}' for {name}"),
+            }
+            .into())
+        }
+        "SO_RCVBUF" | "SO_SNDBUF" if value <= 0 => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid send/receive buffer size: {value}"),
+            }
+            .into())
+        }
+        _ => {}
+    }
+
+    if let Some(fd) = fd {
+        let table = ctx.fd_table();
+        let _ = match name.as_str() {
+            "SO_REUSEADDR" => table.udp_set_reuse_address(fd, value != 0),
+            "SO_BROADCAST" => table.udp_set_broadcast(fd, value != 0),
+            "SO_RCVBUF" => table.udp_set_recv_buffer_size(fd, value as usize),
+            "SO_SNDBUF" => table.udp_set_send_buffer_size(fd, value as usize),
+            "IP_TOS" => table.udp_set_tos(fd, value as u32),
+            "IP_MULTICAST_TTL" => table.udp_set_multicast_ttl_v4(fd, value as u32),
+            "IP_MULTICAST_LOOP" => table.udp_set_multicast_loop_v4(fd, value != 0),
+            _ => Ok(()),
+        };
+    }
+    dc_option_set(ctx, this, &name, value);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `DatagramChannel.getOption(SocketOption)`.
+///
+/// Reads the SOCKET where the socket can answer, and the recorded request
+/// otherwise. The order matters: a value set before `bind()` was applied to the
+/// fd that existed then, and `bind` closes that fd and opens a replacement
+/// (`native_dc_bind`), so on a rebound channel the record is the only place the
+/// caller's own value still exists.
+///
+/// The return MUST be boxed — `getOption` is `<T> T getOption(SocketOption<T>)`,
+/// and a raw `Value::Int` returned for an object-typed method coerces to null,
+/// which NPEs the adaptor's `((Boolean) …).booleanValue()`. See
+/// `socket_channel::box_socket_option`.
+fn dc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    let name = dc_option_name(ctx, args.get(1));
+    let fd = dc_fd(ctx, this);
+
+    if name == "IP_MULTICAST_IF" {
+        // Prefer the interface Java itself named: the socket only knows an
+        // address, and mapping an address back to an interface is lossy.
+        let index = dc_option_get(ctx, this, &name).unwrap_or(0);
+        if index > 0 {
+            return ctx.invoke(
+                "java/net/NetworkInterface",
+                "getByIndex",
+                "(I)Ljava/net/NetworkInterface;",
+                &[Value::Int(index)],
+            );
+        }
+        let address = fd.and_then(|fd| ctx.fd_table().udp_multicast_if_v4(fd).ok());
+        match address {
+            Some(v4) if !v4.is_unspecified() => {
+                let text = ctx.create_string(&v4.to_string());
+                let inet = ctx.invoke(
+                    "java/net/InetAddress",
+                    "getByName",
+                    "(Ljava/lang/String;)Ljava/net/InetAddress;",
+                    &[Value::Object(Some(text))],
+                )?;
+                ctx.invoke(
+                    "java/net/NetworkInterface",
+                    "getByInetAddress",
+                    "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
+                    &[inet.unwrap_or(Value::Object(None))],
+                )
+            }
+            // No interface selected — HotSpot answers null here, measured.
+            _ => Ok(Some(Value::Object(None))),
+        }
+    } else {
+        let live = fd.and_then(|fd| {
+            let table = ctx.fd_table();
+            match name.as_str() {
+                "SO_REUSEADDR" => table.udp_reuse_address(fd).ok().map(i32::from),
+                "SO_BROADCAST" => table.udp_broadcast(fd).ok().map(i32::from),
+                "SO_RCVBUF" => table.udp_recv_buffer_size(fd).ok().map(|n| n as i32),
+                "SO_SNDBUF" => table.udp_send_buffer_size(fd).ok().map(|n| n as i32),
+                "IP_TOS" => table.udp_tos(fd).ok().map(|n| n as i32),
+                "IP_MULTICAST_TTL" => table.udp_multicast_ttl_v4(fd).ok().map(|n| n as i32),
+                "IP_MULTICAST_LOOP" => table.udp_multicast_loop_v4(fd).ok().map(i32::from),
+                _ => None,
+            }
+        });
+        let raw = live
+            .or_else(|| dc_option_get(ctx, this, &name))
+            .unwrap_or(0);
+        crate::socket_channel::box_socket_option(ctx, &name, raw)
+    }
+}
+
+/// `DatagramChannel.supportedOptions()`.
+///
+/// HotSpot JDK 25 / Linux answers `[IP_DONTFRAGMENT, IP_MULTICAST_IF,
+/// IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_TOS, SO_BROADCAST,
+/// SO_INCOMING_NAPI_ID, SO_RCVBUF, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF]`
+/// (measured). The `jdk.net.ExtendedSocketOptions` entries are left out here
+/// because nothing in this file implements them, and the set is a CONTRACT, not
+/// a wish list: netty's `NioChannelOption.setOption` uses
+/// `supportedOptions().contains(...)` as its only gate and reports an unlisted
+/// option as "not set" — so listing an option nothing honours turns a refusal
+/// into a silent lie.
+///
+/// What must NOT be here is just as load-bearing: `TCP_NODELAY` is netty's
+/// `newInvalidOption()` for `NioDatagramChannelTest.testInvalidNioChannelOption`,
+/// which asserts `setOption` returns false for it.
+fn dc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    crate::socket_channel::supported_options_set(
+        ctx,
+        &[
+            "IP_MULTICAST_IF",
+            "IP_MULTICAST_LOOP",
+            "IP_MULTICAST_TTL",
+            "IP_TOS",
+            "SO_BROADCAST",
+            "SO_RCVBUF",
+            "SO_REUSEADDR",
+            "SO_SNDBUF",
+        ],
+    )
+}
+
+/// `DatagramChannel.socket()`.
+///
+/// # This used to answer the CHANNEL ITSELF, and that was a type error
+///
+/// `socket()` is declared `()Ljava/net/DatagramSocket;` and a
+/// `java.nio.channels.DatagramChannel` is not a `java.net.DatagramSocket`. The
+/// old body returned `this` anyway, and nothing caught it: javac emits NO
+/// checkcast at the call site, because the DECLARED return type already
+/// satisfies the assignment, so the wrong object flowed into
+/// `DatagramSocket`-typed locals silently. What it cost, measured against
+/// HotSpot on the same host:
+///
+/// ```text
+///   ch.socket().getClass().getName()   java.nio.channels.DatagramChannel
+///                            HotSpot:  sun.nio.ch.DatagramSocketAdaptor
+///   ch.socket() instanceof DatagramSocket   false     (HotSpot: true)
+///   ch.socket() == ch                       true      (HotSpot: false)
+///   ch.socket().getSoTimeout()   NoSuchMethodError    (HotSpot: the timeout)
+///   ch.socket().getLocalPort()   NoSuchMethodError    (HotSpot: the port)
+/// ```
+///
+/// Every `java.net.DatagramSocket` method that worked did so only because its
+/// name AND descriptor happened to collide with a `DatagramChannel` native.
+///
+/// # The fix is the one `sc_socket`/`ssc_socket` already use
+///
+/// Mirror the real `DatagramChannelImpl.socket()` → `DatagramSocketAdaptor
+/// .create(this)`. The adaptor is a genuine `java.net.DatagramSocket`
+/// subclass, its construction runs the `DatagramSocket`/`MulticastSocket`
+/// instance initializers, and it keeps the channel in its private `dc` field —
+/// which is what `dc_receiver_channel` reads to keep every native below
+/// working on the channel's real UDP fd.
+///
+/// The adaptor is CACHED, unlike `sc_socket`'s. Two calls to `socket()` must
+/// answer the same object or the adaptor's own state — `timeout`, which
+/// `getSoTimeout()` reads — resets on every call, turning an accepted timeout
+/// into a silent `0`.
+///
+/// # The fallback is the channel, deliberately
+///
+/// `sun.nio.ch.DatagramSocketAdaptor` does not exist under `--jdk-only` /
+/// synthetic-JDK, where there is no class library to build it from. Falling
+/// back to the channel keeps that mode byte-for-byte on its current behaviour
+/// instead of failing `socket()` outright. A bare `new java/net/DatagramSocket`
+/// would be worse than either: JDK 25 routes every method through a `delegate`
+/// field that no `<init>` has filled in.
+fn native_dc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut this = obj_arg92(args, 0)?;
+    if let Some(cached) = dc_socket_cache_get(ctx, this) {
+        return Ok(Some(Value::Object(Some(cached))));
+    }
+    // `invoke` runs Java bytecode, which allocates, which can relocate `this`
+    // under a moving collector — and `this` is then written into the cache as
+    // one half of a pair, so a stale local here would key the row on a dead
+    // address. Same reason `ssc_socket` pins.
+    let pin = ctx.pin_native_root(this);
+    let created = ctx.invoke(
+        "sun/nio/ch/DatagramSocketAdaptor",
+        "create",
+        "(Lsun/nio/ch/DatagramChannelImpl;)Ljava/net/DatagramSocket;",
+        &[Value::Object(Some(this))],
+    );
+    this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    if let Ok(Some(v @ Value::Object(Some(adaptor)))) = created {
+        dc_socket_cache_put(ctx, this, adaptor);
+        return Ok(Some(v));
+    }
+    Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -19231,17 +21374,44 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => "0.0.0.0:0".to_string(),
     };
 
-    // Close old socket and open a new one bound to the address
-    if let Some(old_fd) = dc_fd(ctx, this) {
-        let _ = ctx.fd_table().close(old_fd);
-    }
+    // `SO_REUSEADDR` is a PRE-bind option, so whatever was applied to the
+    // socket being replaced does not carry over — reapply what Java asked for.
+    // `dc_option_get` is the record `native_dc_set_option` keeps for exactly
+    // the cases where the socket cannot answer for itself.
+    let reuse = dc_option_get(ctx, this, "SO_REUSEADDR").unwrap_or(0) != 0;
 
-    let fd_id =
+    // Bind the socket this channel ALREADY has, keeping its fd id.
+    //
+    // This used to `close(old_fd)` and `open_udp(addr)`, which handed the
+    // channel a NEW fd id. The id is the channel's identity everywhere else in
+    // the VM — most importantly it is the key the NIO selector registers under
+    // — and netty registers before it binds (`AbstractChannel.register0` runs
+    // `javaChannel().register(selector, 0)`; `doBind` comes after). So the
+    // registration was left keyed on a dead id, holding a dup of the discarded
+    // socket, and `NioDatagramChannel` never received a single datagram: the
+    // bind succeeded, the send worked, and inbound traffic simply never
+    // reached the event loop. `PcapWriteHandlerTest`'s `udpV4*` cases and
+    // `io.netty.resolver.dns`'s transport are the visible half of that.
+    if let Some(existing) = dc_fd(ctx, this) {
         ctx.fd_table()
-            .open_udp(Some(&addr_str))
+            .udp_rebind(existing, Some(&addr_str), reuse)
             .map_err(|e| RuntimeError::IOException {
                 message: format!("DatagramChannel.bind: {e}"),
             })?;
+        if let Ok(fresh) = ctx.fd_table().udp_try_clone(existing) {
+            crate::nio_selector::selector_refresh_udp(existing as i32, &fresh);
+        }
+        return Ok(Some(Value::Object(Some(this))));
+    }
+
+    let fd_id = if reuse {
+        ctx.fd_table().open_udp_reuse(Some(&addr_str))
+    } else {
+        ctx.fd_table().open_udp(Some(&addr_str))
+    }
+    .map_err(|e| RuntimeError::IOException {
+        message: format!("DatagramChannel.bind: {e}"),
+    })?;
 
     set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))
@@ -19479,7 +21649,17 @@ fn dc_inet_socket_address(
     ctx.set_field_by_name(inet_holder, "family", Value::Int(1));
     ctx.set_field_by_name(inet, "holder", Value::Object(Some(inet_holder)));
 
-    let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 2)?;
+    // Width 1, not 2: every field below is written BY NAME, so the request only
+    // ever needed to cover what the class declares, and real
+    // `java.net.InetSocketAddress` declares exactly one instance field
+    // (`javap -p`, JDK 25.0.3.9: `private final transient
+    // InetSocketAddress$InetSocketAddressHolder holder`; its superclass
+    // `java.net.SocketAddress` declares only a static `serialVersionUID`).
+    // The second slot sat past the declared width with no writer and no reader.
+    // No-op in synthetic-JDK mode, where `class_manager` fabricates this class
+    // with three fields and `alloc_object` clamps any request up to them.
+    // W7-66-live-over-allocations.md.
+    let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 1)?;
     let socket_holder =
         try_alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
     let socket_host = ctx.create_string(host);
@@ -19545,6 +21725,12 @@ fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // releases cannot carry "non-blocking" over to a later channel that
     // happens to be allocated with the same hash.
     dc_set_blocking(ctx, this, true);
+    // ... and the `socket()` adaptor, for the same staleness reason plus one
+    // more: that row holds two heap references and is a GC root, so leaving it
+    // behind keeps a closed channel and its adaptor alive forever.
+    dc_socket_cache_clear(ctx, this);
+    // ... and the recorded socket options, same staleness reason again.
+    dc_option_clear(ctx, this);
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }
@@ -19596,30 +21782,48 @@ fn native_dc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(i32::from(dc_is_blocking(ctx, this)))))
 }
 
-fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    // Phase T16 can allocate an older channel layout that does not retain the
-    // fd-table id in field zero. The JDK contract after bind(null) is still a
-    // non-null wildcard local address; use port zero when that legacy layout
-    // cannot expose its ephemeral port rather than returning null to JNDI.
-    let addr = dc_fd(ctx, this)
-        .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
-        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+/// `DatagramChannel.remoteAddress()` / `getRemoteAddress()`.
+///
+/// The same per-method hole as `localAddress()` above, found by walking the
+/// whole adaptor surface (`AdaptorAudit`) instead of waiting for the next
+/// application to hit it: it is declared on `sun.nio.ch.DatagramChannelImpl`,
+/// not on the abstract `java.nio.channels.DatagramChannel` this VM
+/// instantiates, and `sun.nio.ch.DatagramSocketAdaptor`'s real bytecode calls
+/// it from `getRemoteSocketAddress()` and `getPort()`:
+///
+/// ```text
+///   NoSuchMethodError: java.nio.channels.DatagramChannel.remoteAddress()
+///                      Ljava/net/InetSocketAddress;
+/// ```
+///
+/// NOTE THE DESCRIPTOR, again: like `localAddress()`, the `DatagramChannelImpl`
+/// spelling returns the NARROWER `java.net.InetSocketAddress`. Both are
+/// registered.
+///
+/// `null` for an unconnected channel is the JDK's own answer, not a failure —
+/// `getRemoteSocketAddress()` returns null and `getPort()` returns -1 there.
+fn native_dc_remote_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = dc_receiver_channel(ctx, obj_arg92(args, 0)?);
+    if !dc_is_connected(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
+    let addr = dc_fd(ctx, this).and_then(|fd| ctx.fd_table().udp_peer_addr(fd).ok());
+    match addr {
+        Some(addr) => dc_build_inet_socket_address(ctx, &addr),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Build a real `java.net.InetSocketAddress` from a `host:port` string.
+///
+/// Shared by the local- and remote-address bridges. Goes through the real
+/// `(String,int)` constructor rather than writing slots by hand — see
+/// [`native_dc_local_addr`] for what the hand-written two-slot form cost.
+fn dc_build_inet_socket_address(ctx: &mut dyn NativeContext, addr: &str) -> MethodCallResult {
     let (host, port) = addr
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
         .unwrap_or(("0.0.0.0", 0));
-    // Build the address through the real constructor rather than writing the
-    // legacy two-slot layout by hand. The hand-written form put a bare host
-    // String in slot 0 — where a real-layout `InetSocketAddress` keeps its
-    // `holder` — so `getAddress()` fell through to an out-of-range slot read
-    // and answered **null** while `isUnresolved()` still answered **false**.
-    // That is the same broken pair that let `ServerSocket.bind` walk past its
-    // unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`; here it
-    // simply meant `DatagramChannel.getLocalAddress().getAddress()` was null on
-    // a channel that was demonstrably bound. `(Ljava/lang/String;I)V` resolves
-    // the numeric literal and populates the holder, so both answers agree and
-    // match HotSpot.
     let host_s = ctx.create_string(host);
     let host_pin = ctx.pin_native_root(host_s);
     let host_s = ctx.read_native_pin(host_pin, host_s);
@@ -19635,368 +21839,55 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 }
 
+fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    // Phase T16 can allocate an older channel layout that does not retain the
+    // fd-table id in field zero. The JDK contract after bind(null) is still a
+    // non-null wildcard local address; use port zero when that legacy layout
+    // cannot expose its ephemeral port rather than returning null to JNDI.
+    let addr = dc_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+    // Build the address through the real constructor rather than writing the
+    // legacy two-slot layout by hand. The hand-written form put a bare host
+    // String in slot 0 — where a real-layout `InetSocketAddress` keeps its
+    // `holder` — so `getAddress()` fell through to an out-of-range slot read
+    // and answered **null** while `isUnresolved()` still answered **false**.
+    // That is the same broken pair that let `ServerSocket.bind` walk past its
+    // unresolved-address guard and NPE inside `sun.nio.ch.Net.bind`; here it
+    // simply meant `DatagramChannel.getLocalAddress().getAddress()` was null on
+    // a channel that was demonstrably bound. `(Ljava/lang/String;I)V` resolves
+    // the numeric literal and populates the holder, so both answers agree and
+    // match HotSpot. (That construction now lives in
+    // `dc_build_inet_socket_address`, shared with the remote-address bridge.)
+    dc_build_inet_socket_address(ctx, &addr)
+}
+
 // ---------------------------------------------------------------------------
-// 92.4: Real Selector (platform-native I/O multiplexing)
+// 92.4: Real Selector — DELETED (W7-66, 2026-08-12)
 // ---------------------------------------------------------------------------
 //
-// On Windows we use non-blocking poll (WouldBlock checks).
-// On Linux/macOS a real implementation would use epoll/kqueue.
-// This implementation uses Rust's platform-agnostic poll approach via
-// fd_table.poll_ready() which works everywhere.
+// `register_selector` and the ten natives only it installed
+// (`native_sel_open`, `native_channel_register`, `do_select`,
+// `native_sel_select{,_timeout,_now}`, `native_sel_selected_keys`,
+// `native_sel_keys`, `native_sel_wakeup`, `native_sel_close`,
+// `native_sel_is_open`) are gone. The registrar lost its only caller in
+// Wave 3 / Task C — see the note in `register_nio_channel_extras` — and
+// `nio_selector.rs::register_nio_selector`, called from `register_io_natives`,
+// has been the source of truth for `java/nio/channels/Selector` and
+// `SelectionKey` since. Deadness confirmed by grep before deletion: the
+// registrar's only reference in the workspace was its own definition, and
+// every native it installed had exactly one other reference, its own `fn`.
+//
+// Five of W7-59's twenty-eight `over` census rows lived here — `SelectionKey`
+// 4-vs-1 and `HashSet` 2-vs-1 — and were noise in every future run of
+// `CRATONVM_DBG_LAYOUT_ALIAS`. They are the "5 dead" column, now zero.
+//
+// The `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/`OP_ACCEPT` accessors
+// this registrar carried under a "KEEP" comment went with it, and nothing
+// changes: an unreachable registrar never installed them. `nio_selector.rs`
+// declares the same four constants (`pub const OP_READ: i32 = 1`, ...).
 
-fn register_selector(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let sel = "java/nio/channels/Selector";
-
-    // Selector.open() → Selector
-    r.register(
-        sel,
-        "open",
-        "()Ljava/nio/channels/Selector;",
-        native_sel_open,
-    );
-
-    // select() → int (number of ready channels)
-    r.register(sel, "select", "()I", native_sel_select);
-
-    // select(long timeout) → int
-    r.register(sel, "select", "(J)I", native_sel_select_timeout);
-
-    // selectNow() → int (non-blocking)
-    r.register(sel, "selectNow", "()I", native_sel_select_now);
-
-    // selectedKeys() → Set<SelectionKey>
-    r.register(
-        sel,
-        "selectedKeys",
-        "()Ljava/util/Set;",
-        native_sel_selected_keys,
-    );
-
-    // keys() → Set<SelectionKey>
-    r.register(sel, "keys", "()Ljava/util/Set;", native_sel_keys);
-
-    // wakeup() → Selector
-    r.register(
-        sel,
-        "wakeup",
-        "()Ljava/nio/channels/Selector;",
-        native_sel_wakeup,
-    );
-
-    // close() → void
-    r.register(sel, "close", "()V", native_sel_close);
-
-    // isOpen() → boolean
-    r.register(sel, "isOpen", "()Z", native_sel_is_open);
-
-    // SelectableChannel.register(Selector, int ops) → SelectionKey
-    r.register(
-        "java/nio/channels/SelectableChannel",
-        "register",
-        "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
-        native_channel_register,
-    );
-
-    // SelectionKey methods
-    let sk = "java/nio/channels/SelectionKey";
-    r.register(sk, "interestOps", "()I", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(ctx.get_field(this, SK_FIELD_INTEREST)))
-    });
-    r.register(sk, "readyOps", "()I", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        Ok(Some(ctx.get_field(this, SK_FIELD_READY)))
-    });
-    r.register(sk, "isReadable", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let ready = match ctx.get_field(this, SK_FIELD_READY) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if ready & OP_READ != 0 { 1 } else { 0 })))
-    });
-    r.register(sk, "isWritable", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let ready = match ctx.get_field(this, SK_FIELD_READY) {
-            Value::Int(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if ready & OP_WRITE != 0 { 1 } else { 0 })))
-    });
-    r.register(
-        sk,
-        "channel",
-        "()Ljava/nio/channels/SelectableChannel;",
-        |ctx, args| {
-            let this = obj_arg92(args, 0)?;
-            Ok(Some(ctx.get_field(this, SK_FIELD_CHANNEL)))
-        },
-    );
-    r.register(sk, "cancel", "()V", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        ctx.set_field(this, SK_FIELD_VALID, Value::Int(0));
-        Ok(None)
-    });
-    r.register(sk, "isValid", "()Z", |ctx, args| {
-        let this = obj_arg92(args, 0)?;
-        let valid = matches!(ctx.get_field(this, SK_FIELD_VALID), Value::Int(1));
-        Ok(Some(Value::Int(if valid { 1 } else { 0 })))
-    });
-
-    // OP constants — KEEP: `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/
-    // `OP_ACCEPT` are `static final int` values fixed by the NIO spec
-    // (1/4/8/16). Returning them is the correct implementation, not a stub.
-    r.register(sk, "OP_READ", "()I", |_, _| Ok(Some(Value::Int(OP_READ))));
-    r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
-    r.register(sk, "OP_CONNECT", "()I", |_, _| {
-        Ok(Some(Value::Int(OP_CONNECT)))
-    });
-    r.register(sk, "OP_ACCEPT", "()I", |_, _| {
-        Ok(Some(Value::Int(OP_ACCEPT)))
-    });
-    r.set_category(__prev_cat);
-}
-
-fn native_sel_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let sel = try_alloc_synthetic(ctx, "java/nio/channels/Selector", SEL_NUM_FIELDS)?;
-    let regs = ctx.new_array(ArrayElementType::Reference, 128);
-    ctx.set_field(sel, SEL_FIELD_REGS, Value::Object(Some(regs)));
-    ctx.set_field(sel, SEL_FIELD_COUNT, Value::Int(0));
-    ctx.set_field(sel, SEL_FIELD_OPEN, Value::Int(1));
-    Ok(Some(Value::Object(Some(sel))))
-}
-
-fn native_channel_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let channel = obj_arg92(args, 0)?;
-    let selector = obj_arg92(args, 1)?;
-    let ops = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => OP_READ,
-    };
-
-    let sk = try_alloc_synthetic(ctx, "java/nio/channels/SelectionKey", SK_NUM_FIELDS)?;
-    ctx.set_field(sk, SK_FIELD_CHANNEL, Value::Object(Some(channel)));
-    ctx.set_field(sk, SK_FIELD_INTEREST, Value::Int(ops));
-    ctx.set_field(sk, SK_FIELD_READY, Value::Int(0));
-    ctx.set_field(sk, SK_FIELD_VALID, Value::Int(1));
-
-    // Add to selector's registration array
-    let count = match ctx.get_field(selector, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    if let Value::Object(Some(regs)) = ctx.get_field(selector, SEL_FIELD_REGS) {
-        ctx.set_array_element(regs, count, Value::Object(Some(sk)));
-        ctx.set_field(selector, SEL_FIELD_COUNT, Value::Int((count + 1) as i32));
-    }
-
-    Ok(Some(Value::Object(Some(sk))))
-}
-
-/// Core select logic: poll all registered channels and update ready ops.
-fn do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> i32 {
-    let count = match ctx.get_field(selector, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(selector, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => return 0,
-    };
-
-    let mut ready_count = 0i32;
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if !matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                continue;
-            }
-            let interest = match ctx.get_field(sk, SK_FIELD_INTEREST) {
-                Value::Int(n) => n,
-                _ => 0,
-            };
-
-            // Get the channel's fd to poll
-            let channel = match ctx.get_field(sk, SK_FIELD_CHANNEL) {
-                Value::Object(Some(c)) => c,
-                _ => continue,
-            };
-
-            // Try to get fd from field 0 (DatagramChannel, FileChannel, etc.)
-            let fd_id = match ctx.get_field(channel, 0) {
-                Value::Int(v) => v as u32,
-                _ => continue,
-            };
-
-            let (readable, writable) = ctx.fd_table().poll_ready(fd_id);
-            let mut ready = 0;
-            if readable && interest & OP_READ != 0 {
-                ready |= OP_READ;
-            }
-            if writable && interest & OP_WRITE != 0 {
-                ready |= OP_WRITE;
-            }
-
-            if ready != 0 {
-                ctx.set_field(sk, SK_FIELD_READY, Value::Int(ready));
-                ready_count += 1;
-            } else {
-                ctx.set_field(sk, SK_FIELD_READY, Value::Int(0));
-            }
-        }
-    }
-    ready_count
-}
-
-fn native_sel_select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_select_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let _timeout = match args.get(1) {
-        Some(Value::Long(n)) => *n,
-        _ => 0,
-    };
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    // Simplified: do a single poll (real impl would sleep for timeout)
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_select_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    if !matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1)) {
-        return Err(RuntimeError::IOException {
-            message: "Selector is closed".into(),
-        }
-        .into());
-    }
-    let ready = do_select(ctx, this);
-    Ok(Some(Value::Int(ready)))
-}
-
-fn native_sel_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => {
-            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-            let arr = ctx.new_array(ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            return Ok(Some(Value::Object(Some(set))));
-        }
-    };
-
-    // Collect keys with non-zero ready ops
-    let mut selected = Vec::new();
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                if let Value::Int(ready) = ctx.get_field(sk, SK_FIELD_READY) {
-                    if ready != 0 {
-                        selected.push(sk);
-                    }
-                }
-            }
-        }
-    }
-
-    // Build a Set (synthetic HashSet: [0]=backing array, [1]=size)
-    let set_arr = ctx.new_array(ArrayElementType::Reference, selected.len());
-    for (i, sk) in selected.iter().enumerate() {
-        ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
-    }
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-    ctx.set_field(set, 0, Value::Object(Some(set_arr)));
-    ctx.set_field(set, 1, Value::Int(selected.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
-}
-
-fn native_sel_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
-        Value::Object(Some(a)) => a,
-        _ => {
-            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-            let arr = ctx.new_array(ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            return Ok(Some(Value::Object(Some(set))));
-        }
-    };
-
-    let mut valid = Vec::new();
-    for i in 0..count {
-        if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-            if matches!(ctx.get_field(sk, SK_FIELD_VALID), Value::Int(1)) {
-                valid.push(sk);
-            }
-        }
-    }
-
-    let set_arr = ctx.new_array(ArrayElementType::Reference, valid.len());
-    for (i, sk) in valid.iter().enumerate() {
-        ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
-    }
-    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
-    ctx.set_field(set, 0, Value::Object(Some(set_arr)));
-    ctx.set_field(set, 1, Value::Int(valid.len() as i32));
-    Ok(Some(Value::Object(Some(set))))
-}
-
-fn native_sel_wakeup(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    // No-op in simplified model (select doesn't block)
-    Ok(Some(Value::Object(Some(this))))
-}
-
-fn native_sel_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    ctx.set_field(this, SEL_FIELD_OPEN, Value::Int(0));
-    // Invalidate all registered keys
-    let count = match ctx.get_field(this, SEL_FIELD_COUNT) {
-        Value::Int(n) => n as usize,
-        _ => 0,
-    };
-    if let Value::Object(Some(regs)) = ctx.get_field(this, SEL_FIELD_REGS) {
-        for i in 0..count {
-            if let Value::Object(Some(sk)) = ctx.get_array_element(regs, i) {
-                ctx.set_field(sk, SK_FIELD_VALID, Value::Int(0));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg92(args, 0)?;
-    let open = matches!(ctx.get_field(this, SEL_FIELD_OPEN), Value::Int(1));
-    Ok(Some(Value::Int(if open { 1 } else { 0 })))
-}
 
 // ===========================================================================
 // Comprehensive I/O tests
@@ -22427,6 +24318,12 @@ mod bais_layout_tests {
         .expect("read ok");
         assert_eq!(n, Some(Value::Int(-1)));
 
+        // EOF wins over the zero-length short-circuit, exactly as the JDK
+        // orders the two checks. Witnessed on stock HotSpot JDK 25:
+        //   new ByteArrayInputStream(new byte[4], 0, -1) => count = -1
+        //   read(dst, 0, 8) == -1   read(dst, 0, 0) == -1   available() == -1
+        // This assertion used to read `Int(0)`, which froze the divergence
+        // netty's AbstractByteBufTest.testStreamTransfer1 tripped over.
         let zero_length = native_bais_read_bytes(
             &mut ctx,
             &[
@@ -22437,7 +24334,7 @@ mod bais_layout_tests {
             ],
         )
         .expect("zero-length read ok");
-        assert_eq!(zero_length, Some(Value::Int(0)));
+        assert_eq!(zero_length, Some(Value::Int(-1)));
     }
 
     fn make_hibernate_lob_stream(ctx: &mut MockNativeContext, count: i64) -> ObjectRef {
@@ -22631,6 +24528,162 @@ mod buffer_bounds_tests {
         alloc_byte_buffer(ctx, cap)
     }
 
+    /// W7-58 — the direct arm, at the exact receiver shape that used to fail.
+    ///
+    /// A real `java.nio.DirectByteBuffer` has no `hb`, and slot 0 is
+    /// `Buffer.mark` = -1. `bb_state` fell through to it and raised
+    /// "ByteBuffer missing backing array (field 0 returned Int(-1))". This
+    /// pins the mark AS -1 so the test cannot pass by the slot happening to
+    /// hold something else.
+    #[test]
+    fn bb_state_resolves_a_direct_buffer_through_address() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![5u8, 6, 7, 8];
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark — the slot that used to be read as `hb`
+        ctx.set_field(bb, 1, Value::Int(1)); // position
+        ctx.set_field(bb, 2, Value::Int(3)); // limit
+        ctx.set_field(bb, 3, Value::Int(4)); // capacity
+        ctx.set_field(bb, 4, Value::Long(native.as_mut_ptr() as i64)); // address
+
+        let view = bb_state(&ctx, bb).expect("direct buffer must resolve, not error");
+        assert!(matches!(view.storage, BbStorage::Direct { .. }));
+        assert_eq!((view.pos, view.lim, view.cap), (1, 3, 4));
+        assert_eq!(tb_read_elem(&ctx, view, 0).unwrap(), Value::Int(5));
+        assert_eq!(tb_read_elem(&ctx, view, 3).unwrap(), Value::Int(8));
+        tb_write_elem(&mut ctx, view, 2, Value::Int(-1)).unwrap();
+        assert_eq!(native[2], 0xFF);
+    }
+
+    /// `remaining()` / `hasRemaining()` are `limit - position` and
+    /// `position < limit`. They are defined on `java.nio.Buffer`, above any
+    /// notion of storage, and must answer on a buffer with NO resolvable
+    /// storage at all — the receiver here has neither array nor address, which
+    /// is strictly harder than the direct case that broke `RJdkDefineClass`.
+    #[test]
+    fn remaining_needs_no_backing_storage() {
+        let mut ctx = MockNativeContext::new();
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 1, Value::Int(2)); // position
+        ctx.set_field(bb, 2, Value::Int(9)); // limit
+        ctx.set_field(bb, 3, Value::Int(16)); // capacity
+
+        assert!(
+            bb_state(&ctx, bb).is_err(),
+            "this receiver genuinely has no storage — if bb_state stopped \
+             refusing it, the assertions below would prove nothing"
+        );
+        assert_eq!(
+            native_bb_remaining(&mut ctx, &[Value::Object(Some(bb))]).unwrap(),
+            Some(Value::Int(7))
+        );
+        assert_eq!(
+            native_bb_has_remaining(&mut ctx, &[Value::Object(Some(bb))]).unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    /// A HEAP buffer's `Buffer.address` is `ARRAY_BYTE_BASE_OFFSET + offset`
+    /// (16 for a fresh one), not a process pointer. If the array fails to
+    /// resolve, the direct arm must NOT accept 16 and dereference it —
+    /// `addr=0x10` was 51 of the 53 crashes in the 2026-08-10 H2 sweep.
+    #[test]
+    fn direct_arm_refuses_an_array_base_offset_as_a_pointer() {
+        let mut ctx = MockNativeContext::new();
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1));
+        ctx.set_field(bb, 1, Value::Int(0));
+        ctx.set_field(bb, 2, Value::Int(4));
+        ctx.set_field(bb, 3, Value::Int(4));
+        ctx.set_field_by_name(bb, "address", Value::Long(16));
+        assert!(bb_state(&ctx, bb).is_err());
+        assert!(bb_storage_view(&ctx, bb).is_err());
+        assert!(!is_plausible_native_addr(16));
+        assert!(is_plausible_native_addr(0x1_0000));
+    }
+
+    /// A DIRECT typed view is byte-addressed: its element index has to be
+    /// scaled by the element width, and the bytes decoded in the receiver's
+    /// byte order. `ByteBufferAsIntBufferL` / `...B` is where real JDK 25 puts
+    /// that order, there being no field to hold it.
+    #[test]
+    fn direct_typed_view_scales_by_element_width_and_honours_order() {
+        let mut ctx = MockNativeContext::new();
+        // 0x01020304 big-endian, then 0x05060708 big-endian.
+        let mut native = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let addr = native.as_mut_ptr() as i64;
+
+        let be = ctx.alloc_object_with_class(8, "java/nio/ByteBufferAsIntBufferB");
+        ctx.set_field(be, 1, Value::Int(0));
+        ctx.set_field(be, 2, Value::Int(2));
+        ctx.set_field(be, 3, Value::Int(2));
+        ctx.set_field_by_name(be, "address", Value::Long(addr));
+        let bev = bb_state(&ctx, be).unwrap();
+        assert_eq!(tb_elem_width(bev.elem), 4);
+        assert!(bev.big_endian);
+        assert_eq!(tb_read_elem(&ctx, bev, 0).unwrap(), Value::Int(0x01020304));
+        // Element 1, not byte 1 — the whole point of the width scaling.
+        assert_eq!(tb_read_elem(&ctx, bev, 1).unwrap(), Value::Int(0x05060708));
+
+        let le = ctx.alloc_object_with_class(8, "java/nio/ByteBufferAsIntBufferL");
+        ctx.set_field(le, 1, Value::Int(0));
+        ctx.set_field(le, 2, Value::Int(2));
+        ctx.set_field(le, 3, Value::Int(2));
+        ctx.set_field_by_name(le, "address", Value::Long(addr));
+        let lev = bb_state(&ctx, le).unwrap();
+        assert!(!lev.big_endian);
+        assert_eq!(tb_read_elem(&ctx, lev, 0).unwrap(), Value::Int(0x04030201));
+
+        // Round-trip a write through the little-endian view.
+        tb_write_elem(&mut ctx, lev, 1, Value::Int(0x0A0B0C0D)).unwrap();
+        assert_eq!(&native[4..8], &[0x0D, 0x0C, 0x0B, 0x0A]);
+    }
+
+    /// `Char` is unsigned and `Short` is signed. They share a width, so the
+    /// only thing that separates them is the sign extension, and getting it
+    /// wrong is invisible until a value with the high bit set goes through.
+    #[test]
+    fn direct_char_is_unsigned_and_short_is_signed() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![0xFFu8, 0xFE];
+        let addr = native.as_mut_ptr() as i64;
+
+        let cb = ctx.alloc_object_with_class(8, "java/nio/DirectCharBufferL");
+        ctx.set_field(cb, 3, Value::Int(1));
+        ctx.set_field_by_name(cb, "address", Value::Long(addr));
+        let cv = bb_state(&ctx, cb).unwrap();
+        assert_eq!(tb_read_elem(&ctx, cv, 0).unwrap(), Value::Int(0xFEFF));
+
+        let sb = ctx.alloc_object_with_class(8, "java/nio/DirectShortBufferL");
+        ctx.set_field(sb, 3, Value::Int(1));
+        ctx.set_field_by_name(sb, "address", Value::Long(addr));
+        let sv = bb_state(&ctx, sb).unwrap();
+        assert_eq!(tb_read_elem(&ctx, sv, 0).unwrap(), Value::Int(-257));
+    }
+
+    /// `array()` on a typed buffer used to return raw slot 0, i.e.
+    /// `Buffer.mark` on any real-layout receiver — an `Int(-1)` returned where
+    /// the descriptor promises `[I`. A direct receiver must throw instead.
+    #[test]
+    fn typed_array_accessor_refuses_a_direct_receiver_and_never_returns_mark() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![0u8; 8];
+        let bb = ctx.alloc_object_with_class(8, "java/nio/DirectIntBufferU");
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 3, Value::Int(2));
+        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as i64));
+        let r = native_tb_array(&mut ctx, &[Value::Object(Some(bb))]);
+        assert!(r.is_err(), "direct array() must throw, got {r:?}");
+
+        // And the heap case still answers with the array itself.
+        let heap = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 3);
+        match native_tb_array(&mut ctx, &[Value::Object(Some(heap))]).unwrap() {
+            Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 3),
+            other => panic!("heap array() must return the backing array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn allocated_heap_bytebuffer_sets_real_address() {
         let mut ctx = MockNativeContext::new();
@@ -22700,9 +24753,9 @@ mod buffer_bounds_tests {
     fn bb_get_bulk_valid_copies_bytes() {
         let mut ctx = MockNativeContext::new();
         let bb = make_bb(&mut ctx, 4);
-        let (arr, _, _, _) = bb_state(&ctx, bb).unwrap();
+        let view = bb_state(&ctx, bb).unwrap();
         for i in 0..4 {
-            ctx.set_array_element(arr, i, Value::Int((i as i32) + 1));
+            tb_write_elem(&mut ctx, view, i, Value::Int((i as i32) + 1)).unwrap();
         }
         let dst = ctx.new_array(ArrayElementType::Byte, 4);
         let r = native_bb_get_bulk(
@@ -22752,6 +24805,139 @@ mod buffer_bounds_tests {
         assert_eq!(ctx.get_array_element(dst, 1), Value::Int(11));
         assert_eq!(ctx.get_array_element(dst, 2), Value::Int(12));
         assert_eq!(ctx.get_field(bb, 1), Value::Int(4));
+    }
+
+    /// W7-83, step 1 of 2: **the mock's own honesty, asserted before anything
+    /// depends on it.**
+    ///
+    /// `MockNativeContext::heap_kind_of` returned `ObjectKind::Object`
+    /// unconditionally, `heap_element_type_of` returned
+    /// `ArrayElementType::Reference` unconditionally, and `object_is_array` was
+    /// left on the trait default `false` — for a mock that allocates arrays as
+    /// their own `HeapEntry::Array` variant and has always known the answer.
+    ///
+    /// Every unit test in this crate runs against this mock, so those three
+    /// constants were not cosmetic: they made an entire species of screen
+    /// untestable here. A native that asks "is this actually an array?" got the
+    /// same answer for a `byte[]` and for an ordinary instance, so a test of
+    /// such a screen passed whether or not the screen was right — the probe
+    /// that cannot fail, one layer down from the code under test.
+    ///
+    /// The assertions are paired (array AND non-array, each element type AND
+    /// its default value) precisely because a single-sided assertion is what a
+    /// constant satisfies.
+    #[test]
+    fn mock_answers_object_kind_from_its_own_heap_discriminant() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 4);
+        let obj = ctx.alloc_object(3);
+
+        assert_eq!(
+            ctx.heap_kind_of(bytes),
+            ObjectKind::Array,
+            "the mock allocated this as HeapEntry::Array and must say so — a \
+             constant `Object` here makes every array/instance fork in this \
+             crate untestable"
+        );
+        assert_eq!(
+            ctx.heap_kind_of(obj),
+            ObjectKind::Object,
+            "and it must still answer Object for an ordinary instance, or the \
+             repair has merely inverted the constant"
+        );
+        assert!(ctx.object_is_array(bytes));
+        assert!(!ctx.object_is_array(obj));
+
+        // The element type is the argument `new_array` used to discard.
+        assert_eq!(ctx.heap_element_type_of(bytes), ArrayElementType::Byte);
+        let longs = ctx.new_array(ArrayElementType::Long, 2);
+        assert_eq!(ctx.heap_element_type_of(longs), ArrayElementType::Long);
+        assert_eq!(
+            ctx.get_array_element(longs, 0),
+            Value::Long(0),
+            "a fresh long[] reads back Long(0), not Int(0) — the mock used to \
+             fill every array with Int(0) whatever it was asked for"
+        );
+        let refs = ctx.new_ref_array(ClassId::new(0), 2);
+        assert_eq!(ctx.heap_element_type_of(refs), ArrayElementType::Reference);
+        assert_eq!(ctx.get_array_element(refs, 0), Value::Object(None));
+        // The trait specifies `Reference` for a NON-array too, so this arm is
+        // the contract rather than a leftover of the old constant.
+        assert_eq!(ctx.heap_element_type_of(obj), ArrayElementType::Reference);
+    }
+
+    /// W7-83, step 2 of 2: **a `MemorySegment` at slot 5 is not a backing
+    /// array**, and the typed-view population that legitimately parks a real
+    /// array there still resolves.
+    ///
+    /// Measured on HotSpot 25.0.3.9 (`probes/DirectByteBufferStateProbe.java`,
+    /// the `seg.*` section): `Arena.ofAuto().allocate(16).asByteBuffer()`
+    /// answers `hasArray() == false` and throws `UnsupportedOperationException`
+    /// from `array()`, and its `hb` is null while `Buffer.segment` holds a live
+    /// `jdk.internal.foreign.NativeMemorySegmentImpl`. `bb_resolve_heap_array`
+    /// used to return that segment and hand it to `heap_element_type_of` /
+    /// `get_array_element` as the backing array.
+    ///
+    /// Both arms are in one test on purpose. The rejecting arm alone would pass
+    /// against a screen that refuses EVERYTHING at slot 5, which would take the
+    /// typed views out with it and turn W7-69's deliberate non-firing control
+    /// into a dead branch.
+    #[test]
+    fn bb_state_refuses_a_memory_segment_at_the_segment_slot() {
+        let mut ctx = MockNativeContext::new();
+
+        // --- the RED: a real-JDK-shaped receiver with a segment and no `hb`.
+        let mut native = vec![31u8, 32, 33, 34];
+        let addr = native.as_mut_ptr() as i64;
+        let segment = ctx.alloc_object_with_class(0, "jdk/internal/foreign/NativeMemorySegmentImpl");
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // Buffer.mark
+        ctx.set_field(bb, 1, Value::Int(0)); // Buffer.position
+        ctx.set_field(bb, 2, Value::Int(4)); // Buffer.limit
+        ctx.set_field(bb, 3, Value::Int(4)); // Buffer.capacity
+        ctx.set_field(bb, 4, Value::Long(addr)); // Buffer.address
+        ctx.set_field(bb, BB_SEGMENT_SLOT, Value::Object(Some(segment)));
+
+        assert!(
+            bb_resolve_heap_array(&ctx, bb).is_none(),
+            "slot 5 is `java.nio.Buffer.segment`; a MemorySegment is not a \
+             byte[] and must not be returned as one"
+        );
+
+        // And the receiver resolves as DIRECT, which is what it is — the
+        // rejection degrades to the right answer rather than to "no storage".
+        // `is_plausible_native_addr` is untouched and still guards this arm.
+        let view = bb_state(&ctx, bb).expect("an Arena-backed buffer is a DIRECT buffer");
+        match view.storage {
+            BbStorage::Direct { addr: got } => assert_eq!(got, addr),
+            BbStorage::Heap { arr, .. } => {
+                panic!("resolved a heap array {arr:?} from a MemorySegment receiver")
+            }
+        }
+        assert_eq!(tb_read_elem(&ctx, view, 0).unwrap(), Value::Int(31));
+
+        // --- the CONTROL, in the same test: `native-builtins`' typed buffer
+        // views park a REAL array at slot 5 because `segment` is the only
+        // Object-typed field `Buffer` declares. That population must still
+        // resolve, and W7-69 §3 relies on this arm staying live.
+        let arr = ctx.new_array(ArrayElementType::Byte, 4);
+        ctx.set_array_element(arr, 0, Value::Int(77));
+        let view_buf = ctx.alloc_object(8);
+        ctx.set_field(view_buf, 0, Value::Int(-1));
+        ctx.set_field(view_buf, 1, Value::Int(0));
+        ctx.set_field(view_buf, 2, Value::Int(4));
+        ctx.set_field(view_buf, 3, Value::Int(4));
+        ctx.set_field(view_buf, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
+
+        assert_eq!(
+            bb_resolve_heap_array(&ctx, view_buf),
+            Some(arr),
+            "the screen must reject a non-array WITHOUT taking the typed-view \
+             population with it"
+        );
+        let vv = bb_state(&ctx, view_buf).expect("a slot-5 array is backing storage");
+        assert!(matches!(vv.storage, BbStorage::Heap { .. }));
+        assert_eq!(tb_read_elem(&ctx, vv, 0).unwrap(), Value::Int(77));
     }
 
     #[test]
@@ -22828,6 +25014,77 @@ mod buffer_bounds_tests {
         native_bais_init(ctx, &[Value::Object(Some(this)), Value::Object(Some(buf))])
             .expect("init ok");
         this
+    }
+
+    /// JDK order: EOF is reported before the zero-length short-circuit, so
+    /// `read(b, off, 0)` on a drained stream is -1. Regression guard for the
+    /// netty `testStreamTransfer1` failure.
+    #[test]
+    fn bais_read_zero_len_at_eof_is_minus_one() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let drain = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(5),
+            ],
+        )
+        .expect("drain ok");
+        assert_eq!(drain, Some(Value::Int(5)));
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(-1)), "len=0 at EOF must report -1");
+    }
+
+    /// An EMPTY source is at EOF from the first call, so even the very first
+    /// zero-length read reports -1.
+    #[test]
+    fn bais_read_zero_len_empty_source_is_minus_one() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(-1)));
+    }
+
+    /// ... but a zero-length read with bytes still available is 0, not -1.
+    #[test]
+    fn bais_read_zero_len_before_eof_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-len read ok");
+        assert_eq!(r, Some(Value::Int(0)));
     }
 
     #[test]

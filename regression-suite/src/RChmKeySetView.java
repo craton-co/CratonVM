@@ -116,7 +116,14 @@ public class RChmKeySetView {
                 (ConcurrentHashMap.KeySetView<String, Boolean>) o;
         check(Boolean.TRUE.equals(view.getMappedValue()),
                 "getMappedValue()=" + view.getMappedValue());
-        check(view.getMap() != null, "getMap() is null");
+        // `!= null` alone is satisfied by a fresh map minted per call. The
+        // three lines below already prove the add reaches SOME map the getter
+        // returns; what they cannot see is that it is ONE map, held by the
+        // view, and empty before the add. Both halves are read from the same
+        // object at run time -- no host constant.
+        ConcurrentHashMap<String, Boolean> backing = view.getMap();
+        check(backing != null && backing.isEmpty() && backing == view.getMap(),
+                "getMap() must be one stable, initially empty backing map, got " + backing);
         view.add("a");
         check(view.getMap().containsKey("a"), "add() did not reach the backing map");
         check(Boolean.TRUE.equals(view.getMap().get("a")),

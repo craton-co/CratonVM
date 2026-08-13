@@ -426,6 +426,23 @@ struct Args {
     )]
     enable_native_access: Option<String>,
 
+    /// Enable preview features (mirrors JDK `--enable-preview`).
+    ///
+    /// A class file whose `minor_version` is 65535 at the running JVM's major
+    /// version is a preview class file (JVMS 4.1), and HotSpot refuses to load
+    /// it without this flag — measured on Adoptium 25.0.3.9:
+    /// `java.lang.UnsupportedClassVersionError: Preview features are not
+    /// enabled for P (class file version 69.65535). Try running with
+    /// '--enable-preview'`. CratonVM loaded such a class file unconditionally
+    /// until docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md.
+    ///
+    /// Takes no value, unlike `--enable-native-access` above: HotSpot's flag is
+    /// a bare boolean, so it needs no `VALUE_TAKING_OPTS` entry either (see the
+    /// comment on that table — boolean flags are copied through verbatim by the
+    /// separator inserter).
+    #[arg(long = "enable-preview")]
+    enable_preview: bool,
+
     /// AOT compilation mode (-XX:AOTMode=off/training/production).
     #[arg(long = "XX:AOTMode", value_name = "MODE", default_value = "off")]
     aot_mode: String,
@@ -1640,6 +1657,32 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // name (see the comment above).
             i += 1;
         }
+        // `--sun-misc-unsafe-memory-access=<mode>` (JEP 498). HotSpot's launcher
+        // does exactly this rewrite: the flag's only effect is to set the
+        // `sun.misc.unsafe.memory.access` system property, and when the flag is
+        // absent HotSpot sets NOTHING — the effective mode is still "allow with
+        // a warning", but `System.getProperty` answers null.
+        //
+        // That null is load-bearing for more than tidiness. netty 4.2 disables
+        // `sun.misc.Unsafe` by default on Java 25+ *unless* this property is
+        // set, so a VM that pins it — which CratonVM did, unconditionally, in
+        // `vm_init.rs` — silently puts netty and every other Unsafe-aware
+        // library on a different code path than a stock JDK 25 run, and makes
+        // any CratonVM-vs-HotSpot comparison over them a comparison of two
+        // different code paths rather than two VMs.
+        //
+        // Rewriting to `-D` here rather than parsing it later gives the
+        // property exactly one source: the user.
+        else if let Some(mode) = a.strip_prefix("--sun-misc-unsafe-memory-access=") {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!(
+                    "[cratonvm] --sun-misc-unsafe-memory-access={mode} -> \
+                     -Dsun.misc.unsafe.memory.access={mode}"
+                );
+            }
+            out.push(format!("-Dsun.misc.unsafe.memory.access={mode}"));
+            i += 1;
+        }
         // HotSpot VM-selection flags. Modern HotSpot accepts `-server` and
         // `-client` for compatibility (the server VM is effectively the only
         // implementation on current JDKs). WildFly's HostController launch
@@ -1654,10 +1697,23 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         }
         // Assertion control flags: `-ea`/`-enableassertions[:<pkgname>...|:<classname>]`,
         // `-da`/`-disableassertions[...]`, `-esa`/`-enablesystemassertions`,
-        // `-dsa`/`-disablesystemassertions`. CratonVM does not implement assertion
-        // checking; silently ignore so Gradle/Maven forks that pass `-ea`
-        // unconditionally don't crash clap (which would treat `-ea` as
-        // short-option bundling `-e -a` and abort with "unexpected argument '-e'").
+        // `-dsa`/`-disablesystemassertions`.
+        //
+        // They are dropped HERE (clap would read `-ea` as the short-option
+        // cluster `-e -a` and abort with "unexpected argument '-e'"), but they
+        // are no longer *ignored*: `main` scans the same argv with
+        // [`launcher_assertions_requested`] before the flag snapshot is
+        // latched, and the unscoped spellings set `CRATONVM_ENABLE_ASSERTIONS`.
+        // This arm has to stay a pure token filter — see that function for why
+        // the switch cannot be flipped from inside this (pure, ~60-test)
+        // normaliser.
+        //
+        // The *scoped* forms (`-ea:some.pkg...`, `-da:some.Class`) really are
+        // ignored: `assertion_status_default()` is one global with no
+        // per-package granularity, and reading `-ea:some.pkg` as global-enable
+        // would switch on assertions for the classes the caller deliberately
+        // left out. `CRATONVM_DBG_ARGS` names them so the silence is
+        // discoverable.
         else if a == "-ea"
             || a == "-da"
             || a == "-esa"
@@ -1670,7 +1726,14 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             || a.starts_with("-disablesystemassertions")
         {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
-                eprintln!("[cratonvm] ignoring assertion flag: {a}");
+                if assertion_flag_scope(a).is_some() {
+                    eprintln!("[cratonvm] assertion flag applied JVM-wide: {a}");
+                } else {
+                    eprintln!(
+                        "[cratonvm] ignoring scoped assertion flag (no per-package \
+                         granularity): {a}"
+                    );
+                }
             }
             i += 1;
         } else {
@@ -2660,6 +2723,72 @@ fn launcher_nojit_requested(argv: &[String]) -> bool {
         .any(|arg| arg == "--nojit")
 }
 
+/// Which assertion scope an argv token switches, and to what.
+///
+/// `Some((system, enable))` for the four **unscoped** spellings; `None` for
+/// everything else, including the scoped forms (`-ea:pkg...`, `-da:Class`) —
+/// see [`launcher_assertions_requested`].
+fn assertion_flag_scope(arg: &str) -> Option<(bool, bool)> {
+    match arg {
+        "-ea" | "-enableassertions" => Some((false, true)),
+        "-da" | "-disableassertions" => Some((false, false)),
+        "-esa" | "-enablesystemassertions" => Some((true, true)),
+        "-dsa" | "-disablesystemassertions" => Some((true, false)),
+        _ => None,
+    }
+}
+
+/// The JVM-wide assertion status requested on the command line, or `None` when
+/// no unscoped assertion flag was passed.
+///
+/// `Class.desiredAssertionStatus()` decides whether a class's `<clinit>` stores
+/// `$assertionsDisabled = false`, i.e. whether real `assert` bytecode throws.
+/// CratonVM has always implemented it — `assertion_status_default()` in
+/// `native-builtins` — but the only way to reach the switch was
+/// `CRATONVM_ENABLE_ASSERTIONS`, which no Maven Surefire or Gradle fork will
+/// ever set. Surefire forks the test JVM with `-ea` by default, so every
+/// `assert`-based validation test in the corpus silently did nothing. The
+/// recorded case is netty's HTTP/2 flow-controller classes, where HotSpot goes
+/// 34/34 with `-ea` and CratonVM stayed at 28/34 — see the retired
+/// `ea-flag-ignored-so-assert-never-fires-20260812` write-up.
+///
+/// **Why it is scanned here and not inside `normalize_java_launcher_argv`.**
+/// That function is pure and has ~60 unit tests; `CRATONVM_ENABLE_ASSERTIONS` is
+/// a declared flag served from the immutable snapshot `install_flags` latches at
+/// the top of `main`. A `set_var` from inside the normaliser would be invisible
+/// to the VM (the snapshot is already taken by the time `run()` normalises) and
+/// would make those tests order-dependent. Injecting a launcher override is the
+/// supported route and the one `--nojit` and `--dump-phase-report` already use.
+///
+/// **The two scopes are tracked separately, then OR-ed.** HotSpot's `-ea` and
+/// `-esa` are independent switches (user classes vs. bootclasspath classes);
+/// CratonVM has one global. Reducing the command line by plain last-wins would
+/// make `-ea -dsa` resolve to *off* and quietly undo the `-ea` a build tool put
+/// there on purpose. Last-wins **within** each scope and OR **across** them
+/// keeps every combination that asks for assertions anywhere answering "on".
+/// The residual over-breadth is a lone `-esa`, which turns them on for user
+/// classes too; that is the direction that fails loudly rather than silently.
+///
+/// Scoped forms are skipped entirely — see the comment on the strip arm in
+/// `normalize_java_launcher_argv`.
+fn launcher_assertions_requested(argv: &[String]) -> Option<bool> {
+    let mut user: Option<bool> = None;
+    let mut system: Option<bool> = None;
+    for arg in argv.iter().take_while(|arg| arg.as_str() != "--") {
+        if let Some((is_system, enable)) = assertion_flag_scope(arg) {
+            if is_system {
+                system = Some(enable);
+            } else {
+                user = Some(enable);
+            }
+        }
+    }
+    match (user, system) {
+        (None, None) => None,
+        (u, s) => Some(u.unwrap_or(false) || s.unwrap_or(false)),
+    }
+}
+
 /// The `--dump-phase-report <FILE>` path, scanned out of the launcher portion
 /// of the expanded argv.
 ///
@@ -2899,6 +3028,28 @@ fn run() -> Result<()> {
     if args.enable_native_access.is_some() {
         cratonvm_native_builtins::panama::set_native_access_enabled(true);
     }
+
+    // --enable-preview: JVMS 4.1 preview class files (`minor_version == 65535`
+    // at the running major version) are refused by the reader unless this is
+    // set, matching HotSpot, whose default is also off. Two consumers must see
+    // the same bit or the VM would refuse to load a preview class file while
+    // telling the class library that preview is enabled:
+    //   * cratonvm_reader::set_preview_enabled — the class-file parser's gate;
+    //   * jdk/internal/misc/PreviewFeatures.isPreviewEnabled — read by
+    //     `Class.isUnnamedClass()` and therefore by JUnit's launcher.
+    // Measured on Adoptium 25.0.3.9: `PreviewFeatures.isEnabled` is false
+    // without the flag and true with it, so the two really are one bit. Set
+    // through `cratonvm_native_builtins` rather than the reader directly
+    // because `vm-cli` does not depend on `cratonvm-reader` at all — and
+    // because one entry point is what keeps the two consumers agreeing.
+    //
+    // Applied here for the same timing reason --enable-native-access gives
+    // above: main thread, before `Vm::new(config)` parses a single class, so
+    // no class file can be checked against the wrong value.
+    //
+    // Set unconditionally rather than under `if args.enable_preview`, so an
+    // embedder that reuses this path cannot inherit a stale `true`.
+    cratonvm_native_builtins::set_preview_enabled(args.enable_preview);
 
     // -XX:+ShowCodeDetailsInExceptionMessages (JEP 358): publish to the
     // env_cache so the interpreter's helpful-NPE opcode gate observes it on
@@ -3848,16 +3999,36 @@ fn run() -> Result<()> {
                 }
 
                 let total_acks = shared_for_watchdog.stack_dump_ack_count();
+                // Print the per-thread summary HERE, not at request time: only
+                // now is it known which threads answered, and that is what lets
+                // the summary tell a RUNNING-and-dumped thread apart from a
+                // RUNNING-and-silent one (JIT-compiled code or a long native
+                // call). See `SharedVm::dump_thread_summary_after_dumps`.
+                shared_for_watchdog.dump_thread_summary_after_dumps();
                 eprintln!(
                     "=== T19.H1 watchdog: {total_acks} thread(s) dumped; \
                      aborting process ==="
                 );
 
                 // KC-watchdog-native: when zero Java threads ack'd a dump,
-                // every interpreter thread is parked in native (Rust) code
-                // — the most common cause being a JNI / native-method loop
-                // or a deadlock on a Rust mutex inside the runtime. The
-                // Java-frame dump produces nothing actionable, so fall
+                // no thread reached an interpreter dispatch point. That is
+                // TWO states, not one, and this block used to assert the
+                // wrong one of them as fact ("main thread is in native
+                // (Rust) code"):
+                //
+                //   * parked in native (Rust) code — a JNI/native-method
+                //     loop or a deadlock on a runtime mutex; or
+                //   * RUNNING in JIT-COMPILED code, which the interpreter's
+                //     dump hook cannot observe at all because the hook lives
+                //     in the dispatch loop the thread is not executing.
+                //
+                // `--nojit` separates them in one re-run, and the message
+                // below now says so. Guessing cost
+                // known-issues/netty/brotli-integration-test-hangs-outside-the-interpreter
+                // an entire investigation: nothing was blocked, a compiled
+                // `ByteBuf.writeByte` loop was simply 200x too slow.
+                //
+                // Either way the Java-frame dump produces nothing, so fall
                 // back to:
                 //   1. The watchdog thread's own native backtrace (cheap
                 //      and tells you WHERE in the runtime the watchdog
@@ -3873,13 +4044,20 @@ fn run() -> Result<()> {
                 if total_acks == 0 {
                     let pid = std::process::id();
                     eprintln!(
-                        "=== T19.H1 watchdog: no Java threads responded \
-                         — main thread is in native (Rust) code. \
-                         pid={pid}. Attach a native debugger before the \
-                         3s post-dump grace ends to capture the hang \
-                         site (Windows: `cdb -p {pid}` then `~* k`; \
-                         Linux: `gdb -p {pid}` then `thread apply all bt`). \
-                         ==="
+                        "=== T19.H1 watchdog: no Java thread reached an \
+                         interpreter dispatch point. That is EITHER \
+                         JIT-compiled code (which this hook cannot observe \
+                         — it lives in the dispatch loop) OR native (Rust) \
+                         code. Do NOT assume the second: re-run with \
+                         --nojit, and if the frame dumps appear there the \
+                         thread was in compiled code and was RUNNING, not \
+                         stuck. pid={pid}. To settle it on the live process \
+                         instead, attach a native debugger before the 3s \
+                         post-dump grace ends (Windows: `cdb -p {pid}` then \
+                         `~* k`; Linux: `gdb -p {pid}` then `thread apply \
+                         all bt`) — a thread burning CPU in \
+                         `jit_invoke_*`/compiled frames is the first case, \
+                         one parked in a futex/read is the second. ==="
                     );
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!(
@@ -4213,6 +4391,36 @@ fn run() -> Result<()> {
     // too.
     let _phase_shutdown = phase::enter(phase::Category::VmShutdown);
     tracing::info!("main() completed in {:.2}s", main_elapsed.as_secs_f64());
+
+    // W7-90: the read-side slot-map sweep's PRIMARY trigger.
+    //
+    // `read_alias::verify_declared_slot_maps` had no caller at all until this
+    // line, which is indistinguishable from a detector that reports all-clear —
+    // the species this whole campaign is about, sitting inside the instrument
+    // built to detect it. Seven `SlotMap`s were published to a sweep that never
+    // ran (W7-69 §7.2, W7-75 §7, W7-77 §7).
+    //
+    // Here rather than at registration because the sweep's one hard requirement
+    // is that the class be LOADED, and W7-69 established that at registration
+    // time most are not: `java.nio.DirectByteBuffer` is package-private and is
+    // not among the 323 classes `bootstrap_core_classes` names, so its
+    // `declared_fields` comes back empty and "not loaded" is indistinguishable
+    // from "no fields". Immediately after `main` returns is the point in the
+    // process with the most classes loaded, and it is where every other
+    // self-gated census in this launcher already prints.
+    //
+    // ABOVE the `match result` deliberately, so a workload that PANICKED out of
+    // `main` still produces its census — the same argument the missing-natives
+    // dump below makes for being unconditional. `System.exit` never reaches
+    // this line; `lang_system::native_system_exit` carries the second trigger
+    // for that path.
+    //
+    // Gated with no `else`: observation only, and the report is printed and
+    // dropped. With the flag off this is one `OnceLock` load and a branch, once.
+    if cratonvm_native_api::layout_alias::enabled() {
+        let _ = vm.sweep_declared_slot_maps("main-returned");
+    }
+
     let result = match result {
         Ok(r) => r,
         Err(panic) => {
@@ -5217,7 +5425,22 @@ fn main() {
             flag_overrides = flag_overrides.with(phase::FLAG_ENABLE, "coarse");
         }
     }
-    let runtime_flags = cratonvm_types::VmFlags::from_env_with_overrides(flag_overrides);
+    // `-ea` / `-da` / `-esa` / `-dsa`: the HotSpot spelling of
+    // `CRATONVM_ENABLE_ASSERTIONS`, applied here for the same reason as the two
+    // overrides above — the flag is declared, so the snapshot latched three
+    // lines below is the last point at which it can be set at all.
+    let mut flag_unsets: Vec<&str> = Vec::new();
+    match launcher_assertions_requested(&early_argv) {
+        Some(true) => flag_overrides = flag_overrides.with("CRATONVM_ENABLE_ASSERTIONS", "1"),
+        // `-da` has to make the name *absent*, not set it to "0": the flag is
+        // parsed with `present`, under which `=0` still reads as enabled. An
+        // explicit `-da` therefore also overrides an inherited export, which is
+        // what HotSpot does.
+        Some(false) => flag_unsets.push("CRATONVM_ENABLE_ASSERTIONS"),
+        None => {}
+    }
+    let runtime_flags =
+        cratonvm_types::VmFlags::from_env_with_overrides_and_unsets(flag_overrides, &flag_unsets);
     if cratonvm_types::install_flags(runtime_flags).is_err() {
         eprintln!("[cratonvm] runtime flags were read before launcher configuration");
         std::process::exit(1);
@@ -5974,6 +6197,89 @@ mod tests {
         );
     }
 
+    /// Both spellings of every JPMS `--add-*` flag must parse, and must not
+    /// swallow the following argument.
+    ///
+    /// HotSpot accepts `--add-opens M/P=T` and `--add-opens=M/P=T` alike. A
+    /// launcher that consumed the NEXT token as part of a space-separated
+    /// value would eat `-cp` and its directory, and the symptom would be
+    /// `Could not find or load main class` — which reads as a broken program
+    /// or a bad classpath, not as a mis-parsed flag. That misreading is not
+    /// hypothetical: W7-56-infercaller-strict.md reported exactly this defect
+    /// and told readers to prefer the `=` spelling on CratonVM. It was wrong;
+    /// re-measured 2026-08-12, all eight combinations below already worked, on
+    /// the then-current binary AND on the pre-merge control. These assertions
+    /// exist so the claim can be settled by running the tests rather than by
+    /// re-deriving it, and so a future arg-parsing change cannot make it true.
+    ///
+    /// The `-cp` and main-class assertions are the load-bearing half: a test
+    /// that only checked the flag's own value would pass against a launcher
+    /// that swallowed the classpath.
+    ///
+    /// Parsed through `normalize_java_launcher_argv`, which is what the real
+    /// launcher does before clap sees anything. Calling `Args::try_parse_from`
+    /// directly is NOT equivalent and would test the wrong thing: clap reads a
+    /// bare `-cp /tmp/cp` as short `-c` with the attached value `p`, so the
+    /// assertion below fails for a reason that has nothing to do with the flag
+    /// under test. Measured while writing this test.
+    #[test]
+    fn add_star_flags_accept_both_spellings_without_eating_the_next_arg() {
+        // (flag, value, accessor label) — one row per JPMS add-* flag.
+        let cases: &[(&str, &str)] = &[
+            ("--add-opens", "java.logging/java.util.logging=ALL-UNNAMED"),
+            ("--add-exports", "java.base/java.lang=ALL-UNNAMED"),
+            ("--add-reads", "java.logging=ALL-UNNAMED"),
+            ("--add-modules", "java.logging"),
+        ];
+        for (flag, value) in cases {
+            // Space-separated: `--flag VALUE -cp DIR Main`
+            let spaced = Args::try_parse_from(normalize_java_launcher_argv(tokens(&[
+                "cratonvm", flag, value, "-cp", "/tmp/cp", "Main",
+            ])))
+            .unwrap_or_else(|e| panic!("clap must accept `{flag} {value}`: {e}"));
+
+            // Joined: `--flag=VALUE -cp DIR Main`
+            let joined_flag = format!("{flag}={value}");
+            let joined = Args::try_parse_from(normalize_java_launcher_argv(tokens(&[
+                "cratonvm",
+                &joined_flag,
+                "-cp",
+                "/tmp/cp",
+                "Main",
+            ])))
+            .unwrap_or_else(|e| panic!("clap must accept `{joined_flag}`: {e}"));
+
+            for (spelling, parsed) in [("space", &spaced), ("equals", &joined)] {
+                // The flag's own value survived.
+                let got: &[String] = match *flag {
+                    "--add-opens" => &parsed.add_opens,
+                    "--add-exports" => &parsed.add_exports,
+                    "--add-reads" => &parsed.add_reads,
+                    "--add-modules" => &parsed.add_modules,
+                    other => unreachable!("unlisted flag {other}"),
+                };
+                assert_eq!(
+                    got,
+                    &[value.to_string()],
+                    "{flag} ({spelling}) lost or mangled its own value"
+                );
+
+                // ...and, the half that actually catches the reported defect,
+                // the FOLLOWING option was not consumed as part of it.
+                assert_eq!(
+                    parsed.classpath.as_deref(),
+                    Some("/tmp/cp"),
+                    "{flag} ({spelling}) swallowed -cp; this is the defect that                      surfaces as `Could not find or load main class`"
+                );
+                assert_eq!(
+                    parsed.class_name.as_deref(),
+                    Some("Main"),
+                    "{flag} ({spelling}) swallowed the main class"
+                );
+            }
+        }
+    }
+
     /// clap must reject the two mode flags together rather than letting one
     /// silently win.
     #[test]
@@ -6699,6 +7005,202 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `--sun-misc-unsafe-memory-access=<mode>` (JEP 498).
+    //
+    // The flag's whole effect is the system property it sets, and the property
+    // is the single input netty 4.2 keys its Unsafe-vs-FFM decision on. A
+    // default run must leave it UNSET, exactly as HotSpot does — CratonVM used
+    // to pin it to `allow` in `vm_init`, which silently put netty and every
+    // other Unsafe-aware library on a different code path than a stock JDK 25.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsafe_memory_access_flag_becomes_the_system_property() {
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "--sun-misc-unsafe-memory-access=allow",
+            "Main",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["java", "-Dsun.misc.unsafe.memory.access=allow", "Main"])
+        );
+    }
+
+    #[test]
+    fn every_unsafe_memory_access_mode_round_trips() {
+        for mode in ["allow", "warn", "debug", "deny"] {
+            let out = normalize_java_launcher_argv(argv(&[
+                "java",
+                &format!("--sun-misc-unsafe-memory-access={mode}"),
+                "Main",
+            ]));
+            assert_eq!(
+                out,
+                argv(&[
+                    "java",
+                    &format!("-Dsun.misc.unsafe.memory.access={mode}"),
+                    "Main"
+                ]),
+                "mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_unsafe_memory_access_flag_leaves_the_property_unset() {
+        // The load-bearing half: a plain command line must not introduce the
+        // property, because `System.getProperty(...) == null` is what makes
+        // netty take the same path it takes on a stock JDK 25.
+        let out = normalize_java_launcher_argv(argv(&["java", "-Xmx1g", "Main"]));
+        assert!(
+            !out.iter().any(|a| a.contains("sun.misc.unsafe.memory.access")),
+            "a default command line must not mention the property: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_memory_access_flag_after_the_separator_is_the_programs_own() {
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "Main",
+            "--",
+            "--sun-misc-unsafe-memory-access=allow",
+        ]));
+        assert_eq!(
+            out,
+            argv(&[
+                "java",
+                "Main",
+                "--",
+                "--sun-misc-unsafe-memory-access=allow"
+            ])
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Assertion flags: `-ea` and friends.
+    //
+    // Two halves that must both hold. `normalize_java_launcher_argv` still
+    // *strips* every spelling (clap cannot parse them), and
+    // `launcher_assertions_requested` reads the same argv for the switch. A
+    // test that only checked the strip would pass with the switch deleted,
+    // which is exactly the state this fixed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assertion_flags_are_stripped_before_clap() {
+        for flag in [
+            "-ea",
+            "-da",
+            "-esa",
+            "-dsa",
+            "-enableassertions",
+            "-disableassertions",
+            "-enablesystemassertions",
+            "-disablesystemassertions",
+            "-ea:io.netty...",
+            "-da:some.Class",
+        ] {
+            let out = normalize_java_launcher_argv(argv(&["java", flag, "Main"]));
+            assert_eq!(out, argv(&["java", "Main"]), "flag {flag} survived the strip");
+        }
+    }
+
+    #[test]
+    fn unscoped_ea_enables_and_da_disables() {
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-enableassertions", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-disableassertions", "Main"])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn no_assertion_flag_leaves_the_env_var_in_charge() {
+        // `None`, not `Some(false)`: a plain command line must not clear an
+        // inherited CRATONVM_ENABLE_ASSERTIONS.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-Xmx1g", "Main"])),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_assertion_flags_are_not_honoured() {
+        // One global switch has no per-package granularity, so `-ea:io.netty`
+        // must NOT read as global-enable — that would turn assertions on for
+        // every class the caller deliberately left out.
+        for flag in ["-ea:io.netty...", "-da:io.netty.Foo", "-ea:com.example"] {
+            assert_eq!(
+                launcher_assertions_requested(&argv(&["java", flag, "Main"])),
+                None,
+                "scoped flag {flag} was honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn last_wins_within_a_scope() {
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "-da", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "-ea", "Main"])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_flag_never_cancels_a_user_scope_enable() {
+        // HotSpot's `-ea -dsa` is "user assertions on, system assertions off".
+        // Collapsed onto one global switch that has to stay ON, or the `-dsa`
+        // silently undoes the `-ea` Surefire put there.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-ea", "-dsa", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-esa", "-da", "Main"])),
+            Some(true)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-dsa", "Main"])),
+            Some(false)
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-esa", "Main"])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn an_ea_after_the_program_args_separator_is_the_programs_own() {
+        // `java -jar app.jar -- -ea` passes `-ea` to the application; scanning
+        // past `--` would let a program argument reconfigure the VM.
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "Main", "--", "-ea"])),
+            None
+        );
+        assert_eq!(
+            launcher_assertions_requested(&argv(&["java", "-da", "Main", "--", "-ea"])),
+            Some(false)
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // HotSpot single-dash compatibility rewrites — C36 acceptance.
     //
     // Stock `java -Xmx256m -classpath x Main` must parse, otherwise the
@@ -7060,6 +7562,35 @@ mod tests {
         assert_eq!(parsed.enable_native_access.as_deref(), Some("ALL-UNNAMED"));
         assert_eq!(parsed.class_name.as_deref(), Some("Main"));
         assert_eq!(parsed.args, argv(&["arg"]));
+    }
+
+    #[test]
+    fn enable_preview_is_a_bare_flag_and_does_not_consume_main_class() {
+        // Before docs/known-issues/jdk-only/W7-28-preview-classfile-gating.md
+        // this was `error: unexpected argument '--enable-preview' found`, with
+        // clap suggesting `--enable-native-access`. Run the whole pre-clap
+        // pipeline, not just `try_parse_from`: a bare boolean needs no
+        // VALUE_TAKING_OPTS entry, and this is what proves it — if it ever
+        // acquired one, `Main` would be eaten as the flag's value.
+        let argv0: Vec<String> = argv(&["java", "--enable-preview", "Main", "arg"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse --enable-preview");
+
+        assert!(parsed.enable_preview);
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        assert_eq!(parsed.args, argv(&["arg"]));
+    }
+
+    #[test]
+    fn enable_preview_defaults_off_like_hotspot() {
+        // HotSpot's default is off, measured: plain `java -cp . P` on a
+        // 69.65535 class file raises UnsupportedClassVersionError.
+        let parsed = Args::try_parse_from(argv(&["cratonvm", "Main"]))
+            .expect("clap must parse without the flag");
+        assert!(!parsed.enable_preview);
     }
 
     #[test]

@@ -111,8 +111,8 @@ pub(super) fn checkcast_lambda_instantiated_args(
     args: &[Value],
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
-    let (sam_params, _) = split_method_descriptor(sam_desc);
-    let (inst_params, _) = split_method_descriptor(inst_desc);
+    let (sam_params, _) = split_method_descriptor_ref(sam_desc);
+    let (inst_params, _) = split_method_descriptor_ref(inst_desc);
     for (sam_idx, inst_tok) in inst_params.iter().enumerate() {
         // Only a reference instantiated param can carry a checkcast.
         if !is_reference_desc(inst_tok) {
@@ -532,8 +532,28 @@ pub fn coerce_lambda_args(
     receiver_present: bool,
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
-    let (sam_params, _sam_ret) = split_method_descriptor(sam_desc);
-    let (impl_params, _impl_ret) = split_method_descriptor(impl_desc);
+    // Provable no-op fast path, taken by every non-capturing lambda whose SAM,
+    // implementation and instantiated types agree — `x -> x + 1`, `Foo::bar`,
+    // and the overwhelming majority of the lambdas a reactive stack executes.
+    //
+    // With all three descriptors identical, `num_captures == 0` and no receiver,
+    // `args` lines up token-for-token with both parameter lists, so:
+    //   * every `coerce_arg(tok, tok, v)` returns `v` untouched (its first line
+    //     is `if sam_tok == impl_tok { return Ok(v) }`), and
+    //   * `checkcast_lambda_instantiated_args` skips every parameter, because it
+    //     only casts where the instantiated type NARROWS the erased SAM type.
+    // The work below is therefore pure overhead here: two descriptor walks, a
+    // `handles` vector, and one pin push/truncate per argument, on every call.
+    if num_captures == 0
+        && !receiver_present
+        && sam_desc == impl_desc
+        && sam_desc == inst_desc
+    {
+        return Ok(());
+    }
+
+    let (sam_params, _sam_ret) = split_method_descriptor_ref(sam_desc);
+    let (impl_params, _impl_ret) = split_method_descriptor_ref(impl_desc);
 
     // The SAM's params correspond to args[num_captures..].
     // The impl's params correspond to args[receiver_skip..] where
@@ -604,18 +624,18 @@ pub fn coerce_lambda_args(
         // args (i >= num_captures), use sam_params[i - num_captures]. For
         // capture args (i < num_captures), we assume they match impl type
         // already (captures are erased at capture time).
-        let sam_tok: String = if i >= num_captures {
+        let sam_tok: &str = if i >= num_captures {
             let sam_idx = i - num_captures;
             if sam_idx < sam_params.len() {
-                sam_params[sam_idx].clone()
+                sam_params[sam_idx]
             } else {
-                impl_non_recv[impl_idx].clone()
+                impl_non_recv[impl_idx]
             }
         } else {
-            impl_non_recv[impl_idx].clone()
+            impl_non_recv[impl_idx]
         };
-        let impl_tok = &impl_non_recv[impl_idx];
-        let coerced = match coerce_arg(shared, thread, &sam_tok, impl_tok, args[i]) {
+        let impl_tok = impl_non_recv[impl_idx];
+        let coerced = match coerce_arg(shared, thread, sam_tok, impl_tok, args[i]) {
             Ok(v) => v,
             Err(e) => {
                 thread.native_pin_roots.truncate(pin_base);
@@ -667,7 +687,7 @@ pub(crate) fn lambda_args_sam_compatible(
     sam_descriptor: &str,
     args: &[Value],
 ) -> bool {
-    let (params, _ret) = split_method_descriptor(sam_descriptor);
+    let (params, _ret) = split_method_descriptor_ref(sam_descriptor);
     for (i, pd) in params.iter().enumerate() {
         if pd.starts_with('[') {
             // Array-typed SAM param. This was previously covered by the
@@ -699,7 +719,7 @@ pub(crate) fn lambda_args_sam_compatible(
             }
             continue; // null / missing / genuinely an array -- don't second-guess further
         }
-        if !pd.starts_with('L') || pd.as_str() == "Ljava/lang/Object;" {
+        if !pd.starts_with('L') || *pd == "Ljava/lang/Object;" {
             continue; // generic/erased or non-reference param -- never second-guess
         }
         let arg = match args.get(i) {
@@ -755,6 +775,24 @@ pub(crate) fn lambda_impl_dispatch_override(
     if !crate::runtime::env_cache::loader_aware_resolution() {
         return None;
     }
+    // Nothing to override when no user-defined loader has ever defined a class
+    // in this process: `lookup_loader_initiated` below already returns `None`
+    // unless `get_loader_id(host)` is `UserDefined(_)`, and this atomic is
+    // exactly the "could that ever be true" question — `register_defining_loader`
+    // is called whenever any `ClassId` is assigned a `UserDefined` identity, so
+    // `false` guarantees no class anywhere has one. Behaviour-preserving; the
+    // same short-circuit, for the same reason, already sits inside
+    // `lookup_loader_initiated`.
+    //
+    // Hoisted here because the lambda path reached it only AFTER a
+    // `lambda_proxy_hosts` read lock + hash, and paid that per LAMBDA CALL.
+    // Measured on a lambda-only profile: this function plus its `_driven`
+    // sibling plus `lambda_global_impl_owner` were 11.3% of the run, essentially
+    // all of it re-deriving a per-proxy constant that is `None` for every
+    // program without a custom classloader.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let host = *shared
         .classes
         .lambda_proxy_hosts
@@ -805,6 +843,14 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
         return Some(cid);
     }
     if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    // Same short-circuit as the passive sibling, and here it subsumes the
+    // `UserDefined(_)` test four lines below: if no class in the process has a
+    // user-defined defining loader, `get_loader_id(host)` cannot return one.
+    // Without it this arm took a SECOND `lambda_proxy_hosts` read lock and a
+    // `class_manager` read lock per lambda call, to reach that same verdict.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
         return None;
     }
     let host = *shared
@@ -1746,8 +1792,12 @@ pub(crate) fn try_lambda_dispatch(
     let sam_desc = call_site.sam_descriptor.clone();
     let impl_desc = call_site.impl_handle.descriptor.clone();
     let inst_desc = call_site.instantiated_descriptor.clone();
-    let (_sam_params_tmp, sam_ret) = split_method_descriptor(&sam_desc);
-    let (_impl_params_tmp, impl_ret) = split_method_descriptor(&impl_desc);
+    // Only the RETURN token is read here. This used to be two
+    // `split_method_descriptor` calls, i.e. a full parameter walk plus a `Vec`
+    // plus a `String` per parameter of both descriptors, allocated and dropped
+    // on every lambda invocation, for two `&str`s.
+    let sam_ret = descriptor_return_ref(&sam_desc);
+    let impl_ret = descriptor_return_ref(&impl_desc);
     match call_site.impl_handle.kind {
         MethodHandleKind::InvokeStatic => {
             // Static method: all args are parameters (no receiver).

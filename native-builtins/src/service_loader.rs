@@ -1699,6 +1699,319 @@ fn service_accepts_type(
     }
 }
 
+/// `factoryMethod.toString()` — the exact text `ServiceLoader.fail(service,
+/// factoryMethod + " return type not a subtype")` interpolates, e.g.
+/// `public static java.lang.Object com.example.Bad.provider()`.
+///
+/// Measured against HotSpot 25.0.3.9 rather than inferred; the whole message is
+/// asserted verbatim by `regression-suite/src/RJdkModule.java`'s `Rejected`
+/// service, so a drift here is a red vector rather than a silent divergence.
+///
+/// Falls back to `<fqn>.provider()` when `Method.toString()` cannot be driven.
+/// That keeps the one part a reader has to have — which provider was refused —
+/// without inventing modifiers or a return type this VM did not actually read.
+fn factory_method_display(
+    ctx: &mut dyn NativeContext,
+    method: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> String {
+    let method_pin = ctx.pin_native_root(method);
+    let method_now = ctx.read_native_pin(method_pin, method);
+    let rendered = match ctx.invoke(
+        "java/lang/reflect/Method",
+        "toString",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(method_now))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(method_pin);
+    if rendered.is_empty() {
+        format!("{fqn}.provider()")
+    } else {
+        rendered
+    }
+}
+
+/// The verdict of `ServiceLoader.loadProvider`'s factory-form subtype gate.
+enum FactoryReturn {
+    /// A legal `provider()`. Carries the return-type mirror, which is what
+    /// `ProviderImpl` records as `type` and what `Provider.type()` answers.
+    /// The reference is UNPINNED — pin it before the next allocation, the same
+    /// contract `factory_return_type` and `load_provider_class` carry.
+    Accepted(cratonvm_types::ObjectRef),
+    /// `getReturnType()` could not be read at all. Historic behaviour is kept
+    /// (treat the provider as legal) for the same reason `service_accepts_type`
+    /// answers `true` on an unreadable `isAssignableFrom`: an interrogation
+    /// this VM cannot drive must never MANUFACTURE a refusal.
+    Unreadable,
+    /// Not a subtype of the service. Carries the `ServiceConfigurationError` to
+    /// raise, or `None` when the error object itself could not be built — the
+    /// contract `service_configuration_error` has always had, where the caller
+    /// drops the provider rather than pretending to have thrown.
+    Rejected(Option<MethodCallFailed>),
+}
+
+/// `ServiceLoader.loadProvider`'s factory-form gate, shared by BOTH provider
+/// paths:
+///
+/// ```text
+/// Class<?> returnType = factoryMethod.getReturnType();
+/// if (!service.isAssignableFrom(returnType))
+///     fail(service, factoryMethod + " return type not a subtype");
+/// ```
+///
+/// It is a function because it has to run in `native_sl_iterator` AND
+/// `native_sl_stream`. It was written inline on the iterator only, and the
+/// `stream()` path computed the return type without ever asking: an illegal
+/// module-declared factory raised from `iterator()` and was handed out by
+/// `stream()` as a `Provider` whose `get()` returns an object of the wrong type
+/// (measured: a `String` for a service interface). Nothing downstream catches
+/// that — `ProviderImpl.invokeFactoryMethod`'s `(S)` cast is erased — so this
+/// gate is the only gate there is. See W7-85-serviceloader-stream-validation.md.
+///
+/// PIN ORDER, which is the delicate part: every step allocates and re-enters
+/// Java, so no `ObjectRef` may be held raw across a call.
+///
+///  * `factory` is re-read through the caller's `factory_pin` before each use;
+///  * the service mirror is fetched with the NON-allocating `sl_service_mirror`
+///    AFTER `factory_return_type` has returned, never held across it;
+///  * the return mirror takes its own pin for the duration of
+///    `isAssignableFrom` and is read back through that pin before the pin
+///    drops, so `Accepted` names the forwarded address, not the pre-GC one;
+///  * `Method.toString()` and `sl_service_name` are driven while the caller's
+///    pins are still standing, i.e. before any of them is released.
+///
+/// The caller's `sl_pin` and `factory_pin` are left exactly as they were found.
+fn factory_return_is_subtype(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    factory_pin: usize,
+    factory: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> FactoryReturn {
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let ret = match factory_return_type(ctx, factory_now) {
+        Some(ret) => ret,
+        None => return FactoryReturn::Unreadable,
+    };
+    let ret_pin = ctx.pin_native_root(ret);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let ret_now = ctx.read_native_pin(ret_pin, ret);
+    let accepted = match sl_service_mirror(ctx, sl_now) {
+        Some(service) => service_accepts_type(ctx, service, ret_now),
+        // No readable service mirror: there is nothing to compare against, so
+        // keep the historic accept rather than refuse on an unasked question.
+        None => true,
+    };
+    if accepted {
+        let ret_now = ctx.read_native_pin(ret_pin, ret);
+        ctx.unpin_native_roots(ret_pin);
+        return FactoryReturn::Accepted(ret_now);
+    }
+    let factory_now = ctx.read_native_pin(factory_pin, factory);
+    let rendered = factory_method_display(ctx, factory_now, fqn);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    ctx.unpin_native_roots(ret_pin);
+    FactoryReturn::Rejected(service_configuration_error(
+        ctx,
+        &format!("{service_name}: {rendered} return type not a subtype"),
+    ))
+}
+
+/// `String.valueOf(clazz)` — the exact interpolation `ServiceLoader
+/// .loadProvider` performs in `fail(service, clazz + " not a subtype")`.
+///
+/// `Class.toString()` renders `class com.foo.Bar` / `interface com.foo.Bar`,
+/// NOT the bare binary name: the CLASSPATH iterator spells the same refusal
+/// `clazz.getName() + " not a subtype"`, so the JDK's two provider paths really
+/// do print different text for one rule. This helper follows `loadProvider`,
+/// which is the path being mirrored here.
+///
+/// Falls back to the FQN when `Class.toString()` cannot be driven — the one
+/// part a reader has to have is *which* provider was refused, and inventing a
+/// `class `/`interface ` prefix this VM did not read would be a fabrication.
+fn provider_class_display(
+    ctx: &mut dyn NativeContext,
+    class: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> String {
+    let class_pin = ctx.pin_native_root(class);
+    let class_now = ctx.read_native_pin(class_pin, class);
+    let rendered = match ctx.invoke(
+        "java/lang/Class",
+        "toString",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(class_now))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(class_pin);
+    if rendered.is_empty() {
+        fqn.to_string()
+    } else {
+        rendered
+    }
+}
+
+/// The verdict of `ServiceLoader.loadProvider`'s CONSTRUCTOR-form gates — the
+/// two rules that apply once `findStaticProviderMethod` has answered `null`.
+///
+/// Two states, not [`FactoryReturn`]'s three, and deliberately so: an
+/// interrogation this VM cannot drive is `Accepted`, folded into the same
+/// variant as a genuine pass. That is the same refusal-of-a-refusal
+/// `service_accepts_type` makes when `isAssignableFrom` is unreadable — **a
+/// widening into a throw must never fire on a question that went unanswered.**
+enum ConstructorForm {
+    /// Legal — or unanswerable, which is treated as legal.
+    Accepted,
+    /// One of the two rules is positively broken. `None` when the
+    /// `ServiceConfigurationError` itself could not be built; the caller then
+    /// drops the provider rather than pretending to have thrown, which is the
+    /// contract `service_configuration_error` has always carried.
+    Rejected(Option<MethodCallFailed>),
+}
+
+/// `ServiceLoader.loadProvider`'s constructor-form subtype gate:
+///
+/// ```text
+/// // no factory method so must be a subtype
+/// if (!service.isAssignableFrom(clazz))
+///     fail(service, clazz + " not a subtype");
+/// ```
+///
+/// Absent on BOTH provider paths until now — `W6-2`'s last live row, and the
+/// `none / none` row `W7-85`'s population sweep confirmed independently. It
+/// lands on both paths in one change for the reason that record exists: a guard
+/// installed on one of two siblings is validated by whichever fixture walks the
+/// other one, and reads green forever.
+///
+/// PIN ORDER: identical in shape to [`factory_return_is_subtype`]. `sl` and
+/// `class` are re-read through the caller's pins before *each* use, the service
+/// mirror is fetched with the non-allocating [`sl_service_mirror`] and handed
+/// straight to `service_accepts_type` (which takes its own pins), and the
+/// message is rendered while the caller's pins still stand. The caller's pins
+/// are left exactly as they were found.
+fn constructor_form_is_subtype(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    class_pin: usize,
+    class: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> ConstructorForm {
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service = match sl_service_mirror(ctx, sl_now) {
+        Some(service) => service,
+        // No readable service mirror: there is nothing to compare against, so
+        // keep the historic accept rather than refuse on an unasked question.
+        None => return ConstructorForm::Accepted,
+    };
+    let class_now = ctx.read_native_pin(class_pin, class);
+    if service_accepts_type(ctx, service, class_now) {
+        return ConstructorForm::Accepted;
+    }
+    let class_now = ctx.read_native_pin(class_pin, class);
+    let rendered = provider_class_display(ctx, class_now, fqn);
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    ConstructorForm::Rejected(service_configuration_error(
+        ctx,
+        &format!("{service_name}: {rendered} not a subtype"),
+    ))
+}
+
+/// `Class.getConstructor()` searches **public** members only; this file asks
+/// `getDeclaredConstructor()`. So a provider whose no-arg constructor is
+/// private or package-private was found here, opened by
+/// [`grant_reflective_override`], and handed out — where `loadProvider` refuses
+/// it.
+///
+/// Answers `true` on an unreadable `getModifiers()`, for [`ConstructorForm`]'s
+/// stated reason.
+fn constructor_is_public(
+    ctx: &mut dyn NativeContext,
+    ctor_pin: usize,
+    ctor: cratonvm_types::ObjectRef,
+) -> bool {
+    const ACC_PUBLIC: i32 = 0x0001;
+    let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
+    match ctx.invoke(
+        "java/lang/reflect/Constructor",
+        "getModifiers",
+        "()I",
+        &[Value::Object(Some(ctor_now))],
+    ) {
+        Ok(Some(Value::Int(mods))) => (mods & ACC_PUBLIC) != 0,
+        _ => true,
+    }
+}
+
+/// `ServiceLoader.getConstructor`'s failure:
+///
+/// ```text
+/// try { ctor = clazz.getConstructor(); }
+/// catch (Throwable x) {
+///     fail(service, cn + " Unable to get public no-arg constructor", x);
+/// }
+/// ```
+///
+/// Both illegal shapes arrive here — *no* no-arg constructor and a *non-public*
+/// one — because `getConstructor()` cannot see either, and both arrive carrying
+/// the `NoSuchMethodException` it throws, whose message is `<fqn>.<init>()`.
+///
+/// This is the **three**-argument `fail`, so unlike every other refusal in this
+/// file the error carries a CAUSE. Building it is therefore part of the fix, not
+/// decoration: `RJdkModule` asserts the cause is present, and a cause-less
+/// `ServiceConfigurationError` here would be a second, quieter divergence
+/// standing in for the one being closed. If the `NoSuchMethodException` cannot
+/// be built the cause-less form is raised anyway — losing the cause is better
+/// than losing the refusal.
+fn no_public_no_arg_ctor_error(
+    ctx: &mut dyn NativeContext,
+    sl_pin: usize,
+    sl: cratonvm_types::ObjectRef,
+    fqn: &str,
+) -> Option<MethodCallFailed> {
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let service_name = sl_service_name(ctx, sl_now);
+    let text = format!("{service_name}: {fqn} Unable to get public no-arg constructor");
+
+    let detail = ctx.create_string(&format!("{fqn}.<init>()"));
+    let detail_pin = ctx.pin_native_root(detail);
+    let detail = ctx.read_native_pin(detail_pin, detail);
+    let built_cause = ctx.new_object_initialized(
+        "java/lang/NoSuchMethodException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    );
+    ctx.unpin_native_roots(detail_pin);
+    let cause = match built_cause {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return service_configuration_error(ctx, &text),
+    };
+    let cause_pin = ctx.pin_native_root(cause);
+    let message = ctx.create_string(&text);
+    let message_pin = ctx.pin_native_root(message);
+    let cause = ctx.read_native_pin(cause_pin, cause);
+    let message = ctx.read_native_pin(message_pin, message);
+    let built = ctx.new_object_initialized(
+        "java/util/ServiceConfigurationError",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(message)), Value::Object(Some(cause))],
+    );
+    // Truncate-to-base: releasing `cause_pin` releases `message_pin` with it.
+    ctx.unpin_native_roots(cause_pin);
+    match built {
+        Ok(Some(Value::Object(Some(error)))) => Some(MethodCallFailed::ExceptionThrown(error)),
+        _ => None,
+    }
+}
+
 /// The JDK's own per-loader instance cache: `ServiceLoader.instantiatedProviders`.
 ///
 /// `initialize_real_service_loader_fields` allocates this list and
@@ -1882,36 +2195,18 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 let factory_pin = ctx.pin_native_root(factory);
                 // The JDK fails the load when the factory's return type is not a
                 // subtype of the service; a provider it may not legally hand out
-                // must not be quietly dropped instead.
+                // must not be quietly dropped instead. `native_sl_stream` runs
+                // the SAME call — see `factory_return_is_subtype`, which owns
+                // the pin order both paths depend on.
                 //
-                // Order matters: `factory_return_type` allocates, so the service
-                // mirror is read AFTER it (via the non-allocating
-                // `sl_service_mirror`) rather than being held across that call.
-                let factory_now = ctx.read_native_pin(factory_pin, factory);
-                let subtype_ok = match factory_return_type(ctx, factory_now) {
-                    Some(ret) => {
-                        let ret_pin = ctx.pin_native_root(ret);
-                        let sl_now = ctx.read_native_pin(sl_pin, sl);
-                        let ret_now = ctx.read_native_pin(ret_pin, ret);
-                        let ok = match sl_service_mirror(ctx, sl_now) {
-                            Some(service) => service_accepts_type(ctx, service, ret_now),
-                            None => true,
-                        };
-                        ctx.unpin_native_roots(ret_pin);
-                        ok
-                    }
-                    None => true,
-                };
-                if !subtype_ok {
+                // The error is built INSIDE that call, while `class_pin` and
+                // `factory_pin` are still standing, because rendering the
+                // message drives `Method.toString()`.
+                if let FactoryReturn::Rejected(error) =
+                    factory_return_is_subtype(ctx, sl_pin, sl, factory_pin, factory, &fqn)
+                {
                     ctx.unpin_native_roots(class_pin);
-                    let sl_now = ctx.read_native_pin(sl_pin, sl);
-                    let service_name = sl_service_name(ctx, sl_now);
-                    if let Some(error) = service_configuration_error(
-                        ctx,
-                        &format!(
-                            "{service_name}: provider() of {fqn} returns a type that is not a subtype"
-                        ),
-                    ) {
+                    if let Some(error) = error {
                         ctx.unpin_native_roots(sl_pin);
                         return Err(error);
                     }
@@ -1939,25 +2234,44 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                         Value::Object(Some(empty_args)),
                     ],
                 );
-                ctx.unpin_native_roots(class_pin);
                 let inst = match invoked {
-                    Ok(Some(Value::Object(Some(o)))) => o,
+                    Ok(Some(Value::Object(Some(o)))) => {
+                        ctx.unpin_native_roots(class_pin);
+                        o
+                    }
                     // `ProviderImpl.invokeFactoryMethod` fails the load on a null
                     // return. Skipping the provider here would be a fabricated
                     // success for a configuration the spec rejects.
+                    //
+                    // The `stream()` path reports this through the REAL
+                    // `ProviderImpl.invokeFactoryMethod` bytecode at
+                    // `Provider.get()`, so it already carried the JDK's exact
+                    // wording. Render the same text here — the two paths
+                    // disagreeing about the message for the same provider is
+                    // the smaller sibling of the defect this whole record is
+                    // about, and `RJdkModule` now asserts they are equal.
+                    // `factory_pin` still stands at this point on purpose:
+                    // `Method.toString()` is an allocating invoke and
+                    // `class_pin` (taken first) would take it down with it.
                     Ok(_) => {
+                        let factory_now = ctx.read_native_pin(factory_pin, factory);
+                        let rendered = factory_method_display(ctx, factory_now, &fqn);
+                        ctx.unpin_native_roots(class_pin);
                         let sl_now = ctx.read_native_pin(sl_pin, sl);
                         let service_name = sl_service_name(ctx, sl_now);
                         if let Some(error) = service_configuration_error(
                             ctx,
-                            &format!("{service_name}: provider() of {fqn} returned null"),
+                            &format!("{service_name}: {rendered} returned null"),
                         ) {
                             ctx.unpin_native_roots(sl_pin);
                             return Err(error);
                         }
                         continue;
                     }
-                    Err(failure) => return Err(provider_construction_error(ctx, &fqn, failure)),
+                    Err(failure) => {
+                        ctx.unpin_native_roots(class_pin);
+                        return Err(provider_construction_error(ctx, &fqn, failure));
+                    }
                 };
                 list = ctx.read_native_pin(list_pin, list);
                 let inst_pin = ctx.pin_native_root(inst);
@@ -1978,6 +2292,36 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         if built_via_factory {
             continue;
+        }
+
+        // --- JPMS constructor form -------------------------------------------
+        // Once `findStaticProviderMethod` has answered null, `loadProvider`
+        // applies two more rules before it constructs anything:
+        //
+        //     if (!service.isAssignableFrom(clazz))
+        //         fail(service, clazz + " not a subtype");
+        //     ctor = clazz.getConstructor();   // PUBLIC no-arg, or fail
+        //
+        // Neither was enforced on EITHER provider path — W6-2's last live row
+        // and the sibling W7-85's sweep found beside it. Both are gated on
+        // `module_declared` for the same reason the factory block above is:
+        // this is `loadProvider`, which serves the MODULE path. The classpath
+        // iterator (`LazyClassPathLookupIterator`) carries its own spelling of
+        // both rules and that copy stays unarmed — arming it would change
+        // Spring/Tomcat/Elasticsearch/WildFly boot, which walks hundreds of
+        // classpath providers and none module-declared.
+        let provider_is_module_declared = module_declared.iter().any(|m| m == &fqn);
+        if provider_is_module_declared {
+            if let ConstructorForm::Rejected(error) =
+                constructor_form_is_subtype(ctx, sl_pin, sl, class_pin, class, &fqn)
+            {
+                ctx.unpin_native_roots(class_pin);
+                if let Some(error) = error {
+                    ctx.unpin_native_roots(sl_pin);
+                    return Err(error);
+                }
+                continue;
+            }
         }
 
         let empty_types = ctx.new_ref_array(
@@ -2010,6 +2354,15 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 if diag {
                     eprintln!("[SL-DBG]   skip (no zero-arg ctor): {fqn}");
                 }
+                // For a module-declared provider `getConstructor()` THROWING is
+                // not a skip — `loadProvider` fails the whole load. A classpath
+                // provider keeps the historic silent skip.
+                if provider_is_module_declared {
+                    if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, &fqn) {
+                        ctx.unpin_native_roots(sl_pin);
+                        return Err(error);
+                    }
+                }
                 continue;
             }
         };
@@ -2026,6 +2379,20 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // itself was fixed — the Constructor object created there was fine;
         // it went stale HERE, one call site later).
         let ctor_pin = ctx.pin_native_root(ctor);
+        // `getConstructor()` is public-only and this file asked
+        // `getDeclaredConstructor()`, so a NON-public no-arg constructor got
+        // this far, was opened by `grant_reflective_override` below, and was
+        // handed out. `loadProvider` refuses it with the same error the absent
+        // case raises, because the JDK cannot tell the two apart: both are
+        // `getConstructor()` throwing `NoSuchMethodException`.
+        if provider_is_module_declared && !constructor_is_public(ctx, ctor_pin, ctor) {
+            ctx.unpin_native_roots(ctor_pin);
+            if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, &fqn) {
+                ctx.unpin_native_roots(sl_pin);
+                return Err(error);
+            }
+            continue;
+        }
         // setAccessible(true). For a module-declared provider the constructor
         // lives in a package the module may neither export nor open, and the
         // caller-sensitive `setAccessible` invoke is REFUSED here (its result was
@@ -2402,20 +2769,71 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let type_now = ctx.read_native_pin(type_pin, type_class);
             if let Some(method) = provider_factory_method(ctx, type_now) {
                 let method_pin = ctx.pin_native_root(method);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                // Caller-insensitive `setAccessible(true)` so the real
-                // `ProviderImpl.invokeFactoryMethod` bytecode can call it —
-                // see `grant_reflective_override`.
-                grant_reflective_override(ctx, method_now);
-                let method_now = ctx.read_native_pin(method_pin, method);
-                match factory_return_type(ctx, method_now) {
-                    Some(ret) => {
+                // W7-85: the same `!service.isAssignableFrom(returnType)` gate
+                // `native_sl_iterator` applies. It was absent here and nowhere
+                // else, so an illegal module-declared factory raised
+                // `ServiceConfigurationError` from `iterator()` and was quietly
+                // handed out by `stream()` — a `Provider` whose `type()` is the
+                // wrong class and whose `get()` returns an object that is not
+                // of the service type. Nothing downstream catches that: the
+                // `(S)` cast in `ProviderImpl.invokeFactoryMethod` is erased.
+                match factory_return_is_subtype(ctx, sl_pin, sl, method_pin, method, fqn) {
+                    FactoryReturn::Accepted(ret) => {
                         let ret_pin = ctx.pin_native_root(ret);
+                        // Caller-insensitive `setAccessible(true)` so the real
+                        // `ProviderImpl.invokeFactoryMethod` bytecode can call
+                        // it — see `grant_reflective_override`. Granted only
+                        // once the return type is ACCEPTED: opening a factory
+                        // this loader is about to refuse would leave a door
+                        // ajar for a caller that must never exist.
+                        let method_now = ctx.read_native_pin(method_pin, method);
+                        grant_reflective_override(ctx, method_now);
                         factory = Some((method_pin, method, ret_pin, ret));
                     }
                     // Unreadable return type: fall back to the constructor
                     // flavour rather than build a half-formed wrapper.
-                    None => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Unreadable => ctx.unpin_native_roots(method_pin),
+                    FactoryReturn::Rejected(error) => {
+                        // `type_pin` is this iteration's first pin, so
+                        // truncating to it also releases `method_pin` and
+                        // anything the gate took after it.
+                        ctx.unpin_native_roots(type_pin);
+                        match error {
+                            Some(error) => {
+                                ctx.unpin_native_roots(sl_pin);
+                                return Err(error);
+                            }
+                            // The error object itself could not be built. Drop
+                            // the provider rather than hand it out — handing it
+                            // out is the one outcome this gate exists to stop.
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- JPMS constructor form -------------------------------------------
+        // The two rules `native_sl_iterator` now applies once the factory form
+        // is out of the picture: `!service.isAssignableFrom(clazz)` and the
+        // PUBLIC no-arg constructor. They land on both provider paths in one
+        // change on purpose — installing a validation on one of two siblings,
+        // and letting a fixture that only ever walks the other one call it
+        // covered, is the defect W7-85 exists to document.
+        let provider_is_module_declared = module_declared.iter().any(|m| m == fqn);
+        if factory.is_none() && provider_is_module_declared {
+            if let ConstructorForm::Rejected(error) =
+                constructor_form_is_subtype(ctx, sl_pin, sl, type_pin, type_class, fqn)
+            {
+                // `type_pin` is this iteration's first pin, so truncating to it
+                // releases everything this iteration has taken.
+                ctx.unpin_native_roots(type_pin);
+                match error {
+                    Some(error) => {
+                        ctx.unpin_native_roots(sl_pin);
+                        return Err(error);
+                    }
+                    None => continue,
                 }
             }
         }
@@ -2450,11 +2868,32 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                     }
                     // Release this iteration's pins, keep sl + list.
                     ctx.unpin_native_roots(type_pin);
+                    // Same rule as `native_sl_iterator`: for a module-declared
+                    // provider this is `getConstructor()` throwing, which
+                    // `loadProvider` turns into a failed load, not a skip.
+                    if provider_is_module_declared {
+                        if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, fqn) {
+                            ctx.unpin_native_roots(sl_pin);
+                            return Err(error);
+                        }
+                    }
                     continue;
                 }
             };
             ctx.unpin_native_roots(empty_types_pin);
             let ctor_pin = ctx.pin_native_root(ctor);
+            // A non-public no-arg constructor is invisible to
+            // `Class.getConstructor()`, so the JDK never reaches it; this file
+            // asked `getDeclaredConstructor()` and then opened it below.
+            if provider_is_module_declared && !constructor_is_public(ctx, ctor_pin, ctor) {
+                // `type_pin` precedes `ctor_pin`; truncating to it takes both.
+                ctx.unpin_native_roots(type_pin);
+                if let Some(error) = no_public_no_arg_ctor_error(ctx, sl_pin, sl, fqn) {
+                    ctx.unpin_native_roots(sl_pin);
+                    return Err(error);
+                }
+                continue;
+            }
             // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
             // succeeds for non-public providers. A module-declared provider's
             // package may be neither exported nor opened, and the

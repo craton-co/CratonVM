@@ -1304,6 +1304,22 @@ impl MockNativeContext {
         unsafe { (*self.superclass_override.get()).insert(class_id.as_u32(), super_id) };
     }
 
+    /// Set `class_access_flags` for `class_id`.
+    ///
+    /// The default is `0` — i.e. **not public**, and that is not an accident
+    /// to be worked around: a test that never calls this is testing a
+    /// package-private class. It matters for anything reading
+    /// [`crate::lang_class::mirror_is_public`], because `Lookup.UNCONDITIONAL`'s
+    /// access rule is about the target CLASS rather than the member. A
+    /// `publicLookup()` test whose target class was left at the default is
+    /// refused before the member is looked at at all, and would then pass for
+    /// the wrong reason wherever the assertion is "this throws".
+    #[allow(dead_code)]
+    pub(crate) fn set_class_access_flags(&self, class_id: ClassId, flags: u16) {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.class_flags_override.get()).insert(class_id.as_u32(), flags) };
+    }
+
     /// WP0.2: set the interface list of `class_id`.
     #[allow(dead_code)]
     pub(crate) fn set_interfaces(&self, class_id: ClassId, ifaces: Vec<ClassId>) {

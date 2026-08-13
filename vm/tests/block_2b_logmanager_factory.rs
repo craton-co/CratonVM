@@ -58,14 +58,38 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
     None
 }
 
+/// Is either compiled class OLDER than the fixture source?
+///
+/// A `.class` that predates its `.java` is the documented stale-artefact trap:
+/// the compiled probe keeps answering a question the current source no longer
+/// asks, so an edit to the fixture appears in no log. An unreadable timestamp
+/// (no source at all, no metadata) is not evidence of staleness — and cannot be
+/// repaired by recompiling either — so it reads as `false` and any existing
+/// artefact is kept.
+fn any_class_older_than_source(src: &Path, classes: &[&Path]) -> bool {
+    let Ok(src_mtime) = src.metadata().and_then(|m| m.modified()) else {
+        return false;
+    };
+    classes
+        .iter()
+        .any(|c| match c.metadata().and_then(|m| m.modified()) {
+            Ok(cls_mtime) => cls_mtime < src_mtime,
+            // Cannot tell — recompile rather than trust it.
+            Err(_) => true,
+        })
+}
+
 fn ensure_probe_compiled() -> bool {
     let dir = probe_dir();
     let cls = dir.join("LmSubclass.class");
     let inner = dir.join("LmSubclass$MyLm.class");
-    if cls.exists() && inner.exists() {
+    let src = dir.join("LmSubclass.java");
+    if cls.exists()
+        && inner.exists()
+        && !any_class_older_than_source(&src, &[cls.as_path(), inner.as_path()])
+    {
         return true;
     }
-    let src = dir.join("LmSubclass.java");
     if !src.exists() {
         // A missing fixture is a broken checkout, not an absent toolchain. Report
         // it loudly, and fail under CRATONVM_REQUIRE_E2E — see

@@ -675,8 +675,35 @@ fn spawn_child(
     redirects: &ProcessRedirects,
 ) -> Result<SpawnedChild, MethodCallFailed> {
     if program.is_empty() {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: "ProcessBuilder: empty program".to_string(),
+        // HotSpot does NOT pre-validate the program name here. `ProcessBuilder.start`
+        // hands `command[0]` straight to `ProcessImpl.create`, the OS refuses it, and
+        // the failure surfaces as an `IOException` naming the empty program:
+        //
+        //   HotSpot 25 (Windows): java.io.IOException: Cannot run program "":
+        //                         CreateProcess error=87, <localized>
+        //   HotSpot 25 (Unix):    java.io.IOException: Cannot run program "":
+        //                         error=2, No such file or directory
+        //
+        // We refused with `IllegalArgumentException`, which is not an `IOException`,
+        // so a caller writing the JDK's own `catch (IOException)` around a spawn --
+        // the only checked exception `start()` declares -- did not catch it and the
+        // error escaped as an unchecked throw. Measured on this host:
+        //   HotSpot  : java.io.IOException: Cannot run program ""...
+        //   CratonVM : java.lang.IllegalArgumentException: ProcessBuilder: empty program
+        //
+        // Both modes were wrong; this is a HotSpot-parity fix, not a mode-keyed one.
+        // regression-suite/src/RJdkProcess.java asserts the TYPE only, because the
+        // OS half of the message is localized and the errno differs per platform.
+        // The OS half is platform-specific: HotSpot reports whatever the spawn
+        // syscall returned. Emitting the Windows text on Unix would be a fresh
+        // divergence in place of the old one, so it is selected per platform.
+        let os_detail = if cfg!(windows) {
+            "CreateProcess error=87, The parameter is incorrect"
+        } else {
+            "error=2, No such file or directory"
+        };
+        return Err(RuntimeError::IOException {
+            message: format!("Cannot run program \"\": {os_detail}"),
         }
         .into());
     }
@@ -1060,8 +1087,12 @@ fn signal_pid(pid: i64, force: bool) -> bool {
 #[cfg(windows)]
 fn signal_pid(pid: i64, _force: bool) -> bool {
     use std::ffi::c_void;
-    // Signatures are IDENTICAL to `foreign_pid_is_alive`'s and `pipe.rs`'s
-    // declarations so the `clashing_extern_declarations` deny-lint does not fire.
+    // Signatures are IDENTICAL to `win_liveness_and_start_time`'s and
+    // `pipe.rs`'s declarations so the `clashing_extern_declarations` deny-lint
+    // does not fire. (This used to name `foreign_pid_is_alive`, whose Windows
+    // arm was folded into `win_liveness_and_start_time` and no longer exists —
+    // a dangling name in a lint rationale is how the next reader concludes the
+    // rationale is obsolete.)
     type Handle = *mut c_void;
     type Bool = i32;
     const PROCESS_TERMINATE: u32 = 0x0001;
@@ -1388,6 +1419,29 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// opposite answers — the first is a stub Process the VM owns, the second is
 /// someone else's.
 ///
+/// # The census, taken rather than asserted (2026-08-12, W7-46)
+///
+/// The paragraph above said "every concrete `java.lang.Process` native now
+/// asks" and then named five. That was a list, not a census, and it was one
+/// short — the guard's own comment outlived the sweep that wrote it. Re-taken
+/// against the image with `javap -p java.lang.Process` and
+/// `javap -p java.lang.ProcessImpl` (JDK 25.0.3, Windows), because what matters
+/// is not "is this method concrete" but "is it concrete AND unoverridden by the
+/// class strict mode actually instantiates":
+///
+/// | registered on `java/lang/Process` | on the image | `ProcessImpl` overrides it? | needs the guard |
+/// | --- | --- | --- | --- |
+/// | `waitFor()I`, `exitValue`, `destroy`, `getInputStream`, `getErrorStream`, `getOutputStream` | abstract | yes (must) | no — dispatch never walks up |
+/// | `isAlive`, `pid`, `toHandle`, `destroyForcibly`, `waitFor(JLjava/util/concurrent/TimeUnit;)Z` | concrete | yes | **yes**, and all five have it |
+/// | `onExit` | concrete | **yes** | no — same reason as the abstract rows |
+/// | `descendants` | concrete | **NO** | **yes**, and it did not have one until W7-46 |
+///
+/// `descendants()` is the whole point of the table: it is the only triple this
+/// VM registers on `java/lang/Process` that is both reachable from a real
+/// `java.lang.ProcessImpl` receiver and unguarded, and what it answered there
+/// was an empty stream. `info()` and `children()` are equally unoverridden but
+/// this VM does not register them, so they reach the JDK's own bytecode.
+///
 /// See `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
@@ -1507,9 +1561,35 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // args[2] = working dir (String, nullable),
     // args[3] = stdHandles (long[], in/out),
     // args[4] = redirectErrorStream (boolean).
+    // A command line this native cannot turn into a program is an `IOException`,
+    // NOT a handle of 0.
+    //
+    // Both arms below used to `return Ok(Some(Value::Long(0)))`, and the JDK
+    // caller has no null-handle check to catch it: `ProcessImpl.<init>` stores
+    // whatever `create` returned into its `handle` field and carries straight on
+    // to `getProcessId0(handle)`. So `ProcessBuilder.start()` returned a live
+    // `java.lang.ProcessImpl` naming no process — `pid()` 0, `isAlive()` false,
+    // `waitFor()` -1 — where HotSpot 25 raises
+    // `IOException: Cannot run program "": CreateProcess error=87`.
+    //
+    // This is the same defect species W6-10 finding 4 removed from the
+    // enumeration primitives' error paths, entering here through the ARGUMENT
+    // path of code W3-6 added; the species does not stay fixed by fixing one
+    // path. The real `create` is declared `throws IOException` on the image
+    // (`javap -p -s java.lang.ProcessImpl`) and reports `CreateProcess error=`
+    // plus the Win32 code, so an `IOException` is the answer the caller's own
+    // `catch` is already written for — `ProcessBuilder.start()` wraps it into
+    // `Cannot run program ...` and rethrows.
     let cmd_line = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Long(0))),
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: "Cannot run program \"\": CreateProcess error=87, \
+                          The parameter is incorrect"
+                    .to_string(),
+            }
+            .into())
+        }
     };
     // The JDK passes a single pre-built command string here; on Windows
     // its arguments are double-quoted whenever they contain spaces (e.g.
@@ -1518,7 +1598,16 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // double-quote handling instead.
     let parts: Vec<String> = tokenize_command_line(&cmd_line);
     if parts.is_empty() {
-        return Ok(Some(Value::Long(0)));
+        // The REACHABLE arm: `new ProcessBuilder("").start()` reaches
+        // `ProcessImpl.createCommandLine` with an empty program name, so
+        // `cmdstr` is empty and this tokenizes to nothing.
+        return Err(RuntimeError::IOException {
+            message: format!(
+                "Cannot run program \"{cmd_line}\": CreateProcess error=87, \
+                 The parameter is incorrect"
+            ),
+        }
+        .into());
     }
     let program = &parts[0];
     let rest = &parts[1..];
@@ -2177,20 +2266,73 @@ fn handle_for_pid(pid: i64) -> Option<i64> {
 /// `Instant.ofEpochMilli` of the same quantity. Ticks would compare equal to
 /// themselves and satisfy `destroy0` just as well, but would be wrong the moment
 /// anything displayed one.
+/// `(creation time in epoch millis, kernel+user CPU in nanoseconds)` for `pid`,
+/// or `None` when `/proc/<pid>/stat` cannot be read or parsed — the Linux
+/// counterpart of [`win_process_times`], and deliberately the same shape.
+///
+/// **One read answers both**, for the reason [`win_process_times`]' contract
+/// states: fields 14 (`utime`), 15 (`stime`) and 22 (`starttime`) are three
+/// columns of ONE line, so a single `read_to_string` cannot attribute them to
+/// two different processes the way two reads across a pid recycle could. Before
+/// this, `Info.totalTime` was simply never sourced on Linux and kept its `-1`
+/// constructor default, so `totalCpuDuration()` reported `Optional.empty()` on a
+/// platform whose kernel had the number in the file the start time was already
+/// being parsed out of (W5-2 residual 2).
+///
+/// The field indices all share one off-by-three: `after_comm` begins at field 3
+/// (`state`), so field N is index N-3 — 14 -> 11, 15 -> 12, 22 -> 19.
+///
+/// `utime`/`stime` are the process's OWN CPU; `cutime`/`cstime` (fields 16/17)
+/// are its reaped children's and are NOT added. HotSpot's
+/// `ProcessHandleImpl_unix.c` sums exactly the first pair, and
+/// `Info.totalCpuDuration()` is documented as the cputime "of the process".
 #[cfg(target_os = "linux")]
-fn os_process_start_time(pid: i64) -> Option<i64> {
+fn linux_proc_stat_times(pid: i64) -> Option<(i64, i64)> {
     if pid <= 0 {
         return None;
     }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_stat_line_times(&stat)
+}
+
+/// The PARSE half of [`linux_proc_stat_times`], split out from the READ so that
+/// one line of `/proc/<pid>/stat` can answer more than one question.
+///
+/// [`linux_liveness_and_start_time`] needs exactly that: the fact that the file
+/// opened at all is `isAlive0`'s liveness answer, and field 22 of the same
+/// buffer is its start time. Keeping the split at the function boundary rather
+/// than copying the parser is deliberate — the field indices below share one
+/// off-by-three and the `rfind(')')` rule exists because field 2 may contain
+/// spaces AND parentheses, so a second copy is a second chance to get both
+/// wrong, and the two copies would then disagree about a start time that
+/// `ProcessHandleImpl$Info.info(pid, startTime)` compares with a bare `!=`.
+#[cfg(target_os = "linux")]
+fn linux_stat_line_times(stat: &str) -> Option<(i64, i64)> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
-    // The remaining fields start at field 3 (`state`), so field 22 is index 19.
-    let ticks: i64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
     let hz = clock_ticks_per_second();
     if hz <= 0 {
         return None;
     }
-    Some(boot_time_millis()? + ticks.checked_mul(1000)? / hz)
+    let ticks: i64 = fields.get(19)?.parse().ok()?;
+    let start_ms = boot_time_millis()? + ticks.checked_mul(1000)? / hz;
+    // A tick is 1/hz of a second, so nanoseconds is `ticks * 1e9 / hz`. The
+    // multiply is done first and saturating: on a machine that has been up for
+    // years an i64 of nanoseconds still has ~292 years of headroom, but a
+    // `checked_mul` that returned `None` here would drop the START time too, and
+    // the start time is the one this record cannot do without.
+    let utime: i64 = fields.get(11).and_then(|f| f.parse().ok()).unwrap_or(0);
+    let stime: i64 = fields.get(12).and_then(|f| f.parse().ok()).unwrap_or(0);
+    let cpu_nanos = utime
+        .saturating_add(stime)
+        .saturating_mul(1_000_000_000)
+        / hz;
+    Some((start_ms, cpu_nanos))
+}
+
+#[cfg(target_os = "linux")]
+fn os_process_start_time(pid: i64) -> Option<i64> {
+    linux_proc_stat_times(pid).map(|(start_ms, _)| start_ms)
 }
 
 /// `GetProcessTimes` — `(creation time in epoch millis, kernel+user CPU in
@@ -2282,11 +2424,15 @@ fn os_process_start_time(_pid: i64) -> Option<i64> {
 /// `Info.totalCpuDuration()` reads back through `Duration.ofNanos`) — from ONE
 /// OS probe.
 ///
-/// Only the Windows arm reports a CPU time: it comes free from the same
-/// `GetProcessTimes` the start time already needs. The Linux arm would need a
-/// second parse of `/proc/<pid>/stat` (fields 14/15) and is left at `None` —
-/// `Info.totalTime` then keeps its `-1` constructor default, which is the JDK's
-/// own "unknown" sentinel and renders as `Optional.empty()`.
+/// Windows and Linux both report a CPU time, and on both it comes out of the
+/// SAME probe the start time already needs — `GetProcessTimes` there,
+/// `/proc/<pid>/stat` here. Every other target has no probe wired up and answers
+/// `None`, so `Info.totalTime` keeps its `-1` constructor default, which is the
+/// JDK's own "unknown" sentinel: `totalCpuDuration()`'s guard is `totalTime !=
+/// -1` (verified with `javap -c java.lang.ProcessHandleImpl$Info`), so it
+/// renders as `Optional.empty()` — the spec-mandated absence, not a fabricated
+/// zero. A written `0` would render as `Optional[PT0S]`, i.e. the positive claim
+/// that the process has used no CPU.
 ///
 /// **Why the two are fetched together.** `info0` used to ask
 /// `start_time_or_any(pid)` and then a separate `os_process_cpu_nanos(pid)`,
@@ -2299,9 +2445,10 @@ fn os_process_start_time(_pid: i64) -> Option<i64> {
 /// process instance, because a pid can be recycled between them.
 ///
 /// **The start time is the same number `start_time_or_any` answers, by
-/// construction.** The Windows arm here is `os_process_start_time`'s body plus
-/// `start_time_or_any`'s `STARTTIME_ANY` fallback, inlined; the non-Windows arm
-/// calls `start_time_or_any` outright. That identity is load-bearing:
+/// construction.** The Windows and Linux arms here are each
+/// `os_process_start_time`'s own body plus `start_time_or_any`'s
+/// `STARTTIME_ANY` fallback, inlined; the catch-all arm calls
+/// `start_time_or_any` outright. That identity is load-bearing:
 /// `ProcessHandleImpl$Info.info(pid, startTime)` wipes `command`, `arguments`,
 /// `startTime`, `totalTime` and `user` off the record unless `startTime ==
 /// info.startTime` — a bare `!=` with no `STARTTIME_ANY` wildcarding — and
@@ -2315,11 +2462,30 @@ fn start_time_and_cpu(pid: i64) -> (i64, Option<i64>) {
     }
 }
 
-/// No platform outside Windows has a CPU-time probe wired up here, so
+/// The Linux arm, and the same identity argument as the Windows one above: this
+/// is `os_process_start_time`'s body (i.e. `linux_proc_stat_times`) plus
+/// `start_time_or_any`'s `STARTTIME_ANY` fallback, inlined, so the number
+/// written to `Info.startTime` is still exactly the number `isAlive0` returns
+/// and `current_process_start_time` stamps on `ProcessHandle.current()`.
+///
+/// A `/proc/<pid>/stat` that cannot be read degrades BOTH halves together: the
+/// start time to `STARTTIME_ANY` (the process exists, its start time is not
+/// available) and the CPU total to `None` (`Optional.empty()`). Reporting a
+/// start time from one read and a CPU total from another would reintroduce
+/// exactly the two-probe attribution hole [`win_process_times`] exists to close.
+#[cfg(target_os = "linux")]
+fn start_time_and_cpu(pid: i64) -> (i64, Option<i64>) {
+    match linux_proc_stat_times(pid) {
+        Some((start_ms, cpu_nanos)) => (start_ms, Some(cpu_nanos)),
+        None => (PROCESS_STARTTIME_ANY, None),
+    }
+}
+
+/// No platform outside Windows and Linux has a CPU-time probe wired up here, so
 /// `Info.totalTime` keeps its `-1` constructor default. The start time still
 /// comes from `start_time_or_any`, the one source `isAlive0`, `info0` and
 /// `current_process_start_time` all share.
-#[cfg(not(windows))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn start_time_and_cpu(pid: i64) -> (i64, Option<i64>) {
     (start_time_or_any(pid), None)
 }
@@ -2391,6 +2557,222 @@ fn os_process_image_name(_pid: i64) -> Option<String> {
     None
 }
 
+/// The account that owns `pid`, in the platform's own spelling, or `None`.
+///
+/// `Info.user` was left `null` on every platform, so `ProcessHandle.Info.user()`
+/// — whose body is `Optional.ofNullable(user)`, verified with `javap -c
+/// java.lang.ProcessHandleImpl$Info` — reported `Optional.empty()` for every
+/// process on a platform where HotSpot reports a name (W5-2 residual 1;
+/// `Optional[CARBON\Victor]` is what real HotSpot 25 answered on this host).
+///
+/// **`None` here is a spec-mandated absence, not a fallback.**
+/// `ProcessHandle.Info`'s own javadoc: *"The attributes of a process vary by
+/// operating system and are not available in all implementations. Information
+/// about processes is limited by the operating system privileges of the process
+/// making the request."* Every failure path below is one of those two sentences
+/// — a target with no probe wired up, or a process this VM may not open — and
+/// each answers `Optional.empty()` rather than substituting THIS process's user,
+/// which is the fabricated success the equivalent `parent()` stub still commits
+/// (see the record).
+///
+/// Windows spells it `DOMAIN\name`, which is what `LookupAccountSidW` produces
+/// from the token's SID and what HotSpot's `ProcessHandleImpl_md.c` reports; it
+/// is deliberately not normalised.
+#[cfg(windows)]
+fn os_process_user(pid: i64) -> Option<String> {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const TOKEN_QUERY: u32 = 0x0008;
+    /// `TOKEN_INFORMATION_CLASS::TokenUser`.
+    const TOKEN_USER_CLASS: i32 = 1;
+    /// Both are the documented maxima for an account and a domain name. The API
+    /// takes them in CHARACTERS and reports back how many it wrote.
+    const NAME_CHARS: u32 = 256;
+    const DOMAIN_CHARS: u32 = 256;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+    #[link(name = "Advapi32")]
+    extern "system" {
+        fn OpenProcessToken(
+            h_process: Handle,
+            desired_access: u32,
+            token_handle: *mut Handle,
+        ) -> Bool;
+        fn GetTokenInformation(
+            token_handle: Handle,
+            token_information_class: i32,
+            token_information: *mut c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> Bool;
+        fn LookupAccountSidW(
+            lp_system_name: *const u16,
+            sid: *mut c_void,
+            name: *mut u16,
+            cch_name: *mut u32,
+            referenced_domain_name: *mut u16,
+            cch_referenced_domain_name: *mut u32,
+            pe_use: *mut i32,
+        ) -> Bool;
+    }
+
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return None;
+    }
+    // SAFETY: every out-parameter is a live, fully-initialised local of the
+    // documented layout; both handles are closed on every path out of the block;
+    // the two null failure returns are refused before use. The token buffer is a
+    // `Vec<u64>` rather than a `Vec<u8>` on purpose — `TOKEN_USER` begins with a
+    // `SID_AND_ATTRIBUTES` whose first member is a `PSID`, and reading a pointer
+    // out of a 1-aligned byte buffer is an unaligned load; a `u64` element type
+    // gives the allocation 8-byte alignment by construction.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return None;
+        }
+        let mut token: Handle = std::ptr::null_mut();
+        let opened = OpenProcessToken(h, TOKEN_QUERY, &mut token) != 0;
+        CloseHandle(h);
+        if !opened || token.is_null() {
+            return None;
+        }
+        // Size probe first: `TOKEN_USER` is variable-length because the SID it
+        // carries is, so there is no fixed struct to hand in. The probe call is
+        // EXPECTED to fail (`ERROR_INSUFFICIENT_BUFFER`); only `needed` matters.
+        let mut needed: u32 = 0;
+        GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf: Vec<u64> = vec![0; (needed as usize).div_ceil(8)];
+        let mut written = needed;
+        let got = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut written,
+        ) != 0;
+        CloseHandle(token);
+        if !got {
+            return None;
+        }
+        // The SID points INTO `buf`, which outlives the lookup below.
+        let sid = *buf.as_ptr().cast::<*mut c_void>();
+        if sid.is_null() {
+            return None;
+        }
+        let mut name = vec![0u16; NAME_CHARS as usize];
+        let mut domain = vec![0u16; DOMAIN_CHARS as usize];
+        let mut cch_name = NAME_CHARS;
+        let mut cch_domain = DOMAIN_CHARS;
+        let mut sid_type: i32 = 0;
+        let resolved = LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut cch_name,
+            domain.as_mut_ptr(),
+            &mut cch_domain,
+            &mut sid_type,
+        ) != 0;
+        // A SID that resolves to no account (a deleted user, an unreachable
+        // domain controller) is the javadoc's "not available", so it stays
+        // absent. Rendering the raw SID string instead would be a value HotSpot
+        // never produces.
+        if !resolved {
+            return None;
+        }
+        let cch_name = (cch_name as usize).min(name.len());
+        let cch_domain = (cch_domain as usize).min(domain.len());
+        let account = String::from_utf16_lossy(&name[..cch_name]);
+        if account.trim().is_empty() {
+            return None;
+        }
+        let domain = String::from_utf16_lossy(&domain[..cch_domain]);
+        if domain.trim().is_empty() {
+            Some(account)
+        } else {
+            Some(format!("{domain}\\{account}"))
+        }
+    }
+}
+
+/// `/proc/<pid>/status`' `Uid:` line carries four columns — real, effective,
+/// saved-set and filesystem uid — and the REAL uid (the first) is the one
+/// HotSpot's `ProcessHandleImpl_unix.c` reports, so it is the one taken here.
+///
+/// Resolved through the passwd database rather than `/etc/passwd` directly:
+/// `getpwuid_r` goes through NSS, so an LDAP/SSSD account resolves to the same
+/// name HotSpot prints, and a container with no passwd entry at all answers
+/// `None` — the javadoc's "not available", not a fabricated numeric stand-in.
+/// A buffer too small for the entry (`ERANGE`) is treated the same way; it is an
+/// absence, and inventing a name is the failure this campaign is hunting.
+#[cfg(target_os = "linux")]
+fn os_process_user(pid: i64) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    // SAFETY: `libc::passwd` is a plain C struct of pointers and integers, for
+    // which an all-zero bit pattern is a valid (null/0) value. It is only read
+    // after `getpwuid_r` below reports success, which is what fills it in.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pwd`, `buf` and `found` are live locals; `getpwuid_r` writes only
+    // through them and only up to `buf.len()` bytes, and `pwd.pw_name` points
+    // into `buf`, which outlives the read below. It is the reentrant form on
+    // purpose — `getpwuid` returns a pointer into a static that another thread's
+    // call would overwrite under us.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_name` is a NUL-terminated C string inside `buf`, which is
+    // still in scope.
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+        .to_string_lossy()
+        .into_owned();
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// No account probe is wired up for this target, so `Info.user` stays `null` and
+/// `user()` answers `Optional.empty()` — which the `ProcessHandle.Info` javadoc
+/// specifies for exactly this case: *"The attributes of a process vary by
+/// operating system and are not available in all implementations."*
+#[cfg(not(any(target_os = "linux", windows)))]
+fn os_process_user(_pid: i64) -> Option<String> {
+    None
+}
+
 /// `sysconf(_SC_CLK_TCK)` — the unit of `/proc/<pid>/stat`'s tick fields.
 #[cfg(target_os = "linux")]
 fn clock_ticks_per_second() -> i64 {
@@ -2459,40 +2841,82 @@ pub fn current_process_start_time() -> i64 {
 /// only value `isAlive()` reads as not-alive.
 const PROCESS_STARTTIME_ANY: i64 = 0;
 
-/// Is a pid we did not spawn still alive?
-///
-/// `/proc/<pid>` is present for a zombie too, which is the answer we want: a
-/// process that has exited but not been reaped is still a process.
-#[cfg(target_os = "linux")]
-fn foreign_pid_is_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
+// There is no `#[cfg(target_os = "linux")] fn foreign_pid_is_alive` any more
+// either, and for the same reason the Windows one went (below). It was
+// `std::path::Path::new(&format!("/proc/{pid}")).exists()`, and its only caller
+// went straight on to `start_time_or_any(pid)` -> `/proc/<pid>/stat`: two
+// filesystem probes of two DIFFERENT files for one question, in the one native
+// whose return value exists so that `ProcessHandleImpl.isAlive()` and `destroy0`
+// can detect a RECYCLED pid. Cheaper than Windows' two `OpenProcess` calls, and
+// the attribution hole is identical — see [`linux_liveness_and_start_time`],
+// which is now the single door. What the boolean knew is preserved there: a
+// zombie is still a process (`/proc/<pid>/stat` exists until it is reaped, and
+// reporting it alive is what the JDK's reaper needs), and a non-positive pid
+// names none.
 
-/// Is a pid we did not spawn still alive? — Win32.
+// There is no `#[cfg(windows)] fn foreign_pid_is_alive` any more, deliberately.
+// It existed to answer liveness ALONE, and its one caller
+// (`native_proc_handle_is_alive0`) always went on to ask
+// `start_time_or_any(pid)` in the same breath — a second `OpenProcess` for the
+// other half of one question. Keeping the boolean wrapper beside
+// `win_liveness_and_start_time` would leave a second door onto the same probe
+// through which that pairing could grow back, and it would have no caller, so
+// it is folded in rather than retained. What it knew is preserved below: the
+// `ERROR_ACCESS_DENIED` edge, the 259 ambiguity, and the DWORD-range refusal
+// that keeps `ProcessHandle.of(Long.MAX_VALUE)` syscall-free
+// (`RJdkProcess` asserts that lookup is empty).
+
+/// Liveness AND start time for a foreign pid, from **one** `OpenProcess`.
 ///
-/// The unconditional `true` this replaces was a fabricated success: it made
-/// `ProcessHandleImpl.isAlive0` answer "alive, start time unknown" (0) for
-/// EVERY pid, so `ProcessHandle.of(anything)` was always present. The JDK
-/// specifies an empty `Optional` for a pid that names no process, and
-/// `regression-suite/src/RJdkProcess.java:155`
-/// (`ProcessHandle.of(Long.MAX_VALUE).isEmpty()`) measures exactly that —
-/// HotSpot 25 passes it, the unconditional `true` could not.
+/// # Why one handle rather than two calls
 ///
-/// `OpenProcess` + `GetExitCodeProcess` is what HotSpot's own
-/// `ProcessHandleImpl_md.c` does on Windows. Two documented edges are handled
-/// deliberately rather than left to chance:
-///   * `ERROR_ACCESS_DENIED` from `OpenProcess` means the process EXISTS and we
-///     merely lack rights to it (a service, or another user's session), so it is
-///     reported alive — the opposite answer would be the same fabrication in the
-///     other direction.
-///   * A process whose real exit code happens to be `STILL_ACTIVE` (259) reads
-///     as alive until its handle is closed. That is a Win32 API-level ambiguity
-///     with no cheaper resolution, and it is the same one HotSpot inherits.
+/// `ProcessHandleImpl.isAlive0(pid)` needs both facts at once — its return value
+/// is `-1` for "not alive" and the process's start time otherwise — and it used
+/// to get them from two separate probes: `foreign_pid_is_alive(pid)`
+/// (`OpenProcess` + `GetExitCodeProcess` + `CloseHandle`) followed by
+/// `start_time_or_any(pid)` -> [`win_process_times`] (`OpenProcess` +
+/// `GetProcessTimes` + `CloseHandle`). That is the shape W6-10 finding 2
+/// removed from `info0` — "a single call opened the same process TWICE and read
+/// a different half of the same answer each time" — surviving on the
+/// neighbouring native, and it is not only a wasted syscall pair:
+///
+/// * **Attribution.** [`win_process_times`]' own contract is "one `OpenProcess`
+///   answers both quantities, so they can never disagree about which process
+///   they describe". With two opens a pid recycled in between yields "alive"
+///   about one process and a start time about another — and that start time is
+///   exactly the number `ProcessHandleImpl.isAlive()` compares against
+///   `this.startTime`, and the number `destroy0`'s recycled-pid guard trusts.
+///   A probe whose whole job is to detect a recycled pid must not itself
+///   straddle one.
+/// * **Cost.** `ProcessHandle.of(pid)` calls `isAlive0` once per lookup, and
+///   `RJdkProcess`' tree polling reaches it through every handle it materialises.
+///   Two opens become one.
+///
+/// The Win32 handle from `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` is
+/// valid for `GetExitCodeProcess` and `GetProcessTimes` alike, so no additional
+/// access right is needed and the desired-access mask is unchanged.
+///
+/// # The answers, and where each came from before
+///
+/// Every arm below is one of the two old functions' arms, unchanged — this is a
+/// merge, not a re-decision, and the pair `(alive, start)` it returns is
+/// value-identical to what the two calls produced whenever no recycle happened:
+///
+/// * pid outside the `DWORD` range — `(false, None)`. Refused without a
+///   syscall, which is what keeps `ProcessHandle.of(Long.MAX_VALUE)` cheap
+///   (`RJdkProcess` asserts it is empty).
+/// * `OpenProcess` returns null with `ERROR_ACCESS_DENIED` — `(true, None)`.
+///   The process EXISTS and we lack rights to it; reporting it dead would be a
+///   fabrication in the other direction. No start time is obtainable, so the
+///   caller degrades to `STARTTIME_ANY` (0) exactly as before.
+/// * `OpenProcess` returns null for any other reason — `(false, None)`.
+/// * `GetExitCodeProcess` fails, or reports anything but `STILL_ACTIVE` —
+///   `(false, None)`. The 259 ambiguity is unchanged and is the one HotSpot
+///   inherits too.
+/// * alive, and `GetProcessTimes` fails — `(true, None)`. Same degradation to
+///   `STARTTIME_ANY` the separate `win_process_times` produced.
 #[cfg(windows)]
-fn foreign_pid_is_alive(pid: i64) -> bool {
+fn win_liveness_and_start_time(pid: i64) -> (bool, Option<i64>) {
     use std::ffi::c_void;
     // Signatures are IDENTICAL to `pipe.rs`'s `CloseHandle` declaration so the
     // `clashing_extern_declarations` deny-lint does not fire.
@@ -2501,11 +2925,34 @@ fn foreign_pid_is_alive(pid: i64) -> bool {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const STILL_ACTIVE: u32 = 259;
     const ERROR_ACCESS_DENIED: i32 = 5;
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+    /// Same layout and the same recombination rule as [`win_process_times`]'
+    /// local copy: a `FILETIME` is only 4-byte aligned, so the two halves are
+    /// shifted together explicitly rather than aliased as a `u64`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    impl FileTime {
+        fn as_u64(self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
 
     #[link(name = "Kernel32")]
     extern "system" {
         fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
         fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut u32) -> Bool;
+        fn GetProcessTimes(
+            h_process: Handle,
+            lp_creation_time: *mut FileTime,
+            lp_exit_time: *mut FileTime,
+            lp_kernel_time: *mut FileTime,
+            lp_user_time: *mut FileTime,
+        ) -> Bool;
         fn CloseHandle(h_object: Handle) -> Bool;
     }
 
@@ -2513,21 +2960,136 @@ fn foreign_pid_is_alive(pid: i64) -> bool {
     // process, and answering that without a syscall keeps the `Long.MAX_VALUE`
     // probe cheap.
     if pid <= 0 || pid > u32::MAX as i64 {
-        return false;
+        return (false, None);
     }
     // SAFETY: `OpenProcess` takes only scalars; `GetExitCodeProcess` writes one
-    // `u32` through a pointer to a live local; the handle is closed on every
-    // path out. A null handle is the documented failure return and is never
-    // passed on.
+    // `u32` and `GetProcessTimes` four `FILETIME`s through pointers to live,
+    // fully-initialised locals of exactly the documented layout; the handle is
+    // closed on every path out. A null handle is the documented failure return
+    // and is never passed on.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
         if h.is_null() {
-            return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+            let denied =
+                std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+            return (denied, None);
         }
         let mut code: u32 = 0;
         let queried = GetExitCodeProcess(h, &mut code) != 0;
+        let alive = queried && code == STILL_ACTIVE;
+        let mut start = None;
+        if alive {
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            if GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
+                start = creation
+                    .as_u64()
+                    .checked_sub(FILETIME_UNIX_EPOCH)
+                    .and_then(|created| i64::try_from(created / 10_000).ok());
+            }
+        }
         CloseHandle(h);
-        queried && code == STILL_ACTIVE
+        (alive, start)
+    }
+}
+
+/// Liveness AND start time for a foreign pid, from **one** `/proc/<pid>/stat`
+/// read — the Linux counterpart of [`win_liveness_and_start_time`], and the
+/// same argument.
+///
+/// # Why one read rather than two probes
+///
+/// `isAlive0(pid)` used to ask `foreign_pid_is_alive(pid)` — an `exists()` on
+/// `/proc/<pid>` — and then `start_time_or_any(pid)`, which reads
+/// `/proc/<pid>/stat`. Two probes of two different paths for one question, and
+/// the objection is not the cost (two file reads, not two handle opens) but the
+/// ATTRIBUTION: a pid recycled between them yields "alive" about one process and
+/// a start time about another, and that start time is precisely the number
+/// `ProcessHandleImpl.isAlive()` compares against `this.startTime` and
+/// `destroy0`'s recycled-pid guard trusts. A probe whose whole job is to detect
+/// a recycled pid must not itself straddle one. One `read_to_string` cannot:
+/// the existence of the line and field 22 of that same line describe one
+/// process instance by construction.
+///
+/// It is also what the oracle does. `ProcessHandleImpl_unix.c`'s `isAlive0` is
+/// `os_getParentPidAndTimings(env, pid, &totalTime, &startTime)` — a single
+/// `/proc/<pid>/stat` open — returning `-1` when it fails, so this is HotSpot's
+/// shape rather than a local invention.
+///
+/// # The answers, and where each came from before
+///
+/// Every arm is one of the two old probes' arms, unchanged; this is a merge,
+/// not a re-decision:
+///
+/// * non-positive pid — `(false, None)`. Both old probes refused it.
+/// * the file opened — `(true, ...)`. `/proc/<pid>/stat` exists for a ZOMBIE
+///   too, which is the answer the old `exists()` on `/proc/<pid>` gave and the
+///   one the JDK's reaper needs: a process that has exited but not been reaped
+///   is still a process.
+/// * the file opened but the line will not parse (a `/proc/stat` with no
+///   `btime`, an `_SC_CLK_TCK` of 0, a truncated line) — `(true, None)`, which
+///   the caller degrades to `STARTTIME_ANY` (0) exactly as the old
+///   `start_time_or_any` did. This is why the READ and the PARSE are separate
+///   functions: collapsing them would report a live process as DEAD on a
+///   machine-wide condition that says nothing about that process.
+/// * `ENOENT` — `(false, None)`. On this platform that IS the liveness answer;
+///   `/proc/<pid>/stat` is mode 0444, so a live process cannot be missing it.
+/// * any other error — `(true, None)`. Refusing to say "dead" on an error we
+///   cannot attribute is the same asymmetry the Windows arm makes for
+///   `ERROR_ACCESS_DENIED`: claiming a running process had exited is the
+///   fabrication in the direction that breaks callers.
+#[cfg(target_os = "linux")]
+fn linux_liveness_and_start_time(pid: i64) -> (bool, Option<i64>) {
+    if pid <= 0 {
+        return (false, None);
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => (
+            true,
+            linux_stat_line_times(&stat).map(|(start_ms, _)| start_ms),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(_) => (true, None),
+    }
+}
+
+/// `isAlive0`'s answer for a pid this VM did not spawn: `-1` when it is not
+/// alive, its start time (or `STARTTIME_ANY`) when it is.
+///
+/// Split per platform so that each can answer from the SINGLE probe that
+/// carries both halves — [`win_liveness_and_start_time`] on Windows,
+/// [`linux_liveness_and_start_time`] on Linux. The two bodies are deliberately
+/// identical below the probe name; the pair `(alive, start)` is the whole
+/// interface, and a platform that grows a real probe joins by supplying one
+/// rather than by re-deriving the mapping onto `-1` / `STARTTIME_ANY`.
+///
+/// Only the platform-of-last-resort arm still takes two steps, because there
+/// `os_process_start_time` has no probe at all and answers `None` outright —
+/// there is no second read to straddle a recycle with.
+#[cfg(windows)]
+fn foreign_start_time_or_dead(pid: i64) -> i64 {
+    match win_liveness_and_start_time(pid) {
+        (true, start) => start.unwrap_or(PROCESS_STARTTIME_ANY),
+        (false, _) => -1,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn foreign_start_time_or_dead(pid: i64) -> i64 {
+    match linux_liveness_and_start_time(pid) {
+        (true, start) => start.unwrap_or(PROCESS_STARTTIME_ANY),
+        (false, _) => -1,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn foreign_start_time_or_dead(pid: i64) -> i64 {
+    if foreign_pid_is_alive(pid) {
+        start_time_or_any(pid)
+    } else {
+        -1
     }
 }
 
@@ -2555,9 +3117,16 @@ fn native_proc_handle_current_pid0(
 /// The `long` returned is a start-time, not a boolean: `ProcessHandleImpl`
 /// reads it as `STARTTIME_PROCESS_UNKNOWN` (-1) for "no such process",
 /// `STARTTIME_ANY` (0) for "exists, start time unavailable", and any positive
-/// value as the start time itself. We have no cheap start time, so alive is
-/// reported as the constant 1 — `isAlive()` compares it against the value it
-/// cached at construction, and a constant compares equal to itself.
+/// value as the start time itself. A live process is reported as
+/// `start_time_or_any(pid)` — the real OS start time where the platform has a
+/// probe, `STARTTIME_ANY` (0) where it does not.
+///
+/// (This paragraph used to say "we have no cheap start time, so alive is
+/// reported as the constant 1". That stopped being true when `os_process_start_time`
+/// gained its Windows and Linux arms, and the body below has not returned a
+/// constant since. Left corrected rather than deleted: a stale comment that
+/// describes a defect the code no longer has is how the next reader concludes
+/// the fix never landed.)
 ///
 /// The distinction between 0 and -1 is load-bearing. Returning 0 for a process
 /// that does not exist reads as "exists, unknown start time"; the reaper's
@@ -2596,12 +3165,14 @@ fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) ->
             Some(_) => Ok(Some(Value::Long(-1))), // exited
             None => Ok(Some(Value::Long(start_time_or_any(pid)))),
         },
-        // Someone else's process: ask the OS.
-        None => Ok(Some(Value::Long(if foreign_pid_is_alive(pid) {
-            start_time_or_any(pid)
-        } else {
-            -1
-        }))),
+        // Someone else's process: ask the OS — for BOTH facts at once. This was
+        // `foreign_pid_is_alive(pid)` followed by `start_time_or_any(pid)`: two
+        // separate `OpenProcess`/`CloseHandle` pairs on Windows, and two reads
+        // of two different `/proc` paths on Linux, for one question — straddling
+        // a pid-recycle window in the one native whose return value exists to
+        // detect recycled pids. Both arms now answer from one probe; see
+        // `foreign_start_time_or_dead`.
+        None => Ok(Some(Value::Long(foreign_start_time_or_dead(pid)))),
     }
 }
 
@@ -2648,7 +3219,7 @@ fn native_proc_handle_wait_for_process_exit0(
     //   after        onExitWaitsWhileAlive=still-waiting
     //
     // The fallback then depends on `isAlive0` answering for a pid we did not
-    // spawn, which `foreign_pid_is_alive` does; without that this would trade a
+    // spawn, which `foreign_start_time_or_dead` does; without that this would trade a
     // wrong answer for a hang, so the probe waits on the future after the
     // process really dies rather than only checking that it does not complete.
     let Some(handle) = handle_for_pid(pid) else {
@@ -3497,6 +4068,48 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .into())
         }
     };
+    // `descendants()` is CONCRETE on `java.lang.Process` and — unlike
+    // `isAlive`, `pid`, `toHandle`, `destroyForcibly` and
+    // `waitFor(long, TimeUnit)` — it was never given the [`is_vm_process`]
+    // guard those five carry, even though `is_vm_process`' own doc comment
+    // says "every concrete `java.lang.Process` native now asks". It did not,
+    // and the omission is measurable rather than theoretical:
+    //
+    // `javap -p java.lang.ProcessImpl` (JDK 25.0.3, Windows image) lists the
+    // methods the real subclass overrides — `exitValue`, `waitFor()`,
+    // `waitFor(long, TimeUnit)`, `destroy`, `onExit`, `toHandle`,
+    // `supportsNormalTermination`, `destroyForcibly`, `pid`, `isAlive`, the
+    // three stream getters, `toString` — and `descendants()` is NOT among
+    // them. So under `--jdk-only`, where `ProcessBuilder.start()` really does
+    // return a `java.lang.ProcessImpl`, dispatch walks up to
+    // `java/lang/Process` and lands HERE with a receiver whose layout is the
+    // JDK's, not `PROC_FIELD_COUNT` slots of subprocess bookkeeping.
+    // `PROC_FIELD_PID` is slot 10; on a `ProcessImpl` that slot holds one of
+    // the stream references, so the read below did not even yield a `Long` —
+    // it fell to `-1`, `collect_descendant_pids(-1)` returned `Ok(vec![])`,
+    // and `Process.descendants()` answered an EMPTY STREAM. That is the
+    // fabricated success this file's `ProcessScanError` machinery was built to
+    // remove, arriving by the one route the machinery cannot see: a correct
+    // scan of the wrong process.
+    //
+    // The foreign answer is the JDK's own concrete body, verbatim —
+    // `return toHandle().descendants();` — which reaches the real
+    // `ProcessHandleImpl.descendants()` and therefore `getProcessPids0`, the
+    // same probe this native would have used, for the right pid.
+    if !is_vm_process(ctx, this) {
+        let handle = ctx.invoke_virtual(this, "toHandle", "()Ljava/lang/ProcessHandle;", &[])?;
+        let Some(Value::Object(Some(handle))) = handle else {
+            // `Process.toHandle()`'s own default body throws this, and
+            // `descendants()` is specified to propagate it: "the process is not
+            // supported by this operating system" is a refusal, and an empty
+            // stream is not how it is spelled.
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Process.descendants()".to_string(),
+            }
+            .into());
+        };
+        return ctx.invoke_virtual(handle, "descendants", "()Ljava/util/stream/Stream;", &[]);
+    }
     let pid = match ctx.get_field(this, PROC_FIELD_PID) {
         Value::Long(p) => p,
         _ => -1,
@@ -4257,27 +4870,48 @@ fn native_proc_handle_get_process_pids0(
     let pids = arr_of(1);
     let ppids = arr_of(2);
     let starts = arr_of(3);
-    // `set_array_element` cannot allocate, so none of these refs can move
-    // underneath the loop.
+    // Array lengths are loop-INVARIANT — `set_array_element` cannot allocate,
+    // cannot resize, and cannot move any of these refs — so they are probed
+    // once rather than three times per enumerated process. On a machine with
+    // several hundred processes `ProcessHandle.allProcesses()` was making
+    // ~3N virtual `array_length` calls per snapshot and ~6N across the JDK
+    // caller's mandatory retry (`ProcessHandleImpl` sizes its arrays at 100 and
+    // re-invokes whenever the returned count exceeds that). Nothing observable
+    // changes; this is the free half of W6-10's remaining cost.
+    //
+    // The EXPENSIVE half is deliberately still inside the loop and still
+    // guarded: `start_time_or_any` is one `OpenProcess`/`GetProcessTimes`/
+    // `CloseHandle` per row on Windows, and `PROCESSENTRY32` carries no
+    // creation time, so there is no cheaper documented source. Paying it only
+    // for indices the caller's array can actually hold is what keeps the first
+    // (100-element) pass at 100 opens instead of N.
+    let pids_len = pids.map_or(0, |a| ctx.array_length(a));
+    let ppids_len = ppids.map_or(0, |a| ctx.array_length(a));
+    let starts_len = starts.map_or(0, |a| ctx.array_length(a));
     for (i, (pid, ppid)) in found.iter().enumerate() {
         if let Some(a) = pids {
-            if i < ctx.array_length(a) {
+            if i < pids_len {
                 ctx.set_array_element(a, i, Value::Long(*pid));
             }
         }
         if let Some(a) = ppids {
-            if i < ctx.array_length(a) {
+            if i < ppids_len {
                 ctx.set_array_element(a, i, Value::Long(*ppid));
             }
         }
         if let Some(a) = starts {
-            if i < ctx.array_length(a) {
+            if i < starts_len {
                 // `children()` and `allProcesses()` build their handles straight
                 // out of this array — `new ProcessHandleImpl(cpids[i],
                 // stimes[i])` — so a 0 here is what left every handle in those
                 // streams unable to tell itself apart from a recycled pid.
                 ctx.set_array_element(a, i, Value::Long(start_time_or_any(*pid)));
             }
+        }
+        // Every remaining row is past the end of all three arrays; the caller
+        // only wants the COUNT from here on, and `found.len()` already has it.
+        if i >= pids_len && i >= ppids_len && i >= starts_len {
+            break;
         }
     }
     Ok(Some(Value::Int(found.len() as i32)))
@@ -4323,6 +4957,27 @@ fn native_proc_handle_get_process_pids0(
 /// arguments from `/proc/<pid>/cmdline`; Windows reports the image path only,
 /// which is exactly what HotSpot 25 answers there (`commandLine()` and
 /// `arguments()` measured EMPTY on real HotSpot for this host).
+///
+/// **Every field this native declines to write is an `Optional.empty()` the
+/// JDK's own accessor derives from the constructor default**, and that is the
+/// specified answer, not a shortfall. `ProcessHandle.Info`'s javadoc: *"The
+/// attributes of a process vary by operating system and are not available in all
+/// implementations. Information about processes is limited by the operating
+/// system privileges of the process making the request. The return types are
+/// `Optional<T>` allowing explicit tests and actions if the value is
+/// available."* The three sentinels, all confirmed by `javap -c`: `command` /
+/// `commandLine` / `arguments` / `user` are `null` -> `Optional.ofNullable`;
+/// `startTime` guards on `> 0`; `totalTime` guards on `!= -1`. Writing a
+/// plausible-looking value into any of them instead — a synthesised command line
+/// with no arguments, this VM's own user, a zero CPU total — produces a PRESENT
+/// `Optional` carrying something the OS never said, which no caller can tell
+/// from a real reading.
+///
+/// `user` is now sourced on both Linux and Windows (`os_process_user`), and
+/// `totalTime` on both as well: Windows from `GetProcessTimes`, Linux from
+/// `/proc/<pid>/stat` fields 14/15 over `sysconf(_SC_CLK_TCK)`. Both had been
+/// recorded as residuals of the lane that fixed `startTime`
+/// (docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md).
 fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -4356,6 +5011,7 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     } else {
         None
     };
+    let user = os_process_user(pid);
 
     // Pin `this` across every allocation below — each `create_string` /
     // `new_array` can trigger a moving young GC that would relocate it.
@@ -4389,6 +5045,19 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let cmd_str = ctx.create_string(&command);
         let this_cur = ctx.read_native_pin(this_pin, this);
         ctx.set_field_by_name(this_cur, "command", Value::Object(Some(cmd_str)));
+    }
+
+    // `user` is only written when the OS named an account. Left unwritten it
+    // keeps the constructor's `null`, and `user()` is `Optional.ofNullable(user)`
+    // — so absence is reported as absence. Writing a placeholder (this VM's own
+    // user, the numeric uid, the raw SID) would be indistinguishable to the
+    // caller from a real answer, and the javadoc explicitly provides for the
+    // value not being there: *"Information about processes is limited by the
+    // operating system privileges of the process making the request."*
+    if let Some(user) = user {
+        let user_str = ctx.create_string(&user);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this_cur, "user", Value::Object(Some(user_str)));
     }
 
     // Scalars last: neither write can allocate, so `this` cannot move between
@@ -5092,6 +5761,106 @@ mod tests {
             },
         );
         (handle, pid)
+    }
+
+    /// The merged one-`OpenProcess` probe must answer the SAME start time the
+    /// separate `os_process_start_time` does.
+    ///
+    /// This is not a tautology and it is the whole reason the merge is safe to
+    /// make. `ProcessHandleImpl$Info.info(pid, startTime)` — real JDK bytecode
+    /// — compares the handle's start time with the one `info0` wrote using a
+    /// bare `!=` with no `STARTTIME_ANY` wildcard, and wipes `command`,
+    /// `arguments`, `startTime`, `totalTime` and `user` off the record on a
+    /// mismatch of one millisecond. `isAlive0` supplies the handle's number and
+    /// `info0` supplies the other, so the moment `isAlive0` sources its start
+    /// time from a *different* probe than `start_time_or_any`, W5-2's two
+    /// silently-skipped `RJdkProcess` checks come straight back.
+    ///
+    /// The other two rows are the arms the old boolean `foreign_pid_is_alive`
+    /// carried and this probe inherited: a pid outside the `DWORD` range is
+    /// refused without a syscall (which is what keeps
+    /// `ProcessHandle.of(Long.MAX_VALUE)` cheap and empty), and a pid no
+    /// process holds is not alive.
+    #[test]
+    #[cfg(windows)]
+    fn one_open_reports_the_same_start_time_as_the_separate_probe() {
+        let me = std::process::id() as i64;
+        let (alive, start) = win_liveness_and_start_time(me);
+        assert!(alive, "this process is running");
+        assert_eq!(
+            start,
+            os_process_start_time(me),
+            "the merged probe and `start_time_or_any`'s source must be ONE \
+             number; `Info.info(pid, startTime)` compares them with a bare `!=`"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(me),
+            start_time_or_any(me),
+            "and so must what `isAlive0` hands back"
+        );
+
+        assert_eq!(
+            win_liveness_and_start_time(i64::MAX),
+            (false, None),
+            "a pid outside the DWORD range cannot name a process, and is \
+             refused without a syscall"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(i64::MAX),
+            -1,
+            "-1 is the only value `ProcessHandleImpl.isAlive()` reads as dead"
+        );
+    }
+
+    /// The Linux twin of the test above, asserting the same identity for the
+    /// same reason — and it is the only scheduled witness this arm has.
+    ///
+    /// The Linux merge has no Java-visible witness: what it removes is a
+    /// pid-recycle attribution window and a race between two `/proc` reads,
+    /// neither of which a regression-suite vector can provoke on demand. What
+    /// IS assertable, and is the thing that would break if the merge were wrong,
+    /// is the identity `Info.info(pid, startTime)` depends on — `isAlive0`'s
+    /// start time and `start_time_or_any`'s must be ONE number, compared there
+    /// with a bare `!=` that wipes five fields on a mismatch of one
+    /// millisecond. The moment `linux_liveness_and_start_time` parses field 22
+    /// differently from `linux_proc_stat_times`, W5-2's two silently-skipped
+    /// `RJdkProcess` checks come straight back; a shared
+    /// `linux_stat_line_times` is what makes that unfalsifiable, and this is
+    /// what checks it stayed shared.
+    ///
+    /// The third row is the arm the deleted boolean `foreign_pid_is_alive`
+    /// carried: a pid no process holds is not alive, and `-1` is the only value
+    /// `ProcessHandleImpl.isAlive()` reads that way. `i64::MAX` is far outside
+    /// `pid_max`, so `/proc/<pid>/stat` is `ENOENT` for it on any host.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn one_stat_read_reports_the_same_start_time_as_the_separate_probe() {
+        let me = std::process::id() as i64;
+        let (alive, start) = linux_liveness_and_start_time(me);
+        assert!(alive, "this process is running");
+        assert_eq!(
+            start,
+            os_process_start_time(me),
+            "the merged probe and `start_time_or_any`'s source must be ONE \
+             number; `Info.info(pid, startTime)` compares them with a bare `!=`"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(me),
+            start_time_or_any(me),
+            "and so must what `isAlive0` hands back"
+        );
+
+        assert_eq!(
+            linux_liveness_and_start_time(i64::MAX),
+            (false, None),
+            "no process holds that pid, and an absent /proc/<pid>/stat is how \
+             this platform says so"
+        );
+        assert_eq!(
+            foreign_start_time_or_dead(i64::MAX),
+            -1,
+            "-1 is the only value `ProcessHandleImpl.isAlive()` reads as dead"
+        );
     }
 
     /// The two ids are different numbers, and a `ProcessHandleImpl` native

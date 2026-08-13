@@ -284,37 +284,296 @@ fn windows_build_number() -> Option<u32> {
     Some(22000)
 }
 
-/// Derive `user.language` and `user.country` from the host locale.
+/// The four BCP-47 subtags the JDK publishes per locale category.
 ///
-/// Parses `$LC_ALL`/`$LANG` on Unix, which typically look like
-/// `en_US.UTF-8`.  Windows has no direct env equivalent; we default to
-/// `en`/`US` if the env-var approach fails.
-fn derive_locale() -> (String, String) {
-    let raw = cratonvm_types::flags::runtime_var("LC_ALL")
-        .or_else(|_| cratonvm_types::flags::runtime_var("LANG"))
-        .unwrap_or_default();
-    // Strip `.<encoding>` suffix and any `@<variant>`.
-    let base = raw
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("");
-    if let Some((lang, country)) = base.split_once('_') {
-        if !lang.is_empty() && !country.is_empty() {
-            return (lang.to_string(), country.to_string());
-        }
-    }
-    if !base.is_empty() && !base.contains('_') {
-        // Just a language code (e.g. "C" or "en")
-        if base == "C" || base == "POSIX" {
-            return ("en".to_string(), "US".to_string());
-        }
-        return (base.to_string(), String::new());
-    }
-    ("en".to_string(), "US".to_string())
+/// Mirrors the `_display_*_NDX` / `_format_*_NDX` slot groups of
+/// `jdk.internal.util.SystemProps$Raw` — the JDK's platform layer hands
+/// `SystemProps` exactly these four strings twice, once for DISPLAY and once
+/// for FORMAT, and `SystemProps.fillI18nProps` turns them into the `user.*`
+/// property family.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocaleSubtags {
+    pub language: String,
+    pub script: String,
+    pub country: String,
+    pub variant: String,
 }
+
+/// The host's two locales, as the JDK models them.
+///
+/// These are genuinely two different settings on Windows (UI language vs
+/// "Regional format") and two different `LC_*` categories on Unix, which is
+/// why `Locale.Category` exists at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostLocale {
+    /// Seeds `user.language`/`user.script`/`user.country`/`user.variant`.
+    pub display: LocaleSubtags,
+    /// Seeds the `user.*.format` overlay when it differs from `display`.
+    pub format: LocaleSubtags,
+}
+
+/// Split a locale name into BCP-47 subtags.
+///
+/// Accepts both spellings the two host families use:
+///   * BCP-47, as `GetUserDefaultLocaleName` returns it — `ru-RU`,
+///     `zh-Hans-CN`, `sr-Latn-RS`, `ca-ES-valencia`.
+///   * POSIX, as `$LANG` carries it — `ru_RU.UTF-8`, `en_US`, `C`,
+///     `sr_RS@latin`.
+///
+/// Classification follows the BCP-47 grammar the JDK's own
+/// `Locale.forLanguageTag` uses: subtag 1 is the language; a 4-alpha subtag is
+/// a script; a 2-alpha or 3-digit subtag is a region; anything after that is a
+/// variant. Java spells variants uppercase and joins multiples with `_`, which
+/// is what `Locale.getVariant()` returns, so we do the same.
+///
+/// `C` and `POSIX` map to `en`/`US`, exactly as the HotSpot launcher's
+/// `java_props_md.c` does — a real JVM never reports language `"C"`.
+pub(crate) fn parse_locale_name(raw: &str) -> LocaleSubtags {
+    // POSIX carries the charset after `.` and a modifier after `@`; BCP-47 has
+    // neither, so stripping them is a no-op on that spelling.
+    let raw = raw.trim();
+    let (head, modifier) = match raw.split_once('@') {
+        Some((h, m)) => (h, m.trim()),
+        None => (raw, ""),
+    };
+    let head = head.split('.').next().unwrap_or("").trim();
+
+    let mut out = LocaleSubtags::default();
+    let mut parts = head
+        .split(['-', '_'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(first) = parts.next() else {
+        return LocaleSubtags {
+            language: "en".to_string(),
+            country: "US".to_string(),
+            ..LocaleSubtags::default()
+        };
+    };
+    if first.eq_ignore_ascii_case("C") || first.eq_ignore_ascii_case("POSIX") {
+        return LocaleSubtags {
+            language: "en".to_string(),
+            country: "US".to_string(),
+            ..LocaleSubtags::default()
+        };
+    }
+    out.language = first.to_ascii_lowercase();
+
+    let mut variants: Vec<String> = Vec::new();
+    for part in parts {
+        // A one-character subtag is a BCP-47 *singleton* and everything after
+        // it is an extension (`ja-JP-u-ca-japanese`), not a variant. Java keeps
+        // extensions off `Locale.getVariant()`, and we do not model them, so
+        // stop rather than fold `u`/`ca`/`japanese` into the variant string.
+        if part.len() == 1 {
+            break;
+        }
+        let is_alpha = part.chars().all(|c| c.is_ascii_alphabetic());
+        let is_digit = part.chars().all(|c| c.is_ascii_digit());
+        if out.script.is_empty() && out.country.is_empty() && part.len() == 4 && is_alpha {
+            // Script subtags are Titlecase in BCP-47 and in `Locale.getScript()`.
+            let mut s = part.to_ascii_lowercase();
+            s[..1].make_ascii_uppercase();
+            out.script = s;
+        } else if out.country.is_empty()
+            && variants.is_empty()
+            && ((part.len() == 2 && is_alpha) || (part.len() == 3 && is_digit))
+        {
+            out.country = part.to_ascii_uppercase();
+        } else {
+            variants.push(part.to_ascii_uppercase());
+        }
+    }
+
+    // POSIX `@modifier`. The two that name a script rather than a variant are
+    // the Serbian/Azeri script selectors; everything else the JDK carries
+    // through as a variant.
+    match modifier.to_ascii_lowercase().as_str() {
+        "" => {}
+        "latin" | "latn" => out.script = "Latn".to_string(),
+        "cyrillic" | "cyrl" => out.script = "Cyrl".to_string(),
+        other => variants.push(other.to_ascii_uppercase()),
+    }
+    out.variant = variants.join("_");
+
+    // The three ISO-639 codes Java froze at their pre-1989 spellings.
+    // `Locale` applies this internally (`convertOldISOCodes`), so
+    // `Locale.getDefault().getLanguage()` returns the old code no matter what
+    // the property says; applying it here keeps `System.getProperty
+    // ("user.language")` and `Locale.getDefault().getLanguage()` in agreement,
+    // which is the invariant `locale_bootstrap::resolve_default_locale`
+    // depends on.
+    out.language = match out.language.as_str() {
+        "he" => "iw".to_string(),
+        "yi" => "ji".to_string(),
+        "id" => "in".to_string(),
+        _ => out.language,
+    };
+    out
+}
+
+/// Read the two host locales.
+///
+/// **Windows** — the JDK's `java_props_md.c` reads two distinct settings and
+/// this mirrors them: `GetUserDefaultUILanguage()` (Settings ▸ Language, the
+/// UI language) seeds DISPLAY, and `GetUserDefaultLocaleName()` (Settings ▸
+/// Region ▸ "Regional format") seeds FORMAT. They are independent — an English
+/// UI with a Russian regional format is an ordinary configuration — which is
+/// the whole reason `Locale.Category` exists. Before W7-67 this function did
+/// not query Windows at all and every Windows host reported `en_US`.
+///
+/// **Unix** — the JDK calls `setlocale(LC_CTYPE, "")` for FORMAT and
+/// `setlocale(LC_MESSAGES, "")` for DISPLAY, and libc resolves each from
+/// `LC_ALL` ▸ the category's own variable ▸ `LANG`. We read that precedence
+/// directly rather than linking `setlocale`, which is process-global state we
+/// do not otherwise touch. Note `LC_ALL` must beat `LANG`, not the other way
+/// round.
+fn derive_host_locale() -> HostLocale {
+    if let Some(host) = platform_host_locale() {
+        return host;
+    }
+
+    let env = |name: &str| cratonvm_types::flags::runtime_var(name).unwrap_or_default();
+    let lc_all = env("LC_ALL");
+    let lang = env("LANG");
+    let pick = |category: String| {
+        if !lc_all.trim().is_empty() {
+            lc_all.clone()
+        } else if !category.trim().is_empty() {
+            category
+        } else {
+            lang.clone()
+        }
+    };
+    HostLocale {
+        display: parse_locale_name(&pick(env("LC_MESSAGES"))),
+        format: parse_locale_name(&pick(env("LC_CTYPE"))),
+    }
+}
+
+/// The host's locales from a platform API, or `None` where there is no such
+/// API and the environment is the only source.
+///
+/// Unix/macOS deliberately return `None` rather than calling `setlocale`:
+/// `setlocale` mutates process-global state we do not otherwise touch, and the
+/// `LC_ALL` ▸ category ▸ `LANG` precedence it would apply is the one the caller
+/// reads directly.
+#[cfg(target_os = "windows")]
+fn platform_host_locale() -> Option<HostLocale> {
+    windows_host_locale()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_host_locale() -> Option<HostLocale> {
+    None
+}
+
+/// Ask Windows for the UI language and the regional format, as BCP-47 names.
+///
+/// `GetUserDefaultLocaleName` is the modern replacement for the
+/// `GetUserDefaultLCID` + `GetLocaleInfo(LOCALE_SISO639LANGNAME/
+/// LOCALE_SISO3166CTRYNAME)` pair `java_props_md.c` uses: it returns the same
+/// locale, already assembled as a BCP-47 name, so the script subtag survives
+/// (`zh-Hans-CN`) instead of having to be reconstructed from the LCID.
+///
+/// Returns `None` if either call fails, so the caller falls through to the
+/// environment path rather than inventing a locale.
+#[cfg(target_os = "windows")]
+fn windows_host_locale() -> Option<HostLocale> {
+    // LOCALE_NAME_MAX_LENGTH.
+    const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetUserDefaultLocaleName(lp_locale_name: *mut u16, cch_locale_name: i32) -> i32;
+        fn GetUserDefaultUILanguage() -> u16;
+        fn LCIDToLocaleName(
+            locale: u32,
+            lp_name: *mut u16,
+            cch_name: i32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+
+    /// Trim the trailing NUL the Win32 `*LocaleName` calls include in their
+    /// returned length and decode the UTF-16 buffer.
+    fn decode(buf: &[u16], written: i32) -> Option<String> {
+        if written <= 1 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&buf[..(written as usize - 1)]);
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    let mut buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    let written =
+        unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), LOCALE_NAME_MAX_LENGTH as i32) };
+    let format_name = decode(&buf, written)?;
+
+    // The UI language is a LANGID. `MAKELCID(langid, SORT_DEFAULT)` is just
+    // the LANGID zero-extended, since SORT_DEFAULT == 0.
+    let ui_langid = unsafe { GetUserDefaultUILanguage() };
+    let mut ui_buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    let ui_written = unsafe {
+        LCIDToLocaleName(
+            u32::from(ui_langid),
+            ui_buf.as_mut_ptr(),
+            LOCALE_NAME_MAX_LENGTH as i32,
+            0,
+        )
+    };
+    // A UI language Windows cannot name is not a reason to discard the
+    // regional format we did read — fall back to it, which is what a host with
+    // UI == format looks like anyway.
+    let display_name = decode(&ui_buf, ui_written).unwrap_or_else(|| format_name.clone());
+
+    Some(HostLocale {
+        display: parse_locale_name(&display_name),
+        format: parse_locale_name(&format_name),
+    })
+}
+
+/// Publish one `user.<base>` property family, following
+/// `jdk.internal.util.SystemProps.fillI18nProps` exactly.
+///
+/// Three rules, all of them load-bearing and none of them obvious:
+///
+///  1. **A command-line `-Duser.<base>` wins outright and suppresses the
+///     overlay.** The JDK returns from `fillI18nProps` before deriving
+///     anything, so `-Duser.language=fr` on a host whose regional format is
+///     German must NOT leave a `user.language.format=de` behind.
+///  2. **The base property takes the DISPLAY value**, not the format one.
+///  3. **`.display` is never created from platform values** — the JDK only
+///     writes it when it differs from the base, and it has just been *set*
+///     from the base, so the condition is dead. `.format` is written only when
+///     it differs from DISPLAY.
+///
+/// `cmdline` is `config.system_properties`, which the caller re-applies over
+/// `sys_props` afterwards; consulting it here is what implements rule 1.
+fn fill_i18n_props(
+    sys_props: &mut HashMap<String, String>,
+    cmdline: &[(String, String)],
+    base: &str,
+    display: &str,
+    format: &str,
+) {
+    if cmdline.iter().any(|(k, _)| k == base) {
+        return; // Rule 1: do not override, and do not derive the overlay.
+    }
+    // HotSpot publishes all four keys unconditionally, empty string included —
+    // `System.getProperty("user.variant")` is `""` there, never null. We used
+    // to omit `user.script`/`user.variant` entirely.
+    sys_props.insert(base.to_string(), display.to_string());
+    if format != display {
+        sys_props.insert(format!("{base}.format"), format.to_string());
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // SharedVm — thread-safe shared state
@@ -1644,6 +1903,21 @@ impl SharedVm {
                 cratonvm_native_builtins::util_concurrent_ext::register_synthetic_aqs_natives(
                     &mut native_methods,
                 );
+                // Same shape, same reason, one class further on: the
+                // `CyclicBarrier` natives are gated on `CRATONVM_SYNTHETIC_AQS`
+                // inside `register_concurrent_natives` because the default
+                // real-JDK build should run the real class. Synthetic mode has
+                // no real class — `CyclicBarrier` is a 3-field compatibility
+                // stub with no method bodies — so that gate left `new
+                // CyclicBarrier(2)` at `NoSuchMethodError: <init>(I)V` and all
+                // four `JucComplete` barrier fixtures red, with the TCK table
+                // still listing them as passing. Runtime-gated on
+                // `use_synthetic_jdk` (this arm), not on the flag and not on
+                // the Cargo feature, so a feature-enabled binary running
+                // real-JDK mode is unaffected.
+                cratonvm_native_builtins::util_concurrent_ext::register_cyclic_barrier_natives(
+                    &mut native_methods,
+                );
             } else {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field
@@ -2119,9 +2393,35 @@ impl SharedVm {
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
                 cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
-                cratonvm_native_builtins::jmx::register_management_factory_platform_server_stub(
-                    &mut native_methods,
-                );
+                // W7-50 (2026-08-12): `register_management_factory_platform_server_stub`
+                // used to be called here. This is the REAL-JDK arm — the
+                // `else` of `if config.use_synthetic_jdk` above — and the
+                // default build's real-JDK arm below refuses this exact call
+                // under JMX-CLUSTER-20260720, with a measured rationale
+                // (`queryNames(null, null)` returning 0 entries because every
+                // platform MXBean was being zeroed out). The feature build
+                // never got that revert, so the two builds' real-JDK arms
+                // disagreed on the one registration that decides whether
+                // `ManagementFactory.getPlatformMBeanServer()` returns a real
+                // `com.sun.jmx.mbeanserver.JmxMBeanServer` or an empty
+                // synthetic `javax/management/MBeanServer`.
+                //
+                // With the synthetic server as the receiver, `MBeanServer`'s
+                // interface natives in `native-builtins/src/jmx.rs` answer
+                // instead of real bytecode, and they bind BY NAME: getAttribute
+                // (jmx.rs:6677) probes `getAttribute(String)Object`, then
+                // `get<Cap>()Ljava/lang/Object;` and `is<Cap>()Z` with
+                // HARD-CODED return descriptors. `RJdkJmx$Counter.getValue()`
+                // returns `int`, so every probe missed and the three misses
+                // surfaced as three `NoSuchMethodError`s naming methods the
+                // fixture's own nested class never declared. Removing the call
+                // puts the real introspection back on the path and makes this
+                // arm identical to the default build's.
+                //
+                // The bind-by-name dispatch itself is NOT fixed here: it is
+                // still the only implementation synthetic mode has, and this
+                // vector cannot measure it. Recorded in
+                // W7-50-synthetic-jdk-strict-six.md as a live latent defect.
                 // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
                 // friends. The real-JDK bytecode delegates to
                 // `getPlatformMXBean(Class)` which throws "X is not a platform
@@ -2133,16 +2433,21 @@ impl SharedVm {
                 // forked test JVM continue past constructor.
                 #[cfg(feature = "management")]
                 cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
-                // Synthetic-JDK-only: `MBeanServerFactory.createMBeanServer`/
-                // `newMBeanServer` overrides. Safe here because there is no
-                // real `java.management` module to shadow. Must NOT be
-                // called from the real-JDK branch below — see the function
-                // doc for why (it broke `getPlatformMBeanServer()` interface
-                // dispatch when it leaked into real mode).
-                #[cfg(feature = "management")]
-                cratonvm_native_builtins::jmx::register_mbean_server_factory_synthetic(
-                    &mut native_methods,
-                );
+                // W7-50 (2026-08-12): `register_mbean_server_factory_synthetic`
+                // used to be called here, under a comment reading
+                // "Synthetic-JDK-only ... Must NOT be called from the real-JDK
+                // branch below — ... it broke `getPlatformMBeanServer()`
+                // interface dispatch when it leaked into real mode." The
+                // comment was right and its own call site was the leak: this
+                // is the real-JDK arm. "The branch below" was read as the
+                // `#[cfg(not(feature = "synthetic-jdk"))]` block, but the
+                // relevant fork is `if config.use_synthetic_jdk`, and these
+                // lines are in its `else`.
+                //
+                // Removing it costs synthetic mode nothing: vm_init's two
+                // call sites for this function were BOTH in this arm, so the
+                // synthetic arm never received it. Its only other caller is a
+                // unit test (jmx.rs:7172).
                 // RKC16N.11: pre-register the rest of the sun.management.*
                 // native surface so future Keycloak-boot iterations don't
                 // trip on missing-native errors as JMM init walks deeper.
@@ -2964,24 +3269,34 @@ impl SharedVm {
         // our ReentrantLock native when nested inside deep I/O call chains.
         sys_props.insert("jdk.io.useMonitors".to_string(), "true".to_string());
 
-        // JEP 498 — `sun.misc.Unsafe` memory-access methods (getObject,
-        // putOrderedLong, …) call `Unsafe.beforeMemoryAccess()` on entry.
-        // Under the JDK 25 default (`warn`) the *first* call drops into
-        // `beforeMemoryAccessSlow()`, which runs a `StackWalker.walk()` and
-        // unconditionally dereferences `frames.get(1)` to name the caller.
-        // CratonVM's StackWalker can return fewer than two frames for some
-        // native/JIT-spliced call chains, so `List.get(1)` throws
-        // ArrayIndexOutOfBoundsException — surfacing in jctools'
-        // MpscUnboundedArrayQueue (Netty's per-NioEventLoop task queue) as
-        // "failed to create a child event loop". Setting the documented
-        // escape-hatch property to `allow` makes `beforeMemoryAccess()`
-        // return at its first check (`MEMORY_ACCESS_OPTION == ALLOW`),
-        // bypassing the warning machinery entirely — exactly what a real
-        // JVM does when run with `-Dsun.misc.unsafe.memory.access=allow`.
-        sys_props.insert(
-            "sun.misc.unsafe.memory.access".to_string(),
-            "allow".to_string(),
-        );
+        // NOT seeded here: `sun.misc.unsafe.memory.access`.
+        //
+        // It used to be pinned to `allow` unconditionally, as a workaround for
+        // JEP 498: under the JDK 25 default (`warn`) the first legacy
+        // `sun.misc.Unsafe` memory access drops into
+        // `Unsafe.beforeMemoryAccessSlow()`, which walks the stack and
+        // dereferences `frames.get(1)`; CratonVM's StackWalker was reported to
+        // return fewer than two frames for some native/JIT-spliced chains, and
+        // that surfaced in jctools' `MpscUnboundedArrayQueue` (netty's
+        // per-`NioEventLoop` task queue) as "failed to create a child event
+        // loop". Pinning `allow` makes `beforeMemoryAccess()` return at its
+        // first check and bypasses the warning machinery.
+        //
+        // The cost was much larger than the fix. HotSpot sets this property
+        // ONLY for `--sun-misc-unsafe-memory-access=<mode>`; a default JDK 25
+        // run leaves it unset. netty 4.2 keys its entire Unsafe-vs-FFM
+        // decision on exactly that (`PlatformDependent0.explicitNoUnsafeCause0`
+        // disables Unsafe on Java 25+ unless the property is set), so pinning
+        // it put netty — and every other Unsafe-aware library — on a different
+        // code path than a stock JDK 25 run, and made every "CratonVM vs
+        // HotSpot" netty comparison a comparison of two different code paths.
+        //
+        // The property is now the user's to set: `vm-cli` rewrites
+        // `--sun-misc-unsafe-memory-access=<mode>` to the `-D` form and nothing
+        // else writes it, so a default run answers `null` exactly as HotSpot
+        // does. The `sun/misc/Unsafe` post-clinit repair in `vm_util.rs` reads
+        // the same property and falls back to `WARN` — the JDK's own default —
+        // rather than to a forced `ALLOW`.
 
         // Allow dynamic agents to attach to *this* running VM in-process.
         // Tools that ship as a `java.lang.instrument` agent but are launched
@@ -3122,11 +3437,48 @@ impl SharedVm {
             std::env::temp_dir().to_string_lossy().into_owned(),
         );
 
-        // Locale — derive from LANG/LC_ALL on Unix, or fall back to en_US.
-        // Format: <language>_<country>.<encoding>  e.g. "en_US.UTF-8".
-        let (user_language, user_country) = derive_locale();
-        sys_props.insert("user.language".to_string(), user_language);
-        sys_props.insert("user.country".to_string(), user_country);
+        // Locale — W7-67. Read the HOST's two locales (Windows: UI language +
+        // regional format; Unix: LC_MESSAGES + LC_CTYPE, each resolved through
+        // LC_ALL ▸ category ▸ LANG) and publish the `user.*` family the way
+        // `jdk.internal.util.SystemProps.fillI18nProps` does. This used to
+        // parse `$LANG` only, so every Windows host — where `$LANG` is unset —
+        // reported `en_US` regardless of the machine's actual settings.
+        //
+        // `config.system_properties` (the `-D` flags) is passed in so a
+        // command-line `-Duser.language=…` suppresses the derived `.format`
+        // overlay, matching the JDK; it is re-applied over `sys_props` below,
+        // which is what makes the `-D` value itself win.
+        let host_locale = derive_host_locale();
+        for (base, display, format) in [
+            (
+                "user.language",
+                &host_locale.display.language,
+                &host_locale.format.language,
+            ),
+            (
+                "user.script",
+                &host_locale.display.script,
+                &host_locale.format.script,
+            ),
+            (
+                "user.country",
+                &host_locale.display.country,
+                &host_locale.format.country,
+            ),
+            (
+                "user.variant",
+                &host_locale.display.variant,
+                &host_locale.format.variant,
+            ),
+        ] {
+            fill_i18n_props(
+                &mut sys_props,
+                &config.system_properties,
+                base,
+                display,
+                format,
+            );
+        }
         // user.timezone is normally set by the JDK's TimeZone.getDefault()
         // during initPhase1 — pre-populate with TZ env or empty string so
         // the key is at least present.
@@ -3482,12 +3834,14 @@ impl SharedVm {
                 swallow_counter: std::sync::atomic::AtomicU64::new(0),
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+                stack_dump_acked_tids: parking_lot::Mutex::new(Vec::new()),
                 stack_sample_mode: std::sync::atomic::AtomicBool::new(false),
             },
             jit: crate::vm::realms::JitRealm {
                 jit_cache: JitCache::new(),
                 profile_store: ProfileStore::new(),
                 jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                jit_gate_pass: parking_lot::RwLock::new(FxHashMap::default()),
                 // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
                 // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
                 // policy when the environment is unset.
@@ -6742,9 +7096,26 @@ impl SharedVm {
         // watchdog. They wake, emit their park-site snapshot / current
         // frames, and the process aborts right after.
         self.threads.thread_registry.unpark_all_for_stack_dump();
-        // Summarize every registered thread (incl. those with no dumpable
-        // interpreter frames — blocked in a native lock, or never started).
-        self.threads.thread_registry.dump_thread_summary_to_stderr();
+        // The per-thread summary is NOT printed here. It used to be, and that
+        // made its most load-bearing column a lie: printed at request time, it
+        // cannot know which threads went on to answer, so it labelled every
+        // RUNNING thread "read the live stack dump above" — including threads
+        // that never produced one. The watchdog now calls
+        // [`Self::dump_thread_summary_after_dumps`] once the grace period has
+        // closed, when the ack set is complete.
+    }
+
+    /// T19.H1 — print the per-thread summary once the watchdog's grace period
+    /// has closed, so it can distinguish a RUNNING thread that dumped from one
+    /// that stayed silent (i.e. is in JIT-compiled code or a long native call).
+    ///
+    /// Summarizes every registered thread, including those with no dumpable
+    /// interpreter frames — blocked in a native lock, or never started.
+    pub fn dump_thread_summary_after_dumps(&self) {
+        let acked = self.debug.stack_dump_acked_tids.lock().clone();
+        self.threads
+            .thread_registry
+            .dump_thread_summary_to_stderr(&acked);
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -6911,6 +7282,9 @@ impl SharedVm {
         self.debug
             .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // Record WHICH thread answered, not just how many did — see
+        // `stack_dump_acked_tids`.
+        self.debug.stack_dump_acked_tids.lock().push(tid);
     }
 
     /// T19.H1 — count of threads that have completed their dump.
@@ -7167,6 +7541,14 @@ impl SharedVm {
         // synthetic-jdk mode (1-field stub, slot 0 is the primitive fd tag) the
         // store still happens. `class_layout` is only populated when compact is
         // enabled, so this is a no-op (legacy behaviour) when the flag is off.
+        //
+        // 2026-08-12 (W7-84-primitive-in-reference-store.md): this guard was
+        // written against `gen_heap`, the only heap that boxed. `zgc`, `g1` and
+        // `heap` dropped the same write to null, so on those collectors the
+        // hazard above could not occur and this guard was carrying nothing.
+        // All four box now, so the guard is load-bearing on every collector —
+        // which is the honest cost of converging on the value-preserving
+        // answer, and the reason it is stated here rather than left implicit.
         let slot0_is_ref = cratonvm_gc::class_layout(ps_class_id.as_u32())
             .and_then(|l| l.field_is_ref(0))
             .unwrap_or(false);
@@ -7609,6 +7991,33 @@ impl Vm {
         ctx.check_post_block_gc();
         self.main_thread
             .set_vm_state("vm-main:blocking-region-returned");
+    }
+
+    /// Sweep every published `read_alias::SlotMap` against the class the loader
+    /// actually has, and print the one-line summary. W7-90-slot-map-sweep-caller.md.
+    ///
+    /// **Why here and not at registration.** W7-69-read-side-alias-instrument.md
+    /// settled that: at registration time most of these classes are not loaded,
+    /// and `declared_fields` returning empty is indistinguishable from "the
+    /// class has no fields" — `java.nio.DirectByteBuffer` is package-private and
+    /// is not among the 323 classes `bootstrap_core_classes` names. The sweep
+    /// has to run at a point where the workload has already caused the loads,
+    /// and this method exists so the launcher has one call rather than a
+    /// hand-rolled `NativeContextImpl` at the call site.
+    ///
+    /// Self-gated: with the flag off `verify_declared_slot_maps` returns before
+    /// touching a class, a name or a lock, so this costs one `OnceLock` load and
+    /// a branch — once, on a teardown path. It is observation-only in every
+    /// mode; the returned report is printed and dropped.
+    pub fn sweep_declared_slot_maps(
+        &mut self,
+        trigger: &str,
+    ) -> cratonvm_native_api::read_alias::SweepReport {
+        let ctx = crate::vm::vm_exec::NativeContextImpl {
+            shared: &self.shared,
+            thread: &mut self.main_thread,
+        };
+        cratonvm_native_api::read_alias::sweep_declared_slot_maps_at(&ctx, trigger)
     }
 
     /// Create a new VM with the given configuration.
@@ -9245,6 +9654,149 @@ mod tests {
             Some("CratonVM")
         );
         assert!(props.contains_key("file.encoding"));
+    }
+
+    // -----------------------------------------------------------------
+    // W7-67 — host default locale
+    // -----------------------------------------------------------------
+
+    /// The BCP-47 spelling Windows hands back. These are not "language and
+    /// country" — a script subtag sits between them and must not be mistaken
+    /// for the region, which is what a naive `split_once('_')` did.
+    #[test]
+    fn parse_locale_name_reads_bcp47_subtags() {
+        let ru = parse_locale_name("ru-RU");
+        assert_eq!(ru.language, "ru");
+        assert_eq!(ru.country, "RU");
+        assert_eq!(ru.script, "");
+        assert_eq!(ru.variant, "");
+
+        let zh = parse_locale_name("zh-Hans-CN");
+        assert_eq!(zh.language, "zh");
+        assert_eq!(zh.script, "Hans");
+        assert_eq!(zh.country, "CN");
+
+        // A 3-digit region (UN M.49) is a region, not a variant.
+        let es = parse_locale_name("es-419");
+        assert_eq!(es.language, "es");
+        assert_eq!(es.country, "419");
+
+        // Everything after the region is a variant; Java uppercases them and
+        // joins multiples with `_`.
+        let ca = parse_locale_name("ca-ES-valencia");
+        assert_eq!(ca.country, "ES");
+        assert_eq!(ca.variant, "VALENCIA");
+    }
+
+    /// The POSIX spelling `$LANG` carries, including the suffixes that are not
+    /// part of the locale.
+    #[test]
+    fn parse_locale_name_reads_posix_spelling() {
+        let ru = parse_locale_name("ru_RU.UTF-8");
+        assert_eq!(ru.language, "ru");
+        assert_eq!(ru.country, "RU");
+
+        let bare = parse_locale_name("en");
+        assert_eq!(bare.language, "en");
+        assert_eq!(bare.country, "");
+
+        // `@latin`/`@cyrillic` name a script, not a variant.
+        let sr = parse_locale_name("sr_RS@latin");
+        assert_eq!(sr.language, "sr");
+        assert_eq!(sr.country, "RS");
+        assert_eq!(sr.script, "Latn");
+
+        // Any other modifier is carried as a variant.
+        assert_eq!(parse_locale_name("de_DE@euro").variant, "EURO");
+    }
+
+    /// `java_props_md.c` maps the POSIX locales onto English/US — a real JVM
+    /// never reports language `"C"`. This is the CI default on a bare shell.
+    #[test]
+    fn parse_locale_name_maps_posix_locales_to_english() {
+        for raw in ["C", "POSIX", "C.UTF-8", "", "  "] {
+            let got = parse_locale_name(raw);
+            assert_eq!(got.language, "en", "input {raw:?}");
+            assert_eq!(got.country, "US", "input {raw:?}");
+        }
+    }
+
+    /// The three ISO-639 codes Java froze at their pre-1989 spellings. Applying
+    /// them here is what keeps `System.getProperty("user.language")` equal to
+    /// `Locale.getDefault().getLanguage()`, which `Locale` reaches by its own
+    /// internal `convertOldISOCodes`.
+    #[test]
+    fn parse_locale_name_applies_the_frozen_iso639_codes() {
+        assert_eq!(parse_locale_name("he-IL").language, "iw");
+        assert_eq!(parse_locale_name("yi").language, "ji");
+        assert_eq!(parse_locale_name("id-ID").language, "in");
+    }
+
+    /// `SystemProps.fillI18nProps` rule 2/3: the base property takes the
+    /// DISPLAY value, and `.format` appears ONLY when it differs. A host whose
+    /// UI and regional format agree — the common case — must not grow a
+    /// redundant overlay, because `Locale.getDefault(FORMAT)` reading a
+    /// present-but-equal key is indistinguishable from reading the base.
+    #[test]
+    fn fill_i18n_props_writes_the_format_overlay_only_when_it_differs() {
+        let mut props = HashMap::new();
+        fill_i18n_props(&mut props, &[], "user.language", "ru", "ru");
+        assert_eq!(props.get("user.language").map(String::as_str), Some("ru"));
+        assert!(!props.contains_key("user.language.format"));
+        // `.display` is never derived from platform values — the JDK's
+        // condition for writing it is dead once the base has taken the same
+        // value.
+        assert!(!props.contains_key("user.language.display"));
+
+        let mut split = HashMap::new();
+        fill_i18n_props(&mut split, &[], "user.language", "en", "ru");
+        assert_eq!(split.get("user.language").map(String::as_str), Some("en"));
+        assert_eq!(
+            split.get("user.language.format").map(String::as_str),
+            Some("ru")
+        );
+    }
+
+    /// `SystemProps.fillI18nProps` rule 1, and the one that is easy to get
+    /// wrong: a command-line `-Duser.language` does not merely override the
+    /// base — it suppresses the derived overlay entirely. Without this,
+    /// `-Duser.language=en -Duser.country=US` on this ru_RU host would pin the
+    /// base to en and leave `user.language.format=ru` behind, so
+    /// `NumberFormat.getInstance()` would still format in Russian and a
+    /// "pinned locale" run would not actually be pinned.
+    #[test]
+    fn fill_i18n_props_lets_a_command_line_value_suppress_the_overlay() {
+        let cmdline = vec![("user.language".to_string(), "en".to_string())];
+        let mut props = HashMap::new();
+        fill_i18n_props(&mut props, &cmdline, "user.language", "en", "ru");
+        assert!(
+            props.is_empty(),
+            "a -D base value must suppress both the derived base and the \
+             overlay, got {props:?}"
+        );
+    }
+
+    /// HotSpot publishes all four `user.*` locale keys, empty string included:
+    /// `System.getProperty("user.variant")` is `""` there, never null. We used
+    /// to omit `user.script` and `user.variant` entirely.
+    #[test]
+    fn shared_vm_publishes_the_whole_user_locale_family() {
+        let shared = SharedVm::new(VmConfig::default());
+        let props = shared.system_properties.read();
+        for key in [
+            "user.language",
+            "user.script",
+            "user.country",
+            "user.variant",
+        ] {
+            assert!(props.contains_key(key), "{key} must be published");
+        }
+        // Never the raw POSIX locale names.
+        let lang = props.get("user.language").cloned().unwrap_or_default();
+        assert!(
+            !lang.is_empty() && lang != "C" && lang != "POSIX",
+            "user.language must be a real language code, got {lang:?}"
+        );
     }
 
     #[test]

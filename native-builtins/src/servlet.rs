@@ -5,6 +5,10 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+// The heap's own object-kind discriminant. `s2_bb_arr` uses it to refuse a
+// `java.nio.Buffer.segment` that is a `MemorySegment` rather than a backing
+// array — see W7-83-segment-as-backing-array.md.
+use cratonvm_types::ObjectKind;
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::phases_late::{
@@ -1394,11 +1398,16 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
         // BEFORE the nested dispatch because that call runs arbitrary Java and a
         // moving young GC there would relocate `this`, stranding a write made
         // afterwards (native stale-local family).
+        //
+        // The delegated failure PROPAGATES: `InputStreamReader.close()` is a
+        // bare `sd.close()` under `throws IOException`, and `StreamDecoder`'s
+        // `implClose()` is a bare `in.close()` / `ch.close()`. No `catch` on
+        // that chain. W7-57-close-flush-swallow-sweep.md
         r.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
                 ctx.set_field(this, 0, Value::Object(None));
-                let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+                ctx.invoke_virtual(stream, "close", "()V", &[])?;
             }
             Ok(None)
         });
@@ -2589,11 +2598,60 @@ fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
             }
         }
     };
-    let mut stream = stream.lock();
-    match &mut *stream {
+    let mut guard = stream.lock();
+    let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.read(buf),
         #[cfg(unix)]
         TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+    };
+    drop(guard);
+    s2_tls_classify_after_block(id, result)
+}
+
+/// Re-ask the registry AFTER a blocking TLS call has returned, and report a
+/// concurrent `close()` as such instead of as EOF or as a peer error.
+///
+/// This is the close-awareness half of W7-53's mechanism that a TLS record
+/// layer CAN safely take. The other half — parking in `poll` on a bounded
+/// slice and abandoning the wait when the registry entry disappears — must NOT
+/// be transplanted here: `native_tls::TlsStream::read` assembles a TLS record
+/// across an unbounded number of underlying `recv` calls and exposes no
+/// "is a whole record available" query, so a loop that returned between two of
+/// them would hand the caller a partial record and desynchronise the stream
+/// for good. Classifying a call that has ALREADY returned cannot do that: the
+/// record layer is at rest at that point, by construction.
+///
+/// `ErrorKind::Interrupted` is the carrier the rest of this family uses
+/// (`net_phase_e::re1_socket_closed_err`, `socket_channel::
+/// channel_async_closed_err`) and it is unambiguous here for the same reason:
+/// the only producer below is this function, and it produces it only when the
+/// id has left the registry — a state no successful I/O can be in.
+///
+/// What this does NOT do on its own is END the wait. That is
+/// [`s2_tls_close`]'s job (it shuts the duplicate handle down), and on Windows
+/// it still cannot: see the note there.
+fn s2_tls_classify_after_block(
+    id: i32,
+    result: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    // Cheap and exact: a live id is still in the table. Taken AFTER the call,
+    // deliberately — a close that landed while this thread was parked is then
+    // observed on the very next instruction, and a close that raced a
+    // readiness edge still wins, which is what HotSpot does (it fails an I/O a
+    // concurrent `close()` beat rather than handing back bytes on a socket
+    // Java has already closed).
+    if s2_registry().lock().tls_streams.contains_key(&id) {
+        return result;
+    }
+    match result {
+        // Bytes that genuinely arrived before the close are still delivered:
+        // dropping them would lose data the peer really sent, and the NEXT
+        // call reports the close.
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "socket closed",
+        )),
     }
 }
 
@@ -2616,12 +2674,17 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
             }
         }
     };
-    let mut stream = stream.lock();
-    match &mut *stream {
+    let mut guard = stream.lock();
+    let result = match &mut *guard {
         TlsClientStream::Native(stream) => stream.write(data),
         #[cfg(unix)]
         TlsClientStream::LegacyDsa(stream) => stream.write(data),
-    }
+    };
+    drop(guard);
+    // Same after-the-fact classification as the read side, and safe for the
+    // same reason — see `s2_tls_classify_after_block`. A partial write that
+    // did land is reported as such; the next call reports the close.
+    s2_tls_classify_after_block(id, result)
 }
 
 /// NEW-13: perform a graceful TLS shutdown (close_notify) and drop the stream.
@@ -2635,12 +2698,53 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
     // Unregister under the registry lock, shut down outside it.
     let entry = s2_registry().lock().tls_streams.remove(&id);
     if let Some(entry) = entry {
+        // ─── WAKE THE PARKED PEER FIRST (W7-61) ──────────────────────────────
+        //
+        // `TlsEntry::raw` is a `try_clone`d handle on the same socket, and its
+        // doc comment says it exists precisely so an fd-level operation can run
+        // without waiting on `stream`'s mutex. This close never used it, and
+        // the sentence below it — "the entry is already unregistered, so
+        // dropping the handle suffices" — is false in the one case that
+        // matters: a thread parked in `s2_tls_read_direct` holds an `Arc` on
+        // the stream, so dropping OUR `Arc` closes nothing, the `try_lock`
+        // below always fails, and the reader waits forever. That is W7-53's
+        // "four TLS sites" row.
+        //
+        // A `shutdown` on the duplicate is the record-safe wakeup: it does not
+        // take the stream mutex, does not free the handle the parked thread is
+        // mid-syscall on (so it cannot be a use-after-close), and does not
+        // interrupt the record layer at an arbitrary point — it ends the
+        // underlying byte stream, which the record layer already has to handle.
+        //
+        // PLATFORM, stated as a contract rather than as a measurement (no Linux
+        // arm was run for this change):
+        //   * Unix — `shutdown(SHUT_RDWR)` wakes a parked `recv` with EOF, so
+        //     the reader returns and `s2_tls_classify_after_block` then reports
+        //     the close rather than a spurious end-of-stream.
+        //   * Windows — Winsock has NO `shutdown` that aborts a pending
+        //     blocking call; only `closesocket` does, and closing a handle a
+        //     worker is inside a syscall on is exactly the use-after-close
+        //     `pipe.rs` was fixed for. So on Windows this call is a no-op for
+        //     an already-parked reader and that half of the row stays OPEN.
+        //     It is written down rather than quietly counted, for the same
+        //     reason W7-53 left the Windows pipe sink write open: a mechanism
+        //     that compiles, looks like the others, and cannot deliver the
+        //     wakeup is what removes a site from a census while leaving the
+        //     defect. The correct Windows fix is the same one that file names —
+        //     overlapped I/O with a bounded `GetOverlappedResultEx` — which is
+        //     a change to how the socket is created, not landable on
+        //     inspection.
+        if let Some(raw) = entry.raw.as_ref() {
+            let _ = raw.shutdown(std::net::Shutdown::Both);
+        }
         // Best-effort: if the peer already closed the connection, shutdown
         // can legitimately return an error that should not surface as an
         // exception to Java-side callers. `try_lock` because a peer parked in
         // a blocking read on this same stream holds the per-stream mutex —
         // waiting for it here would just relocate the stall we removed. The
-        // entry is already unregistered, so dropping the handle suffices.
+        // graceful TLS `close_notify` this sends is the nicety; the `raw`
+        // shutdown above is the liveness guarantee, and it does not depend on
+        // winning this lock.
         if let Some(mut stream) = entry.stream.try_lock() {
             match &mut *stream {
                 TlsClientStream::Native(stream) => {
@@ -3287,8 +3391,31 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     // was:<0.0>" across nearly the entire ES vector-codec test family —
     // every value read through a typed-buffer view came back zero
     // regardless of what was actually written.
+    //
+    // W7-83: and slot 5 is `Buffer.segment` on a REAL loaded `java.nio.Buffer`,
+    // where the value is a `MemorySegment`, not an array. Measured on Eclipse
+    // Adoptium 25.0.3.9: `ByteBuffer.allocate(16)` has `segment == null`,
+    // `ByteBuffer.allocateDirect(16)` has `segment == null`, and
+    // `Arena.ofAuto().allocate(16).asByteBuffer()` has `hb == null` and
+    // `segment == jdk.internal.foreign.NativeMemorySegmentImpl`.
+    //
+    // Without the kind screen this function returned that `MemorySegment` to
+    // `array()`, whose declared return type is `[B`, and made `hasArray()`
+    // answer `true` where HotSpot answers `false`. **This registration wins in
+    // Compatible mode** (W7-76 §2: `set_drop_real_layout_synthetic(true)` runs
+    // before `register_io_natives`, so `register_nio_natives` is skipped and
+    // nothing overwrites s2), and `array`/`hasArray`/`arrayOffset` are all on
+    // `native_override.rs`'s forced-native list for `java/nio/ByteBuffer`, so
+    // the native answers even though the real bytecode is present.
+    //
+    // Rejecting the segment is what makes the receiver fall through to the
+    // callers' direct arms: `array()`'s `None if s2_bb_direct_addr(..)` arm
+    // raises `UnsupportedOperationException` and `hasArray()` answers false —
+    // exactly HotSpot. `s2_bb_direct_addr` keeps its own
+    // `is_plausible_native_addr` screen, which is untouched and is still what
+    // stops a heap buffer's `address = 16` being dereferenced.
     match ctx.get_field(buf, BB_SEGMENT_SLOT) {
-        Value::Object(Some(a)) => Some(a),
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == ObjectKind::Array => Some(a),
         _ => None,
     }
 }
@@ -3947,13 +4074,13 @@ fn listener_pollreq_fd(listener: &TcpListener) -> i64 {
 }
 
 #[cfg(unix)]
-fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
+pub(crate) fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
     use std::os::unix::io::AsRawFd;
     sock.as_raw_fd() as i64
 }
 
 #[cfg(windows)]
-fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
+pub(crate) fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
     use std::os::windows::io::AsRawSocket;
     sock.as_raw_socket() as i64
 }
@@ -4352,6 +4479,110 @@ fn poll_empty_selector(ctx: &mut dyn NativeContext, sel: ObjectRef, timeout_ms: 
     }
 }
 
+// ---- Close-awareness for the synthetic NIO surface -------------------------
+//
+// A thread parked in a blocking accept/read/write on one of these sockets must
+// come back when another thread closes the channel. It could not: `close`
+// removes the entry from `s2_registry()`, but the parked thread cloned the
+// `Arc` / `try_clone`d the handle out before it started, so the OS socket stays
+// open and the syscall stays in the kernel. That is the same defect the three
+// readers fixed on 2026-08-07/11 had, and the loop below is the same loop —
+// park in `poll`, re-ask the registry every slice — rather than a second
+// mechanism doing the same job.
+//
+// `net_phase_e.rs` documents this file's accept as broken in a comment of its
+// own ("on Windows, closing one duplicated socket handle does not unblock a
+// thread blocked in `accept()` on another duplicate"); the fix landed there and
+// not here.
+
+/// How long a parked synthetic-NIO operation waits inside one poll before
+/// re-asking `s2_registry()` whether its socket was closed under it. Same value
+/// and same role as `native-io/src/net.rs`'s `NET_READ_CLOSE_POLL_MS`.
+const S2_CLOSE_POLL_MS: i32 = 25;
+
+/// Readiness with a bounded wait, over this file's existing [`selector_poll`]
+/// abstraction rather than a fresh binding of `poll(2)`/`WSAPoll`.
+///
+/// `Some(true)` ready (including POLLERR/POLLHUP, which the following syscall
+/// then surfaces as the concrete error); `Some(false)` the slice expired;
+/// `None` the OS poll itself failed — the caller's signal to fall back to one
+/// plain blocking syscall rather than spin on something that can never report
+/// readiness.
+pub(crate) fn s2_poll_ready(fd: i64, want_write: bool, timeout_ms: i32) -> Option<bool> {
+    let req = PollReq {
+        fd,
+        events: if want_write { POLL_OUT } else { POLL_IN },
+    };
+    let revents = selector_poll(&[req], timeout_ms);
+    let bits = *revents.first()?;
+    let wanted = if want_write { POLL_OUT } else { POLL_IN };
+    Some(bits & (wanted | POLL_ERR | POLL_HUP) != 0)
+}
+
+/// Is `lid` still a live listener? `ServerSocketChannel.close()` removes the
+/// entry, so this flips exactly when Java closed it.
+fn s2_listener_still_registered(lid: i32) -> bool {
+    s2_registry().lock().listeners.contains_key(&lid)
+}
+
+/// Is `sid` still a live stream? `SocketChannel.close()` removes the entry.
+pub(crate) fn s2_stream_still_registered(sid: i32) -> bool {
+    s2_registry().lock().streams.contains_key(&sid)
+}
+
+/// Is `sid` still a live datagram socket? `DatagramChannel.close()` removes the
+/// entry. Exposed for `phases_late::net_channels`, whose `DatagramChannel` sites
+/// share this registry.
+pub(crate) fn s2_dgram_still_registered(sid: i32) -> bool {
+    s2_registry().lock().dgrams.contains_key(&sid)
+}
+
+/// The error a parked synthetic-NIO operation reports once its socket has been
+/// closed from another thread. `ErrorKind::Interrupted` is the carrier all
+/// three landed close-aware readers use, and it is unambiguous here because
+/// [`s2_poll_ready`] never reports EINTR as an error.
+pub(crate) fn s2_async_closed_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "channel closed")
+}
+
+/// Park until `fd` is ready or the socket `still_registered` names is closed.
+///
+/// `Ok(true)` ready; `Ok(false)` no usable poll primitive, fall back to one
+/// plain blocking syscall; `Err(Interrupted)` closed from another thread.
+///
+/// The registry lock is taken inside `still_registered` for that lookup alone
+/// and is never held across the poll — the whole point of cloning the handle
+/// out first, and the reason `s2_registry()` being a single process-wide mutex
+/// is survivable at all.
+///
+/// # On expiry
+///
+/// The per-pass `S2_CLOSE_POLL_MS` slice expiring is not an outcome — it is
+/// only the point at which the registry is re-asked, and the loop continues.
+/// There is no second deadline here because none of these call sites has a
+/// `SO_TIMEOUT` to honour: this synthetic `SocketChannel` surface exposes no
+/// timed read, and `ServerSocketChannel.accept()` is untimed by contract.
+pub(crate) fn s2_wait_ready_close_aware(
+    fd: i64,
+    want_write: bool,
+    still_registered: &dyn Fn() -> bool,
+) -> std::io::Result<bool> {
+    loop {
+        let Some(ready) = s2_poll_ready(fd, want_write, S2_CLOSE_POLL_MS) else {
+            return Ok(false);
+        };
+        // Asked AFTER the poll so a close landing while we are parked is seen
+        // on the very next pass, and a close that raced a readiness edge still
+        // wins.
+        if !still_registered() {
+            return Err(s2_async_closed_err());
+        }
+        if ready {
+            return Ok(true);
+        }
+    }
+}
+
 fn s2_try_accept_nonblocking(reg: &mut SocketRegistry, lid: i32) -> Option<i32> {
     let listener = reg.listeners.get(&lid)?;
     let _ = listener.set_nonblocking(true);
@@ -4383,6 +4614,34 @@ pub(crate) fn s2_blocking_accept(lid: i32) -> Option<i32> {
         let _ = l.set_nonblocking(false);
         l.try_clone().ok()?
     };
+    // CLOSE-AWARENESS 2026-08-12: `try_clone()` is precisely why the close
+    // could not reach this accept. `ServerSocketChannel.close()` removes the
+    // registry entry and drops ITS listener; this thread is parked on a
+    // DUPLICATE handle, and on Windows closing one duplicate does not abort a
+    // blocking call on another. So park in `poll` and re-ask the registry —
+    // the same loop `net::net_accept_close_aware`,
+    // `socket_channel::accept_close_aware` and `re2_accept_into` all use.
+    //
+    // `Ok(false)` (no poll primitive on this target) falls through to the plain
+    // blocking accept, which cannot see the close but at least still accepts.
+    match s2_wait_ready_close_aware(
+        listener_pollreq_fd(&listener),
+        false,
+        &|| s2_listener_still_registered(lid),
+    ) {
+        Ok(_) => {}
+        // Closed under us. `None` is this function's existing "no connection"
+        // answer and every caller already handles it.
+        Err(_) => return None,
+    }
+    // NAMED RESIDUAL: with two threads accepting the same `lid`, the loser of
+    // the race between the poll above and this `accept()` parks again until the
+    // next connection, and that park is not close-aware. It is not closed by
+    // flipping the clone non-blocking: `try_clone` shares the blocking mode with
+    // the registry's listener on both platforms (a `dup`'s O_NONBLOCK lives on
+    // the open file description; a Windows duplicate shares the socket's FIONBIO
+    // state), so this thread would be changing the other one's contract. Every
+    // accept parked before this change; at most one loser parks after it.
     match listener.accept() {
         Ok((stream, _)) => {
             let mut reg = s2_registry().lock();
@@ -5558,9 +5817,45 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Object(None))),
         }
     });
+    // `arrayOffset()` has the SAME two refusals as `array()` eighteen lines
+    // above, and had neither — a direct receiver answered `0`, which is a
+    // perfectly ordinary offset, so `hasArray()`-less code that reached for the
+    // offset got a number instead of the exception that tells it to take the
+    // direct path. The real JDK body is three lines and both of them are in it:
+    //
+    // ```java
+    // if (hb == null)  throw new UnsupportedOperationException();
+    // if (isReadOnly)  throw new ReadOnlyBufferException();
+    // return offset;
+    // ```
+    //
+    // Transcribed from the `array()` arm rather than written afresh, so the two
+    // cannot drift; the storage classification and both `RuntimeError` variant
+    // shapes are that arm's. Measured oracle rows, probes/DirectByteBufferStateProbe.expected.txt
+    // on jdk-25.0.3.9: `direct.arrayOffset.throws`, `direct.win.arrayOffset.throws`
+    // and `direct.win.readOnly.arrayOffset.throws` are `UnsupportedOperationException`;
+    // `heap.win.readOnly.arrayOffset.throws` is `ReadOnlyBufferException`; the
+    // happy paths are `heap.arrayOffset = 0` and `heap.win.arrayOffset = 4`, so
+    // the window's base still has to come through. Record: W7-83 §7.1.
     r.register(bb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
+        match s2_bb_arr(ctx, this) {
+            Some(_) => {
+                if s2_bb_is_read_only(ctx, this) {
+                    return Err(RuntimeError::ReadOnlyBufferException.into());
+                }
+                Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32)))
+            }
+            None if s2_bb_direct_addr(ctx, this).is_some() => {
+                Err(RuntimeError::UnsupportedOperationException {
+                    message: "direct buffer has no backing array".to_string(),
+                }
+                .into())
+            }
+            // Storage-less synthetic: keep the historic benign zero, for the
+            // same reason `array()` keeps its historic benign null.
+            None => Ok(Some(Value::Int(s2_bb_heap_base(ctx, this) as i32))),
+        }
     });
     r.register(bb, "hasArray", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5633,13 +5928,44 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     // advanced native `address`. The bare-synthetic 6-slot layout has no
     // `offset` field to carry a base, so it keeps the legacy copying
     // behaviour (data-correct, aliasing not representable).
+    //
+    // BYTE ORDER IS **NOT** CARRIED ACROSS ANY OF THESE FOUR. All four ran
+    // `let ord = s2_bb_order(ctx, this)` and propagated it, and that is wrong in
+    // a way no amount of aliasing correctness compensates for.
+    //
+    // The mechanism, because it is not obvious from any javadoc: each of these
+    // four returns a NEW buffer built by a `ByteBuffer` constructor, and
+    // `boolean bigEndian = true` is a FIELD INITIALISER on `ByteBuffer` — it
+    // runs on every construction, so a derived view comes back BIG_ENDIAN
+    // however the source was set. These methods preserve CONTENT, not ORDER.
+    // And `order()` is `public final`, reading the field directly, so there is
+    // no per-subclass override point at which a propagated order could be
+    // corrected afterwards.
+    //
+    // The `s2` registrar WINS in Compatible mode and all four descriptors are
+    // force-native, so the propagation was live:
+    // `ByteBuffer.allocate(16).order(LITTLE_ENDIAN).slice().order()` answered
+    // LITTLE_ENDIAN where HotSpot answers BIG_ENDIAN, and **every typed read
+    // through such a view was byteswapped relative to HotSpot** — a wrong value,
+    // not an exception, which is the quiet kind.
+    //
+    // Measured, jdk-25.0.3.9:
+    // `{direct,heap}.ord.{slice,sliceRange,duplicate,readOnly}.order = BIG_ENDIAN`.
+    // Record: W7-76 §10.
+    //
+    // THE EXCLUSION, and it is the reason this is a comment and not a one-line
+    // diff: `as<T>Buffer()` DOES carry the order, and must keep doing so. It
+    // reaches it through `s2_bb_order`'s `java/nio/ByteBufferAs…{B,L}`
+    // class-name arm — a different mechanism at a different site — because the
+    // JDK picks the `B` or the `L` view class from the source's order at
+    // construction time. Do not "fix the inconsistency" by unifying the two.
     r.register(bb, "slice", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this).max(0);
         let lim = s2_bb_limit(ctx, this).max(pos);
         let rem = lim - pos;
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         if s2_bb_synthetic_layout(ctx, this) {
             let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
             if let Some(src) = s2_bb_arr(ctx, this) {
@@ -5690,7 +6016,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let lim = s2_bb_limit(ctx, this);
         s2_check_from_index_size(index, length, lim)?;
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                 s2_bb_new_heap_view(
@@ -5740,7 +6066,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let cap = s2_bb_cap(ctx, this);
         let mark = s2_bb_get_mark(ctx, this);
         let ro = s2_bb_is_read_only(ctx, this);
-        let ord = s2_bb_order(ctx, this);
+        let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                 s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, ro, ord)
@@ -5778,7 +6104,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let lim = s2_bb_limit(ctx, this);
             let cap = s2_bb_cap(ctx, this);
             let mark = s2_bb_get_mark(ctx, this);
-            let ord = s2_bb_order(ctx, this);
+            let ord = 0; // BIG_ENDIAN — HotSpot RESETS the order on a derived view; see the block comment above
             let buf = match s2_bb_storage(ctx, this) {
                 Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
                     s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, true, ord)
@@ -6785,18 +7111,44 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut tmp = vec![0u8; cap];
+        // `s2_blocking_accept` leaves the streams it registers in BLOCKING
+        // mode, so a `SocketChannel.read` on one of them parks in `recv` — and
+        // `close` only removes the map entry, which cannot reach a thread
+        // holding an `Arc` clone of the stream. Gate on the channel's own
+        // recorded mode: a non-blocking channel must keep answering 0
+        // (`IOStatus.UNAVAILABLE`) immediately, which is what every
+        // selector-driven reactor on this surface depends on.
+        let blocking = ctx.get_field(this, S2SC_BLOCKING).as_int().unwrap_or(1) != 0;
         let n = {
             let stream = {
                 let reg = s2_registry().lock();
                 reg.streams.get(&sock_id).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
-                    Ok(0) => -1i32,
-                    Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                    Err(_) => -1,
+                let closed_first = blocking
+                    && matches!(
+                        s2_wait_ready_close_aware(stream_pollreq_fd(&stream), false, &|| {
+                            s2_stream_still_registered(sock_id)
+                        }),
+                        Err(_)
+                    );
+                if closed_first {
+                    // Closed from another thread while parked. -1 is this
+                    // surface's end-of-input answer and unwinds the caller's
+                    // read loop, which is the outcome the close has to produce;
+                    // it is a weaker answer than the
+                    // `AsynchronousCloseException` the real `SocketChannel`
+                    // path raises, and is named as such in
+                    // W7-53-blocking-close-family.md.
+                    -1i32
+                } else {
+                    let mut stream_ref = &*stream;
+                    match stream_ref.read(&mut tmp) {
+                        Ok(0) => -1i32,
+                        Ok(n) => n as i32,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(_) => -1,
+                    }
                 }
             } else {
                 -1
@@ -6826,17 +7178,32 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         if data.is_empty() {
             return Ok(Some(Value::Int(0)));
         }
+        // Write twin of the read above — a blocking `send` parks behind peer
+        // backpressure exactly as a `recv` parks behind peer silence, and the
+        // close reaches neither.
+        let blocking = ctx.get_field(this, S2SC_BLOCKING).as_int().unwrap_or(1) != 0;
         let n = {
             let stream = {
                 let reg = s2_registry().lock();
                 reg.streams.get(&sock_id).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match stream_ref.write(&data) {
-                    Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                    Err(_) => -1,
+                let closed_first = blocking
+                    && matches!(
+                        s2_wait_ready_close_aware(stream_pollreq_fd(&stream), true, &|| {
+                            s2_stream_still_registered(sock_id)
+                        }),
+                        Err(_)
+                    );
+                if closed_first {
+                    -1i32
+                } else {
+                    let mut stream_ref = &*stream;
+                    match stream_ref.write(&data) {
+                        Ok(n) => n as i32,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                        Err(_) => -1,
+                    }
                 }
             } else {
                 -1
@@ -7640,6 +8007,162 @@ mod tests {
                  feature-designs/native-builtins-shim-audit.md."
             );
         }
+    }
+
+    /// W7-83 — `java.nio.Buffer.segment` is not a backing array, on the
+    /// registration that WINS in Compatible mode.
+    ///
+    /// W7-76 §2 settled the registration question: in both Compatible arms
+    /// `set_drop_real_layout_synthetic(true)` runs before `register_io_natives`,
+    /// so `register_nio_natives` is skipped and nothing overwrites
+    /// `register_s2_bytebuffer`. `array()[B`, `hasArray()Z` and `arrayOffset()I`
+    /// are all on `native_override.rs`'s forced-native list for
+    /// `java/nio/ByteBuffer`, so these natives answer even with the real
+    /// bytecode present.
+    ///
+    /// Measured on Eclipse Adoptium 25.0.3.9 (`probes/DirectByteBufferStateProbe.java`,
+    /// section `seg`): `Arena.ofAuto().allocate(16).asByteBuffer()` is a
+    /// `java.nio.DirectByteBuffer` with `hb == null`, `segment ==
+    /// jdk.internal.foreign.NativeMemorySegmentImpl` and a real process pointer
+    /// in `address`; `hasArray()` is **false** and `array()` throws
+    /// `UnsupportedOperationException`. Before the screen `s2_bb_arr` returned
+    /// the segment, so `hasArray()` answered true and `array()` — whose declared
+    /// return type is `[B` — handed back a `MemorySegment`.
+    ///
+    /// The heap control arm is asserted in the same test: a genuine backing
+    /// array must still answer `hasArray() == true` and come back from
+    /// `array()`, or the screen has merely broken the other population.
+    #[test]
+    fn s2_bytebuffer_refuses_a_memory_segment_as_a_backing_array() {
+        use cratonvm_native_api::FieldMetadata;
+
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        register_s2_bytebuffer(&mut registry);
+        let array_fn = registry
+            .find("java/nio/ByteBuffer", "array", "()[B")
+            .expect("ByteBuffer.array native");
+        let has_array_fn = registry
+            .find("java/nio/ByteBuffer", "hasArray", "()Z")
+            .expect("ByteBuffer.hasArray native");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        // Answer an unresolvable name the way production does, so `hb` reads
+        // back as absent rather than as the mock's historic `Int(0)`.
+        ctx.set_absent_field_answers_null(true);
+        let cid = ctx
+            .ensure_class_initialized("java/nio/DirectByteBuffer")
+            .expect("mock class");
+        // The real JDK 25 layout, transitively over the superclass chain:
+        // mark(0) position(1) limit(2) capacity(3) address(4) segment(5)
+        // hb(6) offset(7). Declaring it is what makes `hb`-by-name resolve to
+        // slot 6 (and answer null) instead of never resolving at all.
+        ctx.set_declared_fields(
+            cid,
+            [
+                ("mark", "I", 0),
+                ("position", "I", 1),
+                ("limit", "I", 2),
+                ("capacity", "I", 3),
+                ("address", "J", 4),
+                ("segment", "Ljava/lang/foreign/MemorySegment;", 5),
+                ("hb", "[B", 6),
+                ("offset", "I", 7),
+            ]
+            .into_iter()
+            .map(|(name, descriptor, slot_index)| FieldMetadata {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: cid,
+                is_static: false,
+            })
+            .collect(),
+        );
+
+        let mut native = vec![0u8; 16];
+        let addr = native.as_mut_ptr() as i64;
+        let segment = match ctx
+            .new_object("jdk/internal/foreign/NativeMemorySegmentImpl")
+            .expect("segment stand-in")
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        let buf = match ctx.new_object("java/nio/DirectByteBuffer").expect("buffer") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(buf, 0, Value::Int(-1)); // mark
+        ctx.set_field(buf, BB_POS, Value::Int(0));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(16));
+        ctx.set_field(buf, BB_CAP, Value::Int(16));
+        ctx.set_field(buf, BB_MARK, Value::Long(addr)); // real layout: `address`
+        ctx.set_field(buf, BB_SEGMENT_SLOT, Value::Object(Some(segment)));
+
+        assert!(
+            s2_bb_arr(&ctx, buf).is_none(),
+            "a MemorySegment at slot 5 was returned as a backing array"
+        );
+        assert!(
+            matches!(
+                has_array_fn(&mut ctx, &[Value::Object(Some(buf))]),
+                Ok(Some(Value::Int(0)))
+            ),
+            "HotSpot answers hasArray() == false for an Arena segment's \
+             asByteBuffer(); measured, not assumed"
+        );
+        let thrown = array_fn(&mut ctx, &[Value::Object(Some(buf))]);
+        match &thrown {
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                RuntimeError::UnsupportedOperationException { .. },
+            ))) => {}
+            other => panic!(
+                "array() on an Arena segment's buffer must throw \
+                 UnsupportedOperationException as HotSpot does, got {other:?}"
+            ),
+        }
+
+        // --- the control: a genuine heap buffer still answers with its array.
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        let heap = match ctx.new_object("java/nio/HeapByteBuffer").expect("buffer") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(heap, BB_ARRAY, Value::Object(Some(arr)));
+        ctx.set_field(heap, BB_POS, Value::Int(0));
+        ctx.set_field(heap, BB_LIMIT, Value::Int(16));
+        ctx.set_field(heap, BB_CAP, Value::Int(16));
+        assert_eq!(s2_bb_arr(&ctx, heap), Some(arr));
+        assert!(matches!(
+            has_array_fn(&mut ctx, &[Value::Object(Some(heap))]),
+            Ok(Some(Value::Int(1)))
+        ));
+        let got = array_fn(&mut ctx, &[Value::Object(Some(heap))]);
+        match &got {
+            Ok(Some(Value::Object(Some(a)))) if *a == arr => {}
+            other => panic!(
+                "a genuine heap buffer must still answer array() with its own \
+                 backing array, got {other:?}"
+            ),
+        }
+
+        // --- and the OTHER slot-5 population: `native-builtins`' own typed
+        // buffer views park a real array there, because `segment` is the only
+        // Object-typed field `Buffer` declares. The screen must not take them
+        // out with the MemorySegment.
+        let view_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        let view = match ctx.new_object("java/nio/IntBuffer").expect("view") {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        ctx.set_field(view, BB_SEGMENT_SLOT, Value::Object(Some(view_arr)));
+        assert_eq!(
+            s2_bb_arr(&ctx, view),
+            Some(view_arr),
+            "a typed buffer view's backing array lives at slot 5 and must \
+             still resolve"
+        );
     }
 
     #[test]

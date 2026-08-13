@@ -51,7 +51,32 @@ public class RPriorityQueueGc {
 
     static volatile Object sink;
 
+    /**
+     * Count of assertions whose EXECUTION COUNT is deterministic, published on a
+     * CK line so the cross-VM diff can see a run that silently asserted fewer
+     * things than the oracle (harness guard G3; see
+     * regression-suite/harness-guard.sh and
+     * docs/known-issues/jdk-only/W7-60-harness-extract-blindness.md).
+     */
+    static int checks = 0;
+
     static void check(boolean cond, String what) {
+        checks++;
+        if (!cond) {
+            throw new AssertionError("RPriorityQueueGc: " + what);
+        }
+    }
+
+    /**
+     * Same assertion, deliberately NOT counted. Used only inside the concurrent
+     * drain loop, whose trip count is how many of the workers' interleaved
+     * poll()s happened to find a non-empty queue — scheduling-dependent, and
+     * therefore different on two VMs that are both correct. `checks` is printed
+     * on a line the runner diffs against HotSpot, so folding these in would make
+     * a CORRECT VM go red at random. The count stays a constant for a healthy
+     * run and moves only when an arm stops executing, which is what G3 is for.
+     */
+    static void checkDyn(boolean cond, String what) {
         if (!cond) {
             throw new AssertionError("RPriorityQueueGc: " + what);
         }
@@ -86,7 +111,8 @@ public class RPriorityQueueGc {
     public static void main(String[] args) throws Exception {
         singleThreaded();
         concurrent();
-        System.out.println("PASS RPriorityQueueGc");
+        System.out.println("CK RPriorityQueueGc checks=" + checks);
+        System.out.println("PASS RPriorityQueueGc (" + checks + " checks)");
     }
 
     // ---- 1. sorted insert survives a GC inside compareTo -------------------
@@ -165,10 +191,10 @@ public class RPriorityQueueGc {
         long prev = Long.MIN_VALUE;
         Object o;
         while ((o = q.poll()) != null) {
-            check(o instanceof Item, "drain returned " + o.getClass().getName());
+            checkDyn(o instanceof Item, "drain returned " + o.getClass().getName());
             Item it = (Item) o;
-            check(it.payload == it.key * 3 + 1, "drain corrupted: " + it);
-            check(it.key >= prev, "drain out of order: " + it.key + " after " + prev);
+            checkDyn(it.payload == it.key * 3 + 1, "drain corrupted: " + it);
+            checkDyn(it.key >= prev, "drain out of order: " + it.key + " after " + prev);
             prev = it.key;
             drained++;
         }

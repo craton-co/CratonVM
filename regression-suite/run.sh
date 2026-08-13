@@ -70,6 +70,15 @@ TIMEOUT="${TIMEOUT:-120}"
 # so ServiceLoader discovery goes through ClassLoader.getResources rather than
 # a fabricated shortcut.
 MODSRC="$HERE/modules"
+# Sources recompiled OVER $MODBUILD once the module itself has been compiled,
+# with no module context. This is how the suite expresses a provider shape javac
+# REFUSES in a `provides` clause (a `provider()` whose return type is not a
+# subtype of the service): javac enforces that only while compiling
+# module-info.java, and `ServiceLoader.loadProvider` carries the same rule as a
+# RUNTIME gate precisely for modules that were not assembled by javac. Dropping
+# this pass leaves a module that passes its own NEGATIVE test, so
+# `compile_modules` fails loudly rather than skipping it.
+MODOVERLAY="$HERE/modules-overlay"
 RESOURCES="$HERE/resources"
 JDKONLY_MODULE="cratonvm.jdkonly.svc"
 
@@ -94,7 +103,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # every scheduled class already receives that flag, so a second registration
 # would run the identical command twice. Nothing schedules by glob — every list
 # here is explicit — so the name collision is cosmetic.
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RChaCha20Cipher RLockedIdentityHash RCanAccessReceiver RForeignLayoutCollections RForeignLayoutJdkInterfaces RLoaderChurnDefine RClassUnloadSweep RPriorityQueueGc RTreeRangeGc RJdkViews"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -107,7 +116,7 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
 # a defined class read back through java.lang.Class — so a registered surface
 # agreeing with itself cannot make them pass.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass RJdkX509Intercept RJdkLogging"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
@@ -213,9 +222,19 @@ fi
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
 
-# Extract only the deterministic test lines (PASS/CK), stripping CratonVM's
-# timestamped WARN/tracing noise and ANSI colour, so the cross-VM diff is clean.
-extract() { sed 's/\x1b\[[0-9;]*m//g' | grep -aE '^(PASS|CK) ' ; }
+# extract() — the PASS/CK filter the cross-VM diff runs through — and the four
+# guards that keep it from deleting the evidence, both live in harness-guard.sh.
+# ONE definition, because the filter the suite diffs through and the filter the
+# guards reason about drifting apart is the same defect one level up.
+#
+# The guards exist because for a long time nothing checked that anything
+# meaningful survived this filter. Three scheduled vectors printed their entire
+# evidence on other prefixes, extract() reduced each to the constant
+# `PASS <Class>`, and a constant always matches itself: RDataInputFastPull with
+# a one-line defect injected exited rc=0 with output byte-identical to a clean
+# run. See W7-60-harness-extract-blindness.md and W7-51-vacuous-sweep-round-2.md.
+. "$HERE/harness-guard.sh" || { echo "ERROR: cannot source $HERE/harness-guard.sh"; exit 3; }
+harness_load_uncounted "$HERE/harness-uncounted.txt"
 
 # Copy every non-source file under $1 into $2, preserving relative paths.
 copy_tree() {
@@ -242,6 +261,56 @@ compile_modules() {
     "$JAVAC" --release "$REL" --module-source-path "$MODSRC" -d "$MODBUILD" --module "$JDKONLY_MODULE" || return 1
   else
     "$JAVAC" --module-source-path "$MODSRC" -d "$MODBUILD" --module "$JDKONLY_MODULE" || return 1
+  fi
+  # Second pass: recompile $MODOVERLAY over the class files just produced, on a
+  # PLAIN CLASSPATH so javac never sees the `provides` clause it would reject.
+  # See $MODOVERLAY's own sources for why the shape cannot be written directly.
+  if [ -d "$MODOVERLAY/$JDKONLY_MODULE" ]; then
+    ovl=$(find "$MODOVERLAY/$JDKONLY_MODULE" -name '*.java' | tr '\n' ' ')
+    if [ -n "$ovl" ]; then
+      # Unquoted on purpose: a source-file word list, and the suite tree carries
+      # no spaces. `-classpath` is the already-compiled module output so the
+      # overlay can still reference the module's own types.
+      if [ -n "$REL" ]; then
+        "$JAVAC" --release "$REL" -classpath "$MODBUILD/$JDKONLY_MODULE" \
+            -d "$MODBUILD/$JDKONLY_MODULE" $ovl || return 1
+      else
+        "$JAVAC" -classpath "$MODBUILD/$JDKONLY_MODULE" \
+            -d "$MODBUILD/$JDKONLY_MODULE" $ovl || return 1
+      fi
+    fi
+  fi
+  # Ground-truth the overlay instead of trusting that it landed. If the second
+  # pass silently did nothing, RJdkModule's negative ServiceLoader checks would
+  # fail on BOTH VMs — a harness error wearing a VM defect's clothes, which is
+  # the exact misclassification this vector's record warns about.
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/WrongFactory.class" ]; then
+    if ! "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.WrongFactory 2>/dev/null \
+        | grep -q 'public static java.lang.Object provider()'; then
+      echo "ERROR: modules-overlay did not land — WrongFactory.provider() must return Object"
+      return 1
+    fi
+  fi
+  # Same ground-truthing for the two constructor-form providers (W6-2). Each
+  # names a shape javac refuses in a `provides` clause, so the overlay pass is
+  # the only thing that can produce it: NotSubProvider must implement nothing,
+  # and HiddenCtor's no-arg constructor must be private.
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/NotSubProvider.class" ]; then
+    if "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.NotSubProvider 2>/dev/null \
+        | grep -q 'implements'; then
+      echo "ERROR: modules-overlay did not land — NotSubProvider must implement nothing"
+      return 1
+    fi
+  fi
+  if [ -f "$MODBUILD/$JDKONLY_MODULE/com/cratonvm/jdkonly/svc/internal/HiddenCtor.class" ]; then
+    if ! "$JDK/bin/javap" -p -classpath "$MODBUILD/$JDKONLY_MODULE" \
+        com.cratonvm.jdkonly.svc.internal.HiddenCtor 2>/dev/null \
+        | grep -q 'private com.cratonvm.jdkonly.svc.internal.HiddenCtor('; then
+      echo "ERROR: modules-overlay did not land — HiddenCtor() must be private"
+      return 1
+    fi
   fi
   copy_tree "$MODSRC/$JDKONLY_MODULE" "$MODBUILD/$JDKONLY_MODULE"
   HAVE_MODULE=1
@@ -355,6 +424,8 @@ resolve_release() {
 # pass/fail/failed.
 run_pass() {
   pass=0; fail=0; failed=""
+  hbad=0; hfailed=""
+  GUARDTMP="$HERE/.guard-tmp"; rm -rf "$GUARDTMP"; mkdir -p "$GUARDTMP"
   label=""; [ -n "$REL" ] && label=" (--release $REL)"
   echo "== compiling regression-suite$label =="
   compile_modules || { echo "ERROR: javac failed on module $JDKONLY_MODULE"; return 3; }
@@ -391,20 +462,47 @@ run_pass() {
     # Cross-VM diff against HotSpot (when present). HotSpot gets the vector's
     # own cross-VM arguments but never CRATONVM_ARGS and never $cvextra — the
     # oracle must stay unmodified.
-    if [ "$state" = PASS ] && [ -x "$HS" ]; then
-      hskey=$(timeout "$TIMEOUT" "$HS" $extra -cp "$BUILD" "$c" 2>&1 | extract)
-      if [ "$cvkey" != "$hskey" ]; then
+    #
+    # The oracle's RAW output and its EXIT CODE are both kept now. Until
+    # 2026-08-12 this line was `hskey=$(... | extract)`: the rc was thrown away,
+    # so an oracle that crashed or hit the 120 s timeout silently became a
+    # TRUNCATED ground truth, and the raw output was thrown away, so the lines
+    # extract() deleted — which is exactly the evidence the harness is blind to
+    # — could not be inspected. Guards G1 and G4 both need what was discarded.
+    HARNESS_GUARD_MSGS=""; guarded=0
+    if [ -x "$HS" ]; then
+      timeout "$TIMEOUT" "$HS" $extra -cp "$BUILD" "$c" > "$GUARDTMP/hs.raw" 2>&1
+      hsrc=$?
+      hskey=$(extract < "$GUARDTMP/hs.raw")
+      harness_guard_oracle "$c" "$GUARDTMP/hs.raw" "$hsrc" || guarded=1
+      if [ "$state" = PASS ] && [ "$cvkey" != "$hskey" ]; then
         state=FAIL; why="output differs from HotSpot"
         printf '    --- HotSpot ---\n%s\n    --- CratonVM ---\n%s\n' "$hskey" "$cvkey" | sed 's/^/    /'
       fi
     fi
+    # G2/G3 read only what survived the filter, so they run even with no
+    # HotSpot on the box — the run where they matter MOST, because that is the
+    # run where the cross-VM diff is skipped for every class and a vector's
+    # banner is the only thing left.
+    printf '%s\n' "$cvkey" > "$GUARDTMP/cv.key"
+    harness_guard_extract "$c" "$GUARDTMP/cv.key" || guarded=1
+
     if [ "$state" = PASS ]; then pass=$((pass+1)); printf "  %-14s PASS\n" "$c"
     else fail=$((fail+1)); failed="$failed $c"; printf "  %-14s FAIL  %s\n" "$c" "$why"; fi
+    # Reported SEPARATELY from the vector's own verdict, and counted separately.
+    # "the VM answered wrongly" and "the instrument cannot see the answer" are
+    # different findings and must not be summed into one number.
+    if [ "$guarded" -ne 0 ]; then
+      hbad=$((hbad+1)); hfailed="$hfailed $c"
+      printf '%s\n' "$HARNESS_GUARD_MSGS"
+    fi
   done
+  rm -rf "$GUARDTMP"
   return 0
 }
 
 total_pass=0; total_fail=0; total_failed=""; ran=0; skipped=""
+total_hbad=0; total_hfailed=""
 
 if [ -z "${RELEASES:-}" ]; then
   REL=""
@@ -413,6 +511,7 @@ if [ -z "${RELEASES:-}" ]; then
   [ "$rc" -eq 0 ] || exit "$rc"
   ran=1
   total_pass=$pass; total_fail=$fail; total_failed="$failed"
+  total_hbad=$hbad; total_hfailed="$hfailed"
 else
   BASE_JDK="$JDK"; BASE_JAVAC="$JAVAC"; BASE_HS="$HS"
   for REL in $RELEASES; do
@@ -434,6 +533,8 @@ else
     fi
     ran=$((ran+1))
     total_pass=$((total_pass+pass)); total_fail=$((total_fail+fail))
+    total_hbad=$((total_hbad+hbad))
+    [ -n "$hfailed" ] && total_hfailed="$total_hfailed$(printf '%s' "$hfailed" | sed "s/ / r$REL:/g")"
     [ -n "$failed" ] && total_failed="$total_failed$(printf '%s' "$failed" | sed "s/ / r$REL:/g")"
     echo "  --release $REL: $pass passed, $fail failed"
   done
@@ -475,6 +576,22 @@ if [ -n "$UNREGISTERED_FOUND" ]; then
       echo "    reason. Set STRICT_COVERAGE=1 to make this a failure."
     fi
   done
+fi
+
+# ---- the instrument's own verdict ----------------------------------------
+#
+# Counted into the exit status, and reported on its own line. A harness guard
+# firing does NOT mean the VM is wrong; it means the run just reported on a
+# comparison it could not have lost. That is the more serious of the two,
+# because every other lane's "green" rests on this instrument — so it is fatal,
+# not a warning. A warning inside a green build is how the previous version of
+# this defect survived long enough to be measured.
+if [ "$total_hbad" -gt 0 ]; then
+  echo "  HARNESS: $total_hbad vector(s) reported on a comparison the suite cannot see:${total_hfailed}"
+  echo "    Each is explained above. Fix the vector (or its row in harness-uncounted.txt);"
+  echo "    reproduce without a CratonVM build via: bash regression-suite/harness-selfcheck.sh"
+  total_fail=$((total_fail+total_hbad))
+  total_failed="$total_failed$(printf '%s' "$total_hfailed" | sed 's/ / harness:/g')"
 fi
 
 echo "REGRESSION SUITE: $total_pass passed, $total_fail failed${total_failed:+ ( failed:$total_failed )}"

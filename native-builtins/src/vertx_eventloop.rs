@@ -121,13 +121,14 @@ pub const STATE_STARTED: i32 = 1;
 pub const STATE_SHUTTING_DOWN: i32 = 2;
 pub const STATE_TERMINATED: i32 = 3;
 
-// T19_K4 — synthetic `java.lang.Thread` mirror layout. Mirrored from
-// `classloading::class_manager::synthetic_field_count` for the
-// "java/lang/Thread" arm: 5 slots, `name=0, priority=1, tid=2, target=3,
-// virtualFlag=4`.
-const THREAD_MIRROR_SLOTS: usize = 5;
-const THREAD_MIRROR_NAME_SLOT: usize = 0;
-const THREAD_MIRROR_TID_SLOT: usize = 2;
+// T19_K4 — the synthetic `java.lang.Thread` mirror layout used to be declared
+// here (`THREAD_MIRROR_SLOTS/NAME_SLOT/TID_SLOT`). It moved to
+// `crate::SYNTHETIC_THREAD_MIRROR_*` on 2026-08-12
+// (W7-74-short-object-repairs.md) with the allocation itself: the width was
+// being handed to `alloc_object(ClassId::new(0), …)` on EVERY image, including
+// real ones where `java.lang.Thread` declares 19, and `xnio_io_thread.rs`
+// carried an open-coded copy of the same three numbers. One declaration, one
+// allocator (`crate::alloc_carrier_thread_mirror`), which asks the class.
 
 // ---------------------------------------------------------------------------
 // Resource caps
@@ -701,46 +702,60 @@ fn spawn_vertx_event_loop_inner(
         //     `Thread.enumerate()` and JVMTI thread-list APIs see
         //     it.
         //
-        // Layout: synthetic `java/lang/Thread` is 5 slots —
+        // Layout: `crate::alloc_carrier_thread_mirror` picks it. On a real
+        // image the mirror is a genuine 19-slot `java.lang.Thread` built by
+        // the registered `Thread.<init>(ThreadGroup, Runnable, String)`; on a
+        // synthetic image it is the historical 5-slot map
         // `name=0, priority=1, tid=2, target=3, virtualFlag=4`
-        // (see `classloading::class_manager::synthetic_field_count`).
-        // We set `name`, stamp `tid`, and leave the rest at default
-        // (priority=0, target=null, virtualFlag=0). `Thread.currentThread()`
-        // chains through the registry by `ObjectRef`, so the slot
-        // layout is only relevant if Java-side reflection asks for
-        // the name / tid directly — which it does for tracing.
+        // (`classloading::class_manager::synthetic_field_count`).
+        //
+        // W7-74-short-object-repairs.md. This read
+        // `ctx.alloc_object(ClassId::new(0), THREAD_MIRROR_SLOTS)` until
+        // 2026-08-12, which on a real image produced a five-slot
+        // `cratonvm/synthetic/AnonymousObject$5` — not a `java.lang.Thread` at
+        // all, and fourteen fields short of one — and then published it to the
+        // registry, so it was what `Thread.currentThread()` handed back on
+        // every Vert.x/Netty event-loop carrier. The comment it replaces was
+        // not wrong, it was scoped to the synthetic image and stopped being
+        // true when the image changed underneath it.
         if vm_tid != 0 {
-            let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), THREAD_MIRROR_SLOTS);
-            let name_obj = ctx.create_string(&name);
-            ctx.set_field(
-                mirror,
-                THREAD_MIRROR_NAME_SLOT,
-                Value::Object(Some(name_obj)),
-            );
-            // priority slot 1: leave at 0 (NORM_PRIORITY = 5 in the
-            // JDK, but synthetic Thread default is 0; tests don't
-            // rely on this).
-            ctx.set_field(mirror, THREAD_MIRROR_TID_SLOT, Value::Long(vm_tid as i64));
-            // target slot 3: null (we don't run a Runnable).
-            // virtualFlag slot 4: 0 (this is a platform thread).
-            // Attach to the registry. Failure here is recoverable —
-            // the registration entry from above is still valid; the
-            // mirror just won't be findable by ObjectRef. We log it
-            // via `tracing::warn!` rather than escalating because
-            // the only legitimate failure is "thread id missing"
-            // which would mean the registry is in an inconsistent
-            // state we can't fix from here.
-            let attached = ctx.set_native_thread_java_obj(vm_tid, mirror);
-            if !attached {
+            // `None` = the class could not be resolved (`--jdk-only` refuses to
+            // fabricate one). Leaving the registry entry without a mirror is
+            // the correct degradation: `current_thread_object` then builds a
+            // full-width real mirror lazily on first use, which is precisely
+            // what the short mirror used to pre-empt.
+            // Bound to a `let` rather than written inline as the `if let`
+            // scrutinee: a scrutinee's temporaries (this reborrow of `ctx`
+            // included) live for the whole `if let` under Rust 2021, and the
+            // body needs `ctx` again for `set_native_thread_java_obj`.
+            let mirror = crate::alloc_carrier_thread_mirror(&mut **ctx, &name, vm_tid, daemon);
+            if let Some(mirror) = mirror {
+                // Attach to the registry. Failure here is recoverable —
+                // the registration entry from above is still valid; the
+                // mirror just won't be findable by ObjectRef. We log it
+                // via `tracing::warn!` rather than escalating because
+                // the only legitimate failure is "thread id missing"
+                // which would mean the registry is in an inconsistent
+                // state we can't fix from here.
+                let attached = ctx.set_native_thread_java_obj(vm_tid, mirror);
+                if !attached {
+                    tracing::warn!(
+                        event_loop = %name,
+                        vm_tid = vm_tid,
+                        "T19_K4: set_native_thread_java_obj failed; mirror won't be \
+                         findable by ObjectRef (registration is otherwise OK)",
+                    );
+                } else {
+                    el.java_thread_mirror_ptr
+                        .store(mirror.as_ptr() as usize, Ordering::Release);
+                }
+            } else {
                 tracing::warn!(
                     event_loop = %name,
                     vm_tid = vm_tid,
-                    "T19_K4: set_native_thread_java_obj failed; mirror won't be \
-                     findable by ObjectRef (registration is otherwise OK)",
+                    "T19_K4: java/lang/Thread would not resolve; no mirror pre-registered \
+                     (Thread.currentThread() will build one lazily)",
                 );
-            } else {
-                el.java_thread_mirror_ptr
-                    .store(mirror.as_ptr() as usize, Ordering::Release);
             }
         }
 
@@ -2458,7 +2473,7 @@ mod tests {
         let mirror_ptr_usize = ctx.native_thread_java_obj_ptr(vm_tid);
         assert_ne!(mirror_ptr_usize, 0);
         let mirror = unsafe { ObjectRef::from_raw(mirror_ptr_usize as *mut u8) };
-        let name_obj = match ctx.get_field(mirror, THREAD_MIRROR_NAME_SLOT) {
+        let name_obj = match ctx.get_field(mirror, crate::SYNTHETIC_THREAD_MIRROR_NAME_SLOT) {
             Value::Object(Some(o)) => o,
             other => panic!("name slot must hold a String ref, got {other:?}"),
         };
@@ -2483,7 +2498,7 @@ mod tests {
         assert_ne!(vm_tid, 0);
         let mirror_ptr = ctx.native_thread_java_obj_ptr(vm_tid);
         let mirror = unsafe { ObjectRef::from_raw(mirror_ptr as *mut u8) };
-        match ctx.get_field(mirror, THREAD_MIRROR_TID_SLOT) {
+        match ctx.get_field(mirror, crate::SYNTHETIC_THREAD_MIRROR_TID_SLOT) {
             Value::Long(t) => assert_eq!(t as u64, vm_tid, "tid slot must equal vm_thread_id"),
             other => panic!("tid slot must hold a Long, got {other:?}"),
         }

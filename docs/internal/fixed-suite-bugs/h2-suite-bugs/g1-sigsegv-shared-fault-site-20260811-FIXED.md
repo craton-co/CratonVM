@@ -1,11 +1,16 @@
 # H2 under `-XX:+UseG1GC` — SIGSEGV at a byte-identical heap address — **FIXED**
 
-**Status:** FIXED (2026-08-11) by
+**Status:** FIXED (2026-08-11) on `fix/g1-h2-sigsegv-and-aot-cglib-20260811`, by
+two commits. The crash itself is
 `fix(g1): the post-evacuation-failure rset walk accepted any region-resident word as an object`
-on `fix/g1-h2-sigsegv-and-aot-cglib-20260811`. The crash is
-`G1Collector::record_outgoing_rset_edges` reading an `ObjectHeader` out of an
+— `G1Collector::record_outgoing_rset_edges` reading an `ObjectHeader` out of an
 address it only knew was *inside some region's span*, and then walking the slots
-that header claimed.
+that header claimed. The follow-up question that guard raised ("why is a
+self-forwarded seed not an object start?") was then chased to its producer and
+fixed by
+`fix(g1): a root that is not an object PINS its region instead of being evacuated`;
+see the section of that name below, which supersedes the open follow-up the
+first version of this page carried.
 
 ## The site, named
 
@@ -154,16 +159,87 @@ belong to the long-running H2 residual triage
 carries `TestRandomMapOps` as "heavy fuzz workload, very likely fixed, not
 verified to completion"), not here.
 
-## Open follow-up, stated rather than buried
+## Why the seed was not an object — answered, and fixed at the producer
 
-`KEPT_SEED_REJECTED` and `EVAC_HOLDER_REJECTED` are both documented as "expected
-to be ZERO", and on this workload both are non-zero. The guard makes the pause
-survivable; it does not explain why a self-forwarded pointer-map key is not an
-object start by the time the unresolved-kept block runs. The most likely
-explanation — `drain_kept_self_forwards` runs a Phase-5 that can reset/retype
-regions, so a seed captured before it can be above its region's *new* cursor
-afterwards — fits the observed rejection shape but was not established here.
-Anyone picking that up should start from the counters, not from a fresh crash.
+The follow-up this page originally left open ("why is a self-forwarded seed not
+an object start?") was chased with the counters and is now closed. The guessed
+explanation in the first version of this page — a seed left above its region's
+*new* cursor by the drain's Phase 5 — is **wrong**: the verdict is never
+`AboveCursor`.
+
+Instrumenting the rejection to name the failing check, locate the address in its
+region's own object grid, and dump the bytes gives the same answer every time:
+
+```
+REJECTED a non-object SEED (#1): obj=0x20042800070 verdict=ImplausibleShape
+  region=4 type=Survivor base=0x20042800000 cursor=0x194c0 off=0x70
+  grid=INTERIOR of=0x68 delta=0x8 size=0x70 cid=675 kind=Object idx=3
+rejected seed 0x20042800070: seeds=1 map=23927 inbound_forwards=0 passes=2
+  in_roots=true roots=2085 in_jit_roots=false jit_roots=0
+```
+
+The seed is an **interior pointer** — `0x8` into a live `class_id=675` object
+(its mark word), or `0x60` into a primitive array's payload. It is below the
+cursor, in a live region, and `inbound_forwards=0` rules out the recycled-
+destination reading. And `in_roots=true`: it arrived in the **root array**, at
+index 8 of ~2 090, from the `frame/thread` half rather than any named native
+source.
+
+That is by design on the producing side. `collect_roots` filters operand-stack
+slots with `is_heap_addr` — a RANGE check — because the strict
+`is_object_address` probe dropped genuine young / mid-initialisation roots when
+it was used there (2026-08-04). Its own comment says a false positive is
+harmless: for the non-moving sweep it only over-retains.
+
+**G1 then acted on it.** All four CSet paths screened a root for CSet membership
+and nothing else, so `evacuate_object` read a header at whatever address
+arrived, sized a memcpy from those bytes, and copied them. Measured on
+`TestValueMemory`, per affected pause:
+
+| observation | count |
+| --- | --- |
+| CSet roots that are not objects | 6-8 |
+| …of those, **copied** to a fresh address | 6-8 (all) |
+| the copy arriving as a non-object root of the NEXT pause | yes (`0x…800070 → 0x…d000a0 → 0x…4000a0`) |
+| the copy desyncing its destination region's object grid | yes (`grid=DESYNC-BEFORE-TARGET at=0xa0 after=3 objects`) |
+
+So the seed population, the `EVAC_HOLDER_REJECTED` holders, and the SIGSEGV were
+all one defect's tail. Worse than the crash: the forwarding entry installed for
+a non-object is applied by the VM's post-GC remap to the operand-stack slot the
+address came from — **rewriting a Java `long`**.
+
+The fix pins instead. A root that is not an object start excludes its region
+from the CSet, exactly as this collector already does for a conservative JIT
+root it cannot rewrite, and exactly as the generational collector already does
+for interior conservative roots
+(`gen_heap::tests::interior_conservative_root_pins_the_object_it_points_into`).
+Evacuating such a root is unsound and so is skipping it, for one reason: the
+collector cannot tell a real reference from a long, so it may neither rewrite
+the slot nor drop what it might point at.
+
+Post-fix, on the same 10 runs of `TestValueMemory`:
+
+| counter | pre-fix | post-fix |
+| --- | --- | --- |
+| non-object CSet roots reaching the evacuator | 6-8 per affected run | **0** |
+| non-object roots COPIED | 6-8 per affected run | **0** |
+| `kept-seed … REJECTED` | 3-6 | **0** |
+| `evacuation ref-scan REJECTED a non-object HOLDER` | 6-9 | **0** |
+| SIGSEGV | 4 in 15 | **0 in 25** |
+| regions pinned by the new rule | — | 3-7 per affected run |
+
+Both counters this page called "expected to be ZERO" now are. The four H2
+classes and `ApplicationContextAotGeneratorTests` are unchanged from their
+pre-fix results (see the table above and 40/40 under G1), so the pinning does
+not cost a visible reclaim.
+
+**What the screen does not catch**, stated because the tests pin it: it reads
+the bytes AT the address, so an interior pointer whose bytes happen to decode as
+a header — a zeroed field cell being the standard example, `class_id=0,
+num_slots=0, kind=Object`, sizing to exactly `HEADER_SIZE` — is
+indistinguishable from an object start. Every non-object root measured here was
+of the shape it does catch. The honest guarantee is "no root whose bytes are not
+a header reaches the evacuator", not "no non-object root does".
 
 ## Related
 

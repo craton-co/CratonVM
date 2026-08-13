@@ -660,13 +660,36 @@ impl Heap {
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
-            return unsafe {
+            let v = unsafe {
                 cratonvm_types::read_compact_field(
                     ptr,
                     storage,
                     std::sync::atomic::Ordering::Relaxed,
                 )
             };
+            if !storage.is_reference() {
+                return v;
+            }
+            // Un-box the wrapper `set_field` installs for a non-reference value
+            // stored into a declared-REFERENCE slot — the field half of what
+            // `get_array_element_unboxing` already does for elements. This
+            // accessor used to hand such a value to `write_compact_field`,
+            // whose `FieldStorageKind::Reference` arm maps every non-`Object`
+            // value to raw 0, so the write was silently dropped to null
+            // (W7-84-primitive-in-reference-store.md).
+            return crate::autobox::unbox_reference_slot(
+                v,
+                |r| {
+                    if !self.is_valid_heap_object(r) {
+                        return None;
+                    }
+                    // SAFETY: `is_valid_heap_object` confirmed `r` points to an
+                    // 8-byte-aligned address inside one of this heap's arenas,
+                    // so reading its `ObjectHeader` is valid memory.
+                    Some(unsafe { (*(r.as_ptr() as *const ObjectHeader)).class_id })
+                },
+                |r| self.get_field(r, 0),
+            );
         }
         // HIB-DCAST-LATEPHASE.1 (mutator side), the fourth accessor family.
         // `compact_object_field_storage` answers `None` for TWO reasons and
@@ -726,6 +749,23 @@ impl Heap {
         if let Some((offset, storage)) =
             cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
         {
+            // A non-reference value into a declared-REFERENCE slot: box it,
+            // rather than let `write_compact_field`'s `Reference` arm map it to
+            // raw 0 and drop the write to null. This is the field half of what
+            // `set_array_element` below has always done for elements
+            // (W7-84-primitive-in-reference-store.md).
+            let value = if storage.is_reference() {
+                let class_id = self.get_header(obj_ref).class_id;
+                crate::autobox::box_for_reference_slot(value, class_id, index, |v| {
+                    let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
+                    self.set_field(wrapper, 0, v);
+                    wrapper
+                })
+            } else {
+                value
+            };
+            // Recomputed AFTER the boxing closure: it may have allocated, and
+            // this is a semi-space copying heap.
             let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
             unsafe {
                 cratonvm_types::write_compact_field(
@@ -1007,6 +1047,10 @@ impl Heap {
                     _ => {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
+                        // Arm the process-wide wrapper latch — see the matching
+                        // note in `GenerationalHeap::set_array_element` and
+                        // `crate::autobox`.
+                        crate::autobox::note_wrapper_created();
                         write_prim_element(
                             base,
                             index,
@@ -2424,18 +2468,43 @@ mod tests {
         assert_eq!(heap.identity_hash_code(obj), hash, "must be stable");
     }
 
+    /// `alloc_object` allocates through `alloc_zeroed`, and an all-zero slot
+    /// decodes as `Value::Int(0)` (the discriminant-0 variant of `Value`; see
+    /// `alloc_object_with_descriptors`, which exists precisely because that is
+    /// NOT `Object(None)`). Every field of a fresh object must read back as
+    /// that zero, including one carved out of arena bytes a previous object
+    /// has already written to.
+    ///
+    /// Was vacuous: three `let _ = heap.get_field(obj, n);` and "just verify no
+    /// crash". Swapping `alloc_zeroed` for a non-zeroing bump in
+    /// `alloc_object`, so a recycled/dirty slot is handed back as-is, stayed
+    /// green.
     #[test]
     fn alloc_object_fields_zero_initialized() {
         let heap = Heap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
 
-        // All fields should read as zero (which is Value::Uninitialized from zeroed memory,
-        // or more precisely, whatever zero bits represent for Value).
-        // In practice, we set fields before reading in real code.
-        // Just verify no crash.
-        let _ = heap.get_field(obj, 0);
-        let _ = heap.get_field(obj, 1);
-        let _ = heap.get_field(obj, 2);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj, i),
+                Value::Int(0),
+                "field {i} of a fresh object must read as the zeroed slot"
+            );
+        }
+
+        // Dirty this object, then allocate another: the new one's slots must
+        // still be zero rather than whatever the arena last held.
+        heap.set_field(obj, 0, Value::Long(-1));
+        heap.set_field(obj, 1, Value::Double(1.5));
+        heap.set_field(obj, 2, Value::Object(Some(obj)));
+        let obj2 = heap.alloc_object(ClassId::new(0), 3);
+        for i in 0..3 {
+            assert_eq!(
+                heap.get_field(obj2, i),
+                Value::Int(0),
+                "field {i} of a later object must be zeroed too"
+            );
+        }
     }
 
     #[test]
@@ -3087,7 +3156,12 @@ mod tests {
         let v_long = Value::Long(f64::to_bits(std::f64::consts::PI) as i64);
         let coerced = coerce_field_value_by_descriptor(v_long, b'D');
         match coerced {
-            Value::Double(d) => assert!((d - std::f64::consts::PI).abs() < 1e-12),
+            // Bit equality, not a tolerance. This asserts a REINTERPRETATION:
+            // the whole claim is that the 64 bits survive, and a tolerance of
+            // 1e-12 admits ~5,100 ulps of drift in a value that cannot legally
+            // drift at all — it would pass a slot that silently narrowed the
+            // double to f32 and back.
+            Value::Double(d) => assert_eq!(d.to_bits(), std::f64::consts::PI.to_bits()),
             other => panic!("expected Double, got {other:?}"),
         }
     }

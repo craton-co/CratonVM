@@ -2799,8 +2799,16 @@ mod tests {
         assert_eq!(frame.get_local(0).as_int(), Some(42));
         // Long via the context-aware compact accessor.
         assert_eq!(frame.get_local_compact(1).as_long(), Some(9999999999));
-        assert!((frame.get_local(2).as_float().unwrap() - 3.15).abs() < 1e-6);
-        assert!((frame.get_local(3).as_double().unwrap() - 2.719).abs() < 1e-9);
+        // Bit equality, like the int/long/object slots asserted beside them:
+        // a local read back is a round trip with no arithmetic on the path.
+        assert_eq!(
+            frame.get_local(2).as_float().unwrap().to_bits(),
+            3.15f32.to_bits()
+        );
+        assert_eq!(
+            frame.get_local(3).as_double().unwrap().to_bits(),
+            2.719f64.to_bits()
+        );
         assert!(frame.get_local(4).is_null());
         assert_eq!(frame.get_local(5), Value::Uninitialized);
         if let Value::ReturnAddress(a) = frame.get_local(6) {

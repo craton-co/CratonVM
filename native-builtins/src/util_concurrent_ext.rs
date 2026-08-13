@@ -791,8 +791,8 @@ fn native_lock_support_get_blocker(
     Ok(Some(Value::Object(None)))
 }
 
-/// Report a caller that imposes its own small field layout on a class which
-/// already has a bigger one.
+/// Report a caller that imposes its own field layout on a class which already
+/// has a different one — in EITHER direction.
 ///
 /// `alloc_concurrent_synthetic` does NOT truncate: both it and
 /// `NativeContext::alloc_object` clamp the slot count UP to the resolved
@@ -810,81 +810,95 @@ fn native_lock_support_get_blocker(
 /// came back empty (see
 /// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
 ///
-/// `num_fields < real` is a self-discriminating test for it: a class this call
+/// `num_fields != real` is a self-discriminating test for it: a class this call
 /// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
-/// and nothing is reported. A smaller request means somebody else -- the real
-/// class file, or another native fabricating a wider shape -- already owns the
+/// and nothing is reported. Any inequality means somebody else -- the real class
+/// file, or another native fabricating a different shape -- already owns the
 /// layout.
 ///
-/// Deduplicated by (class, requested, caller) so a hot allocation loop reports
-/// once, not once per object.
+/// **Both directions are reported, and the OVER direction is the dangerous one.**
+/// Until 2026-08-11 the test was `num_fields < real`, so the instrument was blind
+/// to exactly the half `docs/architecture/natives-over-real-jdk-classes.md` §5
+/// calls out: *"a slot index against a real layout is not a wrong answer -- it is
+/// heap corruption"*. A request WIDER than the class is the caller stating, in
+/// the one place it is machine-readable, that it holds a slot map with more
+/// entries than the class has fields. Two consequences, and neither is visible
+/// at the allocation:
+///
+/// * The object comes back with `num_fields` slots while its class declares
+///   `real`, so its header disagrees with `num_total_fields`. That is precisely
+///   the condition `vm/src/memory/gc.rs::validate_object_sizes`
+///   (`CRATONVM_DBG_VALIDATE_NEW=1`) prints as `BAD ... num_slots=N EXPECTED=M`
+///   -- it was written for a JIT `new` with a wrong-size header, and this funnel
+///   manufactures the same shape deliberately.
+/// * The same class is then allocated in TWO widths: `real` by every real
+///   bytecode `new` and by the JIT, `num_fields` here. The wide slot map is not
+///   restricted to the objects this funnel made. Any native that applies it to a
+///   receiver it did NOT allocate -- and these natives do receive real-JDK
+///   objects, see `native_cf_complete`'s slot-1 type discriminator below -- reads
+///   or writes past the end of that object.
+///
+/// It is reported, not refused, and one sub-population is why. `jca/kem.rs`,
+/// `jca/signature.rs`, `jca/key_factory.rs` and `jca/key_agreement.rs`
+/// over-allocate ON PURPOSE, through `synthetic_base_offset` (27 uses): it asks
+/// `class_num_total_fields` for the real width and appends private slots ABOVE
+/// it, *"so reference writes never land on a slot the real layout declares with
+/// an incompatible descriptor"*. That is the correct remedy for this species,
+/// and it necessarily shows up here as `over`. This funnel cannot tell it apart
+/// from a hard-coded wide guess -- both arrive as one integer -- so the census
+/// names both and the reader subtracts. See the ENABLED note in the body for
+/// what a follow-up must measure before this could be made fatal.
+///
+/// `real == 0` was excluded from BOTH directions until 2026-08-12, on the
+/// argument that 0 is overloaded: it means "class not loaded yet" (the reason
+/// the `max` below exists at all) and it also means "genuinely no instance
+/// fields" -- every interface, and `java/lang/Object`. This funnel is routinely
+/// asked for interface names (`java/util/concurrent/locks/Condition`,
+/// `java/util/concurrent/Flow$Subscription`), where a non-zero request is the
+/// intended fabrication and not an alias.
+///
+/// **The argument was sound and the exclusion was still wrong**, because 0 is
+/// also the ONLY value of `real` for which the `max` below does nothing -- and
+/// therefore the only case in which the object handed back is genuinely NARROWER
+/// than the class it is handed out as. Every `under` row describes an object the
+/// clamp already widened; the short objects were all in the excluded bucket.
+/// Those sites now report `direction=undeclared`, which says "this instrument
+/// cannot adjudicate this allocation" instead of saying nothing, because saying
+/// nothing is what a consumer reads as clean. See
+/// W7-73-short-object-blind-spot.md.
+///
+/// Deduplicated by (class, requested, declared, site) so a hot allocation loop
+/// reports once, not once per object. The site is IN the key on purpose: two
+/// natives making the same mistake on the same class are two findings.
 ///
 /// `#[track_caller]` so the site reported is the NATIVE that asked for the
 /// shape: `alloc_concurrent_synthetic` is itself `#[track_caller]`, so the
 /// attribute chains through it to the original call site. Without it every
 /// report would name this file.
+///
+/// # This is a forwarder, not an implementation
+///
+/// The counting, the flag, the dedup key and the output channel moved to
+/// `cratonvm_native_api::layout_alias` on 2026-08-12 (W7-59). They had to: this
+/// funnel is busy but it is not the only allocator, and the ~200 production
+/// `alloc_object` call sites in `native-builtins`, `native-io` and
+/// `native-collections` that bypass it were never censused — including the live
+/// owner of the widest over-allocation in the workspace. See
+/// W7-59-layout-detector-coverage.md and W7-49-slot-index-recensus.md.
+///
+/// **Why this call still exists after the base allocator was instrumented.**
+/// The base allocator sees the count this funnel passes it, and that count is
+/// already clamped: `n = num_fields.max(real)`. An UNDER-request therefore
+/// arrives there as `n == real` and is invisible. Reporting here, before the
+/// clamp, is the only place the under direction survives. Dropping this line
+/// would make the detector quieter in the direction it has reported since it
+/// was written.
 #[track_caller]
 fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-
-    // OFF by default, and deliberately so. Measured over a 30-class random
-    // sample of the real Tomcat suite this fires for 49 distinct JDK classes
-    // from 75 call sites, and the SAME runs produced zero out-of-bounds field
-    // reads -- so the shape is pervasive and, on that corpus, harmless: the
-    // clamp keeps every access in bounds, and no second native reads a wider
-    // layout for any of those classes. An always-on warning would be 75 lines
-    // of boot noise for a risk register, not a bug list.
-    //
-    // It becomes a BUG when a class has two layouts and someone reads the
-    // wider one. That is `java.lang.Process`, and the discriminator is cheap:
-    // a class appearing in BOTH this census and the `cratonvm::gc::guard`
-    // out-of-bounds reads has a live defect. Turn this on, run the failing
-    // workload, and intersect the two lists.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
-    }) {
-        return;
-    }
-    // `OrderedPlMutex`, not a raw `parking_lot::Mutex`: `native-builtins` runs
-    // a lock-discipline ratchet over this crate and a raw construction fails
-    // it. `LockLevel::Scratch` (L0, "acquires nothing") is the honest level —
-    // the guard below lives for exactly one `insert` and nothing is taken while
-    // it is held, which is what makes a future violation a checker failure
-    // rather than a hang. This census re-enters the VM through `tracing::warn!`
-    // right after, so that property is worth stating rather than assuming.
-    static SEEN: OnceLock<
-        cratonvm_types::lock_order::OrderedPlMutex<
-            HashSet<(String, usize, &'static str, u32)>,
-        >,
-    > = OnceLock::new();
-    let site = std::panic::Location::caller();
-    let key = (
-        class_name.to_string(),
-        num_fields,
-        site.file(),
-        site.line(),
-    );
-    let seen = SEEN.get_or_init(|| {
-        cratonvm_types::lock_order::OrderedPlMutex::new(
-            HashSet::new(),
-            cratonvm_types::lock_order::LockLevel::Scratch,
-        )
-    });
-    if !seen.lock().insert(key) {
-        return;
-    }
-    tracing::warn!(
-        class = class_name,
-        requested_fields = num_fields,
-        real_fields = real,
-        site = %site,
-        "native allocated a class under its own SMALLER field layout; the slot \
-         count is clamped up to the real one, so these writes alias the real \
-         class's own fields and any native reading a wider layout for this \
-         class reads past the object"
-    );
+    // `observe_from_rust` is `#[track_caller]` and so is this function, so the
+    // location that reaches the census is the NATIVE that asked for the shape,
+    // not this forwarding line and not `alloc_concurrent_synthetic` in between.
+    let _ = cratonvm_native_api::layout_alias::observe_from_rust(class_name, num_fields, real);
 }
 
 // The infallible `alloc_concurrent_synthetic` twin is DELETED (JDK-only wave 2,
@@ -940,9 +954,32 @@ pub(crate) fn try_alloc_concurrent_synthetic(
             // room. 0 means the class isn't loaded yet — keep the caller's
             // requested size.
             let real = ctx.class_num_total_fields(cid);
-            if num_fields > 0 && num_fields < real {
+            // `!=`, not `<`, since 2026-08-11 (JDK-only lane W4-4).
+            //
+            // Call the SHARED rule; do not re-derive it. This line read
+            // `if num_fields > 0 && real > 0 && num_fields != real` until
+            // 2026-08-12, which is `layout_alias::classify` open-coded — a second
+            // implementation of the one primitive
+            // W7-59-layout-detector-coverage.md said it had eliminated ("there is
+            // one implementation here"). It had eliminated the second copy of the
+            // reporting MACHINERY and left a second copy of the DECISION, and the
+            // two then drifted on the case that matters: `real > 0` is exactly
+            // the `declared == 0` exclusion W7-73-short-object-blind-spot.md
+            // removed, so this funnel — the busiest allocator in the workspace —
+            // would have stayed blind to the short-object species after
+            // `classify` learned to report it.
+            //
+            // Strictly louder: `classify` returns `Some` for every input this
+            // predicate accepted, plus `Undeclared` for `real == 0`.
+            if cratonvm_native_api::layout_alias::classify(num_fields, real).is_some() {
                 report_layout_alias(class_name, num_fields, real);
             }
+            // ALLOCATION IS UNCHANGED by the widening above: still `max`, so an
+            // over-request still gets the slots it asked for and an under-request
+            // is still clamped up. Reporting and refusing are separate changes and
+            // this lane makes only the first -- the over-allocating population has
+            // never been counted (see the ENABLED note), and a funnel with ~2,000
+            // call sites is not where you discover that number by failing.
             let n = num_fields.max(real);
             // `try_alloc_object_gc_safe` first (proactively collects, then walks
             // young -> old gen without aborting): this is the shared allocator
@@ -972,6 +1009,78 @@ pub(crate) fn try_alloc_concurrent_synthetic(
     }
 }
 
+/// Where a native's PRIVATE slot map starts on an instance of `class_name`.
+///
+/// Zero when the class is a fabricated stub (its fields are `_f0.._fN` and the
+/// synthetic map IS the layout); otherwise the real class's transitive declared
+/// field count, so every private slot lands ABOVE every field the real layout
+/// declares. This is the idiom `jca/kem.rs::synthetic_base_offset` uses, with
+/// the stub arm added: without it the base RATCHETS in synthetic-JDK mode,
+/// because the first allocation fabricates a class declaring `base + width`
+/// fields and the next call reads that number back as the new base, so two
+/// objects of one class end up with two different slot maps in one run.
+/// `is_class_synthetic_stub` is stable under that — a stub stays a stub.
+///
+/// Read W7-49-slot-index-recensus.md for why the alternative — guessing the
+/// layout from the object's own slot count — cannot work for a receiver this
+/// native did not allocate.
+///
+/// **The body moved to `cratonvm_native_api::appended_slots` on 2026-08-12**
+/// and this is now a forwarder, not a second copy. W7-68-live-under-allocations.md
+/// found the `under` direction's live cases in `native-io`
+/// (`java/nio/channels/FileChannel`, `java/nio/MappedByteBuffer`), which cannot
+/// reach a `pub(crate)` helper in this crate; copying it here would have made
+/// it the sixteenth private re-implementation of a primitive
+/// W7-59-layout-detector-coverage.md §2.1 already counted fifteen copies of.
+/// Kept as a name because this crate's call sites read better with it and
+/// because deleting it would churn them for nothing.
+pub(crate) fn appended_slot_base_for_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> usize {
+    cratonvm_native_api::appended_slots::base_for_class(ctx, class_name)
+}
+
+/// Allocate `class_name` carrying `width` private slots appended above the real
+/// layout, and hand back the base those slots start at.
+///
+/// The pair (object, base) is what makes the write in-bounds AND non-aliasing:
+/// the object is `base + width` slots wide, so `base + i` for `i < width` is
+/// inside it, and no `base + i` collides with a field the real class declares.
+/// Contrast the shape this replaces — allocate `width` slots on a class that
+/// declares `real > 0` fields and write `0..width`, which puts the native's
+/// `Int` into whatever reference the real layout declares at slot 0.
+#[track_caller]
+pub(crate) fn try_alloc_with_appended_slots(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    width: usize,
+) -> Result<(ObjectRef, usize), MethodCallFailed> {
+    let base = appended_slot_base_for_class(ctx, class_name);
+    let obj = try_alloc_concurrent_synthetic(ctx, class_name, base + width)?;
+    let carried = ctx.object_num_fields(obj);
+    debug_assert!(
+        carried >= base + width,
+        "appended-slot allocation of {class_name} came back with {carried} \
+         slots, needed base {base} + width {width}"
+    );
+    Ok((obj, base))
+}
+
+// NOT PROVIDED, and the omission is deliberate: a `base_for_this_receiver`
+// companion (W7-49, 2026-08-12). It was written, its only caller was reverted,
+// and it is not left here unused — but the reason it cannot exist usefully is
+// worth keeping, because it is the first thing the next reader will reach for.
+//
+// Given an object this native did NOT allocate, "how many private slots does it
+// carry" is not answerable from its width. A real-layout instance of the exact
+// class is narrow and can be refused; a real SUBCLASS instance is wide, for its
+// own reasons, and `width - real` lands squarely inside its own fields. So such
+// a helper can only ever refuse the narrow case, which is the easy half. The
+// sound remedy for foreign receivers is a side table keyed on object identity —
+// `jca/key_factory.rs` already runs one, with the GC-stable key that lane had to
+// invent when the raw `ObjectRef` address aliased across a young collection.
+
 /// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
 /// Java throwable.
 ///
@@ -996,6 +1105,55 @@ pub(crate) fn refused_class(
         Ok(id) => Ok(id),
         Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
     }
+}
+
+/// The synthetic `java.util.concurrent.CyclicBarrier` surface.
+///
+/// Registered from TWO places, because two different conditions need it and
+/// neither can see the other:
+///
+///  * [`register_concurrent_natives`], when `CRATONVM_SYNTHETIC_AQS` is set —
+///    the real `CyclicBarrier` bytecode is present but its `ReentrantLock` /
+///    `Condition` are being served synthetically, so the barrier is served
+///    synthetically too;
+///  * `vm_init`'s synthetic-JDK arm, where there IS no real bytecode. This one
+///    was missing. `67c5e048c` narrowed the whole surface to the env flag, on
+///    the reasoning that the default real-JDK build should run the real class —
+///    correct for that build, but synthetic-JDK mode has only a 3-field
+///    compatibility STUB for `CyclicBarrier` (`class_manager`'s
+///    `synthetic_stub_fields`) and no method bodies at all, so it lost the
+///    constructor outright: all four `JucComplete` barrier fixtures went to
+///    `NoSuchMethodError: java.util.concurrent.CyclicBarrier.<init>(I)V` while
+///    the TCK table still listed them as passing. A flag is not a mode
+///    ([`crate::nbflags`] cannot see the JDK mode; `vm_init` can), which is
+///    exactly why the call lives there and not behind another `nbflags` test.
+///
+/// Deleting these natives instead — the standing preference for synthetic
+/// shadows of pure-Java JDK classes — is not available for the same reason:
+/// synthetic-JDK mode has nothing to fall back to.
+pub fn register_cyclic_barrier_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let cb = "java/util/concurrent/CyclicBarrier";
+    registry.register(cb, "<init>", "(I)V", native_cb_init);
+    registry.register(
+        cb,
+        "<init>",
+        "(ILjava/lang/Runnable;)V",
+        native_cb_init_action,
+    );
+    registry.register(cb, "await", "()I", native_cb_await);
+    registry.register(
+        cb,
+        "await",
+        "(JLjava/util/concurrent/TimeUnit;)I",
+        native_cb_await_timeout,
+    );
+    registry.register(cb, "getParties", "()I", native_cb_get_parties);
+    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
+    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
+    registry.register(cb, "reset", "()V", native_cb_reset);
+    registry.set_category(__prev_cat);
 }
 
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
@@ -1062,25 +1220,21 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // alongside the lock ones; both are registered together above.
 
     // --- CyclicBarrier ---
-    let cb = "java/util/concurrent/CyclicBarrier";
-    registry.register(cb, "<init>", "(I)V", native_cb_init);
-    registry.register(
-        cb,
-        "<init>",
-        "(ILjava/lang/Runnable;)V",
-        native_cb_init_action,
-    );
-    registry.register(cb, "await", "()I", native_cb_await);
-    registry.register(
-        cb,
-        "await",
-        "(JLjava/util/concurrent/TimeUnit;)I",
-        native_cb_await_timeout,
-    );
-    registry.register(cb, "getParties", "()I", native_cb_get_parties);
-    registry.register(cb, "getNumberWaiting", "()I", native_cb_get_number_waiting);
-    registry.register(cb, "isBroken", "()Z", native_cb_is_broken);
-    registry.register(cb, "reset", "()V", native_cb_reset);
+    //
+    // Synthetic-AQS mode only HERE. With real AQS (the default) the real JDK
+    // `CyclicBarrier` — ReentrantLock + Condition + an identity-compared
+    // `Generation` — is correct and needs no help, exactly as for
+    // ReentrantLock/Lock/Condition and Semaphore above. The constructors are
+    // gated with the rest, not separately: `native_cb_init` stores its state
+    // holder in the receiver's slot 0, which is the real layout's `lock` field,
+    // so registering only the constructors while `await()` runs real bytecode
+    // would hand that bytecode a barrier whose `lock` is an array.
+    //
+    // Synthetic-JDK mode registers the same set from `vm_init`, where the mode
+    // is known — see [`register_cyclic_barrier_natives`].
+    if !real_aqs {
+        register_cyclic_barrier_natives(registry);
+    }
     registry.set_category(__prev_cat);
 
     // --- CopyOnWriteArrayList (M18) ---
@@ -2099,7 +2253,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -2484,7 +2638,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3189,7 +3343,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     _ => 0,
                 };
                 let unit_ordinal = match args.get(2) {
-                    Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                    Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
                     _ => 2,
                 };
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -3531,7 +3685,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord);
@@ -3741,7 +3895,7 @@ pub(crate) fn native_cond_await_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_raw, unit_ordinal).max(0) as u64;
@@ -4408,7 +4562,7 @@ pub(crate) fn native_sem_try_acquire_timeout(
         _ => 0,
     };
     let unit_ordinal = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2, // MILLISECONDS
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -5083,7 +5237,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 0,
     };
     let unit_ord = match args.get(2) {
-        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        Some(Value::Object(Some(u))) => time_unit_ordinal(ctx, *u),
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;
@@ -8147,239 +8301,58 @@ pub(crate) fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry)
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
-    let scope = "java/util/concurrent/StructuredTaskScope";
-
-    r.register(scope, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        scope,
-        "<init>",
-        "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_init_scope(ctx, this)?;
-            Ok(None)
-        },
-    );
-
-    r.register(
-        scope,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let callable = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, callable)
-        },
-    );
-
-    r.register(
-        scope,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Do not downgrade an already shut-down / closed scope (state 2):
-            // `shutdown(); join();` must leave isShutdown() == true.
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(
-        scope,
-        "joinUntil",
-        "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                ctx.set_field(this, 1, Value::Int(1));
-            }
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(scope, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    // shutdown() must be observable by isShutdown() below (which tests
-    // field 1 == 2). The former no-op meant `scope.shutdown();
-    // scope.isShutdown()` answered false, so ShutdownOn*-style loops that
-    // poll for the shutdown flag never saw it and kept forking subtasks.
-    r.register(scope, "shutdown", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(scope, "isShutdown", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(
-            if matches!(ctx.get_field(this, 1), Value::Int(2)) {
-                1
-            } else {
-                0
-            },
-        )))
-    });
-
-    let subtask = "java/util/concurrent/StructuredTaskScope$Subtask";
-    r.register(subtask, "get", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        match ctx.get_field(this, 3) {
-            Value::Int(1) => Ok(Some(ctx.get_field(this, 1))),
-            Value::Int(2) => Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into()),
-            _ => Err(RuntimeError::IllegalStateException {
-                message: "Subtask result is unavailable".into(),
-            }
-            .into()),
-        }
-    });
-    r.register(
-        subtask,
-        "state",
-        "()Ljava/util/concurrent/StructuredTaskScope$Subtask$State;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        },
-    );
-    r.register(
-        subtask,
-        "exception",
-        "()Ljava/lang/Throwable;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
-
-    // --- ShutdownOnFailure ---
-    let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
-    r.register(sof, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sof,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnFailure;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sof, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sof, "throwIfFailed", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if pd_has_failure(ctx, this) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "Subtask failed".into(),
-            }
-            .into());
-        }
-        Ok(None)
-    });
-    r.register(
-        sof,
-        "throwIfFailed",
-        "(Ljava/util/function/Function;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if pd_has_failure(ctx, this) {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "Subtask failed".into(),
-                }
-                .into());
-            }
-            Ok(None)
-        },
-    );
-
-    // --- ShutdownOnSuccess ---
-    let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
-    r.register(sos, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this)?;
-        Ok(None)
-    });
-    r.register(
-        sos,
-        "fork",
-        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/StructuredTaskScope$Subtask;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let c = args.get(1).copied().unwrap_or(Value::Object(None));
-            pd_fork_callable(ctx, this, c)
-        },
-    );
-    r.register(
-        sos,
-        "join",
-        "()Ljava/util/concurrent/StructuredTaskScope$ShutdownOnSuccess;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
-            Ok(Some(Value::Object(Some(this))))
-        },
-    );
-    r.register(sos, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(2));
-        Ok(None)
-    });
-    r.register(sos, "result", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        pd_first_success(ctx, this)
-            .map(|v| Ok(Some(v)))
-            .unwrap_or_else(|| {
-                Err(RuntimeError::IllegalStateException {
-                    message: "No successful subtask".into(),
-                }
-                .into())
-            })
-    });
-    r.register(
-        sos,
-        "result",
-        "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            pd_first_success(ctx, this)
-                .map(|v| Ok(Some(v)))
-                .unwrap_or_else(|| {
-                    Err(RuntimeError::IllegalStateException {
-                        message: "No successful subtask".into(),
-                    }
-                    .into())
-                })
-        },
-    );
-}
+/// RETIRED 2026-08-12 (W7-18 patch B). Registers nothing, on purpose, and the
+/// function is kept only because its call site is in another lane's file
+/// (`lib.rs`'s `register_phase_d_natives`).
+///
+/// This was the *third* registrar of `java/util/concurrent/StructuredTaskScope`,
+/// and every triple it held was either dead or a landmine:
+///
+/// * **Provably inert.** All three registrars sit inside
+///   `register_synthetic_overrides`, and the call order there is
+///   `register_phase67_natives` (`phases_late/concurrent.rs`), then
+///   `register_phase_d_natives` (this one), then
+///   `register_jdk25_concurrency_natives`. `register()` is
+///   last-registration-wins (docs/architecture/natives-over-real-jdk-classes.md
+///   §3), and `jdk25_concurrency.rs` registers a superset of this function's
+///   `StructuredTaskScope` and `$Subtask` triples — so every one of them was
+///   overwritten before boot finished. The only registrations here that ever
+///   *won* were the two covariant-return `join()`s,
+///   `$ShutdownOnFailure.join()L…$ShutdownOnFailure;` and
+///   `$ShutdownOnSuccess.join()L…$ShutdownOnSuccess;`, which `jdk25_concurrency`
+///   spelled with the base `L…StructuredTaskScope;` return and therefore did not
+///   collide with. Both are on classes **JEP 505 deleted**: `javap` and
+///   `Class.forName` answer "not found" on Adoptium 25.0.3.9, `--real-jdk` and
+///   `--jdk-only` alike (docs/known-issues/jdk-only/W7-18-structured-task-scope-jep505.md §3).
+///
+/// * **A landmine, which is why it is retired rather than left alone.** These
+///   bodies used a DIFFERENT `$Subtask` slot convention from the registrar that
+///   owns the readers. Here, `state` was read and written at **slot 3** (`1` =
+///   success, `2` = failed) and the result at slot 1. In
+///   `jdk25_concurrency.rs`, which wins `Subtask.get/state/exception`, the
+///   layout is `SUBTASK_FIELD_STATE = 0`, `RESULT = 1`, `EXCEPTION = 2`,
+///   **`CALLABLE = 3`** — so this file's `state` write landed on the callable
+///   REFERENCE slot: an `Int` in a slot the collector scans as an oop, which is
+///   heap corruption rather than a wrong answer
+///   (docs/architecture/natives-over-real-jdk-classes.md §5). It never fired
+///   only because every one of those triples was overwritten. The day anyone
+///   deletes a JDK-21-shaped triple from the winning registrar, this becomes
+///   live. `t3_impl.rs::register_t31_structured_concurrency` is already a
+///   tombstone for exactly this defect ("registering them here caused the
+///   canonical 8-field layout to be overridden with the earlier 2-field stubs,
+///   silently breaking `close()`, `result()`, and `throwIfFailed()`"); this is
+///   the copy that pass missed.
+///
+/// Scope of the change: **synthetic-JDK mode only**, and structurally so. All
+/// three registrars are reachable only from `register_synthetic_overrides`,
+/// which is `#[cfg(feature = "synthetic-jdk")]` and called only on the
+/// `use_synthetic_jdk` arm of `vm_init`. In `--real-jdk` and `--jdk-only` real
+/// JDK bytecode serves this API end to end, measured at
+/// `compatibility_classes: 0` / `synthetic_stub_invocations: 0` with zero
+/// StructuredTaskScope violations (W7-18 §5), so nothing here can move either
+/// shipping mode by any amount, and nothing here can move a ratchet taken in
+/// Compatible mode.
+pub(crate) fn register_pd_structured_concurrency(_r: &mut NativeMethodRegistry) {}
 
 // ===========================================================================
 // Concurrency primitive tests & Unsafe.setMemory test

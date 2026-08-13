@@ -1328,6 +1328,148 @@ fn file_identity_pair(ctx: &mut dyn NativeContext, fd: FdId) -> (i64, i64) {
     (fd as i64, fd as i64)
 }
 
+/// Do two PATHS name the same file? — the `Files.isSameFile` question.
+///
+/// # Why this exists next to `file_identity_triple`
+///
+/// Everything above keys file identity on an **open fd**, because that is what
+/// `FileKey` is handed. `java.nio.file.Files.isSameFile(Path, Path)` asks the
+/// same question about two paths that may not be open at all, and the tree's
+/// only answer for it is
+/// `native-builtins/src/phases_late/nio_file.rs`'s `FileSystemProvider.isSameFile`,
+/// which calls `Path.equals` and whose comment claims *"The default provider's
+/// same-file check is path equality"*.
+///
+/// **That claim is wrong about the JDK.** Path equality is the JDK's *fast
+/// path*, not its answer. JDK 25 `sun.nio.fs.UnixFileSystemProvider.isSameFile`
+/// returns early on `file1.equals(obj2)` and otherwise `stat`s BOTH paths and
+/// compares `st_dev`/`st_ino`; the Windows provider does the same through
+/// `GetFileInformationByHandle`'s volume serial + file index. So the JDK answers
+/// `true` — and CratonVM answers `false` — for every pair that names one file by
+/// two spellings: a hard link, a symlink and its target, `dir/x` and `dir/./x`,
+/// an absolute path and the relative path to the same file, and on Windows two
+/// spellings differing only in case or in 8.3 shortening. `Files.isSameFile` is
+/// how callers ask "am I about to copy a file onto itself", so a `false` there
+/// is the fabricated answer that lets the destructive branch run.
+///
+/// This is the identity half only. The call site is another lane's file and the
+/// switch-over is recorded, not applied — see
+/// W7-8-fabricated-success-io-sweep.md.
+///
+/// # What each platform arm compares, and what it still cannot see
+///
+/// * **Unix** — `fs::metadata` on each path (which FOLLOWS symlinks, matching
+///   the provider's `UnixFileAttributes.get(file, true)`) and compare
+///   `(st_dev, st_ino)`. This is the JDK's own predicate, so it sees hard links
+///   as well as every spelling difference.
+/// * **Windows** — open each path and compare
+///   `(dwVolumeSerialNumber, nFileIndexHigh, nFileIndexLow)` from
+///   `GetFileInformationByHandle`, reusing this file's existing [`win_fileid`]
+///   binding. `std::fs::File::open` cannot open a DIRECTORY on Windows, so a
+///   directory pair falls back to comparing `fs::canonicalize` results, which
+///   resolves links, `.`/`..`, relative prefixes, case and 8.3 names. The one
+///   thing that fallback cannot see is a hard link — and Windows has no hard
+///   links to directories, so on the arm that uses it the gap is empty.
+/// * The `Ok(false)` on a failed identity read is deliberate and is NOT a
+///   fabricated success: `isSameFile` is a question whose safe answer is "no,
+///   they are not known to be the same", and the destructive callers branch on
+///   `true`. An I/O error that prevents an answer is reported as `Err` and the
+///   caller raises `IOException`, which is what the method declares.
+///
+/// # Errors
+///
+/// Propagates the underlying metadata / open failure, which the JDK surfaces as
+/// `IOException` (`Files.isSameFile` declares "@throws IOException if an I/O
+/// error occurs"). A path equal to the other is answered `true` WITHOUT
+/// touching the disk, exactly like the JDK's fast path — so `isSameFile(p, p)`
+/// on a nonexistent `p` is `true` rather than an error, which is the reflexivity
+/// the javadoc requires ("It is reflexive: for Path f, isSameFile(f,f) should
+/// return true").
+pub fn paths_name_the_same_file(
+    a: &std::path::Path,
+    b: &std::path::Path,
+) -> std::io::Result<bool> {
+    // The JDK's own fast path, and the only branch that must not touch the disk.
+    if a == b {
+        return Ok(true);
+    }
+    same_file_identity(a, b)
+}
+
+/// Unix arm of [`paths_name_the_same_file`]: `(st_dev, st_ino)`, which is the
+/// provider's own predicate.
+///
+/// `fs::metadata` FOLLOWS symlinks, matching the provider's
+/// `UnixFileAttributes.get(file, true)` — so this sees a link and its target as
+/// one file, as well as every spelling difference and every hard link.
+///
+/// One `fn` per platform rather than three `cfg`'d blocks inside one body: that
+/// is the shape `pipe.rs`'s three `poll_pipe` definitions use, and it does not
+/// depend on a `cfg`'d block landing in tail position.
+#[cfg(unix)]
+fn same_file_identity(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let ma = std::fs::metadata(a)?;
+    let mb = std::fs::metadata(b)?;
+    Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
+}
+
+/// Windows arm of [`paths_name_the_same_file`]: volume serial + file index, the
+/// provider's own predicate here too.
+///
+/// `File::open` cannot open a DIRECTORY on Windows (that needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which `std` does not request), so a directory
+/// pair falls back to comparing `canonicalize` results — which resolves links,
+/// `.`/`..`, relative prefixes, case and 8.3 names. The only thing that fallback
+/// cannot see is a hard link, and Windows has no hard links to directories, so
+/// on the arm that uses it the gap is empty.
+#[cfg(windows)]
+fn same_file_identity(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
+    match (win_file_identity(a), win_file_identity(b)) {
+        (Ok(ia), Ok(ib)) => Ok(ia == ib),
+        // `canonicalize` fails loudly for a path that does not exist, which is
+        // the error `Files.isSameFile` is specified to report.
+        _ => Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?),
+    }
+}
+
+/// Fallback arm of [`paths_name_the_same_file`]. **Not compilable on any host in
+/// this campaign.** No identity primitive on this target, so this falls back to
+/// the strongest spelling-independent comparison available rather than to `==`,
+/// which the caller has already tried.
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
+    Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
+}
+
+/// `(volume serial, file index high, file index low)` for a path, via one
+/// `GetFileInformationByHandle` on a freshly opened read handle.
+///
+/// Errors for a directory — `File::open` on Windows does not grant
+/// `FILE_FLAG_BACKUP_SEMANTICS` — which is why the caller has a fallback rather
+/// than treating a failure as "different files".
+#[cfg(windows)]
+fn win_file_identity(path: &std::path::Path) -> std::io::Result<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::File::open(path)?;
+    // SAFETY: `info` is POD; the OS fully writes it on success and it is only
+    // read when the call returns non-zero. Same pattern as
+    // `file_identity_triple` above.
+    let mut info: win_fileid::ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` keeps the raw handle live for the duration of the call and
+    // `info` is writable storage for exactly this Win32 structure.
+    let ok =
+        unsafe { win_fileid::GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        info.dw_volume_serial_number,
+        info.n_file_index_high,
+        info.n_file_index_low,
+    ))
+}
+
 /// Variant of `map0` for legacy FileChannelImpl signatures where
 /// arg 0 is a raw int fd (not a FileDescriptor object). Reuses
 /// `native_fc_map0` after promoting the int to an `Object`-shaped
@@ -1825,6 +1967,64 @@ mod tests {
     // intermediate (i.e., we are NOT staging through a Vec); we
     // do this indirectly by asserting that a 32 MiB mmap is
     // O(1) Vec allocations beyond the buffer.
+    /// `isSameFile` is not path equality — the assertion that would have caught
+    /// the `Path.equals` approximation.
+    ///
+    /// RED against a `paths_name_the_same_file` implemented as `a == b`, which
+    /// is what `FileSystemProvider.isSameFile` still does in
+    /// `native-builtins/src/phases_late/nio_file.rs`. Every pair below names ONE
+    /// file by two spellings, and every one of them compares unequal as a Rust
+    /// `Path` — `Path`'s `PartialEq` walks `components()`, which folds away `.`
+    /// but keeps `..`, so the traversal case is a genuine inequality on every
+    /// platform and needs no privilege, no link support and no `canonicalize`
+    /// agreement to be meaningful.
+    #[test]
+    fn wp3_3_same_file_is_identity_not_path_equality() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("f.bin"), b"payload").unwrap();
+
+        let direct = root.join("f.bin");
+        let via_parent = root.join("sub").join("..").join("f.bin");
+        assert_ne!(
+            direct, via_parent,
+            "the two spellings must differ as Paths, or this test asserts nothing"
+        );
+        assert!(
+            paths_name_the_same_file(&direct, &via_parent).unwrap(),
+            "a `..` traversal to the same file must be the same file"
+        );
+
+        // Two genuinely different files. Without this the row above is
+        // satisfied by an implementation that answers `true` for everything,
+        // which is the failure mode one direction of assertions cannot see.
+        std::fs::write(root.join("g.bin"), b"payload").unwrap();
+        assert!(
+            !paths_name_the_same_file(&direct, &root.join("g.bin")).unwrap(),
+            "byte-identical but distinct files are NOT the same file"
+        );
+
+        // Reflexive without touching the disk, which is the JDK's fast path and
+        // the reason `isSameFile(f, f)` is `true` for a nonexistent `f`.
+        let ghost = root.join("does-not-exist");
+        assert!(paths_name_the_same_file(&ghost, &ghost).unwrap());
+
+        // A hard link is the case `canonicalize` CANNOT see, so it is the one
+        // that proves the identity read is doing the work rather than a path
+        // normalisation. Not made unconditional: `hard_link` depends on the
+        // filesystem backing the temp dir, and a whole-test skip on that is the
+        // vacuity this suite is trying to get rid of — so the rows above stand
+        // on their own and this one only ever adds.
+        let linked = root.join("hard.bin");
+        if std::fs::hard_link(&direct, &linked).is_ok() {
+            assert!(
+                paths_name_the_same_file(&direct, &linked).unwrap(),
+                "a hard link names the same file"
+            );
+        }
+    }
+
     #[test]
     fn helper_smoke_writeln() {
         // Sanity that std::io::Write is in scope and `write_all`

@@ -497,20 +497,32 @@ fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // GC-safety: `close()` re-enters Java; `this` is used again afterward
     // (field clear + side-table key), so pin it across the call and re-read
     // the current address before those uses.
+    //
+    // The delegated close PROPAGATES. `StreamDecoder.implClose()` is exactly
+    // `if (ch != null) ch.close(); else in.close();` under
+    // `throws IOException`, and `close()` calls it inside a `try` whose
+    // `finally` only sets `closed = true` — there is no `catch`.
+    // W7-57-close-flush-swallow-sweep.md
+    //
+    // The `closed` marker and the side-table drop still run on the failing
+    // path, matching that `finally`, and the failure is reported after.
     let this_pin = ctx.pin_native_root(this);
-    if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
-        let _ = ctx.invoke_virtual(is, "close", "()V", &[]);
+    let closed = if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
+        ctx.invoke_virtual(is, "close", "()V", &[]).map(|_| ())
     } else if let Value::Object(Some(ch)) = ctx.get_field_by_name(this, "ch") {
         // Channel-backed decoder (`Channels.newReader(ReadableByteChannel, ...)`)
         // — no InputStream exists, close the channel instead so a FileChannel
         // opened for e.g. a Flyway migration script isn't leaked.
-        let _ = ctx.invoke_virtual(ch, "close", "()V", &[]);
-    }
+        ctx.invoke_virtual(ch, "close", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field_by_name(this, "in", Value::Object(None));
     let key = sd_key(ctx, this);
     sd_table().lock().unwrap().remove(&key);
+    closed?;
     Ok(None)
 }
 

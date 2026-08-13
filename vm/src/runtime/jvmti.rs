@@ -4349,8 +4349,18 @@ mod tests {
 
         assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 42);
         assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 123456789);
-        assert!((env.get_local_float(1, 0, 2).unwrap() - 3.14).abs() < 0.001);
-        assert!((env.get_local_double(1, 0, 3).unwrap() - 2.718281828).abs() < 0.0001);
+        // The int, long and object slots on the lines around these are
+        // asserted with `assert_eq!`; these two were the only slots in the
+        // same round trip given a window, and 0.001 on 3.14 is a 0.03% one —
+        // wide enough for a slot that stored the float as fixed point.
+        assert_eq!(
+            env.get_local_float(1, 0, 2).unwrap().to_bits(),
+            3.14f32.to_bits()
+        );
+        assert_eq!(
+            env.get_local_double(1, 0, 3).unwrap().to_bits(),
+            2.718281828f64.to_bits()
+        );
         assert_eq!(env.get_local_object(1, 0, 4).unwrap(), Some(0xDEAD));
 
         // Type mismatch
@@ -4372,10 +4382,10 @@ mod tests {
         assert_eq!(env.get_local_long(1, 0, 1).unwrap(), 999);
 
         env.set_local_float(1, 0, 2, 1.5).unwrap();
-        assert!((env.get_local_float(1, 0, 2).unwrap() - 1.5).abs() < 0.001);
+        assert_eq!(env.get_local_float(1, 0, 2).unwrap().to_bits(), 1.5f32.to_bits());
 
         env.set_local_double(1, 0, 3, 2.5).unwrap();
-        assert!((env.get_local_double(1, 0, 3).unwrap() - 2.5).abs() < 0.001);
+        assert_eq!(env.get_local_double(1, 0, 3).unwrap().to_bits(), 2.5f64.to_bits());
 
         env.set_local_object(1, 0, 4, None).unwrap();
         assert_eq!(env.get_local_object(1, 0, 4).unwrap(), None);

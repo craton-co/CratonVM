@@ -220,7 +220,7 @@ mod tests {
             let id = shared.alloc_lambda_proxy_id();
             shared.classes.lambda_proxies.write().insert(
                 id,
-                LambdaCallSite {
+                std::sync::Arc::new(LambdaCallSite {
                     functional_interface_id: None,
                     // `Runnable` does not extend `Serializable`, so the
                     // inheritance half of the rule is false either way and the
@@ -233,7 +233,7 @@ mod tests {
                     capture_types: vec![],
                     proxy_class_id: id,
                     serializable_flag: flag,
-                },
+                }),
             );
             id
         };

@@ -2215,6 +2215,20 @@ enum SnapshotItrRoute {
     /// A native `TreeSet` (including the descending snapshot), removed through
     /// the sorted array + size bookkeeping in [`ts_remove_element`].
     TreeSet,
+    /// A native `LinkedList`, removed through [`native_ll_remove_object`].
+    ///
+    /// This is the one route whose `remove()` is not the same operation the
+    /// fabricated iterator performed: `LinkedList$Itr` is node-live and unlinks
+    /// the node `next()` returned, while this deletes the FIRST occurrence of
+    /// that element. The two differ only for a list holding duplicates, and
+    /// only on the `--jdk-only` path — where the alternative is not a
+    /// better-behaved `remove()` but a `NoClassDefFoundError` before `next()`.
+    LinkedList,
+    /// A native `ArrayDeque`, removed through
+    /// [`native_ad_remove_first_occurrence`] — which is the same call
+    /// `native_ad_itr_remove` already makes for the fabricated `ArrayDeque$Itr`,
+    /// so this route changes the class name and nothing else.
+    ArrayDeque,
 }
 
 /// The live collection a snapshot iterator's `remove()` must delete from.
@@ -2660,6 +2674,43 @@ fn refused_class(
         Ok(id) => Ok(id),
         Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
     }
+}
+
+/// [`try_alloc_synthetic`] at the width the LOADED class declares, with
+/// `synthetic_width` used only when the class cannot be resolved at all.
+///
+/// For the collections in this file whose whole state lives in an
+/// address-keyed side table — `ts_get_slot`/`ts_set_slot` and their TreeMap
+/// twins never touch the object's own fields, and say so — the private slot
+/// count is not a layout. Passing it to the allocator only widens the object
+/// past what the class declares: real `java.util.TreeSet` declares ONE field
+/// (`javap -p` against JDK 25.0.3.9: `private transient NavigableMap m`), so
+/// asking for `TS_NUM_FIELDS` put two slots past the declared width that
+/// nothing in the workspace ever writes or reads. See
+/// W7-66-live-over-allocations.md for the census and
+/// W7-59-layout-detector-coverage.md for the instrument that found it.
+///
+/// In synthetic-JDK mode this is a no-op **by construction**, not by argument:
+/// `class_manager` fabricates `java/util/TreeSet` with three instance fields,
+/// so the declared width already IS the synthetic width, and
+/// `NativeContext::alloc_object` clamps any request UP to the declared count
+/// regardless. The `synthetic_width` fallback covers only the "no class of
+/// this name anywhere" arm that [`try_alloc_synthetic`] itself handles.
+///
+/// This is deliberately NOT `try_alloc_with_appended_slots`' shape: that idiom
+/// is for natives carrying private slots ON the object, which these do not.
+#[track_caller]
+fn try_alloc_declared_width(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    synthetic_width: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let declared = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => ctx.class_num_total_fields(cid),
+        Err(_) => 0,
+    };
+    let width = if declared > 0 { declared } else { synthetic_width };
+    try_alloc_synthetic(ctx, class_name, width)
 }
 
 /// Allocate a *real* JDK object of `class_name` with its natural field count and
@@ -3263,13 +3314,25 @@ fn java_float_to_string(v: f32) -> String {
 /// For objects that are not plain strings or primitives, this calls
 /// `toString()` via virtual dispatch so that overridden implementations
 /// (e.g. ArrayList, HashMap, user classes) produce correct output.
-fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
-    match val {
+///
+/// Fallible for the reason on [`collection_elements_generic`]. The
+/// `ClassName@hash` fallback below is the right answer when there is no
+/// `toString()` to run, and it was the wrong one when there was and it *threw*
+/// or was refused: `[a, cratonvm.internal.Foo@1a2b, c]` is a plausible string
+/// with no exception behind it, so a strict refusal inside an element's own
+/// `toString()` came out of `list.toString()` looking like ordinary output.
+/// HotSpot propagates — `AbstractCollection.toString` is a bare
+/// `sb.append(e)` loop with no catch.
+fn obj_to_display_string(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+) -> Result<String, MethodCallFailed> {
+    Ok(match val {
         Value::Object(None) => "null".to_string(),
         Value::Object(Some(obj)) => {
             // Fast path: if it's a Java String, read it directly
             if let Some(s) = ctx.read_string(*obj) {
-                return s;
+                return Ok(s);
             }
 
             // Fast path for wrapper types: if the object is a `java.lang.*`
@@ -3299,7 +3362,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                 if is_wrapper {
                     match ctx.get_field(*obj, 0) {
                         Value::Int(v) => {
-                            return if name.contains("Boolean") {
+                            return Ok(if name.contains("Boolean") {
                                 if v != 0 { "true" } else { "false" }.to_string()
                             } else if name.contains("Character") {
                                 char::from_u32(v as u32).unwrap_or('?').to_string()
@@ -3309,14 +3372,14 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                                 (v as i16).to_string()
                             } else {
                                 v.to_string()
-                            };
+                            });
                         }
-                        Value::Long(v) => return v.to_string(),
+                        Value::Long(v) => return Ok(v.to_string()),
                         // Fix (item 4): Java shortest-round-trip formatting,
                         // not Rust's default `{}` (which omits the trailing
                         // `.0` and uses `inf`/`NaN` spellings).
-                        Value::Float(v) => return java_float_to_string(v),
-                        Value::Double(v) => return java_double_to_string(v),
+                        Value::Float(v) => return Ok(java_float_to_string(v)),
+                        Value::Double(v) => return Ok(java_double_to_string(v)),
                         _ => {}
                     }
                 }
@@ -3327,6 +3390,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                 Ok(Some(Value::Object(Some(str_ref)))) => ctx
                     .read_string(str_ref)
                     .unwrap_or_else(|| "null".to_string()),
+                Err(e) => return Err(e),
                 _ => {
                     // Final fallback: ClassName@hash. Arrays render the JVMS
                     // array-class name (the header's class_id is the COMPONENT
@@ -3352,7 +3416,7 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
         Value::Float(v) => java_float_to_string(*v),
         Value::Double(v) => java_double_to_string(*v),
         _ => "?".to_string(),
-    }
+    })
 }
 
 /// JVMS array-class name for a heap array (`[Ljava/lang/Class;`, `[I`,
@@ -3514,23 +3578,36 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
 /// bug: all topic states share one consumer-set key, so only the last topic was
 /// grouped → rack-aware assignment skipped for the others). Invoking the real
 /// `equals` closes the gap for arbitrary key types.
-fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
+///
+/// Fallible for the reason [`map_keys_equal`] already states, and this is the
+/// same defect one function over: `if let Ok(..)` folded a thrown or refused
+/// `equals` into `false`, so a failing key comparison did not fail — it opened
+/// a new group. `groupingBy` then answered a map with one bucket per element
+/// and no exception, which is a wrong answer wearing the shape of a correct
+/// one. A non-exceptional contract violation (the callee returned a non-`Int`)
+/// still falls through as `false`, exactly as in `map_keys_equal`.
+fn group_key_equal(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
     if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
         if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
-            return true;
+            return Ok(true);
         }
-        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+        return match ctx.invoke_virtual(
             *oa,
             "equals",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(*ob))],
         ) {
-            return v != 0;
-        }
-        return false;
+            Ok(Some(Value::Int(v))) => Ok(v != 0),
+            Err(e) => Err(e),
+            _ => Ok(false),
+        };
     }
     // Primitives / null: the cheap structural comparison is exact.
-    values_equal(&*ctx, a, b)
+    Ok(values_equal(&*ctx, a, b))
 }
 
 /// `List.contains`/`indexOf` element comparison with full JDK semantics.
@@ -3549,24 +3626,42 @@ fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
 /// cheap structural check first, then fall back to the search target's real
 /// Java `equals`. JDK `List.indexOf` semantics call `o.equals(es[i])` — i.e.
 /// `target.equals(elem)` — so the real-equals receiver is the search `target`.
-fn list_element_matches(ctx: &mut dyn NativeContext, elem: &Value, target: &Value) -> bool {
+///
+/// Fallible for the same reason as [`group_key_equal`] and [`map_keys_equal`]:
+/// `if let Ok(..)` mapped a thrown or refused `equals` onto "these two are not
+/// equal", and every caller below is a `contains` / `indexOf` / `remove` /
+/// `retainAll` / `frequency`, so the swallow does not merely lose the answer —
+/// it produces the *opposite* one and lets the caller act on it (`remove`
+/// reports "not present" and mutates nothing; `retainAll` drops the element).
+/// The real JDK propagates out of `List.contains`, since the whole method body
+/// is `indexOf(o) >= 0` over `o.equals(es[i])`.
+///
+/// A non-exceptional contract violation — the callee returned something that
+/// is not an `Int` — still answers `false`, as in the two helpers above.
+fn list_element_matches(
+    ctx: &mut dyn NativeContext,
+    elem: &Value,
+    target: &Value,
+) -> Result<bool, MethodCallFailed> {
     // Cheap structural path: identity, unboxed primitives, String, enum, null.
     if values_equal(&*ctx, elem, target) {
-        return true;
+        return Ok(true);
     }
     // Distinct objects whose value-equality the structural check can't see:
     // defer to the target's real `equals(elem)`.
     if let (Value::Object(Some(t)), Value::Object(Some(e))) = (target, elem) {
-        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+        return match ctx.invoke_virtual(
             *t,
             "equals",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(*e))],
         ) {
-            return v != 0;
-        }
+            Ok(Some(Value::Int(v))) => Ok(v != 0),
+            Err(err) => Err(err),
+            _ => Ok(false),
+        };
     }
-    false
+    Ok(false)
 }
 
 /// GC-safe linear scan of `buf[0..len]` for an element matching `target`
@@ -3586,15 +3681,25 @@ fn pinned_array_search(
     buf: ObjectRef,
     len: usize,
     target: Value,
-) -> (Option<usize>, ObjectRef, Value) {
+) -> Result<(Option<usize>, ObjectRef, Value), MethodCallFailed> {
     let buf_pin = ctx.pin_native_root(buf);
     let th = pin_value(ctx, target);
     let mut buf = buf;
     let mut target = target;
     let mut found = None;
+    // A refused/throwing element `equals` is recorded and the loop left by the
+    // ordinary `break`, so `unpin_native_roots(buf_pin)` still runs — an early
+    // `?` here would skip the truncate this helper exists to guarantee.
+    let mut failed: Option<MethodCallFailed> = None;
     for i in 0..len {
         let elem = ctx.get_array_element(buf, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = match list_element_matches(ctx, &elem, &target) {
+            Ok(m) => m,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -3603,7 +3708,10 @@ fn pinned_array_search(
         }
     }
     ctx.unpin_native_roots(buf_pin);
-    (found, buf, target)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok((found, buf, target)),
+    }
 }
 
 // ===========================================================================
@@ -3626,15 +3734,19 @@ const AL_DEFAULT_CAPACITY: usize = 10;
 /// each access rather than caching globally.
 #[inline]
 fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
-    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData");
-    let size = ctx.resolve_field_index("java/util/ArrayList", "size");
-    match (data, size) {
-        (Some(d), Some(s)) => {
-            let n = std::cmp::max(d, s) + 1;
-            (d, s, n)
-        }
-        _ => (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
-    }
+    al_slots_resolved(ctx).unwrap_or((AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS))
+}
+
+/// `al_slots`, but reporting whether the layout was actually RESOLVED rather
+/// than defaulted. `al_slots_for`'s memo caches only `Some`: a
+/// `resolve_field_index` that fails today because the class is not loaded yet
+/// can succeed later, and caching the constant fallback would pin the wrong
+/// layout for the rest of the run. Same argument `class_name_rc` makes for not
+/// caching its `None`.
+fn al_slots_resolved(ctx: &dyn NativeContext) -> Option<(usize, usize, usize)> {
+    let data = ctx.resolve_field_index("java/util/ArrayList", "elementData")?;
+    let size = ctx.resolve_field_index("java/util/ArrayList", "size")?;
+    Some((data, size, std::cmp::max(data, size) + 1))
 }
 
 /// Receiver-aware slot resolution for the shared ArrayList-backed list natives.
@@ -3649,17 +3761,84 @@ fn al_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
 /// file"). Resolve against the receiver's actual class instead.
 fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
     let cid = ctx.class_id_of_object(this);
+    let raw = cid.as_u32();
+    let vm = ctx.vm_identity();
+    let index = facts_slot_index(raw) & (AL_SLOTS_WAYS - 1);
+
+    let hit = AL_SLOTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != Some(vm) {
+            *cache = (Some(vm), [None; AL_SLOTS_WAYS]);
+        }
+        match cache.1[index] {
+            Some((cached_id, slots)) if cached_id == raw => Some(slots),
+            _ => None,
+        }
+    });
+    if let Some(slots) = hit {
+        return slots;
+    }
+
+    // Cold. The borrow above is released first: the resolution below re-enters
+    // the VM, which must never find this `RefCell` already borrowed.
+    let resolved = al_slots_for_uncached(ctx, cid);
+    if let Some(slots) = resolved {
+        AL_SLOTS.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if cache.0 == Some(vm) {
+                cache.1[index] = Some((raw, slots));
+            }
+        });
+        return slots;
+    }
+    (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS)
+}
+
+/// Ways in the direct-mapped receiver-class -> list-slot-layout cache.
+///
+/// `al_slots_for` sits on EVERY `native_al_*` operation and re-derived a
+/// constant each time: a string-keyed `class_id_by_name`, an `is_subclass`
+/// walk, and two string-keyed `resolve_field_index` calls, all behind the
+/// class-manager lock. `native_al_size` reaches it twice per call. Measured
+/// before this memo, on an idle box: `ArrayList.size()` 1014 ns/op against
+/// 28 ns/op for the identical method body written in plain Java on the same VM;
+/// netty's `AhoCorasicSearchProcessorFactory.buildTrie` — 6.05 M ArrayList
+/// native calls — took 217 s where HotSpot takes 0.214 s.
+///
+/// Sound for the same reason as `RECEIVER_FACTS` and `RECEIVER_NAMES`: a
+/// `ClassId` is never reissued, and a class's field layout is immutable after
+/// linking.
+const AL_SLOTS_WAYS: usize = 64;
+
+thread_local! {
+    /// `(vm_identity, [(ClassId, (data, size, n)); WAYS])`.
+    static AL_SLOTS: std::cell::RefCell<(
+        Option<usize>,
+        [Option<(u32, (usize, usize, usize))>; AL_SLOTS_WAYS],
+    )> = const { std::cell::RefCell::new((None, [None; AL_SLOTS_WAYS])) };
+}
+
+/// The uncached body of [`al_slots_for`]. `None` when the layout could not be
+/// resolved, so the caller can apply the constant fallback WITHOUT caching it.
+fn al_slots_for_uncached(
+    ctx: &dyn NativeContext,
+    cid: ClassId,
+) -> Option<(usize, usize, usize)> {
     if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
         if cid == vec_id || ctx.is_subclass(cid, vec_id) {
             if let (Some(d), Some(s)) = (
                 ctx.resolve_field_index("java/util/Vector", "elementData"),
                 ctx.resolve_field_index("java/util/Vector", "elementCount"),
             ) {
-                return (d, s, std::cmp::max(d, s) + 1);
+                return Some((d, s, std::cmp::max(d, s) + 1));
             }
+            // A Vector receiver whose own layout is unresolvable must NOT fall
+            // through to ArrayList's `size` slot — that is the DF08 mixup this
+            // function exists to prevent. Report unresolved instead.
+            return None;
         }
     }
-    al_slots(ctx)
+    al_slots_resolved(ctx)
 }
 
 /// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
@@ -3803,23 +3982,76 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
 ///
 /// The 64M cap is a runaway guard; a well-behaved iterator terminates long
 /// before it.
-fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+///
+/// # Why this returns a `Result` and not a bare `Vec`
+///
+/// It used to be `-> Vec<Value>`, and both `match` arms mapped *every* failure
+/// of `iterator()` / `hasNext()` / `next()` to "no more elements". Measured
+/// 2026-08-11 on the pre-built binary against Temurin 25.0.3.9:
+///
+///     new ArrayList<>(List.of("a","b","c")).equals(linkedList)
+///
+/// answered `true` on HotSpot and in `Compatible`, and **`false`** under
+/// `--jdk-only` — silently, no exception — because the `NoClassDefFoundError:
+/// java/util/LinkedList$Itr` raised by the `invoke_virtual` below arrived here
+/// as `Vec::new()` and `native_al_equals` then compared 3 elements against 0.
+///
+/// A refusal that reaches a caller with nowhere to put it stops being a
+/// refusal, which is the one failure mode contract §5 cannot tolerate: the
+/// census still records the violation, so the run looks *measured* while the
+/// program is handed a wrong answer. And an empty collection is the failure
+/// mode that reads as a pass everywhere a caller only iterates — the same
+/// shape that let four `TreeMap` navigable views answer `{}` for months
+/// (docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md).
+/// Reasoned in
+/// docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+/// and docs/known-issues/jdk-only/W7-20-refusal-laundered-into-wrong-answer.md
+///
+/// The discrimination line, which is the whole of the fix and applies to every
+/// helper in this family:
+///
+/// * `Err(..)` — the call was *refused* or threw. Propagate. This is a policy
+///   `NoClassDefFoundError` under `--jdk-only`, and in `Compatible` it is an
+///   exception the receiver's own `iterator()`/`next()` raised, which HotSpot
+///   also propagates out of `AbstractList.equals` rather than truncating.
+/// * `Ok(..)` with nothing usable — a null iterator, a void return, a
+///   primitive. The call did not fail; it gave us nothing to walk. That is the
+///   documented best effort for a foreign collection whose layout we cannot
+///   model, and it is unchanged.
+fn collection_elements_generic(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let pin_base = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(pin_base, this);
     let iter = match ctx.invoke_virtual(this_cur, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
-        _ => {
+        Err(e) => {
             ctx.unpin_native_roots(pin_base);
-            return Vec::new();
+            return Err(e);
+        }
+        Ok(_) => {
+            ctx.unpin_native_roots(pin_base);
+            return Ok(Vec::new());
         }
     };
     let iter_pin = ctx.pin_native_root(iter);
     let mut out: Vec<(Value, Option<(usize, ObjectRef)>)> = Vec::new();
+    // Set when the walk was cut short by a *failure* rather than by the
+    // iterator reporting done. Held in a local instead of returning early so
+    // the pin unwind below stays one strictly-LIFO path — an early `return`
+    // past the per-element handles is the PIN-DANGLING shape this file's
+    // `chm_extra_entries` history already paid for once.
+    let mut failed: Option<MethodCallFailed> = None;
     const MAX_ELEMENTS: usize = 64 * 1024 * 1024;
     while out.len() < MAX_ELEMENTS {
         let iter_cur = ctx.read_native_pin(iter_pin, iter);
         match ctx.invoke_virtual(iter_cur, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
             _ => break,
         }
         let iter_cur = ctx.read_native_pin(iter_pin, iter);
@@ -3830,6 +4062,10 @@ fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
                     _ => None,
                 };
                 out.push((v, pin));
+            }
+            Err(e) => {
+                failed = Some(e);
+                break;
             }
             _ => break,
         }
@@ -3850,7 +4086,12 @@ fn collection_elements_generic(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
     }
     ctx.unpin_native_roots(iter_pin);
     ctx.unpin_native_roots(pin_base);
-    refreshed
+    match failed {
+        // The partial `refreshed` is dropped on purpose: a caller that got a
+        // prefix would be right back to comparing 3 elements against 0.
+        Some(e) => Err(e),
+        None => Ok(refreshed),
+    }
 }
 
 #[inline]
@@ -4415,7 +4656,11 @@ fn unmod_list_oob_error(
 }
 
 fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
+    // `class_name_rc` is the memoized reader; `class_name_of_id` takes the
+    // class-manager read lock and allocates a fresh `String` on EVERY call.
+    // This runs on the hot path of every `native_al_*` entry point.
+    let cid = ctx.class_id_of_object(this);
+    let name = class_name_rc(&*ctx, cid)?;
     if !name.starts_with("cratonvm/internal/Unmodifiable") {
         return None;
     }
@@ -4433,8 +4678,8 @@ fn unmod_receiver_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
 /// reporting **0**. The sizes are constants of the wrapper type, so answer them
 /// directly and keep the delegation as the path for everything else.
 fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    let name = ctx.class_name_of_id(ctx.class_id_of_object(this))?;
-    match name.as_str() {
+    let name = class_name_rc(ctx, ctx.class_id_of_object(this))?;
+    match &*name {
         "java/util/Collections$SingletonList"
         | "java/util/Collections$SingletonSet"
         | "java/util/Collections$SingletonMap" => Some(1),
@@ -4684,6 +4929,29 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // A `values()` / TreeMap-`entrySet()` view is an `ArrayList` here, but it is
+    // not addable. `Map.values`: "The collection supports element removal ... It
+    // does not support the `add` or `addAll` operations"; the JDK's
+    // `HashMap$Values extends AbstractCollection`, whose `add` is a bare
+    // `throw new UnsupportedOperationException()`.
+    //
+    // `values.addUnsupported` measured `m.values().add(99)` returning `true`
+    // here, leaving a value in the snapshot that no key in `m` maps to.
+    //
+    // The marker is the same one `native_al_remove_obj` / `native_al_clear` /
+    // the iterator's `remove()` already consult to write removals through, so
+    // this adds no new notion of "is a view" — it answers the question those
+    // three already ask. A plain `ArrayList` cannot match it: the trailing
+    // capacity slot of a normal list is null, and this test requires both a
+    // non-null trailing slot AND `length > size`.
+    if values_view_source(ctx, this).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     // GC-SAFETY: `al_ensure_capacity` allocates (and can GC) internally on a
@@ -4811,7 +5079,7 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // then shift through the REFRESHED references.
     let this_pin = ctx.pin_native_root(this);
     let vh = view_src.map(|v| ctx.pin_native_root(v));
-    let (found, data, _target) = pinned_array_search(ctx, data, size, target);
+    let (found, data, _target) = pinned_array_search(ctx, data, size, target)?;
     let this = ctx.read_native_pin(this_pin, this);
     let view_src = match (view_src, vh) {
         (Some(v), Some(h)) => Some(ctx.read_native_pin(h, v)),
@@ -4900,7 +5168,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if let Some(data) = data {
         // Family-1 fix (cce0079): pinned scan — the `equals()` dispatch can
         // move `data`/`target` mid-walk.
-        let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+        let (found, _, _) = pinned_array_search(ctx, data, size as usize, target)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
@@ -4928,7 +5196,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let mut found = false;
         for (i, orig) in elems.iter().enumerate() {
             let elem = read_pinned_elem(ctx, handles[i], *orig);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             target = read_pinned_elem(ctx, th, target);
             if matched {
                 found = true;
@@ -4959,7 +5227,7 @@ pub fn native_al_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None => return Ok(Some(Value::Int(-1))),
     };
     // Family-1 fix (cce0079): pinned scan.
-    let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+    let (found, _, _) = pinned_array_search(ctx, data, size as usize, target)?;
     Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
 }
 
@@ -4984,7 +5252,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let mut found = None;
     for i in (0..size).rev() {
         let elem = ctx.get_array_element(data, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -5044,19 +5312,31 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// via virtual dispatch. ONLY safe to call from paths the `iterator()` native
 /// does not itself route through (e.g. `toArray()`), since the iterator native
 /// snapshots non-list collections through `collect_collection_elements`.
-fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+///
+/// Fallible for the reason spelled out on [`collection_elements_generic`]: an
+/// `Err` from any of the three calls below is a refusal or a thrown exception,
+/// and returning `Vec::new()` for it hands the caller a wrong answer that
+/// every caller-that-only-iterates reads as a pass. `Ok` with nothing usable
+/// still means "nothing to walk" and still yields an empty `Vec`.
+fn collect_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let it = match ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
-        _ => return Vec::new(),
+        Err(e) => return Err(e),
+        Ok(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
     loop {
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => return Err(e),
             _ => break,
         }
         match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => out.push(v),
+            Err(e) => return Err(e),
             _ => break,
         }
         // Safety bound against a misbehaving iterator that never reports done.
@@ -5064,7 +5344,7 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Recursion-safe wrapper around [`collect_via_real_iterator`].
@@ -5073,16 +5353,23 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
 /// collection native that itself wants a fallback snapshot. One level is all
 /// any caller needs, so a re-entrant request yields an empty Vec (and the
 /// caller keeps whatever it already had) instead of recursing.
-fn collect_via_real_iterator_once(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+fn collect_via_real_iterator_once(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     use std::cell::Cell;
     thread_local! {
         static IN_REAL_ITER: Cell<bool> = const { Cell::new(false) };
     }
     if IN_REAL_ITER.with(Cell::get) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     IN_REAL_ITER.with(|g| g.set(true));
     let out = collect_via_real_iterator(ctx, coll);
+    // Cleared on the failing path too. `out` is now a `Result`, and an early
+    // `?` here would leave the guard latched for the rest of the thread's
+    // life — every later fallback walk on this thread would answer empty,
+    // which is the exact laundering this change exists to remove.
     IN_REAL_ITER.with(|g| g.set(false));
     out
 }
@@ -5166,29 +5453,52 @@ fn heuristic_snapshot_is_suspect(
 fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Vec<Value>, MethodCallFailed> {
     // GC-safety: every step below can run arbitrary Java (`invoke_virtual`),
     // which may complete a moving young collection and leave `this` stale.
+    //
+    // Split so the pin is released on the failing path as well. The body has
+    // always had a `?` in it (`collect_collection_elements`) and now has three
+    // more, and an early return past `unpin_native_roots` leaks a root for the
+    // rest of the run — the object is then immortal, and a later
+    // `unpin_native_roots` taken at a *lower* base silently truncates it away.
     let this_pin = ctx.pin_native_root(this);
+    let out = al_or_collection_elements_pinned(ctx, this, this_pin);
+    ctx.unpin_native_roots(this_pin);
+    out
+}
+
+fn al_or_collection_elements_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    this_pin: usize,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let mut elems = collect_collection_elements(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
     if !elems.is_empty() {
         if heuristic_snapshot_is_suspect(ctx, this, &elems) {
             let this = ctx.read_native_pin(this_pin, this);
-            let real = collect_via_real_iterator_once(ctx, this);
+            // The `?` matters here even though we already hold `elems`:
+            // `heuristic_snapshot_is_suspect` has just said the snapshot in
+            // hand must NOT be trusted (null holes in a non-`List`), so
+            // swallowing a refusal from the real walk would return the
+            // untrusted answer as if it were the checked one.
+            let real = collect_via_real_iterator_once(ctx, this)?;
             if !real.is_empty() {
                 elems = real;
             }
         }
-        ctx.unpin_native_roots(this_pin);
         return Ok(elems);
     }
+    // A refused `size()` is not "size 0". Answering 0 here skips the walk and
+    // returns the empty heuristic snapshot, which is the wrong answer this
+    // whole family launders.
     let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
+        Err(e) => return Err(e),
         _ => 0,
     };
     let this = ctx.read_native_pin(this_pin, this);
     if real_size > 0 {
-        elems = collect_via_real_iterator(ctx, this);
+        elems = collect_via_real_iterator(ctx, this)?;
     }
-    ctx.unpin_native_roots(this_pin);
     Ok(elems)
 }
 
@@ -5557,8 +5867,11 @@ pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 text.push_str(", ");
             }
             let val = ctx.get_array_element(d, i);
+            // Hoisted out of the `write!` argument so the `?` is an ordinary
+            // statement rather than a return out of a macro expansion.
+            let d = obj_to_display_string(ctx, &val)?;
             // `write!` into a String never fails; ignore the Result.
-            let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
+            let _ = write!(text, "{}", d);
         }
     }
     text.push(']');
@@ -5704,6 +6017,122 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(from as i32));
     ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(sub_size as i32));
     ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(parent_size));
+    // Explicit, not left to whatever `alloc_object` zero-initialises a slot of
+    // an undeclared shape to: W7-1's `lastRet` was exactly this hazard, an
+    // int-zero read as a meaningful value. `this` is a real `ArrayList` here,
+    // so there is no enclosing view to propagate to.
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(None));
+    Ok(Some(Value::Object(Some(view))))
+}
+
+/// The enclosing view of a nested `subList`, or `None` for a view carved
+/// directly out of an `ArrayList`. Guards on the field count so a view built by
+/// some other path with the older four-field shape simply reports "no enclosing
+/// view" (it degrades to the pre-existing behaviour) rather than reading past
+/// the object.
+fn asl_view_parent(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) <= ASL_FIELD_VIEW_PARENT {
+        return None;
+    }
+    match ctx.get_field(this, ASL_FIELD_VIEW_PARENT) {
+        Value::Object(Some(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// `subList` ON a sublist — a real nested view, not a view of a snapshot.
+///
+/// This was registered as `asl_delegate_snapshot`, which materialised the
+/// slice into a fresh `ArrayList` and returned a view of THAT. Reads were
+/// right; every write went into the throwaway. Measured:
+///
+/// ```text
+/// subList.nestedClearWritesThroughToBase  HotSpot [a, B, e]  CratonVM [a, B, c, d, e]
+/// subList.afterNestedClear                HotSpot [B]        CratonVM [B, c, d]
+/// ```
+///
+/// The composition is on the ROOT: the nested view points at the same backing
+/// `ArrayList` with `offset = enclosing.offset + fromIndex`, so it needs no
+/// interval arithmetic at read time and every existing `asl_*` native works on
+/// it unchanged. The enclosing view is recorded separately, in
+/// [`ASL_FIELD_VIEW_PARENT`], only so a structural mutation can walk back up.
+///
+/// Range check is against the ENCLOSING VIEW's size, not the root's, and uses
+/// `AbstractList.subListRangeCheck`'s wording — the same three arms as
+/// `native_al_sub_list`, and note the `fromIndex > toIndex` case is an
+/// `IllegalArgumentException` rather than a bounds exception at all.
+fn native_asl_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let to_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let (parent, _, size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+    if from_i32 < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("fromIndex = {from_i32}")).into(),
+        );
+    }
+    if to_i32 > size {
+        return Err(
+            cratonvm_types::error::RuntimeError::ioobe(format!("toIndex = {to_i32}")).into(),
+        );
+    }
+    if from_i32 > size || to_i32 < 0 {
+        return Err(cratonvm_types::error::RuntimeError::ioobe(format!(
+            "fromIndex = {from_i32}, toIndex = {to_i32}"
+        ))
+        .into());
+    }
+    if from_i32 > to_i32 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("fromIndex({from_i32}) > toIndex({to_i32})"),
+            }
+            .into(),
+        );
+    }
+    // GC-SAFETY: the allocation below can move `this` and the root list, and
+    // both are STORED in the new view's fields. Re-read the whole enclosing
+    // state through the pin afterwards rather than reusing the pre-allocation
+    // copies — a from-space `parent` recorded here would be what every later
+    // read of the nested view indexes into.
+    let this_pin = ctx.pin_native_root(this);
+    let view = match try_alloc_synthetic(ctx, ASL_CLASS, ASL_NUM_FIELDS) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let view_pin = ctx.pin_native_root(view);
+    let this = ctx.read_native_pin(this_pin, this);
+    let (parent, offset, _, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.set_field(view, ASL_FIELD_PARENT, Value::Object(Some(parent)));
+    ctx.set_field(view, ASL_FIELD_OFFSET, Value::Int(offset + from_i32));
+    ctx.set_field(view, ASL_FIELD_SIZE, Value::Int(to_i32 - from_i32));
+    ctx.set_field(view, ASL_FIELD_EXPECTED, Value::Int(expected));
+    ctx.set_field(view, ASL_FIELD_VIEW_PARENT, Value::Object(Some(this)));
+    let view = ctx.read_native_pin(view_pin, view);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(view))))
 }
 
@@ -5731,7 +6160,23 @@ const ASL_FIELD_PARENT: usize = 0;
 const ASL_FIELD_OFFSET: usize = 1;
 const ASL_FIELD_SIZE: usize = 2;
 const ASL_FIELD_EXPECTED: usize = 3;
-const ASL_NUM_FIELDS: usize = 4;
+/// The view this view was carved out of — `null` when `subList` was called on a
+/// real `ArrayList`, and the enclosing `ArrayListSubList` when it was called on
+/// another view.
+///
+/// [`ASL_FIELD_PARENT`] deliberately stays the ROOT list with an ABSOLUTE
+/// offset, so every existing `asl_*` native keeps working on a nested view
+/// without being edited. This field exists for the one thing that cannot be
+/// derived from the root: a structural mutation through a nested view has to
+/// adjust the ENCLOSING views' `size`/`expected` too, or they immediately read
+/// as comodified. The JDK does the same walk, up its own `SubList.parent`
+/// chain, in `updateSizeAndModCount`.
+///
+/// It is an object field and therefore GC-scanned, unlike a side table — the
+/// same reason `TmViewSpec`'s three references had to be wired into all four
+/// overlay GC hooks and this one does not.
+const ASL_FIELD_VIEW_PARENT: usize = 4;
+const ASL_NUM_FIELDS: usize = 5;
 
 /// Read `(parent, offset, size, expected_parent_size)` from a sublist view.
 fn asl_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
@@ -5784,37 +6229,18 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
-    // toArray(T[]) / toArray(IntFunction) — delegate through a fresh snapshot
-    // ArrayList (which registers both overloads). Without these, a caller doing
-    // `subList(..).toArray(new X[0])` (e.g. the JUnit Platform launcher, and
-    // ~every ESTestCase via ES-FAIL-04) hits a NoSuchMethodError on the
-    // synthetic ASL class and aborts.
-    r.register(
-        c,
-        "toArray",
-        "([Ljava/lang/Object;)[Ljava/lang/Object;",
-        |ctx, args| {
-            asl_delegate_snapshot(
-                ctx,
-                args,
-                "toArray",
-                "([Ljava/lang/Object;)[Ljava/lang/Object;",
-            )
-        },
-    );
-    r.register(
-        c,
-        "toArray",
-        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-        |ctx, args| {
-            asl_delegate_snapshot(
-                ctx,
-                args,
-                "toArray",
-                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
-            )
-        },
-    );
+    // `toArray(T[])` and `toArray(IntFunction)` are registered ONCE, further
+    // down this same function under "REGRESSION FIX (hibernate-smoke)".
+    //
+    // A byte-identical second pair used to sit here: two independent regression
+    // fixes — the JUnit Platform launcher and ~every ESTestCase via ES-FAIL-04
+    // here, Hibernate's metadata collector there — each added the same two
+    // registrations without noticing the other. Registration is
+    // last-write-wins, so this pair could only ever LOSE the slot, and
+    // `duplicate_registration_gate` counted both rows as shadowed. The callers
+    // named by both fixes are served by the surviving pair, which has the same
+    // body (`asl_delegate_snapshot` with the same descriptors), so deleting
+    // this one changes no behaviour. Do not re-add a pair here.
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
     // these, an interface-level `Collection`/`List` native would be reached
@@ -5900,9 +6326,9 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/ListIterator;",
         |ctx, args| asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;"),
     );
-    r.register(c, "subList", "(II)Ljava/util/List;", |ctx, args| {
-        asl_delegate_snapshot(ctx, args, "subList", "(II)Ljava/util/List;")
-    });
+    // NOT `asl_delegate_snapshot`: a view of a snapshot reads correctly and
+    // writes nowhere. See `native_asl_sub_list`.
+    r.register(c, "subList", "(II)Ljava/util/List;", native_asl_sub_list);
     r.register(
         c,
         "spliterator",
@@ -5940,6 +6366,17 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
             asl_delegate_mutating(ctx, args, "removeIf", "(Ljava/util/function/Predicate;)Z")
         },
     );
+    // `List.sort` is a MUTATOR of the view's range, and `subList.sortWritesThrough`
+    // measured `base.subList(1,4).sort(naturalOrder())` leaving `base` at
+    // `[9, 5, 1, 7, 3]` where HotSpot has `[9, 1, 5, 7, 3]`. It had no
+    // registration here at all, so the call reached an interface-level native
+    // that read the ASL receiver through the `ArrayList` layout — the sorted
+    // result landed nowhere. `asl_delegate_mutating` is exactly right for it:
+    // the snapshot's real `sort` reorders in place, the element count does not
+    // change, and the slice is written back over `[offset, offset+size)`.
+    r.register(c, "sort", "(Ljava/util/Comparator;)V", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "sort", "(Ljava/util/Comparator;)V")
+    });
     r.set_category(__prev_cat);
 }
 
@@ -6086,7 +6523,8 @@ fn native_asl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             text.push_str(", ");
         }
         let val = ctx.get_array_element(buf, i);
-        let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
+        let d = obj_to_display_string(ctx, &val)?;
+        let _ = write!(text, "{}", d);
     }
     text.push(']');
     let s = ctx.create_string(&text);
@@ -6209,6 +6647,31 @@ fn asl_delegate_mutating(
     al_set_size(ctx, parent, w as i32);
     ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
     ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    // Ripple the element-count change up the enclosing views, the way the JDK's
+    // `SubList.updateSizeAndModCount` walks its own `parent` chain. Without
+    // this, `sub.subList(1,3).clear()` leaves `sub` holding the pre-mutation
+    // `expected`, so the very next read of `sub` raises
+    // `ConcurrentModificationException` — where HotSpot answers `[B]`
+    // (`subList.afterNestedClear`). Only ANCESTORS are updated: a SIBLING view
+    // over the same parent is genuinely comodified and must keep failing, which
+    // is what its now-stale `expected` does.
+    //
+    // No allocation in this loop, so the refs stay valid without pinning. The
+    // hop cap is the same defensive bound `implements_comparable` uses: a cycle
+    // is impossible by construction (a view's enclosing view is always older
+    // than it), and a cap costs nothing to be sure.
+    let delta = new_size - size;
+    let mut cursor = asl_view_parent(ctx, this);
+    for _ in 0..64 {
+        let Some(v) = cursor else { break };
+        let vs = match ctx.get_field(v, ASL_FIELD_SIZE) {
+            Value::Int(s) => s,
+            _ => break,
+        };
+        ctx.set_field(v, ASL_FIELD_SIZE, Value::Int((vs + delta).max(0)));
+        ctx.set_field(v, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+        cursor = asl_view_parent(ctx, v);
+    }
     ctx.unpin_native_roots(pin);
     Ok(ret)
 }
@@ -6248,7 +6711,13 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             let d_cur = ctx.read_native_pin(d_pin, d);
             let val = ctx.get_array_element(d_cur, i);
             // List.hashCode contract: 31*acc + e.hashCode() (0 for null).
-            let elem_hash = element_hash_code(ctx, &val);
+            let elem_hash = match element_hash_code(ctx, &val) {
+                Ok(h) => h,
+                Err(e) => {
+                    ctx.unpin_native_roots(d_pin);
+                    return Err(e);
+                }
+            };
             hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
         }
         ctx.unpin_native_roots(d_pin);
@@ -6296,9 +6765,23 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         if !al_eq_operand_is_list(ctx, other) || !al_eq_operand_is_list(ctx, this) {
             return Ok(Some(Value::Int(0)));
         }
-        let ea = collection_elements_generic(ctx, this);
+        // Nothing of ours is pinned yet, so a refusal on the first operand can
+        // propagate with a bare `?`.
+        let ea = collection_elements_generic(ctx, this)?;
         let (ea_pin, ea_handles) = pin_value_slice(ctx, &ea);
-        let eb = collection_elements_generic(ctx, other);
+        // The second operand is where `arrayList.equals(linkedList)` refuses
+        // under `--jdk-only`, and by now `ea`'s elements are pinned — so this
+        // one has to unwind before it propagates. `?` here would leak
+        // `ea_pin`'s roots for the rest of the run.
+        let eb = match collection_elements_generic(ctx, other) {
+            Ok(eb) => eb,
+            Err(e) => {
+                if ea_pin != usize::MAX {
+                    ctx.unpin_native_roots(ea_pin);
+                }
+                return Err(e);
+            }
+        };
         let (eb_pin, eb_handles) = pin_value_slice(ctx, &eb);
         let pin_base = if ea_pin == usize::MAX { eb_pin } else { ea_pin };
         let equal: Result<bool, MethodCallFailed> = (|| {
@@ -6982,15 +7465,27 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
 /// distribution). `null` hashes to 0. Strings and primitive wrappers are
 /// hashed by value to match the JDK; arbitrary objects dispatch to their
 /// virtual `hashCode()`.
-fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
+///
+/// Fallible for the reason `map_hash_key` already documents one screen up —
+/// this is the same swallow, in the helper the *collection* `hashCode`
+/// contracts run through instead of the bucket path. `_ => identity_hash_code`
+/// answered a plausible number for a `hashCode()` that threw or was refused,
+/// and a plausible number is the worst possible answer here: the aggregate
+/// `List`/`Set`/`Map` hash comes out stable and wrong, so the collection is
+/// filed under a bucket its own equal twin will never be found in.
+///
+/// A callee that returns something other than an `Int` — a contract violation
+/// with no exceptional control flow — still falls back to the identity hash,
+/// exactly as `map_hash_key` does.
+fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, MethodCallFailed> {
     match v {
-        Value::Object(None) => 0,
-        Value::Int(x) => *x,
-        Value::Long(x) => (*x ^ (*x >> 32)) as i32,
-        Value::Float(x) => x.to_bits() as i32,
+        Value::Object(None) => Ok(0),
+        Value::Int(x) => Ok(*x),
+        Value::Long(x) => Ok((*x ^ (*x >> 32)) as i32),
+        Value::Float(x) => Ok(x.to_bits() as i32),
         Value::Double(x) => {
             let bits = x.to_bits() as i64;
-            (bits ^ (bits >> 32)) as i32
+            Ok((bits ^ (bits >> 32)) as i32)
         }
         Value::Object(Some(obj)) => {
             // String hashCode by value (UTF-16 code units, wrapping mul+add).
@@ -6999,7 +7494,7 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
                 for cu in s.encode_utf16() {
                     h = h.wrapping_mul(31).wrapping_add(cu as i32);
                 }
-                return h;
+                return Ok(h);
             }
             // Primitive wrapper types hash by their boxed primitive value.
             if let Some(prim) = unbox_wrapper(ctx, *obj) {
@@ -7007,12 +7502,13 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
             }
             // Arbitrary objects: honour the contract via their virtual hashCode().
             match ctx.invoke_virtual(*obj, "hashCode", "()I", &[]) {
-                Ok(Some(Value::Int(h))) => h,
-                _ => ctx.identity_hash_code(*obj),
+                Ok(Some(Value::Int(h))) => Ok(h),
+                Err(e) => Err(e),
+                _ => Ok(ctx.identity_hash_code(*obj)),
             }
         }
         // Internal VM values that cannot legitimately be collection elements.
-        Value::ReturnAddress(_) | Value::Uninitialized => 0,
+        Value::ReturnAddress(_) | Value::Uninitialized => Ok(0),
     }
 }
 
@@ -10280,7 +10776,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         let mut target = target;
         for (i, val_orig) in values.iter().enumerate() {
             let val = read_pinned_elem(ctx, v_handles[i], *val_orig);
-            let matched = list_element_matches(ctx, &val, &target);
+            let matched = list_element_matches(ctx, &val, &target)?;
             target = read_pinned_elem(ctx, target_pin, target);
             if matched {
                 found = true;
@@ -10312,7 +10808,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 }
                 let node_pin = ctx.pin_native_root(node);
                 let value = get_node_value(ctx, node);
-                let matched = list_element_matches(ctx, &value, &target);
+                let matched = list_element_matches(ctx, &value, &target)?;
                 let node = ctx.read_native_pin(node_pin, node);
                 b = ctx.read_native_pin(b_pin, b);
                 target = read_pinned_elem(ctx, target_pin, target);
@@ -10642,8 +11138,8 @@ fn native_map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = map_collect_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let ks = obj_to_display_string(ctx, key);
-        let vs = obj_to_display_string(ctx, value);
+        let ks = obj_to_display_string(ctx, key)?;
+        let vs = obj_to_display_string(ctx, value)?;
         parts.push(format!("{}={}", ks, vs));
     }
     let text = format!("{{{}}}", parts.join(", "));
@@ -10659,15 +11155,57 @@ fn native_map_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // hashCode/equals (arbitrary, GC-capable bytecode), and the DEFAULT value
     // sat raw in `args` across it — the common absent-key branch then
     // returned a pre-move address. Pin the default across the lookup.
+    //
+    // `this` and `key` are pinned for the same reason, added with the
+    // `containsKey` re-ask below: that second lookup needs BOTH of them AFTER
+    // the first one has run arbitrary bytecode, and re-reading them out of
+    // `args` would hand the disambiguating question a pre-move receiver — the
+    // very defect this comment block was written about, one call later.
+    let this0 = args.first().copied().unwrap_or(Value::Object(None));
+    let key0 = args.get(1).copied().unwrap_or(Value::Object(None));
     let default0 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let this_pin = pin_value(ctx, this0);
+    let key_pin = pin_value(ctx, key0);
     let default_pin = pin_value(ctx, default0);
+    let pin_base = [this_pin, key_pin, default_pin]
+        .into_iter()
+        .find(|p| *p != usize::MAX);
     let result = native_map_get(ctx, args);
+    let this_now = read_pinned_elem(ctx, this_pin, this0);
+    let key_now = read_pinned_elem(ctx, key_pin, key0);
     let default_now = read_pinned_elem(ctx, default_pin, default0);
-    if default_pin != usize::MAX {
-        ctx.unpin_native_roots(default_pin);
+    if let Some(base) = pin_base {
+        ctx.unpin_native_roots(base);
     }
     match result? {
-        Some(Value::Object(None)) => Ok(Some(default_now)),
+        // A null answer from `get` is ambiguous in exactly the way
+        // `Map.getOrDefault` is specified to resolve: "the value to which the
+        // specified key is mapped, or `defaultValue` if this map contains **no
+        // mapping** for the key". A key present with a null value has a
+        // mapping, so it answers `null` — not the default.
+        //
+        // `HashMap.getOrDefaultOverNullValue` measured `DEFAULT` here against
+        // HotSpot's `null`, after `nm.put("k", null)`. `HashMap.getOrDefault`
+        // reads the NODE (`(e = getNode(key)) == null ? defaultValue : e.value`)
+        // and so never has to ask twice; this path only has the value, so it
+        // asks the second question the `Map` interface's own default
+        // implementation asks — `(((v = get(key)) != null) || containsKey(key))`.
+        //
+        // The extra `containsKey` costs one more lookup on a MISS, which is the
+        // common case for this method. That is the price of the distinction and
+        // the interface default pays it too; the alternative is answering
+        // "absent" for a mapping that exists, which no caller can detect.
+        Some(Value::Object(None)) => {
+            let present = matches!(
+                native_map_contains_key(ctx, &[this_now, key_now])?,
+                Some(Value::Int(1))
+            );
+            if present {
+                Ok(Some(Value::Object(None)))
+            } else {
+                Ok(Some(default_now))
+            }
+        }
         other => Ok(other),
     }
 }
@@ -10731,7 +11269,7 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // native_map_put re-enters Java, moving `this` and every pending pair.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, other);
+    let entries = collect_entries_any(ctx, other)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, value)) in entries.iter().enumerate() {
@@ -10764,9 +11302,21 @@ fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let key = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
         // Map.hashCode contract: sum of Map.Entry hashes,
         // where Entry hash = keyHash ^ valueHash.
-        let kh = element_hash_code(ctx, &key);
+        let kh = match element_hash_code(ctx, &key) {
+            Ok(h) => h,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
         let value = read_pinned_elem(ctx, handles[2 * i + 1], flat[2 * i + 1]);
-        let vh = element_hash_code(ctx, &value);
+        let vh = match element_hash_code(ctx, &value) {
+            Ok(h) => h,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
         hash = hash.wrapping_add(kh ^ vh);
     }
     ctx.unpin_native_roots(pin_base);
@@ -11131,7 +11681,17 @@ fn source_map_remove(
 /// Collect `(key, value)` pairs from any of the natively-modelled maps,
 /// dispatching on the concrete backend so a LinkedHashMap's overlay / a
 /// TreeMap's tree are read correctly rather than as empty bucket tables.
-fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(Value, Value)> {
+///
+/// Fallible for the reason on [`collection_elements_generic`], and this is the
+/// map-side twin of that defect: every caller below is a copy constructor, a
+/// `putAll`, a `forEach`, a `hashCode` or a serialisation writer, and each one
+/// reads an empty answer as "the source map had no entries". A refused
+/// `isEmpty()` / `entrySet()` / `iterator()` therefore used to produce an empty
+/// destination map and no exception at all.
+fn collect_entries_any(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     // See through CratonVM's synthetic unmodifiable wrapper first so a
     // `Map.of(...)` / `Collections.unmodifiableMap(...)` source is read as its
     // backing map (and the TreeMap/LHM dispatch below sees the real class).
@@ -11142,10 +11702,10 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_lhm_receiver(ctx, source) {
         let ks = lhm_collect_keys(ctx, source);
         let vs = lhm_collect_values(ctx, source);
-        return ks.into_iter().zip(vs).collect();
+        return Ok(ks.into_iter().zip(vs).collect());
     }
     if is_tree_map_receiver(ctx, source) {
-        return tm_collect_pairs(ctx, source);
+        return Ok(tm_collect_pairs(ctx, source));
     }
     // Only interpret the source's fields as a HashMap bucket table when it is
     // actually one of the map kinds CratonVM models that way (real/synthetic
@@ -11159,7 +11719,7 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_native_bucket_map(ctx, source) {
         let entries = map_collect_entries(ctx, source);
         if !entries.is_empty() {
-            return entries;
+            return Ok(entries);
         }
     }
     // Either a genuinely empty native map, or a `Map` whose internal layout
@@ -11179,21 +11739,26 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     // own entry pin then faithfully pinned an ALREADY-STALE address. Pin +
     // refresh across the probe.
     let source_pin = ctx.pin_native_root(source);
-    let nonempty = matches!(
-        ctx.invoke(
-            "java/util/Map",
-            "isEmpty",
-            "()Z",
-            &[Value::Object(Some(source))],
-        ),
-        Ok(Some(Value::Int(0)))
+    // The `matches!` this replaced folded `Err` into "empty", which is the
+    // arm that mattered: a refused `isEmpty()` skipped the walk entirely and
+    // the caller copied nothing. Unwind the pin before propagating.
+    let is_empty = ctx.invoke(
+        "java/util/Map",
+        "isEmpty",
+        "()Z",
+        &[Value::Object(Some(source))],
     );
     let source = ctx.read_native_pin(source_pin, source);
     ctx.unpin_native_roots(source_pin);
+    let nonempty = match is_empty {
+        Ok(Some(Value::Int(0))) => true,
+        Err(e) => return Err(e),
+        _ => false,
+    };
     if nonempty {
         return collect_entries_via_iterator(ctx, source);
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Walk an arbitrary `java.util.Map` via its polymorphic
@@ -11235,9 +11800,13 @@ impl Drop for IterCollectGuard {
 fn collect_entries_via_iterator(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
-) -> Vec<(Value, Value)> {
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     let guard_key = source.as_ptr() as u64;
     let inserted = ITER_COLLECT_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    // The RAII guard also covers the `?`-shaped early returns the inner walk
+    // now has: an `Err` unwinds through `Drop` exactly as a panic did, so a
+    // refusal cannot leave a stale key behind and make a later collection of a
+    // pointer-reused source wrongly answer empty.
     let _guard = IterCollectGuard {
         key: guard_key,
         inserted,
@@ -11245,7 +11814,7 @@ fn collect_entries_via_iterator(
     if !inserted {
         // Re-entrant collection of the SAME source via its own entrySet view —
         // walking it again would recurse forever. Break the cycle.
-        return Vec::new();
+        return Ok(Vec::new());
     }
     collect_entries_via_iterator_inner(ctx, source)
 }
@@ -11253,7 +11822,7 @@ fn collect_entries_via_iterator(
 fn collect_entries_via_iterator_inner(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
-) -> Vec<(Value, Value)> {
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     let mut out = Vec::new();
     // Dispatch through `invoke_virtual` on each concrete receiver — NOT
     // `ctx.invoke("java/util/Map", ...)`. The latter keys the native lookup on
@@ -11283,18 +11852,26 @@ fn collect_entries_via_iterator_inner(
     let source_c = ctx.read_native_pin(source_pin, source);
     let set = match ctx.invoke_virtual(source_c, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Err(e);
+        }
         _ => {
             ctx.unpin_native_roots(source_pin);
-            return out;
+            return Ok(out);
         }
     };
     let set_pin = ctx.pin_native_root(set);
     let set_c = ctx.read_native_pin(set_pin, set);
     let it = match ctx.invoke_virtual(set_c, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(i)))) => i,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Err(e);
+        }
         _ => {
             ctx.unpin_native_roots(source_pin);
-            return out;
+            return Ok(out);
         }
     };
     let it_pin = ctx.pin_native_root(it);
@@ -11302,34 +11879,50 @@ fn collect_entries_via_iterator_inner(
     // strictly LIFO — nothing is unpinned until the single truncate below, so
     // handles stay valid (see the PIN-DANGLING history in chm_extra_entries).
     let mut pinned: Vec<(usize, Value, usize, Value)> = Vec::new();
+    // Same reason as `collection_elements_generic`: a failure inside the walk
+    // is recorded and the loop left by the normal `break`, so the one truncate
+    // at `source_pin` still covers `set_pin`, `it_pin` and every per-entry pin.
+    let mut failed: Option<MethodCallFailed> = None;
     loop {
         let it_c = ctx.read_native_pin(it_pin, it);
-        let has_next = matches!(
-            ctx.invoke_virtual(it_c, "hasNext", "()Z", &[]),
-            Ok(Some(Value::Int(n))) if n != 0
-        );
-        if !has_next {
-            break;
+        match ctx.invoke_virtual(it_c, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+            _ => break,
         }
         let it_c = ctx.read_native_pin(it_pin, it);
         let entry = match ctx.invoke_virtual(it_c, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(e)))) => e,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
             _ => break,
         };
         let entry_pin = ctx.pin_native_root(entry);
         let entry_c = ctx.read_native_pin(entry_pin, entry);
-        let key = ctx
-            .invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        // `.ok().flatten().unwrap_or(null)` mapped a throwing or refused
+        // `getKey()` to a null KEY, which then went into the destination map as
+        // a real entry — a fabricated datum, not a missing one.
+        let key = match ctx.invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         let key_pin = pin_value(ctx, key);
         let entry_c = ctx.read_native_pin(entry_pin, entry);
-        let value = ctx
-            .invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let value = match ctx.invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         let value_pin = pin_value(ctx, value);
         pinned.push((key_pin, key, value_pin, value));
     }
@@ -11339,7 +11932,10 @@ fn collect_entries_via_iterator_inner(
         out.push((key, value));
     }
     ctx.unpin_native_roots(source_pin);
-    out
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 /// Build a keySet/entrySet view: a `HashSet` snapshot whose backing remembers
@@ -11477,7 +12073,7 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), Me
     set_map_size(ctx, backing, 0);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
-        let entries = collect_entries_any(ctx, source);
+        let entries = collect_entries_any(ctx, source)?;
         let entry_pins: Vec<(usize, usize)> = entries
             .iter()
             .map(|(k, v)| (pin_value(ctx, *k), pin_value(ctx, *v)))
@@ -11598,7 +12194,7 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             // them and hand back only refreshed addresses (canary-caught
             // live via `native_hs_iterator` during WildFly domain boot).
             let src_pin = ctx.pin_native_root(source);
-            let entries = collect_entries_any(ctx, source);
+            let entries = collect_entries_any(ctx, source)?;
             let source = ctx.read_native_pin(src_pin, source);
             let (keys, vals): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
             let (_, kh) = pin_value_slice(ctx, &keys);
@@ -11688,7 +12284,7 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
             _ => false,
         }
     };
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
 
     // GC-SAFETY: the entry-view branch below allocates a new `SimpleEntry`
     // per element via `alloc_live_entry`, and `alloc_ref_array` further down
@@ -11774,7 +12370,7 @@ fn remove_source_entry_by_value(
     source: ObjectRef,
     value: Value,
 ) -> Result<(), MethodCallFailed> {
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     // Family-1 fix (cce0079): the per-entry `equals()` dispatch can move
     // `source`/`value`/every snapshot key+value — pin them all, refresh per
     // use, and hand `source_map_remove` current addresses.
@@ -11788,7 +12384,7 @@ fn remove_source_entry_by_value(
     let mut result = Ok(());
     for i in 0..keys.len() {
         let v = read_pinned_elem(ctx, v_handles[i], vals[i]);
-        let matched = list_element_matches(ctx, &v, &value);
+        let matched = list_element_matches(ctx, &v, &value)?;
         source = ctx.read_native_pin(src_pin, source);
         value = read_pinned_elem(ctx, vh, value);
         if matched {
@@ -11840,6 +12436,27 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
         }
     }
     None
+}
+
+/// Write a removal back to whatever a [`ts_view_source`] marker names.
+///
+/// Two kinds of source reach that marker now. A `TreeMap` keySet view names a
+/// MAP, whose removal is `remove(Object)Object`; a `descendingSet` view names
+/// another `TreeSet`, whose removal is `remove(Object)Z`. Dispatching by
+/// descriptor is not optional — `source_map_remove`'s
+/// `(Ljava/lang/Object;)Ljava/lang/Object;` does not exist on `TreeSet` at all,
+/// so calling it on a set source raises `NoSuchMethodError` rather than
+/// removing anything.
+fn ts_source_remove(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    elem: Value,
+) -> Result<(), MethodCallFailed> {
+    if is_tree_map_receiver(ctx, source) {
+        return source_map_remove(ctx, source, elem);
+    }
+    ctx.invoke_virtual(source, "remove", "(Ljava/lang/Object;)Z", &[elem])?;
+    Ok(())
 }
 
 /// Get the backing HashMap from a HashSet.
@@ -12310,7 +12927,13 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..keys.len() {
         let k = read_pinned_elem(ctx, handles[i], keys[i]);
         // Set.hashCode contract: sum of element hashCode()s (0 for null).
-        h = h.wrapping_add(element_hash_code(ctx, &k));
+        match element_hash_code(ctx, &k) {
+            Ok(eh) => h = h.wrapping_add(eh),
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        }
     }
     ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Int(h)))
@@ -12599,6 +13222,34 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // A keySet()/entrySet() view is not addable. `Map.keySet`: "The set supports
+    // element removal ... It does not support the `add` or `addAll`
+    // operations"; the JDK's `HashMap$KeySet extends AbstractSet`, and
+    // `AbstractCollection.add` is a bare `throw new
+    // UnsupportedOperationException()`.
+    //
+    // `keySet.addUnsupported` measured `m.keySet().add("nope")` returning
+    // normally here. That is worse than it looks: the key landed in the VIEW's
+    // backing and not in `m`, so the caller was left holding a "view" that
+    // disagrees with the map it is a view of — the same silent-divergence shape
+    // the write-through rows are about, arrived at from the other side.
+    //
+    // The predicate is the view marker itself, not a class-name test: an
+    // ordinary `HashSet`'s backing is a real `java/util/HashMap` with fewer
+    // than `VIEW_BACKING_FIELDS` slots, so `view_backing_source` answers `None`
+    // for it by construction. Construction of the view is unaffected —
+    // `make_view_set_of` populates the backing through `native_map_put` and
+    // never comes through here.
+    if view_backing_source(ctx, backing).is_some() {
+        return Err(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                // HotSpot's is message-less; `thrownDetail` prints a message
+                // when there is one.
+                message: String::new(),
+            }
+            .into(),
+        );
+    }
     // put(element, PRESENT) — the previous value being null is how this
     // reports "the element was not already in the set". See `present_marker`
     // for why the marker must be a reference.
@@ -13167,7 +13818,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let keys = collect_view_snapshot_ordered(ctx, backing)?;
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
-        parts.push(obj_to_display_string(ctx, k));
+        parts.push(obj_to_display_string(ctx, k)?);
     }
     let text = format!("[{}]", parts.join(", "));
     let s = ctx.create_string(&text);
@@ -13516,7 +14167,21 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     if cursor >= total {
-        return Ok(Some(Value::Object(None)));
+        // W7-1 residual: this answered `null` past the end where
+        // `HashMap$KeyItr.next()` throws. `null` is the worst answer available —
+        // it is also a legitimate element of a `HashMap` key set, so a caller
+        // that over-ran its own `hasNext()` got an element it could not
+        // distinguish from a real one and NPE'd somewhere else entirely. The
+        // message is `native_snapshot_itr_next`'s verbatim: that function is the
+        // other half of this iterator family (it delegates HERE for a
+        // `HashMap$KeyItr` receiver) and already throws it on all three of its
+        // own exhausted paths, so the two cannot drift into different reports.
+        return Err(
+            cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "No more elements".to_string(),
+            }
+            .into(),
+        );
     }
     let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
         Value::Object(Some(arr)) => arr,
@@ -13756,7 +14421,7 @@ fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     for i in 0..len {
         let arr = ctx.read_native_pin(arr_pin, arr);
         let val = ctx.get_array_element(arr, i);
-        parts.push(obj_to_display_string(ctx, &val));
+        parts.push(obj_to_display_string(ctx, &val)?);
     }
     ctx.unpin_native_roots(arr_pin);
     let text = format!("[{}]", parts.join(", "));
@@ -14284,7 +14949,7 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let s = match val {
         _ if opt_value_is_empty(val) => "Optional.empty".to_string(),
         _ => {
-            let display = obj_to_display_string(ctx, &val);
+            let display = obj_to_display_string(ctx, &val)?;
             format!("Optional[{display}]")
         }
     };
@@ -15171,6 +15836,36 @@ fn native_collections_unmodifiable_list(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `Collections.unmodifiableList` is idempotent by identity:
+    //
+    // ```java
+    // if (list.getClass() == UnmodifiableList.class ||
+    //     list.getClass() == UnmodifiableRandomAccessList.class)
+    //     return (List<T>) list;
+    // ```
+    //
+    // `unmodifiableList.rewrapIsNewObject` measured
+    // `Collections.unmodifiableList(un) == un` as `false` here against HotSpot's
+    // `true`. A second wrapper is not merely wasteful — it is a different
+    // object, so a caller that re-wraps defensively and then compares by
+    // identity (or uses the result as a map key) sees two distinct lists where
+    // the JDK has one, and every extra layer costs another delegation hop on
+    // every read.
+    //
+    // The test is exact class identity, as the JDK's is, and NOT
+    // [`unmod_is_immutable`]: a `List.of(...)` shares this wrapper class here
+    // but reports `ImmutableCollections$ListN` from `getClass()`, and the JDK
+    // does wrap that one — its two `==` comparands are the `Collections$Unmodifiable*`
+    // classes only. So the immutable marker has to exclude, not include.
+    if ctx.object_num_fields(src) > UNMOD_FIELD_IMMUTABLE
+        && ctx
+            .class_name_of_id(ctx.class_id_of_object(src))
+            .as_deref()
+            == Some(UNMOD_LIST_CLASS)
+        && !matches!(ctx.get_field(src, UNMOD_FIELD_IMMUTABLE), Value::Int(1))
+    {
+        return Ok(Some(Value::Object(Some(src))));
+    }
     let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src)?;
     Ok(Some(Value::Object(Some(w))))
 }
@@ -15261,7 +15956,7 @@ fn native_hibernate_persistent_map_for_each(
             return Ok(None);
         }
     };
-    let entries = collect_entries_any(ctx, backing);
+    let entries = collect_entries_any(ctx, backing)?;
     let keys: Vec<Value> = entries.iter().map(|(k, _)| *k).collect();
     let vals: Vec<Value> = entries.iter().map(|(_, v)| *v).collect();
     let (key_pin_base, key_pins) = pin_value_slice(ctx, &keys);
@@ -15304,7 +15999,7 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // iteration must hand the value to the consumer, not evaluate its
     // `hashCode()`. Use the concrete-backend collector so this bridge is also
     // safe for LinkedHashMap, TreeMap, immutable wrappers, and foreign maps.
-    let entries = collect_entries_any(ctx, this);
+    let entries = collect_entries_any(ctx, this)?;
     // GC-SAFETY: the BiConsumer `accept` allocates → moving young GC relocates
     // `action` and every key/value; pin all and re-read from the handles before
     // each dispatch.
@@ -15904,9 +16599,9 @@ fn native_entry_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .unwrap_or(Value::Object(None));
         let value_pin = pin_value(ctx, value);
         let key = read_pinned_elem(ctx, key_pin, key);
-        let kh = element_hash_code(ctx, &key);
+        let kh = element_hash_code(ctx, &key)?;
         let value = read_pinned_elem(ctx, value_pin, value);
-        Ok(kh ^ element_hash_code(ctx, &value))
+        Ok(kh ^ element_hash_code(ctx, &value)?)
     })();
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(hashes?)))
@@ -16364,6 +17059,26 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // `HashMap.merge` opens with
+    // `if (value == null || remappingFunction == null) throw new NullPointerException();`
+    // — `Map.merge`: "@throws NullPointerException if ... the value or
+    // remappingFunction is null". `Map.mergeNullValueThrows` measured
+    // `m.merge("g", null, Integer::sum)` returning normally here.
+    //
+    // The refusal is not decoration. A null value means "remove the mapping" to
+    // the rest of this function (see the `new_val == null` branch below, which
+    // is the correct handling of a null RESULT), so a caller that reached
+    // `merge` with a null argument silently got a delete where it asked for an
+    // insert — and on an absent key, a silent no-op.
+    //
+    // The refusal is on an explicitly-passed null, not on a missing argument:
+    // `args.get(3)` returning `None` is a malformed call, and turning that into
+    // an NPE would report a dispatch defect as a program error.
+    if matches!(value, Value::Object(None))
+        || matches!(args.get(3), Some(Value::Object(None)))
+    {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
     let bi_function = match args.get(3) {
         Some(Value::Object(Some(f))) => *f,
         _ => return Ok(Some(Value::Object(None))),
@@ -16973,13 +17688,92 @@ const STREAM_FIELD_ELEMENTS: usize = 0;
 // runs them once; intermediate ops propagate them; flatMap/concat follow the JDK
 // close-handler contract. See docs/known-issues/keycloak-16-stream-onclose-and-laziness.md.
 const STREAM_FIELD_CLOSE_HANDLERS: usize = 1;
-const STREAM_NUM_FIELDS: usize = 2;
+/// The full synthetic-Stream layout: slots 0..=4 (see `STREAM_FIELD_LINKED`).
+///
+/// Was 2 until W7-65 added the linked-or-consumed slot. Growing it makes slots
+/// 2 (lazy spliterator) and 3 (op chain) *readable* on streams built by
+/// `make_stream` for the first time, which is safe because
+/// `Heap::try_alloc_object` allocates through `try_alloc_zeroed`: an unwritten
+/// slot reads back as the zero `Value`, so `stream_lazy_spliterator` and
+/// `stream_has_chain` both still answer "no". Every reader of slots 2/3/4
+/// guards on `object_num_fields` anyway, so the many 1-field ad-hoc stream
+/// allocations elsewhere in the workspace are unaffected.
+const STREAM_NUM_FIELDS: usize = 5;
 /// Lazy source spliterator slot, populated only by
 /// `StreamSupport.stream(realSpliterator, false)` (see service_loader.rs). When
 /// present (and `STREAM_FIELD_ELEMENTS` is still null), the stream has NOT been
 /// drained: `forEach` drives the spliterator one element at a time, and every
 /// other op materialises it first via `materialize_lazy_stream`.
 const STREAM_FIELD_LAZY_SPLITERATOR: usize = 2;
+// Slot 3 is `STREAM_FIELD_OP_CHAIN` (declared with the lazy-pipeline code
+// below, which is the only thing that writes it).
+/// W7-65 — `java.util.stream.AbstractPipeline.linkedOrConsumed`, modelled.
+///
+/// `Value::Int(1)` once this stream stage has been linked (an intermediate op
+/// was applied to it) or consumed (a terminal op read its elements); anything
+/// else — including the zero a fresh slot reads back as — means "not yet".
+/// Deliberately asymmetric: only the exact `Int(1)` counts, so a stream whose
+/// slot was never written can never be mistaken for a used one.
+const STREAM_FIELD_LINKED: usize = 4;
+
+/// HotSpot's own message text, measured from
+/// `AbstractPipeline.MSG_STREAM_LINKED` in `jdk-25.0.3.9-hotspot/lib/src.zip`.
+const STREAM_LINKED_MSG: &str = "stream has already been operated upon or closed";
+
+/// True when `stream` carries the linked-or-consumed slot AND it is set.
+///
+/// A short-layout stream (the 1-field `Stream` objects several native modules
+/// still mint, and the legacy 2-field layout) has no slot to carry the flag and
+/// is therefore never reported as used. That is the deliberate direction of the
+/// error: a missed reuse is a residual divergence, a spurious one breaks a
+/// working pipeline.
+fn stream_is_linked(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
+    if ctx.object_num_fields(stream) <= STREAM_FIELD_LINKED {
+        return false;
+    }
+    matches!(ctx.get_field(stream, STREAM_FIELD_LINKED), Value::Int(1))
+}
+
+/// Set the linked-or-consumed flag. No-op on a stream with no slot for it.
+fn stream_mark_linked(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+    if ctx.object_num_fields(stream) <= STREAM_FIELD_LINKED {
+        return;
+    }
+    ctx.set_field(stream, STREAM_FIELD_LINKED, Value::Int(1));
+}
+
+/// The JDK's `linkOrConsume()`: throw if this stage was already linked or
+/// consumed, otherwise mark it.
+///
+/// WHERE THIS IS CALLED FROM, and why there is exactly one call site.
+/// `AbstractPipeline` sets the flag in eight places — the two
+/// intermediate-stage constructors, `linkOrConsume`, `evaluate(TerminalOp)`,
+/// `evaluateToArrayNode`, `sourceStageSpliterator`, `close` and `spliterator`.
+/// CratonVM does not run that bytecode: a synthetic stream is an element
+/// snapshot, and *every* operation that links or consumes one — intermediate
+/// and terminal alike — reads that snapshot through `stream_elements`. So the
+/// JDK's eight sites collapse onto that one funnel, and putting the check
+/// there is what makes this a 1-site change rather than a 99-site one.
+///
+/// Reference streams only. `IntStream`/`LongStream`/`DoubleStream` reach the
+/// funnel through `int_stream_elements`, which is INFALLIBLE
+/// (`.unwrap_or_default()`) at 25 call sites: throwing there would be swallowed
+/// and silently degrade the stream to empty, which is worse than the divergence
+/// it would close. The primitive streams are left unguarded on purpose — see
+/// docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md.
+fn stream_link_or_consume(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if stream_is_linked(ctx, stream) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: STREAM_LINKED_MSG.to_string(),
+        }
+        .into());
+    }
+    stream_mark_linked(ctx, stream);
+    Ok(())
+}
 
 /// The lazy source spliterator stashed on a synthetic stream by
 /// `StreamSupport.stream(realSpliterator, false)`, or `None` for an ordinary
@@ -17250,6 +18044,11 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
+    // W7-65: stated here rather than left to `try_alloc_zeroed` two crates
+    // away, so the "a fresh stream is unlinked" invariant lives where the
+    // layout is built. Slots 2 and 3 still rely on that zeroing, which is why
+    // only the exact `Int(1)` is read as linked.
+    ctx.set_field(stream, STREAM_FIELD_LINKED, Value::Int(0));
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         stream_pin
     } else {
@@ -17325,7 +18124,11 @@ fn make_derived_stream(
 /// field2=aux:Long). Present only on streams produced by a deferred intermediate
 /// op under `CRATONVM_LAZY_STREAMS`; older 2/3-field streams simply have no chain.
 const STREAM_FIELD_OP_CHAIN: usize = 3;
-const STREAM_NUM_FIELDS_LAZY: usize = 4;
+/// A deferred-op stream's layout. Kept as its own name for the call site's
+/// intent, but equal to `STREAM_NUM_FIELDS` since W7-65: a lazy stage must
+/// carry the linked-or-consumed slot too, or the terminal that finally reads it
+/// would have nowhere to record the consume.
+const STREAM_NUM_FIELDS_LAZY: usize = STREAM_NUM_FIELDS;
 
 const LAZY_OP_PEEK: i32 = 0;
 const LAZY_OP_MAP: i32 = 1;
@@ -17400,10 +18203,18 @@ fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
 
 /// Raw SOURCE elements of a (lazy) synthetic stream — slot 0, BEFORE the op-chain
 /// is applied. Drains a lazy spliterator source first.
-fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+///
+/// The drain is the fallible part, and the `let _ =` on it was the launderer:
+/// a spliterator whose `tryAdvance` refused or threw left slot 0 holding
+/// whatever it held before, and the pull below then read that as the stream's
+/// source — a truncated or empty pipeline, with no exception anywhere.
+fn stream_source_elems(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(this_pin, this);
-    let _ = materialize_lazy_stream(ctx, this_cur);
+    let drained = materialize_lazy_stream(ctx, this_cur);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
@@ -17412,8 +18223,11 @@ fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Valu
         }
         _ => Vec::new(),
     };
+    // Unpin before propagating: a `?` on `drained` at its own line would skip
+    // the truncate below.
     ctx.unpin_native_roots(this_pin);
-    elems
+    drained?;
+    Ok(elems)
 }
 
 /// Build a lazy derived stream that appends op `(kind, lambda, aux)` to `src`'s
@@ -17854,7 +18668,7 @@ fn stream_pull_internal(
             });
         }
 
-        let base = stream_source_elems(ctx, stream);
+        let base = stream_source_elems(ctx, stream)?;
         let (_, base_pins) = pin_value_slice(ctx, &base);
         // GC-SAFETY (register-invisible-root closeable gap -- see
         // `NativeContext::refresh_root_snapshot`'s doc comment): same
@@ -18012,7 +18826,7 @@ fn stream_pull_synthetic_downstream(
             });
         }
 
-        let base = stream_source_elems(ctx, stream_cur);
+        let base = stream_source_elems(ctx, stream_cur)?;
         let (_, base_pins) = pin_value_slice(ctx, &base);
         let mut state = stream_new_pull_state(chain.len());
         for (idx, v) in base.iter().copied().enumerate() {
@@ -18314,6 +19128,90 @@ fn native_stream_chain_collector_accept(
 /// array-based `stream_process_chain` loops already do (via their own
 /// `emit`/`downstream_emit` wrapper's captured flag), so this is a drop-in
 /// replacement for "get `base` then loop `stream_process_chain` over it".
+/// The `--jdk-only` road for [`drain_spliterator_inline`]: same per-element
+/// interleaving, no fabricated `Consumer`.
+///
+/// `cratonvm/internal/StreamChainCollector` is a name no JDK image declares, so
+/// strict mode refuses to fabricate it and the `?` in
+/// [`drain_spliterator_inline`] used to be the last unguarded mint of the family
+/// W2-1-strict-refuses-the-synthetic-stream-stack.md was opened for. The
+/// substitution is the one `drain_spliterator_via_real_iterator` already proved:
+/// `java.util.Spliterators.iterator(Spliterator)` hands back a real
+/// `java.util.Spliterators$1Adapter` that is itself both the `Iterator` and the
+/// `Consumer`, so the `tryAdvance` drive runs from real bytecode and no
+/// `Consumer` of ours is needed.
+///
+/// What is preserved, and it is the whole point of the inline drain: ONE element
+/// is pulled, run through `chain` (and `emit`) to completion, and only then is
+/// the next one asked for. A `limit` or an `emit` returning
+/// [`PullStep::Stop`] therefore still short-circuits before the source is
+/// exhausted — `stream_limit_saturated` is consulted at the top of every
+/// iteration exactly as the collector-driven loop consults `guard.poll()`.
+///
+/// What differs, stated rather than hidden: `Spliterators$1Adapter` buffers one
+/// element between `hasNext()` and `next()`, so a source whose `tryAdvance`
+/// observes downstream side effects sees them one element later than the
+/// collector path does. That is the "cursor" idiom the module comment above
+/// describes, and it is why this is the FALLBACK and not the default.
+fn drain_spliterator_inline_via_real_iterator(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    chain: &[LazyOp],
+    chain_pins: &[usize],
+    emit: &mut StreamEmit<'_>,
+) -> Result<PullStep, MethodCallFailed> {
+    let spl_pin = ctx.pin_native_root(spl);
+    let spl_cur = ctx.read_native_pin(spl_pin, spl);
+    let adapter = ctx.invoke(
+        "java/util/Spliterators",
+        "iterator",
+        "(Ljava/util/Spliterator;)Ljava/util/Iterator;",
+        &[Value::Object(Some(spl_cur))],
+    );
+    ctx.unpin_native_roots(spl_pin);
+    let it = match adapter? {
+        Some(Value::Object(Some(it))) => it,
+        _ => return Ok(PullStep::Continue),
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let mut state = stream_new_pull_state(chain.len());
+    const SAFETY_CAP: usize = 1_000_000;
+    let mut n = 0usize;
+    let outcome: Result<PullStep, MethodCallFailed> = loop {
+        if n >= SAFETY_CAP {
+            break Ok(PullStep::Continue);
+        }
+        if stream_limit_saturated(chain, &state, 0) {
+            break Ok(PullStep::Stop);
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let has_next = match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            Ok(_) => false,
+            Err(e) => break Err(e),
+        };
+        if !has_next {
+            break Ok(PullStep::Continue);
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let elem = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Object(None),
+            Err(e) => break Err(e),
+        };
+        // `elem` goes straight into the chain, whose own `pin_value` roots it —
+        // nothing allocates between the `next()` return and that pin.
+        match stream_process_chain(ctx, elem, chain, chain_pins, 0, &mut state, emit) {
+            Ok(PullStep::Stop) => break Ok(PullStep::Stop),
+            Ok(PullStep::Continue) => {}
+            Err(e) => break Err(e),
+        }
+        n += 1;
+    };
+    ctx.unpin_native_roots(it_pin);
+    outcome
+}
+
 fn drain_spliterator_inline(
     ctx: &mut dyn NativeContext,
     spl: ObjectRef,
@@ -18321,7 +19219,26 @@ fn drain_spliterator_inline(
     chain_pins: &[usize],
     emit: &mut StreamEmit<'_>,
 ) -> Result<PullStep, MethodCallFailed> {
-    let collector = try_alloc_synthetic(ctx, STREAM_CHAIN_COLLECTOR_CLASS, 0)?;
+    // W2-1 residual 4. Same idiom, same reason, as
+    // `drain_spliterator_to_array_capped`'s `Err(_refused) =>` arm two thousand
+    // lines above: a fabrication that happens to run first makes every other
+    // site's refusal order-dependent rather than a policy.
+    //
+    // REACHABILITY, stated so the next reader does not mistake this for a fixed
+    // bug: under `--jdk-only` `stream_make_lazy_derived` already returns
+    // `Ok(None)` (the `cratonvm/stream/LazyOp` guard), so slot 3 is never
+    // written, `stream_has_chain` is false, and every `stream_pull` entry point
+    // is gated on it — so strict mode does not reach this function today. The
+    // guard is here because "unreachable" is a property of five call sites in
+    // two other functions, not of this one, and the previous shape failed by
+    // FABRICATING under Compatible and by raising `NoClassDefFoundError` under
+    // strict at whichever site got there first.
+    let collector = match try_alloc_synthetic(ctx, STREAM_CHAIN_COLLECTOR_CLASS, 0) {
+        Ok(c) => c,
+        Err(_refused) => {
+            return drain_spliterator_inline_via_real_iterator(ctx, spl, chain, chain_pins, emit)
+        }
+    };
     let spl_pin = ctx.pin_native_root(spl);
     let col_pin = ctx.pin_native_root(collector);
 
@@ -18516,6 +19433,32 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if !is_synthetic_stream(&cn) {
         return Ok(Some(Value::Object(Some(this))));
     }
+    // W7-65 residual 4, closed 2026-08-12. `AbstractPipeline.onClose(Runnable)`
+    // (line 362 of the JDK 25 source) is the JDK's one CHECK-ONLY site: it
+    // throws `IllegalStateException(MSG_STREAM_LINKED)` when the stage is
+    // already linked or consumed, and then registers the handler WITHOUT
+    // marking. Measured on HotSpot 25 as `reuse.onCloseAfterConsume` = throws,
+    // which a reading of the source alone would not have predicted, so the
+    // measurement is the authority.
+    //
+    // Why this cannot fire spuriously, which is the only question that mattered:
+    // the read is `stream_is_linked`, whose two guards do the work. It is placed
+    // AFTER the `is_synthetic_stream` gate above — deliberately, because slot 4
+    // on a REAL pipeline is one of its own fields and could hold `Int(1)` for
+    // reasons of its own — and `stream_is_linked` additionally requires the
+    // 5-slot layout, so every short-layout stream (the whole
+    // `StreamSupport.stream(realSpliterator, false)` family) is exempt. Nothing
+    // else in the file writes slot 4, so the flag can only be here because
+    // `stream_link_or_consume` put it there.
+    //
+    // No mark: the JDK does not set here, and adding one would make this the
+    // second set site on a path that runs in every try-with-resources.
+    if stream_is_linked(ctx, this) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: STREAM_LINKED_MSG.to_string(),
+        }
+        .into());
+    }
     // W1 fix: a 1-field synthetic stream (e.g. Files.lines's eager array-backed
     // stream) has no close-handler slot to attach to. Reading/writing slot 1
     // would index past the receiver; behave as a no-op (return `this`) instead.
@@ -18553,13 +19496,42 @@ fn native_stream_on_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Object(Some(this))))
 }
 
-/// `BaseStream.close()` for synthetic streams: run the registered close handlers.
+/// `BaseStream.close()` for synthetic streams: mark the stage linked-or-consumed,
+/// then run the registered close handlers.
+///
+/// W7-65 residual 3, closed 2026-08-12. `AbstractPipeline.close()` is the JDK's
+/// site 7 and the only one that sets **unconditionally, with no preceding
+/// check** — which is why `close(); close()` and `count(); close()` both return
+/// normally on HotSpot 25 (`reuse.closeTwice`, `reuse.consumeThenClose`) while
+/// `close(); count()` throws (`reuse.closeThenCount`). `stream_mark_linked` is
+/// the unconditional setter, so all three fall out of one line; using
+/// `stream_link_or_consume` here would have made `close()` itself throw and
+/// broken every try-with-resources.
+///
+/// The reason this was left open in W7-65 was "a VM-internal path that closes a
+/// synthetic stream earlier than HotSpot would". Censused since, from source:
+/// the only `invoke_virtual(_, "close", "()V", _)` calls in this file are the
+/// two `flatMap` inner-stream closes — the lazy chain's
+/// (`stream_process_chain`) and the eager body's (`native_stream_flat_map`) —
+/// and both run AFTER that inner stream's elements have been pulled, which is
+/// exactly what the JDK's own `try (Stream<R> result = mapper.apply(u))` does.
+/// Neither inner stream is touched again, so the mark ends nothing. No native
+/// anywhere else in the workspace closes a `java.util.stream.Stream` it did not
+/// just mint and drain.
 fn native_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         let cn = ctx
             .class_name_of_id(ctx.class_id_of_object(*this))
             .unwrap_or_default();
         if is_synthetic_stream(&cn) {
+            // BEFORE the handlers, matching `AbstractPipeline.close()`, whose
+            // first statement is `linkedOrConsumed = true` and whose
+            // `closeAction.run()` is last. The order is observable in two ways:
+            // a handler that operates on the stream must see it spent (HotSpot
+            // throws there too), and a handler that THROWS must still leave the
+            // stage marked. Running the handlers first would have got both
+            // backwards.
+            stream_mark_linked(ctx, *this);
             stream_run_close_handlers(ctx, *this)?;
         }
     }
@@ -18586,8 +19558,23 @@ fn stream_elements(
     // e.g. Spring's MergedAnnotations.stream()) — materialize those via toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    // W7-65: `AbstractPipeline.linkedOrConsumed`. This is the single funnel
+    // every operation on a synthetic stream reaches, so it is the single place
+    // the flag is read and written. Reference streams only (see
+    // `stream_link_or_consume` for why the primitive ones are excluded), and
+    // ahead of any work: the JDK also throws before it evaluates anything.
+    //
+    // Nothing has allocated between `stream_pin` and here — `class_id_of_object`
+    // and `class_name_of_id` are pure lookups — so `stream` is still current.
+    let linked = if class_name == "java/util/stream/Stream" {
+        stream_link_or_consume(ctx, stream)
+    } else {
+        Ok(())
+    };
     // Single-exit so the `stream` pin is always released (see GC-SAFETY above).
-    let result: Result<Vec<Value>, MethodCallFailed> = if is_synthetic_stream(&class_name) {
+    let result: Result<Vec<Value>, MethodCallFailed> = if let Err(e) = linked {
+        Err(e)
+    } else if is_synthetic_stream(&class_name) {
         // keycloak-16 Part B: a lazy stream defers its peek/map/filter/limit/skip
         // ops onto slot 3 while sharing the upstream SOURCE (slot 0, which may
         // itself still be an undrained lazy spliterator -- slot 2). Apply the
@@ -18673,28 +19660,36 @@ fn stream_elements_mut(
 /// `toArray()` (`()[I` / `()[J` / `()[D`, NOT `()[Ljava/lang/Object;`). `toarray_desc`
 /// selects the right one. Used by `flatMap`, whose mapper commonly returns such
 /// real primitive streams.
+///
+/// Fallible for the reason on [`collection_elements_generic`]: the receiver
+/// here is frequently a REAL JDK pipeline, so `toArray` is real bytecode that
+/// can throw — and the `let _ =` on the drain plus the catch-all
+/// `_ => Vec::new()` turned both a thrown exception and a strict refusal into
+/// "that sub-stream was empty", which `flatMap` then concatenated into its
+/// result as if it were.
 fn prim_stream_values(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
     toarray_desc: &str,
-) -> Vec<Value> {
-    let _ = materialize_lazy_stream(ctx, stream);
+) -> Result<Vec<Value>, MethodCallFailed> {
+    materialize_lazy_stream(ctx, stream)?;
     let cn = ctx
         .class_name_of_id(ctx.class_id_of_object(stream))
         .unwrap_or_default();
     if is_synthetic_stream(&cn) {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
-            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+            return Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect());
         }
-        return Vec::new();
+        return Ok(Vec::new());
     }
     match ctx.invoke_virtual(stream, "toArray", toarray_desc, &[]) {
         Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
-            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+            Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
         }
-        _ => Vec::new(),
+        Err(e) => Err(e),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -18809,6 +19804,41 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(
         c,
         "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_stream_for_each,
+    );
+    // W7-9 §8.1 precondition 1. `forEachOrdered(Consumer)` is ABSTRACT on the
+    // real `java.util.stream.Stream`, so — per the interface rule in
+    // docs/architecture/natives-over-real-jdk-classes.md §1 and W7-9 §2 — this
+    // registration is reachable only for a receiver whose runtime class IS the
+    // interface (a CratonVM mint); a real `ReferencePipeline` has its own
+    // `Code` and is not shadowed.
+    //
+    // Until 2026-08-12 the ONLY registration of this triple was in
+    // `native-builtins/src/phases_late/streams.rs::register_phase56_stream_extras`,
+    // which `register_synthetic_overrides` alone reaches — a no-op shim in both
+    // shipping builds. That dead registrar is why
+    // `vm/src/runtime/interpreter.rs`'s `!has_code` arm carries a hardcoded
+    // `method_name == "forEachOrdered"` re-dispatch to `forEach`, which tests
+    // the NAME and descriptor and not the `class_id`.
+    //
+    // Registering it here is deliberately behaviour-NEUTRAL today: that
+    // interpreter special case runs ~20 lines ABOVE `resolve_native_for_dispatch`
+    // and still wins, so this callback is not yet reached. It exists so the
+    // special case can be deleted — W7-9 §8.1's order is "land the registration,
+    // prove it live, then delete", and deleting first converts a wrong answer
+    // into an `AbstractMethodError`.
+    //
+    // `forEach` is the correct body for the same reason the deleted comment
+    // gave: every synthetic stream here is sequential, and `stream_elements`
+    // yields the encounter-order snapshot. The three PRIMITIVE widths take a
+    // different descriptor and are registered by
+    // `phases_late::register_phase56_primitive_stream_terminals`, wired into the
+    // essentials path — see `native-builtins/tests/essential_wiring_ratchet.rs`,
+    // whose comment naming this row as "the next row to add" is now stale.
+    r.register(
+        c,
+        "forEachOrdered",
         "(Ljava/util/function/Consumer;)V",
         native_stream_for_each,
     );
@@ -20077,12 +21107,16 @@ fn native_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         });
     } else {
         // Fallback: sort by string representation.
+        // `collect::<Result<..>>` rather than a `?` inside the closure: the
+        // closure has to keep returning a `Result` for the sort key, and a
+        // refused element `toString()` must abort the sort instead of ordering
+        // the stream by a fabricated `ClassName@hash`.
         let keys: Vec<String> = (0..elements.len())
             .map(|i| {
                 let e = read_pinned_elem(ctx, ehandles[i], elements[i]);
                 obj_to_display_string(ctx, &e)
             })
-            .collect();
+            .collect::<Result<Vec<String>, MethodCallFailed>>()?;
         idx.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
     }
     let sorted: Vec<Value> = idx
@@ -20197,7 +21231,7 @@ fn native_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         for (u_idx, u) in unique.iter().enumerate() {
             let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
             let u = read_pinned_elem(ctx, unique_handles[u_idx], *u);
-            if list_element_matches(ctx, &elem, &u) {
+            if list_element_matches(ctx, &elem, &u)? {
                 dup = true;
                 break;
             }
@@ -20443,6 +21477,27 @@ fn native_stream_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// are registered in streams.rs). Replaces the field-0-raw iterator that bypassed
 /// the chain. Non-synthetic / real pipelines flow through `stream_elements`'s
 /// `toArray` path, so this is correct for those too.
+///
+/// W7-2 §3: this registration also serves the THREE PRIMITIVE streams, because
+/// `iterator()Ljava/util/Iterator;` is declared on `BaseStream` — the supertype
+/// of `IntStream`/`LongStream`/`DoubleStream` — and that is the descriptor a
+/// call site records whenever the static type is `BaseStream` or `Stream`. A
+/// synthetic `IntStream` keeps its elements in a PRIMITIVE `int[]`, so
+/// `stream_elements` hands back bare `Value::Int`s; storing those into the
+/// `Object[]` below put an untyped word where the JDK's `Arrays$ArrayItr.next()`
+/// — declared `()Ljava/lang/Object;` — hands a reference to the caller. It is
+/// silent at the store and only misbehaves one frame away: measured, `o != null`
+/// was TRUE and `o.getClass()` raised NPE on the very same word, and
+/// `o instanceof Integer` was false for every element. That is the
+/// primitive-in-a-reference-store species (W7-84), not a wrong answer.
+/// [`box_primitive_stream_elements`] fixes it for every element and allocates
+/// nothing on a reference stream, which is the common case this function exists
+/// for (Hibernate's `JoinedList.iterator()`).
+///
+/// NOTE the registration order: `streams.rs`'s `native_stream_empty_iterator`
+/// does its own boxing, but native-collections registers AFTER native-builtins
+/// (last-writer-wins), so for `Stream`/`BaseStream` THIS function is the one
+/// that runs. The two must both box or the surface is only half covered.
 fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -20455,6 +21510,10 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let elements = stream_elements(ctx, this)?;
+    // Box BEFORE pinning: the returned wrappers are already re-read past any
+    // collection `valueOf` caused, and nothing allocates between here and the
+    // `pin_value_slice` on the next line.
+    let elements = box_primitive_stream_elements(ctx, &elements)?;
     let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let arr = alloc_ref_array(ctx, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
@@ -22231,7 +23290,7 @@ fn native_collfn_finisher_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let elements = container_values(ctx);
             let mut parts = Vec::with_capacity(elements.len());
             for elem in &elements {
-                parts.push(obj_to_display_string(ctx, elem));
+                parts.push(obj_to_display_string(ctx, elem)?);
             }
             let (delim, prefix, suffix) = if tag == COLLECTOR_TAG_JOINING_DELIM {
                 (
@@ -23082,6 +24141,11 @@ fn box_primitive_result(ctx: &mut dyn NativeContext, v: Value) -> Result<Value, 
         Value::Int(_) => ("java/lang/Integer", "(I)Ljava/lang/Integer;"),
         Value::Long(_) => ("java/lang/Long", "(J)Ljava/lang/Long;"),
         Value::Double(_) => ("java/lang/Double", "(D)Ljava/lang/Double;"),
+        // `Float` belongs with the other three: there is no `FloatStream`, but a
+        // `Value::Float` reaches reference-typed surfaces through `Array.get` /
+        // reflective field reads that feed a stream, and left unboxed it is the
+        // same untyped word in a reference slot the Int arm exists to prevent.
+        Value::Float(_) => ("java/lang/Float", "(F)Ljava/lang/Float;"),
         other => return Ok(other),
     };
     if let Ok(Some(boxed @ Value::Object(Some(_)))) =
@@ -23227,7 +24291,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem));
+                    parts.push(obj_to_display_string(ctx, &elem)?);
                 }
                 let joined = parts.join("");
                 let s = ctx.create_string(&joined);
@@ -23253,7 +24317,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
                 for i in 0..elements.len() {
                     let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                    parts.push(obj_to_display_string(ctx, &elem));
+                    parts.push(obj_to_display_string(ctx, &elem)?);
                 }
                 let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
                 let s = ctx.create_string(&joined);
@@ -23642,7 +24706,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -23768,7 +24832,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -23878,7 +24942,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -24376,10 +25440,43 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
+/// Infallible wrapper over [`stream_elements`] for the three primitive stream
+/// interfaces. **25 call sites, and the `.unwrap_or_default()` is the mechanism
+/// that turns any throw raised anywhere below it into a silently EMPTY stream.**
+///
+/// The claim this comment used to make — "the chain branch is unreachable here,
+/// so this can never actually error" — is TRUE but named only one of
+/// `stream_elements`' three error paths. Re-derived 2026-08-12, all three, so
+/// the next reader can check whether it still holds rather than trusting it:
+///
+/// 1. **`stream_link_or_consume`** — gated on `class_name ==
+///    "java/util/stream/Stream"`, so no primitive receiver reaches it.
+/// 2. **`materialize_lazy_stream`** — needs a spliterator in slot 2. Only
+///    `StreamSupport.stream(Spliterator,Z)` writes that slot, and it mints
+///    `java/util/stream/Stream`; `StreamSupport.intStream`/`longStream`/
+///    `doubleStream` live in `native-builtins/src/phases_late/streams.rs`,
+///    reachable only from `register_synthetic_overrides`. Unreachable on both
+///    shipping modes.
+/// 3. **The real-pipeline `toArray()[Ljava/lang/Object;` branch** — needs a
+///    receiver whose class is not one of the four interface names. Every
+///    `native_{int,long,double}_stream_*` native is registered on an INTERFACE
+///    name, and every native-shadow hierarchy walk in the tree is a *superclass*
+///    walk (W7-9 §2), so a real `IntPipeline$Head` resolves its own concrete
+///    `Code` and never reaches these bodies. `prim_stream_values` is the
+///    function that exists for real primitive pipelines, and it uses the correct
+///    `()[I`/`()[J`/`()[D` descriptor.
+///
+/// So the swallow eats nothing today. It is still the reason W7-65's residual 1
+/// (extending `linkedOrConsumed` to the primitive streams) is open, and the cost
+/// of closing it is NOT "add `?` at 25 sites": at least
+/// `native_int_stream_peek`'s call has a live `pin_native_root` handle in scope,
+/// so a bare `?` there leaks a pin — the LIFO pin-stack corruption family this
+/// file has paid for repeatedly (see `stream_apply_chain_full`'s cceres3 note).
+/// Each of the 25 needs its live pins checked and the `match`-and-unpin form
+/// where any is held, which is why the conversion is its own change with its own
+/// review surface. Recorded in
+/// docs/known-issues/jdk-only/W7-65-stream-reuse-throws.md §5.1.
 fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    // Primitive streams never carry a reference-Stream deferred op-chain (the
-    // lazy ops register only on `java/util/stream/Stream`), so the chain branch
-    // of `stream_elements` is unreachable here and this can never actually error.
     stream_elements(ctx, stream).unwrap_or_default()
 }
 
@@ -24526,7 +25623,7 @@ fn native_primitive_iterator_next_boxed(
 ) -> MethodCallResult {
     let val = primitive_iterator_next_value(ctx, args)?;
     Ok(Some(
-        box_primitive_stream_elements(ctx, &[val])
+        box_primitive_stream_elements(ctx, &[val])?
             .into_iter()
             .next()
             .unwrap_or(Value::Object(None)),
@@ -24770,13 +25867,26 @@ fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // `stream_elements_mut` (toArray) which handles both synthetic and real.
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[I");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[I") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(I)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[I"));
+                match prim_stream_values(ctx, sub, "()[I") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -24950,6 +26060,14 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         "sorted",
         "()Ljava/util/stream/IntStream;",
         native_int_stream_sorted,
+    );
+    // W7-2 §7.2 — `distinct` was declared-and-unregistered on all three
+    // primitive streams (AbstractMethodError on the interface declaration).
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/IntStream;",
+        native_int_stream_distinct,
     );
     r.register(
         c,
@@ -25569,6 +26687,43 @@ fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     make_int_stream(ctx, &elements)
 }
 
+/// `IntStream.distinct()` — the first occurrence of each value, in encounter
+/// order.
+///
+/// W7-2 §7.2: `distinct` was missing on ALL THREE primitive streams, which on a
+/// synthetic stream (whose runtime class is the interface itself) means the
+/// `invokeinterface` resolved to the abstract declaration and the call died with
+/// `AbstractMethodError: … has no Code attribute` — the same death
+/// `summaryStatistics` died, and the family this record is about.
+///
+/// The JDK's `IntPipeline.distinct()` is `boxed().distinct().mapToInt(i -> i)`,
+/// i.e. `Integer.equals`, which for `Integer` is plain value equality — so a set
+/// of the raw `i32`s is exactly it. Encounter order is preserved by keeping the
+/// FIRST occurrence, which is what `ReduceOps`' `LinkedHashSet` accumulator does.
+/// A non-`Int` element cannot occur on a primitive stream; it is passed through
+/// rather than silently dropped, so a layout defect elsewhere shows up as a
+/// wrong count instead of as an empty stream.
+fn native_int_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match e {
+            Value::Int(i) => {
+                if seen.insert(*i) {
+                    out.push(*e);
+                }
+            }
+            _ => out.push(*e),
+        }
+    }
+    make_int_stream(ctx, &out)
+}
+
 fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -25684,7 +26839,22 @@ fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Box each primitive stream element to its wrapper object so `boxed()` yields a
 /// real `Stream<Integer/Long/Double>` — collect/iteration then observe wrapper
 /// objects, not raw primitive `Value`s in reference slots.
-fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]) -> Vec<Value> {
+///
+/// Reference elements are returned verbatim and allocate nothing, so this is
+/// safe to run over any element list whose destination is reference-typed
+/// (`Object[]`, `Iterator.next()Ljava/lang/Object;`) without asking first
+/// whether the source stream is primitive.
+///
+/// Fallible: the per-element boxing is [`box_primitive_result`], whose
+/// `valueOf`-then-fabricate path can refuse (a fabricated `java/lang/Integer`
+/// is refused under `--jdk-only`). Returning the refusal is the point — the
+/// previous `.ok().flatten().unwrap_or(Value::Object(None))` turned it into a
+/// silent `null` element, which is a wrong answer wearing the shape of a
+/// correct one.
+fn box_primitive_stream_elements(
+    ctx: &mut dyn NativeContext,
+    elements: &[Value],
+) -> Result<Vec<Value>, MethodCallFailed> {
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // `valueOf` allocates, so the wrapper refs accumulated in `out` (and any
     // object elements passed through) must be pinned as produced and re-read
@@ -25693,30 +26863,18 @@ fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]
     let mut first_pin = elem_base;
     let mut out = Vec::with_capacity(elements.len());
     let mut out_handles: Vec<usize> = Vec::with_capacity(elements.len());
+    // Single-exit: an early `return Err` would leak every pin taken above, so
+    // the failure is parked and raised after the unpin below.
+    let mut failure: Option<MethodCallFailed> = None;
     for (idx, v) in elements.iter().enumerate() {
         let v = read_pinned_elem(ctx, elem_handles[idx], *v);
-        let boxed = match v {
-            Value::Int(i) => ctx.invoke(
-                "java/lang/Integer",
-                "valueOf",
-                "(I)Ljava/lang/Integer;",
-                &[Value::Int(i)],
-            ),
-            Value::Long(l) => ctx.invoke(
-                "java/lang/Long",
-                "valueOf",
-                "(J)Ljava/lang/Long;",
-                &[Value::Long(l)],
-            ),
-            Value::Double(d) => ctx.invoke(
-                "java/lang/Double",
-                "valueOf",
-                "(D)Ljava/lang/Double;",
-                &[Value::Double(d)],
-            ),
-            other => Ok(Some(other)),
+        let bv = match box_primitive_result(ctx, v) {
+            Ok(bv) => bv,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
         };
-        let bv = boxed.ok().flatten().unwrap_or(Value::Object(None));
         let h = pin_value(ctx, bv);
         if first_pin == usize::MAX {
             first_pin = h;
@@ -25728,7 +26886,10 @@ fn box_primitive_stream_elements(ctx: &mut dyn NativeContext, elements: &[Value]
     if first_pin != usize::MAX {
         ctx.unpin_native_roots(first_pin);
     }
-    out
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25737,7 +26898,7 @@ fn native_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return make_stream(ctx, &[]),
     };
     let elements = int_stream_elements(ctx, this);
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -25956,13 +27117,26 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[J");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[J") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(J)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[J"));
+                match prim_stream_values(ctx, sub, "()[J") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -25974,6 +27148,82 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ctx.unpin_native_roots(f_pin);
     make_long_stream(ctx, &out)
 }
+/// `LongStream.sorted()` — natural ascending order.
+///
+/// W7-2 §7.2. `sorted` existed for `IntStream` only (added for Groovy's shaded
+/// ANTLR lexer); the `LongStream` and `DoubleStream` declarations were abstract
+/// and unregistered, so the call died with `AbstractMethodError: … has no Code
+/// attribute` on the interface exactly as `summaryStatistics` did.
+fn native_long_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let mut elements = stream_elements(ctx, this)?;
+    elements.sort_by_key(|v| match v {
+        Value::Long(l) => *l,
+        Value::Int(i) => *i as i64,
+        _ => 0,
+    });
+    make_long_stream(ctx, &elements)
+}
+
+/// `LongStream.distinct()` — see [`native_int_stream_distinct`]. `Long.equals`
+/// is value equality, so a set of the raw `i64`s is the JDK's dedupe.
+fn native_long_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_long_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match e {
+            Value::Long(l) => {
+                if seen.insert(*l) {
+                    out.push(*e);
+                }
+            }
+            Value::Int(i) => {
+                if seen.insert(*i as i64) {
+                    out.push(Value::Long(*i as i64));
+                }
+            }
+            _ => out.push(*e),
+        }
+    }
+    make_long_stream(ctx, &out)
+}
+
+/// `LongStream.findFirst()` / `findAny()` — `OptionalLong` of the first element.
+///
+/// W7-2 §7.2: `IntStream` got this in spring-bug-03 and the other two were left,
+/// which is the "each was fixed for the one member a workload happened to reach"
+/// shape §1 of that record names. The synthetic stream is eager and
+/// `stream_elements` preserves encounter order, so the first element satisfies
+/// `findFirst`; `findAny` may return any element and the first is a valid choice.
+fn native_long_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this)?;
+    let first = match elements.first() {
+        Some(Value::Long(l)) => Some(Value::Long(*l)),
+        Some(Value::Int(i)) => Some(Value::Long(*i as i64)),
+        _ => None,
+    };
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None)?;
+    if let Some(v) = first {
+        set_opt_prim_value(ctx, opt, v);
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
 fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -26136,6 +27386,32 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         "asDoubleStream",
         "()Ljava/util/stream/DoubleStream;",
         native_long_stream_as_double,
+    );
+    // W7-2 §7.2 — the LongStream half of the hole: `findFirst`/`findAny`
+    // (present on IntStream since spring-bug-03), `sorted` and `distinct`.
+    r.register(
+        c,
+        "findFirst",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_find_first,
+    );
+    r.register(
+        c,
+        "findAny",
+        "()Ljava/util/OptionalLong;",
+        native_long_stream_find_first,
+    );
+    r.register(
+        c,
+        "sorted",
+        "()Ljava/util/stream/LongStream;",
+        native_long_stream_sorted,
+    );
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/LongStream;",
+        native_long_stream_distinct,
     );
     r.set_category(__prev_cat);
 }
@@ -26486,7 +27762,7 @@ fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -26630,13 +27906,26 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[D");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[D") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(D)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[D"));
+                match prim_stream_values(ctx, sub, "()[D") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -26646,6 +27935,245 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     ctx.unpin_native_roots(f_pin);
+    make_double_stream(ctx, &out)
+}
+
+/// `Double.doubleToLongBits(d)` — the canonicalising form, which is what
+/// `Double.equals` and `Double.compare` are both specified in terms of.
+///
+/// Rust's `f64::to_bits` is `doubleToRawLongBits`: it preserves the payload of a
+/// signalling or negatively-signed NaN, so two NaNs that Java calls equal would
+/// key differently. Collapsing every NaN onto the canonical quiet pattern is the
+/// difference between `DoubleStream.of(0.0/0.0, 0.0/0.0).distinct().count()`
+/// answering `1` (HotSpot) and `2`.
+fn java_double_to_long_bits(d: f64) -> i64 {
+    if d.is_nan() {
+        0x7ff8_0000_0000_0000u64 as i64
+    } else {
+        d.to_bits() as i64
+    }
+}
+
+/// `Double.compare(d1, d2)` as an `Ordering`, and a total order — which is what
+/// `Arrays.sort(double[])` (and therefore `DoubleStream.sorted()`) uses.
+///
+/// It is NOT `f64`'s `PartialOrd`, and the two disagree on the two cases a
+/// `sorted()` test looks at first: Java orders `-0.0` strictly BELOW `+0.0`, and
+/// puts every NaN at the top. `f64::total_cmp` is a third order again (it sorts
+/// negatively-signed NaN below `-inf`), so neither stock comparator will do.
+fn java_double_compare(a: f64, b: f64) -> std::cmp::Ordering {
+    if a < b {
+        return std::cmp::Ordering::Less;
+    }
+    if a > b {
+        return std::cmp::Ordering::Greater;
+    }
+    java_double_to_long_bits(a).cmp(&java_double_to_long_bits(b))
+}
+
+/// Read a stream element as an `f64`, widening the integral shapes the way the
+/// primitive-stream natives around here already do.
+fn stream_elem_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Double(d) => Some(*d),
+        Value::Float(f) => Some(*f as f64),
+        Value::Int(i) => Some(*i as f64),
+        Value::Long(l) => Some(*l as f64),
+        _ => None,
+    }
+}
+
+/// `DoubleStream.anyMatch(DoublePredicate)`.
+///
+/// W7-2 §7.2 calls this one conspicuous, and it is: `allMatch` and `noneMatch`
+/// sit beside it in `register_double_stream_natives` and `anyMatch` did not,
+/// so `DoubleStream.anyMatch` alone died with `AbstractMethodError: … has no
+/// Code attribute` on the interface declaration.
+fn native_double_stream_any_match(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let p = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    stream_match(ctx, this, p, "(D)Z", 0)
+}
+
+/// `double DoubleStream.reduce(double identity, DoubleBinaryOperator op)`.
+/// Mirrors `native_long_stream_reduce_seeded`; see it for the pin contract.
+fn native_double_stream_reduce_seeded(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let identity = args.get(1).and_then(stream_elem_as_f64).unwrap_or(0.0);
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(identity))),
+    };
+    let op = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(identity))),
+    };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let op_pin = ctx.pin_native_root(op);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(op_pin);
+            return Err(e);
+        }
+    };
+    let mut acc = identity;
+    for elem in &elements {
+        let e = match stream_elem_as_f64(elem) {
+            Some(d) => d,
+            None => continue,
+        };
+        let op = ctx.read_native_pin(op_pin, op);
+        let r = match ctx.invoke_virtual(
+            op,
+            "applyAsDouble",
+            "(DD)D",
+            &[Value::Double(acc), Value::Double(e)],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(op_pin);
+                return Err(e);
+            }
+        };
+        acc = r.as_ref().and_then(stream_elem_as_f64).unwrap_or(acc);
+    }
+    ctx.unpin_native_roots(op_pin);
+    Ok(Some(Value::Double(acc)))
+}
+
+/// `OptionalDouble DoubleStream.reduce(DoubleBinaryOperator op)` — the
+/// no-identity overload. Empty stream → empty `OptionalDouble`.
+fn native_double_stream_reduce(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    let op = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let o = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(o))));
+        }
+    };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let op_pin = ctx.pin_native_root(op);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(op_pin);
+            return Err(e);
+        }
+    };
+    let mut acc: Option<f64> = None;
+    for elem in &elements {
+        let e = match stream_elem_as_f64(elem) {
+            Some(d) => d,
+            None => continue,
+        };
+        acc = Some(match acc {
+            None => e,
+            Some(a) => {
+                let op = ctx.read_native_pin(op_pin, op);
+                let r = match ctx.invoke_virtual(
+                    op,
+                    "applyAsDouble",
+                    "(DD)D",
+                    &[Value::Double(a), Value::Double(e)],
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.unpin_native_roots(op_pin);
+                        return Err(e);
+                    }
+                };
+                r.as_ref().and_then(stream_elem_as_f64).unwrap_or(a)
+            }
+        });
+    }
+    ctx.unpin_native_roots(op_pin);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+    if let Some(a) = acc {
+        set_opt_prim_value(ctx, opt, Value::Double(a));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// `DoubleStream.findFirst()` / `findAny()` — see
+/// [`native_long_stream_find_first`].
+fn native_double_stream_find_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = stream_elements(ctx, this)?;
+    let first = elements.first().and_then(stream_elem_as_f64);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None)?;
+    if let Some(d) = first {
+        set_opt_prim_value(ctx, opt, Value::Double(d));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// `DoubleStream.sorted()` — `Arrays.sort(double[])` order, i.e.
+/// [`java_double_compare`], not `f64`'s `PartialOrd`.
+fn native_double_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    // Normalised to `Value::Double` on the way out, not just sorted: the result
+    // goes to `make_double_stream`, which allocates a `double[]`, so an integral
+    // `Value` that slipped in from an upstream widening op would be stored into
+    // a slot of the wrong width.
+    let mut doubles: Vec<f64> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        doubles.push(stream_elem_as_f64(e).unwrap_or(0.0));
+    }
+    doubles.sort_by(|a, b| java_double_compare(*a, *b));
+    let out: Vec<Value> = doubles.into_iter().map(Value::Double).collect();
+    make_double_stream(ctx, &out)
+}
+
+/// `DoubleStream.distinct()` — `Double.equals` semantics, see
+/// [`java_double_to_long_bits`]: all NaNs are one value and `-0.0` is distinct
+/// from `+0.0`, which is the opposite of what `==` on `f64` says for both.
+fn native_double_stream_distinct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_double_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match stream_elem_as_f64(e) {
+            Some(d) => {
+                if seen.insert(java_double_to_long_bits(d)) {
+                    out.push(Value::Double(d));
+                }
+            }
+            None => out.push(*e),
+        }
+    }
     make_double_stream(ctx, &out)
 }
 
@@ -26770,6 +28298,53 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
         "mapToInt",
         "(Ljava/util/function/DoubleToIntFunction;)Ljava/util/stream/IntStream;",
         native_double_stream_map_to_int,
+    );
+    // W7-2 §7.2 — the DoubleStream half, and the largest of the three holes:
+    // `anyMatch` (conspicuous, because `allMatch`/`noneMatch` above it are both
+    // registered), both `reduce` overloads, `findFirst`/`findAny`, `sorted` and
+    // `distinct`. Every one of them was an abstract interface declaration with
+    // no live registration, i.e. an `AbstractMethodError` waiting for a caller.
+    r.register(
+        c,
+        "anyMatch",
+        "(Ljava/util/function/DoublePredicate;)Z",
+        native_double_stream_any_match,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(DLjava/util/function/DoubleBinaryOperator;)D",
+        native_double_stream_reduce_seeded,
+    );
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/util/function/DoubleBinaryOperator;)Ljava/util/OptionalDouble;",
+        native_double_stream_reduce,
+    );
+    r.register(
+        c,
+        "findFirst",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_find_first,
+    );
+    r.register(
+        c,
+        "findAny",
+        "()Ljava/util/OptionalDouble;",
+        native_double_stream_find_first,
+    );
+    r.register(
+        c,
+        "sorted",
+        "()Ljava/util/stream/DoubleStream;",
+        native_double_stream_sorted,
+    );
+    r.register(
+        c,
+        "distinct",
+        "()Ljava/util/stream/DoubleStream;",
+        native_double_stream_distinct,
     );
     r.set_category(__prev_cat);
 }
@@ -27051,7 +28626,7 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return make_stream(ctx, &[]),
     };
     let elements = stream_elements(ctx, this)?;
-    let boxed = box_primitive_stream_elements(ctx, &elements);
+    let boxed = box_primitive_stream_elements(ctx, &elements)?;
     make_stream(ctx, &boxed)
 }
 
@@ -27693,7 +29268,7 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // `new HashMap<>(treeMap)` / `new HashMap<>(unmodifiableNavigableMap)`
     // silently produced an empty map.
     let source = ctx.read_native_pin(source_pin, source);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, value)) in entries.iter().enumerate() {
@@ -27798,7 +29373,7 @@ fn native_hashmap_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Some(cname) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
         ensure_hashtable_load_factor(ctx, this, &cname);
     }
-    let entries = collect_entries_any(ctx, this);
+    let entries = collect_entries_any(ctx, this)?;
     let size = entries.len() as i32;
     let cap = hashmap_serialized_capacity(ctx, this, size);
     let oos_cls = "java/io/ObjectOutputStream";
@@ -28825,15 +30400,70 @@ fn native_comparator_then_comparing_double(
 // heap-reference-integrity defect (see interpreter.rs's
 // `synthetic_stub_should_yield_to_real_bytecode` StringJoiner exclusion), so
 // this native must keep owning execution either way.
-const SJ_FIELD_DELIM: usize = 0;
-const SJ_FIELD_PREFIX: usize = 1;
-const SJ_FIELD_SUFFIX: usize = 2;
-const SJ_FIELD_ELEMENTS: usize = 3;
-const SJ_FIELD_EMPTY_VALUE: usize = 4;
+//
+// W7-77-guarded-slot-maps.md renamed these from `SJ_FIELD_*`. The old name read
+// as "StringJoiner's fields" and they are not: on JDK 25.0.3.9 `javap -p
+// java.util.StringJoiner` gives the transitive instance layout
+//
+//     0 prefix   1 delimiter   2 suffix   3 elts (String[])
+//     4 size     5 len         6 emptyValue
+//
+// so slots 0 and 1 are `prefix`/`delimiter` SWAPPED against the map below, and
+// slot 4 is `size`, an `int`, where the map says `emptyValue`, a String. Slot 2
+// (`suffix`) and slot 3 (`elts`, the map's `ELEMENTS`) happen to line up, which
+// is what makes this shape dangerous: two of five agree, both mismatched pairs
+// are String-to-String, and every read resolves.
+//
+// THE MAP IS NOT WRONG — IT IS FOR A DIFFERENT CLASS. It describes the
+// fabricated 5-slot stub (`_f0.._f4`), which really does have this layout. Both
+// classes answer to the binary name `java/util/StringJoiner`, so no `SlotMap`
+// can tell them apart by name and `SJ_STUB_SLOT_MAP` below is published knowing
+// it will read as a disagreement against a loaded real class. That is correct:
+// the row is meant to stay in the census, because a guarded row is not a clean
+// row. The `_SYNTHETIC_SLOT_` infix is the part a reader sees before they reach
+// for these constants on a real receiver.
+//
+// THE GUARD IS `sj_real_layout`, a CLASS-SIDE witness — it resolves all seven
+// real field names or answers `None`, and is therefore all-or-nothing rather
+// than per-receiver. Every entry point that touches a constant below branches on
+// it first: `native_sj_init_delim`, `native_sj_init_full`, `native_sj_add`,
+// `native_sj_merge`, `native_sj_set_empty_value` and `sj_build_string` (which
+// `native_sj_to_string` and `native_sj_length` delegate to). `sj_read_elements`
+// is the one helper that reads a constant without asking, and it is private and
+// called only from the two legacy branches of `sj_build_string`/`native_sj_merge`.
+// `guarded_slot_maps.rs::string_joiner_entry_points_still_branch_on_the_real_layout`
+// mechanises exactly that list, so deleting the branch fails a test instead of
+// silently writing a prefix into a real `delimiter`.
+const SJ_SYNTHETIC_SLOT_DELIM: usize = 0;
+const SJ_SYNTHETIC_SLOT_PREFIX: usize = 1;
+const SJ_SYNTHETIC_SLOT_SUFFIX: usize = 2;
+const SJ_SYNTHETIC_SLOT_ELEMENTS: usize = 3;
+const SJ_SYNTHETIC_SLOT_EMPTY_VALUE: usize = 4;
+
+/// What the legacy numeric path believes about `java/util/StringJoiner`,
+/// published for `read_alias::verify_declared_slot_maps`.
+///
+/// Deliberately states the BELIEF, not JDK 25's layout: a map that publishes
+/// the right answer sweeps clean and measures nothing. Three of these five will
+/// report as `WrongField` whenever the real class is the loaded one — that is
+/// the census row this record is about, and it leaves the census only when the
+/// numeric path does.
+pub static SJ_STUB_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/util/StringJoiner",
+        slots: &[
+            (SJ_SYNTHETIC_SLOT_DELIM, "delimiter"),
+            (SJ_SYNTHETIC_SLOT_PREFIX, "prefix"),
+            (SJ_SYNTHETIC_SLOT_SUFFIX, "suffix"),
+            (SJ_SYNTHETIC_SLOT_ELEMENTS, "elts"),
+            (SJ_SYNTHETIC_SLOT_EMPTY_VALUE, "emptyValue"),
+        ],
+        origin: "native-collections/src/lib.rs SJ_SYNTHETIC_SLOT_*",
+    };
 
 // JDK-ONLY-CLASSIFY: stub — `java.util.StringJoiner` declares zero ACC_NATIVE
 // methods in JDK 25; all 7 registrations here shadow concrete bytecode using a
-// fabricated 5-slot layout (`SJ_FIELD_*` above) that does not match the real
+// fabricated 5-slot layout (`SJ_SYNTHETIC_SLOT_*` above) that does not match the real
 // class. This is the repo's clearest worked example of why the category must be
 // a per-registration decision rather than ambient state: the SAME seven
 // registrations are emitted under `Bridge` by `register_string_joiner_natives`
@@ -28847,6 +30477,11 @@ fn register_string_joiner_natives_with_category(
 ) {
     let __prev_cat = registry.current_category();
     registry.set_category(kind);
+    // Unconditional and idempotent-by-pointer, so publishing from BOTH the
+    // `Bridge` and the `SyntheticStub` registrar is one entry, not two. Not
+    // gated on `CRATONVM_DBG_LAYOUT_ALIAS`: a run that enables the flag later
+    // must still have something to sweep.
+    cratonvm_native_api::read_alias::declare_slot_map(&SJ_STUB_SLOT_MAP);
     registry.register(
         "java/util/StringJoiner",
         "<init>",
@@ -28904,8 +30539,15 @@ pub fn register_string_joiner_stub_natives(registry: &mut NativeMethodRegistry) 
 
 /// Real JDK `java/util/StringJoiner`'s actual field indices, resolved by
 /// name. `None` when only the synthetic 5-field fallback class is loaded (no
-/// real bytecode present) — callers fall back to the legacy `SJ_FIELD_*`
-/// constants/ArrayList-of-elements representation in that case.
+/// real bytecode present) — callers fall back to the legacy
+/// `SJ_SYNTHETIC_SLOT_*` constants/ArrayList-of-elements representation in that
+/// case.
+///
+/// This is the guard for the whole `SJ_SYNTHETIC_SLOT_*` census row (W7-77).
+/// It is a CLASS-side witness, not a receiver-side one, and it is
+/// all-or-nothing: one unresolvable name out of seven sends every entry point
+/// down the legacy path. On a loaded real class that would write a prefix into
+/// `delimiter` and an `emptyValue` String into the `int` `size`.
 struct SjRealLayout {
     prefix: usize,
     delimiter: usize,
@@ -28975,11 +30617,11 @@ fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
     ctx.set_field(elements, 1, Value::Int(0));
 
-    ctx.set_field(this, SJ_FIELD_DELIM, delim);
-    ctx.set_field(this, SJ_FIELD_PREFIX, Value::Object(None));
-    ctx.set_field(this, SJ_FIELD_SUFFIX, Value::Object(None));
-    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_DELIM, delim);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_PREFIX, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_SUFFIX, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, Value::Object(None));
     Ok(None)
 }
 
@@ -29021,11 +30663,11 @@ fn native_sj_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field(elements, 0, Value::Object(Some(backing)));
     ctx.set_field(elements, 1, Value::Int(0));
 
-    ctx.set_field(this, SJ_FIELD_DELIM, delim);
-    ctx.set_field(this, SJ_FIELD_PREFIX, prefix);
-    ctx.set_field(this, SJ_FIELD_SUFFIX, suffix);
-    ctx.set_field(this, SJ_FIELD_ELEMENTS, Value::Object(Some(elements)));
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, Value::Object(None));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_DELIM, delim);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_PREFIX, prefix);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_SUFFIX, suffix);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS, Value::Object(Some(elements)));
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, Value::Object(None));
     Ok(None)
 }
 
@@ -29155,8 +30797,8 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
 
     // Legacy 5-field synthetic fallback: elements live in an internal
-    // ArrayList (field SJ_FIELD_ELEMENTS), added to below.
-    let elements = match ctx.get_field(this, SJ_FIELD_ELEMENTS) {
+    // ArrayList (field SJ_SYNTHETIC_SLOT_ELEMENTS), added to below.
+    let elements = match ctx.get_field(this, SJ_SYNTHETIC_SLOT_ELEMENTS) {
         Value::Object(Some(r)) => r,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
@@ -29207,7 +30849,7 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// Helper: read all elements from a legacy-layout StringJoiner's internal
 /// ArrayList as strings. Only used on the synthetic-fallback path.
 fn sj_read_elements(ctx: &mut dyn NativeContext, sj: ObjectRef) -> Vec<String> {
-    let elements = match ctx.get_field(sj, SJ_FIELD_ELEMENTS) {
+    let elements = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_ELEMENTS) {
         Value::Object(Some(r)) => r,
         _ => return Vec::new(),
     };
@@ -29288,22 +30930,22 @@ fn sj_build_string(ctx: &mut dyn NativeContext, sj: ObjectRef) -> String {
 
     // Legacy 5-field synthetic fallback.
     let elements = sj_read_elements(ctx, sj);
-    let delim = match ctx.get_field(sj, SJ_FIELD_DELIM) {
+    let delim = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_DELIM) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
-    let prefix = match ctx.get_field(sj, SJ_FIELD_PREFIX) {
+    let prefix = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_PREFIX) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
-    let suffix = match ctx.get_field(sj, SJ_FIELD_SUFFIX) {
+    let suffix = match ctx.get_field(sj, SJ_SYNTHETIC_SLOT_SUFFIX) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
 
     if elements.is_empty() {
         // Check emptyValue
-        if let Value::Object(Some(ev)) = ctx.get_field(sj, SJ_FIELD_EMPTY_VALUE) {
+        if let Value::Object(Some(ev)) = ctx.get_field(sj, SJ_SYNTHETIC_SLOT_EMPTY_VALUE) {
             return ctx.read_string(ev).unwrap_or_default();
         }
         return format!("{prefix}{suffix}");
@@ -29365,7 +31007,7 @@ fn native_sj_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(Some(Value::Object(Some(this))));
     }
     // Join other's elements with other's delimiter and add as a single element
-    let other_delim = match ctx.get_field(other, SJ_FIELD_DELIM) {
+    let other_delim = match ctx.get_field(other, SJ_SYNTHETIC_SLOT_DELIM) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
     };
@@ -29394,7 +31036,7 @@ fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return Ok(Some(Value::Object(Some(this))));
     }
 
-    ctx.set_field(this, SJ_FIELD_EMPTY_VALUE, empty_val);
+    ctx.set_field(this, SJ_SYNTHETIC_SLOT_EMPTY_VALUE, empty_val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -29600,13 +31242,23 @@ fn rnd_uniform_double(next: &mut impl FnMut(u32) -> i32) -> f64 {
 ///
 /// Factored out of the native so the specified sequence is testable without a
 /// VM — `next` is `Random.next(bits)`.
+///
+/// The multiplier is `StrictMath.sqrt(-2 * StrictMath.log(s) / s)` in the JDK,
+/// and the `StrictMath` there is load-bearing: `sqrt`, `*` and `/` are
+/// exactly-rounded IEEE 754 and agree everywhere, but `log` is a bit-for-bit
+/// fdlibm contract that platform libm does not meet. Using `s.ln()` here put
+/// every SEEDED gaussian stream one ULP off HotSpot's —
+/// `new Random(42).nextGaussian()` printed `1.141905315473055` against
+/// HotSpot's `1.1419053154730547`, which is the same double as
+/// `Math.log`-derived, not a `Double.toString` difference. See
+/// W7-44-numberformat-enum-and-double-tostring.md.
 fn rnd_gaussian_pair(mut next: impl FnMut(u32) -> i32) -> (f64, f64) {
     loop {
         let v1 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
         let v2 = 2.0 * rnd_uniform_double(&mut next) - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
-            let multiplier = (-2.0 * s.ln() / s).sqrt();
+            let multiplier = (-2.0 * cratonvm_types::fdlibm::log(s) / s).sqrt();
             return (v1 * multiplier, v2 * multiplier);
         }
     }
@@ -30166,8 +31818,23 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
     // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
-    // node-iterating bytecode runs against our overlay structure (where the
-    // JDK `first` field is always null) and returns an array full of nulls.
+    // node-iterating bytecode runs against our overlay structure and returns an
+    // array full of nulls.
+    //
+    // CORRECTED 2026-08-11: the original of this comment gave the reason as
+    // *"the JDK `first` field is always null"*, and that has not been true
+    // since `ll_set` began mirroring the overlay into the real fields (see
+    // `ll_get`'s overlay-MISS arm). Measured reflectively under
+    // `--add-opens java.base/java.util=ALL-UNNAMED`, a native `LinkedList`
+    // carries a real `size` and a real `first`/`last` node chain whose
+    // `item`/`next`/`prev` walk matches HotSpot's exactly, and
+    // `descendingIterator()` — which nothing here intercepts — runs real
+    // `LinkedList$ListItr` bytecode over it successfully. The registration is
+    // still right, for a different reason: the overlay stays AUTHORITATIVE for
+    // `size` on read, so real bytecode that MUTATES the list leaves the two
+    // owners disagreeing (`native_ll_iterator` records the reproducer). Keep
+    // the natives the single writer; do not "simplify" this away on the
+    // strength of the old reason.
     registry.register(
         c,
         "toArray",
@@ -30184,11 +31851,77 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         native_ll_spliterator,
     );
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
-    // fields via getfield; our overlay-based LL never writes those, so
-    // `List.sort` default-method path crashes with NoSuchElementException
-    // inside Spring's `processDeferredImportSelectors`. Override
-    // `listIterator()` / `listIterator(I)` to return a snapshot-array iterator
-    // with cursor + list_ref so `next`/`hasNext`/`set` work via our overlay.
+    // fields via getfield; the `List.sort` default-method path crashed with
+    // NoSuchElementException inside Spring's `processDeferredImportSelectors`.
+    // Override `listIterator()` / `listIterator(I)` to return a snapshot-array
+    // iterator with cursor + list_ref so `next`/`hasNext`/`set` work via our
+    // overlay.
+    //
+    // CORRECTED 2026-08-11: this comment used to blame *"our overlay-based LL
+    // never writes those"*, and that reason is stale — `ll_set` mirrors both
+    // fields, and the whole real node chain reads back correctly (see the
+    // `toArray(T[])` note above). The registration is still correct because the
+    // overlay wins on READ while real bytecode writes the heap, so a real
+    // `ListItr` that mutates leaves the two disagreeing. A real
+    // `Arrays$ArrayItr` cannot stand in either — it has no
+    // `previous`/`set`/`add` — and a real `ArrayList$ListItr` over a snapshot
+    // would drop `set()` writes silently, which is worse. Reasoned in
+    // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
+    //
+    // UNDER `--jdk-only` THIS PAIR WAS AN OPEN GAP UNTIL 2026-08-11:
+    // `cratonvm/internal/LinkedListSnapshotListItr` was refused, so
+    // `listIterator()` and every real `AbstractList` method reaching it
+    // (`equals`, `hashCode`, `indexOf` against a foreign list) raised
+    // `NoClassDefFoundError`. Two independent gates refused it, not one, and
+    // both had to move in the same commit:
+    //
+    //   1. the class:  `try_alloc_synthetic` stamped `CompatibilityStub`, which
+    //      §5 forbids. Now minted through `ensure_vm_internal_class`
+    //      (`ClassOrigin::VmInternal`) — the door ten `MethodHandles`
+    //      combinator carriers took the same day, on the same test
+    //      (docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md). The
+    //      class qualifies: no image declares `cratonvm/internal/*`, no class
+    //      file could exist for it, and it is a 3-slot tuple of the VM's own
+    //      state.
+    //   2. its natives: the name was on `VM_MINTED_STAND_IN_RECEIVERS` in
+    //      native-api/src/no_image_receiver.rs, so `register()` re-tagged all
+    //      nine registrations below from the ambient `Bridge` to
+    //      `SyntheticStub` BEFORE the `JdkOnly` arm read the kind — and that
+    //      arm then returned without inserting them. Confirmed by
+    //      `--dump-native-registry`, which printed `synthetic-stub` for all
+    //      nine though this registrar sets `Bridge`. Moved to
+    //      `VM_SERVICE_RECEIVERS`.
+    //
+    // Clearing 1 without 2 leaves strict holding a well-formed carrier with no
+    // implementation: the failure moves from `NoClassDefFoundError` at
+    // `listIterator()` to `UnsatisfiedLinkError` at the first `hasNext()` —
+    // later, further from the cause, and no better for the contract. That is
+    // the exact trap `STRICT_STILL_FABRICATES` is kept as an empty table to
+    // name ("the two halves of this defect are the registration's kind and the
+    // class's existence"), running in the other direction. Measured, not
+    // inferred, in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+    //
+    // **The gap does NOT leave the census, and that is deliberate.** The row
+    // that names it is `native-shadows-bytecode` on
+    // `java/util/LinkedList.listIterator`, keyed on the REAL class and on this
+    // registration, so no change to the carrier can move it. Only
+    // `compatibility-class-requested` for the carrier's own name disappears.
+    // CratonVM still serves `listIterator` from a native instead of running the
+    // JDK's bytecode; that is an ownership defect and it is still counted.
+    //
+    // What the same record measures, and what made the old refusal worse than
+    // it looked: it was NOT loud everywhere. `new ArrayList<>(List.of("a",
+    // "b","c")).equals(linkedList)` answered **false** under `--jdk-only` — no
+    // exception, just the wrong answer — because `native_al_equals`'s
+    // cross-layout arm called `collection_elements_generic`, whose signature
+    // had no error channel, so the `NoClassDefFoundError` its `iterator()` call
+    // raised became `Vec::new()` and the two sides differed in length. That
+    // helper now returns a `Result` and its whole family with it
+    // (docs/known-issues/jdk-only/W7-20-refusal-laundered-into-wrong-answer.md),
+    // which matters independently of the mint above: a refusal that reaches a
+    // caller with nowhere to put it does not stay a refusal, and the next
+    // carrier to be refused here would have been laundered the same way.
     registry.register(
         c,
         "listIterator",
@@ -30229,29 +31962,91 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // natives registered on `java/util/ListIterator` share the same
     // array@0/cursor@1 layout, so dispatch through either route agrees.
     let lit = "cratonvm/internal/LinkedListSnapshotListItr";
-    registry.register(lit, "hasNext", "()Z", native_ll_listitr_has_next);
-    registry.register(lit, "next", "()Ljava/lang/Object;", native_ll_listitr_next);
-    registry.register(lit, "hasPrevious", "()Z", native_ll_listitr_has_previous);
-    registry.register(
+    // `register_with_kind`, NOT the ambient `register`, and the difference is
+    // the census column `kind_stated` rather than the kind itself — the kind is
+    // `Bridge` either way, in both runtime modes, so nothing about dispatch or
+    // policy changes here.
+    //
+    // Until the 2026-08-11 move to `VM_SERVICE_RECEIVERS` these nine carried
+    // `kind_stated = true`, because `register()`'s
+    // `receiver_declared_by_no_supported_image` arm re-tagged them
+    // `SyntheticStub` and STATED the kind (a measurement adjudicated it). The
+    // move is the right fix for the kind and it silently dropped the
+    // adjudication: an EXCLUSION restores the ambient category, and an ambient
+    // category is `kind_stated = false`. `scripts/jdk-only-kind-map.py` scores
+    // that as a regression on purpose and refuses it — adjudication there is
+    // one-way (`false -> true` freely, never `true -> false`), because a row
+    // that goes back to inheriting is a row the next ambient edit moves in
+    // silence again. Re-freezing the baseline to the lost bit would have
+    // converted the gate into a rubber stamp for exactly the defect it exists
+    // to catch.
+    //
+    // Stating `Bridge` here is the honest form of the same claim the exclusion
+    // makes: contract §11 reviewed this receiver as a VM service, and `Bridge`
+    // is the only tag that survives `NativeKind::allowed_in(JdkOnly)`.
+    // W7-62-ratchets-and-dead-code.md
+    registry.register_with_kind(
+        lit,
+        "hasNext",
+        "()Z",
+        native_ll_listitr_has_next,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "next",
+        "()Ljava/lang/Object;",
+        native_ll_listitr_next,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "hasPrevious",
+        "()Z",
+        native_ll_listitr_has_previous,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "previous",
         "()Ljava/lang/Object;",
         native_ll_listitr_previous,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    registry.register(lit, "nextIndex", "()I", native_ll_listitr_next_index);
-    registry.register(
+    registry.register_with_kind(
+        lit,
+        "nextIndex",
+        "()I",
+        native_ll_listitr_next_index,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "previousIndex",
         "()I",
         native_ll_listitr_previous_index,
+        cratonvm_native_api::NativeKind::Bridge,
     );
-    registry.register(lit, "set", "(Ljava/lang/Object;)V", native_ll_listitr_set);
-    registry.register(lit, "remove", "()V", native_ll_listitr_remove_noop);
-    registry.register(
+    registry.register_with_kind(
+        lit,
+        "set",
+        "(Ljava/lang/Object;)V",
+        native_ll_listitr_set,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
+        lit,
+        "remove",
+        "()V",
+        native_ll_listitr_remove_noop,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+    registry.register_with_kind(
         lit,
         "add",
         "(Ljava/lang/Object;)V",
         native_ll_listitr_remove_noop,
+        cratonvm_native_api::NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
 }
@@ -30293,9 +32088,30 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
         ll_snapshot_array(ctx, this_at_call)
     });
+    // Minted through the VM-internal door, not the compatibility one. This
+    // carrier is VM-internal state, not a stand-in: no image declares a
+    // `cratonvm/…` name, nothing is being stood in for, and the three slots are
+    // the snapshot, the cursor and the backing list. Contract §1 item 6 permits
+    // that in both modes — the door
+    // docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md established
+    // for the ten `MethodHandles` combinator carriers, on the same test.
+    //
+    // Load-bearing pairing: inert without the companion move of this class from
+    // `VM_MINTED_STAND_IN_RECEIVERS` to `VM_SERVICE_RECEIVERS` in
+    // native-api/src/no_image_receiver.rs, and that move is inert without this.
+    // Without the move, `register()` re-tags the nine natives below
+    // `SyntheticStub` and `--jdk-only` drops them, so this mint hands strict a
+    // well-formed object with no methods and the failure becomes an
+    // `UnsatisfiedLinkError` at the first `hasNext()`. Land both or neither.
+    //
+    // `ensure_vm_internal_class` is infallible, so the `?` this call used to
+    // carry is gone. The allocation stays INSIDE `rooted_across`: it can
+    // collect, and `arr` and `this` are stored into the result immediately
+    // after, so hoisting it out would leave both unrooted across a moving GC.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        try_alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
-    })?;
+        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
+        ctx.alloc_object(cid, 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(0));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -30318,9 +32134,11 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
         ll_snapshot_array(ctx, this_at_call)
     });
+    // Same mint, same pairing, as `native_ll_list_iterator` above.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        try_alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
-    })?;
+        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
+        ctx.alloc_object(cid, 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(idx.max(0)));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -31057,11 +32875,14 @@ fn ll_pinned_find(
     this: ObjectRef,
     target: Value,
     from_tail: bool,
-) -> (Option<ObjectRef>, ObjectRef) {
+) -> Result<(Option<ObjectRef>, ObjectRef), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let th = pin_value(ctx, target);
     let mut this = this;
     let mut target = target;
+    // See `pinned_array_search`: recorded, not returned early, so the two
+    // `unpin_native_roots` below still run.
+    let mut failed: Option<MethodCallFailed> = None;
     let start_field = if from_tail { "tail" } else { "head" };
     let step_slot = if from_tail {
         LL_NODE_PREV
@@ -31076,7 +32897,14 @@ fn ll_pinned_find(
     while let Some(cur) = cur_opt {
         let cur_pin = ctx.pin_native_root(cur);
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = match list_element_matches(ctx, &elem, &target) {
+            Ok(m) => m,
+            Err(e) => {
+                failed = Some(e);
+                ctx.unpin_native_roots(cur_pin);
+                break;
+            }
+        };
         let cur = ctx.read_native_pin(cur_pin, cur);
         this = ctx.read_native_pin(this_pin, this);
         target = read_pinned_elem(ctx, th, target);
@@ -31092,7 +32920,10 @@ fn ll_pinned_find(
         ctx.unpin_native_roots(cur_pin);
     }
     ctx.unpin_native_roots(this_pin);
-    (found, this)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok((found, this)),
+    }
 }
 
 fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -31102,7 +32933,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     // Family-1 fix (cce0079): walk via the pinned chain-find helper.
-    let (found, _) = ll_pinned_find(ctx, this, target, false);
+    let (found, _) = ll_pinned_find(ctx, this, target, false)?;
     Ok(Some(Value::Int(if found.is_some() { 1 } else { 0 })))
 }
 
@@ -31125,7 +32956,7 @@ fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // using the REFRESHED node/receiver (the equals dispatches inside the
     // walk can move both — relinking through stale copies corrupted the
     // list structure).
-    let (found, this) = ll_pinned_find(ctx, this, target, false);
+    let (found, this) = ll_pinned_find(ctx, this, target, false)?;
     if let Some(cur) = found {
         ll_unlink_node(ctx, this, cur);
         return Ok(Some(Value::Int(1)));
@@ -31207,7 +33038,7 @@ fn native_ll_remove_last_occurrence(
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     // Family-1 fix (cce0079): same as `native_ll_remove_object`, walking
     // tail→head.
-    let (found, this) = ll_pinned_find(ctx, this, target, true);
+    let (found, this) = ll_pinned_find(ctx, this, target, true)?;
     if let Some(cur) = found {
         ll_unlink_node(ctx, this, cur);
         return Ok(Some(Value::Int(1)));
@@ -31352,7 +33183,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     while let Some(cur) = cur_opt {
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        parts.push(obj_to_display_string(ctx, &elem));
+        parts.push(obj_to_display_string(ctx, &elem)?);
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
             Value::Object(Some(r)) => Some(r),
             _ => None,
@@ -31376,7 +33207,51 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (this, itr) = rooted_across1(ctx, this, |ctx| {
         try_alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3)
     });
-    let itr = itr?;
+    // `java/util/LinkedList$Itr` is a name no JDK image declares (the real one
+    // is `LinkedList$ListItr`), so `--jdk-only` refuses it and every
+    // `linkedList.iterator()` — including the one real
+    // `AbstractCollection.toString()` reaches — died with
+    // `NoClassDefFoundError: java/util/LinkedList$Itr` before `hasNext()`.
+    //
+    // The obvious alternative was to drop the interception and let real
+    // `LinkedList` bytecode run, and unlike the other collections here that is
+    // genuinely available: the natives mirror their overlay into the real
+    // `first`/`last`/`size` fields (`ll_set`; see `ll_get`'s overlay-MISS arm),
+    // and `linkedList.descendingIterator()` — which nothing intercepts —
+    // already walks that chain and answers `[c,b,a]` under `--jdk-only` today.
+    // The two registrar comments below claiming *"the JDK `first` field is
+    // always null"* and *"our overlay-based LL never writes those"* have been
+    // outlived by that mirror.
+    //
+    // It is still the wrong answer, and one run says why. Drive a real
+    // `ListItr.remove()` (via `descendingIterator()`) against a native
+    // LinkedList and the two owners disagree: real `unlink` decrements the real
+    // `size` and re-links the real nodes, `ll_get` reads the OVERLAY first and
+    // still answers the old size, and the NEXT real iteration walks off the end
+    // — `NullPointerException: Cannot read field "item"` at
+    // `LinkedList$ListItr.previous`, reproducible in `Compatible` mode on an
+    // unmodified binary. Handing iteration to real bytecode would put a second
+    // writer on state the natives own. The snapshot keeps one owner.
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there and the
+    // node-live `LinkedList$Itr` is still what `--real-jdk` hands back, with
+    // its `remove()`-unlinks-the-node-just-returned semantics intact.
+    let itr = match itr {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            if head_pin != usize::MAX {
+                ctx.unpin_native_roots(head_pin);
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let snap = ll_snapshot_array(ctx, this);
+            let n = ctx.array_length(snap);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real =
+                real_snapshot_iterator(ctx, snap, n, Some((this, SnapshotItrRoute::LinkedList)));
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let head = read_pinned_elem(ctx, head_pin, head);
     if head_pin != usize::MAX {
         ctx.unpin_native_roots(head_pin);
@@ -31933,7 +33808,7 @@ fn build_reversed_map_snapshot(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let mut entries = collect_entries_any(ctx, source);
+    let mut entries = collect_entries_any(ctx, source)?;
     entries.reverse();
     let m = alloc_linked_hash_map(ctx);
     for (k, v) in entries {
@@ -32758,7 +34633,7 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     while let Value::Object(Some(node)) = cur {
         let node_pin = ctx.pin_native_root(node);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let matched = list_element_matches(ctx, &val, &target);
+        let matched = list_element_matches(ctx, &val, &target)?;
         let node = ctx.read_native_pin(node_pin, node);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -32946,8 +34821,8 @@ fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let ks = obj_to_display_string(ctx, &key);
-        let vs = obj_to_display_string(ctx, &val);
+        let ks = obj_to_display_string(ctx, &key)?;
+        let vs = obj_to_display_string(ctx, &val)?;
         parts.push(format!("{ks}={vs}"));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
@@ -33073,7 +34948,7 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // native_lhm_put re-enters Java, moving `this` and every pending pair.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, val)) in entries.iter().enumerate() {
@@ -33097,7 +34972,54 @@ const AD_FIELD_DATA: usize = 0; // Object[] circular buffer
 const AD_FIELD_HEAD: usize = 1; // Int head index
 const AD_FIELD_TAIL: usize = 2; // Int tail index
 const AD_FIELD_SIZE: usize = 3; // Int element count
+/// Elements a default-constructed deque holds before the first grow. The
+/// *array* is one slot longer — see [`ad_ensure_capacity`] for why that spare
+/// slot is not an optimisation but the JDK's own emptiness invariant.
 const AD_DEFAULT_CAPACITY: usize = 16;
+
+/// `ArrayDeque.addFirst`/`addLast` open with `if (e == null) throw new
+/// NullPointerException();`, and that refusal is load-bearing rather than
+/// defensive: a null in the ring buffer is how real `ArrayDeque` bytecode
+/// *encodes* "another thread mutated me while I was iterating".
+/// `nonNullElementAt` turns any null it reads into a
+/// `ConcurrentModificationException`, so accepting one here does not just lose
+/// three `no-throw` observables — it arms the JDK's own iterator to kill a
+/// caller that never touched null.
+///
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// `dq.add(null)` returned `true`, `dq.size()` answered 3 where HotSpot said 0,
+/// the deque printed `[a, null, null, null, x, y, x, z]`, and then
+///
+/// ```text
+/// java.util.ConcurrentModificationException
+///     at java.util.ArrayDeque.nonNullElementAt(ArrayDeque.java:268)
+///     at java.util.ArrayDeque$DescendingIterator.next(ArrayDeque.java:746)
+/// ```
+///
+/// took the remaining 12 observables of the `dequeEdges` probe section with it.
+/// The CME was therefore never an over-throw and never had anything to do with
+/// the `modCount` this crate gained this session: real JDK bytecode diagnosed
+/// the state this missing check produced, and diagnosed it correctly. See
+/// W7-33-differential-dead-sections.
+///
+/// The check sits in the two funnels rather than at each registration because
+/// that is where the JDK puts it — `add`, `offer`, `offerFirst`, `offerLast`,
+/// `push` and `addAll` all reach the deque through `addFirst`/`addLast` in
+/// both implementations. The one other caller is the `java/util/Queue`
+/// interface bridge, which points at the `ArrayDeque` implementation by
+/// construction; the null-tolerant `Queue` in the JDK is `LinkedList`, and
+/// `((Queue<String>) new LinkedList<String>()).offer(null)` was measured
+/// storing its null on both CratonVM modes today, so it does not route here.
+///
+/// HotSpot's is message-less. `thrownDetail` prints a message when there is
+/// one, so inventing one would itself be a divergence.
+#[inline]
+fn ad_refuse_null(elem: Value) -> Result<(), MethodCallFailed> {
+    if matches!(elem, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException { message: None }.into());
+    }
+    Ok(())
+}
 
 fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32, i32) {
     let data = match ctx.get_field(this, AD_FIELD_DATA) {
@@ -33119,13 +35041,54 @@ fn ad_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     (data, head, tail, size)
 }
 
+/// Grow the ring buffer so it can hold `min_cap` elements **and still leave one
+/// slot free**.
+///
+/// The spare slot is the whole of the 2026-08-11 `stream()` fix, so it is worth
+/// stating why it is not slack. Slots 0..2 of our overlay are not ours: the real
+/// `java.util.ArrayDeque` declares exactly `elements`/`head`/`tail` in that
+/// order, and `synthetic_stub_fields` pads the class to four so our `size` can
+/// live at slot 3. Everything real JDK bytecode reads about this deque it
+/// derives from `head`/`tail` alone — `size()` is `sub(tail, head,
+/// elements.length)` — and that arithmetic has no way to distinguish full from
+/// empty. The JDK resolves the ambiguity by never letting the buffer fill:
+/// `new ArrayDeque()` is `new Object[16 + 1]`, `new ArrayDeque(n)` is
+/// `new Object[n + 1]`, and `grow` runs one element early. `head == tail` then
+/// means empty, always.
+///
+/// This function used to grow only when the buffer was *over*full
+/// (`min_cap <= old_cap` returned early), so a deque whose element count
+/// reached its capacity wrapped `tail` right back onto `head` — a perfectly
+/// consistent state for our natives, which read `size` from slot 3, and an
+/// EMPTY deque to everything else. Measured on the pre-fix binary against
+/// HotSpot 25, two elements from `new ArrayDeque<>(List.of("a","b"))`:
+///
+/// ```text
+/// HotSpot   elements=[a, b, null]  head=0  tail=2
+/// CratonVM  elements=[a, b]        head=0  tail=0
+/// ```
+///
+/// with `size()`, `toString()`, `contains()`, `getFirst()` and `forEach()` all
+/// answering correctly beside it — those are ours — while `stream().count()`,
+/// `parallelStream()`, `spliterator()` and `toArray(T[])` (which we do not
+/// register, so it is real bytecode) all answered for an empty deque. Sixteen
+/// elements in a default deque did the same thing, and `[a,b]` in a
+/// 16-slot buffer did not, which is why this hid: it fires only when the count
+/// happens to land exactly on the capacity.
+///
+/// `docs/known-issues/jdk-only/W7-1-treemap-views-and-iterator-remove-contract.md`
+/// is why it was found at all — an empty collection reads as a pass at every
+/// caller that only iterates, so the probe that caught this prints element
+/// CONTENT for every member rather than a verdict.
 fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usize) {
     let (data, head, _tail, size) = ad_state(ctx, this);
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
-    if min_cap <= old_cap {
+    // `<`, not `<=`: an array of exactly `min_cap` slots is full at `min_cap`
+    // elements, and full is what we must never be.
+    if min_cap < old_cap {
         return;
     }
-    let new_cap = std::cmp::max(old_cap * 2, min_cap);
+    let new_cap = std::cmp::max(old_cap * 2, min_cap + 1);
     // GC-safety: the allocation can complete a moving young GC; `this` and the
     // old buffer are both bare Rust locals used below. See `rooted_across`.
     let mut this = this;
@@ -33240,7 +35203,15 @@ fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     // GC-safety: see `rooted_across` — `this` must survive the allocation.
-    let (this, buf) = rooted_across1(ctx, this, |ctx| alloc_ref_array(ctx, AD_DEFAULT_CAPACITY));
+    //
+    // `+ 1` is the JDK's own expression: `ArrayDeque()` is literally
+    // `elements = new Object[16 + 1]`, and HotSpot 25 prints `elements.len=17`
+    // for a fresh deque. The spare slot is the emptiness invariant real
+    // bytecode reads this object through — `ad_ensure_capacity` has the full
+    // reasoning and the measurement.
+    let (this, buf) = rooted_across1(ctx, this, |ctx| {
+        alloc_ref_array(ctx, AD_DEFAULT_CAPACITY + 1)
+    });
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
@@ -33253,9 +35224,24 @@ fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // The real `ArrayDeque(int)` body, transcribed rather than approximated:
+    //
+    //     elements = new Object[(numElements < 1) ? 1
+    //                         : (numElements == Integer.MAX_VALUE) ? Integer.MAX_VALUE
+    //                         : numElements + 1];
+    //
+    // The `+ 1` matters here more than anywhere else in this file, because this
+    // constructor is the one `ArrayDeque(Collection)` calls: `this(c.size())`
+    // then `copyElements(c)`. With the old `max(n, 1)` a deque built from a
+    // 2-element collection got a 2-slot buffer, filled it, and wrapped `tail`
+    // onto `head` — `new ArrayDeque<>(List.of("a","b")).stream().count()`
+    // answered 0 against HotSpot's 2, in BOTH compatibility modes. See
+    // `ad_ensure_capacity`.
     let cap = match args.get(1) {
-        Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
-        _ => AD_DEFAULT_CAPACITY,
+        Some(Value::Int(c)) if *c < 1 => 1,
+        Some(Value::Int(c)) if *c == i32::MAX => i32::MAX as usize,
+        Some(Value::Int(c)) => (*c as usize) + 1,
+        _ => AD_DEFAULT_CAPACITY + 1,
     };
     // HotSpot throws a catchable OutOfMemoryError for an over-large element
     // array rather than aborting; mirror that instead of the panicking alloc.
@@ -33299,6 +35285,8 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
     // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
     // and refresh both, otherwise the store below writes a pre-GC element
@@ -33328,6 +35316,8 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Before anything is pinned or grown: see `ad_refuse_null`.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): same shape as
     // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
     // buffer grow and refresh both before the store.
@@ -33387,6 +35377,16 @@ fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         ctx.get_array_element(buf, head as usize)
     });
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
+    // Null the vacated slot, as the real `pollFirst` does (`es[h] = null`).
+    // `ad_remove_at_logical` already did this for the interior case and gives
+    // the retention reason; the head/tail cases were the two that did not, so a
+    // polled deque kept its dropped elements alive and printed them where
+    // HotSpot prints `null` (`elements=[a, b]` vs `[null, b, null]` after one
+    // `poll()`). Nothing reads outside `head..head+size`, so this was invisible
+    // to every accessor — which is exactly why it survived.
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, head as usize, Value::Object(None));
+    }
     let new_head = (head + 1) % cap;
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(new_head));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
@@ -33412,6 +35412,10 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let elem = data.map_or(Value::Object(None), |buf| {
         ctx.get_array_element(buf, new_tail as usize)
     });
+    // Null the vacated slot — same reason as `native_ad_remove_first`.
+    if let Some(buf) = data {
+        ctx.set_array_element(buf, new_tail as usize, Value::Object(None));
+    }
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
@@ -33489,7 +35493,7 @@ fn native_ad_remove_first_occurrence(
     for k in 0..size as usize {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
@@ -33539,7 +35543,7 @@ fn native_ad_remove_last_occurrence(
     for k in (0..size as usize).rev() {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
         target = read_pinned_elem(ctx, th, target);
@@ -33673,7 +35677,7 @@ fn native_ad_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         for i in 0..(size as usize) {
             let idx = (head as usize + i) % cap;
             let elem = ctx.get_array_element(buf, idx);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             target = read_pinned_elem(ctx, th, target);
             if matched {
@@ -33694,6 +35698,22 @@ fn native_ad_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Null the live range before resetting the cursors, mirroring the real
+    // `clear()`'s `circularClear(elements, head, tail)`. Resetting the three
+    // ints alone left every cleared element strongly reachable from the buffer
+    // with nothing able to reach it back — `clear()` is the one call a caller
+    // makes *specifically* to drop references, so this is the site where the
+    // leak is least acceptable and was least visible.
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    if let Some(buf) = data {
+        let cap = ctx.array_length(buf);
+        if cap > 0 {
+            for i in 0..(size.max(0) as usize).min(cap) {
+                let idx = (head as usize + i) % cap;
+                ctx.set_array_element(buf, idx, Value::Object(None));
+            }
+        }
+    }
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(0));
@@ -33758,7 +35778,57 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let value = read_pinned_elem(ctx, elem_pins[i], *e);
         ctx.set_array_element(arr, i, value);
     }
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3)?;
+    // No JDK image declares `java/util/ArrayDeque$Itr` — the real one is
+    // `ArrayDeque$DeqIterator` — so `--jdk-only` refuses it and, before this
+    // arm, `new ArrayDeque<>(..).iterator()` raised
+    // `NoClassDefFoundError: java/util/ArrayDeque$Itr` before `hasNext()`.
+    // Land on the real `Arrays$ArrayItr` instead, exactly as the HashSet and
+    // TreeSet sites do. The trade is smaller here than anywhere else: this
+    // iterator is ALREADY snapshot-backed (field 0 is the copy taken above,
+    // not the ring buffer), and `native_ad_itr_remove`'s whole body is the
+    // `native_ad_remove_first_occurrence` call that `SnapshotItrRoute::ArrayDeque`
+    // makes — so the two shapes differ in the class name and nothing else.
+    //
+    // Letting real `ArrayDeque.iterator()` bytecode run instead was rejected on
+    // the strength of a reflective read — `elements=Object[2] head=0 tail=0` on
+    // a two-element deque, so real `DeqIterator` derives size 0 and iterates
+    // nothing.
+    //
+    // CORRECTED 2026-08-11: the observation was right and the diagnosis under
+    // it was wrong, in a way worth keeping. `tail` was never unwritten —
+    // `native_ad_add_last` writes it on every call. What that reading missed is
+    // the modulus: the deque came from `new ArrayDeque<>(List.of("a","b"))`,
+    // whose 2-slot buffer the two adds filled exactly, wrapping `tail` back
+    // onto `head`. The same deque built with the no-arg constructor reads
+    // `head=0 tail=2` and streams correctly, which is the control that names
+    // the real defect. Fixed at its source in `ad_ensure_capacity` and the two
+    // constructors: the buffer now always keeps the JDK's spare slot, so
+    // `head == tail` means empty and nothing else.
+    //
+    // The registration is still right, for the reason it always should have
+    // given: no JDK image declares `java/util/ArrayDeque$Itr`, and
+    // `native_ad_itr_remove` must keep our slot-3 `size` in step with a removal
+    // that real `delete(...)` bytecode knows nothing about. `--jdk-only` still
+    // lands on the real `Arrays$ArrayItr` below, which keeps the gap on the
+    // census. Re-measured in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there.
+    let itr = match try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                elems.len(),
+                Some((this, SnapshotItrRoute::ArrayDeque)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let arr = ctx.read_native_pin(arr_pin, arr);
@@ -33818,7 +35888,7 @@ fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let parts: Vec<String> = elems
         .iter()
         .map(|e| obj_to_display_string(ctx, e))
-        .collect();
+        .collect::<Result<Vec<String>, MethodCallFailed>>()?;
     let s = format!("[{}]", parts.join(", "));
     Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
 }
@@ -34154,6 +36224,19 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `java.util.PriorityQueue`: "This queue does not permit null elements",
+    // and both funnels declare `@throws NullPointerException if the specified
+    // element is null`. `offer` opens with the check and `add` delegates to it,
+    // which is why one check here covers the two registrations above.
+    //
+    // Measured on the binary before this line existed:
+    // `PriorityQueue.nullAdd=no-throw` against HotSpot's
+    // `java.lang.NullPointerException`. The reason the JDK refuses is the same
+    // one `ArrayDeque` has — a null has no place in a comparison heap, and
+    // `siftUp` would dereference it on the very next insert — so `ad_refuse_null`
+    // is reused rather than duplicated (only its name is `ArrayDeque`-specific).
+    // See W7-33-differential-dead-sections R1.
+    ad_refuse_null(elem)?;
     // Family-1 stale-at-store fix (cce0079): `pq_ensure_capacity`
     // reallocates the heap array on grow (GC-capable) — pin `this`/`elem`
     // across it and refresh both, otherwise the store below writes a pre-GC
@@ -34245,7 +36328,7 @@ fn native_pq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // element into a stale array. Pin the receiver, search through the
     // pinned helper, and act on the refreshed addresses it returns.
     let this_pin = ctx.pin_native_root(this);
-    let (found_idx, buf, _target) = pinned_array_search(ctx, buf, size as usize, target);
+    let (found_idx, buf, _target) = pinned_array_search(ctx, buf, size as usize, target)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let idx = match found_idx {
@@ -34276,7 +36359,7 @@ fn native_pq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Family-1 fix (cce0079): the naive loop walked a `buf` left stale
         // by the per-element `equals()` dispatch; search via the pinned
         // helper instead.
-        let (found, _, _) = pinned_array_search(ctx, buf, size as usize, target);
+        let (found, _, _) = pinned_array_search(ctx, buf, size as usize, target)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
@@ -34359,7 +36442,7 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
-            parts.push(obj_to_display_string(ctx, &elem));
+            parts.push(obj_to_display_string(ctx, &elem)?);
         }
     }
     let s = format!("[{}]", parts.join(", "));
@@ -34601,12 +36684,15 @@ fn native_stack_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // `java.util.Stack.pop`: "@throws EmptyStackException if this stack is
+        // empty". That class extends `RuntimeException` DIRECTLY, so the
+        // `NoSuchElementException` this used to raise is not a supertype of it
+        // and a `catch (EmptyStackException)` in application code never fired —
+        // a mistyped refusal sends the caller down the wrong branch, which is
+        // worse than no refusal because it looks handled. Measured:
+        // `Stack.popOnEmpty=java.util.NoSuchElementException` against HotSpot's
+        // `java.util.EmptyStackException`. See W7-33-differential-dead-sections R2.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     native_al_remove_at(ctx, &[Value::Object(Some(this)), Value::Int(size - 1)])
 }
@@ -34618,12 +36704,12 @@ fn native_stack_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(
-            cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "Stack is empty".to_string(),
-            }
-            .into(),
-        );
+        // Same contract as `pop` above: `java.util.Stack.peek` declares
+        // `@throws EmptyStackException if this stack is empty`. Not measured by
+        // the probe — it only asks `pop` — but the two are one refusal in the
+        // JDK (`peek` is what `pop` calls first) and leaving one behind is how
+        // the pair drifts apart again.
+        return Err(cratonvm_types::error::RuntimeError::EmptyStackException.into());
     }
     let elem = data.map_or(Value::Object(None), |buf| {
         ctx.get_array_element(buf, (size - 1) as usize)
@@ -34648,7 +36734,7 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let mut found = None;
         for i in (0..(size as usize)).rev() {
             let elem = ctx.get_array_element(buf, i);
-            let matched = list_element_matches(ctx, &elem, &target);
+            let matched = list_element_matches(ctx, &elem, &target)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             target = read_pinned_elem(ctx, th, target);
             if matched {
@@ -34768,15 +36854,24 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
             // caller of this helper (addAll / removeAll / retainAll /
             // containsAll / hashCode / copy ctors) is off the iterator
             // native's path, so driving the real `iterator()` is safe.
-            let real = collect_via_real_iterator_once(ctx, coll);
+            // See `al_or_collection_elements_pinned`: the snapshot in hand has
+            // just been declared untrustworthy, so a refused re-derivation
+            // must not be answered with it.
+            let real = collect_via_real_iterator_once(ctx, coll)?;
             if !real.is_empty() {
                 return Ok(real);
             }
         }
         return Ok(elems);
     }
+    // A refused `size()`/`toArray()` is not an empty collection. Both used to
+    // fall through to the (empty) `elems`, so every copy constructor, `addAll`,
+    // `removeAll`, `retainAll` and `containsAll` over a strict-refused argument
+    // silently saw zero elements — `addAll` in particular then reports `false`
+    // ("collection unchanged"), which reads as an ordinary no-op.
     let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
+        Err(e) => return Err(e),
         _ => 0,
     };
     if real_size <= 0 {
@@ -34784,6 +36879,7 @@ fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: Object
     }
     let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
+        Err(e) => return Err(e),
         _ => return Ok(elems),
     };
     let len = ctx.array_length(arr);
@@ -35418,7 +37514,7 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut in_coll = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &elem);
+            let matched = list_element_matches(ctx, &ce, &elem)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             elem = read_pinned_elem(ctx, eh, elem);
             if matched {
@@ -35503,7 +37599,7 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut in_coll = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &elem);
+            let matched = list_element_matches(ctx, &ce, &elem)?;
             buf = ctx.read_native_pin(buf_pin, buf);
             elem = read_pinned_elem(ctx, eh, elem);
             if matched {
@@ -35675,7 +37771,7 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut should_keep = false;
         for (ci, ce_orig) in coll_elems.iter().enumerate() {
             let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
-            let matched = list_element_matches(ctx, &ce, &e);
+            let matched = list_element_matches(ctx, &ce, &e)?;
             e = read_pinned_elem(ctx, cur_handles[i], e);
             if matched {
                 should_keep = true;
@@ -36705,6 +38801,39 @@ fn tm_new_range_view(
     hi: Option<(Value, bool)>,
     descending: bool,
 ) -> MethodCallResult {
+    // W7-36 residual — the OTHER arm of `NavigableSubMap`'s constructor, the one
+    // `tm_refuse_reversed_bounds` documents as deliberately not routed to it:
+    //
+    // ```text
+    // } else {
+    //     if (!fromStart) m.compare(lo, lo);   // type (and possibly null) check
+    //     if (!toEnd)     m.compare(hi, hi);   // type check
+    // }
+    // ```
+    //
+    // So a SINGLE-bound `headMap`/`tailMap` refuses a null bound with
+    // `NullPointerException` and a non-`Comparable` bound with
+    // `ClassCastException`. Both compares are unconditional — they do not
+    // consult `root` — which is why `container_is_empty` is passed `true` rather
+    // than asked of the map: on an empty map the JDK still refuses, and asking
+    // would under-throw exactly there.
+    //
+    // Fires only when exactly one bound is present. Two bounds take the `if`
+    // arm, already covered by `tm_refuse_reversed_bounds` at the two `subMap`
+    // entry points; `descendingMap` supplies neither and is untouched. Reads the
+    // RECEIVER's comparator slot, as `tm_refuse_reversed_bounds` does, so a view
+    // of a view is judged by its own ordering. Runs before any pin because it
+    // allocates nothing: `implements_comparable` and `object_class_name` are
+    // both pure `ClassId` lookups.
+    if lo.is_some() != hi.is_some() {
+        let bound = lo.or(hi).map(|(k, _)| k).unwrap_or(Value::Object(None));
+        tree_natural_order_key_check(
+            ctx,
+            &tm_get_slot(ctx, source, TM_FIELD_COMPARATOR),
+            bound,
+            true,
+        )?;
+    }
     // GC-SAFETY: the allocation, `Collections.reverseOrder` and the resync all
     // collect, and `source` and the two bound keys are bare Rust locals that end
     // up STORED in the side table — a from-space address recorded there would
@@ -37033,6 +39162,96 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     )
 }
 
+/// The JDK's `compare(key, key)` — "type (and possibly null) check" in its own
+/// comment — for the sorted containers, hoisted to the natives that can reach an
+/// EMPTY one.
+///
+/// Three measured divergences, one cause:
+///
+/// ```text
+/// TreeMap.nullKeyPut              HotSpot NullPointerException  CratonVM no-throw
+/// TreeMap.nullKeyGet              HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.nullAddNaturalOrdering  HotSpot NullPointerException  CratonVM no-throw
+/// TreeSet.incomparableFirstAdd    HotSpot ClassCastException    CratonVM no-throw
+/// ```
+///
+/// None of them is an extra rule. Under natural ordering every insert and every
+/// lookup runs `((Comparable) key).compareTo(other)`, which raises both: the
+/// `checkcast` in front of the call raises `ClassCastException` for a
+/// non-`Comparable` receiver, and the invoke itself raises
+/// `NullPointerException` for a null one. `TreeMap.getEntry` opens with an
+/// explicit `if (key == null) throw new NullPointerException()` for exactly
+/// that reason, and `addEntryToEmptyMap` writes the self-compare out by hand
+/// because on an empty container no comparison would otherwise happen at all.
+///
+/// So the gap here is *two* gaps that look like one. [`compare_via_compare_to`]
+/// already raises the ClassCastException half — but only once there is
+/// something to compare against, which is why only the FIRST add diverged. It
+/// never raises the null half at all, and deliberately: it orders `null` first,
+/// because its other caller is `Arrays.sort(Object[])`, whose contract that is.
+/// A sorted map has the opposite contract, so the check has to live here rather
+/// than be added there.
+///
+/// Scoped to natural ordering — `comparator == null` — because that is where
+/// the JDK scopes it. `TreeMap.put`: "@throws NullPointerException if the
+/// specified key is null and this map uses natural ordering, **or its
+/// comparator does not permit null keys**"; with a comparator supplied the JDK
+/// asks the comparator and nothing else. `new TreeSet<>(Comparator.nullsFirst(..))`
+/// legitimately holds a null, and a comparator over a non-`Comparable` element
+/// type is the ordinary reason to supply one — this file already documents a
+/// `Set<Class<?>>` ordered by a name-comparator above `tree_key_from_value`, and
+/// `compare_via_compare_to` documents Spring catching the CCE from the other
+/// shape. Refusing under a comparator would be the over-throw.
+///
+/// The CCE message is `compare_via_compare_to`'s, verbatim, so the two sites
+/// that model the same `checkcast` cannot drift into two different reports. The
+/// NPE carries no message, like [`ad_refuse_null`]: HotSpot's has none here and
+/// `thrownDetail` prints a message when there is one.
+///
+/// `container_is_empty` gates the `Comparable` half only, and gates it exactly
+/// where the JDK gates it: the self-compare is written out by hand in
+/// `addEntryToEmptyMap` and nowhere else, because a non-empty container reaches
+/// the same `checkcast` through the real comparison a moment later — here, via
+/// `compare_via_compare_to` inside `tm_binary_search`/`ts_binary_search`.
+/// Running the hierarchy walk on every populated `get`/`put`/`add` would buy
+/// nothing and would put a class-hierarchy walk on the fast-mode `TreeMap`
+/// path, which today performs no comparison at all. The null half is
+/// unconditional because it is a `matches!` and because
+/// `compare_via_compare_to` will never supply it.
+fn tree_natural_order_key_check(
+    ctx: &dyn NativeContext,
+    comparator: &Value,
+    key: Value,
+    container_is_empty: bool,
+) -> Result<(), MethodCallFailed> {
+    if !matches!(comparator, Value::Object(None)) {
+        return Ok(());
+    }
+    match key {
+        Value::Object(None) => Err(RuntimeError::NullPointerException { message: None }.into()),
+        Value::Object(Some(k)) if container_is_empty && !implements_comparable(ctx, k) => {
+            let cname = object_class_name(ctx, k).replace('/', ".");
+            Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
+            }
+            .into())
+        }
+        // A primitive `Value` never reaches a `(Ljava/lang/Object;)` key
+        // parameter; treat anything else as already checked rather than
+        // inventing a refusal for a shape the registrations cannot produce.
+        _ => Ok(()),
+    }
+}
+
+/// `true` when a natively-managed TreeMap holds no entries, in either storage
+/// mode — `TM_FIELD_SIZE` is maintained by the fast-mode BTreeMap path as well
+/// as the array path (`native_tm_put`'s own fast-mode eligibility test reads
+/// it). Only ever used to decide whether the JDK's empty-map self-compare
+/// applies, so a wrong answer under-throws rather than over-throws.
+fn tm_is_empty_now(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
+}
+
 /// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
 /// if missing. Caller must ensure they only invoke this when fast mode
 /// is applicable (no comparator, etc.).
@@ -37199,7 +39418,16 @@ fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
     }
 }
 
-// TreeSet — sorted set backed by sorted array
+// TreeSet — sorted set backed by sorted array.
+//
+// These are NOT object slot indices. `ts_get_slot`/`ts_set_slot` key an
+// address-keyed side table on them and never touch the object's own fields, so
+// nothing here describes a layout and nothing here may be handed to an
+// allocator: real `java.util.TreeSet` declares exactly ONE instance field
+// (`javap -p`, JDK 25.0.3.9: `private transient NavigableMap<E,Object> m`), and
+// every set-view native used to ask for three. Allocate through
+// `try_alloc_declared_width`, which asks for what the loaded class declares.
+// W7-66-live-over-allocations.md.
 const TS_FIELD_DATA: usize = 0; // Object[] sorted elements
 const TS_FIELD_SIZE: usize = 1; // Int: number of elements
 const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
@@ -38667,7 +40895,21 @@ fn ts_ensure_capacity(
     data: ObjectRef,
 ) -> ObjectRef {
     let arr_len = ctx.array_length(data);
-    let needed = (size + 1) as usize;
+    // A live-view marker lives in the LAST capacity slot (see `ts_view_source`),
+    // so a view must keep one slot free beyond its logical size or the next
+    // `ts_insert_at` writes over the marker and the view silently stops writing
+    // through — the "silently stale view" failure this file's other view code
+    // is careful about. Reserve the slot, and carry the marker across a grow.
+    //
+    // Detected exactly as `ts_view_source` detects it, so the two cannot
+    // disagree: `length > size` AND a non-null trailing slot. A plain TreeSet's
+    // spare capacity is all null, so this is `false` for every non-view.
+    let has_marker = (arr_len as i32) > size
+        && matches!(
+            ctx.get_array_element(data, arr_len - 1),
+            Value::Object(Some(_))
+        );
+    let needed = (size + 1) as usize + usize::from(has_marker);
     if needed <= arr_len {
         return data;
     }
@@ -38688,6 +40930,13 @@ fn ts_ensure_capacity(
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
+    }
+    if has_marker {
+        // Read the marker through the pinned `data` rather than carrying it in a
+        // Rust local across `alloc_ref_array` above: a source recorded here as a
+        // from-space address is a use-after-free on the first write-through.
+        let marker = ctx.get_array_element(data, arr_len - 1);
+        ctx.set_array_element(new_arr, new_cap - 1, marker);
     }
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
     let new_arr = ctx.read_native_pin(new_pin, new_arr);
@@ -38758,6 +41007,21 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    // Before the view branch, not after: a DESCENDING view carries a
+    // `Collections.reverseOrder` comparator, so this is a no-op on it and the
+    // redirect below lets the backing map raise the refusal itself. An
+    // ASCENDING range view carries the source's own (null) comparator, and the
+    // JDK refuses there too — `NavigableSubMap.put` calls `inRange(key)` first,
+    // which is a `compare(key, bound)` and raises the NPE before the
+    // `IllegalArgumentException` this function raises for a real out-of-range
+    // key can be reached.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
 
     // W7-1 family 1: a write through a navigable view is a write to the BACKING
     // MAP. Redirect it, and refuse an out-of-range key the way
@@ -38923,6 +41187,16 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // `TreeMap.getEntry` refuses a null key on a natural-ordering map BEFORE it
+    // looks at `root`, so an EMPTY map throws too — which is the shape the probe
+    // measures (`new TreeMap<>().get(null)`). The fast-mode branch below would
+    // otherwise answer `null` for it, i.e. "absent", the quiet wrong answer.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let v = tm_fast_with(ctx, this, |bt| {
@@ -38955,6 +41229,20 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // W7-36 residual, and BEFORE the view branch for the reason `native_tm_put`
+    // states: a DESCENDING view carries a `Collections.reverseOrder` comparator,
+    // so this is a no-op on it and the redirect lets the backing map raise;
+    // an ASCENDING view carries the source's own (null) comparator and
+    // `NavigableSubMap.remove`'s `inRange(key)` is a `compare(key, bound)` that
+    // raises there too. `TreeMap.remove` itself is `getEntry(key)`, which
+    // null-checks and casts to `Comparable` ahead of `root` — an empty map
+    // refuses as well.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     // W7-1 family 1. This is the row the record measured directly:
     // `tm.headMap("c").remove("a")` used to delete from a detached snapshot and
     // leave `tm` reading `{a=1, b=2, c=3, d=4}`. The JDK's
@@ -39018,6 +41306,17 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     tm_sync_native_state(ctx, this)?;
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // W7-36 residual: `TreeMap.containsKey` is `getEntry(key) != null`, and
+    // `getEntry` performs the `if (key == null) throw new NullPointerException();`
+    // + `(Comparable) key` checkcast BEFORE it looks at `root` — so an EMPTY map
+    // refuses too. Both branches below would otherwise answer "absent", which is
+    // the quiet wrong answer `native_tm_get` was given this same call for.
+    tree_natural_order_key_check(
+        ctx,
+        &tm_get_slot(ctx, this, TM_FIELD_COMPARATOR),
+        key,
+        tm_is_empty_now(ctx, this),
+    )?;
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let found = tm_fast_with(ctx, this, |bt| bt.contains_key(&tk));
@@ -39053,7 +41352,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let mut found = false;
         for (i, v_orig) in values.iter().enumerate() {
             let v = read_pinned_elem(ctx, handles[i], *v_orig);
-            let matched = list_element_matches(ctx, &v, &target);
+            let matched = list_element_matches(ctx, &v, &target)?;
             target = read_pinned_elem(ctx, th, target);
             if matched {
                 found = true;
@@ -39080,7 +41379,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let mut found = false;
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i * 2 + 1);
-        let matched = list_element_matches(ctx, &v, &target);
+        let matched = list_element_matches(ctx, &v, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -39427,16 +41726,39 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 }
 
+/// Build the `Map.Entry` that `TreeMap`'s *relative-navigation* accessors hand
+/// back — `firstEntry`, `lastEntry`, `pollFirstEntry`, `pollLastEntry`,
+/// `floorEntry`, `ceilingEntry`, `higherEntry`, `lowerEntry`, and nothing else.
+///
+/// Every one of those is `exportEntry(e)` in the JDK, which is
+/// `new AbstractMap.SimpleImmutableEntry<>(e)` — a SNAPSHOT, whose `setValue`
+/// throws. `TreeMap.firstEntryIsImmutable` measured
+/// `tm.firstEntry().setValue(99)` returning normally here against HotSpot's
+/// `java.lang.UnsupportedOperationException`, because this allocated the
+/// MUTABLE twin. `AbstractMap.SimpleImmutableEntry.setValue`: "@throws
+/// UnsupportedOperationException always".
+///
+/// The two classes have the same two instance fields in the same order (`key`,
+/// `value`; `javap -p` on both), so nothing about the direct field stores below
+/// changes — only which `setValue` the receiver resolves to.
+///
+/// This is deliberately NOT the entry-set path. `TreeMap.entrySet()`'s iterator
+/// yields the LIVE `TreeMap.Entry`, whose `setValue` writes through, and
+/// `TreeMap.entrySetEntryIsLive` already matches HotSpot; that path allocates
+/// its own `AbstractMap$SimpleEntry` through `alloc_live_entry` and is
+/// untouched. Getting these two backwards in either direction is a divergence,
+/// which is why the split is stated here rather than left to the call sites.
 fn tm_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> Result<ObjectRef, MethodCallFailed> {
-    // AbstractMap$SimpleEntry is a real Map.Entry implementation, so reflection
-    // (Class.getMethods) and reflective property access see getKey/getValue.
-    // The old fabricated "HashMap$Entry" does not implement Map.Entry — see
-    // native_tm_entry_set for the SpEL EL1008E that motivated this.
+    // Both `Simple*Entry` classes are real `Map.Entry` implementations, so
+    // reflection (Class.getMethods) and reflective property access see
+    // getKey/getValue. The old fabricated "HashMap$Entry" does not implement
+    // Map.Entry — see native_tm_entry_set for the SpEL EL1008E that motivated
+    // that change.
     // GC-safety: same hazard as `native_map_entry` — pin `key`/`value` across
     // the allocation so the entry is populated with post-move addresses.
     let key_pin = pin_value(ctx, key);
     let value_pin = pin_value(ctx, value);
-    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2)?;
+    let entry = try_alloc_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2)?;
     let key = read_pinned_elem(ctx, key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     if key_pin != usize::MAX {
@@ -39848,7 +42170,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // collect, moving both `this` and every key still held only in `pairs`.
     let this_pin = ctx.pin_native_root(this);
     let pinned_pairs = PinnedPairs::new(ctx, &pairs);
-    let ts = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     // Reserve one extra trailing slot and stash the source TreeMap there so the
     // keySet view writes through (`keySet().remove` / `iterator().remove`).
     // The slot lives beyond the logical size, so sorted iteration / binary
@@ -40109,6 +42431,28 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     } else {
         key_pin
     };
+    // W7-36 named this native as a suspected `getOrDefault`-over-a-null-VALUE
+    // defect. It is not one — see the record's correction: both storage paths
+    // read the mapping itself (`bt.get(&tk).copied()` / the array slot), so a
+    // key present with a null value already answers `null` rather than the
+    // default, which is what `Map.getOrDefault` specifies. What IS missing is
+    // the refusal: `TreeMap.getOrDefault` is `getEntry(key)`, the same
+    // null-check + `Comparable` checkcast `native_tm_get` runs, and without it
+    // `new TreeMap<>().getOrDefault(null, d)` answered `d` where HotSpot throws.
+    //
+    // Computed into a local BEFORE the `if let`: an `if let` scrutinee's
+    // temporaries — including the `&*ctx` reborrow the call takes — live to the
+    // end of the `if let` in this edition, and the arm needs `ctx` mutably to
+    // release the pins.
+    let key_check = {
+        let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+        let empty_now = tm_is_empty_now(ctx, this);
+        tree_natural_order_key_check(ctx, &comparator, key, empty_now)
+    };
+    if let Err(e) = key_check {
+        ctx.unpin_native_roots(first_pin);
+        return Err(e);
+    }
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied());
@@ -40273,7 +42617,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // implements via `putAll`) silently copied nothing — the second half of the
     // Elasticsearch `Settings.Builder.put(Settings)` failure (its builder map is
     // a TreeMap, so `output.map.putAll(settingsMap)` lands here).
-    let pairs = collect_entries_any(ctx, source);
+    let pairs = collect_entries_any(ctx, source)?;
     // Family-1 stale-ObjectRef fix: each `native_tm_put` call below can run a
     // user Comparator/lambda and trigger a moving GC. `this` was a bare local
     // reused across every iteration, and `pairs` (keys/values collected
@@ -40328,10 +42672,10 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             buf.push_str(", ");
         }
         let (k, _) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &k));
+        buf.push_str(&obj_to_display_string(ctx, &k)?);
         buf.push('=');
         let (_, v) = pinned_pairs.get(&*ctx, i);
-        buf.push_str(&obj_to_display_string(ctx, &v));
+        buf.push_str(&obj_to_display_string(ctx, &v)?);
     }
     ctx.unpin_native_roots(pinned_pairs.base());
     buf.push('}');
@@ -40382,6 +42726,62 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 // subMap: entries with keys >= fromKey and < toKey
+/// `NavigableSubMap`'s constructor, first three lines:
+///
+/// ```text
+/// if (!fromStart && !toEnd) {
+///     if (m.compare(lo, hi) > 0)
+///         throw new IllegalArgumentException("fromKey > toKey");
+/// }
+/// ```
+///
+/// `TreeMap.subMapReversedBounds` measured `tm.subMap("d", "a")` returning an
+/// empty view here against HotSpot's `IllegalArgumentException`. An empty view
+/// is the failure mode that reads as a pass everywhere a caller only iterates —
+/// W7-1-treemap-views-and-iterator-remove-contract is a whole record about that
+/// shape — and a caller that transposed two bounds gets no signal at all.
+///
+/// Only the two-bound entry points reach this. `headMap`/`tailMap` take the
+/// `else` arm of that `if`, which is a type check on the single bound and not
+/// an ordering check, so they are deliberately not routed here.
+///
+/// The ordering asked is the RECEIVER's, not the source map's: for
+/// `descendingMap().subMap(a, b)` the receiver is the descending view, whose
+/// comparator slot holds the `Collections.reverseOrder` wrapper, and the JDK's
+/// `m.compare` on a `DescendingSubMap` is that same reversed ordering. Reading
+/// the slot rather than the backing map's is what makes composition agree.
+///
+/// GC-SAFETY: `tree_compare` dispatches a user `Comparator` (or a
+/// `Comparable.compareTo` override), a full interpreted call that can move
+/// `this` and both bound keys — all three are used afterwards, and the two keys
+/// end up STORED in the view's side-table entry, where a from-space address
+/// would outlive the collection that produced it. Pin, compare, re-read.
+fn tm_refuse_reversed_bounds(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    from_key: Value,
+    to_key: Value,
+) -> Result<(ObjectRef, Value, Value), MethodCallFailed> {
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let this_pin = ctx.pin_native_root(this);
+    let from_pin = pin_value(ctx, from_key);
+    let to_pin = pin_value(ctx, to_key);
+    let verdict = tree_compare(ctx, &comparator, from_key, to_key);
+    let this = ctx.read_native_pin(this_pin, this);
+    let from_key = read_pinned_elem(ctx, from_pin, from_key);
+    let to_key = read_pinned_elem(ctx, to_pin, to_key);
+    ctx.unpin_native_roots(this_pin);
+    if verdict? > 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "fromKey > toKey".to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok((this, from_key, to_key))
+}
+
 fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -40389,6 +42789,7 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -40438,6 +42839,10 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_key = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
+    // The JDK's check is on the bounds alone and ignores the inclusive flags —
+    // `subMap(k, false, k, false)` is a legal empty range, `subMap(hi, .., lo, ..)`
+    // is not. See `tm_refuse_reversed_bounds`.
+    let (this, from_key, to_key) = tm_refuse_reversed_bounds(ctx, this, from_key, to_key)?;
     tm_new_range_view(
         ctx,
         this,
@@ -40717,6 +43122,12 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // Before the search, because on an EMPTY set the search performs no
+    // comparison and so raises nothing — the `TreeSet.incomparableFirstAdd`
+    // half. On a non-empty set this fires first and `compare_via_compare_to`
+    // (which would raise the same CCE) is never reached, so the two agree by
+    // construction rather than by coincidence.
+    tree_natural_order_key_check(ctx, &comparator, elem, size == 0)?;
     let data = match data_opt {
         Some(d) => d,
         None => {
@@ -40736,12 +43147,35 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     match search {
         Ok(_) => Ok(Some(Value::Int(0))), // already present
         Err(pos) => {
+            // `this` is pinned as well as `elem` now: `ts_ensure_capacity`
+            // allocates, and both are used after it — `this` by the size store
+            // and, below, by the write-through.
+            let this_pin = ctx.pin_native_root(this);
             let elem_pin = pin_value(ctx, elem);
             let data = ts_ensure_capacity(ctx, this, size, data);
+            let this = ctx.read_native_pin(this_pin, this);
             let elem = read_pinned_elem(ctx, elem_pin, elem);
-            ctx.unpin_native_roots(elem_pin);
             ts_insert_at(ctx, data, size, pos, elem);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size + 1));
+            // Live `descendingSet()` view: an add through the view is an add to
+            // the backing set. `TreeSet.descendingWriteThrough` measured
+            // `ts.descendingSet().add(9)` leaving `ts` at `[1, 2, 3]` where
+            // HotSpot has `[1, 2, 9]` — the view's own contents were already
+            // right, so this is the one direction that was missing.
+            //
+            // A MAP source is a `TreeMap.keySet()` view, and `keySet().add` is
+            // `UnsupportedOperationException` in the JDK, not a write-through.
+            // That refusal is a separate, unmeasured row and is deliberately not
+            // added here; what matters for this one is that a map source must
+            // NOT be handed an add, which is what the predicate says.
+            let propagated = match ts_view_source(ctx, this) {
+                Some(source) if !is_tree_map_receiver(ctx, source) => ctx
+                    .invoke_virtual(source, "add", "(Ljava/lang/Object;)Z", &[elem])
+                    .map(|_| ()),
+                _ => Ok(()),
+            };
+            ctx.unpin_native_roots(this_pin);
+            propagated?;
             Ok(Some(Value::Int(1)))
         }
     }
@@ -40767,8 +43201,10 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
             // Live TreeMap keySet view: delete the key from the source TreeMap.
+            // Live view: propagate the removal to whatever the marker names —
+            // a `TreeMap` for a keySet view, a `TreeSet` for a descendingSet.
             if let Some(source) = ts_view_source(ctx, this) {
-                source_map_remove(ctx, source, elem)?;
+                ts_source_remove(ctx, source, elem)?;
             }
             Ok(Some(Value::Int(1)))
         }
@@ -40783,6 +43219,12 @@ fn native_ts_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // W7-36 residual: `TreeSet.contains` is `m.containsKey(o)`, i.e. the same
+    // `getEntry` null-check + `Comparable` checkcast `native_ts_add` already
+    // runs. It has to be ahead of the `data_opt` early return as well as the
+    // search: an empty set has no backing array here, and answering `false` for
+    // `contains(null)` is precisely the "returns where the JDK refuses" row.
+    tree_natural_order_key_check(ctx, &comparator, elem, size == 0)?;
     let data = match data_opt {
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
@@ -41296,7 +43738,7 @@ fn ts_remove_element(
     // Live TreeMap keySet view: the element is a key, so delete it from the
     // source TreeMap as well.
     if let Some(source) = ts_view_source(ctx, owner) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(None)
 }
@@ -41371,7 +43813,7 @@ fn native_ts_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 buf.push_str(", ");
             }
             let v = ctx.get_array_element(data, i);
-            buf.push_str(&obj_to_display_string(ctx, &v));
+            buf.push_str(&obj_to_display_string(ctx, &v)?);
         }
     }
     buf.push(']');
@@ -41394,7 +43836,7 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41443,7 +43885,7 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41482,6 +43924,47 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// The `TreeSet` twin of [`tm_refuse_reversed_bounds`].
+///
+/// W7-36 left this one explicitly: *"`TreeSet.subSet(hi, lo)`. The `TreeMap`
+/// twin of it is fixed; the `TreeSet` one is not measured and was not widened
+/// into."* `TreeSet.subSet` is `new TreeSet<>(m.subMap(...))`, so it reaches the
+/// **same** `NavigableSubMap` constructor and the same
+/// `throw new IllegalArgumentException("fromKey > toKey")` — the message is that
+/// constructor's verbatim, in both places, for the reason
+/// `tree_natural_order_key_check` gives for sharing the CCE text: two sites
+/// modelling one refusal must not drift into two different reports.
+///
+/// Returns the possibly-moved receiver and bounds, exactly as the `TreeMap`
+/// twin does: `tree_compare` dispatches a user `Comparator` (or a
+/// `Comparable.compareTo` override), a full interpreted call that can move all
+/// three, and all three are used afterwards.
+fn ts_refuse_reversed_bounds(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    from_elem: Value,
+    to_elem: Value,
+) -> Result<(ObjectRef, Value, Value), MethodCallFailed> {
+    let comparator = ts_get_slot(ctx, this, TS_FIELD_COMPARATOR);
+    let this_pin = ctx.pin_native_root(this);
+    let from_pin = pin_value(ctx, from_elem);
+    let to_pin = pin_value(ctx, to_elem);
+    let verdict = tree_compare(ctx, &comparator, from_elem, to_elem);
+    let this = ctx.read_native_pin(this_pin, this);
+    let from_elem = read_pinned_elem(ctx, from_pin, from_elem);
+    let to_elem = read_pinned_elem(ctx, to_pin, to_elem);
+    ctx.unpin_native_roots(this_pin);
+    if verdict? > 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "fromKey > toKey".to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok((this, from_elem, to_elem))
+}
+
 fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -41489,8 +43972,9 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_elem = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41564,7 +44048,7 @@ fn native_ts_tail_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let from_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41612,7 +44096,7 @@ fn native_ts_head_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let to_elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let inclusive = arg_bool(args, 2);
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41663,8 +44147,12 @@ fn native_ts_sub_set_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let from_inclusive = arg_bool(args, 2);
     let to_elem = args.get(3).copied().unwrap_or(Value::Object(None));
     let to_inclusive = arg_bool(args, 4);
+    // The JDK's check is on the bounds alone and ignores the inclusive flags —
+    // `subSet(e, false, e, false)` is a legal empty range, `subSet(hi, .., lo, ..)`
+    // is not. Same split as `native_tm_sub_map_inclusive`.
+    let (this, from_elem, to_elem) = ts_refuse_reversed_bounds(ctx, this, from_elem, to_elem)?;
     let (data_opt, size, comparator) = ts_state(ctx, this);
-    let mut result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let mut result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
@@ -41826,50 +44314,111 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// TreeSet holding the same elements ordered by the reversed comparator
 /// (`Collections.reverseOrder`), so `iterator`/`first`/`last`/`contains` on the
 /// result are all consistent with descending order.
+///
+/// It is also a WRITE-THROUGH view. `TreeSet.descendingWriteThrough` measured
+///
+/// ```text
+/// HotSpot   3:[9, 2, 1]:[1, 2, 9]
+/// CratonVM  3:[9, 2, 1]:[1, 2, 3]
+/// ```
+///
+/// — `ds.pollFirst()` and `ds.add(9)` both answered correctly *on the view* and
+/// left the backing set untouched. The mechanism is the source marker in the
+/// trailing capacity slot that `ts_view_source` already defines for `TreeMap`
+/// keySet views: `pollFirst`, `pollLast`, `remove`, `clear` and the iterator's
+/// `remove` all consult it, so installing it here is most of the fix; only the
+/// add direction and the map-vs-set removal descriptor
+/// ([`ts_source_remove`]) had to be added.
+///
+/// The marker goes on AFTER the population loop, deliberately: installed first,
+/// every `native_ts_add` below would write each element straight back into the
+/// set it was copied from.
+///
+/// **This makes the view live in one direction only.** A write through `ds`
+/// reaches `ts`; a later write to `ts` is NOT visible in `ds`, which remains
+/// the snapshot it always was. The JDK's is live both ways. Closing the other
+/// direction needs a rebuild-before-read funnel like `tm_sync_native_state`,
+/// and `TreeSet` has no such funnel — every one of its ~40 natives reads
+/// `ts_state` directly. Recorded in W7-36-differential-view-families rather
+/// than half-built here.
 fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data_opt, size, comparator) = ts_state(ctx, this);
-    let rev = match comparator {
-        Value::Object(Some(c)) => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "(Ljava/util/Comparator;)Ljava/util/Comparator;",
-            &[Value::Object(Some(c))],
-        )?,
-        _ => ctx.invoke(
-            "java/util/Collections",
-            "reverseOrder",
-            "()Ljava/util/Comparator;",
-            &[],
-        )?,
-    }
-    .unwrap_or(Value::Object(None));
-    let result = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
-    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
-    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
-        // (it grows the destination array and can dispatch a Comparator), so
-        // both the source array and the result move under this loop.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut result = result;
-        for i in 0..(size as usize) {
-            let e = ctx.get_array_element(data, i);
-            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
+    // GC-SAFETY: `this` is now needed at the very END of this function (it is
+    // the source stored in the view marker), across a `Collections.reverseOrder`
+    // dispatch, two allocations and a whole population loop. It was previously
+    // dead after the first read and so was never pinned.
+    let this_pin = ctx.pin_native_root(this);
+    // Single-exit through a closure so no `?` can unwind past the pin above and
+    // strand it (and everything pinned on top of it) — the shape
+    // `native_map_put_if_absent` uses for the same reason.
+    let outcome = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let (data_opt, size, comparator) = ts_state(ctx, this);
+        let rev = match comparator {
+            Value::Object(Some(c)) => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+                &[Value::Object(Some(c))],
+            )?,
+            _ => ctx.invoke(
+                "java/util/Collections",
+                "reverseOrder",
+                "()Ljava/util/Comparator;",
+                &[],
+            )?,
         }
-        ctx.unpin_native_roots(data_pin);
-        return Ok(Some(Value::Object(Some(result))));
-    }
-    Ok(Some(Value::Object(Some(result))))
+        .unwrap_or(Value::Object(None));
+        // `rev` is a freshly allocated comparator held in a bare Rust local
+        // across the two allocations below and then STORED — the same
+        // stale-at-store shape the Family-1 notes throughout this file describe.
+        let rev_pin = pin_value(ctx, rev);
+        let result = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+        let result_pin = ctx.pin_native_root(result);
+        // One slot beyond the elements, for the source marker installed after
+        // the population loop. Sized so `ts_ensure_capacity` never has to grow
+        // during that loop — when the marker is not there yet to be carried.
+        let cap = std::cmp::max(size as usize, TS_DEFAULT_CAPACITY) + 1;
+        let buf = alloc_ref_array(ctx, cap);
+        let mut result = ctx.read_native_pin(result_pin, result);
+        let rev = read_pinned_elem(ctx, rev_pin, rev);
+        ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+        ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+        ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
+        if let Some(data) = data_opt {
+            // Family-1 stale-ObjectRef fix (2026-07-31): `native_ts_add` allocates
+            // (it grows the destination array and can dispatch a Comparator), so
+            // both the source array and the result move under this loop.
+            let data_pin = ctx.pin_native_root(data);
+            let mut data = data;
+            for i in 0..(size as usize) {
+                let e = ctx.get_array_element(data, i);
+                native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+                data = ctx.read_native_pin(data_pin, data);
+                result = ctx.read_native_pin(result_pin, result);
+            }
+            // Left pinned: the caller's `unpin_native_roots(this_pin)` releases
+            // this frame's whole pin range, and unpinning `data_pin` here would
+            // drop `result_pin` with it (it sits above).
+        }
+        // Install the live-view marker last. Nothing allocates from here to the
+        // return, so both refs read through their pins stay valid.
+        let this = ctx.read_native_pin(this_pin, this);
+        let result = ctx.read_native_pin(result_pin, result);
+        let (rdata, rsize, _) = ts_state(ctx, result);
+        if let Some(rd) = rdata {
+            let dlen = ctx.array_length(rd);
+            if (dlen as i32) > rsize {
+                ctx.set_array_element(rd, dlen - 1, Value::Object(Some(this)));
+            }
+        }
+        Ok(Some(Value::Object(Some(result))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    outcome
 }
 
 /// `TreeSet.pollFirst()` — remove and return the lowest element (null if empty).
@@ -41889,7 +44438,7 @@ fn native_ts_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     // Live TreeMap keySet view: delete the key from the source TreeMap too.
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, first)?;
+        ts_source_remove(ctx, source, first)?;
     }
     Ok(Some(first))
 }
@@ -41911,7 +44460,7 @@ fn native_ts_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ts_remove_at(ctx, data, size, idx);
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
     if let Some(source) = ts_view_source(ctx, this) {
-        source_map_remove(ctx, source, last)?;
+        ts_source_remove(ctx, source, last)?;
     }
     Ok(Some(last))
 }
@@ -42909,7 +45458,7 @@ fn native_chm_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
         // --- key/value pairs, then the two-null terminator.
         let this = ctx.read_native_pin(this_pin, this);
-        let entries = collect_entries_any(ctx, this);
+        let entries = collect_entries_any(ctx, this)?;
         let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
         let (_, flat_pins) = pin_value_slice(ctx, &flat);
         for i in 0..flat.len() {
@@ -43163,6 +45712,25 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
         "forEach",
         "(JLjava/util/function/BiConsumer;)V",
         native_chm_for_each_parallel,
+    );
+    // The two bulk operations the round-2 differential measured. Every method
+    // in this family walks `table` through a `Traverser`, and a natively-backed
+    // CHM keeps its entries in a SEGMENTED layout that never populates `table`
+    // — so unregistered, they run real bytecode over an empty tree and answer
+    // `null`. See `native_chm_reduce_values` for why that answer is the worst
+    // possible one. The rest of the family is still unregistered; the list is in
+    // W7-36-differential-view-families.
+    r.register(
+        c,
+        "reduceValues",
+        "(JLjava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_reduce_values,
+    );
+    r.register(
+        c,
+        "searchKeys",
+        "(JLjava/util/function/Function;)Ljava/lang/Object;",
+        native_chm_search_keys,
     );
     r.register(c, "mappingCount", "()J", native_chm_mapping_count);
     r.register(
@@ -43502,7 +46070,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // collected entries are reused across GC-triggering hashing/puts and
     // GC-pausable segment-lock waits; `this` is pinned BEFORE the
     // GC-triggering collection.
-    let src_entries = collect_entries_any(ctx, source);
+    let src_entries = collect_entries_any(ctx, source)?;
     let _resize_flag = ChmResizeLockGuard::enter();
     let flat: Vec<Value> = src_entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, flat_pins) = pin_value_slice(ctx, &flat);
@@ -44529,7 +47097,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // flattened slice (plus `this`, pinned BEFORE the GC-triggering
     // collection) and re-read each element right before use.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, flat_pins) = pin_value_slice(ctx, &flat);
     let result = (|| -> MethodCallResult {
@@ -44789,8 +47357,8 @@ fn native_chm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = chm_collect_all_entries(ctx, this);
     let mut parts = Vec::with_capacity(entries.len());
     for (key, value) in &entries {
-        let k = crate::obj_to_display_string(ctx, key);
-        let v = crate::obj_to_display_string(ctx, value);
+        let k = crate::obj_to_display_string(ctx, key)?;
+        let v = crate::obj_to_display_string(ctx, value)?;
         parts.push(format!("{}={}", k, v));
     }
     let s = format!("{{{}}}", parts.join(", "));
@@ -45108,6 +47676,136 @@ fn native_chm_for_each_parallel(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     ctx.unpin_native_roots(action_pin);
     Ok(None)
+}
+
+/// `ConcurrentHashMap.reduceValues(long parallelismThreshold, BiFunction reducer)`
+/// — "the result of accumulating all values using the given reducer to combine
+/// values, or null if none".
+///
+/// Measured `CHM.reduceValues=null` against HotSpot's `6`, on a map whose
+/// ordinary `entrySet` iteration answered correctly in the SAME run
+/// (`CHM.sortedContent={a=6}` matches, and that is `new TreeMap<>(chm)` walking
+/// `entrySet`). The split is the `Traverser`: every method in the bulk-operation
+/// family walks the real `table` field, and a natively-backed CHM keeps its
+/// entries in the segmented side layout that never populates `table` — so the
+/// real bytecode traverses an empty tree and reports "no values".
+///
+/// That is the worst answer available. `null` from `reduceValues` is exactly
+/// what an empty map returns, so a caller cannot tell a lost traversal from a
+/// legitimately empty reduction — the quiet shape the round-2 widening was
+/// written to catch. `forEach(long, BiConsumer)` above was registered for the
+/// same reason.
+///
+/// The fold matches `ReduceValuesTask`: seed with the first value, then
+/// `reducer.apply(acc, next)`. The `parallelismThreshold` argument is read and
+/// ignored, as it may be: it is a *hint*, and a sequential evaluation is a legal
+/// answer for any value of it.
+fn native_chm_reduce_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // `if (reducer == null) throw new NullPointerException();` — the first
+    // statement of the real method.
+    let reducer = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let values = chm_collect_all_values(ctx, this);
+    // GC-SAFETY: `apply` is arbitrary interpreted bytecode. It can move the
+    // reducer, every value still held only in this Rust Vec, and the accumulator
+    // — which is the one that matters most, because it is fed back in as an
+    // argument on the very next iteration.
+    let reducer_pin = ctx.pin_native_root(reducer);
+    let (_, value_pins) = pin_value_slice(ctx, &values);
+    let mut acc: Option<Value> = None;
+    let mut acc_pin = usize::MAX;
+    let mut result: Result<Option<Value>, MethodCallFailed> = Ok(None);
+    for i in 0..values.len() {
+        let next = read_pinned_elem(ctx, value_pins[i], values[i]);
+        let Some(prev) = acc else {
+            acc = Some(next);
+            acc_pin = pin_value(ctx, next);
+            continue;
+        };
+        let reducer = ctx.read_native_pin(reducer_pin, reducer);
+        let prev = read_pinned_elem(ctx, acc_pin, prev);
+        match ctx.invoke_virtual(
+            reducer,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[prev, next],
+        ) {
+            Ok(r) => {
+                let combined = r.unwrap_or(Value::Object(None));
+                acc = Some(combined);
+                acc_pin = pin_value(ctx, combined);
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if let Ok(ref mut out) = result {
+        *out = Some(match acc {
+            Some(v) => read_pinned_elem(ctx, acc_pin, v),
+            None => Value::Object(None),
+        });
+    }
+    ctx.unpin_native_roots(reducer_pin);
+    result
+}
+
+/// `ConcurrentHashMap.searchKeys(long parallelismThreshold, Function searchFunction)`
+/// — "a non-null result from applying the given search function on each key, or
+/// null if none".
+///
+/// Same cause and same silence as [`native_chm_reduce_values`]: measured
+/// `CHM.searchKeys=null` against HotSpot's `found`, where `null` is also the
+/// legitimate "nothing matched" answer. Short-circuits on the first non-null
+/// result, as `SearchKeysTask` does.
+fn native_chm_search_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let search_fn = match args.get(2) {
+        Some(Value::Object(Some(f))) => *f,
+        Some(Value::Object(None)) => {
+            return Err(RuntimeError::NullPointerException { message: None }.into())
+        }
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = chm_collect_all_keys(ctx, this);
+    let fn_pin = ctx.pin_native_root(search_fn);
+    let (_, key_pins) = pin_value_slice(ctx, &keys);
+    let mut result: MethodCallResult = Ok(Some(Value::Object(None)));
+    for i in 0..keys.len() {
+        let search_fn = ctx.read_native_pin(fn_pin, search_fn);
+        let key = read_pinned_elem(ctx, key_pins[i], keys[i]);
+        match ctx.invoke_virtual(
+            search_fn,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => {
+                result = Ok(Some(v));
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(fn_pin);
+    result
 }
 
 fn native_chm_mapping_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45548,34 +48246,53 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    // THE LAST MINT SITE ON THE INFALLIBLE FUNNEL — migrated 2026-08-10, and
-    // the trade it makes is not the one the two previous notes describe.
+    // Fallible since 2026-08-10; the refusal ARM below was added 2026-08-11,
+    // and the reason the arm was missing is worth keeping because it was a
+    // correct argument that its own file had already outgrown.
     //
-    // Every other snapshot iterator LANDS on a real `Arrays$ArrayItr` when
-    // `--jdk-only` refuses the fabricated shape, and that trade was argued as
-    // free: "on the strict path the alternative was never a working `remove()`
-    // — it was an iteration that did not reach `next()`". That argument does
-    // NOT hold here, and `RChmKeySetView` is what measured it: HotSpot's
-    // `ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
-    // `remove()` writes through to the map, the test exercises exactly that,
-    // and a fixed-size list's iterator answers
-    // `UnsupportedOperationException: remove`. So this site still must NOT be
-    // landed on the array iterator, and it is not.
+    // The 2026-08-10 note said this site must refuse rather than land on a real
+    // `Arrays$ArrayItr`, because HotSpot's `KeySetView.iterator()` returns a
+    // `KeyIterator` whose `remove()` writes through to the map, `RChmKeySetView`
+    // exercises exactly that, and a fixed-size list's iterator answers
+    // `UnsupportedOperationException: remove`. Every clause of that was true
+    // when it was written and the last one no longer is: `real_snapshot_iterator`
+    // takes a `backing` argument, [`snapshot_itr_backing_table`] carries the
+    // pointer the real two-field class has no slot for, and
+    // `native_snapshot_itr_remove`'s `SetLike` arm ALREADY discriminates a key-set
+    // view (`if is_key_set_view(ctx, backing) { native_ksv_remove(..) }`) — the
+    // write-through this site was held back for was built for this receiver and
+    // then not wired to it. Measured on the pre-fix binary: `--jdk-only`
+    // `RChmKeySetView` died at `surface():140` with
+    // `NoClassDefFoundError: java/util/HashMap$KeyItr` on the plain `for (String
+    // x : s)`, i.e. the refusal cost the whole iteration, not just `remove()`.
     //
-    // REFUSING is a different thing from landing, and it is what step 3 needs.
-    // In the default `Compatible` mode `try_alloc_synthetic` is byte-for-byte
-    // what the infallible spelling did, so `RChmKeySetView` and every ordinary
-    // run are unchanged. Under `--jdk-only` the fabrication of
-    // `java/util/HashMap$KeyItr` — a name NO JDK image declares — now raises a
-    // `NoClassDefFoundError` naming that class instead of silently running a
-    // synthetic collection iterator in place of `java.base`'s bytecode, which
-    // is what contract §11 asks for and what `counts.compatibility_classes`
-    // was reporting as its last non-zero row.
+    // What is NOT available here, and why the refusal cannot simply be dropped:
+    // real `KeySetView.iterator()` bytecode reads `ConcurrentHashMap.table`, and
+    // on a CratonVM-native CHM that field is null — measured reflectively under
+    // `--add-opens java.base/java.util.concurrent=ALL-UNNAMED`: `table = null`,
+    // `baseCount = 0` for a map with one entry, against `Node[16]`/`1` on
+    // HotSpot. Letting the real iterator run would iterate EMPTY, which is the
+    // failure mode that reads as a pass. The snapshot keeps the natives the one
+    // owner of the state; only the class name becomes honest.
     //
-    // The capability is recovered, not traded away, when CratonVM's
-    // `ConcurrentHashMap` carries a real `table[]` its own `KeyIterator` can
-    // walk — the collections reclassification wave, not this one.
-    let itr = try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)?;
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there, so this
+    // arm never runs and the fabricated `HashMap$KeyItr` is still what
+    // `--real-jdk` hands back.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                total,
+                Some((this, SnapshotItrRoute::SetLike)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
@@ -45673,7 +48390,7 @@ fn native_ksv_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut parts = Vec::with_capacity(elems.len());
     for i in 0..elems.len() {
         let e = read_pinned_elem(ctx, handles[i], elems[i]);
-        parts.push(obj_to_display_string(ctx, &e));
+        parts.push(obj_to_display_string(ctx, &e)?);
     }
     if elems_pin != usize::MAX {
         ctx.unpin_native_roots(elems_pin);
@@ -45694,7 +48411,15 @@ fn native_ksv_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     for i in 0..elems.len() {
         let e = read_pinned_elem(ctx, handles[i], elems[i]);
         // `Set.hashCode` contract: the sum of the elements' hash codes.
-        h = h.wrapping_add(element_hash_code(ctx, &e));
+        match element_hash_code(ctx, &e) {
+            Ok(eh) => h = h.wrapping_add(eh),
+            Err(err) => {
+                if elems_pin != usize::MAX {
+                    ctx.unpin_native_roots(elems_pin);
+                }
+                return Err(err);
+            }
+        }
     }
     if elems_pin != usize::MAX {
         ctx.unpin_native_roots(elems_pin);
@@ -45937,7 +48662,7 @@ fn native_ksv_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let mut should_keep = false;
         for j in 0..keep.len() {
             let k = read_pinned_elem(ctx, keep_handles[j], keep[j]);
-            let matched = list_element_matches(ctx, &k, &e);
+            let matched = list_element_matches(ctx, &k, &e)?;
             e = read_pinned_elem(ctx, cur_handles[i], e);
             if matched {
                 should_keep = true;
@@ -49429,7 +52154,7 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         data = ctx.read_native_pin(data_pin, data);
         target = read_pinned_elem(ctx, th, target);
         if matched {
@@ -50488,7 +53213,7 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let mut found = false;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         arr = ctx.read_native_pin(arr_pin, arr);
         target = read_pinned_elem(ctx, th, target);
@@ -50536,7 +53261,7 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let mut found_i = None;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        let matched = list_element_matches(ctx, &elem, &target);
+        let matched = list_element_matches(ctx, &elem, &target)?;
         this = ctx.read_native_pin(this_pin, this);
         arr = ctx.read_native_pin(arr_pin, arr);
         target = read_pinned_elem(ctx, th, target);
@@ -50978,6 +53703,12 @@ fn native_snapshot_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             }
         }
         SnapshotItrRoute::TreeSet => ts_remove_element(ctx, state.backing, last),
+        SnapshotItrRoute::LinkedList => {
+            native_ll_remove_object(ctx, &[Value::Object(Some(state.backing)), last])
+        }
+        SnapshotItrRoute::ArrayDeque => {
+            native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(state.backing)), last])
+        }
     };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
@@ -52389,7 +55120,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     // Return a TreeSet (ordered by the same comparator) containing all keys.
-    let ts = try_alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
+    let ts = try_alloc_declared_width(ctx, "java/util/TreeSet", TS_NUM_FIELDS)?;
     let buf = alloc_ref_array(ctx, std::cmp::max(size as usize, TS_DEFAULT_CAPACITY));
     if let Some(keys) = keys_opt {
         for i in 0..(size as usize) {
@@ -53360,11 +56091,32 @@ fn native_executors_new_scheduled_pool(
 
 // CompletableFuture field layout (shared with native-builtins):
 // field 0 = result value, field 1 = done flag (0=pending, 1=normal, 2=exceptional, 3=cancelled)
-// field 2 = source CF (for deferred stages), field 3 = handler (for deferred stages)
+//
+// Slot 0 aliases the real `volatile Object result` and that aliasing is
+// deliberate and load-bearing — `native_cf_complete` stores the JDK's own
+// `AltResult`/`NIL` encoding there so the un-intercepted `isDone()`/`get()`
+// bytecode agrees with us.
+//
+// Slot 1 aliases the real `volatile Completion stack`, which is a REFERENCE,
+// and the `done` marker written into it is an `Int`. That is the slot-index
+// species of natives-over-real-jdk-classes.md §5, and it is NOT repaired here:
+// the same Int-vs-reference test is this file's discriminator between a
+// synthetic CF and a real one (`cf_is_real_jdk`), it is the only discriminator
+// that stays correct for a real SUBCLASS such as `KafkaCompletableFuture`
+// (whose slot 1 is still `stack`), and moving it needs a build. See
+// W7-66-live-over-allocations.md §"left, with the reason".
+//
+// What IS repaired: the WIDTH. Real `java.util.concurrent.CompletableFuture`
+// declares exactly two instance fields (`javap -p`, JDK 25.0.3.9: `result`,
+// `stack`); the two slots below this comment were allocated on every synthetic
+// CF and then never read or written anywhere in the workspace. They are gone,
+// so the request now equals the declared width.
 const CF_FIELD_RESULT: usize = 0;
 const CF_FIELD_DONE: usize = 1;
-const CF_FIELD_SOURCE: usize = 2;
-const CF_FIELD_HANDLER: usize = 3;
+/// Number of slots a CratonVM *synthetic* `CompletableFuture` carries — the
+/// real declared width, because `CF_FIELD_RESULT`/`CF_FIELD_DONE` are the only
+/// two slots any native in this crate touches.
+const CF_NUM_FIELDS: usize = 2;
 
 fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -53795,14 +56547,67 @@ fn cowal_read_snapshot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(Obje
     }
 }
 
+/// Bump the receiver's `modCount` — but only when the receiver actually has
+/// one, and only into a slot no other COW native owns.
+///
+/// `resolve_field_index(class, field)` answers for the *named* class's
+/// hierarchy, not the receiver's. Asked for `java/util/AbstractList`'s
+/// `modCount` it returns AbstractList's slot regardless of what `this` is, and
+/// a real `java.util.concurrent.CopyOnWriteArrayList` does not extend
+/// `AbstractList` at all — JDK 25 declares it
+/// `implements List, RandomAccess, Cloneable, Serializable`, with exactly two
+/// instance fields, `lock` then `array`. AbstractList's `modCount` is its own
+/// first instance field, so the index collided with `lock` and every bump
+/// stored an `Int` over the monitor object the class synchronises on.
+///
+/// The corruption is silent until the next piece of *real* COW bytecode runs.
+/// Measured 2026-08-12, HotSpot 25.0.3.9 vs CratonVM `--real-jdk`, one binary:
+/// a list survived `add`, `set`, `remove`, `add(int,E)` and `clear` (none of
+/// which bump) and died on the two that do —
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot enter synchronized block because "this.lock" is null
+///     at java.util.concurrent.CopyOnWriteArrayList.addAllAbsent(CopyOnWriteArrayList.java:795)
+/// ```
+///
+/// after `addIfAbsent` with an absent element, or after `addAll`. That killed
+/// the whole `concurrentAndAtomic` probe section: 24 ABQ/Atomic/LongAdder
+/// observables after it were absent rather than measured. See
+/// W7-33-differential-dead-sections.
+///
+/// `al_mod_count_slot` documents this exact hazard for the ArrayList natives
+/// and guards against it; this helper, written separately, never did. Ask the
+/// RECEIVER'S class, and refuse the two slots the COW natives own so a
+/// synthetic layout that happens to collide cannot corrupt them either.
+///
+/// On the real JDK layout the answer is `None` and nothing is written, which is
+/// also the right semantics rather than merely the safe one: a real
+/// `CopyOnWriteArrayList` has no `modCount`, its iterator is a snapshot, and it
+/// never raises `ConcurrentModificationException`. The bump only ever meant
+/// anything for the legacy synthetic stub that mirrored `ArrayList` — and that
+/// stub reaches none of the three call sites, all of which sit on the named-
+/// field (`array`) branch.
 fn cowal_bump_mod_count(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    if let Some(ms) = ctx.resolve_field_index("java/util/AbstractList", "modCount") {
-        let cur = match ctx.get_field(this, ms) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
+    let cid = ctx.class_id_of_object(this);
+    let Some(ms) = ctx.resolve_field_index_by_class_id(cid, "modCount") else {
+        return;
+    };
+    if ms >= ctx.object_num_fields(this) {
+        return;
     }
+    if ctx.resolve_field_index(COWAL_CLASS, "lock") == Some(ms)
+        || ctx.resolve_field_index(COWAL_CLASS, "array") == Some(ms)
+    {
+        return;
+    }
+    let cur = match ctx.get_field(this, ms) {
+        Value::Int(v) => v,
+        // Anything but an `Int` in the slot means it is not the field this
+        // helper thinks it is — the very confusion above. Leave whatever is
+        // there alone instead of overwriting it with a counter.
+        _ => return,
+    };
+    ctx.set_field(this, ms, Value::Int(cur.wrapping_add(1)));
 }
 
 fn cowal_enter_monitor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
@@ -53854,7 +56659,7 @@ fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this_pin = ctx.pin_native_root(this);
     let lock_val = lock_obj.map_or(Value::Object(None), |o| Value::Object(Some(o)));
     let lock_h = pin_value(ctx, lock_val);
-    let (found, arr, elem) = pinned_array_search(ctx, arr, len, elem);
+    let (found, arr, elem) = pinned_array_search(ctx, arr, len, elem)?;
     let mut this = ctx.read_native_pin(this_pin, this);
     let mut lock_obj = match read_pinned_elem(ctx, lock_h, lock_val) {
         Value::Object(o) => o,
@@ -53903,7 +56708,7 @@ fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `CopyOnWriteArrayList.contains` uses `o.equals(elem)`.
     if let Some((arr, len)) = cowal_read_snapshot(ctx, this) {
         // Family-1 fix (cce0079): pinned scan.
-        let (found, _, _) = pinned_array_search(ctx, arr, len, needle);
+        let (found, _, _) = pinned_array_search(ctx, arr, len, needle)?;
         if found.is_some() {
             return Ok(Some(Value::Int(1)));
         }
@@ -54650,22 +57455,20 @@ fn cf_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> CfState {
     }
 }
 
+/// Allocate a CratonVM *synthetic* `CompletableFuture`.
+///
+/// Every live caller passes [`CfState::Pending`]; the completed states go
+/// through [`cf_make_completed`], which builds a genuine JDK object. The width
+/// is [`CF_NUM_FIELDS`] — the real declared width — not the four slots this
+/// used to ask for: `CF_FIELD_SOURCE`/`CF_FIELD_HANDLER` were declared and then
+/// never read or written anywhere in the workspace, so slots 2 and 3 sat past
+/// everything `java.util.concurrent.CompletableFuture` declares with no reader.
+/// W7-66-live-over-allocations.md.
+/// One implementation, not two: this and [`cf_make_completed`]'s last-resort
+/// arm both go through [`cf_make_synthetic_slots`], so the width and the slot
+/// map cannot drift apart between them.
 fn cf_make_synthetic(ctx: &mut dyn NativeContext, state: CfState) -> Result<Value, MethodCallFailed> {
-    let cf = try_alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
-    match state {
-        CfState::Normal(v) => {
-            ctx.set_field(cf, CF_FIELD_RESULT, v);
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-        }
-        CfState::Exceptional(e) => {
-            ctx.set_field(cf, CF_FIELD_RESULT, e);
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
-        }
-        CfState::Pending => {
-            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
-        }
-    }
-    Ok(Value::Object(Some(cf)))
+    cf_make_synthetic_slots(ctx, state)
 }
 
 fn cf_null_callback(method: &str) -> MethodCallResult {
@@ -54736,24 +57539,58 @@ fn cf_make_completed(ctx: &mut dyn NativeContext, state: CfState) -> Result<Valu
             }
             Ok(Value::Object(Some(cf)))
         }
-        _ => {
-            let cf = try_alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
-            match state {
-                CfState::Normal(v) => {
-                    ctx.set_field(cf, CF_FIELD_RESULT, v);
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-                }
-                CfState::Exceptional(e) => {
-                    ctx.set_field(cf, CF_FIELD_RESULT, e);
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
-                }
-                CfState::Pending => {
-                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
+        // The real object could not be constructed. Try the JDK's own static
+        // factory before falling back to a slot-written stand-in — this is the
+        // remedy W7-49 §6.2 landed as `aio_completed_future` in
+        // `native-builtins::http_client`, and it is a different door from
+        // `new_object_initialized` above (a static method, no `<init>`
+        // interception), so it can succeed where that failed. It writes no
+        // index at all: the layout is whatever the loaded class actually is.
+        _ => match state {
+            CfState::Normal(v) => {
+                match ctx.invoke(
+                    "java/util/concurrent/CompletableFuture",
+                    "completedFuture",
+                    "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                    &[v],
+                ) {
+                    Ok(Some(real @ Value::Object(Some(_)))) => Ok(real),
+                    // The factory is unavailable too (synthetic-JDK mode has no
+                    // such method), or answered null. Re-use the same value in
+                    // the stand-in rather than losing it.
+                    _ => cf_make_synthetic_slots(ctx, CfState::Normal(v)),
                 }
             }
-            Ok(Value::Object(Some(cf)))
+            other => cf_make_synthetic_slots(ctx, other),
+        },
+    }
+}
+
+/// The slot-written `CompletableFuture` stand-in, at the real declared width.
+/// Last resort only — both [`cf_make_completed`] doors are tried first.
+fn cf_make_synthetic_slots(
+    ctx: &mut dyn NativeContext,
+    state: CfState,
+) -> Result<Value, MethodCallFailed> {
+    let cf = try_alloc_synthetic(
+        ctx,
+        "java/util/concurrent/CompletableFuture",
+        CF_NUM_FIELDS,
+    )?;
+    match state {
+        CfState::Normal(v) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, v);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+        }
+        CfState::Exceptional(e) => {
+            ctx.set_field(cf, CF_FIELD_RESULT, e);
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
+        }
+        CfState::Pending => {
+            ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
         }
     }
+    Ok(Value::Object(Some(cf)))
 }
 
 fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -54787,6 +57624,12 @@ fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // always carries an Int `done` flag there, whereas the real `stack` field is
     // always a reference. This is the same Int-vs-reference test the already-done
     // check above (`synth_done`) relies on.
+    //
+    // The COUNT is still not a discriminator, and the reason changed: a
+    // synthetic CF is now allocated at the real declared width (two slots), so
+    // it is exactly as wide as a real one. A real SUBCLASS is wider than both.
+    // Int-vs-reference at slot 1 is the only test that stays correct across all
+    // three. W7-66-live-over-allocations.md.
     let synthetic = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(_));
     ctx.set_field(this, CF_FIELD_RESULT, stored);
     if synthetic {
@@ -55300,6 +58143,7 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
     ts_set_slot(ctx, this, slot, v);
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55339,6 +58183,86 @@ mod tests {
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
 
+    // --- al_slots_for memo -------------------------------------------------
+    //
+    // `al_slots_for` is on the path of EVERY `native_al_*` operation and used
+    // to re-derive a constant each call (a string-keyed `class_id_by_name`, an
+    // `is_subclass` walk, two string-keyed `resolve_field_index` lookups, all
+    // behind the class-manager lock). It is now memoized per receiver ClassId.
+    // A stale or cross-wired entry reads the WRONG field slots on every
+    // collection operation in the VM, so the memo is covered directly.
+
+    fn memo_ctx() -> (lbq_blocking_tests::MockCtx, ClassId, ClassId) {
+        let ctx = lbq_blocking_tests::MockCtx::new(1);
+        let al = ClassId::new(4001);
+        let vec = ClassId::new(4002);
+        ctx.define_class(al, "java/util/ArrayList");
+        ctx.define_class(vec, "java/util/Vector");
+        ctx.define_field(al, "elementData", 4);
+        ctx.define_field(al, "size", 6);
+        ctx.define_field(vec, "elementData", 2);
+        ctx.define_field(vec, "elementCount", 3);
+        (ctx, al, vec)
+    }
+
+    #[test]
+    fn al_slots_memo_matches_the_uncached_path_and_is_stable() {
+        let (ctx, al, _vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+
+        let uncached = super::al_slots_for_uncached(&ctx, al);
+        let first = super::al_slots_for(&ctx, list);
+        assert_eq!(first, super::al_slots_for(&ctx, list), "memo must be stable");
+        assert_eq!(first, super::al_slots_for(&ctx, list));
+        if let Some(u) = uncached {
+            assert_eq!(first, u, "memo must match the uncached resolution");
+        }
+    }
+
+    #[test]
+    fn al_slots_memo_does_not_cross_wire_two_receiver_classes() {
+        let (ctx, al, vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+        let vector = ctx.alloc_object_of(vec, 8);
+
+        let l1 = super::al_slots_for(&ctx, list);
+        let v1 = super::al_slots_for(&ctx, vector);
+        // Re-ask in the opposite order: a cache without a tag comparison would
+        // hand the second class the first one's layout here.
+        assert_eq!(super::al_slots_for(&ctx, vector), v1, "Vector layout moved");
+        assert_eq!(super::al_slots_for(&ctx, list), l1, "ArrayList layout moved");
+        assert_ne!(
+            l1, v1,
+            "ArrayList and Vector declare different slots; the memo must keep them apart"
+        );
+    }
+
+    /// An UNRESOLVABLE layout must not be cached: `resolve_field_index` can
+    /// fail before the class is loaded and succeed afterwards, so pinning the
+    /// constant fallback would freeze the wrong slots for the rest of the run.
+    #[test]
+    fn al_slots_memo_does_not_cache_the_fallback() {
+        let ctx = lbq_blocking_tests::MockCtx::new(2);
+        let foreign = ClassId::new(4003);
+        ctx.define_class(foreign, "java/nio/charset/Charset");
+        let obj = ctx.alloc_object_of(foreign, 3);
+
+        assert!(super::al_slots_for_uncached(&ctx, foreign).is_none());
+        let fallback = (super::AL_FIELD_DATA, super::AL_FIELD_SIZE, super::AL_NUM_FIELDS);
+        assert_eq!(super::al_slots_for(&ctx, obj), fallback);
+
+        // Now the layout becomes resolvable, exactly as a late class load would
+        // make it. A cached fallback would keep answering the old slots.
+        ctx.define_class(foreign, "java/util/ArrayList");
+        ctx.define_field(foreign, "elementData", 4);
+        ctx.define_field(foreign, "size", 6);
+        assert_eq!(
+            super::al_slots_for(&ctx, obj),
+            (4, 6, 7),
+            "the fallback was cached, so a later resolution could not win"
+        );
+    }
+
     /// `java.util.Random.nextGaussian()` must reproduce the JDK's documented
     /// sequence for a given seed. The expected bit patterns are the first six
     /// values of `new Random(42)` on Temurin jdk-25.0.3+9.
@@ -55369,11 +58293,16 @@ mod tests {
             got.push(b);
         }
 
-        // Compared with a relative tolerance rather than by bit pattern: the
-        // JDK's multiplier goes through `StrictMath.log` (fdlibm) while this
-        // uses the platform libm, and those may differ in the last ulp. A
-        // DIFFERENT sequence cannot come within 1e-12 of this one, so the
-        // tolerance costs the assertion nothing.
+        // Compared BY BIT PATTERN. This used to carry a 1e-12 relative
+        // tolerance, excused on the grounds that "the JDK's multiplier goes
+        // through `StrictMath.log` (fdlibm) while this uses the platform libm,
+        // and those may differ in the last ulp" — which was true, and was the
+        // defect, not a property to tolerate. The differential probe read that
+        // last ulp straight out of `Double.toString`
+        // (`1.141905315473055` vs HotSpot's `1.1419053154730547`), so a
+        // tolerance that hid it hid a user-visible divergence. `rnd_gaussian_pair`
+        // now uses the fdlibm `log` and the whole stream is exact.
+        // W7-44-numberformat-enum-and-double-tostring.md.
         let expected: [i64; 6] = [
             4607821503525903750,
             4606456510138157127,
@@ -55385,9 +58314,13 @@ mod tests {
         for (i, want_bits) in expected.iter().enumerate() {
             let want = f64::from_bits(*want_bits as u64);
             let have = got[i];
-            assert!(
-                (have - want).abs() <= 1e-12 * want.abs().max(1.0),
-                "nextGaussian[{i}] diverged from the JDK's seeded sequence:                  got {have:?}, want {want:?}"
+            assert_eq!(
+                have.to_bits(),
+                *want_bits as u64,
+                "nextGaussian[{i}] diverged from the JDK's seeded sequence: \
+                 got {have:?} ({:#018x}), want {want:?} ({:#018x})",
+                have.to_bits(),
+                *want_bits as u64
             );
         }
     }
@@ -56136,6 +59069,19 @@ mod tests {
         assert_eq!(CF_FIELD_DONE, 1);
         assert_eq!(TP_FIELD_SIZE, 0);
         assert_eq!(TP_FIELD_SHUTDOWN, 1);
+        // Tightened (W7-66): the request must not exceed what the real class
+        // declares. `javap -p java.util.concurrent.CompletableFuture` on JDK
+        // 25.0.3.9 lists exactly two instance fields — `volatile Object result`
+        // and `volatile CompletableFuture$Completion stack` — and its
+        // superclass is `java.lang.Object`. The old value was 4, so every
+        // synthetic CF carried two slots past the declared width that no site
+        // in the workspace read or wrote. Raising this again is an
+        // over-allocation and `CRATONVM_DBG_LAYOUT_ALIAS=1` will say so.
+        assert_eq!(
+            CF_NUM_FIELDS, 2,
+            "synthetic CompletableFuture must not be allocated wider than the \
+             two fields java.util.concurrent.CompletableFuture declares"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -56688,10 +59634,24 @@ mod tests {
         assert_eq!(AD_FIELD_HEAD, 1);
         assert_eq!(AD_FIELD_TAIL, 2);
         assert_eq!(AD_FIELD_SIZE, 3);
+        // Slots 0..2 are the REAL `java.util.ArrayDeque` layout
+        // (`elements`/`head`/`tail`, in that declaration order, confirmed with
+        // `javap -p java.util.ArrayDeque` on Temurin 25.0.3). Only slot 3 is
+        // ours, reached because `synthetic_stub_fields` pads the class to four.
+        // That is why real bytecode reading this receiver sees a coherent deque
+        // at all — and why `head`/`tail` have to obey the JDK's invariant.
         assert_eq!(AD_DEFAULT_CAPACITY, 16);
+        // The array is `AD_DEFAULT_CAPACITY + 1` slots, never a power of two,
+        // and that is deliberate: the JDK's own `ArrayDeque()` allocates
+        // `new Object[16 + 1]` so that `head == tail` can mean empty and only
+        // empty. The former assertion here required a power of two, which read
+        // as a claim that the index arithmetic masks — it does not. Every site
+        // in this file uses `% cap`, so a non-power-of-two length is correct as
+        // well as required. Assert the shape that is actually load-bearing.
         assert!(
-            AD_DEFAULT_CAPACITY.is_power_of_two(),
-            "AD default capacity must be power of 2"
+            !(AD_DEFAULT_CAPACITY + 1).is_power_of_two(),
+            "the allocated ring buffer is CAPACITY + 1 (the JDK's spare slot), \
+             so it is not a power of two and no site may mask instead of `%`"
         );
     }
 
@@ -57525,8 +60485,16 @@ mod tests {
                 Value::Object(None)
             }
             fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-                None
+            /// Resolve by NAME through the same modelled layout
+            /// `resolve_field_index_by_class_id` uses. This was a `None` stub
+            /// while the by-id form was fully modelled, so a class the test had
+            /// just described with `define_class` + `define_field` still
+            /// answered "no such field" here — which forces
+            /// `al_slots`/`al_slots_for` onto their constant-fallback path and
+            /// makes a layout test unable to exercise the resolved branch.
+            fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+                let class_id = self.class_id_by_name(class_name)?;
+                self.resolve_field_index_by_class_id(class_id, field_name)
             }
             fn create_string(&mut self, _t: &str) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
@@ -57727,7 +60695,7 @@ mod tests {
             assert_eq!(unbox_wrapper(&ctx, entity), None);
             let expected_identity = ctx.identity_hash_code(entity);
             assert_eq!(
-                element_hash_code(&mut ctx, &Value::Object(Some(entity))),
+                element_hash_code(&mut ctx, &Value::Object(Some(entity))).unwrap(),
                 expected_identity
             );
 
@@ -57737,7 +60705,10 @@ mod tests {
             ctx.set_field(boxed, 0, Value::Long(42));
 
             assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
-            assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(boxed))).unwrap(),
+                42
+            );
         }
 
         // ------------------------------------------------------------------
@@ -58558,6 +61529,113 @@ mod tests {
             ctx.define_field(PROPERTIES_CID, "defaults", 8);
         }
 
+        /// `java.util.Random.nextGaussian()` must return the JDK's seeded
+        /// stream AND advance the LCG once per PAIR of calls.
+        ///
+        /// # Why this exists beside `next_gaussian_matches_jdk_seeded_sequence`
+        ///
+        /// That test is vacuous for the defect it names, and the shape is worth
+        /// keeping in view because it is easy to write by accident: it drives
+        /// `rnd_gaussian_pair` and consumes BOTH variates itself, in a loop it
+        /// implements in its own body. The defect its doc comment names —
+        /// "this used to discard the second and draw a fresh pair every time" —
+        /// lives in the CALLER, `native_random_next_gaussian`, which is not on
+        /// that test's call path at all. Delete the `RND_FIELD_NEXT_GAUSSIAN`
+        /// cache from the native and that test stays green, because the helper
+        /// it exercises is still correct. It asserts the side of the fix that
+        /// was never broken.
+        ///
+        /// This one drives the native through a receiver carrying the two real
+        /// `java/util/Random` slots, so the caching is what is under test.
+        ///
+        /// Measured on Temurin jdk-25.0.3+9, not assumed: `new Random(42)`,
+        /// six `nextGaussian()` calls, then one `nextInt()`. The discarding
+        /// implementation answers -0.9498666368908959 for the second call (the
+        /// THIRD value of the conforming stream) and a different `nextInt()`,
+        /// so both assertions below separate the two.
+        #[test]
+        fn next_gaussian_native_caches_the_second_variate_and_advances_once_per_pair() {
+            let mut ctx = MockCtx::new(1);
+            // Two slots: seed(0) and nextNextGaussian(1) — the layout
+            // `native_random_next_gaussian` addresses.
+            let rnd = ctx.alloc_object_of(ClassId::new(0), 2);
+            ctx.set_field(rnd, RND_FIELD_SEED, Value::Long(rnd_scramble_seed(42)));
+            ctx.set_field(rnd, RND_FIELD_NEXT_GAUSSIAN, Value::Object(None));
+
+            fn call(ctx: &mut MockCtx, rnd: ObjectRef) -> f64 {
+                match native_random_next_gaussian(ctx, &[Value::Object(Some(rnd))]) {
+                    Ok(Some(Value::Double(d))) => d,
+                    other => panic!("nextGaussian must answer a Double, got {other:?}"),
+                }
+            }
+
+            // --- the MECHANISM: one draw feeds two calls -------------------
+            let first = call(&mut ctx, rnd);
+            assert!(
+                matches!(ctx.get_field(rnd, RND_FIELD_NEXT_GAUSSIAN), Value::Double(_)),
+                "after the first call the SECOND variate must be cached in nextNextGaussian; an \
+                 empty slot here IS the discarding implementation"
+            );
+            let seed_after_first = ctx.get_field(rnd, RND_FIELD_SEED);
+            let second = call(&mut ctx, rnd);
+            assert!(
+                matches!(
+                    ctx.get_field(rnd, RND_FIELD_NEXT_GAUSSIAN),
+                    Value::Object(None)
+                ),
+                "the second call must CONSUME the cached variate, clearing the slot"
+            );
+            assert_eq!(
+                ctx.get_field(rnd, RND_FIELD_SEED),
+                seed_after_first,
+                "a call served from the cache must not advance the LCG — advancing here is \
+                 exactly the 'twice the specified rate' defect"
+            );
+
+            // --- the STREAM: six values against the oracle -----------------
+            let mut got = vec![first, second];
+            while got.len() < 6 {
+                got.push(call(&mut ctx, rnd));
+            }
+            // Same tolerance and same measurement as the sibling test: `log` is
+            // the only source of divergence (`sqrt` is IEEE-exact), it differs
+            // by at most 1 ulp between fdlibm and the platform libm on these
+            // three pairs, and that propagates to at most 1.77e-16 relative.
+            // Four ulps is 5x that. It is not what makes this test able to fail
+            // — the integer assertion below is.
+            const ULPS: f64 = 4.0;
+            let expected: [i64; 6] = [
+                4607821503525903750,
+                4606456510138157127,
+                -4616641179245592382,
+                -4615707776640798080,
+                4598733263062401967,
+                4604341753479877564,
+            ];
+            for (i, want_bits) in expected.iter().enumerate() {
+                let want = f64::from_bits(*want_bits as u64);
+                let tol = ULPS * f64::EPSILON * want.abs();
+                assert!(
+                    (got[i] - want).abs() <= tol,
+                    "nextGaussian[{i}] diverged from `new Random(42)` on the oracle: got {:?}, \
+                     want {want:?} (tolerance {tol:.3e} = {ULPS} ulps)",
+                    got[i]
+                );
+            }
+
+            // --- the RATE, exactly, with no tolerance in it ----------------
+            // `nextInt()` is `next(32)`. A tolerance cannot blur an i32, so
+            // this is the assertion that cannot be widened into uselessness: an
+            // implementation that drew a fresh pair per call has consumed twice
+            // as much of the stream and lands somewhere else entirely.
+            assert_eq!(
+                rnd_next(&mut ctx, rnd, 32),
+                1583910553,
+                "after six nextGaussian() calls the LCG must be exactly where `new Random(42)` \
+                 leaves it on Temurin jdk-25.0.3+9"
+            );
+        }
+
         /// A real `HashMap` receiver keeps today's behaviour exactly: the
         /// bucket array at slot 0 AND at the real `table` slot, and no legacy
         /// `Int(capacity)` — writing one there is what put an `Int` in the
@@ -59025,8 +62103,17 @@ mod tests {
         for (i, v) in elements.iter().enumerate() {
             ctx.set_array_element(arr, i, *v);
         }
-        let stream = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
-        ctx.set_field(stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+        // W7-65: a FRESH stream stage per iteration. This loop used to collect
+        // twice from one stream object, which `AbstractPipeline` has always
+        // rejected (`IllegalStateException: stream has already been operated
+        // upon or closed`) and which CratonVM now rejects too. The assertion
+        // being made — that `minBy`/`maxBy` answer an `Optional` — is unchanged
+        // and is still made twice; only the illegal sharing is gone.
+        let new_stream = |ctx: &mut MockCtx| {
+            let s = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+            ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            s
+        };
 
         let natural = make_comparator(&mut ctx, CMP_TAG_NATURAL_ORDER)
             .expect("Compatible mode never refuses a comparator stand-in");
@@ -59044,6 +62131,7 @@ mod tests {
         ] {
             let collector = tag_maker(&mut ctx, Value::Object(Some(natural)))
                 .expect("Compatible mode never refuses a collector stand-in");
+            let stream = new_stream(&mut ctx);
             let result = native_stream_collect(
                 &mut ctx,
                 &[Value::Object(Some(stream)), Value::Object(Some(collector))],
@@ -59053,6 +62141,100 @@ mod tests {
                 other => panic!("collect returned {other:?}"),
             };
             assert_eq!(ctx.get_field(opt, OPT_FIELD_VALUE), expected);
+        }
+    }
+
+    /// W7-65 — `AbstractPipeline.linkedOrConsumed`, both directions.
+    ///
+    /// TWO-SIDED ON PURPOSE. The dangerous failure for this change is not the
+    /// missing throw (a residual divergence, visible in the shadow
+    /// differential); it is a flag set once too often, which turns a working
+    /// stream into an `IllegalStateException` on the most pervasive path in the
+    /// Spring Boot and Tomcat arms and shows up in neither the differential nor
+    /// the 70-vector corpus. So this test asserts BOTH halves against the same
+    /// funnel, and neither half is true independently of the code under test:
+    ///
+    ///   * delete the check -> the first half fails;
+    ///   * mark at allocation, or mark twice per operation, or mark a stream
+    ///     other than the receiver -> the second half fails.
+    ///
+    /// The third over-set shape — marking the RESULT of an intermediate op as
+    /// well as its receiver — needs a real intermediate op, whose lambdas this
+    /// mock cannot dispatch. `probes/StreamReuseThrowsProbe` section B covers
+    /// it on a real VM, against the HotSpot values in its `.expected.txt`.
+    #[test]
+    fn a_consumed_stream_refuses_a_second_operation() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        let elements = [Value::Int(3), Value::Int(1), Value::Int(2)];
+        let new_stream = |ctx: &mut MockCtx| {
+            let arr = ctx.new_ref_array(ClassId::new(0), elements.len());
+            for (i, v) in elements.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            let s = ctx.alloc_object(ClassId::new(0), STREAM_NUM_FIELDS);
+            ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            s
+        };
+
+        // -- the under-set half: one stream, two terminals -------------------
+        let s = new_stream(&mut ctx);
+        match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+            Ok(Some(Value::Long(3))) => {}
+            other => panic!("the FIRST terminal on a fresh stream must succeed, got {other:?}"),
+        }
+        match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+            Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                cratonvm_types::error::RuntimeError::IllegalStateException { ref message },
+            ))) => assert_eq!(
+                message.as_str(),
+                STREAM_LINKED_MSG,
+                "the class is only half the contract; HotSpot's wording is the other half"
+            ),
+            other => panic!("second terminal must raise IllegalStateException, got {other:?}"),
+        }
+
+        // -- the over-set half: independent streams stay independent ---------
+        // Each of these is a FRESH stage over equal elements. A flag set at
+        // allocation, or set on anything but the receiver, fails here.
+        for attempt in 0..3 {
+            let fresh = new_stream(&mut ctx);
+            match native_stream_count(&mut ctx, &[Value::Object(Some(fresh))]) {
+                Ok(Some(Value::Long(3))) => {}
+                other => panic!(
+                    "attempt {attempt}: a fresh stream must never inherit another \
+                     stream's linked flag, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// A stream with no slot for the flag (the 1-field ad-hoc layout several
+    /// native modules still mint, and the historical 2-field layout) must be
+    /// left alone entirely. Under-setting there is the deliberate direction of
+    /// the error — see `stream_is_linked`.
+    #[test]
+    fn a_short_layout_stream_is_never_reported_as_linked() {
+        use lbq_blocking_tests::MockCtx;
+        let mut ctx = MockCtx::new(1);
+        ctx.define_class(ClassId::new(0), "java/util/stream/Stream");
+
+        let arr = ctx.new_ref_array(ClassId::new(0), 2);
+        ctx.set_array_element(arr, 0, Value::Int(7));
+        ctx.set_array_element(arr, 1, Value::Int(8));
+        let s = ctx.alloc_object(ClassId::new(0), 1);
+        ctx.set_field(s, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+
+        for attempt in 0..3 {
+            match native_stream_count(&mut ctx, &[Value::Object(Some(s))]) {
+                Ok(Some(Value::Long(2))) => {}
+                other => panic!(
+                    "attempt {attempt}: a stream with no linked slot must never be \
+                     refused, got {other:?}"
+                ),
+            }
         }
     }
 }

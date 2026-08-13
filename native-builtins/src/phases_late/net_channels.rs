@@ -13,14 +13,69 @@ use super::*;
 // =============================================================================
 // NIO Channels — SocketChannel, ServerSocketChannel, Selector, SelectionKey
 // SocketChannel = 4-field synthetic (connected=0, open=1, address=2, fd_id=3)
-// ServerSocketChannel = 3-field synthetic (open=0, bound=1, fd_id=2)
+// ServerSocketChannel = 4-field synthetic (open=0, bound=1, fd_id=2, socket=3)
 // Selector = 3-field synthetic (open=0, keys_arr=1, key_count=2)
 // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
 // =============================================================================
+//
+// The ServerSocketChannel line above read "3-field synthetic (open=0, bound=1,
+// fd_id=2)" until 2026-08-12 and had been wrong since the slot-3 socket cache
+// was added: `open` allocates 4 and every `ssc` body below indexes 0..=3.
+// Corrected rather than deleted, because the count is what `SSC_P58_SLOT_MAP`
+// publishes (W7-88-net-channels-dead-registration.md).
+
+/// What this registrar believes the slots of `java/nio/channels/ServerSocketChannel`
+/// are — published so `read_alias::verify_declared_slot_maps` sweeps it against
+/// whichever class is actually loaded.
+///
+/// Every entry is wrong on the real JDK 25 class, and that disagreement IS the
+/// census row, so it is stated as the belief and not corrected to `javap`.
+/// The real transitive layout (Eclipse Adoptium 25.0.3.9, superclass first,
+/// declaration order, `static` excluded) is
+///
+/// ```text
+///   0 closeLock  1 closed  2 interruptor  3 interruptedTarget   (AbstractInterruptibleChannel)
+///   4 provider   5 keys    6 keyCount     7 keyLock  8 regLock  9 nonBlocking
+///                                                     (AbstractSelectableChannel)
+/// ```
+///
+/// so slot 1 is the `closed` flag a real `isOpen()` reads (this registrar puts
+/// the BOUND flag there), slot 2 is the `sun.nio.ch.Interruptible` (it puts an
+/// `int` fd there), and slot 3 is `interruptedTarget`, which
+/// `AbstractInterruptibleChannel.end(boolean)` reads on every interruptible
+/// operation. `keys` at 5 is the field W7-72-ssc-socket-and-filechannel.md §1
+/// repaired on the winning `native-io` side.
+///
+/// Nothing dispatches to the bodies holding this belief — `register_p58_nio_channels`
+/// is reachable only from `register_synthetic_overrides`, and all nine of its
+/// `ssc` triples are re-registered later by `native-io`'s
+/// `register_socket_channel_real` in every arm. Publishing the map is therefore
+/// a measurement, not a repair: if the registrar ever escapes that gate, the
+/// sweep names the fields instead of a suite finding them.
+pub static SSC_P58_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/nio/channels/ServerSocketChannel",
+        slots: &[
+            (0, "open"),
+            (1, "bound"),
+            (2, "fd"),
+            // Slot 3 lost its only producer when `socket()` was deleted
+            // (W7-88); `open` still nulls it and two `bind` arms still read it,
+            // so the belief is still held and still published.
+            (3, "socket"),
+        ],
+        origin: "native-builtins/src/phases_late/net_channels.rs register_p58_nio_channels",
+    };
 
 pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Unconditional, matching `register_io_natives`' publication of
+    // `BB_SLOT_MAP` and `register_phase52_time_enums`' of `MONTH_SLOT_MAP`:
+    // gating it on `CRATONVM_DBG_LAYOUT_ALIAS` would leave a run that enables
+    // the flag later with nothing to sweep, which is a detector reporting clean
+    // because it cannot see.
+    cratonvm_native_api::read_alias::declare_slot_map(&SSC_P58_SLOT_MAP);
     let sc = "java/nio/channels/SocketChannel";
     r.register(
         sc,
@@ -361,40 +416,45 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // ServerSocketChannel.socket() — return a wrapper ServerSocket linked to this channel.
-    // Cached on first call. The wrapper's bind/getLocalPort delegate back to the channel.
-    r.register(ssc, "socket", "()Ljava/net/ServerSocket;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(cached)) = ctx.get_field(this, 3) {
-            return Ok(Some(Value::Object(Some(cached))));
-        }
-        // 5-field ServerSocket: SS_PORT=0, SS_BACKLOG=1, SS_CLOSED=2, SS_LISTENER_ID=3, channel_ref=4
-        // Pin across the ServerSocket alloc below — a moving young GC there
-        // would relocate `this` (native stale-local family).
-        let this_pin = ctx.pin_native_root(this);
-        let ss = try_alloc_concurrent_synthetic(ctx, "java/net/ServerSocket", 5)?;
-        let this = ctx.read_native_pin(this_pin, this);
-        ctx.unpin_native_roots(this_pin);
-        ctx.set_field(ss, 0, Value::Int(0));
-        ctx.set_field(ss, 1, Value::Int(50));
-        ctx.set_field(ss, 2, Value::Int(0));
-        ctx.set_field(ss, 3, Value::Int(-1));
-        ctx.set_field(ss, 4, Value::Object(Some(this)));
-        // If channel already bound, mirror the port now.
-        let fd = ctx.get_field(this, 2).as_int().unwrap_or(-1);
-        if fd >= 0 {
-            if let Ok(local) = ctx.fd_table().tcp_local_addr(fd as u32) {
-                let port = local
-                    .rsplit(':')
-                    .next()
-                    .and_then(|p| p.parse::<i32>().ok())
-                    .unwrap_or(0);
-                ctx.set_field(ss, 0, Value::Int(port));
-            }
-        }
-        ctx.set_field(this, 3, Value::Object(Some(ss)));
-        Ok(Some(Value::Object(Some(ss))))
-    });
+    // `ServerSocketChannel.socket()Ljava/net/ServerSocket;` USED TO BE REGISTERED
+    // HERE, and was DELETED on 2026-08-12 — W7-88-net-channels-dead-registration.md,
+    // residual 7 of W7-72-ssc-socket-and-filechannel.md. It is not a repair:
+    // deleting it cannot change behaviour, and that is exactly why it went.
+    //
+    // Why it could not run. `--dump-native-registry` on the prebuilt dev binary
+    // shows `native-io/src/socket_channel.rs:4776` owning this triple with
+    // `overwrote = null` in all four runnable configurations (default build,
+    // `--real-jdk` and `--jdk-only`, each also with `CRATONVM_REAL=-net-sockets`)
+    // — `null`, not "overwrote net_channels", because THIS registrar never ran
+    // at all: every net_channels row in those censuses is at line >= 1252, i.e.
+    // `register_p58_nio_channels` contributed nothing. Its only path in is
+    // `register_phase58_natives` <- `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`, and the default `cratonvm-cli` build
+    // reports `jdk.mode.synthetic_compiled_in = false`. In the feature build it
+    // does register and still loses: `vm_init.rs` calls `register_builtins` and
+    // then `register_io_natives` on the NEXT line, and `register()` is
+    // last-write-wins.
+    //
+    // Why deleting beat correcting. The body wrote SEVEN real JDK fields.
+    // `try_alloc_concurrent_synthetic("java/net/ServerSocket", 5)` clamps up to
+    // the real class's six declared slots, so its map (SS_PORT=0, SS_BACKLOG=1,
+    // SS_CLOSED=2, SS_LISTENER_ID=3, channel_ref=4) landed on
+    // `impl`/`created`/`bound`/`closed`/`socketLock` — `closed := -1` alone makes
+    // a `java.net.ServerSocket` report itself CLOSED to its own bytecode — and
+    // `set_field(this, 3, ss)` put that ServerSocket into
+    // `AbstractInterruptibleChannel.interruptedTarget`, which `end(boolean)`
+    // reads on EVERY interruptible operation and, when non-null, follows with
+    // `interruptor.postInterrupt()`. That is a strictly worse version of the
+    // `keys`-slot defect W7-72 §1 repaired. Correcting the map for the real
+    // layout would have broken the fabricated layout this body was written for
+    // (the W7-66 shape); correcting it for the fabricated layout is an inert
+    // fix, because the registration loses in that arm too.
+    //
+    // NOT fixed here: the other eight `ssc` triples in this registrar keep the
+    // same 4-slot map over the same real class. Each also has a later
+    // `native-io` twin (measured — W7-88 §4), so they are dead the same way.
+    // `SSC_P58_SLOT_MAP` publishes the belief so the read-side sweep can see
+    // them, instead of a comment asserting they are fine.
     // ServerSocketChannel.getLocalAddress() — return InetSocketAddress with local port
     r.register(
         ssc,
@@ -612,6 +672,23 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     });
 
     // SelectionKey = 4-field synthetic (channel=0, selector=1, interestOps=2, readyOps=3)
+    //
+    // W7-9 — that "4-field synthetic" is a real JDK class, and this layout is
+    // laid over its declared one. `javap -p java.nio.channels.SelectionKey` on
+    // JDK 25 gives exactly one instance field,
+    // `private volatile java.lang.Object attachment`, at slot 0 — a REFERENCE.
+    // `try_alloc_concurrent_synthetic` takes `num_fields.max(real)` = 4 and
+    // reports an alias only when `num_fields < real`, so requesting 4 against
+    // a declared 1 is silent. Slot 0 happens to hold a reference in both
+    // readings (`channel` here, `attachment` there) which is why nothing has
+    // caught fire, but the two disagree about WHICH reference, and
+    // `nio_selector.rs`'s `sk_attach`/`sk_attachment` read the real one.
+    // Same species as W4-4/W6-3 in a third file; the census is in
+    // docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md §5.
+    // Not repaired here: this registrar is synthetic-only (reached from
+    // `register_synthetic_overrides`), the live SelectionKey surface is
+    // `native-io/src/nio_selector.rs::register_nio_selector_real`, and a
+    // one-sided renumbering would only move the disagreement.
     let sk = "java/nio/channels/SelectionKey";
 
     // The four public interest-op constants. They are `static final int`s, so
@@ -1448,6 +1525,42 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
     });
 
     // AsynchronousSocketChannel = 4-field (connected=0, open=1, fd_id=2, remote_addr=3)
+    //
+    // DEAD, EXCEPT ONE TRIPLE, AND THE SURVIVOR DISAGREES WITH ITS OWNER
+    // (measured 2026-08-12, lane W7-49 — W7-49-slot-index-recensus.md).
+    //
+    // `native-io/src/async_socket.rs::register_async_socket_real` registers
+    // `open()` x2, `isOpen`, `close`, `getRemoteAddress`, `read(ByteBuffer)` and
+    // `write(ByteBuffer)` on this same class, and `register_io_natives` runs
+    // AFTER `register_essential_natives_with_shims` (vm_init.rs:1701 then 1898,
+    // and 2208 then 2403). Registration is last-write-wins, so every one of
+    // those registrations below is overwritten and never dispatches.
+    //
+    // The one survivor is `connect(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;`
+    // — native-io registers only the `(SocketAddress, Object, CompletionHandler)V`
+    // form, so this descriptor is not overwritten. It therefore runs against
+    // objects `aio_asc_open` allocated, under a DIFFERENT slot map:
+    //
+    //     here            native-io (the owner, and the allocator)
+    //     0 connected     0 F_OPEN
+    //     1 open          1 F_CONNECTED
+    //     2 fd_id         2 F_REG_ID   (an AIO registry id, NOT an fd_table fd)
+    //     3 remote        3 F_REMOTE
+    //
+    // Slots 0 and 1 have OPPOSITE meanings and slot 2 holds a different KIND of
+    // integer. That is the two-layouts-on-one-class condition — the shape that
+    // made `java.lang.Process` a bug — and it is NOT repaired here: the owner is
+    // also the allocator, so the repair has to move both sides in one step and
+    // belongs to a lane that owns `native-io`. A one-sided renumber only moves
+    // the disagreement.
+    //
+    // Neither map is layout-correct either way: real
+    // `java.nio.channels.AsynchronousSocketChannel` (JDK 25.0.3.9, `javap -p`)
+    // declares exactly ONE instance field, `provider`, a reference the collector
+    // scans as an oop — so slot 0 of both maps writes an `Int` into it and slots
+    // 1-3 sit past the end of the real layout. `alloc_obj(..., N_FIELDS)` on the
+    // native-io side is a DIRECT allocation, so it never reaches
+    // `report_layout_alias` and this pair appears in no run of that census.
     let asc = "java/nio/channels/AsynchronousSocketChannel";
     r.register(
         asc,
@@ -3192,6 +3305,41 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     //
     // The sock_id was added by NEW-3 so that send/receive/read/write
     // share one persistent UDP socket and the Selector can poll its fd.
+    //
+    // W7-9 — DO NOT WIRE THIS REGISTRAR INTO THE DEFAULT BUILD AS-IS.
+    //
+    // It is `pub(crate)` and reached only from `phases_late.rs`'s
+    // `register_phase72_natives` -> `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`-gated, so none of it runs in the
+    // real-JDK CLI. Two of its bodies — `setOption(SocketOption,Object)` and
+    // `getRemoteAddress()` — are `abstract` on the real JDK 25
+    // `DatagramChannel` (`javap -p`) and are registered by NOTHING in the
+    // default build, so a call on a minted receiver is a hard
+    // `AbstractMethodError` there. That reads as "wire this in and the gap
+    // closes". It is a trap.
+    //
+    // `native-io/src/lib.rs` has its OWN `register_datagram_channel` — same
+    // class name, live in the default build (twice: directly from
+    // `register_io_natives`, and again through
+    // `register_phase92_io_completeness`) — and it mints the receiver with a
+    // DIFFERENT slot assignment. The bodies below read `field 2` as the
+    // connected flag and `field 4` as a `SocketRegistry::dgrams` index. Run
+    // them against the object the default build actually allocates and those
+    // reads land on unrelated slots: an `Int` where the caller stored a
+    // reference, an arbitrary int used as a registry key. That is the
+    // slot-index species
+    // (docs/known-issues/jdk-only/W4-4-slot-index-species-sweep.md), i.e.
+    // heap corruption rather than a wrong answer.
+    //
+    // The precondition for wiring is therefore NOT "call it later than
+    // `register_io_natives`" — it is "one layout owns this class name". Unify
+    // first, then move the two bodies into `native-io`'s live registrar, where
+    // they need no new `vm_init.rs` call at all. Full adjudication — including
+    // the other two absent abstracts, the vectored
+    // `read`/`write([Ljava/nio/ByteBuffer;II)J`, which are NOT composable from
+    // the single-buffer natives because one call must move exactly one
+    // datagram — is in
+    // docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md.
 
     r.register(
         dc,
@@ -3669,13 +3817,50 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; capacity];
-        let result = {
+        // FIX 2026-08-12 (W7-53). Two defects in one expression, and the census
+        // that found `receive`'s copy of the first did not name this one.
+        //
+        // (1) `recv` ran with `reg` — the guard on the PROCESS-WIDE
+        //     `s2_registry` mutex — still alive, because it sat inside the
+        //     block that owns it. On a blocking datagram channel that parks
+        //     every synthetic socket operation in the VM until a packet
+        //     arrives, INCLUDING the `close` that would end the wait. The lock
+        //     is the wait's own gate, so the wedge is self-sustaining. Fixed by
+        //     the rule both TCP read paths have followed since AUDIT
+        //     2026-05-17: take the handle out under a brief guard, drop the
+        //     guard, then make the blocking call.
+        //
+        // (2) The park that remains is not close-aware by itself — closing one
+        //     duplicated socket handle does not abort a blocking call on
+        //     another duplicate. So it goes through the same
+        //     poll-and-re-ask-the-registry loop as every other site in this
+        //     family.
+        let sock = {
             let reg = crate::servlet::s2_registry().lock();
             match reg.dgrams.get(&sid) {
-                Some(sock) => sock.recv(&mut buf),
+                Some(sock) => match sock.try_clone() {
+                    Ok(dup) => dup,
+                    // A dup failure is an ordinary IO error, not a reason to
+                    // fall back to receiving under the lock — that is the
+                    // behaviour being removed.
+                    Err(_) => return Ok(Some(Value::Int(-1))),
+                },
                 None => return Ok(Some(Value::Int(-1))),
             }
         };
+        // `Ok(_)` — ready, or no poll primitive on this target (fall through to
+        // the plain blocking `recv`). `Err(_)` — closed from another thread,
+        // which this surface reports as -1, its end-of-input answer.
+        if crate::servlet::s2_wait_ready_close_aware(
+            crate::servlet::dgram_pollreq_fd(&sock),
+            false,
+            &|| crate::servlet::s2_dgram_still_registered(sid),
+        )
+        .is_err()
+        {
+            return Ok(Some(Value::Int(-1)));
+        }
+        let result = sock.recv(&mut buf);
         match result {
             Ok(n) => {
                 let arr = match ctx.get_field(bb, 0) {
@@ -4440,13 +4625,23 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             // `-1` is the com.sun.net.httpserver convention for "no response
             // body". Errors are swallowed: failing to report the failure must
             // not turn into a second, different failure on the caller.
+            //
+            // KEPT SWALLOW, NARROWED on the `close`. This is a backstop for a
+            // handler that is not there, so `HttpHandler.handle` has no JDK
+            // body to copy a `catch` from — the swallow is a deliberate
+            // decision of ours and stays. What does not belong inside it is an
+            // `Error`: a `NoSuchMethodError` from `HttpExchange.close` means
+            // our own `HttpExchange` natives are broken, which is neither the
+            // original failure nor a second one caused by reporting it.
+            // W7-57-close-flush-swallow-sweep.md
             let _ = ctx.invoke_virtual(
                 exchange,
                 "sendResponseHeaders",
                 "(IJ)V",
                 &[Value::Int(500), Value::Long(-1)],
             );
-            let _ = ctx.invoke_virtual(exchange, "close", "()V", &[]);
+            let closed = ctx.invoke_virtual(exchange, "close", "()V", &[]);
+            cratonvm_native_api::delegated_close::vm_only_best_effort(&*ctx, closed)?;
             Ok(None)
         },
     );

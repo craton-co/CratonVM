@@ -1346,6 +1346,18 @@ fn unreg_memo_gc_reset_enabled() -> bool {
 /// [`note_jit_boundary`] at *every* Rust↔JIT crossing — leaves the cache able
 /// to hit at all.
 ///
+/// **`cache_hits` MEASURED 2026-08-12: 0.0%, in every run.** Three netty
+/// `io.netty.buffer` classes on dev `6d1bfd531` — 1,022 scans, 41,894 scans and
+/// 60,163 scans respectively — and **zero** hits in all three. The
+/// boundary-generation key is bumped from `push_entry_full`, which ran 826
+/// million times in one of those runs, so the generation never survives long
+/// enough for a second scan to match it. The answer is 0%, not "small".
+///
+/// That is not the cost on those classes — `band_words` was **0**, i.e. no band
+/// scanning fired at all — so this is recorded as a fact about the cache rather
+/// than as a lead. Anything that reworks the key should know it starts from
+/// zero. See `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
+///
 /// Off by default and read through one cached bool, so a default run pays a
 /// predictable branch per scan and nothing else.
 pub mod scan_prof {
@@ -1360,6 +1372,23 @@ pub mod scan_prof {
     /// Transfers of control into compiled code (`push_entry_full`). The run's
     /// interpreter→JIT entry count; the JIT's CPU delta divided by this is the
     /// per-entry cost.
+    ///
+    /// **MEASURED 2026-08-12** on netty `io.netty.buffer`, dev `6d1bfd531`, and
+    /// the answer to the question this counter was added for. On
+    /// `AdaptiveByteBufAllocatorTest`: **826,764,658 entries in a 551 s run**
+    /// (1.5 M/s), against 1.59 M tracked method invocations. A flat `perf`
+    /// profile of the same workload puts the entry/exit bookkeeping — this
+    /// function, `pop_jit_entry`, `pin_jit_code_range_owner`,
+    /// `validate_code_ptr`, `gc_quiescence::{enter,leave}`,
+    /// `record_transition`, `jit_execution_{enter,leave}` — at **~15% of CPU**,
+    /// i.e. **~200 ns of pure bookkeeping per entry**, with another ~14% in the
+    /// dispatch that reaches it and 3.3% in the interpreter itself.
+    ///
+    /// So yes: on call-dense code the entry machinery is a first-order cost,
+    /// and it is paid per *transfer*, not per compiled method. Wall time tracks
+    /// entry count across the family — 116.8 M entries/35.3 s, 120.4 M/62.3 s,
+    /// 826.8 M/551 s. Full write-up, including the two hypotheses this refuted,
+    /// in `docs/known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
     pub static JIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
@@ -1555,6 +1584,22 @@ impl UnregMemo {
         // A new compilation invalidates the verdict outright: a slot that held
         // a plain value at the last scan can now sit where a new JIT code range
         // claims to start.
+        //
+        // MEASURED 2026-08-11, and left alone deliberately. This rule can be
+        // argued away — the band is frozen (nothing above the current stack
+        // pointer changes while the thread is nested below it) and a genuine
+        // return address into range R requires R to have existed when the CALL
+        // wrote it, so a range registered after the verdict can only produce a
+        // FALSE positive. Removing the check was implemented, unit-tested and
+        // measured on `DefaultCatalogAndSchemaTest`, which compiles
+        // continuously across 132 SessionFactory bootstraps and so keeps this
+        // memo permanently cold: `native_stack_has_jit_frame` read 35.2 BILLION
+        // stack words with the check and 35.2 billion without it — byte for
+        // byte no change, because the probes that dominate this workload come
+        // from `refresh_moving_young_coverage_for_current_thread`, which
+        // consults no memo at all. So the rule is a real inefficiency and it is
+        // NOT the binding one; it stays until something measures it binding,
+        // rather than trading heap-safety-critical behaviour for nothing.
         UnregScan::Detect { hi: None }
     }
 
@@ -1675,6 +1720,13 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
         let mut addr = (lo + 7) & !7usize;
         const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
         let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+        // Counted per CALL — see `rootprof::note_jit_probe`. Recorded up front
+        // so an early `return Some(..)` (a hit, which stops the walk) still
+        // reports the band this probe was ASKED for, which is the quantity the
+        // memo's incremental-band logic is supposed to be shrinking.
+        crate::memory::native_roots::rootprof::note_jit_probe(
+            (hi.saturating_sub(addr) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        );
         while addr + 8 <= hi {
             // SAFETY: aligned read inside the calling thread's own live stack
             // band between two known stack pointers (same contract as
@@ -1697,6 +1749,112 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
         }
         None
     })
+}
+
+/// Does a candidate A5 slot look like the return-address slot of a REAL frame?
+///
+/// `is_plausible_return_pc` asks whether the *word* could be a return address.
+/// This asks the different question the A5 probe actually needs: whether the
+/// *slot holding it* is where a live frame's return address sits. It is the
+/// frame-shape half of the "raw-word scan, not a frame walk" follow-up that
+/// [`native_stack_has_jit_frame`]'s own comment names.
+///
+/// A frame entered by `call` and opened with the JIT's prologue
+/// (`push rbp; mov rbp, rsp`, which every compiled body emits) lays the stack
+/// out exactly like this, addresses growing upward:
+///
+/// ```text
+///   slot - 8  : saved caller RBP   <- callee's own RBP points here
+///   slot      : return address     <- the candidate word
+///   slot + 8  : caller's frame ...
+/// ```
+///
+/// So the word one slot BELOW a genuine return address is the caller's frame
+/// base: 8-aligned, strictly above this frame, inside the same stack, and
+/// itself the base of a frame whose own return-address slot holds a plausible
+/// return PC. A stale return address left behind in the uninitialised middle of
+/// a live frame has no such neighbour except by coincidence.
+///
+/// Deliberately shallow — two links, no walk to the stack base. The chain above
+/// a genuine JIT frame runs into VM Rust frames, and this tree does not build
+/// with forced frame pointers, so those frames need not maintain RBP at all and
+/// a deeper walk would reject real frames. Two links is what can be asserted
+/// from the JIT's own calling convention alone.
+///
+/// Conservative in the safe direction on purpose: this is only ever used to
+/// decide whether over-detection is happening, never to suppress a hit that
+/// passes.
+fn a5_slot_has_frame_shape(slot: usize, stack_hi: usize) -> bool {
+    if !a5_frame_base_is_plausible(slot, stack_hi) {
+        return false;
+    }
+    // SAFETY: `slot - 8` and `caller_rbp + 8` are 8-aligned addresses inside the
+    // calling thread's own stack — `slot` came from the scan, which only offers
+    // addresses it has already read, and `a5_frame_base_is_plausible` has
+    // bounded `caller_rbp + 8` below `stack_hi`.
+    let caller_rbp = unsafe { ((slot - 8) as *const usize).read() };
+    if !a5_frame_base_is_plausible_link(slot, caller_rbp, stack_hi) {
+        return false;
+    }
+    let caller_ret = unsafe { ((caller_rbp + 8) as *const usize).read() };
+    // The caller of a JIT frame is either another JIT frame or the VM's own
+    // code. Only the first is checkable from here; a caller outside every JIT
+    // range is accepted, because the interpreter->JIT boundary is exactly that
+    // and is the most common real case.
+    match cratonvm_jit::lookup_jit_code_range(caller_ret) {
+        Some(_) => is_plausible_return_pc(caller_ret),
+        None => caller_ret != 0,
+    }
+}
+
+/// Can `slot` be a return-address slot at all? Split out so the arithmetic is
+/// testable without a real stack.
+fn a5_frame_base_is_plausible(slot: usize, stack_hi: usize) -> bool {
+    slot >= 8 && slot & 0x7 == 0 && slot < stack_hi
+}
+
+/// Is `caller_rbp`, read from `slot - 8`, shaped like the caller's frame base?
+///
+/// A saved caller RBP is 8-aligned, strictly OLDER than this frame (a higher
+/// address, since the stack grows down), and leaves room for its own
+/// return-address slot below `stack_hi`. Pure arithmetic, so the invariant this
+/// rests on is stated once and tested directly.
+fn a5_frame_base_is_plausible_link(slot: usize, caller_rbp: usize, stack_hi: usize) -> bool {
+    caller_rbp & 0x7 == 0
+        && caller_rbp > slot
+        && caller_rbp.checked_add(8).is_some_and(|end| end < stack_hi)
+}
+
+/// Census of the A5 band: how many words look like JIT return addresses, and
+/// how many of those sit at a slot with real frame shape.
+///
+/// Diagnostic only — nothing branches on it. It exists to PRICE the frame-shape
+/// filter before anything is built on it, the way the fallback-reason mask
+/// priced the indirect-call repair: if a cycle's hits are all shapeless, the
+/// filter would have converted that cycle; if any hit has frame shape, it would
+/// not, and the cycle is blocked by something the filter cannot reach.
+fn native_stack_jit_frame_census(lo: usize, hi: usize) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut shaped = 0usize;
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    let hi_capped = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi_capped {
+        // SAFETY: same contract as `native_stack_has_jit_frame` — an aligned
+        // read inside this thread's own live stack band.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(w) {
+            let cm = unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+            if w != cm.entry_ptr() as usize && is_plausible_return_pc(w) {
+                total += 1;
+                if a5_slot_has_frame_shape(addr, hi) {
+                    shaped += 1;
+                }
+            }
+        }
+        addr += 8;
+    }
+    (total, shaped)
 }
 
 /// Return-address validation for the A5 raw-word scan.
@@ -1823,6 +1981,15 @@ fn return_pc_validation_enabled() -> bool {
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RETPC_VALIDATE").is_none()
     })
+}
+
+/// Diagnostic gate for [`native_stack_jit_frame_census`]. Off by default: the
+/// census re-scans the whole band a second time, which is affordable only when
+/// you are deliberately measuring.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_CENSUS").is_some())
 }
 
 /// Kill switch for the residue filter on the unregistered-JIT-frame probe --
@@ -2875,6 +3042,18 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         } else {
             None
         };
+        // Price the frame-shape filter without branching on it: for every cycle
+        // this probe diverts, say how many band words looked like JIT return
+        // addresses and how many of those sat at a slot with real frame shape.
+        // `shaped=0` on a hit means the filter would have converted THIS cycle.
+        if hit.is_some() && a5_census_enabled() {
+            let (total, shaped) = native_stack_jit_frame_census(search_lo, high);
+            eprintln!(
+                "[a5-census] hits={total} shaped={shaped} band=[0x{search_lo:x},0x{high:x}) \
+                 band_bytes={}",
+                high.saturating_sub(search_lo),
+            );
+        }
         if let Some((slot, word)) = hit {
             if dbg {
                 // Name the actual evidence: which slot, which word, how far
@@ -4274,6 +4453,7 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     // before.
     let span = heap.conservative_addr_span();
     let mut addr = aligned_low;
+    let hits_before = out.len();
     while addr + 8 <= aligned_high {
         let qword = unsafe { (addr as *const usize).read() };
         addr += 8;
@@ -4286,6 +4466,13 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
             out.push(obj);
         }
     }
+    // Counted per CALL, never per word — see `rootprof::note_stack_scan` for
+    // why these exist. Free when `CRATONVM_DBG_ROOTPROF` is unset (one
+    // already-resolved `OnceLock` load).
+    crate::memory::native_roots::rootprof::note_stack_scan(
+        ((aligned_high - aligned_low) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        (out.len() - hits_before) as u64,          // Widening: a Vec length
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4295,6 +4482,41 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame-shape arithmetic the A5 census prices the probe with.
+    ///
+    /// A JIT frame's caller RBP sits one slot BELOW its return address (both
+    /// x64 backends open every compiled body with `push rbp; mov rbp, rsp`),
+    /// and, because the stack grows down, points at a HIGHER address. Getting
+    /// that direction backwards would make the census report every hit as
+    /// shaped and price the filter at zero.
+    #[test]
+    fn a5_frame_link_points_at_an_older_frame() {
+        let hi = 0x7fff_0000_0000usize;
+        let slot = 0x7ffe_0000_0000usize;
+        // Caller's frame base: higher address, aligned, room for its own slots.
+        assert!(a5_frame_base_is_plausible_link(slot, slot + 0x80, hi));
+        // Younger than this frame — impossible for a caller.
+        assert!(!a5_frame_base_is_plausible_link(slot, slot - 0x80, hi));
+        // Equal is not "older" either: a frame cannot be its own caller.
+        assert!(!a5_frame_base_is_plausible_link(slot, slot, hi));
+        // Misaligned: never a frame base.
+        assert!(!a5_frame_base_is_plausible_link(slot, slot + 0x84, hi));
+        // Off the top of the stack, and the overflow edge of the same test.
+        assert!(!a5_frame_base_is_plausible_link(slot, hi, hi));
+        assert!(!a5_frame_base_is_plausible_link(slot, usize::MAX - 4, hi));
+        // A stale zero word is the single most common shapeless value.
+        assert!(!a5_frame_base_is_plausible_link(slot, 0, hi));
+    }
+
+    #[test]
+    fn a5_slot_must_be_aligned_and_inside_the_stack() {
+        let hi = 0x7fff_0000_0000usize;
+        assert!(a5_frame_base_is_plausible(0x7ffe_0000_0000, hi));
+        assert!(!a5_frame_base_is_plausible(0x7ffe_0000_0004, hi)); // misaligned
+        assert!(!a5_frame_base_is_plausible(hi, hi)); // at the top
+        assert!(!a5_frame_base_is_plausible(0, hi)); // no room for slot - 8
+    }
 
     /// H2-CID0 (2026-08-05) — the sequence the pre-fix memo got wrong.
     ///
@@ -4369,6 +4591,9 @@ mod tests {
 
     /// A new compilation invalidates the verdict regardless of depth — a slot
     /// that held a plain value can now sit inside a brand-new code range.
+    ///
+    /// The rule is conservative and was measured non-binding on 2026-08-11 —
+    /// see `UnregMemo::observe` for the numbers and why it stays anyway.
     #[test]
     fn unreg_memo_new_code_range_forces_a_full_rescan() {
         let mut m = UnregMemo::new();

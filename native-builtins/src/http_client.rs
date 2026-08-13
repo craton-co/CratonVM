@@ -1365,13 +1365,32 @@ fn hci_send_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Ok(None) => Value::Object(None),
         Err(_) => Value::Object(None),
     };
-    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
-    // Field 0 = result, field 1 = completion flag, field 2 = exception, field 3 = stage count.
-    ctx.set_field(cf, 0, resp_val);
-    ctx.set_field(cf, 1, Value::Int(1));
-    ctx.set_field(cf, 2, Value::Object(None));
-    ctx.set_field(cf, 3, Value::Int(0));
-    Ok(Some(Value::Object(Some(cf))))
+    // Build the completed future through the JDK's OWN static factory rather
+    // than fabricating one out of slot indices.
+    //
+    // W7-49 (2026-08-12). What this replaced allocated a real
+    // `java.util.concurrent.CompletableFuture` — which declares exactly two
+    // instance fields, `volatile Object result` and `volatile Completion stack`
+    // (JDK 25.0.3.9, `javap -p`) — with FOUR slots, then wrote:
+    //
+    //   slot 0  result  <- the response          (the one index that was right)
+    //   slot 1  stack   <- Int(1), "done"        REFERENCE slot, scanned as an oop
+    //   slot 2  (past the end of the real layout)
+    //   slot 3  (past the end of the real layout)
+    //
+    // The object then went straight to Java, where the REAL `CompletableFuture`
+    // bytecode owns it: `complete`, `postComplete` and `getNumberOfDependents`
+    // all walk `stack` as a `Completion` chain. This is the same `done`-int-over-
+    // a-reference shape `util_concurrent_ext::native_cf_complete` documents on
+    // itself, in a live real-JDK path.
+    //
+    // `aio_completed_future` invokes `CompletableFuture.completedFuture(Object)`,
+    // so the layout is whatever the loaded class actually is and no index is
+    // written at all — the same helper the async-channel natives on the same
+    // essential path already use, in both modes. Semantics are unchanged: the
+    // old form always marked the future done, with a null result on failure,
+    // which is exactly `completedFuture(null)`.
+    crate::phases_late::concurrent::aio_completed_future(ctx, resp_val)
 }
 
 fn do_send(

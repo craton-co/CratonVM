@@ -932,24 +932,42 @@ pub fn spawn_io_thread_with_ctx(
     //     carrier when other code holds the mirror,
     //   * the carrier shows up in `ThreadRegistry::alive_thread_objects()`.
     //
-    // Synthetic `java/lang/Thread` is 5 slots (see
-    // `classloading::class_manager::synthetic_field_count`):
-    // `name=0, priority=1, tid=2, target=3, virtualFlag=4`.
+    // Layout is `crate::alloc_carrier_thread_mirror`'s to pick: a real 19-slot
+    // `java.lang.Thread` on a real image, the synthetic 5-slot map
+    // (`name=0, priority=1, tid=2, target=3, virtualFlag=4`, see
+    // `classloading::class_manager::synthetic_field_count`) otherwise.
+    //
+    // W7-74-short-object-repairs.md. This read
+    // `ctx.alloc_object(ClassId::new(0), 5)` until 2026-08-12 — five slots of
+    // `cratonvm/synthetic/AnonymousObject$5`, published to the thread registry
+    // as this carrier's `java.lang.Thread`. Same defect and same repair as
+    // `vertx_eventloop::spawn_vertx_event_loop_inner`; the two sites were
+    // copies of each other and are now two calls to one helper.
     if vm_tid != 0 {
-        let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
-        let name_obj = ctx.create_string(&name);
-        ctx.set_field(mirror, 0, Value::Object(Some(name_obj)));
-        ctx.set_field(mirror, 2, Value::Long(vm_tid as i64));
-        let attached = ctx.set_native_thread_java_obj(vm_tid, mirror);
-        if !attached {
+        // Bound to a `let` rather than written inline as the `if let`
+        // scrutinee: a scrutinee's temporaries (the implicit reborrow of `ctx`
+        // included) live for the whole `if let` under Rust 2021, and the body
+        // needs `ctx` again for `set_native_thread_java_obj`.
+        let mirror = crate::alloc_carrier_thread_mirror(ctx, &name, vm_tid, daemon);
+        if let Some(mirror) = mirror {
+            let attached = ctx.set_native_thread_java_obj(vm_tid, mirror);
+            if !attached {
+                tracing::warn!(
+                    io_thread = %name,
+                    vm_tid = vm_tid,
+                    "T19_K4: set_native_thread_java_obj failed for XNIO IO thread; \
+                     mirror won't be findable by ObjectRef (registration is OK)",
+                );
+            } else {
+                record_iot_java_mirror_ptr(handle.id, mirror.as_ptr() as usize);
+            }
+        } else {
             tracing::warn!(
                 io_thread = %name,
                 vm_tid = vm_tid,
-                "T19_K4: set_native_thread_java_obj failed for XNIO IO thread; \
-                 mirror won't be findable by ObjectRef (registration is OK)",
+                "T19_K4: java/lang/Thread would not resolve; no mirror pre-registered \
+                 for this XNIO IO thread (Thread.currentThread() will build one lazily)",
             );
-        } else {
-            record_iot_java_mirror_ptr(handle.id, mirror.as_ptr() as usize);
         }
     }
 

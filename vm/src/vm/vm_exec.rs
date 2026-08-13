@@ -3860,6 +3860,198 @@ fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
     cache.insert(key, byte);
 }
 
+/// `CRATONVM_DBG_HW_ATOMIC=1` — announce the first hardware field atomic of
+/// each kind. A perf or soundness claim about this path is not checkable
+/// without it: every guard in `hw_atomic_addr` fails CLOSED to the lock path,
+/// so a silently-never-taken fast path looks exactly like a working one.
+fn hw_atomic_dbg() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HW_ATOMIC").is_some()
+    })
+}
+
+static HW_ATOMIC_SEEN: [std::sync::atomic::AtomicBool; 3] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// Which payload a caller wants to touch with a hardware atomic, and how to
+/// prove the field really holds one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HwAtomicKind {
+    Int,
+    Long,
+    Reference,
+}
+
+impl HwAtomicKind {
+    fn matches_descriptor(self, d: u8) -> bool {
+        match self {
+            HwAtomicKind::Int => d == b'I',
+            HwAtomicKind::Long => d == b'J',
+            HwAtomicKind::Reference => d == b'L' || d == b'[',
+        }
+    }
+
+    /// The `Value` discriminant a LEGACY cell must ALREADY carry.
+    ///
+    /// Pinned by `field_cell_layout_matches_value_enum`: Int 0, Long 1,
+    /// Object 4. Null and non-null references share tag 4 — a JVM null is a
+    /// zero payload word, not a different tag — so a reference CAS across
+    /// null never has to rewrite the tag.
+    fn legacy_tag(self) -> u32 {
+        match self {
+            HwAtomicKind::Int => 0,
+            HwAtomicKind::Long => 1,
+            HwAtomicKind::Reference => 4,
+        }
+    }
+
+    fn payload_offset(self) -> usize {
+        match self {
+            HwAtomicKind::Int => cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET,
+            _ => cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET,
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            HwAtomicKind::Int => 4,
+            _ => 8,
+        }
+    }
+}
+
+/// Address of a field payload that may be updated with a HARDWARE atomic — the
+/// one location the interpreter, the natives and the JIT must all agree on, and
+/// all reach with the same primitive.
+///
+/// Why this exists: `compare_and_swap_field` used to get its atomicity from
+/// `monitors.with_cas_lock` plus the collector's `volatile_stripe_lock`. Those
+/// make the native path atomic against ITSELF, not against a hardware atomic
+/// issued from compiled code, so a compiled `LOCK XADD` racing an interpreted
+/// read-compare-write lost updates (24,908 of 600,000, measured). Routing both
+/// through one aligned hardware atomic here is what makes the two modes atomic
+/// against EACH OTHER.
+///
+/// Offsets come from [`cratonvm_jit::AtomicIntFieldLayout`], the same type the
+/// JIT bakes its displacement from, and the COMPACT/LEGACY arm is chosen per
+/// OBJECT on the `GC_FLAG_COMPACT` header bit exactly as the codegen does — a
+/// class with a registered compact layout may still have legacy-laid-out
+/// instances. If that layout moves, both sides move together.
+///
+/// `None` means a precondition did not hold and the caller MUST fall back to
+/// the lock-based `Value`-cell path. Callers pass an already-forwarded `obj`.
+fn hw_atomic_addr(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    index: usize,
+    kind: HwAtomicKind,
+) -> Option<*mut u8> {
+    // Arrays have no field layout; their elements keep the existing path.
+    if shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array {
+        return None;
+    }
+    let class_id = shared.mem.heap.class_id_of(obj);
+    // The slot must really be of the requested type. This doubles as the bounds
+    // proof: the descriptor only resolves for a declared field of this class.
+    if !kind.matches_descriptor(resolve_field_descriptor_byte_cached(shared, class_id, index)?) {
+        return None;
+    }
+    let header = shared.mem.heap.get_header(obj);
+    let compact = header.gc_flags() & cratonvm_types::GC_FLAG_COMPACT != 0;
+    let base = obj.as_ptr() as usize;
+
+    let addr = if compact {
+        // A compact body offset IS the payload address; there is no tag word,
+        // so there is nothing to guard. Refuse any width this atomic cannot
+        // address (a narrow reference, say) rather than tearing it.
+        let (body_off, storage) =
+            cratonvm_types::compact_field_storage(class_id.as_u32(), index)?;
+        if storage.size_runtime() as usize != kind.width() {
+            return None;
+        }
+        base.checked_add(cratonvm_types::HEADER_SIZE)?
+            .checked_add(body_off)?
+    } else {
+        if index >= header.num_slots() as usize {
+            return None;
+        }
+        let cell = base
+            .checked_add(cratonvm_types::HEADER_SIZE)?
+            .checked_add(index.checked_mul(cratonvm_types::SLOT_SIZE)?)?;
+        // TAG GUARD. A LEGACY cell carries its type in the tag word, and
+        // `values_equal_for_cas` deliberately treats an uninitialized slot
+        // (which reads as `Object(None)`) as equal to a typed zero. Writing
+        // only the payload of such a cell would leave the tag saying `Object`,
+        // and the next descriptor-coercing read would hand back the coerced
+        // zero — losing the write. Take the hardware path only when the cell is
+        // already a properly tagged cell of this type; everything else falls
+        // back to the lock path, which keeps that coercion behaviour.
+        if cell % std::mem::align_of::<u32>() != 0 {
+            return None;
+        }
+        // SAFETY: `cell` is the start of a live 16-byte `Value` slot.
+        let tag = unsafe {
+            (*(cell as *const std::sync::atomic::AtomicU32))
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        if tag != kind.legacy_tag() {
+            return None;
+        }
+        cell.checked_add(kind.payload_offset())?
+    };
+
+    // A hardware atomic requires natural alignment; anything else would be a
+    // torn access rather than a slow one, so refuse instead of degrading.
+    if addr % kind.width() != 0 {
+        return None;
+    }
+    if hw_atomic_dbg() {
+        let slot = match kind {
+            HwAtomicKind::Int => 0usize,
+            HwAtomicKind::Long => 1,
+            HwAtomicKind::Reference => 2,
+        };
+        if !HW_ATOMIC_SEEN[slot].swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hw-atomic] first {:?} field atomic: class_id={} index={} layout={}",
+                kind,
+                class_id.as_u32(),
+                index,
+                if compact { "compact" } else { "legacy" },
+            );
+        }
+    }
+    Some(addr as *mut u8)
+}
+
+/// # Safety
+/// `addr` must come from [`hw_atomic_addr`] with the matching [`HwAtomicKind`]
+/// for a live, already-forwarded object. Natives run without reaching a
+/// safepoint, so a relocating collector cannot move the object underneath a
+/// single atomic op.
+unsafe fn hw_atomic_i32<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicI32 {
+    &*(addr as *const std::sync::atomic::AtomicI32)
+}
+
+/// # Safety
+/// See [`hw_atomic_i32`].
+unsafe fn hw_atomic_i64<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicI64 {
+    &*(addr as *const std::sync::atomic::AtomicI64)
+}
+
+/// # Safety
+/// See [`hw_atomic_i32`]. The payload word of a reference cell is the raw
+/// pointer (or zero for a JVM null), which is what `values_equal_for_cas`
+/// compares references by, so a bit-level CAS here matches the lock path's
+/// semantics exactly.
+unsafe fn hw_atomic_usize<'a>(addr: *mut u8) -> &'a std::sync::atomic::AtomicUsize {
+    &*(addr as *const std::sync::atomic::AtomicUsize)
+}
+
 fn resolve_field_descriptor_byte_cached(
     shared: &SharedVm,
     class_id: ClassId,
@@ -4618,6 +4810,17 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             eprintln!("Virtual thread {} terminated with error: {:?}", tid, error);
         }
     }
+    // Java-side thread teardown, mirroring the platform-thread death path in
+    // `thread_start` — same helper, same position (after the uncaught-handler
+    // dispatch, before the JFR thread-end event and every teardown step that
+    // follows), and likewise outside the `if let Err(error)` block so it covers
+    // normal and abnormal termination alike. Re-read the `Thread` object from
+    // the registry, which is remapped after every GC; if it has no entry there
+    // is no receiver to clean up and the JFR/monitor sequence below already
+    // handles that case by producing no `term_monitor`.
+    if let Some(exit_thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) {
+        run_thread_exit_shared(&shared, &mut thread, exit_thread_obj);
+    }
     {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4898,6 +5101,147 @@ fn dispatch_uncaught_exception_shared(
     };
     thread.native_pin_roots.truncate(pin_base);
     result
+}
+
+/// Run `java.lang.Thread.exit()` on a thread that is terminating — the Java-side
+/// teardown HotSpot's VM performs and this one never did.
+///
+/// `Thread.exit()`'s javadoc is the contract: *"This method is called by the VM
+/// to give a Thread a chance to clean up before it actually exits."* Nothing in
+/// CratonVM called it, on either death path, in any mode, so its whole body was
+/// dead code here. JDK 25's body (`java.base/java/lang/Thread.java`, read from
+/// `src.zip`) is:
+///
+/// ```text
+/// private void exit() {
+///     try { if (headStackableScopes != null) StackableScope.popAll(); }
+///     finally { ThreadContainer c = threadContainer(); if (c != null) c.remove(this); }
+///     try { if (terminatingThreadLocals() != null) TerminatingThreadLocal.threadTerminated(); }
+///     finally { clearReferences(); }
+/// }
+/// ```
+///
+/// `container.remove(this)` is the load-bearing one and the reason this landed:
+/// it is the ONLY decrement of `ThreadFlock.threadCount`, and that decrement is
+/// what unparks an owner blocked in `awaitAll()`. Measured on the pre-change
+/// binary with a thread started through the JDK's own
+/// `Thread.start(ThreadContainer)`, the count stayed at 1 after the worker died
+/// and a `join()` issued at that point never returned in 3/3 runs, where HotSpot
+/// returned in 0-1 ms — see
+/// docs/known-issues/jdk-only/W7-23-thread-container-registration.md §4. That is
+/// why the registration half in `native-builtins/src/shared_secrets_bridge.rs`
+/// is interlocked off behind `VM_REMOVES_THREADS_FROM_CONTAINERS` until this
+/// exists: adding a thread to a container that is never emptied converts
+/// "`join()` waits for nothing" into "`join()` waits forever".
+///
+/// # Why this is called before any teardown step, not after
+///
+/// `exit()` runs arbitrary Java: it can allocate, it can reach a safepoint, and
+/// `StackableScope.popAll()` is documented "this may block". So it must run
+/// while the caller is still an ordinary live mutator. Every step that follows
+/// on both death paths removes a precondition it needs:
+///
+/// * `tlab.retire()` — fills the TLAB's unused tail with a walkable filler.
+///   Allocating after that is not unsound (`retire()` is idempotent and the
+///   next carve refills), but it is pointless churn on a thread that has been
+///   declared finished.
+/// * `enter_inflated_or_contend(wake_obj)` — from there the caller OWNS the
+///   monitor on its own `Thread` object. Running Java that blocks while holding
+///   it is the three-way deadlock `Monitor::block_enter`'s doc comment warns
+///   about, and `block_enter` never checks safepoints.
+/// * `flush_thread_satb()` — after the drain, any reference this thread
+///   overwrites is logged into a buffer whose only strong `Arc` dies with the
+///   OS thread, so a marker loses gray sources it needed.
+/// * `mark_dead()` — after it the collector no longer scans this thread's
+///   frames or locals. Java run past that point allocates objects nothing roots:
+///   a use-after-free, not a cleanup.
+/// * `release_monitors_held_by_except()` — sweeps every monitor still held.
+///
+/// The one thing that must precede it is the uncaught-exception dispatch, and
+/// not only for tidiness: `clearReferences()` nulls `uncaughtExceptionHandler`,
+/// so running `exit()` first would delete the handler before it was consulted.
+/// HotSpot orders it the same way — `JavaThread::exit` calls `Thread.exit()`
+/// after the handler has run and before it posts JVMTI `ThreadEnd` and before
+/// `ensure_join`'s notify — so the call sites place this between the handler
+/// block and the JFR/JVMTI thread-end events.
+///
+/// # Resolution
+///
+/// `exit` is `private`, so it is resolved on `java/lang/Thread` itself rather
+/// than on the receiver's runtime class: a `Thread` subclass (or
+/// `ThreadBuilders$BoundVirtualThread`, which every "virtual" thread on this VM
+/// really is) does not inherit a private method into its own dispatch surface,
+/// and a same-named method on the subclass must NOT win. `invoke_special_shared_on_class`
+/// is the entry point that says exactly that — invokespecial semantics, walk to
+/// the declaring class, dispatch there and only there, no iface/abstract
+/// retarget — and its pre-resolved form skips the loader-blind by-name lookup
+/// (`java/lang/Thread` is bootstrap and unambiguous, but the ambiguity guard is
+/// not free and not worth touching from a thread-death path).
+///
+/// # Errors are reported, never propagated
+///
+/// A throw out of `exit()` cannot be allowed to escape: everything after this
+/// call on both paths is what marks the thread dead and notifies the monitor
+/// that wakes `Thread.join()`, so an early return would trade one leak for a
+/// guaranteed hang. It is equally not swallowed — a silent `let _ =` here would
+/// hide, for instance, `ThreadFlock.onExit`'s `assert removed` firing under
+/// `-ea`, which is the precise signature of a double-remove. So: log at WARN,
+/// unconditionally, naming the thread and the error, and carry on.
+fn run_thread_exit_shared(shared: &SharedVm, thread: &mut JvmThread, thread_obj: ObjectRef) {
+    // Resolve `java/lang/Thread` without loading it: a thread that is
+    // terminating has already run Java, so the class is loaded. Then check
+    // `exit()V` is actually there before invoking, so a class library whose
+    // `java/lang/Thread` is a stub without it (a `--synthetic-jdk` build; every
+    // mode this binary ships supports has the real one) is a silent no-op
+    // rather than a `NoSuchMethodError` warning on every single thread death.
+    //
+    // Routed through `MemberResolver` rather than a bare `find_method_recursive`
+    // -- same idiom as `native_override.rs`'s `native_override_target_has_bytecode`.
+    // Also populates the per-VM `LinkResolver` with the resolution
+    // `invoke_special_shared_on_class` below will ask for anyway.
+    let (thread_cid, has_exit) = {
+        let cm = shared.classes.class_manager.read();
+        match cm.get_loaded_class_id("java/lang/Thread") {
+            Some(cid) => {
+                let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+                let has_exit = resolver
+                    .declared_method(&cm, resolver.scope(cid), "exit", "()V")
+                    .is_ok();
+                (Some(cid), has_exit)
+            }
+            None => (None, false),
+        }
+    };
+    let Some(thread_cid) = thread_cid.filter(|_| has_exit) else {
+        return;
+    };
+
+    let result = invoke_special_shared_on_class(
+        shared,
+        thread,
+        thread_cid,
+        "java/lang/Thread",
+        "exit",
+        "()V",
+        &[Value::Object(Some(thread_obj))],
+    );
+    if let Err(e) = result {
+        // Drain the native-return slot for the same reason the uncaught-handler
+        // block a few hundred lines down drains it: a leftover there is read as
+        // a substitute for a thrown exception by the next consumer, and
+        // misattributes it.
+        thread.native_pending_return = None;
+        tracing::warn!(
+            "Thread.exit() failed on terminating thread tid={} name={:?}: {:?} — its \
+             Java-side cleanup (StackableScope.popAll / container.remove / \
+             clearReferences) did not complete, so a ThreadContainer may still hold \
+             this thread. Termination continues regardless, so Thread.join() is \
+             still woken.",
+            thread.thread_id.0,
+            thread.name,
+            e,
+        );
+    }
 }
 
 #[inline]
@@ -5233,7 +5577,21 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(exc) = self.thread.pending_async_exception {
             snapshot.push(exc);
         }
-        let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+        // COLLECTOR FIRST. `moving_young_enabled()` ANDs a JIT-side gate with
+        // `flags().gc.moving_young` and consults the collector in neither, so
+        // under G1 and ZGC this whole question is inert — and answering it is
+        // not free: `refresh_moving_young_coverage_for_current_thread` ends in
+        // an UNMEMOISED `native_stack_has_jit_frame` over the full band, on
+        // every blocked-region entry.
+        //
+        // Measured on `DefaultCatalogAndSchemaTest` under the default (ZGC)
+        // collector, 240 s: the probe ran 1,139,842 times reading 35.2 BILLION
+        // stack words. With the moving-young term forced off
+        // (`CRATONVM_NO_MOVING_YOUNG=1`) it ran 494,968 times reading 15.3
+        // billion — exactly one probe per blocked deposit instead of two, and
+        // 20 billion fewer words, for a decision no non-moving collector reads.
+        let moving_young_precise_only = self.shared.mem.heap.is_generational()
+            && crate::jit::conservative_roots::moving_young_enabled()
             && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
             && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
 
@@ -5267,6 +5625,7 @@ impl<'a> NativeContextImpl<'a> {
         // runs non-moving while any thread is in JIT, so nothing is relocated).
         if !moving_young_precise_only {
             let jit_scan_start = snapshot.len();
+            crate::memory::native_roots::rootprof::note_scan_caller(2); // blocked-deposit
             crate::jit::conservative_roots::scan_active_jit_frames(
                 &self.shared.mem.heap,
                 &mut snapshot,
@@ -7203,7 +7562,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         };
         let mut proxies = self.shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
-            proxies.insert(proxy_class_id, call_site);
+            proxies.insert(proxy_class_id, Arc::new(call_site));
             proxy_class_id.as_u32()
         } else {
             0
@@ -11602,6 +11961,61 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // with its slot count. Field-less Object allocations (`new Object()`
         // and array-element class hints) are unaffected.
         let class_id = if class_id == ClassId::new(0) && num_fields > 0 {
+            // LAYOUT-ALIAS CENSUS, THE SHORT-OBJECT HALF (W7-73, 2026-08-12).
+            // This observation must stay ABOVE the substitution below and above
+            // the `anon_class_cache` early `return`, and both halves of that are
+            // load-bearing.
+            //
+            // The substitution replaces `ClassId::new(0)` with
+            // `cratonvm/synthetic/AnonymousObject$N`, which declares exactly
+            // `N`. So every one of these allocations arrives at the census
+            // downstream as `classify(n, n)` — perfect agreement — and prints
+            // nothing in either direction. The caller, meanwhile, resolved a
+            // class and FAILED, then handed the object out as an instance of
+            // the class it named: 30 production sites in the native crates
+            // spell `alloc_object(ClassId::new(0), N)`, and 16 of them name a
+            // class whose real JDK 25 layout is WIDER than `N` — `ZipEntry` 6
+            // against 14, `Pattern` 2 against 20, `ServiceLoader` 2 against 10,
+            // and `java/lang/Thread` 5 against 19 at two sites that are not
+            // even fallback arms. Those are the genuinely short objects, and
+            // both directions of the census were structurally blind to all of
+            // them: `under` cannot fire because the clamp runs first, and this
+            // path cannot fire because the substitution makes the widths agree.
+            //
+            // Reported as `declared = 0` under `layout_alias::UNRESOLVED_CLASS`
+            // rather than as the substitute's name, because the honest statement
+            // is "no declared layout was available here", not "an
+            // AnonymousObject$N was allocated at its exact width".
+            //
+            // OBSERVATION ONLY, and no `else`: the substitution, the cache, the
+            // clamp and the returned object are byte-for-byte what they were.
+            // With the flag off the cost is one `OnceLock` load and one
+            // predictable branch — the same price the base observation below
+            // pays, and paid only by allocations that already took this
+            // untyped-allocation branch.
+            if cratonvm_native_api::layout_alias::enabled() {
+                let frames: Vec<String> = self
+                    .thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .map(|f| {
+                        format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor())
+                    })
+                    .collect();
+                let site = if frames.is_empty() {
+                    "<no java frame>".to_string()
+                } else {
+                    frames.join(" <- ")
+                };
+                let _ = cratonvm_native_api::layout_alias::observe(
+                    cratonvm_native_api::layout_alias::UNRESOLVED_CLASS,
+                    num_fields,
+                    0,
+                    cratonvm_native_api::layout_alias::AllocSite::Java(site.as_str()),
+                );
+            }
             // One synthetic class per distinct field count, shared across
             // all callers — keeps the class store from growing unbounded.
             //
@@ -11773,6 +12187,73 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 resolved.unwrap_or(0)
             }
         };
+        // LAYOUT-ALIAS CENSUS (W7-59, 2026-08-12). This is the terminal every
+        // native object allocation in every native crate reaches — the ~200
+        // production `alloc_object` / `try_alloc_object_gc_safe` sites in
+        // `native-builtins`, `native-io` and `native-collections` that bypass
+        // `try_alloc_concurrent_synthetic`, and the funnel's own allocation too.
+        // Until this line the detector sat on the funnel alone, so
+        // `CRATONVM_DBG_LAYOUT_ALIAS=1` could not name a single direct site —
+        // including `native-io`'s `AsynchronousSocketChannel`, allocated four
+        // slots wide against a class declaring one, which is the widest LIVE
+        // over-allocation W7-49-slot-index-recensus.md found.
+        //
+        // OBSERVATION ONLY. It cannot change what is allocated: `slots` below is
+        // computed exactly as before, from exactly the same two integers, and
+        // this block has no `else`. With the flag off (the default, and every
+        // Compatible-mode run that has not opted in) the cost is one `OnceLock`
+        // load and one predictable branch — no class name is resolved, no frame
+        // is formatted, no lock is taken. The comparison itself is free because
+        // `real_fields` is already in hand for the clamp; nothing is looked up
+        // for the census's sake.
+        //
+        // `#[track_caller]` was considered and rejected here: it would add a
+        // hidden argument to every native allocation plus a reify shim on the
+        // `dyn NativeContext` vtable, paid in every run, to serve a flag that is
+        // off in almost all of them. The Java frames are already a `Vec` on this
+        // thread and are formatted only when a row is about to print — and they
+        // answer the better question, because a Rust source location says a site
+        // EXISTS while a Java frame says the path RAN, which is the
+        // LIVE-versus-dead distinction last-write-wins registration makes
+        // unanswerable from source alone.
+        if cratonvm_native_api::layout_alias::enabled()
+            && cratonvm_native_api::layout_alias::classify(num_fields, real_fields).is_some()
+        {
+            // `get_class` answering `None` is not a missing name — it is the
+            // reason `real_fields` is 0, and it is one of the three shapes
+            // `direction=undeclared` covers (a stale id, or a class observed
+            // mid-registration, which is exactly why the field-count cache above
+            // refuses to memoise a zero). An empty `class` field would have
+            // reported it as a nameless nothing; say which id it was, so the
+            // reader can tell it from an interface allocated at N slots.
+            let class_name = self
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| format!("<unregistered:ClassId({})>", class_id.as_u32()));
+            let frames: Vec<String> = self
+                .thread
+                .frames
+                .iter()
+                .rev()
+                .take(4)
+                .map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor()))
+                .collect();
+            let site = if frames.is_empty() {
+                "<no java frame>".to_string()
+            } else {
+                frames.join(" <- ")
+            };
+            let _ = cratonvm_native_api::layout_alias::observe(
+                class_name.as_str(),
+                num_fields,
+                real_fields,
+                cratonvm_native_api::layout_alias::AllocSite::Java(site.as_str()),
+            );
+        }
         let slots = num_fields.max(real_fields);
         if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
             if let Some(obj) = self.thread.native_alloc_pool.pop() {
@@ -11851,6 +12332,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.allocated_bytes()
     }
 
+    fn current_thread_allocated_bytes(&self) -> Option<u64> {
+        Some(self.thread.tlab.thread_allocated_bytes())
+    }
+
     fn committed_heap_bytes(&self) -> usize {
         self.shared.mem.heap.committed_bytes()
     }
@@ -11912,6 +12397,94 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // write_barrier fires automatically inside set_field_volatile в†’ set_field
     }
 
+    /// Hardware `fetch_add` on an `int` field — the override the trait's
+    /// default impl has always asked for ("the VM override should map this to
+    /// a single `LOCK XADD`").
+    ///
+    /// This is not only a speed-up over the CAS retry loop: it is what puts the
+    /// native path in the SAME atomicity domain as the JIT's ATOMIC_INT
+    /// intrinsic. While this was the default lock-based loop, a compiled
+    /// `LOCK XADD` and an interpreted increment on one counter lost updates
+    /// (24,908 of 600,000 in `MixAtom`), which corrupted
+    /// `LinkedBlockingQueue`'s element count and hung
+    /// `DefaultPromiseTest.testListenerNotifyOrder`.
+    fn atomic_fetch_add_int(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i32,
+    ) -> Result<i32, MethodCallFailed> {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        if let Some(addr) = hw_atomic_addr(self.shared, obj, index, HwAtomicKind::Int) {
+            // SAFETY: `addr` is a live, forwarded, aligned `int` payload in a
+            // correctly tagged cell (see `hw_atomic_addr`); this single atomic
+            // cannot reach a safepoint, so the object cannot move under it.
+            let cell = unsafe { hw_atomic_i32(addr) };
+            return Ok(cell.fetch_add(delta, std::sync::atomic::Ordering::SeqCst));
+        }
+        // Fall back to the trait's CAS retry loop for anything the hardware
+        // path refused (non-`int` slot, unresolvable layout, misalignment).
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Int(v) => v,
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_int: field {} on object is not Int: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
+            };
+            let new_val = Value::Int(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return Ok(old);
+            }
+        }
+    }
+
+    /// Hardware `fetch_add` on a `long` field — the `AtomicLong` analogue of
+    /// [`Self::atomic_fetch_add_int`], and unified for the same reason: a
+    /// future 64-bit atomic intrinsic must be in the same domain as this.
+    fn atomic_fetch_add_long(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i64,
+    ) -> Result<i64, MethodCallFailed> {
+        let obj = self.shared.mem.heap.load_and_forward(obj);
+        if let Some(addr) = hw_atomic_addr(self.shared, obj, index, HwAtomicKind::Long) {
+            // SAFETY: see `atomic_fetch_add_int`.
+            let cell = unsafe { hw_atomic_i64(addr) };
+            return Ok(cell.fetch_add(delta, std::sync::atomic::Ordering::SeqCst));
+        }
+        loop {
+            let current = self.get_field_volatile(obj, index);
+            let old = match current {
+                Value::Long(v) => v,
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_long: field {} on object is not Long: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
+            };
+            let new_val = Value::Long(old.wrapping_add(delta));
+            if self.compare_and_swap_field(obj, index, current, new_val) {
+                return Ok(old);
+            }
+        }
+    }
+
     fn compare_and_swap_field(
         &mut self,
         obj: ObjectRef,
@@ -11919,6 +12492,76 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         expected: Value,
         new_val: Value,
     ) -> bool {
+        // An `int`-to-`int` CAS goes to the hardware, for the same reason
+        // `atomic_fetch_add_int` does: `AtomicInteger.compareAndSet` and a
+        // compiled `LOCK XADD` must be atomic against each other, and a
+        // lock-based read-compare-write is not. No SATB pre-barrier and no
+        // write barrier here — the payload is primitive, so no reference is
+        // overwritten and none escapes.
+        let fwd = self.shared.mem.heap.load_and_forward(obj);
+        match (expected, new_val) {
+            (Value::Int(exp), Value::Int(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Int) {
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_i32(addr) };
+                    return cell
+                        .compare_exchange(
+                            exp,
+                            new,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                }
+            }
+            (Value::Long(exp), Value::Long(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Long) {
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_i64(addr) };
+                    return cell
+                        .compare_exchange(
+                            exp,
+                            new,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                }
+            }
+            (Value::Object(exp), Value::Object(new)) => {
+                if let Some(addr) = hw_atomic_addr(self.shared, fwd, index, HwAtomicKind::Reference)
+                {
+                    // The payload word of a reference cell IS the raw pointer,
+                    // zero for a JVM null, and `values_equal_for_cas` compares
+                    // references by exactly that pointer — so a bit-level CAS
+                    // keeps the lock path's semantics.
+                    let exp_raw = exp.map_or(0usize, |r| r.as_ptr() as usize);
+                    let new_raw = new.map_or(0usize, |r| r.as_ptr() as usize);
+                    // SATB pre-barrier BEFORE the store, preserving (pre,
+                    // store, post) ordering. Firing it on `expected` rather
+                    // than on a re-read is what HotSpot does for a CAS: on
+                    // success `expected` IS the overwritten value, and on
+                    // failure the extra enqueue only over-approximates the
+                    // live set, which SATB is allowed to do.
+                    self.shared.mem.heap.satb_barrier(expected);
+                    // SAFETY: see `atomic_fetch_add_int`.
+                    let cell = unsafe { hw_atomic_usize(addr) };
+                    let swapped = cell
+                        .compare_exchange(
+                            exp_raw,
+                            new_raw,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_ok();
+                    if swapped {
+                        self.shared.mem.heap.write_barrier(fwd, new_val);
+                    }
+                    return swapped;
+                }
+            }
+            _ => {}
+        }
         // T19_H6: descriptor-aware CAS read+write so a long instance field
         // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
         let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
@@ -13042,6 +13685,29 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     eprintln!("Thread {} terminated with error: {:?}", tid, e);
                 }
             }
+            // Java-side thread teardown — `Thread.exit()`, which HotSpot's VM
+            // calls here and this VM never called at all. See
+            // `run_thread_exit_shared` for the JDK body, the measurement, and
+            // the full argument for why this sits exactly here.
+            //
+            // Deliberately OUTSIDE the `if let Err(e) = result` block above, so
+            // it runs on the normal and the abnormal path alike. The abnormal
+            // one is the one that matters most: a task that ends by throwing is
+            // precisely when a structured-concurrency owner is parked waiting
+            // for the flock count to fall, and a cleanup that only covers the
+            // happy path leaves exactly the leak this fixes.
+            //
+            // Re-read the `Thread` object from the registry rather than reusing
+            // `run_thread_obj` from before the `run()` invoke: the registry copy
+            // is remapped after every GC (`update_thread_objs_after_gc`) and the
+            // captured one is not, and `run()` plus the uncaught dispatch is an
+            // arbitrarily long window for a moving collection — the same stale-ref
+            // UAF the `wake_obj` read further down documents.
+            let exit_thread_obj = shared_arc
+                .threads.thread_registry
+                .java_thread_obj(tid)
+                .unwrap_or(thread_obj_for_spawn);
+            run_thread_exit_shared(&shared_arc, &mut jvm_thread, exit_thread_obj);
             // (No carrier-permit release on exit: unreachable here — see the
             // note at the top of this closure — and the permit pool it
             // targeted owned no carrier.)
@@ -15103,13 +15769,35 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
 
     fn jfr_begin_java_recording(&mut self) {
         let mut active = self.shared.debug.jfr_java_recording.lock();
-        if active.is_some() {
-            return;
-        }
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let id = recorder.new_recording(cratonvm_jfr::RecordingSettings::new("jdk.jfr"));
-        recorder.start_recording(id);
-        *active = Some(id);
+        // A recording that is STILL RUNNING is the one to keep: two concurrent
+        // `RecordingStream`s (or a stream alongside a `Recording`) share it, and
+        // beginning again must not replace it under the other one.
+        //
+        // A recording that has already been STOPPED must not be reused, and this
+        // used to `return` on `active.is_some()` without looking. `Recording
+        // ::start()` only transitions out of `New`, so the stopped recording
+        // stayed stopped — and because the early return also skipped the
+        // `jfr_java_recording_running` store, `Event.isEnabled()` answered
+        // `false` for every recording after the first in a process.
+        //
+        // That is what made netty's `JfrEventsTest` fail 9 of its 10 tests while
+        // the first one to run passed: each test opens its own `RecordingStream`,
+        // and only the first got a live recording.
+        let reusable = active.filter(|id| {
+            recorder.get_recording(*id).map(|rec| rec.state)
+                == Some(cratonvm_jfr::recording::RecordingState::Running)
+        });
+        if reusable.is_none() {
+            // Release the finished recording's event ring rather than leaving it
+            // in the map for the life of the process.
+            if let Some(previous) = *active {
+                recorder.discard_recording(previous);
+            }
+            let id = recorder.new_recording(cratonvm_jfr::RecordingSettings::new("jdk.jfr"));
+            recorder.start_recording(id);
+            *active = Some(id);
+        }
         self.shared
             .debug
             .jfr_java_recording_running
@@ -15135,15 +15823,84 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn jfr_emit_java_event(&mut self, event_class: &str, start_ns: u64, duration_ns: u64) {
-        let event_name = format!("jdk.JavaEvent.{}", event_class.replace('/', "."));
+    fn jfr_emit_java_event(
+        &mut self,
+        event_name: &str,
+        fields: &[(String, String, Value)],
+        start_ns: u64,
+        duration_ns: u64,
+    ) {
+        // Resolve the payload BEFORE taking the recorder lock: reading a
+        // `String` field's characters goes back through `self`, and the
+        // recorder guard would still be held.
+        let mut declared: Vec<cratonvm_jfr::EventField> = Vec::with_capacity(fields.len());
+        let mut values = cratonvm_jfr::EventFields::new();
+        for (name, descriptor, value) in fields {
+            // The descriptor decides the JFR field type; `Value` alone cannot
+            // (CratonVM represents boolean/byte/char/short/int all as
+            // `Value::Int`). A descriptor with no JFR counterpart — any
+            // reference type other than `String`, or an array — is dropped
+            // from BOTH the declaration and the payload, so the two stay the
+            // same length and the event still carries every field the format
+            // can describe.
+            let (type_name, encoded) = match descriptor.as_str() {
+                "Z" => (
+                    "boolean",
+                    cratonvm_jfr::EventValue::Boolean(value.as_int().unwrap_or(0) != 0),
+                ),
+                "B" | "C" | "S" | "I" => (
+                    "int",
+                    cratonvm_jfr::EventValue::Int(value.as_int().unwrap_or(0)),
+                ),
+                "J" => (
+                    "long",
+                    cratonvm_jfr::EventValue::Long(match value {
+                        Value::Long(v) => *v,
+                        other => other.as_int().unwrap_or(0) as i64,
+                    }),
+                ),
+                "F" => (
+                    "float",
+                    cratonvm_jfr::EventValue::Float(match value {
+                        Value::Float(v) => *v,
+                        _ => 0.0,
+                    }),
+                ),
+                "D" => (
+                    "double",
+                    cratonvm_jfr::EventValue::Double(match value {
+                        Value::Double(v) => *v,
+                        _ => 0.0,
+                    }),
+                ),
+                "Ljava/lang/String;" => (
+                    "string",
+                    match value {
+                        Value::Object(Some(text)) => match self.read_string(*text) {
+                            Some(text) => cratonvm_jfr::EventValue::String(text.into()),
+                            None => cratonvm_jfr::EventValue::Null,
+                        },
+                        _ => cratonvm_jfr::EventValue::Null,
+                    },
+                ),
+                _ => continue,
+            };
+            declared.push(cratonvm_jfr::EventField::new(name, type_name, ""));
+            values.push(encoded);
+        }
+
+        let thread_id = self.thread.thread_id.0;
         let mut recorder = self.shared.debug.flight_recorder.lock();
+        // `register` is keyed by name and returns the existing id for a name it
+        // already knows, so the first commit of an event name fixes its field
+        // list for the rest of the process — which is what the chunk writer
+        // needs, since one metadata declaration has to describe every instance.
         let type_id = recorder.type_registry.register(cratonvm_jfr::EventType {
             id: cratonvm_jfr::EventTypeId::INVALID,
-            name: event_name,
+            name: event_name.to_owned(),
             category: vec!["Java Application".to_owned()],
             description: "Event committed through the real-JDK jdk.jfr.Event bridge".to_owned(),
-            fields: Vec::new(),
+            fields: declared,
             has_thread: true,
             has_stacktrace: false,
             period: cratonvm_jfr::EventPeriod::BeginEnd,
@@ -15152,13 +15909,49 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         if type_id.is_invalid() {
             return;
         }
+        // A later commit of the same event name whose field count disagrees
+        // with the registered declaration would be dropped by the writer; log
+        // it here where the name is still in hand instead of leaving the drop
+        // unexplained at dump time.
+        if let Some(registered) = recorder.type_registry.get(type_id) {
+            if registered.fields.len() != values.len() {
+                tracing::debug!(
+                    event = %event_name,
+                    declared = registered.fields.len(),
+                    committed = values.len(),
+                    "jdk.jfr.Event commit disagrees with the field list registered for this \
+                     event name; the event will be dropped from a dump"
+                );
+            }
+        }
         recorder.record_event(cratonvm_jfr::EventInstance {
             type_id,
             start_time: start_ns,
             end_time: start_ns.saturating_add(duration_ns),
-            thread_id: self.thread.thread_id.0,
-            fields: cratonvm_jfr::EventFields::new(),
+            thread_id,
+            fields: values,
         });
+    }
+
+    fn jfr_configure_java_recording(
+        &mut self,
+        enabled_names: Option<&[String]>,
+        thresholds: &[(String, u64)],
+    ) {
+        let id = *self.shared.debug.jfr_java_recording.lock();
+        let Some(id) = id else {
+            return;
+        };
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        let Some(recording) = recorder.get_recording_mut(id) else {
+            return;
+        };
+        recording.settings.enabled_event_names =
+            enabled_names.map(|names| names.iter().cloned().collect());
+        recording.settings.event_thresholds_by_name = thresholds
+            .iter()
+            .map(|(name, nanos)| (name.clone(), *nanos))
+            .collect();
     }
 
     fn jfr_set_java_output(&mut self, path: &str) {
@@ -15174,15 +15967,13 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .debug
             .jfr_java_recording_running
             .store(false, std::sync::atomic::Ordering::Release);
-        if let Err(error) = self
-            .shared
-            .debug
-            .flight_recorder
-            .lock()
-            .dump_recording(id, std::path::Path::new(path))
-        {
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        if let Err(error) = recorder.dump_recording(id, std::path::Path::new(path)) {
             tracing::warn!(path = %path, %error, "failed to dump Java JFR recording");
         }
+        // The id was `take`n above, so nothing can reach this recording again;
+        // drop it rather than leaving its event ring alive for the process.
+        recorder.discard_recording(id);
     }
 
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
@@ -24850,9 +25641,18 @@ fn invoke_on_class_shared_inner(
             // returned NULL" sentinel (-1) where HotSpot returned 27.
             //
             // The encoding is the one the rest of this JNI table uses for a
-            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
+            // `JClass`: `class_id_to_jclass`, exactly what `FindClass` hands
+            // back. It must go through that helper and not `as u32`: a bare
+            // `ClassId` of 0 IS JNI NULL, and an untagged one is not
+            // recognisable as a class by `NewGlobalRef`. JNA's `initIDs` does
+            // `NewGlobalRef(cls)` on precisely this argument and reported
+            // `UnsatisfiedLinkError: Can't obtain global reference for class
+            // com.sun.jna.Native` when the two encodings disagreed.
             let (receiver, call_args) = if is_static {
-                (declaring_class_id.as_u32() as u64, args)
+                (
+                    crate::native::jni::class_id_to_jclass(declaring_class_id),
+                    args,
+                )
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),
@@ -24952,9 +25752,18 @@ fn invoke_on_class_shared_inner(
             // returned NULL" sentinel (-1) where HotSpot returned 27.
             //
             // The encoding is the one the rest of this JNI table uses for a
-            // `JClass`: the raw `ClassId`, exactly what `FindClass` hands back.
+            // `JClass`: `class_id_to_jclass`, exactly what `FindClass` hands
+            // back. It must go through that helper and not `as u32`: a bare
+            // `ClassId` of 0 IS JNI NULL, and an untagged one is not
+            // recognisable as a class by `NewGlobalRef`. JNA's `initIDs` does
+            // `NewGlobalRef(cls)` on precisely this argument and reported
+            // `UnsatisfiedLinkError: Can't obtain global reference for class
+            // com.sun.jna.Native` when the two encodings disagreed.
             let (receiver, call_args) = if is_static {
-                (declaring_class_id.as_u32() as u64, args)
+                (
+                    crate::native::jni::class_id_to_jclass(declaring_class_id),
+                    args,
+                )
             } else {
                 let recv = match args.first() {
                     Some(Value::Object(Some(r))) => crate::native::jni::obj_to_jobject(*r),

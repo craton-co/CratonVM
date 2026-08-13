@@ -8,21 +8,30 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
 
-/// POSIX permits a blocking socket read to be interrupted before it consumes
-/// bytes. Retry that transient condition instead of exposing it as a Java EOF
-/// or a zero-length read. Some socket wrappers preserve Linux EINTR only as
-/// raw OS error 4, so accept both representations.
-fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-        match reader.read(buf) {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
-            {
-                continue
-            }
-            result => return result,
-        }
-    }
+/// The deadline a `java/net/SocketInputStream` read must honour, derived from
+/// the socket's own `SO_RCVTIMEO`.
+///
+/// This is the rule W7-53 states per regime: a syscall that is no longer issued
+/// until the socket is ready is a syscall `SO_RCVTIMEO` can never bound. The
+/// close-aware read parks in `poll` and only then reads, so without this the
+/// timeout a caller set with `setSoTimeout` would never fire and the fix for one
+/// hang would have introduced another. `SO_RCVTIMEO` stays set and remains the
+/// first line; this is what still ends the park where it cannot.
+///
+/// `None` — no timeout configured, or the query itself failed — means "no
+/// deadline", which is what an untimed socket asked for. Guessing one would be
+/// the `SocketTimeoutException`-on-a-socket-with-no-timeout regression that
+/// record names as its own falsifier.
+///
+/// (The private `read_retry_eintr` that used to sit here went with its last
+/// caller: the three reads below were its only users and
+/// `re1_read_close_aware` reissues EINTR itself.)
+fn sis_read_deadline(stream: &std::net::TcpStream) -> Option<std::time::Instant> {
+    stream
+        .read_timeout()
+        .ok()
+        .flatten()
+        .map(|d| std::time::Instant::now() + d)
 }
 
 #[cfg(feature = "legacy-synthetic-crypto")]
@@ -7551,20 +7560,21 @@ pub(crate) fn register_currency_natives(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(digits)))
     });
+    // W7-80: the real body is
+    // `getSymbol(Locale.getDefault(Locale.Category.DISPLAY))`, so this answer is
+    // locale-sensitive — `RUB` renders `₽` on a ru host and the bare code `RUB`
+    // on an en one. It used to be a locale-INDEPENDENT four-entry table: right
+    // for USD/EUR/GBP/JPY in every locale, and the bare ISO code for everything
+    // else in every locale. Shares `cldr_currency_symbol` with the 1-arg
+    // overload in `locale_resources`, so the two call forms cannot drift.
     r.register(c, "getSymbol", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let code = match ctx.get_field(this, 0) {
             Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
             _ => String::new(),
         };
-        let sym = match code.as_str() {
-            "USD" => "$",
-            "EUR" => "\u{20AC}",
-            "GBP" => "\u{00A3}",
-            "JPY" => "\u{00A5}",
-            _ => &code,
-        };
-        let s = ctx.create_string(sym);
+        let sym = crate::locale_resources::currency_symbol_for_default_locale(ctx, &code);
+        let s = ctx.create_string(&sym);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(c, "getDisplayName", "()Ljava/lang/String;", |ctx, args| {
@@ -7644,7 +7654,7 @@ pub(crate) fn register_exchanger_natives(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let unit_ordinal = match args.get(3) {
-                Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+                Some(Value::Object(Some(u))) => crate::time_unit_ordinal(ctx, *u),
                 _ => 2,
             };
             let timeout_ms = crate::convert_time_unit_to_millis(timeout_val, unit_ordinal);
@@ -8850,6 +8860,26 @@ pub(crate) fn fjp_quietly_body(
 /// The `method_exists` half is what makes this safe in synthetic-JDK mode,
 /// where the task classes are fabricated stubs with no `setRawResult` to call:
 /// it answers `false` there and the caller takes the side-table-only path.
+///
+/// **How narrow the `false` arm actually is, measured (W7-48).** All three
+/// names in the `matches!` below are ABSTRACT classes, so that arm can only
+/// fire on a receiver whose RUNTIME class is literally one of them — which no
+/// Java program can produce. A user subclass of `RecursiveTask` does not
+/// name-match (its class is `Foo$1`), and `NativeContext::method_exists` walks
+/// the superclass chain (`vm/src/vm/vm_exec.rs`), so it finds the inherited
+/// `protected final setRawResult` and this function answers `true`. The caller
+/// then invokes the virtual — which resolves straight back to the registered
+/// `RecursiveTask.setRawResult` native, i.e. to the same side-table write, by a
+/// longer route. The predicate is therefore behaviourally right in every
+/// reachable case, but NOT for the reason the paragraph above gives: a
+/// `RecursiveTask` / `RecursiveAction` subclass has no field of its own either,
+/// and its `setRawResult` is `final` so it cannot acquire one.
+///
+/// The consequence worth knowing: the side-table-only arm of
+/// `fjp_complete_body` — and therefore [`fjp_state_set_raw_result`] — is
+/// defence in depth, not a live path, and cannot be falsified from Java. Do
+/// not write a corpus assertion claiming to cover it; it would be green before
+/// and after.
 fn fjt_has_own_raw_result_slot(ctx: &mut dyn NativeContext, task: ObjectRef) -> bool {
     let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(task)) else {
         return false;
@@ -11329,11 +11359,168 @@ pub(crate) fn register_phase52_natives(registry: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // java.time.Month enum — 1-field synthetic (field 0 = Int ordinal 1..12)
 // ---------------------------------------------------------------------------
+//
+// W7-77-guarded-slot-maps.md. Slot 0 is `value` ONLY on the fabricated
+// synthetic `java/time/Month`. On the real JDK 25 class it is something else
+// entirely: `java.time.Month` declares no instance fields of its own, and
+// `javap -p java.lang.Enum` on Eclipse Adoptium 25.0.3.9 gives the whole
+// transitive layout as
+//
+//     0 name (java.lang.String)   1 ordinal (int)   2 hash (int)
+//
+// so slot 0 is `Enum.name`, a String REFERENCE, and every `set_field` below
+// puts a `Value::Int` into it.
+//
+// WHAT THAT ACTUALLY COSTS was measured for W7-77 and is *not* what
+// W7-69-read-side-alias-instrument.md §6 predicted. That record called this
+// "the sharpest shape in the census" and said an escape would leave "a bogus
+// pointer for the collector to mark and move". It would not: both write paths
+// screen the `Value` tag before anything reaches the collector.
+//
+//   * Compact layout (`CRATONVM_COMPACT_REF_FIELDS`, ON by default) —
+//     `types::field_layout::write_compact_field`'s `FieldStorageKind::Reference`
+//     arm maps every non-`Object` `Value` through `_ => 0`. The Int is DROPPED
+//     and the slot reads back null.
+//   * Legacy 16-byte cells — `gc::gen_heap::for_each_ref_slot`'s final arm
+//     matches on the stored `Value` tag (`Value::Object(Some(_))`), not on the
+//     class's declared refs, so an `Int` cell is never visited.
+//
+// So this is a wrong ANSWER, not heap corruption, on both layouts. The real
+// consequence of an escape is quieter and still bad: the write nulls
+// `Enum.name` on a SHARED enum constant, and `getValue()` then reads
+// `Object(None)`, whose `.as_int()` is `None`, so `unwrap_or(1)` answers
+// JANUARY for every month of the year.
+//
+// UPDATED 2026-08-12 — W7-84-primitive-in-reference-store.md. The compact
+// bullet above was true of `zgc`, `g1` and `heap` and NOT of `gen_heap`, which
+// boxed the value into an `AUTOBOX_CLASS_ID` wrapper and un-boxed it on read;
+// that three-way disagreement was itself the defect, and all four have now
+// converged on boxing. An escape therefore no longer nulls `Enum.name` on any
+// collector, and JANUARY-for-every-month is no longer the failure mode.
+//
+// It has not become harmless, and the witness below is exactly as necessary as
+// it was. The slot now holds a wrapper, so `getValue()` reads its `Int` back
+// correctly while `Enum.name()` — real JDK bytecode reading the same slot as a
+// `String` — gets an object with no class name and no methods. Only the SHAPE
+// of what the guard prevents changed. This note exists so the next reader does
+// not conclude from a green `getValue()` that the witness can go.
+//
+// `month_slot0_is_synthetic` keeps that hypothetical hypothetical. It is the
+// same remedy shape as `vm_exec.rs`'s `eetop` witness for `Thread` and
+// `lang_class.rs`'s `has_named_layout` for `Method`: ask for a field NAME the
+// real class's hierarchy has and the fabricated stub does not. A slot COUNT
+// cannot identify a layout.
+//
+// THERE IS A SECOND, IDENTICAL MAP: `util_time.rs`'s own `MONTH_FIELD_VALUE`
+// (also 0) with its own `alloc_month`. Every one of its five registered
+// triples — `of`, `getValue`, `length(Z)I`, `maxLength`, `minLength` — is
+// overwritten by `register_phase52_time_enums` below, because
+// `register_synthetic_overrides` calls `register_t25_natives` first and
+// `register_phase52_natives` second and `register()` is last-write-wins. It is
+// DEAD, but it is dead by call ORDER, not by construction: reorder those two
+// lines and it becomes the winner. Renumber one of these maps without the
+// other and the tree has two different answers for slot 0.
 const MONTH_FIELD_VALUE: usize = 0;
+
+/// This native's belief about `java/time/Month`, published so
+/// `read_alias::verify_declared_slot_maps` sweeps it against whatever class is
+/// actually loaded.
+///
+/// Deliberately states what this code BELIEVES, not the real JDK layout. A map
+/// that publishes the correct answer sweeps clean and measures nothing — the
+/// point of the declaration is that the sweep reports the disagreement.
+pub static MONTH_SLOT_MAP: cratonvm_native_api::read_alias::SlotMap =
+    cratonvm_native_api::read_alias::SlotMap {
+        class: "java/time/Month",
+        slots: &[(MONTH_FIELD_VALUE, "value")],
+        origin: "native-builtins/src/phases_early.rs MONTH_FIELD_VALUE",
+    };
+
+/// Class-side witness: is this receiver the fabricated 1-field
+/// `java/time/Month` stub, so that slot 0 really is the `int` month value?
+///
+/// Asked by a field name the real class's hierarchy declares and the stub does
+/// not. `java.time.Month` declares no instance fields itself, so the witness
+/// is `java.lang.Enum.name`; `resolve_field_index_by_class_id` searches the
+/// hierarchy, so it resolves on a real `Month` and misses on the stub. Keyed
+/// on the RECEIVER's `ClassId` rather than on the name `java/time/Month`,
+/// because the name-based lookup answers `None` for "two loaders define it" as
+/// well as for "nobody does", and this predicate must not read the first as
+/// the second.
+fn month_slot0_is_synthetic(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "name")
+        .is_none()
+}
+
+/// Write the synthetic month value, refusing on a real-layout receiver.
+///
+/// The refusal is the guard W7-77 added: without it this is `Enum.name := 0`
+/// on a shared enum constant. It cannot fire today (see the registrar note
+/// above — `register_phase52_time_enums` is reachable only from
+/// `register_synthetic_overrides`, which `vm_init.rs` calls only under
+/// `config.use_synthetic_jdk`, and that mode skips boot-classpath discovery
+/// entirely) and `month_registrars_stay_synthetic_only` in
+/// `native-builtins/tests/guarded_slot_maps.rs` is what keeps that true.
+fn month_set_value(ctx: &mut dyn NativeContext, obj: ObjectRef, val: i32) {
+    if cratonvm_native_api::layout_alias::enabled() {
+        cratonvm_native_api::read_alias::observe_read(
+            &*ctx,
+            obj,
+            MONTH_FIELD_VALUE,
+            "value",
+            "native-builtins/src/phases_early.rs::month_set_value (write)",
+        );
+    }
+    if !month_slot0_is_synthetic(&*ctx, obj) {
+        // Real `java.time.Month`: slot 0 is `Enum.name`. Dropping the write is
+        // strictly louder than performing it — performing it nulls the name of
+        // a shared enum constant and still loses the value.
+        return;
+    }
+    ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+}
+
+/// Allocate a synthetic `java/time/Month` carrying `val`.
+///
+/// The one funnel for all four allocation sites, so the witness above cannot
+/// be applied to three of them and forgotten on the fourth — the failure mode
+/// `reference_convert_the_idiom_not_the_sites` names.
+fn month_alloc(ctx: &mut dyn NativeContext, val: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
+    month_set_value(ctx, obj, val);
+    Ok(obj)
+}
+
+/// Read the synthetic month value, defaulting to January (1) exactly as every
+/// call site did before W7-77 routed them through here.
+///
+/// On a real-layout receiver this now answers 1 *because the witness said so*
+/// rather than because `Value::Object(None).as_int()` happened to be `None` —
+/// the same answer, arrived at deliberately, and observed by the census.
+fn month_value(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if cratonvm_native_api::layout_alias::enabled() {
+        cratonvm_native_api::read_alias::observe_read(
+            ctx,
+            this,
+            MONTH_FIELD_VALUE,
+            "value",
+            "native-builtins/src/phases_early.rs::month_value",
+        );
+    }
+    if !month_slot0_is_synthetic(ctx, this) {
+        return 1;
+    }
+    ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1)
+}
 
 pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    // Unconditional, matching `register_io_natives`' publication of
+    // `BB_SLOT_MAP`: gating it on the flag would leave a run that enables
+    // `CRATONVM_DBG_LAYOUT_ALIAS` later with nothing to sweep, which is a
+    // detector reporting clean because it cannot see.
+    cratonvm_native_api::read_alias::declare_slot_map(&MONTH_SLOT_MAP);
     let month = "java/time/Month";
     r.register(month, "of", "(I)Ljava/time/Month;", |ctx, args| {
         let val = args[0].as_int().unwrap_or(1);
@@ -11343,15 +11530,13 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+        let obj = month_alloc(ctx, val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "values", "()[Ljava/time/Month;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
-            let m = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(m, MONTH_FIELD_VALUE, Value::Int(i as i32 + 1));
+            let m = month_alloc(ctx, i as i32 + 1)?;
             ctx.set_array_element(arr, i, Value::Object(Some(m)));
         }
         Ok(Some(Value::Object(Some(arr))))
@@ -11377,40 +11562,46 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                 "DECEMBER" => 12,
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("No enum constant java.time.Month.{name}"),
+                        // Shared with `Enum.valueOf` and the three other
+                        // synthetic enum `valueOf` bodies so the shape cannot
+                        // drift. `java.time.Month` is top-level, so its
+                        // canonical name is its binary name with dots.
+                        message: crate::lang_class::no_enum_constant_message(
+                            "java.time.Month",
+                            &name,
+                        ),
                     }
                     .into())
                 }
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
+            let obj = month_alloc(ctx, val)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(month, "getValue", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, MONTH_FIELD_VALUE)))
+        Ok(Some(Value::Int(month_value(&*ctx, this))))
     });
     r.register(month, "ordinal", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         Ok(Some(Value::Int(v - 1)))
     });
     r.register(month, "name", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let s = ctx.create_string(p52_month_name(v));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(month, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let s = ctx.create_string(p52_month_name(v));
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(month, "length", "(Z)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let leap = args[1].as_int().unwrap_or(0) != 0;
         let len = match v {
             1 => 31,
@@ -11437,7 +11628,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "maxLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let len = match v {
             2 => 29,
             4 | 6 | 9 | 11 => 30,
@@ -11447,7 +11638,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "minLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let len = match v {
             2 => 28,
             4 | 6 | 9 | 11 => 30,
@@ -11457,20 +11648,18 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     });
     r.register(month, "plus", "(J)Ljava/time/Month;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let add = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 + add) % 12 + 12) % 12 + 1) as i32;
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
+        let obj = month_alloc(ctx, new_val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "minus", "(J)Ljava/time/Month;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+        let v = month_value(&*ctx, this);
         let sub = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 - sub) % 12 + 12) % 12 + 1) as i32;
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-        ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
+        let obj = month_alloc(ctx, new_val)?;
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -11479,10 +11668,9 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         "()Ljava/time/Month;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
+            let v = month_value(&*ctx, this);
             let first = ((v - 1) / 3) * 3 + 1;
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(first));
+            let obj = month_alloc(ctx, first)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -11538,7 +11726,10 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                 "SUNDAY" => 7,
                 _ => {
                     return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("No enum constant java.time.DayOfWeek.{name}"),
+                        message: crate::lang_class::no_enum_constant_message(
+                            "java.time.DayOfWeek",
+                            &name,
+                        ),
                     }
                     .into())
                 }
@@ -11807,8 +11998,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(ldt_ref)) = ctx.get_field(this, ODT_FIELD_LDT) {
             let m = ctx.get_field(ldt_ref, 1).as_int().unwrap_or(1);
-            let mo = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
-            ctx.set_field(mo, MONTH_FIELD_VALUE, Value::Int(m));
+            let mo = month_alloc(ctx, m)?;
             Ok(Some(Value::Object(Some(mo))))
         } else {
             Ok(Some(Value::Object(None)))
@@ -12011,7 +12201,10 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
             let tag = p52_chrono_unit_tag(&name);
             if tag < 0 {
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("No enum constant java.time.temporal.ChronoUnit.{name}"),
+                    message: crate::lang_class::no_enum_constant_message(
+                        "java.time.temporal.ChronoUnit",
+                        &name,
+                    ),
                 }
                 .into());
             }
@@ -13657,7 +13850,10 @@ pub(crate) fn register_phase52_rounding_mode(r: &mut NativeMethodRegistry) {
             let ord = p52_rounding_mode_ordinal(&name);
             if ord < 0 {
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("No enum constant java.math.RoundingMode.{name}"),
+                    message: crate::lang_class::no_enum_constant_message(
+                        "java.math.RoundingMode",
+                        &name,
+                    ),
                 }
                 .into());
             }
@@ -14238,6 +14434,245 @@ pub(crate) const CIPHER_IV: usize = 3;
 const CIPHER_ACCUM: usize = 4;
 const CIPHER_AAD: usize = 5;
 
+/// Return a FRESH copy of the `byte[]` in slot `idx`, so key material never
+/// leaves a native accessor as a live reference into the object.
+///
+/// The real key classes all end `return this.key.clone()`, and the javadoc says
+/// why: "The contents of the array are copied to protect against subsequent
+/// modification." Handing the stored array back is not a shortcut — it lets a
+/// caller zero a key through its own accessor, and it is one half of the
+/// mechanism that produced an all-zero AES key
+/// (W7-21-keygen-and-the-synthetic-secretkeyspec-twin.md).
+///
+/// A slot that does not hold an array reference answers null. Several unrelated
+/// key carriers in this file keep an `Int` at slot 0 (the legacy keystore
+/// shape), and the previous code returned that `Int` straight out of a method
+/// declared `()[B` — a null is at least a value the descriptor admits.
+fn clone_key_bytes_field(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    idx: usize,
+) -> Option<ObjectRef> {
+    let src = match ctx.get_field(obj, idx) {
+        Value::Object(Some(arr)) => arr,
+        // Not an array reference — leave the historical answer alone.
+        other => return other.as_object(),
+    };
+    let len = ctx.array_length(src);
+    let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
+    for i in 0..len {
+        ctx.set_array_element(copy, i, ctx.get_array_element(src, i));
+    }
+    Some(copy)
+}
+
+/// The algorithm a synthetic key carries in slot 1, or `"AES"` if slot 1 holds
+/// something else.
+///
+/// The fallback preserves what this file answered for every carrier before the
+/// algorithm was recorded at all; only `KeyGenerator.generateKey` writes a
+/// String there.
+fn carrier_algorithm(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Value {
+    if let Value::Object(Some(s)) = ctx.get_field(obj, 1) {
+        if ctx.read_string(s).is_some() {
+            return Value::Object(Some(s));
+        }
+    }
+    Value::Object(Some(ctx.create_string("AES")))
+}
+
+/// SunJCE's per-algorithm default key size in BITS, for `KeyGenerator`.
+///
+/// Every row measured on HotSpot 25 (`KeyGenerator.getInstance(a).generateKey()
+/// .getEncoded().length * 8`), not recalled — the defaults are not a family
+/// rule and several are surprising. `HmacSHA1` defaults to its 512-bit BLOCK
+/// size while `HmacSHA224`/`384`/`512` default to their digest size, and AES
+/// has defaulted to 256 since JDK 21.
+///
+/// `None` means refuse. This is the same rule the `Cipher` admission table
+/// follows and for the same reason: a default arm here is how
+/// `KeyGenerator.getInstance("Blowfish")` came to answer with a key generated
+/// under a different algorithm's rules. The set below is exactly the set
+/// HotSpot's SunJCE serves; every one of them is a plain random-byte key except
+/// DES and DESede, whose parity rule `des_set_odd_parity` implements.
+fn keygen_default_bits(algo: &str) -> Option<i32> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AES" => Some(256),
+        "DESEDE" | "TRIPLEDES" => Some(168),
+        "DES" => Some(56),
+        "CHACHA20" => Some(256),
+        "BLOWFISH" | "RC2" | "ARCFOUR" | "RC4" => Some(128),
+        "HMACSHA1" | "HMACMD5" => Some(512),
+        "HMACSHA224" => Some(224),
+        "HMACSHA256" => Some(256),
+        "HMACSHA384" => Some(384),
+        "HMACSHA512" => Some(512),
+        _ => None,
+    }
+}
+
+/// The key sizes in BITS an algorithm's `KeyGenerator.init(int)` accepts, or
+/// `None` if any positive multiple of 8 is allowed (the HMAC family).
+///
+/// Measured refusals, in HotSpot 25's exact wording:
+///
+/// ```text
+/// AES    init(129) -> InvalidParameterException: Wrong keysize: must be equal to 128, 192 or 256
+/// DESede init(128) -> InvalidParameterException: Wrong keysize: must be equal to 112 or 168
+/// ```
+fn keygen_allowed_bits(algo: &str) -> Option<(&'static [i32], &'static str)> {
+    match algo.to_ascii_uppercase().as_str() {
+        "AES" => Some((&[128, 192, 256], "must be equal to 128, 192 or 256")),
+        "DESEDE" | "TRIPLEDES" => Some((&[112, 168], "must be equal to 112 or 168")),
+        "DES" => Some((&[56], "must be equal to 56")),
+        "CHACHA20" => Some((&[256], "must be equal to 256")),
+        _ => None,
+    }
+}
+
+/// The number of key BYTES an algorithm produces for a given key size in bits.
+///
+/// DESede is the one algorithm where these disagree: a "168-bit" DESede key is
+/// **24 bytes**, and a "112-bit" one is also 24 bytes. The missing bits are the
+/// per-byte parity bits, which are carried but not counted. Measured on
+/// HotSpot 25 — `init(112)` and `init(168)` both yield `getEncoded().length ==
+/// 24` — which is why `key_size / 8` was wrong here and would have produced a
+/// 14-byte "DESede key" that is not a DESede key at all.
+fn keygen_byte_len(algo: &str, key_size_bits: i32) -> usize {
+    match algo.to_ascii_uppercase().as_str() {
+        "DESEDE" | "TRIPLEDES" => 24,
+        "DES" => 8,
+        _ => (key_size_bits / 8) as usize,
+    }
+}
+
+/// Force odd parity on the 8 bytes at `offset`, as DES keys require: the low
+/// bit of each byte is set so that the byte's population count is odd.
+///
+/// This is SunJCE's `DESKeyGenerator.setParityBit`, and it is the reason a
+/// DESede key cannot be 21 random bytes widened. The rule was VERIFIED rather
+/// than recalled: applied to a fixed buffer it produces a value the JDK's own
+/// checker accepts, identically on HotSpot 25 and on this VM —
+///
+/// ```text
+/// raw24    = 00070e151c232a31383f464d545b626970777e858c939aa1
+/// parity24 = 01070e151c232a31383e464c545b626870767f858c929ba1
+/// javax.crypto.spec.DESedeKeySpec.isParityAdjusted(parity24, 0) == true
+/// ```
+///
+/// — which is the vector pinned by `des_parity_matches_the_jdk_checker` below.
+fn des_set_odd_parity(key: &mut [u8], offset: usize) {
+    for byte in key.iter_mut().skip(offset).take(8) {
+        if (*byte & 0xfe).count_ones() % 2 == 0 {
+            *byte |= 1;
+        } else {
+            *byte &= 0xfe;
+        }
+    }
+}
+
+/// Turn `len` raw CSPRNG bytes into a valid key for `algo`.
+///
+/// For everything but DES/DESede a key IS its random bytes. The two DES
+/// families need their parity bits, and 2-key Triple DES additionally needs its
+/// shape: SunJCE's `DESedeKeyGenerator` draws only 16 bytes for `init(112)` and
+/// copies the first 8 into the last 8, so K3 == K1. Measured on HotSpot 25 over
+/// three runs — `init(112)` gave `K3==K1: true, K2==K1: false` every time, and
+/// `init(168)` gave `K3==K1: false` — and `DESedeKeySpec.isParityAdjusted` was
+/// true for both.
+fn keygen_condition_key(algo: &str, key: &mut [u8]) {
+    match algo.to_ascii_uppercase().as_str() {
+        "DES" => des_set_odd_parity(key, 0),
+        "DESEDE" | "TRIPLEDES" => {
+            des_set_odd_parity(key, 0);
+            des_set_odd_parity(key, 8);
+            des_set_odd_parity(key, 16);
+        }
+        _ => {}
+    }
+}
+
+/// The 2-key Triple DES shape: K3 := K1. Applied only for `init(112)`.
+fn keygen_fold_two_key_desede(key: &mut [u8]) {
+    if key.len() == 24 {
+        let (head, tail) = key.split_at_mut(16);
+        tail.copy_from_slice(&head[..8]);
+    }
+}
+
+/// The algorithm a `KeyGenerator` synthetic recorded at `getInstance`.
+fn keygen_algorithm_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// `KeyGenerator.getInstance(String)`, `(String, String)` and
+/// `(String, Provider)` — one body for all three.
+///
+/// The two provider-bearing overloads ignore the provider argument: this VM has
+/// one implementation per algorithm, so "BC" and "SunJCE" yield the same bytes.
+/// What none of them may do is accept an algorithm this VM cannot generate for.
+///
+/// One body because there were three, and three copies of a default is how the
+/// default goes wrong in only some of them. Here they had already agreed on the
+/// wrong answer (128 for everything); the next edit is the one that would have
+/// split them.
+fn keygen_get_instance_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let algo = obj_arg(args, 0)?;
+    let algo_str = ctx.read_string(algo).unwrap_or_default();
+    let bits = match keygen_default_bits(&algo_str) {
+        Some(bits) => bits,
+        None => {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/NoSuchAlgorithmException",
+                &format!("{algo_str} KeyGenerator not available"),
+            ))
+        }
+    };
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
+    ctx.set_field(obj, 0, Value::Object(Some(algo)));
+    ctx.set_field(obj, 1, Value::Int(bits));
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// `KeyGenerator.init(int)` and `init(int, SecureRandom)`.
+///
+/// The size was previously stored unchecked, so `init(129)` on AES produced a
+/// 16-byte key (129/8 truncating) under a name the caller believed was 129
+/// bits, and `init(128)` on DESede produced a 16-byte "DESede key". HotSpot
+/// refuses both with `InvalidParameterException`, whose wording is measured in
+/// `keygen_allowed_bits`. An algorithm with no fixed set (the HMAC family)
+/// accepts any positive multiple of 8, which is the JCE rule and what HotSpot
+/// does — `HmacSHA256` really will hand back a 64-bit key for `init(64)`.
+fn keygen_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let algo = keygen_algorithm_of(ctx, this);
+    let key_size = args
+        .get(1)
+        .and_then(|v| v.as_int())
+        .unwrap_or_else(|| keygen_default_bits(&algo).unwrap_or(128));
+    if let Some((allowed, wording)) = keygen_allowed_bits(&algo) {
+        if !allowed.contains(&key_size) {
+            return Err(throw_jca_exc(
+                ctx,
+                "java/security/InvalidParameterException",
+                &format!("Wrong keysize: {wording}"),
+            ));
+        }
+    } else if key_size <= 0 || (key_size & 7) != 0 {
+        return Err(throw_jca_exc(
+            ctx,
+            "java/security/InvalidParameterException",
+            &format!("Wrong keysize: {key_size}"),
+        ));
+    }
+    ctx.set_field(this, 1, Value::Int(key_size));
+    Ok(None)
+}
+
 pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -14419,6 +14854,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
             pbkdf2_generate_secret,
         );
+        // The two accessors the real body cannot serve on a synthetic: both
+        // read instance fields no constructor ever wrote, and `getProvider()`
+        // additionally synchronizes on a null `lock`. See `skf_algo_table`.
+        r.register(skf, "getAlgorithm", "()Ljava/lang/String;", pbkdf2_get_algorithm);
+        r.register(
+            skf,
+            "getProvider",
+            "()Ljava/security/Provider;",
+            pbkdf2_get_provider,
+        );
     }
     // getAlgorithm() -> String
     r.register(
@@ -14466,11 +14911,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(out)))
         }
     });
-    // getIV() -> byte[]
-    r.register(cipher, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, CIPHER_IV)))
-    });
+    // getIV() -> byte[] — DELETED, see `jca::cipher::register_cipher_dispatch`.
+    //
+    // The third aliasing accessor in this registrar, and superseded like the
+    // other two: real `Cipher.getIV` ends `return (iv == null) ? null :
+    // iv.clone()` in the SPI (`CipherCore.getIV`, JDK 25 src.zip), this copy
+    // handed back the stored array, and `jca::cipher`'s copy — which registers
+    // after this one and therefore wins — builds a fresh array from its own
+    // side table. An IV a caller can rewrite in place after `init` is a nonce
+    // that can be made to repeat, which for GCM is a key-recovery bug rather
+    // than an untidiness.
     // Constants — KEEP. These are `static final int` FIELD reads (note the "I"
     // field descriptor, not a method descriptor), and 1/2/3/4 are the literal
     // values `javax.crypto.Cipher` declares. A constant is the correct
@@ -14488,58 +14938,39 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(4)))
     });
 
-    // --- javax.crypto.spec.IvParameterSpec — 1-field (iv=0 byte[]) ---
-    let ivps = "javax/crypto/spec/IvParameterSpec";
-    r.register(ivps, "<init>", "([B)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Copy the IV bytes
-        let iv_arr = obj_arg(args, 1)?;
-        let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
-        for i in 0..len {
-            ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
-        }
-        ctx.set_field(this, 0, Value::Object(Some(copy)));
-        Ok(None)
-    });
-    r.register(ivps, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
+    // --- IvParameterSpec / GCMParameterSpec — DELETED, same reason as SecretKeySpec ---
+    //
+    // Five more registrations (`IvParameterSpec.<init>`/`getIV`,
+    // `GCMParameterSpec.<init>`/`getIV`/`getTLen`) that duplicated
+    // `jca::cipher::register_param_specs` exactly, and lost to it in the one
+    // mode where they registered at all — see the SecretKeySpec tombstone at
+    // the end of this function for the ordering argument. Both `getIV` copies
+    // here handed back the STORED array; the surviving pair clones, because
+    // the real classes end `return this.iv.clone()`. A GCM nonce a caller can
+    // edit in place after the fact is not the same class of disaster as an
+    // all-zero key, but it is the same aliasing mistake, and it is now gone
+    // from this file rather than fixed twice.
 
-    // --- javax.crypto.spec.GCMParameterSpec — 2-field (iv=0, tLen=1) ---
-    let gcmps = "javax/crypto/spec/GCMParameterSpec";
-    r.register(gcmps, "<init>", "(I[B)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let t_len = args[1].as_int().unwrap_or(128);
-        let iv_arr = obj_arg(args, 2)?;
-        let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
-        for i in 0..len {
-            ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
-        }
-        ctx.set_field(this, 0, Value::Object(Some(copy)));
-        ctx.set_field(this, 1, Value::Int(t_len));
-        Ok(None)
-    });
-    r.register(gcmps, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(gcmps, "getTLen", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-
-    // --- javax.crypto.SecretKey — 1-field synthetic (encoded=0 byte[]) ---
+    // --- javax.crypto.SecretKey — 2-field synthetic (encoded=0 byte[], algorithm=1 String) ---
+    //
+    // This carrier is what `KeyGenerator.generateKey` below hands back, and it
+    // was a one-field object whose `getAlgorithm` answered the string "AES" for
+    // every algorithm — so in synthetic mode
+    // `KeyGenerator.getInstance("DESede").generateKey().getAlgorithm()` returned
+    // "AES". A key that misreports its own algorithm is the same species of
+    // defect as a cipher that ignores the requested one: every caller that
+    // branches on `getAlgorithm()` (and `Cipher.init` implementations do)
+    // branches wrong, with nothing raised. The algorithm now travels with the
+    // key in slot 1; `generateKey` is the only allocator of this shape in the
+    // tree, so there is no older 1-field instance to be compatible with.
     let sk = "javax/crypto/SecretKey";
     r.register(sk, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_key_bytes_field(ctx, this, 0))))
     });
-    r.register(sk, "getAlgorithm", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("AES");
-        Ok(Some(Value::Object(Some(s))))
+    r.register(sk, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(carrier_algorithm(ctx, this)))
     });
     r.register(sk, "getFormat", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("RAW");
@@ -14549,8 +14980,19 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     let key = "java/security/Key";
     r.register(key, "getEncoded", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Object(clone_key_bytes_field(ctx, this, 0))))
     });
+    // Deliberately NOT slot-1-aware, unlike the `javax/crypto/SecretKey` copy
+    // above. This triple serves any object whose own class is literally
+    // `java/security/Key`, and this file alone mints several unrelated key
+    // shapes (a 4-slot `java/security/PrivateKey`, `jca::key_factory`'s 5-slot
+    // keys). `NativeContext` exposes no slot count, and `Heap::get_field`
+    // asserts on an out-of-range index rather than answering null — so a
+    // speculative read of slot 1 here would turn an unknown 1-slot carrier into
+    // a panic. The stale "AES" is wrong for a non-AES key, but it is the
+    // behaviour that was already here, and narrowing the fix to the carrier
+    // whose allocators are all known is the part that can be made safe without
+    // building.
     r.register(key, "getAlgorithm", "()Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string("AES");
         Ok(Some(Value::Object(Some(s))))
@@ -14561,18 +15003,22 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     });
 
     // --- javax.crypto.KeyGenerator — 2-field synthetic (algorithm=0, keySize=1) ---
+    //
+    // The default key size used to be the literal 128 for every algorithm, and
+    // `generateKey` never read slot 0 at all — so this shim answered a 128-bit
+    // key to every caller of `KeyGenerator.getInstance(a).generateKey()`
+    // regardless of `a`. Measured against HotSpot 25, that is wrong three ways
+    // at once: AES defaults to 256 (16 bytes where HotSpot gives 32), DESede
+    // defaults to 168 and must be 24 bytes with odd parity per byte (this shim
+    // gave 16 unconditioned random bytes, which is not a DESede key), and an
+    // algorithm this VM cannot generate for was accepted rather than refused.
+    // See `keygen_default_bits`, `keygen_byte_len` and `des_set_odd_parity`.
     let kg = "javax/crypto/KeyGenerator";
     r.register(
         kg,
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128)); // default key size
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
     // Round 15 (BcProbe): KeyGenerator.getInstance("AES", "BC") used by
     // BouncyCastle clients. Without this shim the real-JDK 2-arg overload
@@ -14586,13 +15032,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         kg,
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128)); // default key size
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
     // Provider-instance overload — same synthetic layout, ignores the
     // Provider arg entirely (we synthesise the SPI via the init / generateKey
@@ -14601,35 +15041,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         kg,
         "getInstance",
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
-        |ctx, args| {
-            let algo = obj_arg(args, 0)?;
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
-            ctx.set_field(obj, 0, Value::Object(Some(algo)));
-            ctx.set_field(obj, 1, Value::Int(128));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        keygen_get_instance_named,
     );
-    // KeyGenerator.init(I)V — store keySize at field 1; never touch spi
-    // (spi is null on synthetic instances, and the real JDK bytecode for
-    // init(I) calls this.spi.engineInit(...) → NPE on the real path).
-    r.register(kg, "init", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key_size = args[1].as_int().unwrap_or(128);
-        ctx.set_field(this, 1, Value::Int(key_size));
-        Ok(None)
-    });
-    // KeyGenerator.init(I, SecureRandom)V — store keySize, ignore SecureRandom
-    r.register(
-        kg,
-        "init",
-        "(ILjava/security/SecureRandom;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let key_size = args[1].as_int().unwrap_or(128);
-            ctx.set_field(this, 1, Value::Int(key_size));
-            Ok(None)
-        },
-    );
+    // KeyGenerator.init(I)V — validate against the algorithm, then store
+    // keySize at field 1; never touch spi (spi is null on synthetic instances,
+    // and the real JDK bytecode for init(I) calls this.spi.engineInit(...) →
+    // NPE on the real path).
+    r.register(kg, "init", "(I)V", keygen_init_int);
+    // KeyGenerator.init(I, SecureRandom)V — same validation, ignore SecureRandom
+    r.register(kg, "init", "(ILjava/security/SecureRandom;)V", keygen_init_int);
     // init(SecureRandom) — W2: this was a no-op, which is not the same thing as
     // "leave keySize at its default": after an earlier `init(256)` the field
     // still held 256, so `kg.init(256); kg.init(random); kg.generateKey()`
@@ -14642,7 +15062,13 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(128));
+            // "the provider default", not the literal 128 — which for AES is
+            // 256 and for DESede is 168. Resetting to 128 here re-introduced
+            // the very defect `keygen_default_bits` exists to fix, one method
+            // along.
+            let algo = keygen_algorithm_of(ctx, this);
+            let bits = keygen_default_bits(&algo).unwrap_or(128);
+            ctx.set_field(this, 1, Value::Int(bits));
             Ok(None)
         },
     );
@@ -14674,6 +15100,12 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let key_size = ctx.get_field(this, 1).as_int().unwrap_or(128);
+            // The algorithm was recorded at `getInstance` and, until this
+            // change, never read again — which is how one code path served
+            // every algorithm. It decides the byte length and the
+            // conditioning, both of which differ from `key_size / 8` for the
+            // DES families.
+            let algo = keygen_algorithm_of(ctx, this);
             // Reject obviously invalid sizes. Upper bound is generous — the
             // JCE spec allows any positive multiple of 8 up to provider limits.
             if key_size <= 0 || key_size > 1 << 20 || (key_size & 7) != 0 {
@@ -14686,7 +15118,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                     .into(),
                 );
             }
-            let byte_len = (key_size / 8) as usize;
+            let byte_len = keygen_byte_len(&algo, key_size);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
 
             // Fill with cryptographic OS entropy. Fallback loop exists only
@@ -14699,6 +15131,13 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // Parity first, then the 2-key fold, mirroring SunJCE's
+            // `DESedeKeyGenerator`: it parity-adjusts the 16-byte draw and then
+            // copies K1 over K3, so K3 arrives already adjusted.
+            keygen_condition_key(&algo, &mut buf);
+            if key_size == 112 && algo.eq_ignore_ascii_case("DESede") {
+                keygen_fold_two_key_desede(&mut buf);
+            }
             for (i, &b) in buf.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int((b as i8) as i32));
             }
@@ -14706,34 +15145,51 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             for b in buf.iter_mut() {
                 *b = 0;
             }
-            let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 1)?;
+            // Two slots now: the algorithm travels with the key, so
+            // `SecretKey.getAlgorithm()` stops answering "AES" for everything.
+            // `arr` must survive the allocation below, and the algorithm string
+            // must survive it too.
+            let arr_pin = ctx.pin_native_root(arr);
+            let algo_str = ctx.create_string(&algo);
+            let algo_pin = ctx.pin_native_root(algo_str);
+            let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 2)?;
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let algo_str = ctx.read_native_pin(algo_pin, algo_str);
+            ctx.unpin_native_roots(arr_pin);
             ctx.set_field(sk, 0, Value::Object(Some(arr)));
+            ctx.set_field(sk, 1, Value::Object(Some(algo_str)));
             Ok(Some(Value::Object(Some(sk))))
         },
     );
 
-    // --- javax.crypto.spec.SecretKeySpec — 2-field (encoded=0, algorithm=1) ---
-    let sks = "javax/crypto/spec/SecretKeySpec";
-    r.register(sks, "<init>", "([BLjava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let key_bytes = obj_arg(args, 1)?;
-        let algo = obj_arg(args, 2)?;
-        ctx.set_field(this, 0, Value::Object(Some(key_bytes)));
-        ctx.set_field(this, 1, Value::Object(Some(algo)));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(sks, "getEncoded", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(sks, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(sks, "getFormat", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("RAW");
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // --- javax.crypto.spec.SecretKeySpec — DELETED, see `jca::cipher::register_param_specs` ---
+    //
+    // This registrar used to carry a second `SecretKeySpec` — `<init>`,
+    // `getEncoded`, `getAlgorithm`, `getFormat` — byte-for-byte a weaker
+    // duplicate of the pair in `jca::cipher::register_param_specs`. Weaker in
+    // the way that matters: its `<init>` stored the caller's `byte[]` by
+    // reference and its `getEncoded` handed the stored array straight back,
+    // where the real class clones on both sides *because callers scrub*. That
+    // aliasing is the mechanism behind the all-zero AES key recorded in
+    // W7-21-keygen-and-the-synthetic-secretkeyspec-twin.md.
+    //
+    // It is deleted rather than fixed, and the reachability is the reason it
+    // could be. `register_phase53_crypto` is reached only from
+    // `register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]`
+    // AND gated on `config.use_synthetic_jdk` — so in real-JDK and `--jdk-only`
+    // modes these four registrations never existed at all. In synthetic mode
+    // they did register, and were then immediately overwritten:
+    // `register_synthetic_overrides` calls `register_phase53_natives` and THEN
+    // `jca::cipher::register_cipher_clinit_shim`, and `register()` is
+    // last-registration-wins. So the fixed copy won in every mode and this one
+    // never ran anywhere.
+    //
+    // Which is exactly why it had to go rather than be corrected. A shadowed
+    // second implementation of a key-material primitive is not a dormant defect,
+    // it is a live trap: swapping those two call sites in
+    // `register_synthetic_overrides` — a change nobody would think of as
+    // touching crypto — would have silently restored the zero-key bug. One
+    // primitive, one implementation, and the ordering stops mattering.
     r.set_category(__prev_cat);
 }
 
@@ -15271,7 +15727,10 @@ pub(crate) fn drive_real_cipher(
 // needs this to decrypt PKCS#8 (PBES2) encrypted private keys. We compute
 // PBKDF2 directly with HMAC over the `sha1`/`sha2` crates — a real,
 // RFC-2898-correct derivation, not a synthetic stub (verified byte-identical
-// to HotSpot). Only the 64-byte-block PRFs PEMFile uses are wired.
+// to HotSpot). SHA-1/224/256 (64-byte HMAC block) go through the hand-rolled
+// `hmac_block64`; SHA-384/512 (128-byte HMAC block, needed by pgjdbc's SCRAM
+// client) go through `pbkdf2_derive_wide`, which uses the `hmac` crate so the
+// block size is derived correctly instead of hardcoded.
 // ---------------------------------------------------------------------------
 
 /// HMAC over a 64-byte-block hash (`SHA-1` / `SHA-224` / `SHA-256`).
@@ -15329,15 +15788,61 @@ fn pbkdf2_derive<D: sha2::Digest + Clone>(
 }
 
 /// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
-/// Only 64-byte-block PRFs are supported (the ones PEMFile uses).
 pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
     match alg {
         "PBKDF2WithHmacSHA1" => Some(1),
         "PBKDF2WithHmacSHA224" => Some(224),
         "PBKDF2WithHmacSHA256" => Some(256),
+        "PBKDF2WithHmacSHA384" => Some(384),
+        "PBKDF2WithHmacSHA512" => Some(512),
         _ => None,
     }
 }
+
+/// PBKDF2 (PKCS#5 v2.0) over a 128-byte-block PRF (`SHA-384` / `SHA-512`) —
+/// `hmac_block64` above hardcodes a 64-byte HMAC block, which is wrong for
+/// these (RFC 2104 derives the block size from the underlying hash's own
+/// block size, 128 bytes for SHA-384/512), so it would silently derive the
+/// wrong key instead of throwing. Uses the `hmac` crate (already a dependency,
+/// see `t27_tls_cbc.rs`) so the block size is correct by construction rather
+/// than guessed. pgjdbc's SCRAM-SHA-256 client needs `PBKDF2WithHmacSHA384`
+/// wired for `com.ongres.scram.common.ScramMechanism`'s static init to
+/// succeed, even though SHA-384 itself is only used for the (unrelated)
+/// SCRAM-SHA-256-PLUS channel-binding negotiation path.
+macro_rules! pbkdf2_derive_wide_impl {
+    ($name:ident, $digest:ty) => {
+        fn $name(pw: &[u8], salt: &[u8], iters: u32, dklen: usize) -> Vec<u8> {
+            use hmac::Mac;
+            type HmacImpl = hmac::Hmac<$digest>;
+            let mut out: Vec<u8> = Vec::with_capacity(dklen);
+            let mut block_index: u32 = 1;
+            while out.len() < dklen {
+                let mut salt_i = salt.to_vec();
+                salt_i.extend_from_slice(&block_index.to_be_bytes());
+                let mut mac =
+                    HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                mac.update(&salt_i);
+                let mut u = mac.finalize().into_bytes().to_vec();
+                let mut t = u.clone();
+                for _ in 1..iters.max(1) {
+                    let mut mac =
+                        HmacImpl::new_from_slice(pw).expect("Hmac accepts any key length");
+                    mac.update(&u);
+                    u = mac.finalize().into_bytes().to_vec();
+                    for (a, b) in t.iter_mut().zip(u.iter()) {
+                        *a ^= *b;
+                    }
+                }
+                out.extend_from_slice(&t);
+                block_index += 1;
+            }
+            out.truncate(dklen);
+            out
+        }
+    };
+}
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha384, sha2::Sha384);
+pbkdf2_derive_wide_impl!(pbkdf2_derive_wide_sha512, sha2::Sha512);
 
 /// Crate-visible PBKDF2 entry point (dispatches to the right 64-byte-block
 /// PRF by [`pbkdf2_prf_code`] code) for callers outside this module — used by
@@ -15355,8 +15860,8 @@ pub(crate) fn pbkdf2_derive_for(
     match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
-        384 => pbkdf2_derive::<sha2::Sha384>(pw, salt, iters, dklen),
-        512 => pbkdf2_derive::<sha2::Sha512>(pw, salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(pw, salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(pw, salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
@@ -15517,7 +16022,7 @@ fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<usi
 }
 
 /// `SecretKeyFactory.getInstance(algorithm[, provider])` for PBKDF2.
-/// Recognises only `PBKDF2WithHmacSHA1/224/256`; any other algorithm throws
+/// Recognises `PBKDF2WithHmacSHA1/224/256/384/512`; any other algorithm throws
 /// the same `NoSuchAlgorithmException` (mapped to `SecurityException`) the real
 /// JCA path would have thrown.
 pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15534,6 +16039,7 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
             // recycled hash and derive a WRONG key).
             let key = pbkdf2_key_for(ctx, obj);
             pbkdf2_prf_table().lock().unwrap().insert(key, code);
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         // PKCS#5 v1.5 / PKCS#12 PBE family (`PBEWithMD5AndDES`, …). SunJCE's
@@ -15548,7 +16054,8 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         {
             let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
             let key = pbkdf2_key_for(ctx, obj);
-            pbe_algo_table().lock().unwrap().insert(key, alg);
+            pbe_algo_table().lock().unwrap().insert(key, alg.clone());
+            skf_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
         }
         None => Err(RuntimeError::SecurityException {
@@ -15556,6 +16063,110 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         .into()),
     }
+}
+
+/// The algorithm name every successful `SecretKeyFactory.getInstance` was asked
+/// for, keyed by the same GC-stable identity `pbkdf2_prf_table` uses.
+///
+/// `getAlgorithm()` and `getProvider()` need it, and they cannot read it off the
+/// object: the synthetic is a REAL `javax.crypto.SecretKeyFactory` whose
+/// constructor never ran, so `algorithm` is null and — the part that actually
+/// breaks — `lock` is null too. `getProvider()` opens with `synchronized
+/// (lock)`, so calling it on a perfectly working factory threw
+/// `NullPointerException: Cannot enter synchronized block because "this.lock" is
+/// null`. That is the same species as the `Mac` overloads in
+/// `phases_late::ssl_security`: any method left to the real body reads
+/// uninitialised instance state, and fails in a way that looks nothing like
+/// "this class is synthetic".
+fn skf_algo_table() -> &'static std::sync::Mutex<std::collections::HashMap<usize, String>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, String>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `SecretKeyFactory.getAlgorithm()` — the name `getInstance` was called with.
+pub(crate) fn pbkdf2_get_algorithm(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = pbkdf2_key_for(ctx, this);
+    let algo = skf_algo_table().lock().unwrap().get(&key).cloned();
+    let Some(algo) = algo else {
+        // Not one of ours — see `skf_receiver_is_ours`. Answer from the real
+        // object's own field rather than from an empty table entry.
+        //
+        // Type-checked, not trusted: `get_field_by_name` can fall back to a
+        // name->slot mapping, and a slot that is not the field we asked for
+        // reads back as some other object entirely. Returning it would put a
+        // `String` where a `Provider` belongs (measured: the sibling
+        // `getProvider` did exactly that, and the caller got
+        // `NoSuchMethodError: java.lang.String.getName()`).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "algorithm") {
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(s))
+                .is_some_and(|n| n == "java/lang/String")
+            {
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    };
+    Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
+}
+
+/// `SecretKeyFactory.getProvider()` — SunJCE for the factories this VM builds,
+/// which is where HotSpot resolves every `PBKDF2With*` and `PBEWith*` factory;
+/// the real object's own `provider` field for any other receiver.
+pub(crate) fn pbkdf2_get_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Ok(this) = obj_arg(args, 0) {
+        if !skf_receiver_is_ours(ctx, this) {
+            // Type-checked for the reason `pbkdf2_get_algorithm` documents: an
+            // unchecked `get_field_by_name` handed back the `algorithm` String
+            // here and the caller died on `String.getName()`.
+            if let Value::Object(Some(p)) = ctx.get_field_by_name(this, "provider") {
+                let pid = ctx.class_id_by_name("java/security/Provider");
+                let is_provider =
+                    pid.is_some_and(|pid| ctx.is_subclass(ctx.class_id_of_object(p), pid));
+                if is_provider {
+                    return Ok(Some(Value::Object(Some(p))));
+                }
+            }
+        }
+    }
+    let p = crate::jca::make_named_provider(ctx, "SunJCE")?;
+    Ok(Some(Value::Object(Some(p))))
+}
+
+/// Did **this VM** build this `SecretKeyFactory`?
+///
+/// `getInstance(String[, String])` is a native here, and every factory it
+/// returns is recorded in `skf_algo_table`. `getInstance(String, Provider)` is
+/// NOT registered, so that overload runs the real JDK bytecode and hands back a
+/// genuine `SecretKeyFactory` wrapping the requested provider's own SPI — and
+/// the three natives registered on this class then shadowed the real bytecode
+/// for it too.
+///
+/// The consequence was not a crash but a **silently wrong key**, which is the
+/// worst shape this workspace has a name for. Measured 2026-08-13 against
+/// HotSpot 25 with the same jars: BouncyCastle's `PEMUtilities.getKey` asks for
+/// `SecretKeyFactory.getInstance("PBKDF-OpenSSL", bcProvider)` and derives
+/// `90e508cc4fc9798bdec87516bebe5ecd`; on CratonVM the same call reported
+/// provider `SunJCE`, algorithm `""`, and derived
+/// `bcfb6da32cd0aae96fdc53ed8980f72b` — `generateSecret` had fallen out of its
+/// `unwrap_or(256)` default and run PBKDF2-HMAC-SHA256 under another
+/// algorithm's name. Every netty PKCS#1-encrypted-key test failed downstream of
+/// that (`IOException: Invalid lenByte`, because netty then fell back to
+/// handing raw PKCS#1 bytes to `EncryptedPrivateKeyInfo`).
+///
+/// Table membership is the right test rather than a class-name check: it is
+/// exactly "did our `getInstance` produce this object".
+fn skf_receiver_is_ours(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let key = pbkdf2_key_for(ctx, this);
+    skf_algo_table().lock().unwrap().contains_key(&key)
 }
 
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.
@@ -15567,6 +16178,31 @@ pub(crate) fn pbkdf2_generate_secret(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // A factory this VM did not build belongs to the provider that did — run
+    // ITS `engineGenerateSecret` instead of deriving a key of our own choosing
+    // under its algorithm's name. See `skf_receiver_is_ours` for the measured
+    // wrong-key this closes.
+    if !skf_receiver_is_ours(ctx, this) {
+        if let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "spi") {
+            let spec = args.get(1).copied().unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                spi,
+                "engineGenerateSecret",
+                "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+                &[spec],
+            );
+        }
+        // No SPI to delegate to (a receiver of a shape we do not recognise).
+        // Refuse rather than derive something: this native has no idea what
+        // algorithm was asked for, and answering anyway is how the defect
+        // above happened.
+        return Err(RuntimeError::SecurityException {
+            message: "SecretKeyFactory.generateSecret: this factory was not created by CratonVM \
+                      and carries no provider SPI to delegate to"
+                .to_string(),
+        }
+        .into());
+    }
     // Same GC-stable, collision-disambiguated key used by `getInstance` so the
     // PRF is looked up deterministically for THIS factory instance.
     let key = pbkdf2_key_for(ctx, this);
@@ -15626,12 +16262,27 @@ pub(crate) fn pbkdf2_generate_secret(
     let dk = match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
+        384 => pbkdf2_derive_wide_sha384(&pw_bytes, &salt, iters, dklen),
+        512 => pbkdf2_derive_wide_sha512(&pw_bytes, &salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
     };
     // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
+    //
+    // The comment said `"PBKDF2With…"` but the literal was the bare `"PBKDF2"`,
+    // so `generateSecret(...).getAlgorithm()` answered `PBKDF2` where HotSpot
+    // answers the full `PBKDF2WithHmacSHA256`. Callers that re-key a `Mac` or
+    // `Cipher` from the derived key's own algorithm name — the reason
+    // `SecretKeySpec` carries one — would then ask for an algorithm that does
+    // not exist. Use the name `getInstance` was actually called with.
     let key_arr = make_byte_array(ctx, &dk);
     let kpin = ctx.pin_native_root(key_arr);
-    let algo_s = ctx.create_string("PBKDF2");
+    let requested = skf_algo_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| "PBKDF2".to_string());
+    let algo_s = ctx.create_string(&requested);
     let key_arr_r = ctx.read_native_pin(kpin, key_arr);
     let sk = ctx.new_object_initialized(
         "javax/crypto/spec/SecretKeySpec",
@@ -16344,10 +16995,30 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 }
             }
             let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems)?;
+            // HotSpot answers `Collections$UnmodifiableSet` here, and this
+            // registration deliberately SHADOWS the registry-backed twin under
+            // `--synthetic-jdk` — so a wrapper applied only over there would be
+            // a fix that is invisible in the one mode this code path serves.
+            // Two surfaces of one method drifting is the defect this whole
+            // registration exists to prevent, and that applies to the SHAPE of
+            // the answer as much as to its contents.
+            // W7-63-jca-advertise-vs-serve.md.
+            //
+            // Wrap BEFORE unpinning: the Java round trip can move `set`.
+            //
+            // Caveat, recorded rather than fixed here: in `--synthetic-jdk`,
+            // `java/util/Collections.unmodifiableSet` is itself bound to
+            // `native_return_first_arg` — the IDENTITY — by two registrars in
+            // this file, and `register_synthetic_overrides` runs last, so this
+            // wrap is expected to be INERT in exactly the mode this code path
+            // serves. It is added anyway, because on the day that identity
+            // registration is repaired this call site must already be right,
+            // and because the alternative is a third surface to remember.
+            let view = crate::jca::provider_chain::wrap_unmodifiable_public(ctx, set);
             if let Some(base) = pins.first() {
                 ctx.unpin_native_roots(*base);
             }
-            Ok(Some(Value::Object(Some(set))))
+            Ok(Some(Value::Object(Some(view))))
         },
     );
 
@@ -17932,6 +18603,44 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
     });
 
     // ===== SocketInputStream — real read from TcpStream =====
+    //
+    // THE FOURTH SURFACE of W2-2's blocked-reader defect, converged 2026-08-12.
+    //
+    // All three reads below cloned the `Arc<TcpStream>` out of `s2_registry`,
+    // dropped the lock, and parked in a plain blocking `read` — so a
+    // `Socket.close()` on another thread could not end the park. `close()`
+    // removes the registry entry and shuts the socket down, but it cannot close
+    // the OS handle while this reader holds an `Arc` clone of it; on Windows no
+    // `shutdown` aborts a pending blocking call at all, so the reader stayed
+    // parked forever. `java.net.Socket.close()` is unconditional in JDK 25:
+    // "Any thread currently blocked in an I/O operation upon this socket will
+    // throw a SocketException" — *will*, not *may*.
+    //
+    // Fixed by calling the surface that already solved it,
+    // `net_phase_e::re1_read_close_aware`, rather than by copying its loop or by
+    // deleting these registrations. The two surfaces key the SAME
+    // `s2_registry().streams` map with the same `sid`, so the registry re-ask
+    // that ends the park is the identical question here. `re1`'s own reader is
+    // registered on the DIFFERENT class name `java/net/Socket$SocketInputStream`
+    // (W2-2 records the correction), so neither shadows the other and this had
+    // to be fixed on its own terms.
+    //
+    // Deleting them was the other defensible option and was NOT taken: these are
+    // the only registrations of `java/net/SocketInputStream` in the tree, its
+    // methods have no bytecode to fall back to, and the configuration that
+    // reaches them (`--synthetic-jdk` plus `CRATONVM_SYNTHETIC_NET_SOCKETS`,
+    // since `register_phase53_socket_stubs` early-returns on the default-true
+    // `io.real_net_sockets`) is one this lane cannot run. Trading an unwakeable
+    // read for an `UnsatisfiedLinkError` in a mode nobody measured is not a
+    // repair.
+    //
+    // The deadline is read back off the socket's own `SO_RCVTIMEO` rather than
+    // invented or defaulted. That is not optional: the close-aware loop does not
+    // issue the `read` until the socket is ready, so `SO_RCVTIMEO` can never
+    // fire, and passing `None` would have turned every `setSoTimeout` reader
+    // into a new unbounded park. `re1_read_close_aware` answers `TimedOut` on
+    // expiry, which the existing arm below already maps to
+    // `SocketTimeoutException`.
     let sis = "java/net/SocketInputStream";
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -17945,14 +18654,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
             reg.streams.get(&sid).cloned()
         };
         if let Some(stream) = stream {
-            let mut stream_ref = &*stream;
-            match read_retry_eintr(&mut stream_ref, &mut buf) {
+            let deadline = sis_read_deadline(&stream);
+            match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut buf, deadline) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
                 // A blocking TcpStream only yields WouldBlock here when the
-                // configured SO_RCVTIMEO expires. InputStream.read must throw
-                // the typed Java timeout instead of returning the forbidden
-                // zero-byte read (or pretending the peer closed).
+                // configured SO_RCVTIMEO expires; TimedOut is additionally the
+                // close-aware loop's own deadline expiry. InputStream.read must
+                // throw the typed Java timeout instead of returning the
+                // forbidden zero-byte read (or pretending the peer closed).
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -17964,7 +18674,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                     }
                     .into())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
+                // `Interrupted` is this family's close carrier, NOT a real
+                // EINTR — `re1_read_close_aware` reissues every genuine EINTR
+                // itself and its poll reports EINTR as "not ready". It arrives
+                // only once the registry entry is gone, i.e. `close()` ran.
+                // Answering `0` here (the old arm) would have been a zero-byte
+                // read, which `InputStream.read()` may never return.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Err(
+                    crate::net_phase_e::re1_socket_exception(ctx, "Socket closed"),
+                ),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
         } else {
@@ -17990,8 +18708,8 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 reg.streams.get(&sid).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match read_retry_eintr(&mut stream_ref, &mut tmp) {
+                let deadline = sis_read_deadline(&stream);
+                match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut tmp, deadline) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e)
@@ -18005,7 +18723,15 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                         }
                         .into());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                    // The close carrier — see the block comment above. Was `0`,
+                    // a zero-byte read `InputStream.read([BII)` may never
+                    // return for a non-zero `len`.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(crate::net_phase_e::re1_socket_exception(
+                            ctx,
+                            "Socket closed",
+                        ));
+                    }
                     Err(_) => -1,
                 }
             } else {
@@ -18037,8 +18763,8 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 reg.streams.get(&sid).cloned()
             };
             if let Some(stream) = stream {
-                let mut stream_ref = &*stream;
-                match read_retry_eintr(&mut stream_ref, &mut tmp) {
+                let deadline = sis_read_deadline(&stream);
+                match crate::net_phase_e::re1_read_close_aware(sid, &stream, &mut tmp, deadline) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e)
@@ -18052,7 +18778,13 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                         }
                         .into());
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                    // The close carrier — see the block comment above.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(crate::net_phase_e::re1_socket_exception(
+                            ctx,
+                            "Socket closed",
+                        ));
+                    }
                     Err(_) => -1,
                 }
             } else {
@@ -19953,6 +20685,42 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     }
     let lr = "java/util/logging/LogRecord";
+    // NOT `Intrinsic`, for the same reason as the source-pair block below, and
+    // this is the row that actually held W7-56 open. An intrinsic cannot give
+    // an answer the bytecode would not; this constructor gives a DIFFERENT
+    // object. JDK 25's `LogRecord(Level, String)` ends with
+    // `needToInferCaller = true` and assigns `sequenceNumber` from
+    // `globalSequenceNumber.getAndIncrement()`. This one writes neither.
+    //
+    // `needToInferCaller` is the whole defect. Measured under `--jdk-only` with
+    // `--add-opens=java.logging/java.util.logging=ALL-UNNAMED`, on a binary
+    // where the four source accessors were ALREADY retired and the REAL lazy
+    // getter was running:
+    //
+    //   HotSpot     A4 fresh needToInferCaller=true
+    //   CratonVM    A4 fresh needToInferCaller=false
+    //
+    // A real getter reading a false flag never calls `inferCaller()`, so the
+    // source pair stays null no matter how well the walk works. Retiring the
+    // getters alone was necessary and not sufficient.
+    //
+    // `java/util/logging/LogRecord.<init>(Level,String)` has been in
+    // `RETIRED_SHADOW_TRIPLES` since the 2026-08-11 wave, but the retag arm in
+    // `NativeMethodRegistry::register` only fires on an effective category of
+    // `Bridge`, and this function's ambient category is `Intrinsic` — so the
+    // entry has been INERT the whole time. Under `--jdk-only` the OTHER
+    // registration of this triple (native-builtins/src/lib.rs, `Bridge`) is
+    // refused and this one silently owns the slot, which is why retiring that
+    // one measured verdict-neutral: nothing changed because this kept running.
+    // Fourth instance of the ambient-category defect on this file's JUL rows.
+    // W7-56-infercaller-strict.md
+    //
+    // Spelled as an explicit set/restore rather than `with_category`, matching
+    // this file's own idiom at line 101 and elsewhere: a closure would re-indent
+    // ninety lines of body for a one-line category change, and the tree is not
+    // `cargo fmt`-clean, so that diff would bury the change that matters.
+    let __ctor_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         lr,
         "<init>",
@@ -20011,10 +20779,20 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, 5, Value::Long(now_ms));
                 ctx.set_field(this, 10, Value::Int(short_tid));
             }
+            // Mirrors the real ctor's closing `needToInferCaller = true`. This
+            // shadow only runs in `Compatible` now, where nothing reads the
+            // flag (the source-pair getters are natives there), so it is inert
+            // — but a shadow that silently drops a field the real constructor
+            // sets is exactly what cost W7-56 a build, and the next reader of
+            // this block should not have to rediscover that.
+            if real {
+                ctx.set_field_by_name(this, "needToInferCaller", Value::Int(1));
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(None)))
         },
     );
+    r.set_category(__ctor_cat);
     r.register(
         lr,
         "getLevel",
@@ -20027,30 +20805,59 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         lr_set(ctx, args, "message", 1)
     });
-    r.register(
-        lr,
-        "getSourceClassName",
-        "()Ljava/lang/String;",
-        |ctx, args| lr_get(ctx, args, "sourceClassName", 2),
-    );
-    r.register(
-        lr,
-        "setSourceClassName",
-        "(Ljava/lang/String;)V",
-        |ctx, args| lr_set(ctx, args, "sourceClassName", 2),
-    );
-    r.register(
-        lr,
-        "getSourceMethodName",
-        "()Ljava/lang/String;",
-        |ctx, args| lr_get(ctx, args, "sourceMethodName", 3),
-    );
-    r.register(
-        lr,
-        "setSourceMethodName",
-        "(Ljava/lang/String;)V",
-        |ctx, args| lr_set(ctx, args, "sourceMethodName", 3),
-    );
+    // NOT `Intrinsic`, unlike the ambient category this function sets at its
+    // head. An intrinsic is the kind that cannot give an answer the bytecode
+    // would not — and these can. `getSourceClassName` here is the REAL getter
+    // with the `inferCaller()` call deleted: JDK 25's body is
+    // `if (needToInferCaller) inferCaller(); return sourceClassName;`, this one
+    // is a bare field read, and the field is null because nothing ever inferred
+    // it. Symmetrically `setSourceClassName` is the real setter with its
+    // `needToInferCaller = false` deleted. Measured: HotSpot renders the caller
+    // class, CratonVM renders null.
+    //
+    // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
+    // under `--jdk-only` these survived after the retirement refused every
+    // honest `Bridge` and `SyntheticStub` on the same classes — a refusal is
+    // not a removal. W7-25 lifted the two `LogManager` rows out of the ambient
+    // block for exactly this reason; these are the same defect at sites that
+    // pass did not cover. W7-35-jul-supplier-and-payload-residuals.md
+    //
+    // The `Bridge` tag alone did NOT retire them: it made the `--jdk-only`
+    // census REPORT them (`bridge-ran-over-bytecode`) and left them dispatching,
+    // which is why the source pair was still null in strict mode a day later.
+    // All four triples are entries in `RETIRED_SHADOW_TRIPLES`
+    // (native-api/src/retired_shadow.rs) as of 2026-08-12, so `--jdk-only`
+    // refuses them and the real lazy-inference bytecode runs, while
+    // `Compatible` still dispatches them over records the JUL bridge stamped at
+    // construction. They retire as a SET of four: see that module's docs for
+    // why a getter-only retirement is worse than none.
+    // W7-56-infercaller-strict.md
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            lr,
+            "getSourceClassName",
+            "()Ljava/lang/String;",
+            |ctx, args| lr_get(ctx, args, "sourceClassName", 2),
+        );
+        r.register(
+            lr,
+            "setSourceClassName",
+            "(Ljava/lang/String;)V",
+            |ctx, args| lr_set(ctx, args, "sourceClassName", 2),
+        );
+        r.register(
+            lr,
+            "getSourceMethodName",
+            "()Ljava/lang/String;",
+            |ctx, args| lr_get(ctx, args, "sourceMethodName", 3),
+        );
+        r.register(
+            lr,
+            "setSourceMethodName",
+            "(Ljava/lang/String;)V",
+            |ctx, args| lr_set(ctx, args, "sourceMethodName", 3),
+        );
+    });
 
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
         lr_get(ctx, args, "loggerName", 4)
@@ -20220,27 +21027,47 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // JUnit's `CapturedOutput` wrapping) -- let it run instead of stubbing.
 
     // --- Formatter (abstract) ---
+    //
+    // `formatMessage` is NOT an `Intrinsic`, unlike this function's ambient
+    // category: JDK 25's body resolves the resource bundle and then runs
+    // `java.text.MessageFormat.format` whenever the message contains `{n}` and
+    // the record carries parameters, where this body USED TO return
+    // `getMessage()` verbatim. Measured then: HotSpot `one=A two=B`, CratonVM
+    // `one={0} two={1}`, in BOTH modes. `Intrinsic` is exempt from the
+    // `java/util/logging/` shadow retirement, so under `--jdk-only` this
+    // survived every honest row being refused — a refusal is not a removal,
+    // and re-tagging it `Bridge` did not remove it either: the retirement is
+    // driven by the explicit triple table in `native-api/src/retired_shadow.rs`
+    // and this triple is not in it, so the row still dispatched in both modes
+    // and still answered with the raw pattern.
+    // W7-35-jul-supplier-and-payload-residuals.md
+    // W7-43-formatmessage-substitution.md
     let fmt = "java/util/logging/Formatter";
-    r.register(
-        fmt,
-        "formatMessage",
-        "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                // LogRecord slot 1 is its sequence number on the real JDK
-                // layout, not the message. Resolve through the public method
-                // so concrete JULI formatters receive the string populated by
-                // the logging bridge.
-                match ctx.invoke_virtual(*rec, "getMessage", "()Ljava/lang/String;", &[])? {
-                    Some(Value::Object(Some(message))) => Ok(Some(Value::Object(Some(message)))),
-                    _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+    // Two sessions fixed this row concurrently. The version kept is the one
+    // that reproduces `java.util.logging.Formatter.formatMessage` in full —
+    // ResourceBundle localization with the `MissingResourceException`
+    // drop-through, the null-message answer, and the JDK's own fenced
+    // `indexOf('{')`+digit scan — rather than the `{0`..`{3` sniff, which
+    // misses `{4` and above and skips localization entirely.
+        r.register(
+            fmt,
+            "formatMessage",
+            "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
+            |ctx, args| match args.get(1) {
+                Some(Value::Object(Some(rec))) => jul_formatter_format_message(ctx, *rec),
+                // A null record is an NPE on HotSpot (`record.getMessage()` is
+                // the method's first act). This row has answered with an empty
+                // string since it was written and nothing measured exercises
+                // the null, so the historical answer is kept rather than
+                // introducing a throw that no test can adjudicate.
+                _ => {
+                    let s = ctx.create_string("");
+                    Ok(Some(Value::Object(Some(s))))
                 }
-            } else {
-                let s = ctx.create_string("");
-                Ok(Some(Value::Object(Some(s))))
-            }
-        },
-    );
+            },
+        );
+    });
 
     // --- SimpleFormatter ---
     // Previously `<init>`/`format` were stubbed here the same way
@@ -20268,27 +21095,238 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // `logmanager.rs` already patches around it for that specific case.
 
     // --- LogManager (singleton) ---
+    //
+    // NOT `Intrinsic`, unlike the rest of this function, and the distinction is
+    // load-bearing rather than cosmetic. These two FABRICATE a manager and a
+    // logger in front of real bytecode — a `Bridge` by definition; an intrinsic
+    // is the kind that cannot give an answer the bytecode would not.
+    //
+    // `Intrinsic` is exempt from the `java/util/logging/` shadow retirement, so
+    // while the function-wide ambient category applied here these rows SURVIVED
+    // `--jdk-only` after the retirement refused every OTHER registrar of the
+    // same triples — and a refusal does not remove the registration it would
+    // have overwritten. What was left holding `getLogManager()` was an uncached
+    // fabricator returning a fresh, unconstructed manager on every call
+    // (identityHashCode 7, 8, 9 on three successive calls), whose null
+    // `systemContext` is the first NPE any JUL user hits.
+    //
+    // The real `LogManager.<init>` is itself retired, so the static
+    // `LogManager.manager` already comes out of the real constructor — this
+    // builds no state, it stops shadowing state that is already there.
+    // W7-25-jul-getlogger-regression.md
     let lm = "java/util/logging/LogManager";
-    r.register(
-        lm,
-        "getLogManager",
-        "()Ljava/util/logging/LogManager;",
-        |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        lm,
-        "getLogger",
-        "(Ljava/lang/String;)Ljava/util/logging/Logger;",
-        |ctx, _args| {
-            // Return a new Logger stub
-            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            lm,
+            "getLogManager",
+            "()Ljava/util/logging/LogManager;",
+            |ctx, _args| {
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
+                Ok(Some(Value::Object(Some(obj))))
+            },
+        );
+        r.register(
+            lm,
+            "getLogger",
+            "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+            |ctx, _args| {
+                // Return a new Logger stub
+                let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
+                Ok(Some(Value::Object(Some(logger))))
+            },
+        );
+    });
     r.set_category(__prev_cat);
+}
+
+/// Does the message look like a `java.text` format string?
+///
+/// This is JDK 25 `Formatter.formatMessage`'s own guard, and its own comment
+/// says why it is written this way rather than as `Pattern.compile("\\{\\d")`:
+/// the regex costs 14% more, so the JDK walks `indexOf('{')` and looks at the
+/// next `char`. Reproduced exactly, including the `index >= fence` break that
+/// makes a `{` in the LAST position not a pattern.
+///
+/// Byte-wise is equivalent to the JDK's `char`-wise scan here and not an
+/// approximation of it: `{` and `0`-`9` are ASCII, and UTF-8 never encodes an
+/// ASCII byte inside a multi-byte sequence, so a `{` byte is a `{` char and the
+/// byte after it is the next char's first byte.
+fn jul_message_is_java_text_format(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    let mut index = 0usize;
+    // `fence = length - 1`; the JDK breaks when a `{` is found AT the fence,
+    // which is the same as never looking past the last byte.
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'{' && bytes[index + 1].is_ascii_digit() {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// A `String` result, or the null the JDK returns when the record's message is
+/// null. `formatMessage` is declared to return `String`, and HotSpot really
+/// does hand back `null` for `new LogRecord(level, null)` — the empty string
+/// this row used to answer with is not the same value and prints differently
+/// through `SimpleFormatter.format`.
+fn jul_message_result(ctx: &mut dyn NativeContext, message: Option<String>) -> Value {
+    match message {
+        Some(text) => {
+            let s = ctx.create_string(&text);
+            Value::Object(Some(s))
+        }
+        None => Value::Object(None),
+    }
+}
+
+/// `java.util.logging.Formatter.formatMessage(LogRecord)`.
+///
+/// The registration this serves used to be `record.getMessage()` and nothing
+/// else, which is why the strict corpus' `RJdkLogging.recordPayloads` read back
+/// `one={0} two={1}` where HotSpot reads `one=A two=B`. The record side was
+/// never at fault — the same fixture asserts, and passes, that the record keeps
+/// the RAW pattern and both parameters. HotSpot substitutes in the FORMATTER.
+///
+/// The five steps below are JDK 25's `Formatter.formatMessage` in order, read
+/// off `java.logging/java/util/logging/Formatter.java` in the image's
+/// `src.zip`, not from memory:
+///
+/// 1. `String format = record.getMessage();`
+/// 2. localize it through `record.getResourceBundle()` when there is one,
+///    keeping the original if the lookup misses.
+/// 3. `record.getParameters()`; a null or empty array returns the message with
+///    NO formatting at all — this is why a bare `{0}` in an unparameterized
+///    message survives to the output.
+/// 4. the cheap `{<digit>` probe ([`jul_message_is_java_text_format`]); a
+///    message that does not look like a pattern is returned unchanged.
+/// 5. `java.text.MessageFormat.format(format, parameters)` — **and if that
+///    throws, the original message is returned**. The JDK swallows it on
+///    purpose ("Formatting failed: use localized format string"), which is what
+///    makes a bad pattern such as `set={x} v={0}` come back verbatim instead of
+///    propagating an `IllegalArgumentException` into a logging call.
+///
+/// Step 5 is the trap this fix had to rule out before touching step 4: a
+/// missing or stubbed `MessageFormat` would throw, the swallow would turn that
+/// into "return the raw pattern", and the symptom would be identical with the
+/// guard entirely innocent. It is not that here — measured on the pre-fix dev
+/// binary, `MessageFormat.format("one={0} two={1}", {"A","B"})` answers
+/// `one=A two=B` in BOTH `--real-jdk` and `--jdk-only`, and matches HotSpot on
+/// the quoting, out-of-range-index and bad-argument-name cases too (it throws
+/// `IllegalArgumentException` on `{x}` exactly as HotSpot does). So the
+/// dependency was healthy and the shadow was simply not calling it.
+/// W7-43-formatmessage-substitution.md
+fn jul_formatter_format_message(
+    ctx: &mut dyn NativeContext,
+    record: ObjectRef,
+) -> MethodCallResult {
+    // Every step below re-enters Java and can move the heap, so the record is
+    // rooted once and re-read through its pin after each re-entry (the native
+    // stale-local family). One base pin, one unpin on every exit path.
+    let base_pin = ctx.pin_native_root(record);
+    let out = jul_formatter_format_message_body(ctx, base_pin, record);
+    ctx.unpin_native_roots(base_pin);
+    out
+}
+
+fn jul_formatter_format_message_body(
+    ctx: &mut dyn NativeContext,
+    rec_pin: usize,
+    record: ObjectRef,
+) -> MethodCallResult {
+    // 1. `String format = record.getMessage();`
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let message_obj = ctx.invoke_virtual(rec, "getMessage", "()Ljava/lang/String;", &[])?;
+    let mut message = match message_obj {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    };
+
+    // 2. Localize through the record's own bundle. `getString` raising
+    //    `MissingResourceException` is the DOCUMENTED miss path ("Drop
+    //    through. Use record message as format"), so a failed lookup keeps the
+    //    raw message rather than propagating.
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let catalog_val =
+        ctx.invoke_virtual(rec, "getResourceBundle", "()Ljava/util/ResourceBundle;", &[])?;
+    let catalog = match catalog_val {
+        Some(Value::Object(o)) => o,
+        _ => None,
+    };
+    if let (Some(catalog), Some(key_text)) = (catalog, message.clone()) {
+        let catalog_pin = ctx.pin_native_root(catalog);
+        let key = ctx.create_string(&key_text);
+        let key_pin = ctx.pin_native_root(key);
+        let catalog = ctx.read_native_pin(catalog_pin, catalog);
+        let key = ctx.read_native_pin(key_pin, key);
+        let localized_call = ctx.invoke_virtual(
+            catalog,
+            "getString",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(key))],
+        );
+        if let Ok(Some(Value::Object(Some(localized)))) = localized_call {
+            if let Some(text) = ctx.read_string(localized) {
+                message = Some(text);
+            }
+        }
+    }
+
+    // 3. `Object[] parameters = record.getParameters();` — null or empty means
+    //    NO formatting is performed at all.
+    //    `getParameters()` is INSIDE the JDK's `try`, unlike the two calls
+    //    above it, so a throw here is swallowed into "return the message" too.
+    let rec = ctx.read_native_pin(rec_pin, record);
+    let params_call = ctx.invoke_virtual(rec, "getParameters", "()[Ljava/lang/Object;", &[]);
+    let parameters = match params_call {
+        Ok(Some(Value::Object(o))) => o,
+        Ok(_) => None,
+        Err(_) => return Ok(Some(jul_message_result(ctx, message))),
+    };
+    let Some(parameters) = parameters else {
+        return Ok(Some(jul_message_result(ctx, message)));
+    };
+    let params_pin = ctx.pin_native_root(parameters);
+    let params_probe = ctx.read_native_pin(params_pin, parameters);
+    if ctx.array_length(params_probe) == 0 {
+        return Ok(Some(jul_message_result(ctx, message)));
+    }
+
+    // 4. The `{<digit>` probe. A message that is not a pattern is returned
+    //    unchanged even though parameters are present.
+    let Some(pattern) = message else {
+        // A null message WITH parameters: the JDK reaches `format.length()`
+        // inside its own `try`, the NPE lands in the catch, and the catch
+        // returns `format` — which is null. Not the empty string.
+        return Ok(Some(Value::Object(None)));
+    };
+    if !jul_message_is_java_text_format(&pattern) {
+        let s = ctx.create_string(&pattern);
+        return Ok(Some(Value::Object(Some(s))));
+    }
+
+    // 5. `java.text.MessageFormat.format(format, parameters)`, with the JDK's
+    //    deliberate swallow: any failure returns the (localized) message.
+    let pattern_obj = ctx.create_string(&pattern);
+    let pattern_pin = ctx.pin_native_root(pattern_obj);
+    let parameters = ctx.read_native_pin(params_pin, parameters);
+    let pattern_obj = ctx.read_native_pin(pattern_pin, pattern_obj);
+    let rendered_call = ctx.invoke(
+        "java/text/MessageFormat",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+        &[
+            Value::Object(Some(pattern_obj)),
+            Value::Object(Some(parameters)),
+        ],
+    );
+    match rendered_call {
+        Ok(Some(Value::Object(Some(rendered)))) => Ok(Some(Value::Object(Some(rendered)))),
+        _ => {
+            let s = ctx.create_string(&pattern);
+            Ok(Some(Value::Object(Some(s))))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -24023,5 +25061,159 @@ mod t2_tests {
     fn pkcs7_unpad_rejects_bad_length() {
         assert!(pkcs7_unpad(&[]).is_err());
         assert!(pkcs7_unpad(&[1, 2, 3]).is_err()); // not a multiple of 16
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyGenerator — the parts that are arithmetic rather than heap access.
+    // The registrations themselves need a VM; these do not, and they are the
+    // parts where being wrong is silent.
+    // -----------------------------------------------------------------------
+
+    fn hex24(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The exact vector `javax.crypto.spec.DESedeKeySpec.isParityAdjusted`
+    /// accepted, computed by running this same rule in Java on HotSpot 25 and
+    /// on this VM and feeding the result to the JDK's own checker. If this
+    /// assertion fails, the parity rule has drifted from the one the JDK
+    /// validates against — which is the failure that would otherwise surface as
+    /// `InvalidKeyException` deep inside somebody's DESede cipher.
+    #[test]
+    fn des_parity_matches_the_jdk_checker() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 7) as u8).collect();
+        assert_eq!(hex24(&key), "00070e151c232a31383f464d545b626970777e858c939aa1");
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        assert_eq!(hex24(&key), "01070e151c232a31383e464c545b626870767f858c929ba1");
+        // …and the property the checker actually tests, stated independently of
+        // the vector: every byte has odd population count.
+        for (i, b) in key.iter().enumerate() {
+            assert_eq!(b.count_ones() % 2, 1, "byte {i} is not odd parity");
+        }
+    }
+
+    /// A DES key is 8 bytes of odd parity. Same construction, same checker.
+    #[test]
+    fn des_parity_single_block() {
+        let mut key: Vec<u8> = (0..8u32).map(|i| (0x10 + i * 11) as u8).collect();
+        assert_eq!(hex24(&key), "101b26313c47525d");
+        des_set_odd_parity(&mut key, 0);
+        assert_eq!(hex24(&key), "101a26313d46525d");
+    }
+
+    /// Parity must be idempotent: conditioning an already-conditioned key must
+    /// not move it. A rule that flipped bit 0 unconditionally would pass the
+    /// vector test above and fail this one.
+    #[test]
+    fn des_parity_is_idempotent() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 37 + 5) as u8).collect();
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        let once = key.clone();
+        des_set_odd_parity(&mut key, 0);
+        des_set_odd_parity(&mut key, 8);
+        des_set_odd_parity(&mut key, 16);
+        assert_eq!(once, key);
+    }
+
+    /// 2-key Triple DES: 24 bytes with K3 == K1 and K2 != K1 — the shape
+    /// HotSpot 25 produced on every `init(112)` run.
+    #[test]
+    fn desede_112_folds_k3_onto_k1() {
+        let mut key: Vec<u8> = (0..24u32).map(|i| (i * 13 + 1) as u8).collect();
+        keygen_condition_key("DESede", &mut key);
+        keygen_fold_two_key_desede(&mut key);
+        assert_eq!(key.len(), 24);
+        assert_eq!(&key[0..8], &key[16..24], "K3 must equal K1");
+        assert_ne!(&key[0..8], &key[8..16], "K2 must not equal K1");
+        // The fold must not smuggle in a byte that lost its parity.
+        for b in key.iter() {
+            assert_eq!(b.count_ones() % 2, 1);
+        }
+    }
+
+    /// `key_size / 8` is the wrong length for exactly one family, and this is
+    /// the assertion that says so: 168 bits of DESede is 24 bytes, not 21.
+    #[test]
+    fn desede_key_length_carries_its_parity_bits() {
+        assert_eq!(keygen_byte_len("DESede", 168), 24);
+        assert_eq!(keygen_byte_len("DESede", 112), 24);
+        assert_eq!(keygen_byte_len("DES", 56), 8);
+        // Everything else really is bits/8.
+        assert_eq!(keygen_byte_len("AES", 256), 32);
+        assert_eq!(keygen_byte_len("HmacSHA256", 256), 32);
+    }
+
+    /// Every default measured on HotSpot 25. The AES row is the one that was
+    /// wrong in the field: 128 where HotSpot gives 256.
+    #[test]
+    fn keygen_defaults_match_hotspot() {
+        assert_eq!(keygen_default_bits("AES"), Some(256));
+        assert_eq!(keygen_default_bits("aes"), Some(256));
+        assert_eq!(keygen_default_bits("DESede"), Some(168));
+        assert_eq!(keygen_default_bits("DES"), Some(56));
+        assert_eq!(keygen_default_bits("HmacSHA1"), Some(512));
+        assert_eq!(keygen_default_bits("HmacSHA224"), Some(224));
+        assert_eq!(keygen_default_bits("HmacSHA256"), Some(256));
+        assert_eq!(keygen_default_bits("HmacSHA384"), Some(384));
+        assert_eq!(keygen_default_bits("HmacSHA512"), Some(512));
+        assert_eq!(keygen_default_bits("Blowfish"), Some(128));
+        assert_eq!(keygen_default_bits("ChaCha20"), Some(256));
+        // No default arm: an algorithm this VM cannot generate for is refused,
+        // not served with somebody else's default.
+        assert_eq!(keygen_default_bits("CRATONVM-NO-SUCH-KEYGEN"), None);
+        assert_eq!(keygen_default_bits(""), None);
+    }
+
+    /// The sizes HotSpot refuses, and the ones it accepts.
+    #[test]
+    fn keygen_size_admission_matches_hotspot() {
+        let (aes, _) = keygen_allowed_bits("AES").expect("AES has a fixed set");
+        assert_eq!(aes, &[128, 192, 256][..]);
+        assert!(!aes.contains(&129));
+        let (desede, _) = keygen_allowed_bits("DESede").expect("DESede has a fixed set");
+        assert_eq!(desede, &[112, 168][..]);
+        assert!(!desede.contains(&128));
+        // The HMAC family takes any positive multiple of 8 — HotSpot really
+        // does hand back an 8-byte key for `HmacSHA256` `init(64)`.
+        assert!(keygen_allowed_bits("HmacSHA256").is_none());
+    }
+
+    /// `Formatter.formatMessage`'s step-4 guard, against the HotSpot answers
+    /// measured on JDK 25.0.3+9 for the same strings.
+    ///
+    /// Every case here can fail: the guard is the place this defect was most
+    /// likely to live, and three of these rows (`{x}` before a real `{0}`, a
+    /// lone trailing `{`, and `{` before a non-digit) are exactly the ones a
+    /// "does it contain a brace" shortcut gets wrong in one direction or the
+    /// other.
+    #[test]
+    fn jul_format_guard_matches_the_jdk_indexof_scan() {
+        // A `{<digit>` anywhere makes it a pattern.
+        assert!(jul_message_is_java_text_format("one={0} two={1}"));
+        assert!(jul_message_is_java_text_format("{0}"));
+        assert!(jul_message_is_java_text_format("trailing {9}"));
+        // `{10}` is `{` followed by `1` — a pattern by this rule, even though
+        // MessageFormat may then leave it alone for want of an 11th argument.
+        assert!(jul_message_is_java_text_format("ten={10}"));
+        // A `{` whose next char is not a digit is not enough on its own...
+        assert!(!jul_message_is_java_text_format("set={x}"));
+        assert!(!jul_message_is_java_text_format("no placeholder here"));
+        assert!(!jul_message_is_java_text_format(""));
+        // ...but the scan must keep going and find the later one. HotSpot
+        // formats this string (and MessageFormat then throws on `{x}`, which
+        // the swallow turns back into the raw message).
+        assert!(jul_message_is_java_text_format("set={x} v={0}"));
+        // The JDK's `index >= fence` break: a `{` in the LAST position has no
+        // next char and is never a pattern.
+        assert!(!jul_message_is_java_text_format("trail{"));
+        assert!(!jul_message_is_java_text_format("{"));
+        // The byte scan must not mistake a multi-byte char's continuation byte
+        // for a digit, and must not miss a pattern that follows one.
+        assert!(!jul_message_is_java_text_format("héllo {x}"));
+        assert!(jul_message_is_java_text_format("héllo {0}"));
     }
 }

@@ -110,6 +110,12 @@ const FIXTURE_ALLOWED: &[(&str, &str)] = &[
         "rfjp1_recursive.rs",
         "same as fjp_recursive.rs — its `probe_source()` panics rather than skipping",
     ),
+    (
+        "probe_fixture_census.rs",
+        "the fixture ratchet — like this guard, its `apps/` literals are a detector, not a \
+         lookup. It is the check that makes a missing fixture fail a DEFAULT `cargo test` run \
+         rather than only a `CRATONVM_REQUIRE_E2E=1` one",
+    ),
 ];
 
 /// Files that legitimately launch a Java compiler but do not need

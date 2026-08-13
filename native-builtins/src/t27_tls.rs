@@ -1090,6 +1090,295 @@ pub(crate) fn parse_cert_chain_pem(pem: &str) -> Result<Vec<CertificateDer<'stat
     Ok(certs)
 }
 
+// -----------------------------------------------------------------------------
+// EC PKCS#8 v1 repair: recover the missing public key from the leaf certificate
+// -----------------------------------------------------------------------------
+//
+// `ring` (and therefore rustls's ring backend, including the vendored
+// `rustls-cbc`) can only build an `EcdsaKeyPair` from a PKCS#8 document whose
+// inner SEC1 `ECPrivateKey` carries the optional `publicKey [1]` BIT STRING.
+// The SEC1 branch is no escape hatch: `EcdsaSigningKey::convert_sec1_to_pkcs8`
+// re-wraps and calls the same `from_pkcs8`.
+//
+// `java.security.KeyPairGenerator("EC")` emits the OTHER shape — inner SEC1 of
+// just `version` + `privateKey`, no `parameters [0]`, no `publicKey [1]`. That
+// is not a CratonVM quirk: HotSpot's SunEC produces a byte-identical 67-byte
+// P-256 encoding (verified against JDK 25). rustls reports the refusal as the
+// generic "failed to parse private key as RSA, ECDSA, or EdDSA", which reads
+// like a corrupt key and is not — see
+// `docs/known-issues/netty/ec-pkcs8-v1-server-identity-rejected-20260812.md`.
+//
+// Rather than derive the public point (the in-tree `crypto_impl` EC core is
+// P-256 only, so that would fix one curve), take it from the leaf
+// certificate's `SubjectPublicKeyInfo`, which by definition holds the public
+// key for this identity. That is curve-agnostic and needs no EC arithmetic.
+// It is also self-checking: `ring`'s `from_pkcs8` recomputes the public key
+// from the private scalar and rejects the document if the two disagree, so a
+// cert/key mismatch fails closed exactly as before rather than producing an
+// identity that signs with the wrong key.
+
+/// Byte-length of the DER TLV header at `at` (identifier octet + length
+/// octets), or `None` if the header is truncated or uses an unsupported
+/// long form.
+fn der_header_len(buf: &[u8], at: usize) -> Option<usize> {
+    let len_byte = *buf.get(at + 1)?;
+    if len_byte & 0x80 == 0 {
+        return Some(2);
+    }
+    let n = (len_byte & 0x7f) as usize;
+    // Indefinite length (n == 0) is not valid DER; > 4 length octets is far
+    // beyond anything in a key or certificate.
+    if n == 0 || n > 4 {
+        return None;
+    }
+    Some(2 + n)
+}
+
+/// Value length of the TLV at `at`.
+fn der_value_len(buf: &[u8], at: usize) -> Option<usize> {
+    let len_byte = *buf.get(at + 1)?;
+    if len_byte & 0x80 == 0 {
+        return Some(len_byte as usize);
+    }
+    let n = (len_byte & 0x7f) as usize;
+    if n == 0 || n > 4 {
+        return None;
+    }
+    let mut len = 0usize;
+    for i in 0..n {
+        len = len
+            .checked_mul(256)?
+            .checked_add(*buf.get(at + 2 + i)? as usize)?;
+    }
+    Some(len)
+}
+
+/// `(value_start, value_end)` of the TLV at `at`, bounds-checked against `buf`.
+fn der_tlv(buf: &[u8], at: usize) -> Option<(usize, usize)> {
+    let hdr = der_header_len(buf, at)?;
+    let len = der_value_len(buf, at)?;
+    let start = at.checked_add(hdr)?;
+    let end = start.checked_add(len)?;
+    (end <= buf.len()).then_some((start, end))
+}
+
+/// End offset (exclusive) of the whole TLV at `at`.
+fn der_tlv_end(buf: &[u8], at: usize) -> Option<usize> {
+    Some(der_tlv(buf, at)?.1)
+}
+
+/// `1.2.840.10045.2.1` (id-ecPublicKey), as it appears inside an
+/// `AlgorithmIdentifier` — tag, length and contents.
+const OID_ID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+/// Encode one DER TLV.
+fn der_tlv_encode(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 4);
+    out.push(tag);
+    let n = body.len();
+    if n < 0x80 {
+        out.push(n as u8);
+    } else if n <= 0xff {
+        out.extend_from_slice(&[0x81, n as u8]);
+    } else {
+        out.extend_from_slice(&[0x82, (n >> 8) as u8, (n & 0xff) as u8]);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Pull the `subjectPublicKey` BIT STRING contents (the uncompressed EC point,
+/// `0x04 || X || Y`) out of a DER certificate's `SubjectPublicKeyInfo`, if the
+/// certificate carries an EC public key.
+///
+/// Walks `Certificate -> tbsCertificate -> *` looking for the child SEQUENCE
+/// shaped `{ AlgorithmIdentifier{ id-ecPublicKey, .. }, BIT STRING }`. Matching
+/// on shape rather than counting fields keeps this correct across the optional
+/// `[0] version` and the optional trailing extension fields.
+fn cert_ec_public_key_bits(cert_der: &[u8]) -> Option<Vec<u8>> {
+    if *cert_der.first()? != 0x30 {
+        return None;
+    }
+    let (cert_body, cert_end) = der_tlv(cert_der, 0)?;
+    // tbsCertificate is the first child.
+    if *cert_der.get(cert_body)? != 0x30 {
+        return None;
+    }
+    let (tbs_body, tbs_end) = der_tlv(cert_der, cert_body)?;
+    if tbs_end > cert_end {
+        return None;
+    }
+    let mut p = tbs_body;
+    while p < tbs_end {
+        let end = der_tlv_end(cert_der, p)?;
+        if cert_der[p] == 0x30 {
+            if let Some(bits) = spki_ec_bits(cert_der, p) {
+                return Some(bits);
+            }
+        }
+        p = end;
+    }
+    None
+}
+
+/// If the SEQUENCE at `at` is an EC `SubjectPublicKeyInfo`, return its
+/// `subjectPublicKey` bits with the BIT STRING's leading unused-bits octet
+/// removed.
+fn spki_ec_bits(buf: &[u8], at: usize) -> Option<Vec<u8>> {
+    let (body, end) = der_tlv(buf, at)?;
+    // child 1: AlgorithmIdentifier SEQUENCE starting with id-ecPublicKey
+    if *buf.get(body)? != 0x30 {
+        return None;
+    }
+    let (alg_body, alg_end) = der_tlv(buf, body)?;
+    if buf.get(alg_body..alg_body.checked_add(OID_ID_EC_PUBLIC_KEY.len())?)? != OID_ID_EC_PUBLIC_KEY
+    {
+        return None;
+    }
+    // child 2: subjectPublicKey BIT STRING
+    if alg_end >= end || *buf.get(alg_end)? != 0x03 {
+        return None;
+    }
+    let (bits_body, bits_end) = der_tlv(buf, alg_end)?;
+    // First content octet of a BIT STRING is the unused-bit count; an EC point
+    // is whole octets, so it must be zero.
+    if *buf.get(bits_body)? != 0 || bits_end <= bits_body + 1 {
+        return None;
+    }
+    Some(buf[bits_body + 1..bits_end].to_vec())
+}
+
+/// Given a PKCS#8 EC private key whose inner SEC1 omits `publicKey [1]`, return
+/// an equivalent PKCS#8 with the public key from `leaf_cert_der` spliced in.
+///
+/// Returns `None` — meaning "use the key unchanged" — when the key is not an EC
+/// PKCS#8, when it already carries a public key, or when the certificate has no
+/// EC public key to lend. Every failure path is a no-op, so this can only make
+/// more identities usable, never fewer.
+pub(crate) fn ec_pkcs8_splice_public_key(key_der: &[u8], leaf_cert_der: &[u8]) -> Option<Vec<u8>> {
+    if *key_der.first()? != 0x30 {
+        return None;
+    }
+    let (outer_body, outer_end) = der_tlv(key_der, 0)?;
+    // version INTEGER (PKCS#8 v1 == 0)
+    if *key_der.get(outer_body)? != 0x02 {
+        return None;
+    }
+    let version_end = der_tlv_end(key_der, outer_body)?;
+    // privateKeyAlgorithm AlgorithmIdentifier — must be id-ecPublicKey.
+    if *key_der.get(version_end)? != 0x30 {
+        return None;
+    }
+    let (alg_body, alg_end) = der_tlv(key_der, version_end)?;
+    if key_der.get(alg_body..alg_body.checked_add(OID_ID_EC_PUBLIC_KEY.len())?)?
+        != OID_ID_EC_PUBLIC_KEY
+    {
+        return None;
+    }
+    // privateKey OCTET STRING wrapping the SEC1 ECPrivateKey.
+    if *key_der.get(alg_end)? != 0x04 {
+        return None;
+    }
+    let (oct_body, oct_end) = der_tlv(key_der, alg_end)?;
+    if oct_end > outer_end || *key_der.get(oct_body)? != 0x30 {
+        return None;
+    }
+    let (sec1_body, sec1_end) = der_tlv(key_der, oct_body)?;
+    // inner: version INTEGER, privateKey OCTET STRING, then optionals.
+    if *key_der.get(sec1_body)? != 0x02 {
+        return None;
+    }
+    let sec1_version_end = der_tlv_end(key_der, sec1_body)?;
+    if *key_der.get(sec1_version_end)? != 0x04 {
+        return None;
+    }
+    let sec1_priv_end = der_tlv_end(key_der, sec1_version_end)?;
+    // Already has `publicKey [1]`? Then ring is happy and there is nothing to do.
+    let mut p = sec1_priv_end;
+    while p < sec1_end {
+        if key_der[p] == 0xa1 {
+            return None;
+        }
+        p = der_tlv_end(key_der, p)?;
+    }
+
+    let public_bits = cert_ec_public_key_bits(leaf_cert_der)?;
+
+    // Rebuild the inner SEC1 as version + privateKey + [1] publicKey, keeping
+    // any `parameters [0]` that was present. `parameters` stays optional: the
+    // openssl-produced PKCS#8 that ring accepts omits it too (the curve is
+    // already named by the outer AlgorithmIdentifier).
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&key_der[sec1_body..sec1_priv_end]);
+    let mut q = sec1_priv_end;
+    while q < sec1_end {
+        let end = der_tlv_end(key_der, q)?;
+        if key_der[q] == 0xa0 {
+            inner.extend_from_slice(&key_der[q..end]);
+        }
+        q = end;
+    }
+    let mut bit_string = Vec::with_capacity(public_bits.len() + 1);
+    bit_string.push(0); // unused bits
+    bit_string.extend_from_slice(&public_bits);
+    inner.extend_from_slice(&der_tlv_encode(0xa1, &der_tlv_encode(0x03, &bit_string)));
+
+    let mut outer = Vec::new();
+    outer.extend_from_slice(&key_der[outer_body..version_end]); // version
+    outer.extend_from_slice(&key_der[version_end..alg_end]); // privateKeyAlgorithm
+    outer.extend_from_slice(&der_tlv_encode(0x04, &der_tlv_encode(0x30, &inner)));
+    Some(der_tlv_encode(0x30, &outer))
+}
+
+/// Apply [`ec_pkcs8_splice_public_key`] to a parsed key when the chain's leaf
+/// can supply the missing public key. A no-op for every other key shape.
+pub(crate) fn repair_ec_key_for_ring<'a>(
+    key: PrivateKeyDer<'a>,
+    chain: &[CertificateDer<'_>],
+) -> PrivateKeyDer<'a> {
+    let PrivateKeyDer::Pkcs8(ref pkcs8) = key else {
+        return key;
+    };
+    let Some(leaf) = chain.first() else {
+        return key;
+    };
+    match ec_pkcs8_splice_public_key(pkcs8.secret_pkcs8_der(), leaf.as_ref()) {
+        Some(repaired) => {
+            if crate::nbflags().dbg_tls_hs {
+                eprintln!(
+                    "[dbg-tls-hs] repair_ec_key_for_ring: spliced cert public key into EC PKCS#8 \
+                     ({} -> {} bytes)",
+                    pkcs8.secret_pkcs8_der().len(),
+                    repaired.len()
+                );
+            }
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(repaired))
+        }
+        None => key,
+    }
+}
+
+/// Build a `CertifiedKey` from raw DER, repairing a JDK-shaped EC key first.
+///
+/// The mTLS `KeyManager` resolver is the one identity path that never sees PEM:
+/// its material arrives as DER from `km_alias_material`. That is why it was the
+/// call site the EC repair originally missed — it does not share a line with the
+/// six `parse_private_key_pem` builders. It exists as a named function, rather
+/// than three lines inlined into `resolve_via_java`, so a test can exercise the
+/// path the resolver actually takes: delete the repair here and
+/// `a_key_manager_supplied_jdk_ec_identity_is_repaired_too` goes red.
+pub(crate) fn certified_key_from_der_repairing_ec(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key_der: Vec<u8>,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<CertifiedKey, rustls::Error> {
+    let key = repair_ec_key_for_ring(
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+        &cert_chain,
+    );
+    CertifiedKey::from_der(cert_chain, key, provider)
+}
+
 /// Parse a PEM-encoded PKCS#8 private key. Returns an error if no key block
 /// is present. Accepts both `PRIVATE KEY` (PKCS#8) and `RSA PRIVATE KEY`
 /// (PKCS#1) / `EC PRIVATE KEY` (SEC1) forms.
@@ -1415,7 +1704,9 @@ impl SniCertResolver {
     /// signer, which covers RSA 2048/3072/4096 and ECDSA P-256/P-384.
     fn certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, String> {
         let chain = parse_cert_chain_pem(cert_pem)?;
-        let key = parse_private_key_pem(key_pem)?;
+        // Same repair as the non-SNI server builder: a JDK EC key arrives
+        // without the `publicKey [1]` ring needs, and the cert carries it.
+        let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| format!("unsupported private key: {}", e))?;
         Ok(Arc::new(CertifiedKey::new(chain, signing_key)))
@@ -1471,6 +1762,14 @@ pub(crate) struct TlsClientStreamEntry {
     /// TLS connection must never hold the process-wide registry lock — see
     /// `rustls_stream_read`'s doc comment.
     pub(crate) stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
+    /// A `try_clone`d handle on the same socket, reachable WITHOUT `stream`'s
+    /// mutex. Added 2026-08-12 (W7-61), modelled exactly on
+    /// `servlet::TlsEntry::raw`, which already existed for this purpose on the
+    /// native-tls table. It is the only way `rustls_stream_close` can reach the
+    /// socket while another thread is parked in a read on it — that thread
+    /// holds both the mutex and an `Arc`, so neither `try_lock` nor dropping
+    /// our own `Arc` touches the connection. `None` only if `try_clone` failed.
+    pub(crate) raw: Option<TcpStream>,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     pub(crate) negotiated_protocol: String,
@@ -1481,6 +1780,8 @@ pub(crate) struct TlsClientStreamEntry {
 pub(crate) struct TlsServerStreamEntry {
     /// Per-stream mutex — see `TlsClientStreamEntry::stream`.
     pub(crate) stream: Arc<Mutex<TlsServerStream>>,
+    /// See `TlsClientStreamEntry::raw`.
+    pub(crate) raw: Option<TcpStream>,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
@@ -1492,6 +1793,20 @@ pub(crate) enum TlsServerStream {
     Native(native_tls::TlsStream<TcpStream>),
     #[cfg(unix)]
     LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+}
+
+impl TlsServerStream {
+    /// The underlying TCP socket, borrowed. Used only to `try_clone` a
+    /// registry-held duplicate at registration time — see
+    /// `TlsClientStreamEntry::raw`.
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            TlsServerStream::Rustls(s) => &s.sock,
+            TlsServerStream::Native(s) => s.get_ref(),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.get_ref(),
+        }
+    }
 }
 
 impl Default for ServerRegistry {
@@ -1620,7 +1935,9 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
     enabled_protocols: &[String],
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
-    let key = parse_private_key_pem(key_pem)?;
+    // JDK-generated EC keys omit the `publicKey [1]` that ring demands; the
+    // leaf certificate carries it. No-op for every other key shape.
+    let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
 
     let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
     let builder = if require_client_cert || optional_client_cert {
@@ -1708,7 +2025,9 @@ pub(crate) fn build_client_config(
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
@@ -2041,7 +2360,9 @@ fn build_client_config_ex_with_provider(
         ClientAuthMode::Resolver(resolver) => builder.with_client_cert_resolver(resolver),
         ClientAuthMode::Fixed(Some((cert_pem, key_pem))) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
@@ -2543,8 +2864,12 @@ impl JavaKeyManagerResolver {
                 if cert_chain.is_empty() {
                     continue;
                 }
-                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
-                match CertifiedKey::from_der(cert_chain, key, &self.provider) {
+                // Repairs the JDK-shaped EC key on the way — without it a
+                // JDK-generated EC *client* identity resolves to `Err` here,
+                // the client sends an empty Certificate, and the far end
+                // answers `CertificateRequired`, a failure that names neither
+                // the key nor this decision.
+                match certified_key_from_der_repairing_ec(cert_chain, key_der, &self.provider) {
                     Ok(ck) => return Some(Arc::new(ck)),
                     Err(e) => {
                         if dbg {
@@ -3093,7 +3418,8 @@ fn build_server_config_single_cert_passthrough_client_auth(
     root_hints: Vec<rustls::DistinguishedName>,
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
-    let key = parse_private_key_pem(key_pem)?;
+    // See the sibling builder: JDK EC keys need the cert's public key spliced in.
+    let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
     let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
     let algorithms = provider_and_versions(enabled_ciphers, enabled_protocols)
         .0
@@ -3134,7 +3460,9 @@ pub(crate) fn build_client_config_ciphers(
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
-            let key = parse_private_key_pem(key_pem)?;
+            // A JDK-generated EC client identity needs the same repair as the
+            // server one — ring rejects it otherwise.
+            let key = repair_ec_key_for_ring(parse_private_key_pem(key_pem)?, &chain);
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
@@ -3234,8 +3562,12 @@ pub(crate) fn rustls_client_connect(
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
 
+    // W7-61: registry-held duplicate, taken BEFORE `stream` moves into the
+    // mutex. See `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let entry = TlsClientStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -3422,8 +3754,11 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
             }
         };
 
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.tcp().try_clone().ok();
     let entry = TlsServerStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         sni_hostname,
         negotiated_protocol,
         negotiated_cipher,
@@ -3573,12 +3908,15 @@ pub(crate) fn rustls_server_handshake_over_stream(
         .conn
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let mut reg = sreg().lock();
     let id = alloc_server_id(&mut reg);
     reg.server_streams.insert(
         id,
         TlsServerStreamEntry {
             stream: Arc::new(Mutex::new(TlsServerStream::Rustls(stream))),
+            raw,
             sni_hostname,
             negotiated_protocol,
             negotiated_cipher,
@@ -3645,8 +3983,11 @@ pub(crate) fn rustls_client_handshake_over_stream(
         .conn
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    // W7-61: see `TlsClientStreamEntry::raw`.
+    let raw = stream.sock.try_clone().ok();
     let entry = TlsClientStreamEntry {
         stream: Arc::new(Mutex::new(stream)),
+        raw,
         peer_host: host.to_string(),
         peer_port: 0,
         negotiated_protocol,
@@ -3934,6 +4275,44 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
     }
 }
 
+/// Re-ask the registry AFTER a blocking rustls call has returned, and report a
+/// concurrent `close()` as a close rather than as EOF or as a peer error.
+///
+/// The twin of `servlet::s2_tls_classify_after_block`, and it exists for the
+/// same reason: W7-53's close-aware loop parks in `poll` on a bounded slice and
+/// ABANDONS the wait when the registry entry disappears, which a TLS record
+/// layer cannot survive — a reader that returns between two of the `recv`s that
+/// make up one record leaves the caller with a fragment and the stream
+/// desynchronised. Classifying a call that has already returned has no such
+/// hazard: at that instant the record layer is at rest, either with a whole
+/// record delivered or with a failure of its own.
+///
+/// Note this is genuinely NOT the same as making the read close-aware. It
+/// converts a wakeup into the RIGHT answer; something else still has to
+/// produce the wakeup, and on Windows nothing can — see `rustls_stream_close`.
+fn rustls_classify_after_block(
+    id: i32,
+    result: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    {
+        let reg = sreg().lock();
+        if reg.client_streams.contains_key(&id) || reg.server_streams.contains_key(&id) {
+            return result;
+        }
+    }
+    match result {
+        // Bytes that arrived before the close are still delivered; the NEXT
+        // call reports the close. Dropping them would lose data the peer
+        // really sent, and a TLS record already fully decrypted into `buf` is
+        // not something a close can retract.
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "socket closed",
+        )),
+    }
+}
+
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
     // LOCK DISCIPLINE (stw-takeover / accept-close-deadlock family): resolve
@@ -3964,7 +4343,12 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         // Reuse the same EOF-tolerant read already established for the
         // native HTTP client bridge (`http_url_connection::
         // read_eof_tolerant`) instead of duplicating the tolerance logic.
-        return crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
+        let result = crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
+        drop(e);
+        // W7-61: an unclean peer close and a close from ANOTHER THREAD OF THIS
+        // VM both arrive here as `Ok(0)`. Only the registry can tell them
+        // apart, and only after the call — see `rustls_classify_after_block`.
+        return rustls_classify_after_block(id, result);
     }
     if let Some(stream) = server {
         let mut e = stream.lock();
@@ -3993,7 +4377,8 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
                 id, result
             );
         }
-        return result;
+        drop(e);
+        return rustls_classify_after_block(id, result);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -4014,7 +4399,10 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
     };
     if let Some(stream) = client {
         let mut e = stream.lock();
-        return EintrIo::new(&mut *e).write(data);
+        let result = EintrIo::new(&mut *e).write(data);
+        drop(e);
+        // W7-61 — see `rustls_classify_after_block`.
+        return rustls_classify_after_block(id, result);
     }
     if let Some(stream) = server {
         let mut e = stream.lock();
@@ -4037,7 +4425,8 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
                 id, result
             );
         }
-        return result;
+        drop(e);
+        return rustls_classify_after_block(id, result);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -4055,17 +4444,54 @@ pub(crate) fn rustls_stream_close(id: i32) {
             reg.server_streams.remove(&id),
         )
     };
+    // ─── WAKE THE PARKED PEER FIRST (W7-61) ──────────────────────────────────
+    //
+    // The sentence that used to stand here — "the entry is already
+    // unregistered, so dropping our handle is sufficient — the socket closes
+    // when the last `Arc` goes" — is precisely wrong in the case it was written
+    // for. A thread parked in `rustls_stream_read` HOLDS an `Arc` on this
+    // stream, so the last `Arc` does not go, the socket does not close, the
+    // `try_lock` below always fails, and the reader waits forever. That is
+    // W7-53's "four TLS sites" row, of which these two are half.
+    //
+    // `entry.raw` is a duplicate handle reachable without the stream mutex.
+    // Shutting it down ends the underlying byte stream without freeing the
+    // handle the parked thread is mid-syscall on (so it is not a
+    // use-after-close) and without cutting a TLS record in half (the record
+    // layer already has to handle a truncated connection; what it cannot
+    // handle is a reader that returns mid-record and is then re-entered).
+    //
+    // PLATFORM, a contract rather than a measurement — no Linux arm was run:
+    //   * Unix — `shutdown(SHUT_RDWR)` wakes a parked `recv` with EOF, and
+    //     `rustls_classify_after_block` then reports the close instead of a
+    //     spurious end-of-stream.
+    //   * Windows — Winsock has no `shutdown` that aborts a pending blocking
+    //     call, so for a reader ALREADY parked this is a no-op and that half of
+    //     the row stays OPEN. Named, not quietly counted: the same reason
+    //     W7-53 left the Windows pipe sink write open. A close that has not yet
+    //     been raced into is still observed, because the classification runs on
+    //     every return.
+    for raw in [
+        client.as_ref().and_then(|e| e.raw.as_ref()),
+        server.as_ref().and_then(|e| e.raw.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = raw.shutdown(std::net::Shutdown::Both);
+    }
     // `try_lock`: a peer parked in a blocking read on this SAME stream holds
     // the per-stream mutex, and waiting for it here would just relocate the
-    // old global-lock stall. The entry is already unregistered, so dropping
-    // our handle is sufficient — the socket closes when the last `Arc` goes.
-    if let Some(e) = client {
+    // old global-lock stall. The graceful `close_notify` below is the nicety;
+    // the `raw` shutdown above is the liveness guarantee and does not depend on
+    // winning this lock.
+    if let Some(e) = client.as_ref() {
         if let Some(mut s) = e.stream.try_lock() {
             s.conn.send_close_notify();
             let _ = s.flush();
         }
     }
-    if let Some(e) = server {
+    if let Some(e) = server.as_ref() {
         if let Some(mut guard) = e.stream.try_lock() {
             match &mut *guard {
                 TlsServerStream::Rustls(s) => {
@@ -5822,6 +6248,259 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 // Unit tests — loopback, SNI, mTLS, ALPN
 // -----------------------------------------------------------------------------
 
+/// An EC server identity generated by `java.security.KeyPairGenerator("EC")`
+/// must build a rustls signing key.
+///
+/// The JDK emits PKCS#8 whose inner SEC1 `ECPrivateKey` carries neither
+/// `parameters [0]` nor `publicKey [1]` — 67 bytes for P-256, byte-identical on
+/// HotSpot and CratonVM (verified against JDK 25). `ring` can only build an
+/// `EcdsaKeyPair` from a PKCS#8 that HAS the public key, and reports the refusal
+/// as the generic "failed to parse private key as RSA, ECDSA, or EdDSA" — so
+/// every JDK-generated EC server identity was unusable, and netty's
+/// `Http2MultiplexTransportTest.testFireChannelReadAfterHandshakeSuccess_JDK`
+/// hung forever waiting on a handshake that could never complete.
+///
+/// Both halves are pinned: that the stripped shape is genuinely rejected
+/// WITHOUT the repair (so removing the splice fails this module, rather than
+/// leaving a test that cannot fail), and that it is accepted with it.
+#[cfg(test)]
+mod ec_pkcs8_v1_identity_tests {
+    use super::*;
+
+    /// P-256 identity, generated once with openssl and frozen here so these
+    /// tests need no crypto dependency and run on every platform. The key is
+    /// PKCS#8 WITH `publicKey [1]`; `strip_to_jdk_shape` reduces it to what the
+    /// JDK emits.
+    const P256_KEY: &str = "\
+        308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420\
+        52938df7e0c9a16537f034339c7c7359eced61a35d1b4c87760275ff735ee055a1440342\
+        00040e06bf5c39a8aa566ca83cb86b72d7e38686fee8ce84850064372f42433a7ad3cd49\
+        da99d89ec101763121462a25f8e6c18c90fb7eb089fcfe0e73aa0d743c42";
+    const P256_CRT: &str = "\
+        3082017c30820123a00302010202141f64638ec784227782eb3d08509bde7d8e9fc10c30\
+        0a06082a8648ce3d04030230143112301006035504030c096c6f63616c686f7374301e17\
+        0d3236303831323138303333365a170d3336303830393138303333365a30143112301006\
+        035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d03\
+        0107034200040e06bf5c39a8aa566ca83cb86b72d7e38686fee8ce84850064372f42433a\
+        7ad3cd49da99d89ec101763121462a25f8e6c18c90fb7eb089fcfe0e73aa0d743c42a353\
+        3051301d0603551d0e0416041468f6f21e5636c47e25780b9b832afe4de707a302301f06\
+        03551d2304183016801468f6f21e5636c47e25780b9b832afe4de707a302300f0603551d\
+        130101ff040530030101ff300a06082a8648ce3d0403020347003044022001ce1e112093\
+        114d88086e2105680bb39606ba9c5f67332da35764aafc8d977402204d049c6b89003aa0\
+        5b34697a1a6380393dba365220e82d3f25a6b368d1807289";
+
+    /// P-384 identity — the splice must be curve-agnostic, since it copies the
+    /// point out of the certificate rather than computing it.
+    const P384_KEY: &str = "\
+        3081b6020100301006072a8648ce3d020106052b8104002204819e30819b020101043004\
+        0e7e93856a01d61ca3d12ac7adafd39eccdb844fbeeda287df27b950794f39f4d8277cea\
+        3f4beb35df0ce4e5dec82aa16403620004e185c328a18debe1215987b59333173d761ddc\
+        fc5d5a6172461f40cb8b5e0c2d350792d8008d0b653c81f93c44f8ff8d1b28751f84772b\
+        90662213b6bf2d90fb31f60027c18a38d23d7cc2bd80644a628de877b04077416b879732\
+        ead4163238";
+    const P384_CRT: &str = "\
+        308201ba30820140a00302010202145594e93072003edfb390fffc595b84db6628df7c30\
+        0a06082a8648ce3d04030230143112301006035504030c096c6f63616c686f7374301e17\
+        0d3236303831323138303333365a170d3336303830393138303333365a30143112301006\
+        035504030c096c6f63616c686f73743076301006072a8648ce3d020106052b8104002203\
+        620004e185c328a18debe1215987b59333173d761ddcfc5d5a6172461f40cb8b5e0c2d35\
+        0792d8008d0b653c81f93c44f8ff8d1b28751f84772b90662213b6bf2d90fb31f60027c1\
+        8a38d23d7cc2bd80644a628de877b04077416b879732ead4163238a3533051301d060355\
+        1d0e0416041402e7bb3ae8de78e5dae7449f71da2296fd395874301f0603551d23041830\
+        16801402e7bb3ae8de78e5dae7449f71da2296fd395874300f0603551d130101ff040530\
+        030101ff300a06082a8648ce3d040302036800306502301806748b77941e85ada3cbe438\
+        5e6a5878ffd9b3a1950ffc0265ff13ef21958816d6811b8bffcd3c35f4d0b63f185b1c02\
+        3100afa5d9b1a03c4df25a3807ff3a4408ba7efa1ffd9d6e68aa13429ee73d39b23f3d61\
+        1e36f3ed53be1379ed00737f5d44";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..clean.len() / 2)
+            .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Reduce a PKCS#8 EC key's inner SEC1 to `version` + `privateKey` —
+    /// exactly what a stock JDK's `getEncoded()` produces.
+    fn strip_to_jdk_shape(der: &[u8]) -> Vec<u8> {
+        let (outer, _) = der_tlv(der, 0).unwrap();
+        let ver_end = der_tlv_end(der, outer).unwrap();
+        let alg_end = der_tlv_end(der, ver_end).unwrap();
+        let (oct_body, _) = der_tlv(der, alg_end).unwrap();
+        let (sec1_body, _) = der_tlv(der, oct_body).unwrap();
+        let iv_end = der_tlv_end(der, sec1_body).unwrap();
+        let ipk_end = der_tlv_end(der, iv_end).unwrap();
+
+        let inner = der[sec1_body..ipk_end].to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(&der[outer..alg_end]);
+        body.extend_from_slice(&der_tlv_encode(0x04, &der_tlv_encode(0x30, &inner)));
+        der_tlv_encode(0x30, &body)
+    }
+
+    /// `(parameters[0] present, publicKey[1] present)` for a PKCS#8 EC key.
+    fn inner_optionals(der: &[u8]) -> (bool, bool) {
+        let (outer, _) = der_tlv(der, 0).unwrap();
+        let ver_end = der_tlv_end(der, outer).unwrap();
+        let alg_end = der_tlv_end(der, ver_end).unwrap();
+        let (oct_body, _) = der_tlv(der, alg_end).unwrap();
+        let (sec1_body, sec1_end) = der_tlv(der, oct_body).unwrap();
+        let mut p = der_tlv_end(der, der_tlv_end(der, sec1_body).unwrap()).unwrap();
+        let (mut a, mut b) = (false, false);
+        while p < sec1_end {
+            match der[p] {
+                0xa0 => a = true,
+                0xa1 => b = true,
+                _ => {}
+            }
+            p = der_tlv_end(der, p).unwrap();
+        }
+        (a, b)
+    }
+
+    fn accepted_by_ring(pkcs8: &[u8]) -> bool {
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
+        rustls::crypto::ring::sign::any_supported_type(&key).is_ok()
+    }
+
+    fn round_trip(key_hex: &str, crt_hex: &str, label: &str) {
+        let full = unhex(key_hex);
+        let cert = unhex(crt_hex);
+        assert!(
+            inner_optionals(&full).1,
+            "{label}: fixture must carry publicKey[1] to be a valid control"
+        );
+        assert!(
+            accepted_by_ring(&full),
+            "{label}: control — ring must accept the unmodified fixture"
+        );
+
+        let jdk = strip_to_jdk_shape(&full);
+        assert_eq!(
+            inner_optionals(&jdk),
+            (false, false),
+            "{label}: stripped key must carry no optional fields"
+        );
+        // The bug, pinned. If this ever starts passing, ring learned to derive
+        // the public key and the splice below can be deleted.
+        assert!(
+            !accepted_by_ring(&jdk),
+            "{label}: ring accepted a PKCS#8 EC key with no publicKey"
+        );
+
+        let repaired = ec_pkcs8_splice_public_key(&jdk, &cert)
+            .unwrap_or_else(|| panic!("{label}: splice declined a stripped EC key"));
+        assert!(
+            inner_optionals(&repaired).1,
+            "{label}: repaired key must carry publicKey[1]"
+        );
+        assert!(
+            accepted_by_ring(&repaired),
+            "{label}: ring must accept the repaired key"
+        );
+    }
+
+    #[test]
+    fn jdk_shaped_p256_identity_is_repaired_from_its_certificate() {
+        round_trip(P256_KEY, P256_CRT, "P-256");
+    }
+
+    #[test]
+    fn jdk_shaped_p384_identity_is_repaired_from_its_certificate() {
+        round_trip(P384_KEY, P384_CRT, "P-384");
+    }
+
+    /// The mTLS `KeyManager` resolver is the one identity path that never
+    /// parses PEM: `JavaKeyManagerResolver::resolve_via_java` takes DER
+    /// straight from `km_alias_material` and hands it to
+    /// `CertifiedKey::from_der`. It was missed when the repair first landed, so
+    /// a JDK-generated EC *client* certificate delivered through a Java
+    /// `KeyManager` still resolved to nothing.
+    ///
+    /// Pinned through `CertifiedKey::from_der` rather than
+    /// `any_supported_type`, because that is the call the resolver makes — a
+    /// test against the lower-level entry point would not have caught the
+    /// missing call site either.
+    #[test]
+    fn a_key_manager_supplied_jdk_ec_identity_is_repaired_too() {
+        let cert = CertificateDer::from(unhex(P256_CRT));
+        let jdk = strip_to_jdk_shape(&unhex(P256_KEY));
+        let provider = rustls::crypto::ring::default_provider();
+
+        // Control: the shape `resolve_via_java` used to build is genuinely
+        // rejected, so the positive half below cannot pass vacuously.
+        assert!(
+            CertifiedKey::from_der(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(jdk.clone())),
+                &provider,
+            )
+            .is_err(),
+            "control — CertifiedKey::from_der must reject the stripped JDK shape"
+        );
+
+        // The function `resolve_via_java` calls, not a re-creation of it.
+        assert!(
+            certified_key_from_der_repairing_ec(vec![cert], jdk, &provider).is_ok(),
+            "the KeyManager identity path must repair the JDK EC key it is handed"
+        );
+    }
+
+    #[test]
+    fn splice_declines_a_key_that_already_has_a_public_key() {
+        assert!(
+            ec_pkcs8_splice_public_key(&unhex(P256_KEY), &unhex(P256_CRT)).is_none(),
+            "a key ring already accepts must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn splice_declines_when_the_certificate_cannot_lend_a_matching_point() {
+        // A P-384 certificate must not have its point spliced into a P-256 key:
+        // the splice keys off the cert, so a mismatched pair must be refused by
+        // ring rather than silently producing an identity that signs wrong.
+        let jdk_p256 = strip_to_jdk_shape(&unhex(P256_KEY));
+        let spliced = ec_pkcs8_splice_public_key(&jdk_p256, &unhex(P384_CRT))
+            .expect("the P-384 cert does carry an EC point");
+        assert!(
+            !accepted_by_ring(&spliced),
+            "ring must reject a public key that does not match the private scalar"
+        );
+    }
+
+    #[test]
+    fn splice_declines_non_ec_keys() {
+        // An RSA PKCS#8 (any bytes with the RSA algorithm OID) must be left
+        // alone — those parse fine and rewriting them could only break them.
+        let rsa_alg_pkcs8 = unhex("30820102020100300d06092a864886f70d0101010500048200ec3082");
+        assert!(ec_pkcs8_splice_public_key(&rsa_alg_pkcs8, &unhex(P256_CRT)).is_none());
+    }
+
+    #[test]
+    fn splice_declines_garbage_without_panicking() {
+        let cert = unhex(P256_CRT);
+        for bad in [
+            &b""[..],
+            &b"\x30"[..],
+            &b"\x30\x82"[..],
+            &b"\x30\x03\x02\x01\x00"[..],
+            &b"\x02\x01\x00"[..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+            &[0x30, 0x80, 0x02, 0x01, 0x00][..],
+        ] {
+            assert!(ec_pkcs8_splice_public_key(bad, &cert).is_none());
+        }
+        let jdk = strip_to_jdk_shape(&unhex(P256_KEY));
+        for bad_cert in [
+            &b""[..],
+            &b"\x30\x03\x02\x01\x00"[..],
+            &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff][..],
+        ] {
+            assert!(ec_pkcs8_splice_public_key(&jdk, bad_cert).is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
@@ -7028,7 +7707,7 @@ mod tests {
         //    exactly as cheap as before this fix.
         client.trust_check_done = false;
         client.endpoint_id_alg = None;
-        assert!(super::engine_take_pending_trust_check(&mut client).is_none());
+        assert!(super::engine_take_pending_trust_check(0, &mut client).is_none());
 
         // 2. HTTPS configured: a pending check appears even with no
         //    TrustManager attached, because JSSE's own default manager is what
@@ -7037,7 +7716,7 @@ mod tests {
         client.endpoint_id_alg = Some("HTTPS".to_string());
         client.peer_host = Some("localhost".to_string());
         let pending =
-            super::engine_take_pending_trust_check(&mut client).expect("identity check pending");
+            super::engine_take_pending_trust_check(0, &mut client).expect("identity check pending");
         assert!(pending.trust_ctx_key.is_none());
         assert_eq!(
             pending.endpoint_identity,
@@ -7063,7 +7742,7 @@ mod tests {
         //    is configured on it.
         client.trust_check_done = false;
         client.is_client = false;
-        let pending = super::engine_take_pending_trust_check(&mut client);
+        let pending = super::engine_take_pending_trust_check(0, &mut client);
         assert!(pending.is_none(), "server engines do not identify endpoints");
     }
 
@@ -7349,6 +8028,23 @@ impl EngineConn {
         match self {
             EngineConn::Client(c) => c.send_close_notify(),
             EngineConn::Server(s) => s.send_close_notify(),
+        }
+    }
+    /// Queue a fatal alert for the peer — see
+    /// `rustls::CommonState::queue_fatal_alert` (a CratonVM addition to the
+    /// vendored fork) for why this exists and why it is idempotent.
+    fn queue_fatal_alert(&mut self, desc: rustls::AlertDescription) {
+        match self {
+            EngineConn::Client(c) => c.queue_fatal_alert(desc),
+            EngineConn::Server(s) => s.queue_fatal_alert(desc),
+        }
+    }
+    /// Has the peer sent us a `close_notify`? The inbound half of the
+    /// connection is then closed for good — see `do_unwrap`'s CLOSED report.
+    fn peer_has_closed(&self) -> bool {
+        match self {
+            EngineConn::Client(c) => c.has_received_close_notify(),
+            EngineConn::Server(s) => s.has_received_close_notify(),
         }
     }
     fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
@@ -7734,6 +8430,21 @@ fn alloc_engine_result(
 /// Compute the next handshake status from an EngineState.
 fn handshake_status_of(s: &EngineState) -> i32 {
     if s.closed_inbound && s.closed_outbound {
+        // …but a fully-closed engine can still OWE the peer a record. The
+        // automatic TLS 1.2 `close_notify` response (see `do_unwrap`) closes
+        // both halves and queues the reply in one step, and rustls holds that
+        // reply until a `write_tls` — which only happens if the caller is told
+        // to `wrap` again. Answering NOT_HANDSHAKING here made netty stop
+        // wrapping and the reply was never emitted: `CloseNotifyTest`'s TLS 1.2
+        // parameterisation read `null` where the client's own close_notify
+        // belonged.
+        //
+        // `wants_write()` as well as `outbound`, because the queue that matters
+        // here is rustls's — `outbound` only holds what a previous `wrap`
+        // already drained out of it.
+        if !s.outbound.is_empty() || s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+            return HS_NEED_WRAP_R;
+        }
         return HS_NOT_HANDSHAKING_R;
     }
     // `write_tls()` may have produced more than one complete TLS record. A
@@ -8814,6 +9525,9 @@ fn engine_capture_negotiation(state: &mut EngineState) {
 /// (`trust_ctx_key`), so this can safely cross the lock-drop boundary before
 /// `engine_run_trust_check` (which calls into Java) runs.
 struct PendingTrustCheck {
+    /// The engine this check belongs to, so a rejection can queue the fatal
+    /// alert JSSE sends the peer — see `reject_peer_with_fatal_alert`.
+    engine_id: i32,
     is_client: bool,
     peer_chain_der: Vec<Vec<u8>>,
     /// `None` when the owning `SSLContext` has no `TrustManager[]` attached —
@@ -8845,7 +9559,7 @@ fn endpoint_alg_verifies_identity(alg: &str) -> bool {
 /// deferred to `engine_run_trust_check` specifically so no allocating/GC-
 /// triggering call ever happens while this lock is held (see
 /// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
-fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTrustCheck> {
+fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<PendingTrustCheck> {
     if state.trust_check_done {
         return None;
     }
@@ -8888,6 +9602,7 @@ fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTru
         .and_then(|c| c.negotiated_cipher_suite())
         .map(|cs| format!("{:?}", cs.suite()));
     Some(PendingTrustCheck {
+        engine_id: id,
         is_client: state.is_client,
         peer_chain_der: state.peer_cert_chain_der.clone(),
         trust_ctx_key,
@@ -9062,6 +9777,7 @@ fn engine_run_trust_check(
     if rejected {
         let detail = rejection.unwrap_or_else(|| "no exception detail available".to_string());
         set_last_trust_rejection_detail(&detail);
+        reject_peer_with_fatal_alert(pending.engine_id);
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "javax/net/ssl/SSLHandshakeException",
@@ -9069,6 +9785,35 @@ fn engine_run_trust_check(
         ));
     }
     engine_check_endpoint_identity(ctx, &pending, jsse_identifies)
+}
+
+/// Tell the peer that its certificate was refused, the way JSSE does: queue a
+/// fatal `certificate_unknown` alert on the engine's rustls connection.
+///
+/// This is the missing half of a `TrustManager` rejection. rustls has already
+/// ACCEPTED the chain by the time the Java manager is consulted (the
+/// consultation is deliberately deferred until after `process_new_packets`, so
+/// that calling into the JVM never happens while the engine registry lock is
+/// held), so rustls itself generates no alert. Throwing
+/// `SSLHandshakeException` locally and sending nothing left the peer with an
+/// unexplained TCP close: netty's
+/// `ParameterizedSslHandlerTest.testAlertProducedAndSend` waits for an
+/// `SSLException` derived from that alert and blocked forever without it
+/// (~170x HotSpot's 6 s, still running after 17 minutes).
+///
+/// `certificate_unknown` is the description JSSE maps a `CertificateException`
+/// from a `TrustManager` to. The record itself is emitted by the next `wrap`,
+/// which netty performs because `setHandshakeFailure` -> `ctx.close()` ->
+/// `closeOutboundAndChannel` flushes an empty buffer through the engine.
+///
+/// Takes no `NativeContext` and calls no Java: it must be safe to run on the
+/// rejection path, which is already unwinding.
+fn reject_peer_with_fatal_alert(engine_id: i32) {
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::CertificateUnknown);
+        }
+    });
 }
 
 /// Would real JSSE perform endpoint identification itself for this
@@ -9213,6 +9958,9 @@ fn engine_check_endpoint_identity(
                 eprintln!("[dbg-tls-auth] {detail}");
             }
             set_last_trust_rejection_detail(&detail);
+            // Same reasoning as the TrustManager rejection above: the peer has
+            // to be told, or it sees an unexplained close.
+            reject_peer_with_fatal_alert(pending.engine_id);
             Err(crate::phases_early::throw_jca_exc(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
@@ -9255,6 +10003,12 @@ pub(crate) fn run_client_trust_check_for_chain(
     engine_run_trust_check(
         ctx,
         PendingTrustCheck {
+            // No SSLEngine here: this is the native client-socket path, whose
+            // rustls connection is owned by `servlet::s2_tls_connect` and is
+            // not in `engine_registry`. `reject_peer_with_fatal_alert` is a
+            // no-op for an id that names no engine, which is the right answer
+            // — that path tears the socket down itself.
+            engine_id: -1,
             is_client: true,
             peer_chain_der,
             trust_ctx_key: Some(trust_ctx_key),
@@ -9975,18 +10729,54 @@ fn do_wrap(
         );
     }
 
-    // Closed-outbound short-circuit.
+    // Closed outbound — but NOT a short circuit.
+    //
+    // `closeOutbound()` queues a `close_notify` on the rustls connection, and
+    // a fatal alert may be queued there too (a `TrustManager` rejection — see
+    // `engine_run_trust_check`). The wrap that FOLLOWS the close is the call
+    // JSSE specifies as the one that emits that record: `wrap` returns
+    // `Status.CLOSED` with `bytesProduced` equal to the alert's length, and
+    // only once the queue is empty does it produce nothing.
+    //
+    // This used to return `CLOSED, produced=0` immediately, so the alert was
+    // generated, encrypted, and then left in rustls's write queue forever.
+    // Measured consequences, all one defect:
+    //   * netty's `CloseNotifyTest` / `ApplicationProtocolNegotiationHandlerTest`
+    //     see an EMPTY outbound buffer where a close_notify record belongs
+    //     (`assertCloseNotify`: "0 to be greater than or equal to 7");
+    //   * `ParameterizedSslHandlerTest.testAlertProducedAndSend` blocks
+    //     forever in `awaitUninterruptibly()` — the peer is waiting for an
+    //     alert that is sitting in this queue.
+    //
+    // The drain below is the ordinary path; `closed` only suppresses reading
+    // application data from `srcs` (JSSE consumes nothing after close) and
+    // forces the reported status to CLOSED.
     let closed = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
     if closed {
+        let no_conn = with_engine(id, |s| s.conn.is_none()).unwrap_or(true);
+        let nothing_queued = with_engine(id, |s| s.outbound.is_empty()).unwrap_or(true);
+        if no_conn && nothing_queued {
+            // Closed before anything was ever negotiated: there is no record
+            // layer to encode an alert with, so CLOSED with nothing produced
+            // is the whole truth. Realizing a connection here would start a
+            // handshake for a closed engine.
+            if __dbg_hs {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_NO_CONNECTION",
+                    std::thread::current().id(),
+                    id
+                );
+            }
+            let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
+            return Ok(Some(Value::Object(Some(result?))));
+        }
         if __dbg_hs {
             eprintln!(
-                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_SHORT_CIRCUIT",
+                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_DRAIN",
                 std::thread::current().id(),
                 id
             );
         }
-        let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // Lazily realize rustls connection.
@@ -10032,14 +10822,17 @@ fn do_wrap(
     // wraps, which is why nothing but the WebSocket client ever noticed.
     let mut app_bytes = Vec::new();
     let mut consumed_app = 0usize;
-    let needs_app_data = with_engine(id, |s| {
-        s.handshake_finished_reported
-            && s.conn
-                .as_ref()
-                .map(|c| !c.is_handshaking())
-                .unwrap_or(false)
-    })
-    .unwrap_or(false);
+    // `!closed`: JSSE consumes nothing from `srcs` once `closeOutbound()` has
+    // been called — the only thing left to produce is the queued alert.
+    let needs_app_data = !closed
+        && with_engine(id, |s| {
+            s.handshake_finished_reported
+                && s.conn
+                    .as_ref()
+                    .map(|c| !c.is_handshaking())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
     if needs_app_data {
         for bb in &srcs {
             let n = bb_read_into(ctx, *bb, &mut app_bytes, 16384);
@@ -10084,17 +10877,37 @@ fn do_wrap(
         // lets Tomcat flush it and call wrap again for the remaining record.
         let status = if drained.is_empty() && !s.outbound.is_empty() {
             SR_BUFFER_OVERFLOW
+        } else if closed {
+            // JSSE: every wrap after `closeOutbound()` reports CLOSED,
+            // including the one that carries the close_notify / alert record.
+            // netty writes `out` BEFORE it looks at the status, so reporting
+            // CLOSED alongside a non-zero `bytesProduced` is exactly what gets
+            // the record onto the wire and then stops the wrap loop.
+            SR_CLOSED
         } else {
             SR_OK
         };
         engine_capture_negotiation(s);
-        let hs = handshake_status_of(s);
+        // A closed engine is not handshaking; it either still owes the peer
+        // the rest of its alert (NEED_WRAP, so a caller that loops keeps
+        // pulling) or it owes nothing.
+        let hs = if closed {
+            // `wants_write()` too: rustls may still be holding the alert that
+            // no `wrap` has drained into `outbound` yet.
+            if s.outbound.is_empty() && !s.conn.as_ref().is_some_and(|c| c.wants_write()) {
+                HS_NOT_HANDSHAKING_R
+            } else {
+                HS_NEED_WRAP_R
+            }
+        } else {
+            handshake_status_of(s)
+        };
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
         (cons, status, hs, drained, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
@@ -10475,10 +11288,32 @@ fn do_unwrap(
                             &format!("rustls: {}", e),
                         ));
                     }
-                    return Err(RuntimeError::IOException {
-                        message: format!("rustls process_new_packets: {}", e),
-                    }
-                    .into());
+                    // POST-handshake record-layer failure. `SSLException`, not
+                    // a bare `IOException`, for the same reason the handshake
+                    // branch above gives — and here it is load-bearing rather
+                    // than merely tidy: a **fatal alert from the peer** lands
+                    // on this line, and it is the only signal that says "the
+                    // other side rejected us" as opposed to "the socket
+                    // dropped". netty's
+                    // `ParameterizedSslHandlerTest.testAlertProducedAndSend`
+                    // waits for exactly `cause.getCause() instanceof
+                    // SSLException` and hung forever (~170x HotSpot's 6 s) on
+                    // the `IOException` this used to throw. `SSLException`
+                    // extends `IOException`, so every existing
+                    // `catch (IOException)` is unaffected.
+                    let msg = match e {
+                        rustls::Error::AlertReceived(desc) => {
+                            // JSSE's wording, so a caller matching on the
+                            // message sees what it sees on HotSpot.
+                            format!("Received fatal alert: {desc:?}")
+                        }
+                        other => format!("rustls process_new_packets: {other}"),
+                    };
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/net/ssl/SSLException",
+                        &msg,
+                    ));
                 }
                 let mut tmp = [0u8; 16384];
                 loop {
@@ -10519,13 +11354,60 @@ fn do_unwrap(
             // returning OK here makes Tomcat's handshake loop spin forever).
             status = SR_BUFFER_UNDERFLOW;
         }
+        // The peer's `close_notify` has arrived: JSSE reports CLOSED from this
+        // unwrap and every one after it, and that report is the ONLY way a
+        // caller learns the connection was closed cleanly rather than dropped.
+        //
+        // netty's `SslHandler.unwrap` switches on exactly this
+        // (`case CLOSED: notifyClosure = true`) to fire
+        // `SslCloseCompletionEvent`; without it `CloseNotifyTest` sees the
+        // decrypted response arrive and then no close event at all. Marking
+        // `closed_inbound` here is the same fact seen through
+        // `isInboundDone()`, which is how a caller that polls rather than
+        // switches finds out.
+        //
+        // CLOSED overrides BUFFER_UNDERFLOW deliberately: once the peer has
+        // closed there is no more network data to ask for, and telling the
+        // caller to read more is how a close turns into a spin.
+        if s.conn.as_ref().is_some_and(|c| c.peer_has_closed()) {
+            s.closed_inbound = true;
+            status = SR_CLOSED;
+            // TLS 1.2 and below: answer the peer's `close_notify` with our
+            // own, automatically, the way JSSE does.
+            //
+            // RFC 5246 §7.2.1 makes the response required; RFC 8446 §6.1 makes
+            // it optional, and JSSE's TLS 1.3 engine does NOT send one — an
+            // asymmetry netty encodes directly (`CloseNotifyTest.jdkTls13`
+            // takes a different branch for exactly this, and asserts the
+            // automatic response on every other parameterisation). rustls
+            // queues nothing on its own in either case, so under TLS 1.2 the
+            // peer waited for a record that was never coming:
+            // `ParameterizedSslHandlerTest.testCloseNotify`'s client promise
+            // never completed.
+            //
+            // Marking the engine outbound-closed as well is what JSSE does
+            // here too — an automatic close is a full close, and the next
+            // `wrap` is the one that emits the record (see `do_wrap`'s
+            // closed-outbound drain).
+            let responds = s
+                .conn
+                .as_ref()
+                .and_then(|c| c.protocol_version())
+                .is_some_and(|v| v != rustls::ProtocolVersion::TLSv1_3);
+            if responds && !s.closed_outbound {
+                s.closed_outbound = true;
+                if let Some(c) = s.conn.as_mut() {
+                    c.send_close_notify();
+                }
+            }
+        }
         let hs = handshake_status_of(s);
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
         // Extract-only — see `engine_take_pending_trust_check`'s doc for why
         // the actual Java call must happen after this lock is dropped.
-        let pending_trust_check = engine_take_pending_trust_check(s);
+        let pending_trust_check = engine_take_pending_trust_check(id, s);
         (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {

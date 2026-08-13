@@ -225,29 +225,53 @@ fn inherit_lookup_loader(ctx: &mut dyn NativeContext, this_lookup: ObjectRef) ->
 /// defined under the generated class's own namespace. Passing the resolved
 /// identities through `DefineClassFull` prevents the class manager's
 /// name-only fallback from selecting an unrelated same-named copy.
+/// W7-26 R1 — the two `Err(_) => return (None, None)` arms below used to catch
+/// **any** failure from the lookup loader's resolution, including a real
+/// pending Java throwable. `(None, None)` is the documented fall-through (the
+/// class manager's name-only resolution), so a `VerifyError`, a
+/// `ClassFormatError`, an `ExceptionInInitializerError` from a supertype's
+/// `<clinit>`, or an `OutOfMemoryError` all read as "resolve the supertype by
+/// name instead" and the generated class was defined against whatever the
+/// name-only lookup found — the wrong-answer half of the species, on the path
+/// every ByteBuddy/CGLIB/Hibernate proxy define takes.
+///
+/// `Lookup.defineClass` and `Lookup.defineHiddenClass` both declare
+/// `throws LinkageError` and neither absorbs a loader's throwable, so
+/// propagating is HotSpot parity. `absorb_class_absent` keeps exactly the
+/// "this name is not reachable from here" half absorbed —
+/// `ClassNotFoundException`, `NoClassDefFoundError`, and (see its own residual)
+/// `MethodCallFailed::InternalError`, which is what the resolver returns for a
+/// plain classpath miss and what an isolated loader's legitimate refusal
+/// arrives as. Those are every case this helper's fallback was written for.
 fn resolve_lookup_supertypes(
     ctx: &mut dyn NativeContext,
     this_lookup: ObjectRef,
     class_bytes: &[u8],
-) -> (
-    Option<cratonvm_types::ClassId>,
-    Option<Vec<cratonvm_types::ClassId>>,
-) {
+) -> Result<
+    (
+        Option<cratonvm_types::ClassId>,
+        Option<Vec<cratonvm_types::ClassId>>,
+    ),
+    MethodCallFailed,
+> {
     let lookup_mirror = match ctx.get_field(this_lookup, LK_LOOKUP_CLASS_REF) {
         Value::Object(Some(mirror)) => mirror,
-        _ => return (None, None),
+        _ => return Ok((None, None)),
     };
     let Some(lookup_class_id) = crate::lang_class::mirror_class_id(ctx, lookup_mirror) else {
-        return (None, None);
+        return Ok((None, None));
     };
     let Ok(class_file) = cratonvm_reader::read_class(class_bytes) else {
-        return (None, None);
+        return Ok((None, None));
     };
 
     let superclass_id = match class_file.super_class.as_deref() {
         Some(name) => match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
             Ok(id) => Some(id),
-            Err(_) => return (None, None),
+            Err(failed) => {
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Ok((None, None));
+            }
         },
         None => None,
     };
@@ -255,10 +279,13 @@ fn resolve_lookup_supertypes(
     for name in &class_file.interfaces {
         match ctx.class_id_by_name_via_referencing_class(lookup_class_id, name) {
             Ok(id) => interface_ids.push(id),
-            Err(_) => return (None, None),
+            Err(failed) => {
+                crate::classloader_real::absorb_class_absent(&*ctx, failed)?;
+                return Ok((None, None));
+            }
         }
     }
-    (superclass_id, Some(interface_ids))
+    Ok((superclass_id, Some(interface_ids)))
 }
 
 /// Allocate a fresh Lookup synthetic with full-power modes pointing at
@@ -397,7 +424,7 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Application namespace and CGLIB's WeakCacheKey lookup misses.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
 
     let opts = cratonvm_native_api::DefineClassFull {
         skip_verification: true,
@@ -524,7 +551,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // lookup class, which it cannot if the loaders differ.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
     // Keep the lookup class name only as the FALLBACK label.
     let nest_host_class_name_for_label = lookup_name;
 
@@ -750,7 +777,7 @@ fn lk_define_hidden_class_with_class_data(
     // and CGLIB classData-bound proxies both rely on it.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
-        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
+        resolve_lookup_supertypes(ctx, this_lookup, &class_bytes)?;
     let nest_host_class_name_for_label = lookup_name;
 
     // Same rule as the plain variant: the label comes from the class file's

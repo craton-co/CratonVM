@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::dump::{self, JfrDumpError};
+use crate::dump::JfrDumpError;
 use crate::event::{EventInstance, EventTypeId, EventTypeRegistry, FieldKind};
 use crate::repository::{self, EventRepository};
 
@@ -71,6 +71,28 @@ pub struct RecordingSettings {
     pub enabled_events: FxHashSet<EventTypeId>,
     /// T10.9.B: FxHashMap — EventTypeId is internal JFR definition.
     pub event_thresholds: FxHashMap<EventTypeId, Duration>,
+    /// Event names this recording is restricted to, keyed by JFR event NAME.
+    ///
+    /// `None` — no name filter: every event the recorder sees is kept. That is
+    /// what CratonVM's own recordings want, and it is the historical behaviour
+    /// of every recording.
+    ///
+    /// `Some(set)` — keep ONLY these names. An **empty** set therefore keeps
+    /// nothing, which is exactly what a `jdk.jfr.Recording` with no
+    /// `enable(...)` call means: HotSpot records no events for one. This is why
+    /// the filter cannot reuse [`Self::enabled_events`], whose empty case means
+    /// "all events".
+    ///
+    /// Keyed by name rather than by [`EventTypeId`] because the Java boundary
+    /// learns which events are enabled from `Recording.getSettings()` — before
+    /// any of those event types has been committed, and therefore before any of
+    /// them has an id. The id is assigned by
+    /// [`crate::event::EventTypeRegistry::register`] at first emit.
+    pub enabled_event_names: Option<FxHashSet<String>>,
+    /// Per-event-name duration threshold, in nanoseconds; an event shorter than
+    /// its threshold is dropped. The name-keyed sibling of
+    /// [`Self::event_thresholds`], for the same reason.
+    pub event_thresholds_by_name: FxHashMap<String, u64>,
 }
 
 impl RecordingSettings {
@@ -85,8 +107,57 @@ impl RecordingSettings {
             duration: None,
             enabled_events: FxHashSet::default(),
             event_thresholds: FxHashMap::default(),
+            enabled_event_names: None,
+            event_thresholds_by_name: FxHashMap::default(),
         }
     }
+
+    /// Whether the name-based filter keeps an event of type `name` lasting
+    /// `duration_ns`.
+    ///
+    /// `name` is `None` when the event's type id is not in the registry, which
+    /// a name filter must treat as "not enabled": a filter that names the
+    /// events it wants cannot be satisfied by one whose name is unknown.
+    pub fn name_filter_admits(&self, name: Option<&str>, duration_ns: u64) -> bool {
+        if let Some(enabled) = &self.enabled_event_names {
+            match name {
+                Some(name) if enabled.contains(name) => {}
+                _ => return false,
+            }
+        }
+        if let Some(name) = name {
+            if let Some(&threshold) = self.event_thresholds_by_name.get(name) {
+                if duration_ns < threshold {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Whether `rec` keeps `event` — the id-based filter
+/// ([`Recording::passes_filter`]: state, `enabled_events`, `event_thresholds`)
+/// **and** the name-based one the real-JDK `jdk.jfr` boundary installs
+/// ([`RecordingSettings::enabled_event_names`]).
+///
+/// A free function rather than a method on `Recording` because it needs the
+/// [`EventTypeRegistry`] to turn a type id into a name, and the registry is a
+/// sibling field of the recordings map — a method taking `&self` on
+/// `FlightRecorder` could not also hand out `&mut Recording`.
+fn admits(registry: &EventTypeRegistry, rec: &Recording, event: &EventInstance) -> bool {
+    if !rec.passes_filter(event) {
+        return false;
+    }
+    if rec.settings.enabled_event_names.is_none() && rec.settings.event_thresholds_by_name.is_empty()
+    {
+        // Fast path for every recording that has no name filter at all, which
+        // is all of CratonVM's own: skip the registry lookup entirely.
+        return true;
+    }
+    let name = registry.get(event.type_id).map(|ty| ty.name.as_str());
+    rec.settings
+        .name_filter_admits(name, event.end_time.saturating_sub(event.start_time))
 }
 
 /// Per-recording diagnostic counters surfaced to operators.
@@ -366,6 +437,21 @@ impl FlightRecorder {
     }
 
     pub fn stop_recording(&mut self, id: u64) {
+        // Drain the per-thread rings BEFORE the state transition.
+        //
+        // `record_event` pushes to a bounded per-thread ring and
+        // `drain_per_thread_into_repository` moves ring contents into the
+        // per-recording repositories — but that drain is destructive on the
+        // ring and fans out only to recordings in `Running` state. So anything
+        // still on a ring when its recording stops used to be discarded, and
+        // `dump_recording`'s own drain then found an empty ring and an empty
+        // repository.
+        //
+        // That silently emptied the shape every `jdk.jfr.Recording` user
+        // writes: `start(); … commit(); stop(); dump(path)`. The dump succeeded
+        // and reported a plausible byte count, and the file contained the
+        // recording's metadata and no events at all.
+        self.drain_per_thread_into_repository();
         if let Some(rec) = self.recordings.get_mut(&id) {
             rec.stop();
         }
@@ -498,9 +584,13 @@ impl FlightRecorder {
             // when an event is rejected so the loss is observable through
             // `Recording::stats()` and the workspace log subscriber.
             let id = self.running_ids[0];
+            // Split the borrow: the name filter needs the registry to turn an
+            // event's type id into its JFR name, and that lives in a sibling
+            // field of the one being mutated.
+            let registry = &self.type_registry;
             if let Some(rec) = self.recordings.get_mut(&id) {
                 for ev in drained {
-                    if rec.passes_filter(&ev) {
+                    if admits(registry, rec, &ev) {
                         rec.record_event(ev);
                     } else {
                         rec.note_filtered_out();
@@ -535,13 +625,14 @@ impl FlightRecorder {
             // events).
             let recordings = &mut self.recordings;
             let running_ids = &self.running_ids;
+            let registry = &self.type_registry;
             let n = running_ids.len();
             // Fan out to all but the last recording with clones gated by the
             // recording's enabled_events + threshold filter.
             for &id in &running_ids[..n - 1] {
                 if let Some(rec) = recordings.get_mut(&id) {
                     for ev in drained.iter() {
-                        if rec.passes_filter(ev) {
+                        if admits(registry, rec, ev) {
                             rec.record_event(ev.clone());
                         } else {
                             rec.note_filtered_out();
@@ -555,7 +646,7 @@ impl FlightRecorder {
             let last_id = running_ids[n - 1];
             if let Some(rec) = recordings.get_mut(&last_id) {
                 for ev in drained {
-                    if rec.passes_filter(&ev) {
+                    if admits(registry, rec, &ev) {
                         rec.record_event(ev);
                     } else {
                         rec.note_filtered_out();
@@ -563,6 +654,26 @@ impl FlightRecorder {
                 }
             }
         }
+    }
+
+    /// Drop a recording and release its event repository. Returns whether one
+    /// was removed.
+    ///
+    /// Stopping a recording does not release anything: a `Recording` owns a ring
+    /// of up to `max_size` events (100 000 by default) for as long as it is in
+    /// the map. The real-JDK Java boundary creates one recording per
+    /// `jdk.jfr.consumer.RecordingStream` and per `jdk.jfr.Recording`, so
+    /// without a way to drop a finished one, a program that opens streams in a
+    /// loop would grow without bound.
+    ///
+    /// Callers must only use this at a point where the recording is provably
+    /// finished with — after its dump, or when replacing it with a fresh one.
+    pub fn discard_recording(&mut self, id: u64) -> bool {
+        let removed = self.recordings.remove(&id).is_some();
+        if removed {
+            self.refresh_running_ids();
+        }
+        removed
     }
 
     pub fn get_recording(&self, id: u64) -> Option<&Recording> {
@@ -599,7 +710,19 @@ impl FlightRecorder {
     /// Dump a recording to a JFR binary file.
     ///
     /// The recording must exist and be in `Stopped` or `Running` state.
-    /// Events are serialized using the JFR v2.0 binary format.
+    ///
+    /// The bytes are the **JDK's own** chunk format ([`crate::jdk_chunk`]), not
+    /// CratonVM's internal one ([`crate::dump`]). This is the single dump entry
+    /// point every operator-visible `.jfr` file goes through — `jdk.jfr
+    /// .Recording.dump(Path)`, the `JFR.dump` diagnostic command and the CLI's
+    /// exit-time dump — and all three are expected to hand the file to
+    /// `RecordingFile`, `jfr print` or JMC. Until this used the JDK format,
+    /// every one of those files failed to parse with
+    /// `IOException: Unknown string encoding 17`.
+    ///
+    /// The internal format is still what [`crate::phase`]'s report writes and
+    /// what [`crate::read_events`] reads; see the `jdk_chunk` module docs for
+    /// why the two coexist.
     ///
     /// This method first drains all per-thread ring shards into the
     /// per-recording repositories so that pending events are reflected in
@@ -633,8 +756,16 @@ impl FlightRecorder {
             .fold((u64::MAX, 0u64), |(min_s, max_e), e| {
                 (min_s.min(e.start_time), max_e.max(e.end_time))
             });
+        // An empty recording has no event to take a tick origin from. Zero
+        // would be written into the chunk header's `startNanos`, and every
+        // consumer renders that as `1970-01-01` — `jfr summary` prints it as
+        // the recording's start. Use the wall clock instead, which is what the
+        // chunk's start actually was.
         let start_time = if start_time == u64::MAX {
-            0
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0)
         } else {
             start_time
         };
@@ -644,7 +775,7 @@ impl FlightRecorder {
         // contains every event it should see. See Bug 1 fix in dump.rs.
         // `durable: true` — user-initiated dumps fsync the file before
         // rename for crash durability. Periodic snapshot paths pass `false`.
-        dump::dump_to_file(
+        crate::jdk_chunk::dump_to_file(
             path,
             rec.repository(),
             &self.type_registry,
@@ -1088,6 +1219,169 @@ mod tests {
         assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r2).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r3).unwrap().event_count(), 0);
+    }
+
+    /// `start(); commit(); stop(); dump(path)` — the shape every
+    /// `jdk.jfr.Recording` user writes — must put the committed event in the
+    /// file.
+    ///
+    /// It used not to. `record_event` parks the event on a per-thread ring;
+    /// `drain_per_thread_into_repository` is destructive on that ring and fans
+    /// out only to RUNNING recordings; and `stop_recording` did not drain. So
+    /// the event was discarded by `dump_recording`'s own drain, and the dump
+    /// still reported a plausible size because the chunk's metadata is written
+    /// either way. The parity table in the write-up that prompted this fix
+    /// shows exactly that: a one-event CratonVM dump was 106 bytes larger than
+    /// an empty one — the size of the new event type's METADATA, with no event
+    /// record behind it.
+    #[test]
+    fn an_event_committed_before_stop_survives_into_the_dump() {
+        let mut fr = FlightRecorder::new();
+        let type_id = fr.type_registry.register(crate::event::EventType {
+            id: EventTypeId::INVALID,
+            name: "StopThenDumpProbe".to_owned(),
+            category: vec!["Test".to_owned()],
+            description: String::new(),
+            fields: vec![crate::event::EventField::new("capacity", "int", "")],
+            has_thread: false,
+            has_stacktrace: false,
+            period: crate::event::EventPeriod::None,
+            threshold: None,
+        });
+        let id = fr.new_recording(RecordingSettings::new("stop-then-dump"));
+        fr.start_recording(id);
+
+        // The per-thread ring is process-global; serialize and pre-drain so the
+        // assertion counts only this test's event.
+        let _g = crate::repository::jfr_test_guard();
+        let _ = crate::repository::global_ring_registry().drain_all();
+        fr.record_event(EventInstance {
+            type_id,
+            start_time: 5_000,
+            end_time: 5_100,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(4096)],
+        });
+        // No explicit drain here: stopping is what has to preserve the event.
+        fr.stop_recording(id);
+
+        let dir = std::env::temp_dir().join(format!("jfrk-stopdump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stopdump.jfr");
+        fr.dump_recording(id, &path).expect("dump must succeed");
+
+        let chunk = crate::jdk_chunk::read_chunk(&path).expect("the dump must be a readable chunk");
+        let ours: Vec<_> = chunk
+            .events
+            .iter()
+            .filter(|event| event.type_name == "StopThenDumpProbe")
+            .collect();
+        assert_eq!(
+            ours.len(),
+            1,
+            "the event committed before stop() must be in the dump, got {:?}",
+            chunk.events.iter().map(|e| &e.type_name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ours[0].fields,
+            vec![(
+                "capacity".to_owned(),
+                crate::jdk_chunk::ChunkValue::Int(4096)
+            )]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The name filter's three cases, and the one that matters most: an EMPTY
+    /// enable list keeps nothing.
+    ///
+    /// `enabled_events` (id-keyed) reads an empty set as "all events", which is
+    /// right for a CratonVM-internal recording and exactly wrong for a
+    /// `jdk.jfr.Recording` with no `enable(...)` call — HotSpot records nothing
+    /// for one. That is why this is a separate `Option`, not a reuse.
+    #[test]
+    fn the_name_filter_distinguishes_no_filter_from_an_empty_one() {
+        let mut settings = RecordingSettings::new("names");
+        assert!(
+            settings.name_filter_admits(Some("ProbeEvent"), 0),
+            "no name filter must admit everything"
+        );
+        assert!(settings.name_filter_admits(None, 0));
+
+        settings.enabled_event_names = Some(FxHashSet::default());
+        assert!(
+            !settings.name_filter_admits(Some("ProbeEvent"), 0),
+            "an empty enable list must admit nothing"
+        );
+
+        let mut only_probe = FxHashSet::default();
+        only_probe.insert("ProbeEvent".to_owned());
+        settings.enabled_event_names = Some(only_probe);
+        assert!(settings.name_filter_admits(Some("ProbeEvent"), 0));
+        assert!(!settings.name_filter_admits(Some("jdk.ClassLoad"), 0));
+        assert!(
+            !settings.name_filter_admits(None, 0),
+            "an unnameable event cannot satisfy a filter that names what it wants"
+        );
+
+        settings
+            .event_thresholds_by_name
+            .insert("ProbeEvent".to_owned(), 1_000);
+        assert!(!settings.name_filter_admits(Some("ProbeEvent"), 999));
+        assert!(settings.name_filter_admits(Some("ProbeEvent"), 1_000));
+    }
+
+    /// End to end through the drain: a recording that enables one event name
+    /// keeps that one and drops the rest, and the drop is counted rather than
+    /// silent.
+    #[test]
+    fn the_drain_applies_the_name_filter_and_counts_what_it_drops() {
+        let mut fr = FlightRecorder::new();
+        let wanted = fr.type_registry.register(crate::event::EventType {
+            id: EventTypeId::INVALID,
+            name: "WantedEvent".to_owned(),
+            category: vec!["Test".to_owned()],
+            description: String::new(),
+            fields: Vec::new(),
+            has_thread: false,
+            has_stacktrace: false,
+            period: crate::event::EventPeriod::None,
+            threshold: None,
+        });
+        let unwanted = fr.type_registry.register(crate::event::EventType {
+            id: EventTypeId::INVALID,
+            name: "UnwantedEvent".to_owned(),
+            category: vec!["Test".to_owned()],
+            description: String::new(),
+            fields: Vec::new(),
+            has_thread: false,
+            has_stacktrace: false,
+            period: crate::event::EventPeriod::None,
+            threshold: None,
+        });
+        let mut settings = RecordingSettings::new("filtered");
+        let mut names = FxHashSet::default();
+        names.insert("WantedEvent".to_owned());
+        settings.enabled_event_names = Some(names);
+        let id = fr.new_recording(settings);
+        fr.start_recording(id);
+
+        let _g = crate::repository::jfr_test_guard();
+        let _ = crate::repository::global_ring_registry().drain_all();
+        fr.record_event(make_event(wanted, 100, 200));
+        fr.record_event(make_event(unwanted, 100, 200));
+        fr.drain_per_thread_into_repository();
+
+        let rec = fr.get_recording(id).unwrap();
+        assert_eq!(rec.event_count(), 1, "only the enabled name may be kept");
+        assert_eq!(
+            rec.repository().iter().next().map(|e| e.type_id),
+            Some(wanted)
+        );
+        assert!(
+            rec.stats().events_filtered_out >= 1,
+            "the dropped event must be counted, not silently discarded"
+        );
     }
 
     #[test]

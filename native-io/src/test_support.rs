@@ -37,9 +37,52 @@ pub(crate) struct InvokeScript {
     pub result: MethodCallResult,
 }
 
+/// The mock heap's own object-kind discriminant.
+///
+/// W7-83: this enum has always known which entries are arrays, and until
+/// 2026-08-12 nothing that answered a *kind* question consulted it —
+/// `heap_kind_of` returned `ObjectKind::Object` unconditionally,
+/// `heap_element_type_of` returned `ArrayElementType::Reference`
+/// unconditionally, and `object_is_array` was left on the trait default
+/// `false`. Every unit test in this crate runs against this mock, so those
+/// three constants made an entire class of screens untestable: a native that
+/// asks "is this actually an array?" gets the same answer for a `byte[]` and
+/// for a `MemorySegment`, and any test of the screen passes whether or not the
+/// screen is correct. See W7-83-segment-as-backing-array.md §2.
+///
+/// `Array` therefore carries its `element_type` now: without it
+/// `heap_element_type_of` cannot answer honestly even after it starts
+/// consulting the discriminant, and `new_array`'s element-type argument was
+/// being dropped on the floor.
 enum HeapEntry {
-    Object { fields: Vec<Value> },
-    Array { elements: Vec<Value> },
+    Object {
+        fields: Vec<Value>,
+    },
+    Array {
+        element_type: ArrayElementType,
+        elements: Vec<Value>,
+    },
+}
+
+/// The value a freshly allocated array of `element_type` reads back as, which
+/// is NOT `Int(0)` for every kind: a reference array reads `Object(None)`, and
+/// a `long`/`float`/`double` array reads the correspondingly typed zero. The
+/// mock used to fill every array with `Value::Int(0)`, so a native that
+/// distinguishes "unset reference slot" from "integer zero" could not be
+/// tested here at all. Same table as `native-api/src/test_mock.rs`'s
+/// `default_array_value`, which is the mock that already got this right.
+fn default_array_value(element_type: ArrayElementType) -> Value {
+    match element_type {
+        ArrayElementType::Boolean
+        | ArrayElementType::Byte
+        | ArrayElementType::Char
+        | ArrayElementType::Short
+        | ArrayElementType::Int => Value::Int(0),
+        ArrayElementType::Long => Value::Long(0),
+        ArrayElementType::Float => Value::Float(0.0),
+        ArrayElementType::Double => Value::Double(0.0),
+        ArrayElementType::Reference => Value::Object(None),
+    }
 }
 
 pub(crate) struct MockNativeContext {
@@ -548,26 +591,42 @@ impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
 impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
 
     // --- minimal heap primitives used by the native under test ---
-    fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
+    fn new_array(&mut self, et: ArrayElementType, length: usize) -> ObjectRef {
+        // W7-83: `et` used to be `_et`. The mock allocated every array as a
+        // vector of `Int(0)` and then answered `heap_element_type_of` with a
+        // constant, so the element type a test asked for was unobservable.
         self.alloc_entry(HeapEntry::Array {
-            elements: vec![Value::Int(0); length],
+            element_type: et,
+            elements: vec![default_array_value(et); length],
         })
     }
     fn array_length(&self, obj: ObjectRef) -> usize {
         match &self.heap_ref()[self.entry_index(obj)] {
-            HeapEntry::Array { elements } => elements.len(),
+            HeapEntry::Array { elements, .. } => elements.len(),
             _ => 0,
         }
     }
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
         match &self.heap_ref()[self.entry_index(obj)] {
-            HeapEntry::Array { elements } => elements.get(index).copied().unwrap_or(Value::Int(0)),
+            HeapEntry::Array {
+                elements,
+                element_type,
+            } => elements
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| default_array_value(*element_type)),
+            // Not an array. The production contract is that the caller has
+            // already screened the receiver's kind (`heap_kind_of`), so this
+            // arm is reached only by code that did not — it is kept as a
+            // fail-safe rather than a panic, but see
+            // `heap_kind_of`/`object_is_array`, which are what a caller is now
+            // able to ask FIRST.
             _ => Value::Int(0),
         }
     }
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let idx = self.entry_index(obj);
-        if let HeapEntry::Array { elements } = &mut self.heap_mut()[idx] {
+        if let HeapEntry::Array { elements, .. } = &mut self.heap_mut()[idx] {
             if index < elements.len() {
                 elements[index] = value;
             }
@@ -667,14 +726,49 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
     }
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
+            element_type: ArrayElementType::Reference,
             elements: vec![Value::Object(None); length],
         })
     }
-    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind {
-        ObjectKind::Object
+    /// W7-83. Was `ObjectKind::Object`, unconditionally, for every object on
+    /// this mock's heap — including the ones `new_array`/`new_ref_array` had
+    /// just allocated as `HeapEntry::Array`. The discriminant was right there
+    /// and nothing consulted it.
+    ///
+    /// This is not a cosmetic repair. `bb_resolve_heap_array` needs to reject a
+    /// `java.nio.Buffer.segment` that is a `MemorySegment` rather than a
+    /// `byte[]`, and the only honest screen is a kind question. Against the old
+    /// constant that screen rejected every array too, so
+    /// `bb_get_bulk_reads_real_heap_layout_slot_hb` — a test that legitimately
+    /// stashes a real array at slot 5 — would have gone red for a reason that
+    /// has nothing to do with the screen. Fixing the mock first is what makes
+    /// the screen's test able to fail for the right reason.
+    fn heap_kind_of(&self, o: ObjectRef) -> ObjectKind {
+        match &self.heap_ref()[self.entry_index(o)] {
+            HeapEntry::Array { .. } => ObjectKind::Array,
+            HeapEntry::Object { .. } => ObjectKind::Object,
+        }
     }
-    fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
-        ArrayElementType::Reference
+    /// W7-83. Was `ArrayElementType::Reference`, unconditionally. The trait
+    /// specifies `Reference` for a NON-array and for a reference array, so the
+    /// non-array arm below is the contract, not a fallback; the array arm now
+    /// answers what the array was actually allocated as.
+    fn heap_element_type_of(&self, o: ObjectRef) -> ArrayElementType {
+        match &self.heap_ref()[self.entry_index(o)] {
+            HeapEntry::Array { element_type, .. } => *element_type,
+            HeapEntry::Object { .. } => ArrayElementType::Reference,
+        }
+    }
+    /// W7-83. Was the trait default `false` — i.e. "this context has no heap",
+    /// which is exactly wrong for a mock that does. The trait's own doc says
+    /// the default is for "mock contexts without a heap"; this one has one and
+    /// must answer from it, or a native's array/instance fork is untestable
+    /// here in either direction.
+    fn object_is_array(&self, o: ObjectRef) -> bool {
+        matches!(
+            &self.heap_ref()[self.entry_index(o)],
+            HeapEntry::Array { .. }
+        )
     }
     fn create_string(&mut self, t: &str) -> ObjectRef {
         let obj = self.alloc_object(0);
@@ -694,10 +788,18 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         self.obj_class.insert(obj.as_ptr() as usize, c);
         obj
     }
+    /// W7-83 re-checked this one and left it: an array HAS no instance fields,
+    /// so `0` is the honest answer for the `Array` arm rather than a stub. Note
+    /// what it is NOT, though — it is not a width witness. `new_object` here
+    /// allocates with zero declared fields and keeps its state in the
+    /// name-keyed side map, so `object_num_fields` answers 0 for most objects
+    /// this mock hands out, and a production predicate of the
+    /// `object_num_fields(buf) != 6` species (W7-76 §6) cannot be exercised
+    /// against it without `alloc_object(n)`.
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
         match &self.heap_ref()[self.entry_index(obj)] {
             HeapEntry::Object { fields } => fields.len(),
-            _ => 0,
+            HeapEntry::Array { .. } => 0,
         }
     }
     fn heap_allocated_bytes(&self) -> usize {

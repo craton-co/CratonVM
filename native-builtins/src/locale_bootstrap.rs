@@ -25,12 +25,89 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+/// Which of the JDK's three process defaults a lookup wants.
+///
+/// `java.util.Locale` keeps three, not one: the base default plus a
+/// `Locale.Category.DISPLAY` and a `Locale.Category.FORMAT` default
+/// (`defaultLocale`, `defaultDisplayLocale`, `defaultFormatLocale` in
+/// `Locale.java`). They are seeded from three property families —
+/// `user.language`, `user.language.display`, `user.language.format` — and they
+/// genuinely differ on a host whose UI language and regional format differ,
+/// which is an ordinary Windows configuration.
+///
+/// W7-67: `getDefault(Category)` used to ignore its argument and hand back the
+/// base default, so `Locale.getDefault(FORMAT)` could not disagree with
+/// `Locale.getDefault()` no matter what was set. That collapse is a separate
+/// defect from the hardcoded-`en_US` one and is fixed here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum LocaleCategory {
+    Base,
+    Display,
+    Format,
+}
+
+impl LocaleCategory {
+    /// The `user.*` property suffix this category reads, per
+    /// `Locale.Category`'s own `languageKey`/`countryKey` constants.
+    fn suffix(self) -> &'static str {
+        match self {
+            LocaleCategory::Base => "",
+            LocaleCategory::Display => ".display",
+            LocaleCategory::Format => ".format",
+        }
+    }
+}
+
 /// Process-wide cached default Locale, lazily constructed on first
 /// `Locale.getDefault()` call.  Stable identity so `==` comparisons in JDK
 /// code (e.g. `Locale.getDefault() == cached`) behave sensibly.
-fn cached_default_locale() -> &'static Mutex<Option<ObjectRef>> {
-    static CACHE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+///
+/// One slot per [`LocaleCategory`]. All three are GC roots — see
+/// [`gc_scan_locale_roots`], which must scan every slot or a moving young
+/// collection reclaims the one it missed while this cache keeps handing back
+/// the stale `ObjectRef`.
+fn cached_locale(category: LocaleCategory) -> &'static Mutex<Option<ObjectRef>> {
+    static BASE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    static DISPLAY: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    static FORMAT: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    let cell = match category {
+        LocaleCategory::Base => &BASE,
+        LocaleCategory::Display => &DISPLAY,
+        LocaleCategory::Format => &FORMAT,
+    };
+    cell.get_or_init(|| Mutex::new(None))
+}
+
+/// Every cache slot, for the whole-cache operations (GC scan/remap and
+/// `setDefault(Locale)`, which the JDK defines as setting all three).
+const ALL_LOCALE_CATEGORIES: [LocaleCategory; 3] = [
+    LocaleCategory::Base,
+    LocaleCategory::Display,
+    LocaleCategory::Format,
+];
+
+/// Decode a `java.util.Locale$Category` argument.
+///
+/// Goes through `Enum.name()` rather than reading the `name` or `ordinal`
+/// slot directly: `native_enum_name` (lang_misc) already handles the
+/// shadowing/unwritten-slot traps that a raw field read walks into, and a name
+/// match cannot silently drift if the enum's declaration order changes.
+/// Anything we cannot decode falls back to `Base`, i.e. the pre-W7-67
+/// behaviour, so an unexpected receiver degrades to the old answer rather
+/// than to a wrong category.
+fn decode_category(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> LocaleCategory {
+    let Some(Value::Object(Some(obj))) = arg else {
+        return LocaleCategory::Base;
+    };
+    let name = match ctx.invoke_virtual(*obj, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    match name.as_str() {
+        "DISPLAY" => LocaleCategory::Display,
+        "FORMAT" => LocaleCategory::Format,
+        _ => LocaleCategory::Base,
+    }
 }
 
 /// Map from synthetic Locale ObjectRef → (language, country, language_tag).
@@ -114,10 +191,42 @@ fn env_locale_value() -> String {
 /// agreement, as the JDK guarantees). The environment is the fallback for
 /// contexts with no property table populated yet.
 pub(crate) fn resolve_default_locale(ctx: &dyn NativeContext) -> (String, String) {
-    let prop_lang = ctx.get_system_property("user.language").unwrap_or_default();
+    resolve_default_locale_for(ctx, LocaleCategory::Base)
+}
+
+/// [`resolve_default_locale`], for one [`LocaleCategory`].
+///
+/// A category reads `user.language<suffix>` and falls back to the base
+/// `user.language` when that key is absent — which is exactly what
+/// `Locale.initDefault(Category)` does via `StaticProperty.USER_LANGUAGE_FORMAT`
+/// and friends, and it is why the VM only publishes the `.format` overlay when
+/// it differs from the base (see `vm_init::fill_i18n_props`).
+///
+/// Language and country only: the synthetic Locale this module allocates
+/// records `(language, country, tag)`, so a category whose *script* or
+/// *variant* differs from the base is not represented. No host we run on
+/// splits those two subtags across categories, and modelling them means
+/// widening the side table — recorded in W7-67-host-default-locale.md rather
+/// than half-done here.
+pub(crate) fn resolve_default_locale_for(
+    ctx: &dyn NativeContext,
+    category: LocaleCategory,
+) -> (String, String) {
+    let suffix = category.suffix();
+    let read = |base: &str| -> String {
+        if !suffix.is_empty() {
+            let scoped = ctx
+                .get_system_property(&format!("{base}{suffix}"))
+                .unwrap_or_default();
+            if !scoped.trim().is_empty() {
+                return scoped;
+            }
+        }
+        ctx.get_system_property(base).unwrap_or_default()
+    };
+    let prop_lang = read("user.language");
     if !prop_lang.trim().is_empty() {
-        let prop_country = ctx.get_system_property("user.country").unwrap_or_default();
-        return normalise_language_country(&prop_lang, &prop_country);
+        return normalise_language_country(&prop_lang, &read("user.country"));
     }
     parse_posix_locale(&env_locale_value())
 }
@@ -142,8 +251,13 @@ pub(crate) fn synthetic_language(obj: ObjectRef) -> Option<String> {
 /// followed by a SIGSEGV (TestServerInfo / TestSwallowAbortedUploads). Mirrors
 /// the classloader singleton root scan.
 pub fn gc_scan_locale_roots(out: &mut Vec<ObjectRef>) {
-    if let Some(o) = *cached_default_locale().lock() {
-        out.push(o);
+    // EVERY category slot, not just the base one. A slot missed here is a
+    // Locale the collector is free to reclaim while `cached_locale` keeps
+    // handing back its address.
+    for category in ALL_LOCALE_CATEGORIES {
+        if let Some(o) = *cached_locale(category).lock() {
+            out.push(o);
+        }
     }
     for k in synthetic_locale_data().lock().keys() {
         out.push(*k);
@@ -155,8 +269,8 @@ pub fn gc_update_locale_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
-    {
-        let mut slot = cached_default_locale().lock();
+    for category in ALL_LOCALE_CATEGORIES {
+        let mut slot = cached_locale(category).lock();
         if let Some(obj) = slot.as_mut() {
             if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
                 *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -194,15 +308,22 @@ pub fn gc_update_locale_refs(pointer_map: &cratonvm_types::PointerMap) {
 /// always returns a valid ObjectRef.  We skip `Locale.<init>` entirely and
 /// record language/country in a Rust-side map; native overrides for
 /// `getLanguage()`/`getCountry()` etc. read from that map.
-fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    if let Some(obj) = *cached_default_locale().lock() {
+///
+/// One cache slot per [`LocaleCategory`], so `getDefault(FORMAT)` can differ
+/// from `getDefault()` when the host (or a `-Duser.language.format`) says they
+/// differ. Each slot keeps a stable identity, as before.
+fn get_or_create_default(
+    ctx: &mut dyn NativeContext,
+    category: LocaleCategory,
+) -> MethodCallResult {
+    if let Some(obj) = *cached_locale(category).lock() {
         return Ok(Some(Value::Object(Some(obj))));
     }
 
     // Allocate a synthetic Locale that bypasses <clinit>/<init> failures.
     // 32 slots is conservative: real JDK Locale has ~20 instance fields once
     // inherited fields are counted.
-    let (lang, country) = resolve_default_locale(&*ctx);
+    let (lang, country) = resolve_default_locale_for(&*ctx, category);
     let tag = if country.is_empty() {
         lang.clone()
     } else {
@@ -221,7 +342,7 @@ fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // `locale_populate` also records the data in the lib.rs side table.
     crate::locale_populate(ctx, locale_obj, &lang, &country, "");
 
-    *cached_default_locale().lock() = Some(locale_obj);
+    *cached_locale(category).lock() = Some(locale_obj);
     Ok(Some(Value::Object(Some(locale_obj))))
 }
 
@@ -897,34 +1018,47 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "java/util/Locale",
         "getDefault",
         "()Ljava/util/Locale;",
-        |ctx, _args| get_or_create_default(ctx),
+        |ctx, _args| get_or_create_default(ctx, LocaleCategory::Base),
     );
+    // W7-67: this used to discard its argument and return the base default, so
+    // `Locale.getDefault(FORMAT)` could never disagree with `Locale.getDefault()`.
+    // It now resolves per category off the `user.*.format`/`user.*.display`
+    // overlay, matching `Locale.initDefault(Category)`.
     registry.register(
         "java/util/Locale",
         "getDefault",
         "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
-        |ctx, _args| get_or_create_default(ctx),
+        |ctx, args| {
+            let category = decode_category(ctx, args.first());
+            get_or_create_default(ctx, category)
+        },
     );
     // java.util.Locale.setDefault(Locale) / setDefault(Category, Locale) —
     // since `getDefault()` above is hard-overridden to read our own cache
     // instead of the real JDK's `defaultLocale` static field, `setDefault`
     // must write to that SAME cache or it becomes a no-op from the caller's
     // perspective: `Locale.setDefault(GERMAN); Locale.getDefault()` would
-    // keep returning the original cached en_US Locale. Both real JDK
-    // overloads set the same process-wide default (the Category variant only
-    // matters for the JDK's own DISPLAY/FORMAT split, which we don't track
-    // separately), so both write the one cache `getDefault()` reads. Verified
-    // against real JDK 25 that this is required for
+    // keep returning the original cached en_US Locale. Verified against real
+    // JDK 25 that this is required for
     // `ResourceBundle.Control.getFallbackLocale`'s `Locale.getDefault()`
     // fallback (see `locale_resources::resolve_fallback_locale`) to see a
     // `setDefault` call made earlier in the same test/run.
+    //
+    // W7-67: the two overloads no longer do the same thing, because the cache
+    // is no longer one slot. `Locale.setDefault(Locale)`'s own body is
+    // `setDefault(DISPLAY, l); setDefault(FORMAT, l);` on top of the base
+    // field, so it writes all three; `setDefault(Category, Locale)` writes
+    // only the named one, and must NOT touch the base — a test that pins
+    // FORMAT for a number-format assertion has to leave DISPLAY alone.
     registry.register(
         "java/util/Locale",
         "setDefault",
         "(Ljava/util/Locale;)V",
         |_ctx, args| {
             if let Some(Value::Object(Some(loc))) = args.first() {
-                *cached_default_locale().lock() = Some(*loc);
+                for category in ALL_LOCALE_CATEGORIES {
+                    *cached_locale(category).lock() = Some(*loc);
+                }
             }
             Ok(None)
         },
@@ -933,9 +1067,14 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "java/util/Locale",
         "setDefault",
         "(Ljava/util/Locale$Category;Ljava/util/Locale;)V",
-        |_ctx, args| {
+        |ctx, args| {
             if let Some(Value::Object(Some(loc))) = args.get(1) {
-                *cached_default_locale().lock() = Some(*loc);
+                let loc = *loc;
+                // An undecodable category is the JDK's NullPointerException
+                // case; `decode_category` degrades it to `Base`, i.e. the
+                // pre-W7-67 behaviour, rather than dropping the call.
+                let category = decode_category(ctx, args.first());
+                *cached_locale(category).lock() = Some(loc);
             }
             Ok(None)
         },

@@ -890,7 +890,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     &shared.threads.monitors,
                 )
                 .0;
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
             // relocated survivors — REMAP each watched holder through the
@@ -1115,7 +1115,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         &shared.threads.monitors,
                     )
                     .0;
-                process_references_after_gc(shared, &result.pointer_map);
+                process_references_after_gc(shared, &result.pointer_map, &roots);
 
                 // Update shared VM state (statics, string pool, etc.)
                 update_all_roots(shared, thread, &result.pointer_map);
@@ -1325,7 +1325,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .heap
             .collect_garbage_with_finalizers(&stw, &mut roots, &fin_roots, &shared.threads.monitors)
             .0;
-        process_references_after_gc(shared, &result.pointer_map);
+        process_references_after_gc(shared, &result.pointer_map, &roots);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
@@ -1388,7 +1388,7 @@ pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                     &shared.threads.monitors,
                 )
                 .0;
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
             // multi-threaded forced collection too. The single-threaded GC paths
@@ -1612,7 +1612,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             &fin_addrs,
             &shared.threads.monitors,
         );
-        process_references_after_gc(shared, &result.pointer_map);
+        process_references_after_gc(shared, &result.pointer_map, &roots);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
@@ -1681,7 +1681,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                 &fin_addrs,
                 &shared.threads.monitors,
             );
-            process_references_after_gc(shared, &result.pointer_map);
+            process_references_after_gc(shared, &result.pointer_map, &roots);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: keep the ec_watch corruption-watch table consistent
             // across this multi-threaded finalizer collection (single-threaded
@@ -2019,6 +2019,7 @@ pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
 pub(super) fn process_references_after_gc(
     shared: &SharedVm,
     pointer_map: &cratonvm_types::PointerMap,
+    cycle_roots: &[ObjectRef],
 ) {
     // HIB-CV-24 (Manifestation B): reconcile the defining-loader side-table with
     // this collection. A user `ClassLoader` the application no longer references
@@ -2143,7 +2144,7 @@ pub(super) fn process_references_after_gc(
         // "before the no_refproc short-circuit" rationale: the cache must
         // never hold a stale ObjectRef after a collection, independent of
         // that diagnostic switch.
-        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked);
+        crate::memory::gc::reconcile_class_mirrors(shared, &is_marked, Some(cycle_roots));
         // Rebuild the mirror_pin registry the GC marker consults (gen_heap.rs)
         // from the now-pruned class_mirrors + just-remapped defining-loader
         // side-table, so the marker sees current addresses next cycle.
@@ -3241,8 +3242,13 @@ pub(super) fn tlab_alloc_shaped_inner(
     }
     if let Some((buf, size)) = refill {
         shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        // Read the outgoing TLAB's running per-thread allocation total before
+        // the struct is replaced — `Tlab::new` starts a fresh one at zero, and
+        // `getThreadAllocatedBytes` must not go backwards at a refill.
+        let carried = thread.tlab.thread_allocated_bytes();
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
         thread.tlab = unsafe { cratonvm_gc::Tlab::new(buf, size) };
+        thread.tlab.adopt_allocation_total(carried);
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
@@ -3325,6 +3331,10 @@ pub(crate) fn alloc_object_shared(
             .mem
             .bytes_allocated_total
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        // Same bytes, per thread — the counter behind
+        // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`. It cannot
+        // come from the TLAB cursor here, because this object never touched it.
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // Retire TLAB before GC — its memory is in the arena that will be collected
@@ -3357,12 +3367,13 @@ pub(crate) fn alloc_object_shared(
             .bytes_allocated_total
             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        thread.tlab.note_external_allocation(total_size);
         return Ok(obj);
     }
     // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
     // completed mark cycle's cleanup; run one synchronously and retry once.
     g1_force_full_cycle(shared, thread);
-    shared
+    let obj = shared
         .mem
         .heap
         .try_alloc_object_full(class_id, num_fields)
@@ -3379,7 +3390,9 @@ pub(crate) fn alloc_object_shared(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(total_size);
+    Ok(obj)
 }
 
 /// T1.7.7 — write an HPROF heap dump when allocation fails and the
@@ -3519,11 +3532,19 @@ pub(super) fn gc_alloc_array(
     if let Some(arr) = tlab_alloc_array(thread, shared, class_id, element_type, length) {
         return Ok(arr);
     }
+    // Everything below this line bypasses the TLAB, so the thread's allocation
+    // counter (`Tlab::thread_allocated_bytes`, read by
+    // `com.sun.management.ThreadMXBean.getThreadAllocatedBytes`) sees none of
+    // it from the cursor. Record it explicitly — arrays are precisely the
+    // shape that skips the TLAB, so an unrecorded array path would make the
+    // counter report a small fraction of a buffer-allocating workload.
+    let external_bytes = external_array_bytes(element_type, length);
     if let Some(arr) = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // Retire TLAB before GC
@@ -3544,13 +3565,14 @@ pub(super) fn gc_alloc_array(
         .heap
         .try_alloc_array_full(class_id, element_type, length)
     {
+        thread.tlab.note_external_allocation(external_bytes);
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
     g1_force_full_cycle(shared, thread);
-    shared
+    let arr = shared
         .mem
         .heap
         .try_alloc_array_full(class_id, element_type, length)
@@ -3559,7 +3581,23 @@ pub(super) fn gc_alloc_array(
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
-        })
+        })?;
+    thread.tlab.note_external_allocation(external_bytes);
+    Ok(arr)
+}
+
+/// Footprint, in bytes, of an array that is about to be allocated outside the
+/// TLAB — header plus payload, computed the same way [`tlab_alloc_array`]
+/// computes `total_size`.
+///
+/// Saturating rather than checked: this feeds a monitoring counter, and an
+/// array whose data size overflows `usize` is about to fail its allocation
+/// anyway. Reporting the clamped figure keeps this off the error path.
+#[inline]
+fn external_array_bytes(element_type: ArrayElementType, length: usize) -> usize {
+    use cratonvm_gc::heap::ARRAY_DATA_OFFSET;
+    let data = cratonvm_gc::heap::array_data_size_checked(length, element_type).unwrap_or(0);
+    ARRAY_DATA_OFFSET.saturating_add(data)
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
@@ -4092,7 +4130,21 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(exc);
     }
 
-    let moving_young_precise_only = crate::jit::conservative_roots::moving_young_enabled()
+    // COLLECTOR FIRST. `moving_young_enabled()` ANDs a JIT-side gate with
+    // `flags().gc.moving_young` and consults the collector in neither, so
+    // under G1 and ZGC this whole question is inert — and answering it is
+    // not free: `refresh_moving_young_coverage_for_current_thread` ends in
+    // an UNMEMOISED `native_stack_has_jit_frame` over the full band, on
+    // every blocked-region entry.
+    //
+    // Measured on `DefaultCatalogAndSchemaTest` under the default (ZGC)
+    // collector, 240 s: the probe ran 1,139,842 times reading 35.2 BILLION
+    // stack words. With the moving-young term forced off
+    // (`CRATONVM_NO_MOVING_YOUNG=1`) it ran 494,968 times reading 15.3
+    // billion — exactly one probe per blocked deposit instead of two, and
+    // 20 billion fewer words, for a decision no non-moving collector reads.
+    let moving_young_precise_only = shared.mem.heap.is_generational()
+        && crate::jit::conservative_roots::moving_young_enabled()
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
 
@@ -4130,6 +4182,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // snapshot paths, both of which already invalidate before publishing.
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let jit_scan_start = snapshot.len();
+        crate::memory::native_roots::rootprof::note_scan_caller(1); // safepoint
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut snapshot);
         // G1 pin-in-place, cross-thread half: the snapshot keeps these
         // conservatively-discovered objects ALIVE, but under G1 (a moving
@@ -5162,7 +5215,12 @@ pub(super) fn g1_remark_process_references(
     // Reconcile those weak ownership tables against the completed bitmap before
     // cleanup frees dead regions and before the optional reference-processor
     // short-circuit.
-    crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+    // G1's own mark bitmap has no separate roots Vec by this point (unlike
+    // the Generational path this diagnostic was built for) -- `None` keeps
+    // `CRATONVM_DBG_MIRRORPIN_WHY`'s verified-root check off for G1 rather
+    // than feeding it a stale/empty vector that would misreport every real
+    // root as unverified.
+    crate::memory::gc::reconcile_class_mirrors(shared, is_marked, None);
     let no_moves = cratonvm_types::PointerMap::default();
     let dead_class_hints =
         cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
