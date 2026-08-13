@@ -15,7 +15,10 @@ The reported symptom: a process that ran to a 3000 s timeout with no output
 after test 42 of 44, having raised `OutOfMemoryError` for a 2.7 MB array with
 **1.99 GB of a 2.15 GB heap free**. The reporting page named three things and
 said root-causing two of them was "not chased further here". All three are
-resolved, and chasing them turned up three more.
+resolved, and chasing them turned up three more. Six defects in total; five got
+fixes and the sixth (defect 4) is a real defect whose obvious fix, once
+measured, was not worth what it cost — which is recorded here rather than
+quietly dropped.
 
 ## The instrument, first — because the existing one was one question short
 
@@ -128,7 +131,7 @@ meet, which is what makes the region test on a free block
 (`offset >= high_cursor`) permanently exact. `ZGC_TLAB_MAX_CHUNK`'s doc now says
 in as many words not to reach for that knob again.
 
-## Defect 4 — a GC trigger blind to reservations
+## Defect 4 — a GC trigger blind to reservations (diagnosed; its fix was priced and rejected)
 
 `allocated` — what `needs_gc`'s live-bytes term reads — never counts the part of
 a chunk not yet handed to an object. The blind spot is documented as bounded by
