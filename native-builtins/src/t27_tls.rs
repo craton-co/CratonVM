@@ -8152,6 +8152,10 @@ pub(crate) struct EngineState {
     /// to tell Tomcat's "renegotiate to collect the client certificate"
     /// second `beginHandshake()` apart from an ordinary redundant one.
     client_auth_requested: bool,
+    /// Set once this server engine's `SNIMatcher`s have been consulted for the
+    /// ClientHello's `server_name`, so the callback into Java happens once per
+    /// connection — same one-shot discipline as `trust_check_done`.
+    sni_match_done: bool,
 }
 
 impl Default for EngineState {
@@ -8182,6 +8186,7 @@ impl Default for EngineState {
             trust_managers_ctx_key: None,
             trust_check_done: false,
             client_auth_requested: false,
+            sni_match_done: false,
         }
     }
 }
@@ -9559,6 +9564,39 @@ fn endpoint_alg_verifies_identity(alg: &str) -> bool {
 /// deferred to `engine_run_trust_check` specifically so no allocating/GC-
 /// triggering call ever happens while this lock is held (see
 /// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
+/// The ClientHello `server_name` about to be handed to rustls, exactly once
+/// per engine. `None` — meaning "no gate to apply" — for a client engine, for
+/// an engine with no matchers configured, for every call after the first, and
+/// for any source buffer that does not begin with a parseable ClientHello
+/// carrying a `server_name`.
+///
+/// Marks the engine checked as soon as it looks at a handshake record, so a
+/// hello that carries no SNI is not re-examined on every later `unwrap`.
+fn engine_pending_sni_host(
+    ctx: &mut dyn NativeContext,
+    id: i32,
+    view: &BbView,
+    from: usize,
+    to: usize,
+) -> Option<String> {
+    let interesting = with_engine(id, |s| !s.is_client && !s.sni_match_done).unwrap_or(false);
+    if !interesting {
+        return None;
+    }
+    // No cheap matcher pre-check here: the table is keyed by the ENGINE
+    // object, which this helper does not hold, and
+    // `engine_run_sni_match_check` returns immediately when the engine has
+    // none. This runs at most once per engine either way.
+    let bytes = bb_bytes_range(ctx, view, from, to.min(from + 4096));
+    let host = peek_client_hello_sni(&bytes);
+    if !bytes.is_empty() && bytes[0] == 22 {
+        with_engine(id, |s| {
+            s.sni_match_done = true;
+        });
+    }
+    host
+}
+
 fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<PendingTrustCheck> {
     if state.trust_check_done {
         return None;
@@ -9611,6 +9649,232 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
     })
 }
 
+/// Extract the `server_name` (SNI host) from a buffer that starts at a TLS
+/// record boundary and is expected to hold a ClientHello.
+///
+/// Why parse it here instead of asking rustls: rustls only reports
+/// `server_name()` AFTER it has processed the ClientHello, and processing it
+/// also produces the whole server flight. JSSE's SNI gate runs at ClientHello
+/// time — `ServerHandshakeContext` refuses before a ServerHello exists, so the
+/// client sees an `unrecognized_name` alert and nothing else. Checking after
+/// the fact left the client's handshake already complete: netty's
+/// `SniClientTest.testSniSNIMatcherDoesNotMatchClient` then saw the server
+/// report a failure and the client report success, and its
+/// `assertThrows(SSLException.class, …)` failed with "nothing was thrown".
+///
+/// Deliberately total and bounds-checked: every length is validated against
+/// the remaining slice, and anything unexpected answers `None` (meaning "no
+/// gate to apply"), never a panic. `None` is also the answer for a hello with
+/// no `server_name` extension, which is exactly JSSE's behaviour — with no
+/// name received there is nothing for a matcher to match.
+fn peek_client_hello_sni(buf: &[u8]) -> Option<String> {
+    fn u16at(b: &[u8], i: usize) -> Option<usize> {
+        Some(((*b.get(i)? as usize) << 8) | *b.get(i + 1)? as usize)
+    }
+    // TLS record: type(1) version(2) length(2). Handshake is 22.
+    if *buf.first()? != 22 {
+        return None;
+    }
+    let rec_len = u16at(buf, 3)?;
+    let body = buf.get(5..5 + rec_len)?;
+    // Handshake: msg_type(1)=client_hello, length(3).
+    if *body.first()? != 1 {
+        return None;
+    }
+    let hs_len = ((*body.get(1)? as usize) << 16)
+        | ((*body.get(2)? as usize) << 8)
+        | (*body.get(3)? as usize);
+    let hello = body.get(4..4 + hs_len)?;
+    // legacy_version(2) random(32)
+    let mut p = 34usize;
+    // legacy_session_id
+    p += 1 + *hello.get(p)? as usize;
+    // cipher_suites
+    p += 2 + u16at(hello, p)?;
+    // legacy_compression_methods
+    p += 1 + *hello.get(p)? as usize;
+    // extensions
+    let ext_total = u16at(hello, p)?;
+    p += 2;
+    let ext_end = p.checked_add(ext_total)?;
+    if ext_end > hello.len() {
+        return None;
+    }
+    while p + 4 <= ext_end {
+        let ext_type = u16at(hello, p)?;
+        let ext_len = u16at(hello, p + 2)?;
+        let data = hello.get(p + 4..p + 4 + ext_len)?;
+        if ext_type == 0x0000 {
+            // ServerNameList: list_length(2), then entries of
+            // name_type(1) + length(2) + host.
+            let list_len = u16at(data, 0)?;
+            let list = data.get(2..2 + list_len)?;
+            let mut q = 0usize;
+            while q + 3 <= list.len() {
+                let name_type = *list.get(q)?;
+                let name_len = u16at(list, q + 1)?;
+                let name = list.get(q + 3..q + 3 + name_len)?;
+                if name_type == 0 {
+                    return String::from_utf8(name.to_vec()).ok();
+                }
+                q += 3 + name_len;
+            }
+            return None;
+        }
+        p += 4 + ext_len;
+    }
+    None
+}
+
+/// Read `SSLParameters.getSNIMatchers()` into raw `ObjectRef`s and file them
+/// under this engine. A null/empty collection CLEARS any previous set, so a
+/// caller that reads the parameters, edits something else and writes them back
+/// does not accidentally keep matchers it removed.
+fn capture_sni_matchers(ctx: &mut dyn NativeContext, engine: ObjectRef, params: ObjectRef) {
+    let key = engine_objref_key(ctx, engine);
+    let coll = match ctx.invoke_virtual(params, "getSNIMatchers", "()Ljava/util/Collection;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => {
+            engine_sni_matchers_table().lock().remove(&key);
+            return;
+        }
+    };
+    let mut list = Vec::new();
+    // Walk the Collection through its Iterator rather than assuming an
+    // ArrayList: `SSLParameters.getSNIMatchers` answers an unmodifiable
+    // wrapper, and JSSE itself builds it from whatever the caller passed.
+    if let Ok(Some(Value::Object(Some(it)))) =
+        ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])
+    {
+        let it_pin = ctx.pin_native_root(it);
+        // Bounded: a matcher set is a handful of entries, and an iterator that
+        // never reports exhaustion must not wedge the handshake.
+        for _ in 0..64 {
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "hasNext", "()Z", &[]) {
+                Ok(Some(Value::Int(1))) => {}
+                _ => break,
+            }
+            let it_now = ctx.read_native_pin(it_pin, it);
+            match ctx.invoke_virtual(it_now, "next", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(m)))) => list.push(m),
+                _ => break,
+            }
+        }
+        ctx.unpin_native_roots(it_pin);
+    }
+    let mut table = engine_sni_matchers_table().lock();
+    if list.is_empty() {
+        table.remove(&key);
+    } else {
+        table.insert(key, list);
+    }
+}
+
+/// JSSE's server-side SNI gate: for the `server_name` the peer sent, consult
+/// every configured `SNIMatcher` of the matching type and abort the handshake
+/// with `unrecognized_name` if one refuses.
+///
+/// `SNIHostName`'s type is `StandardConstants.SNI_HOST_NAME` (0), the only type
+/// rustls surfaces, so a matcher declaring any other type is not consulted —
+/// matching `ServerHandshakeContext`, which pairs each received name with the
+/// matcher registered for that name's type and ignores the rest.
+///
+/// Runs with the engine registry lock NOT held: it calls into Java.
+fn engine_run_sni_match_check(
+    ctx: &mut dyn NativeContext,
+    engine_id: i32,
+    engine: ObjectRef,
+    host: String,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let key = engine_objref_key(ctx, engine);
+    let matchers = match engine_sni_matchers_table().lock().get(&key).cloned() {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+    let name_str = ctx.create_string(&host);
+    let base = ctx.pin_native_root(name_str);
+    let name_str = ctx.read_native_pin(base, name_str);
+    let sni_name = ctx.new_object_initialized(
+        "javax/net/ssl/SNIHostName",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(name_str))],
+    );
+    let sni_name = match sni_name {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(base);
+            return Ok(());
+        }
+    };
+    let name_pin = ctx.pin_native_root(sni_name);
+    let m_pins: Vec<usize> = matchers.iter().map(|m| ctx.pin_native_root(*m)).collect();
+    let mut refused = false;
+    for (i, _) in matchers.iter().enumerate() {
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        // Only a SNI_HOST_NAME matcher applies to the name rustls gave us.
+        match ctx.invoke_virtual(m_now, "getType", "()I", &[]) {
+            Ok(Some(Value::Int(0))) => {}
+            _ => continue,
+        }
+        let m_now = ctx.read_native_pin(m_pins[i], matchers[i]);
+        let name_now = ctx.read_native_pin(name_pin, sni_name);
+        match ctx.invoke_virtual(
+            m_now,
+            "matches",
+            "(Ljavax/net/ssl/SNIServerName;)Z",
+            &[Value::Object(Some(name_now))],
+        ) {
+            Ok(Some(Value::Int(0))) => {
+                refused = true;
+                break;
+            }
+            // A matcher that throws is JSSE's "no match" too — it never lets an
+            // application exception decide the handshake succeeded.
+            Err(_) => {
+                refused = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    ctx.unpin_native_roots(base);
+    if !refused {
+        return Ok(());
+    }
+    with_engine(engine_id, |s| {
+        if let Some(c) = s.conn.as_mut() {
+            c.queue_fatal_alert(rustls::AlertDescription::UnrecognisedName);
+        }
+    });
+    Err(crate::phases_early::throw_jca_exc(
+        ctx,
+        "javax/net/ssl/SSLHandshakeException",
+        &format!("Unrecognized server name indication: {host}"),
+    ))
+}
+
+thread_local! {
+    /// Set for the duration of an application `TrustManager` callback.
+    ///
+    /// This VM defers the consultation until AFTER `process_new_packets`
+    /// (deliberately — calling into the JVM while the engine registry lock is
+    /// held is what `engine_take_pending_trust_check`'s doc forbids), so by the
+    /// time the manager runs, rustls reports the handshake finished. Real JSSE
+    /// calls it DURING the handshake, and an `X509ExtendedTrustManager` may
+    /// legitimately read `sslEngine.getHandshakeSession()` — netty's
+    /// `SniClientJava8TestUtil` manager asserts it is non-null. Without this
+    /// flag the "handshake is over, answer null" rule (correct for every other
+    /// caller) made that assertion fail from inside the callback.
+    static IN_TRUST_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is this thread inside an application `TrustManager` callback? See
+/// [`IN_TRUST_CHECK`].
+fn in_trust_check() -> bool {
+    IN_TRUST_CHECK.with(|c| c.get())
+}
+
 /// Run the post-handshake `TrustManager` consultation captured by
 /// `engine_take_pending_trust_check`. MUST be called with the engine registry
 /// lock NOT held. Looks up the real `TrustManager[]` for the owning
@@ -9629,6 +9893,7 @@ fn engine_take_pending_trust_check(id: i32, state: &mut EngineState) -> Option<P
 fn engine_run_trust_check(
     ctx: &mut dyn NativeContext,
     pending: PendingTrustCheck,
+    engine_obj: Option<ObjectRef>,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let trust_managers = match pending.trust_ctx_key {
         Some(key) => ctx_trust_managers_table()
@@ -9697,6 +9962,10 @@ fn engine_run_trust_check(
     // pin pattern in `net_phase_e.rs`'s group-collector native. `base + 1` is
     // the authType pin because these two pins are taken back to back.
     let _ = ctx.pin_native_root(auth_type_str);
+    // The `SSLEngine` goes into the same pin scope: the three-argument
+    // `checkServerTrusted` overload passes it to Java, and every
+    // `invoke_virtual` in the loop below can move it.
+    let engine_pin = engine_obj.map(|e| (ctx.pin_native_root(e), e));
     let tm_pins: Vec<usize> = trust_managers
         .iter()
         .map(|tm| ctx.pin_native_root(*tm))
@@ -9719,16 +9988,38 @@ fn engine_run_trust_check(
     }
     let mut rejected = false;
     let mut rejection: Option<String> = None;
+    // See `IN_TRUST_CHECK`. Cleared on every exit path below — the early
+    // `return Err(e)` for a propagating `Error` clears it too.
+    IN_TRUST_CHECK.with(|c| c.set(true));
     for (i, _tm) in trust_managers.iter().enumerate() {
         let arr_now = ctx.read_native_pin(base, arr);
         let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
         let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
-        let result = ctx.invoke_virtual(
-            tm_now,
-            method,
-            "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
-            &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
-        );
+        // Which overload JSSE would use — see `tm_is_extended`. The engine is
+        // absent on the native client-socket path
+        // (`run_client_trust_check_for_chain`), where JSSE's `Socket`-flavoured
+        // overload would apply and we have no `Socket` mirror either; the
+        // two-argument form stays the answer there, exactly as before.
+        let engine_now = engine_pin.map(|(pin, e)| ctx.read_native_pin(pin, e));
+        let result = match engine_now {
+            Some(engine) if tm_is_extended(ctx, tm_now) => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;\
+                  Ljavax/net/ssl/SSLEngine;)V",
+                &[
+                    Value::Object(Some(arr_now)),
+                    Value::Object(Some(auth_now)),
+                    Value::Object(Some(engine)),
+                ],
+            ),
+            _ => ctx.invoke_virtual(
+                tm_now,
+                method,
+                "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+                &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
+            ),
+        };
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] engine_run_trust_check: invoke_virtual[{}] -> {}",
@@ -9744,6 +10035,17 @@ fn engine_run_trust_check(
             );
         }
         if let Err(e) = result {
+            // An `Error` is NOT a rejection. JSSE catches `Exception` around an
+            // application TrustManager and lets `Error` through untouched; see
+            // `throwable_is_error`. Unpin first — this is an early return out
+            // of the pinned region.
+            if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) = &e {
+                if throwable_is_error(ctx, *exc) {
+                    IN_TRUST_CHECK.with(|c| c.set(false));
+                    ctx.unpin_native_roots(base);
+                    return Err(e);
+                }
+            }
             // Name WHY, unconditionally — not only under `CRATONVM_DBG=tls-auth`.
             // "TrustManager rejected the peer certificate chain" on its own is
             // indistinguishable between the three things that reach it: the
@@ -9772,6 +10074,7 @@ fn engine_run_trust_check(
             break;
         }
     }
+    IN_TRUST_CHECK.with(|c| c.set(false));
     ctx.unpin_native_roots(base);
 
     if rejected {
@@ -9861,6 +10164,58 @@ fn reject_peer_with_fatal_alert(engine_id: i32) {
 /// behaviour. `CRATONVM_DBG=tls-auth` names the chain that was walked, because
 /// "returned true" and "never found the class" are the two answers that must
 /// not be confused when this is next investigated.
+/// Is `tm` an `X509ExtendedTrustManager`?
+///
+/// JSSE picks the overload by this: `SSLContextImpl.chooseTrustManager` uses an
+/// `X509ExtendedTrustManager` AS-IS and `X509TrustManagerImpl` then calls the
+/// **three**-argument `checkServerTrusted(chain, authType, SSLEngine)`; only a
+/// plain `X509TrustManager` gets the two-argument form (through
+/// `AbstractTrustManagerWrapper`). A manager that implements both — every
+/// `X509ExtendedTrustManager` does, the two-arg methods being inherited
+/// abstract — can tell the difference, and the ones in test suites do
+/// deliberately: netty's `SniClientJava8TestUtil` `fail()`s the two-arg form
+/// and asserts on `sslEngine.getHandshakeSession()` in the three-arg one, so
+/// calling the wrong overload turned a passing test into
+/// `SSLHandshakeException: TrustManager rejected the peer certificate chain:
+/// org/opentest4j/AssertionFailedError`.
+fn tm_is_extended(ctx: &mut dyn NativeContext, tm: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(tm));
+    // Bounded for the same reason `jsse_owns_endpoint_identification` bounds
+    // its walk: a corrupted `superclass_of` must not hang the handshake.
+    for _ in 0..32 {
+        let Some(c) = cid else { break };
+        if ctx.class_name_of_id(c).as_deref() == Some("javax/net/ssl/X509ExtendedTrustManager") {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+/// Is `exc` a `java.lang.Error`?
+///
+/// JSSE catches `Exception` around an application `TrustManager` call, never
+/// `Error`. A JUnit assertion failure inside a `TrustManager`
+/// (`org.opentest4j.AssertionFailedError`) is an `Error`, and it is meant to
+/// reach the test runner intact rather than be re-reported as
+/// `SSLHandshakeException` — which is what this VM did, hiding both the
+/// assertion's message and its stack.
+fn throwable_is_error(ctx: &mut dyn NativeContext, exc: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(exc));
+    for _ in 0..64 {
+        let Some(c) = cid else { break };
+        match ctx.class_name_of_id(c).as_deref() {
+            Some("java/lang/Error") => return true,
+            // `Throwable` is above both `Error` and `Exception`; reaching it
+            // without having seen `Error` means this is an `Exception`.
+            Some("java/lang/Throwable") | Some("java/lang/Object") => return false,
+            _ => {}
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
 fn jsse_owns_endpoint_identification(
     ctx: &mut dyn NativeContext,
     trust_managers: &[ObjectRef],
@@ -10018,6 +10373,7 @@ pub(crate) fn run_client_trust_check_for_chain(
             // does not route endpoint identification through here.
             endpoint_identity: None,
         },
+        None,
     )
 }
 
@@ -10551,6 +10907,25 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
+            // JSSE returns null OUTSIDE a handshake — "the session being
+            // negotiated", and once negotiation is over there is none.
+            // netty's `SniClientTest.testSniClient` asserts exactly that
+            // ("After we are done with handshaking getHandshakeSession()
+            // should return null") and got a live session back.
+            //
+            // Only a FINISHED handshake answers null: the pre-handshake case
+            // (`conn` still `None`) keeps returning the best-effort session,
+            // because Jetty's `SslConnection.getBufferSize()` calls this while
+            // sizing buffers for a brand-new connection and drops the
+            // resulting NPE silently — the hang this handler was added for.
+            let finished = with_engine(id, |s| {
+                s.conn.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)
+            })
+            .unwrap_or(false)
+                && !in_trust_check();
+            if finished {
+                return Ok(Some(Value::Object(None)));
+            }
             Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
                 ctx, id,
             )?))))
@@ -10911,7 +11286,7 @@ fn do_wrap(
         (cons, status, hs, drained, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
 
     // Step 3: write the drained bytes into dst.
@@ -11163,6 +11538,14 @@ fn do_unwrap(
     let (src_pos, src_lim) = (src_view.pos, src_view.lim);
     let mut offset = src_pos;
 
+    // JSSE's server-side SNI gate, run at ClientHello time — see
+    // `peek_client_hello_sni` for why it cannot wait until rustls has parsed
+    // the record. Nothing is consumed here; on refusal the bytes are never fed
+    // to rustls at all, so no ServerHello is ever produced.
+    if let Some(host) = engine_pending_sni_host(ctx, id, &src_view, src_pos, src_lim) {
+        engine_run_sni_match_check(ctx, id, this, host)?;
+    }
+
     let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
@@ -11411,7 +11794,7 @@ fn do_unwrap(
         (status, hs, plaintext, pending_trust_check)
     };
     if let Some(pending) = pending_trust_check {
-        engine_run_trust_check(ctx, pending)?;
+        engine_run_trust_check(ctx, pending, Some(this))?;
     }
     let consumed = offset - src_pos;
     bb_set_pos(ctx, src, src_view.layout, offset);
@@ -11654,6 +12037,9 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 with_engine(id, |s| {
                     s.endpoint_id_alg = alg.clone();
                 });
+                // SNI matchers — the server-side gate. See
+                // `engine_run_sni_match_check`.
+                capture_sni_matchers(ctx, this, *p);
             }
             Ok(None)
         },
@@ -11852,6 +12238,29 @@ pub(crate) fn set_engine_trust_ctx_key(
     Ok(())
 }
 
+/// The `SNIMatcher`s a caller installed on a server engine via
+/// `SSLParameters.setSNIMatchers` + `SSLEngine.setSSLParameters`, keyed by
+/// `engine_objref_key`.
+///
+/// A matcher is arbitrary application code — `SNIMatcher.matches(SNIServerName)`
+/// is abstract and netty's own tests subclass it inline — so the decision
+/// cannot be precomputed in Rust from the `SSLParameters`; the objects have to
+/// survive until the ClientHello arrives. That makes this the third
+/// `ObjectRef`-holding table in this module, and it is scanned and remapped by
+/// `gc_scan_tls_ctx_trust_manager_roots` / `gc_update_tls_ctx_trust_manager_refs`
+/// below alongside the other two.
+///
+/// Before this existed, `setSSLParameters` read the ALPN list, the cipher
+/// suites, the client-auth booleans and the endpoint-identification algorithm
+/// off the `SSLParameters` and silently dropped everything else. A server
+/// configured with a matcher that refuses every name still completed the
+/// handshake — netty's `SniClientTest.testSniSNIMatcherDoesNotMatchClient`
+/// asserts an `SSLException` and got `AssertionError: expected SSLException`.
+fn engine_sni_matchers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
 /// this exists (the only ObjectRef-holding side-table in this module that
 /// isn't purely derived PEM/DER bytes).
@@ -11865,6 +12274,15 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
         }
     }
     drop(table);
+    let matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values() {
+        for m in list {
+            if !m.as_ptr().is_null() {
+                roots.push(*m);
+            }
+        }
+    }
+    drop(matchers);
     if let Some(f) = *huc_default_factory_slot().lock() {
         if !f.as_ptr().is_null() {
             roots.push(f);
@@ -11919,6 +12337,18 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
         }
     }
     drop(table);
+    let mut matchers = engine_sni_matchers_table().lock();
+    for list in matchers.values_mut() {
+        for m in list.iter_mut() {
+            let old = m.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: as above.
+                *m = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+    drop(matchers);
     // Same treatment for the installed default `SSLSocketFactory` — see
     // `huc_default_factory_slot`.
     let mut slot = huc_default_factory_slot().lock();

@@ -10527,6 +10527,59 @@ pub(crate) fn register_bc_pkcs12_parameters_generator(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+/// Which PRF does this `PKCS5S2ParametersGenerator` actually carry?
+///
+/// PKCS#5 v2.0 is parameterised by an HMAC: `new PKCS5S2ParametersGenerator()`
+/// is HMAC-SHA1, but `new PKCS5S2ParametersGenerator(new SHA256Digest())` — the
+/// form BouncyCastle's own `PBE$Util.makePBEGenerator` uses for every non-SHA1
+/// PRF — is not. The three `generateDerived*` intrinsics below used to pass a
+/// hardcoded `1` (SHA-1) to `pbkdf2_derive_for` regardless, so **every**
+/// non-SHA1 PBKDF2 through BouncyCastle silently derived the wrong key.
+///
+/// Measured 2026-08-13 against HotSpot 25 with the same jars: netty's
+/// `SslContextBuilderTest`/`JdkSsl*ContextTest` `testPkcs8Des3EncryptedRsa`
+/// reads `rsa_pkcs8_des3_encrypted.key`, PBES2 with PBKDF2-HMAC-**SHA256** and
+/// DESede-CBC. `PBE$Util.makePBEMacParameters(spec, PKCS5S2_UTF8, SHA256, 192)`
+/// returned `992951E4…` (the SHA-1 answer) instead of `9559B2B3…`, the DESede
+/// decrypt then failed `BadPaddingException: pad block corrupted`, netty fell
+/// back to the JDK PBES2 parser, and the test surfaced the JDK's own
+/// `IOException: PBE parameter parsing error: expecting the object identifier
+/// for AES cipher` — an error message three layers away from the defect.
+///
+/// Reads the generator's `hMac` field and asks it its own name
+/// (`HMac.getAlgorithmName()` is `"<digest>/HMAC"`). Returns `None` for any
+/// digest this VM's `pbkdf2_derive_for` does not implement (GOST3411, SM3,
+/// SHA3-*, RIPEMD160, Whirlpool, …) so the caller can fall back to
+/// BouncyCastle's own bytecode instead of substituting a PRF of our choosing —
+/// substituting is exactly what produced the defect above.
+fn bc_pkcs5s2_prf_code(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let hmac = match ctx.get_field_by_name(this, "hMac") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let name = match ctx.invoke_virtual(hmac, "getAlgorithmName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => return None,
+    };
+    // "SHA-256/HMAC" -> "SHA256"; also tolerates BC's older "SHA-256" spellings.
+    let norm: String = name
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match norm.as_str() {
+        "SHA1" => Some(1),
+        "SHA224" => Some(224),
+        "SHA256" => Some(256),
+        "SHA384" => Some(384),
+        "SHA512" => Some(512),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -10545,9 +10598,17 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let key = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,
@@ -10577,9 +10638,20 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedParameters",
+                    "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[
+                        args.get(1).copied().unwrap_or(Value::Int(0)),
+                        args.get(2).copied().unwrap_or(Value::Int(0)),
+                    ],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let derived = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,
@@ -10606,9 +10678,17 @@ pub(crate) fn register_bc_pkcs5s2_parameters_generator(r: &mut NativeMethodRegis
                 }
                 _ => 0,
             };
+            let Some(prf) = bc_pkcs5s2_prf_code(ctx, this) else {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "generateDerivedMacParameters",
+                    "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+                    &[args.get(1).copied().unwrap_or(Value::Int(0))],
+                );
+            };
             let (password, salt, iteration_count) = bc_pkcs5s2_read_state(ctx, this)?;
             let key = crate::phases_early::pbkdf2_derive_for(
-                1,
+                prf,
                 &password,
                 &salt,
                 iteration_count,

@@ -15789,12 +15789,20 @@ fn pbkdf2_derive<D: sha2::Digest + Clone>(
 
 /// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
 pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
-    match alg {
-        "PBKDF2WithHmacSHA1" => Some(1),
-        "PBKDF2WithHmacSHA224" => Some(224),
-        "PBKDF2WithHmacSHA256" => Some(256),
-        "PBKDF2WithHmacSHA384" => Some(384),
-        "PBKDF2WithHmacSHA512" => Some(512),
+    // JCA algorithm names are CASE-INSENSITIVE (`Provider`'s own service
+    // lookup upper-cases both sides), and the spelling differs per provider:
+    // SunJCE registers `PBKDF2WithHmacSHA256`, BouncyCastle registers
+    // `PBKDF2WITHHMACSHA256`, and BouncyCastle's own callers ask for
+    // `PBKDF2withHMACSHA256`. Matching the SunJCE spelling exactly meant every
+    // BouncyCastle spelling threw `SecurityException: … SecretKeyFactory not
+    // available` (measured 2026-08-13 — three of the seven spellings a caller
+    // can legitimately use were rejected).
+    match alg.to_ascii_uppercase().as_str() {
+        "PBKDF2WITHHMACSHA1" => Some(1),
+        "PBKDF2WITHHMACSHA224" => Some(224),
+        "PBKDF2WITHHMACSHA256" => Some(256),
+        "PBKDF2WITHHMACSHA384" => Some(384),
+        "PBKDF2WITHHMACSHA512" => Some(512),
         _ => None,
     }
 }
