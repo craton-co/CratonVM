@@ -187,7 +187,7 @@ generated `flag-inventory.md` describe both as `opt-in | off`. Both now carry
 `young-pause-goal-ms` defect (two rows away in the same file) for the second
 time: **the documentation drift and the inert switch were the same edit.**
 
-### Phase 1 — Re-establish the empirical baseline *(one suite cycle)*
+### Phase 1 — Re-establish the empirical baseline *(one suite cycle)* — **DONE 2026-08-13, except the one run that needs a machine**
 
 The default flip rests on one Tomcat run and a Spring Boot number that is five
 days stale and known to be measured on a binary without two of its own fixes.
@@ -198,6 +198,38 @@ under ZGC and Generational on the same commit, same host, interleaved.
 Generational, that is the finding and the default should be revisited — the
 comparison page's own warning that single-day cross-backend gaps are perishable
 cuts both ways.
+
+**Delivered as
+[`zgc-phase1-empirical-baseline-20260813.md`](zgc-phase1-empirical-baseline-20260813.md)**,
+built entirely from data already in the repository — five suites, not two, and
+no suite re-run. Three findings, in descending order of how much they change:
+
+1. **The Tomcat margin the shipping docs quote is superseded by its own
+   source.** `gc-tuning.md` and `GC.md` cite ZGC 604/29/0 against Generational
+   519/115/1 (2026-08-10). The same record re-ran all three arms on 2026-08-11
+   and got **629/11/0 against 628/11/0** — a one-class lead. Both pages now
+   carry the newer row.
+2. **Widening past the two suites the phase asked for makes the case
+   stronger, not weaker.** Spring Framework (2848 classes), H2 and Hibernate
+   Reactive all already had per-collector sweeps; ZGC is at parity on all
+   three, and H2 is the only suite where a collector separated itself — G1,
+   with 4 crashes.
+3. **The Spring Boot deficit cannot be closed from existing data, and that is
+   the honest answer.** No full-suite ZGC run exists after 2026-08-08. It is
+   the oldest number in the table, measured without two ZGC-only fixes, one of
+   which silently zeroed primitive arrays — a shape that manufactures FAILs
+   wherever it occurs. Treat it as **unmeasured**, not as evidence against ZGC.
+
+**The evidence record had been deleted from the tree.** `ad3393f7c` ("new netty
+bug docs") removed
+`known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`,
+touching no other GC file and leaving six pages — `gc-tuning.md` and `GC.md`
+among them — citing a path that no longer existed. Restored unmodified from
+`ad3393f7c^`. **A default flip whose justification can be deleted by an
+unrelated commit without anything noticing is a governance problem of the same
+family as Gap C**, and it is worth stating that Phase 1 found it only because
+the phase was run under a constraint (use existing data) that forced someone to
+go and read the source.
 
 ### Phase 2 — Make the non-compacting collector defensible on its own terms *(weeks)*
 

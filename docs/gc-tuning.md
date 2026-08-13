@@ -27,11 +27,21 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 > **(2) The escape hatch is `-XX:+UseGenerationalGC`**, available in every
 > build including `--no-default-features`. `-XX:-UseZGC` does the same thing.
 >
-> Why the flip: on the 651-class Tomcat suite, one commit, all three backends —
-> ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min against Generational's
-> 519 / 115 / 1 in 356 min. 63 classes are non-PASS under Generational while
-> passing under *both* other backends, and 62 of those log
-> `[moving-young] fallback`. See
+> Why the flip, as measured on 2026-08-10: on the 651-class Tomcat suite, one
+> commit, all three backends — ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min
+> against Generational's 519 / 115 / 1 in 356 min. 63 classes are non-PASS
+> under Generational while passing under *both* other backends, and 62 of those
+> log `[moving-young] fallback`.
+>
+> **That margin did not survive the next day, and this is the current number.**
+> The same three arms re-run on 2026-08-11 give ZGC **629 PASS / 11 HANG / 0
+> CRASH in 178.4 min** against Generational's **628 / 11 / 0 in 177.5 min** —
+> a one-class lead, not an 85-class one. ZGC is still the top row and still the
+> only backend that has never crashed here, but size up your heap on the
+> paragraph above, not on a pass-rate gap that has closed. The cross-suite
+> picture is
+> [the Phase 1 baseline](feature-designs/zgc-phase1-empirical-baseline-20260813.md).
+> See
 > [`docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md).
 
 ### What is actually shipping, in one place

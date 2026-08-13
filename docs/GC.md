@@ -24,6 +24,14 @@ Generational's 519 / 115 / 1 in 356 min, and 63 classes are non-PASS under
 Generational while passing under both other backends
 ([record](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md)).
 
+**Those are the 2026-08-10 figures, and the record's own 2026-08-11 re-run of
+the same three arms supersedes them:** ZGC **629 / 11 / 0 in 178.4 min**,
+Generational **628 / 11 / 0 in 177.5 min**. The promotion still stands — ZGC
+leads on PASS, ties on HANG, and is the only backend that has never crashed on
+this suite — but the margin is one class, not eighty-five. Do not quote the
+08-10 gap without the 08-11 one beside it; the cross-suite picture is
+[the Phase 1 baseline](feature-designs/zgc-phase1-empirical-baseline-20260813.md).
+
 Two consequences worth stating plainly:
 
 * **It costs heap.** No compaction means ~1.5x the generational footprint on
@@ -35,7 +43,12 @@ Two consequences worth stating plainly:
 The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
 record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
 predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
-it is the measurement this flip still owes. The plan to make this a real,
+it is the measurement this flip still owes. One of those two defects silently
+zeroed a primitive array, which is a shape that manufactures FAILs wherever it
+occurs rather than in one place, so treat that row as **unmeasured** rather
+than as evidence against ZGC. Every other suite that has a per-collector
+sweep — Spring Framework (2848 classes), Tomcat, H2, Hibernate Reactive — puts
+ZGC at parity or one class ahead. The plan to make this a real,
 concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
