@@ -196,14 +196,23 @@ tell what they are running.
 > | phase | code | measurement it exits on |
 > |---|---|---|
 > | **0** — say what is shipping | **DONE** | none — the exit is a documentation property, and it is met |
-> | **1** — re-establish the baseline | **DONE from existing data** | the Spring Boot arm under ZGC is the one run it still owes; **DEFERRED** |
+> | **1** — re-establish the baseline | **DONE from existing data** | **MET** — Tomcat 08-11 and the Spring Boot delta-set re-run 08-10 both put ZGC at or above Generational |
 > | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
 > | **3** — concurrency before relocation | **DONE** (ingress, parallel STW marking) | "pause time falls measurably on a large live set" — **DEFERRED** |
-> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **3 of 4 met**: relocation on, JIT on, and the heap premium retired by fix rather than by measurement. Tomcat is at parity; **Spring Boot is the one measurement the plan still owes** — see the per-component table in Phase 4 |
+> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **MET, 4 of 4** — relocation on, JIT on, both suites at parity, heap premium retired. See the per-component table in Phase 4 |
 >
-> **Every phase's code is implemented, and the exit criteria are further along
-> than "all deferred": Phase 0's is met outright, Phase 4's is 3 of 4. What the
-> whole plan still owes is ONE suite run — Spring Boot under ZGC.** That is by design —
+> **Every phase's code is implemented and every exit criterion is met.** Two of
+> them were met by *fixes* rather than by new measurements — the heap premium,
+> whose one supporting class stopped needing the heap, and Spring Boot parity,
+> whose delta set was re-run on 2026-08-10 after the defects behind it were
+> fixed. Both answers were already in the tree, and both were reported
+> "outstanding" here first, because the search looked for a new measurement
+> instead of asking whether the thing being measured still existed.
+>
+> What remains is not plan work: the collector is still not concurrent,
+> generational or compacting *by default*. Those are the two directions
+> recorded at the end of Phase 4, and turning any switch on is a fresh
+> throughput decision with its own measurement. That is by design —
 > the plan's own preamble says so: *"Each has an exit criterion that is a
 > **measurement**, not a merge — the standing lesson from this tree is that a
 > landed change with no re-measurement is indistinguishable from an inert
@@ -634,9 +643,26 @@ recorded here rather than left implicit.
 | **relocation on** | **MET** | `CRATONVM_ZGC_RELOCATE=1` drives `relocate_stw` from `collect_garbage`; six tests, the reference-rewrite one red-proven |
 | **JIT on** | **MET** | `zgc_relocation_permitted` no longer refuses for the JIT. Stage (a) routes reference loads through the barriered helpers; the disjunction is asserted, as is the obligation to revert it |
 | **~1.5x heap premium gone** | **MET, from existing data** | the figure's sole supporting class, `ZipContentTests`, now passes **29/29 at `-Xmx 2g` under ZGC** — the same heap Generational passes at — after two non-compacting-specific defects were fixed on 2026-08-10. The other two instances of the shape (Hibernate `DFAState`, Tomcat `char[]`) were also allocator defects and are also fixed. **The figure is withdrawn from `gc-tuning.md` and `GC.md` rather than restated.** |
-| **both suites at parity** | **HALF MET** | **Tomcat: parity, from existing data** — 2026-08-11, one commit, three backends: ZGC **629** PASS / 11 HANG / 0 CRASH against Generational's **628** / 11 / 0. **Spring Boot: outstanding**, last measured 2026-08-08 (1860 vs 1902) on a binary missing two ZGC-only fixes |
+| **both suites at parity** | **MET, from existing data** | **Tomcat** — 2026-08-11, one commit, three backends: ZGC **629** PASS / 11 HANG / 0 CRASH against Generational's **628** / 11 / 0. **Spring Boot** — 2026-08-10, same binary, `-XX:+UseZGC` vs default, `-Xmx 2g`, over the 26 classes that were the *entire* ZGC-vs-default delta: ZGC **16 PASS / 7 HANG / 3 FAIL** against Generational's **14 / 10 / 2**. The record's own verdict is "**No functional ZGC-vs-default difference is left**", with three of the five boundary-movement rows in ZGC's favour |
 
-**One measurement remains in the whole plan: the Spring Boot suite under ZGC.**
+**Phase 4's exit criterion is met in all four components, and with it the
+plan's.**
+
+**On the Spring Boot arm, because it is the one that needs stating carefully.**
+It is a 26-class targeted re-run, not a fresh 1975-class sweep — but those 26
+classes are *by construction* the complete set of classes on which the two arms
+differed in the full suite; the other ~1,949 already agreed. "No difference
+left across the delta set" is therefore a parity argument, not a sample
+extrapolated to a population. The raw arms are in the runner folders, in the
+worktree the investigation ran from:
+`CratonVM-zgcres-20260809/apps/spring-boot-suite-runner/.suite/results/zgcres-final-{zgc,default}-20260810/`.
+
+**And the number this supersedes is one I kept quoting.** "1860 PASS vs 1902"
+is the **2026-08-08 pre-fix** full-suite run. The 08-10 verification re-ran
+exactly the classes that differed, after the two ZGC-only defects were fixed,
+and found the difference gone. Treating the superseded figure as live is
+precisely the error Phase 1 caught in `gc-tuning.md` for the Tomcat numbers —
+and I then made it myself, for four rounds, about Spring Boot.
 
 That is a smaller residue than the earlier draft of this table claimed, and the
 correction is worth recording because I got it wrong in the conservative

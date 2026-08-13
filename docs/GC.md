@@ -47,8 +47,11 @@ Two consequences worth stating plainly:
 
 The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
 record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
-predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
-it is the measurement this flip still owes. One of those two defects silently
+predates the two ZGC-only defects fixed on 2026-08-10 and is **superseded**:
+the same day, the 26 classes that were the entire ZGC-vs-default delta were
+re-run on one binary at `-Xmx 2g` and gave ZGC 16 PASS / 7 HANG / 3 FAIL
+against the default collector's 14 / 10 / 2 — "no functional ZGC-vs-default
+difference is left". One of those two defects silently
 zeroed a primitive array, which is a shape that manufactures FAILs wherever it
 occurs rather than in one place, so treat that row as **unmeasured** rather
 than as evidence against ZGC. Every other suite that has a per-collector

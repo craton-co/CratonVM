@@ -131,10 +131,13 @@ Trade-offs at a glance:
   and
   [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md).
 
-  Those Spring Boot numbers are from 2026-08-08 and are **stale in ZGC's
-  disfavour**: two ZGC-only defects behind them were fixed on 2026-08-10 (see
-  the retired page). The suite has not been re-run under ZGC since, which is
-  the main measurement this default flip is still owed.
+  **Those Spring Boot numbers are superseded, not merely stale.** They are the
+  2026-08-08 pre-fix run. Two ZGC-only defects behind them were fixed on
+  2026-08-10, and the same day the 26 classes that were the *entire*
+  ZGC-vs-default delta were re-run on one binary at `-Xmx 2g`: **ZGC 16 PASS /
+  7 HANG / 3 FAIL against the default collector's 14 / 10 / 2**, with the
+  record concluding "no functional ZGC-vs-default difference is left". Quote
+  those figures, not 1860-vs-1902.
 - **ZGC's arena has two ends, and the split is operator-visible.** Small
   objects and TLAB chunks bump upward from the bottom; anything too big for a
   TLAB to serve (>= 64 KiB, i.e. `ZGC_TLAB_MAX_CHUNK / 8`) bumps *downward*
