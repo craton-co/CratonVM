@@ -285,3 +285,34 @@ The fix in this document does not move that test and was not expected to:
 prediction and not a result — pre-fix `SEQ0=0 SEQ1=1 SEQ2=279`, post-fix
 `SEQ0=0 SEQ1=0 SEQ2=299`, framing failures 0 in both, i.e. unchanged inside that
 test's own several-fold noise band.
+
+## Re-verified after merging `origin/dev`
+
+`dev` moved 19 commits during this work, and one of them
+(`perf(jit): the optimizing tier may direct-call a constructor`) lands in the
+same file as the pin. The merge was clean, and everything was re-measured on
+the merged binary rather than assumed:
+
+* `String.charAt` 1.9 ns, `String.length()` 1.4 ns — the intrinsics still fire.
+  Absolute numbers across that whole table are ~1.8x the earlier ones because
+  the host was carrying another build (`char[]` load 1.9 ns vs 1.0 ns), which
+  is exactly why the shape is what to read: `StringCharBuffer.get()` at 226 ns
+  is now FASTER than `HeapCharBuffer.get()` at 306 ns. A String-backed buffer
+  beating an array-backed one is the intrinsic's own signature.
+* `TestWebSocketFrameClient` `OK (4 tests)` (215 s),
+  `TestWebSocketFrameClientSSL` `OK (6 tests)` (244 s).
+* `cratonvm-jit --lib` 1989 passed / 0 failed; `cratonvm-vm --lib` 2497 passed
+  / 0 failed.
+
+### One pre-existing flake seen along the way, NOT caused by this change
+
+A full `cargo test -p cratonvm-jit` once failed
+`intrinsic_string_narrow_oops::string_intrinsics_decode_a_narrow_value_slot`
+with `FATAL narrow-oop encode failure … outside [base, end)`. Baselined against
+a pristine `jit/src/lib.rs`: the test derives its compressed-oop heap base from
+its FIRST `FakeObj` allocation and then allocates more, so any later allocation
+at a lower address aborts the process. On the unmodified file the built test
+exe failed **23 of 25** direct runs, while the same test through `cargo test`
+failed 0 of 6 — environment-sensitive, and nothing to do with this branch. The
+full suite is green on this branch (all 14 binaries) on the re-run. Filed
+separately.
