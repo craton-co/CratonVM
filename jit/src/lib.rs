@@ -8796,6 +8796,23 @@ pub fn try_resolve_intrinsic(
 pub static ATOMIC_INTRINSIC_SITES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `CRATONVM_DBG_INTRINSIC=1` — trace which compiled bodies get the call-site
+/// intrinsic pass at all.
+///
+/// Added 2026-08-13. Every call-site intrinsic (Math, Integer/Long bits,
+/// AtomicInteger, String, and the HashMap/Integer/ConcurrentMap thin direct
+/// binds) is registered in ONE place: the single-pass invoke loop near the end
+/// of `try_compile_inner`. A body produced by the optimizing IR pipeline
+/// returns from that function *before* the loop runs, so it carries none of
+/// them — a fact with no other observable trace, which is why an intrinsic can
+/// measure as completely inert while its resolver, codegen and unit tests are
+/// all correct and all green. This flag prints one line per single-pass invoke
+/// site and one line per IR body, so "did this site even get offered an
+/// intrinsic" is answerable in one run.
+fn dbg_intrinsic_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INTRINSIC").is_some()
+}
+
 /// `CRATONVM_JIT_NO_ATOMIC_INTRINSIC=1` — keep every `AtomicInteger` RMW call
 /// on ordinary native dispatch. The kill switch for bisecting a suspected
 /// miscompile, and the B arm of an in-binary A/B (cross-run wall time on a
@@ -13522,6 +13539,50 @@ pub fn force_c2_enabled() -> bool {
 ///
 /// Called once per compile request, on the compile path only, and rejected on
 /// a raw-byte scan before it does any analysis.
+/// Whether a method carrying a `java/lang/String` access-intrinsic call site is
+/// pinned to the single-pass backend (see the gate in `try_compile_inner`).
+///
+/// Default ON. `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` is the B arm of an
+/// in-binary A/B and the kill switch if a method is ever found where the
+/// optimizing body wins despite losing the intrinsic.
+///
+/// NOT `OnceLock`-cached, matching `ir_direct_calls_enabled` and
+/// `x64::guarded_inline_getfield_enabled`: this is read at compile time only,
+/// never on a runtime hot path, and caching would make the flag racy against
+/// whichever thread compiles first.
+fn string_intrinsic_pin_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_STRING_INTRINSIC_PIN").is_none()
+}
+
+/// Does this method contain a call site the single-pass backend would replace
+/// with an inline `java/lang/String` / `java/lang/CharSequence` access
+/// intrinsic?
+///
+/// Asks `try_resolve_string_intrinsic` — the one function the registration path
+/// also calls — so the gate can never pin a method whose sites that path would
+/// decline. Only `invokevirtual` (0xb6) and `invokeinterface` (0xb9) are
+/// considered, matching the `invoke_kind == 0 || invoke_kind == 2` guard around
+/// the registration itself.
+fn has_string_intrinsic_site(
+    invoke_ops: &[(usize, u16, u8)],
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    layout: Option<StringFieldLayout>,
+) -> bool {
+    if layout.is_none() {
+        return false;
+    }
+    let Some(resolver) = cp_invoke_resolver else {
+        return false;
+    };
+    invoke_ops.iter().any(|&(_, cp_idx, opcode)| {
+        matches!(opcode, 0xb6 | 0xb9)
+            && resolver(cp_idx).is_some_and(|(class_name, method_name, descriptor)| {
+                try_resolve_string_intrinsic(&class_name, &method_name, &descriptor, layout)
+                    .is_some()
+            })
+    })
+}
+
 fn single_pass_only_lowering_for(
     code: &[u8],
     code_len: usize,
@@ -15364,6 +15425,17 @@ fn try_compile_inner(
             );
         }
     }
+    // `java/lang/String`'s field layout, resolved ONCE for the whole
+    // compilation. Two consumers: the optimizing-tier gate immediately below
+    // (`has_string_intrinsic_site`) and `try_resolve_string_intrinsic` in the
+    // single-pass invoke loop near the end of this function. The SAME resolver
+    // feeds `x64::compile`'s `compiler.string_layout`, so the matcher's
+    // "registered" decision and the codegen's "can emit inline" decision never
+    // disagree — a String sentinel is never registered for a site whose codegen
+    // would then bail to a raw `CALL`. Hoisted here (it used to be resolved
+    // just above the invoke loop) so the gate can ask the same question.
+    let resolved_string_layout: Option<StringFieldLayout> =
+        string_layout_resolver.and_then(|r| r());
     if optimize
         // IR lowering has no exact-RBP or safepoint-map publication, so a
         // mapless IR frame must never be live while the young collector
@@ -15407,6 +15479,43 @@ fn try_compile_inner(
         // `feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
+        // Same species as PERF-01 directly above, and measured the same way:
+        // where a `java/lang/String` access intrinsic fires, an IR body is a
+        // DOWNGRADE. Every call-site intrinsic is registered in ONE place —
+        // the single-pass invoke loop at the end of this function — and the IR
+        // lowerer binds direct calls to real function addresses only, so it has
+        // no route to an intrinsic sentinel at all. A method that tiers up
+        // therefore SILENTLY LOSES its intrinsics.
+        //
+        // Measured on this branch, `java/nio/StringCharBuffer.get()C`
+        // (`return str.charAt(nextGetIndex() + offset)`, the inner loop of
+        // Tomcat's `Utf8Encoder.encodeNotHasArray` and so of every WebSocket
+        // text frame the server sends):
+        //
+        //     C2/IR body, intrinsic dropped   504 ns/call
+        //     C1 body, intrinsic emitted      135 ns/call   (3.7x)
+        //
+        // The delta is that large because the intrinsic does not replace one
+        // call with one instruction — it replaces the whole
+        // `charAt → isLatin1 → StringLatin1.charAt → String.checkIndex →
+        // Preconditions.checkIndex` chain, whose tail is a registered NATIVE,
+        // with an inline coder-branch decode. No scheduling the optimizing tier
+        // can do recovers that.
+        //
+        // Deliberately narrow, exactly like PERF-01: only the String family,
+        // and only when a layout actually resolved (without one the single-pass
+        // backend would not emit the intrinsic either, so pinning would cost a
+        // C2 body and buy nothing). The general problem — the optimizing tier
+        // replaces a C1 body whenever it CAN, with no evidence the replacement
+        // is faster — is the one PERF-01 already names. Opt out with
+        // `CRATONVM_JIT_NO_STRING_INTRINSIC_PIN=1` to A/B one binary against
+        // itself.
+        && !(string_intrinsic_pin_enabled()
+            && has_string_intrinsic_site(
+                &scan.invoke_ops,
+                cp_invoke_resolver,
+                resolved_string_layout,
+            ))
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
         // tier used to refuse EVERY method with a `try`/`catch`, which is an
         // enormous population of ordinary Java and cost ~7x on each of them
@@ -15973,6 +16082,9 @@ fn try_compile_inner(
                 let call_eligible = scan.anewarray_ops.is_empty();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
+                    // See `builder.set_object_init_pcs` below.
+                    let mut object_init_pcs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
                     let mut all_emittable = true;
                     // cov-04 census: which site, and which of the five
                     // conditions below, turned `all_emittable` off. Only built
@@ -16402,6 +16514,20 @@ fn try_compile_inner(
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
                         info_map.insert(pc, (info_ptr, num_args, ret));
+                        // Read off the names this iteration already resolved,
+                        // via the boxed `JitInvokeInfo` (the `cn`/`mn`/`desc`
+                        // locals were moved into it above).
+                        if is_special {
+                            // SAFETY: `info_ptr` addresses the box just pushed
+                            // into `ir_call_infos`, which outlives this loop.
+                            let this_info = unsafe { &*(info_ptr as *const JitInvokeInfo) };
+                            if this_info.class_name == "java/lang/Object"
+                                && this_info.method_name == "<init>"
+                                && this_info.descriptor == "()V"
+                            {
+                                object_init_pcs.insert(pc);
+                            }
+                        }
                     }
                     if all_emittable && !info_map.is_empty() {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -16415,6 +16541,16 @@ fn try_compile_inner(
                             );
                         }
                         builder.set_invoke_info(info_map);
+                        // The terminal `super()` of every constructor chain.
+                        // Collected from the SAME resolved names this loop
+                        // already built `invoke_info` from, so it cannot
+                        // disagree with what would otherwise be dispatched.
+                        // Eliding it is the single-pass backend's long-standing
+                        // rule (`x64::bytecode_walk`'s 0xb7 arm); the IR tier
+                        // had no equivalent, so a compiled constructor paid a
+                        // `jit_invoke_dispatch` round trip per allocation for a
+                        // method whose body is `return`.
+                        builder.set_object_init_pcs(object_init_pcs);
                     } else {
                         // A non-emittable invoke is present → leave `invoke_info`
                         // unset (the builder bails on every invoke → single-pass)
@@ -17083,6 +17219,12 @@ fn try_compile_inner(
                         // code-cache occupancy, from the finished artifact.
                         // Reads public accessors only; cannot perturb it.
                         metrics.installed(&compiled);
+                        if dbg_intrinsic_enabled() {
+                            eprintln!(
+                                "[cratonvm-intrinsic] IR body installed (single-pass call-site intrinsics NOT registered) {}.{}{}",
+                                cached.class_name, cached.method_name, cached.method_descriptor
+                            );
+                        }
                         return Some(compiled);
                     }
                     if ir_stage_reporting() {
@@ -17441,13 +17583,8 @@ fn try_compile_inner(
     // C2-review P1 — inlining decision totals for the metrics report. Attached
     // to the artifact at the end of this function.
     let mut inline_tally = InlineDecisionTally::default();
-    // `java/lang/String` field layout, resolved ONCE for the whole
-    // compilation. `try_resolve_string_intrinsic` (in the invoke loop
-    // below) uses it to decide whether a String intrinsic can be
-    // registered; the SAME resolver feeds `x64::compile`'s
-    // `compiler.string_layout`, so matcher and codegen stay consistent.
-    let resolved_string_layout: Option<StringFieldLayout> =
-        string_layout_resolver.and_then(|r| r());
+    // `resolved_string_layout` is resolved once near the top of this function
+    // (the optimizing-tier gate consumes it too); see its declaration there.
     if !scan.invoke_ops.is_empty() {
         let Some(resolver) = cp_invoke_resolver else {
             jitc_bail!("cp_invoke_resolver")
@@ -17462,6 +17599,11 @@ fn try_compile_inner(
                 0xb9 => 2,
                 _ => 3,
             };
+            if dbg_intrinsic_enabled() {
+                eprintln!(
+                    "[cratonvm-intrinsic] single-pass site {class_name}.{method_name}{descriptor} @pc={pc} kind={invoke_kind}"
+                );
+            }
             // JVMS §6.5 super-call redirect (see `try_compile`'s doc comment
             // on `cp_invokespecial_owner_resolver`): for `invokespecial`
             // sites only, substitute the JVMS-correct selection-start class
@@ -18459,6 +18601,26 @@ fn try_compile_inner(
                     ));
                     continue;
                 }
+                // DIAGNOSTIC (2026-08-13): a String accessor site that did NOT
+                // take the intrinsic is otherwise invisible — it just runs the
+                // real bytecode at ~400 ns/call. Name the two reasons apart
+                // (no resolved layout vs. an unmatched name/descriptor) so
+                // "the intrinsic is inert" is answerable in one run.
+                if (class_name == "java/lang/String" || class_name == "java/lang/CharSequence")
+                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+                {
+                    eprintln!(
+                        "[cratonvm-jitc] string-intrinsic MISSED {class_name}.{method_name}{descriptor} @pc={pc} layout={} coder={}",
+                        resolved_string_layout.is_some(),
+                        resolved_string_layout.map(|l| l.has_coder).unwrap_or(false)
+                    );
+                }
+            } else if (class_name == "java/lang/String" || class_name == "java/lang/CharSequence")
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some()
+            {
+                eprintln!(
+                    "[cratonvm-jitc] string-intrinsic SKIPPED-GATE {class_name}.{method_name}{descriptor} @pc={pc} recursive={is_recursive_call} kind={invoke_kind}"
+                );
             }
 
             // Keep only static tail self-calls on the raw backend path. Every
@@ -19925,6 +20087,61 @@ mod tests {
             super::first_unsupported_precise_frame_site(&arraylength, arraylength.len(), &table),
             Some((1, 0xbe)),
             "a protected arraylength must still refuse, at its own pc"
+        );
+    }
+
+    /// A `String` access site must pin its method to the single-pass backend.
+    ///
+    /// Every call-site intrinsic is registered in exactly ONE place — the
+    /// single-pass invoke loop at the end of `try_compile_inner` — and the IR
+    /// lowerer binds direct calls to real function addresses only, so it has no
+    /// route to an intrinsic sentinel. A method that tiers up to the optimizing
+    /// tier therefore silently LOSES its intrinsics, and the loss is invisible:
+    /// the resolver, the codegen ladder and this file's own String-intrinsic
+    /// tests all stay green while `java/nio/StringCharBuffer.get()C` runs at
+    /// 504 ns/call instead of 135.
+    ///
+    /// The foil matters as much as the positive case: a method with no String
+    /// site must NOT be pinned, or this gate would quietly demote the whole
+    /// program to C1.
+    #[test]
+    fn a_string_access_site_pins_its_method_to_the_single_pass_backend() {
+        let layout = super::StringFieldLayout::new(0, Some(1), 2, 7);
+        let resolve = |idx: u16| -> Option<(String, String, String)> {
+            match idx {
+                1 => Some((
+                    "java/lang/String".to_string(),
+                    "charAt".to_string(),
+                    "(I)C".to_string(),
+                )),
+                _ => Some((
+                    "java/lang/Math".to_string(),
+                    "sqrt".to_string(),
+                    "(D)D".to_string(),
+                )),
+            }
+        };
+        // invokevirtual @pc=0 -> cp #1 (String.charAt), invokestatic @pc=3.
+        let with_string: [(usize, u16, u8); 2] = [(0, 1, 0xb6), (3, 2, 0xb8)];
+        assert!(
+            super::has_string_intrinsic_site(&with_string, Some(&resolve), Some(layout)),
+            "a String.charAt call site must keep its method on the backend that              can emit the inline decode"
+        );
+
+        // No String site: the method must stay eligible for the optimizing
+        // tier. `Math.sqrt` IS an intrinsic, but a static one both the IR and
+        // OSR ladders bind themselves — it is not what this gate is about.
+        let plain: [(usize, u16, u8); 1] = [(3, 2, 0xb8)];
+        assert!(
+            !super::has_string_intrinsic_site(&plain, Some(&resolve), Some(layout)),
+            "a method with no String access site must not be demoted to C1"
+        );
+
+        // No resolved layout ⇒ the single-pass backend would not emit the
+        // intrinsic either, so pinning would cost a C2 body and buy nothing.
+        assert!(
+            !super::has_string_intrinsic_site(&with_string, Some(&resolve), None),
+            "without a String layout there is no intrinsic to preserve"
         );
     }
 

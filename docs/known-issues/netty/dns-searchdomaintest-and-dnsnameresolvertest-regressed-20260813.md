@@ -69,3 +69,51 @@ CV_BIN=bin/cratonvm-netty-zgc.exe bash run-netty-suite.sh --list /tmp/dns.txt --
   — repeats the same now-incorrect "SearchDomainTest 7/7" claim in its
   summary table; both docs need a correction or an explicit
   "regressed since" note once this is bisected.
+
+---
+
+## Re-measured on Linux, 2026-08-13 — does NOT reproduce under any collector
+
+Added by the session that wrote the fix this page checks, on
+`azureuser@20.80.105.49`, isolated (one class per process), at dev
+`92d679ba1` — which contains `ae2e1d9c8`:
+
+| collector | `SearchDomainTest` | `DnsAddressResolverGroupTest` | `DnsNameResolverTest` |
+|---|---|---|---|
+| default | ok=7 failed=0 (6 s) | ok=2 failed=0 | ok=196 failed=20 aborted=16 (86 s) |
+| `-XX:+UseZGC` | ok=7 failed=0 (5 s) | ok=2 failed=0 | ok=196 failed=20 aborted=16 (83 s) |
+| `-XX:+UseG1GC` | ok=7 failed=0 (5 s) | ok=2 failed=0 | ok=196 failed=20 aborted=16 (93 s) |
+
+Every row matches the fix doc's claim, including the ZGC configuration this
+page ran. `DnsNameResolverTest` completes in ~85 s where this page records no
+result at 400 s, and `SearchDomainTest` is 7/7 where this page records 1/7.
+
+**So the disagreement is real and is NOT about the source.** `eba7bffaa` (the
+fd-identity fix) *is* an ancestor of `ae2e1d9c8` — verified with
+`git merge-base --is-ancestor` — so both runs were nominally on the same code.
+Two things can still differ, and they are worth checking in this order:
+
+1. **The BINARY, not the checkout.** A CratonVM build carries the source as of
+   the moment it STARTED, and a fresh mtime does not prove otherwise. The fix
+   landed at 10:35 UTC; a binary whose build began before that, in a checkout
+   later fast-forwarded to `ae2e1d9c8`, reproduces this page's numbers exactly
+   — they are the fix doc's own "before" column, unchanged. Check the build's
+   start time against `git log -1 --format=%ci eba7bffaa`, not the file mtime.
+2. **A genuinely Windows-only path.** If the binary is confirmed to postdate
+   the fix, this is the place to look rather than at the DNS classes:
+   `native_dc_bind` now rebinds under the SAME fd id and calls
+   `nio_selector::selector_refresh_udp`, which re-registers the channel so the
+   selector polls the newly bound socket. `selector_register`'s epoll
+   synchronisation is `#[cfg(target_os = "linux")]`; Windows takes a different
+   arm. A refresh that does not take effect there would present exactly as
+   this page describes — bind succeeds, sends work, and inbound datagrams never
+   arrive, so `SearchDomainTest` falls back to its pre-fix count and
+   `DnsNameResolverTest` waits out its resolver timeouts.
+
+The minimal discriminator for (2) needs no netty at all — it is the ~50-line
+repro from the fix doc (two `NioDatagramChannel`s on loopback, one 4-byte
+datagram). `received=false` on Windows with a fix-carrying binary confirms it
+and localises it to the selector refresh; `received=true` points back at (1).
+
+Leaving this page OPEN: "does not reproduce on Linux" is not "is not real", and
+whichever of the two it turns out to be is worth recording here.

@@ -1,11 +1,12 @@
 # The young walk treats a run of EMPTY objects as corruption at other sites
 
-**Status:** all five sites that any workload actually enters are **RESOLVED**
-(2026-08-13). Three remain, and the reason is now precise rather than assumed:
-they are never entered at all, at any heap size tried, so no change to them can
-be measured. Two other residuals are recorded at the bottom — a NEW and
-unexplained phantom-extent finding under memory pressure, and the
-16-bytes-per-empty-object retention, which is now measured and deliberately left
+**Status:** **ALL EIGHT sites RESOLVED** (2026-08-13). The two that the previous
+revision recorded as needing "a workload that genuinely fills the old
+generation" are fixed in wave 7; that prerequisite turned out to be only half
+the story, and the other half was two configuration gates and one hardcoded
+argument. Two unrelated residuals keep this page open — a NEW and unexplained
+phantom-extent finding under memory pressure, and the
+16-bytes-per-empty-object retention, which is measured and deliberately left
 alone.
 
 ## Background
@@ -85,18 +86,116 @@ ABBA-interleaved, wave3/wave4/wave4/wave3, at two heap sizes, two rounds each
 
 ## Still open
 
-### Three sites that cannot be reached
+### The three sites that no suite workload enters — ALL THREE NOW RESOLVED
 
-`mark_young_to_old_refs`, `fixup_young_old_refs` and `walk_young_objects` read
-**0 entries** at every heap size tried. The first two are on the major-GC /
-compaction path (`sp_defrag=0` throughout) and the third is the diagnostic walk
-behind `jcmd GC.heap_info` / `GC.class_histogram`. Wiring them would be an
-unmeasurable change, and unlike the two just fixed, none of them has a live set
-to pass the predicate — `mark_young_to_old_refs` has `walked_bases` (the bases
-the sweep verified, arguably a better on-grid oracle), `fixup_young_old_refs`
-has nothing, `walk_young_objects` has nothing. Whoever needs them should first
-find a workload that enters them; `YOUNG_WALK_ENTRIES` makes that a one-line
-check rather than a guess.
+All three are fixed (2026-08-13, waves 6 and 7). This section keeps what it took
+to reach them, because "no workload enters this" was the wrong diagnosis twice,
+in two different ways.
+
+**The first time it was the workload.** `major=0` on every hibernate-reactive
+run at every heap size from 1500m down to 190m, so neither major-path walk could
+run. `probes/GcWalkProbe.java` fixed that for `mark_young_to_old_refs`.
+
+**The second time it was not the workload at all.** Three more probe shapes
+still could not reach the other two, and the reason was configuration and code,
+not allocation behaviour — see below. `probes/OldGenFillProbe.java` and
+`probes/HeapDumpWalkProbe.java` reach them.
+
+#### `mark_young_to_old_refs` — fixed, and it was firing on every entry
+
+| | entries | zero-run anomalies |
+|---|---|---|
+| before | 4 / 20 (two probe sizes) | **4 / 20 — 100%** |
+| after | 4 / 20 (unchanged) | **0 / 0** |
+
+ABBA-interleaved, 4 runs per arm, all `PROBE-DONE`. Every major cycle was
+seeding its young→old marks from the anomaly arm's CONSERVATIVE scan of the
+skipped stretch instead of from a parse.
+
+This walk has no young live set to hand the predicate — a major cycle retains
+young conservatively and deliberately walks live and dead objects alike, so
+`&[]` is all there is and the no-marked-base-inside condition is vacuous. What
+carries the fix instead is the second argument: **an empty object has no fields,
+so a run of them contains no young→old reference to miss.** The alignment and
+plausible-next-header conditions still establish that `resume` is on-grid.
+
+#### `fixup_young_old_refs` — `System.gc()` can never reach it
+
+The previous revision blamed the probe's `System.gc()` cadence for leaving
+`sp_evacuated=0 sp_unaged=91347`. That was true and it was not the blocker.
+Three gates sit in front of this walk, and only the third is about allocation:
+
+1. **Old-gen compaction is disabled by default.** `oldgen_compact_enabled()` has
+   been `CRATONVM_OLDGEN_COMPACT`-gated since 2026-08-03, pending root-cause
+   attribution of the corruption it caused. `CRATONVM_GC=oldgen-compact` is the
+   supported spelling; the launcher prints the migration line for the legacy
+   name, which is how to confirm the flag was actually seen.
+2. **An interior conservative root downgrades the cycle to the in-place sweep**
+   (`COMPACT_DOWNGRADED_INTERIOR_ROOT`, negative control
+   `CRATONVM_GC=-old-interior-pins`). Measured zero here, so not the blocker —
+   but it is the gate to check first, because it is silent unless the counter is
+   non-zero.
+3. **`System.gc()` routes around the compactor entirely.** An explicit full GC
+   takes the non-moving young path (`nonmoving-explicit-full-gc`), which reaches
+   old gen through `sweep_old_gen_non_moving` → `old_gen_gc(.., compact = false,
+   ..)` with the argument **hardcoded**. Compaction lives only on the MOVING
+   path's `major_gc`, whose Phase 5 fires on `old_gen.used() >= capacity * 75/100
+   || major_requested`.
+
+So the prerequisite is not "fill old gen" but "**drive old gen past 75% by
+ALLOCATION, with no `System.gc()` at all**". With `-Xmx 128m` (old = N/2 = 64 MB)
+and a live set whose rotating third is replaced each round, `probes/OldGenFillProbe.java`
+takes `fixup_yo` from 0 to **13–17 entries**. The tell that a run is on the wrong
+path is `oldgen_coalesce: calls=N` matching the major count: that counter is
+incremented by the in-place arm.
+
+#### `walk_young_objects` — reached through the heap dump, not the marker
+
+Two doors, and the one the previous revision chased is the shut one:
+
+* **The concurrent old-gen marker** (`collect_young_to_old_roots`) needs
+  `old_gen_needs_gc()` — old ≥ 75% — to still hold when `maybe_concurrent_gc`
+  asks after a minor GC. On the generational backend it never does: the Phase-5
+  major runs INSIDE the young collection and clears old first. Measured with
+  `CRATONVM_DBG_MIRRORPIN=1`: `old_gen_used=130974736 / cap=134217728` (97.6%) at
+  Phase 5, and 55% immediately after the major. Raising the live set to 77% of
+  old capacity did not change it.
+* **`hprof::dump_heap`** calls `VmHeap::walk_objects()`, which starts with
+  `walk_young_objects()`, and `maybe_dump_heap_on_oom` fires it under
+  `-XX:+HeapDumpOnOutOfMemoryError` with no heap-ratio gymnastics at all. That
+  takes `walk_young` from 0 to **1–43 entries**.
+* `jcmd <pid> GC.class_histogram` remains the third, permanently shut door:
+  CratonVM implements no attach listener, so it fails with
+  `java.io.IOException: non existent JVM pid`. Verified against a live probe.
+
+One detail matters when shaping the probe: the OOM must land IMMEDIATELY after a
+`System.gc()`. An explicit full GC is the one deterministic way to select the
+non-moving sweep, and only that sweep leaves runs of zeroed dead empty objects in
+from-space. A gradual `hog.add(new byte[chunk])` loop runs many more collections
+on the way down, every one of them moving (`moving-no-jit-frames-live`), and
+hands the dump a dense from-space with nothing to misread. `CRATONVM_NO_MOVING_YOUNG=1`
+does **not** substitute: the decision still read `moving-no-jit-frames-live`.
+
+#### What the fix is worth, and how that was established
+
+On the probes the anomaly does not fire at either site: `fixup_yo` 0/13 and
+`walk_young` 0/1, identical across an ABBA-interleaved pre/fix/fix/pre run. That
+is a real reading and it is not the whole answer, because `walk_young_objects` is
+`pub` and the regression can be driven directly instead:
+
+```
+[ plain object ][ 4 swept empty objects ][ plain object ]
+```
+
+`a_run_of_swept_empty_objects_does_not_hide_the_young_objects_after_it` walks
+that from-space. **Without the fix it returns 1 of 6 objects** — the recovery arm
+re-anchors at the next FREE BLOCK, so it drops the run AND the live object behind
+it. With the fix it returns both plain objects.
+
+That is why this one is a correctness fix rather than a consistency fix: the
+enumeration is what `collect_young_to_old_roots` turns into the concurrent
+marker's young→old roots, and its call site calls those mandatory — "a missed
+mark root here = cleanup frees a live object".
 
 ### Phantom extents under memory pressure — NEW, unexplained
 

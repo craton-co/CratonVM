@@ -1986,6 +1986,8 @@ pub fn compile_with_param_slots(
         // the JIT_THREAD TLS and bails with the i64::MIN sentinel; the entry
         // path must set the TLS and drain the pending exception.
         || compiler.emitted_checkcast_throw
+        // A refused `aastore` stashes an ArrayStoreException the same way.
+        || compiler.emitted_aastore_throw
         // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
         // its stack guard stashes a catchable StackOverflowError near native
         // exhaustion and returns the i64::MIN sentinel, so the method MUST be

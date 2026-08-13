@@ -65,28 +65,35 @@ With `--verbose:gc`, the chosen default is printed at startup, e.g.:
 
 | Collector | How to select | Status |
 |-----------|---------------|--------|
-| **Generational** (default) | (default) or `-XX:+UseGenerationalGC` | Stable. Young/old generations, write barriers, card table. Moving (Cheney) young copy plus non-moving sweep with selective promotion. |
+| **ZGC** (default since 2026-08-10) | (default), `-XX:+UseZGC`, or `--XX:UseGc ZGC` | **The default.** Real and wired end to end, but **not** a real ZGC: a memory-backed, **non-moving**, non-generational, whole-heap stop-the-world mark-sweep over one arena. It has thread-local allocation buffers (default-on). Budget ~1.5x the heap a compacting collector needs. |
+| **Generational** | `-XX:+UseGenerationalGC` or `-XX:-UseZGC` | Stable. Young/old generations, write barriers, card table. Moving (Cheney) young copy plus non-moving sweep with selective promotion. The fallback whenever ZGC is not compiled in. |
 | **G1** (region-based) | `-XX:+UseG1GC` | **Experimental.** Region-based collector; the generational collector remains the safety net during its maturation. |
-| **ZGC** | `-XX:+UseZGC` (or `--XX:UseGc ZGC`) — **only in a build with the `zgc` feature** | **Not in a stock build.** Real and fully selectable where it is compiled in, but not a real ZGC: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep. Research backend — do not depend on it in production. |
 
-The ZGC backend is compiled in only behind the default-off `zgc` Cargo feature,
-so a stock `cratonvm` does not have it and `-XX:+UseZGC` there warns and falls
-back to Generational, like any unknown collector name. Build a ZGC-capable
-launcher with:
+The `zgc` Cargo feature is **on by default** — it gates the `GcAlgorithm::Zgc`
+variant, so the default could not be `Zgc` without it. Only a
+`--no-default-features` build lacks ZGC; there `-XX:+UseZGC` warns and falls
+back to Generational, like any unknown collector name.
+
+What ZGC here does **not** have is everything the OpenJDK name promises: no
+colored pointers, no load barriers, no concurrency, no compaction, no
+generations. It *does* have thread-local allocation buffers — its own, inside
+the backend (`CRATONVM_ZGC_TLAB=0` turns them off) rather than through
+`VmHeap::refill_tlab`, which still returns `None` for this backend. Any page
+telling you ZGC allocates by taking the arena lock on every allocation is
+describing the collector as it stood before 2026-08-08.
+
+The practical consequence of not compacting is **headroom**: free memory can be
+plentiful and still too broken up to serve one large array. See
+[GC tuning](../../../gc-tuning.md) for the sizing guidance and
+[the maturity assessment](../../../feature-designs/zgc-maturity-assessment-and-plan-20260813.md)
+for what is built, what is not, and the plan to close the gap.
 
 ```bash
-cargo build --release -p cratonvm-cli --features zgc
-```
-
-It is default-off for pass-rate parity, not because it is unfinished: on the
-1975-class Spring Boot suite it measures 1860 PASS against the default
-collector's 1902 (and 49 hangs against 18). It also has none of production
-ZGC's properties — no colored pointers, no load barriers, no concurrency, no
-compaction, no generations, no TLABs.
-
-```bash
-# Default (generational)
+# Default (ZGC)
 cratonvm --classpath . MyApp
+
+# The generational collector
+cratonvm -XX:+UseGenerationalGC --classpath . MyApp
 
 # Opt into the experimental G1 collector
 cratonvm -XX:+UseG1GC --classpath . MyApp

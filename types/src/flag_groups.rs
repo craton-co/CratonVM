@@ -1118,8 +1118,19 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None },
     E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "youngscan-stride", on_key: Some("CRATONVM_YOUNGSCAN_STRIDE"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: None },
+    // Both ZGC rows are **kill switches for default-ON machinery**, not opt-ins,
+    // and both were declared as opt-ins until 2026-08-13. `zgc-startbits` gates
+    // the object-start bitmap (`zgc_start_bits_enabled_by_default`) and
+    // `zgc-tlab` gates the ZGC thread-local buffers
+    // (`zgc_tlab_enabled_by_default`); each returns `true` on an unset key and
+    // reads `0`/`off`/`false`/`no` as false. With `off_word: None`,
+    // `CRATONVM_GC=-zgc-tlab` expanded to *unsetting* the key — which leaves the
+    // feature ON, so the documented opt-out was silently inert, and the
+    // generated `flag-inventory.md` row said `opt-in | off` about a default-ON
+    // knob. Same defect, same fix and the same reasoning as
+    // `young-pause-goal-ms` two rows below.
+    E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: Some("0") },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
     // `adapt_young_trigger_to_pause` reads. Default 200 since 2026-08-11
     // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`), so it is a default-ON knob
@@ -2465,6 +2476,49 @@ mod tests {
             c.resolve().unknown_tokens,
             vec!["CRATONVM_JIT=compilation-broker"]
         );
+    }
+
+    /// The two ZGC rows are **kill switches**, and `-token` has to reach the
+    /// value their own parsers read as false.
+    ///
+    /// Both `zgc_tlab_enabled_by_default` and `zgc_start_bits_enabled_by_default`
+    /// return `true` for an unset key, so the `off_word: None` these rows
+    /// carried until 2026-08-13 made `CRATONVM_GC=-zgc-tlab` expand to *unset*
+    /// — i.e. to the ON state. That is the failure mode this test exists for,
+    /// and it is invisible from the outside: the spelling is accepted, no
+    /// unknown-token diagnostic fires, and the feature stays on. It also fed a
+    /// wrong `opt-in | off` row into the generated `flag-inventory.md`.
+    ///
+    /// The exact edit that trips it: put `off_word: None` back on either row.
+    #[test]
+    fn the_zgc_kill_switches_expand_to_the_word_their_parsers_read_as_false() {
+        for (token, key) in [
+            ("zgc-tlab", "CRATONVM_ZGC_TLAB"),
+            ("zgc-startbits", "CRATONVM_ZGC_STARTBITS"),
+        ] {
+            let e = lookup(Group::GC, token).unwrap_or_else(|| panic!("{token} is undeclared"));
+            assert_eq!(e.on_key, Some(key));
+            assert!(e.off_key.is_none(), "{token} gained an opt-out key");
+            assert_eq!(
+                e.off_word,
+                Some("0"),
+                "{token} gates default-ON machinery; without a falsey word                  `CRATONVM_GC=-{token}` unsets the key and leaves it ON"
+            );
+
+            // Off: the grouped spelling must WRITE the falsey word, not clear
+            // the key — and it must win over a stale `=1` from a parent shell.
+            let spec = format!("-{token}");
+            let c = case(&[("CRATONVM_GC", spec.as_str()), (key, "1")]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from("0")),
+                "CRATONVM_GC=-{token} must set {key}=0"
+            );
+
+            // On: the bare token still reaches the key affirmatively.
+            let c = case(&[("CRATONVM_GC", token)]);
+            assert_eq!(c.resolve().get(key), Some(OsString::from("1")));
+        }
     }
 
     /// The rest of the audit: knobs that were read by a live `getenv` because

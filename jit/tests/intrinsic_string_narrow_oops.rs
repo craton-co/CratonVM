@@ -163,9 +163,22 @@ fn register_narrow_string_layout() -> u32 {
     NARROW_STRING_CLASS_ID
 }
 
-/// A COMPACT `java/lang/String` whose `value` slot holds a **narrow** oop.
-fn make_narrow_string(value_ptr: i64, coder: u8, hash: i32) -> FakeObj {
-    let mut obj = FakeObj::with_bytes(HEADER_SIZE + 16);
+/// The storage for a COMPACT `java/lang/String`, with nothing written yet.
+///
+/// Split from [`fill_narrow_string`] on purpose: filling one ENCODES the
+/// `value` pointer, and encoding is only legal — and only correct — once
+/// `narrow_oop::enable` has run with a base that already covers every address
+/// this test will ever hand it. Allocating and filling in one step made the
+/// test depend on malloc ordering; see the ALLOCATE-THEN-ENABLE comment in
+/// `string_intrinsics_decode_a_narrow_value_slot`.
+fn alloc_narrow_string() -> FakeObj {
+    FakeObj::with_bytes(HEADER_SIZE + 16)
+}
+
+/// Write a COMPACT `java/lang/String` whose `value` slot holds a **narrow** oop
+/// into storage from [`alloc_narrow_string`]. Must run AFTER
+/// `narrow_oop::enable`.
+fn fill_narrow_string(obj: &mut FakeObj, value_ptr: i64, coder: u8, hash: i32) {
     let base = obj.base();
     let narrow = narrow_oop::encode(value_ptr as u64);
     unsafe {
@@ -183,7 +196,6 @@ fn make_narrow_string(value_ptr: i64, coder: u8, hash: i32) -> FakeObj {
         std::ptr::copy_nonoverlapping(hash.to_le_bytes().as_ptr(), body.add(8), 4);
         *body.add(12) = 0;
     }
-    obj
 }
 
 /// Compile `return this.<name>()` for a no-arg int-returning String intrinsic.
@@ -239,17 +251,76 @@ fn java_hash(s: &str) -> i32 {
 
 #[test]
 fn string_intrinsics_decode_a_narrow_value_slot() {
-    // The backing array has to be encodable, so derive the heap base from it:
-    // `base = value_ptr - 8` puts the array at narrow oop 1 under shift 3.
+    // ALLOCATE, THEN ENABLE — in that order, and not the other way round.
+    //
+    // Every `FakeObj` is a separate `Vec<u64>`, so the allocator is free to
+    // hand them back in ANY address order. This test used to allocate the
+    // first backing array, derive `heap_base` from THAT one alone, enable
+    // narrow oops, and only then allocate the rest — so any later allocation
+    // landing at a lower address was below the base and
+    // `narrow_oop::encode`'s guard aborted the process:
+    //
+    //     cratonvm: FATAL narrow-oop encode failure: address 0x… outside
+    //     [0x…, 0x…) shift=3 - compressed oops geometry is wrong
+    //
+    // That is a property of malloc, not of anything under test. Measured
+    // 2026-08-13 on an unmodified tree: the built test exe run directly failed
+    // **23 of 25** times, while the same test through `cargo test` failed 0 of
+    // 6 — environment-sensitive, which is why it stayed green in the usual CI
+    // shape and then took down a full `cargo test -p cratonvm-jit` at random.
+    //
+    // So: allocate EVERY object first, take the minimum base across all of
+    // them, and derive the window from that. `min - 8` (not `min`) because
+    // `encode` rejects `delta == 0` — narrow oop 0 is null — so the lowest
+    // object has to sit one shift-unit above the base, exactly as the original
+    // `value_ptr - 8` intended for its single object.
     let latin1 = make_byte_array(b"hello world");
+    let empty_arr = make_byte_array(b"");
+    let mut s = alloc_narrow_string();
+    let mut empty = alloc_narrow_string();
+
     let value_ptr = latin1.ptr();
-    assert_eq!(value_ptr % 8, 0, "FakeObj is Vec<u64>-backed, so 8-aligned");
-    let heap_base = (value_ptr as u64) - 8;
+    let empty_ptr = empty_arr.ptr();
+    for (what, p) in [
+        ("latin1", value_ptr),
+        ("empty_arr", empty_ptr),
+        ("s", s.ptr()),
+        ("empty", empty.ptr()),
+    ] {
+        assert_eq!(p % 8, 0, "{what}: FakeObj is Vec<u64>-backed, so 8-aligned");
+    }
+    // Only the two backing ARRAYS are ever encoded (they are what a `value`
+    // slot points at); the String objects themselves are passed to compiled
+    // code as raw receiver pointers. They are folded into the minimum anyway —
+    // it costs nothing, the window is 32 GiB wide, and it means a future
+    // assertion that encodes one cannot resurrect this bug.
+    let heap_base = [value_ptr, empty_ptr, s.ptr(), empty.ptr()]
+        .into_iter()
+        .min()
+        .expect("four addresses") as u64
+        - 8;
     assert!(
         narrow_oop::enable(heap_base, 3),
         "narrow-oop geometry must be accepted"
     );
     assert!(narrow_oop::narrow_oops_enabled());
+    // The invariant the ALLOCATE-THEN-ENABLE order exists to establish, stated
+    // where a future edit will trip over it. Without this, adding a fifth
+    // object — or getting the minimum wrong — reverts to the old failure mode:
+    // a process abort on 23 runs in 25 and a clean pass on the other 2, which
+    // is the hardest possible thing to attribute. `is_encodable` also rejects
+    // `addr == base`, so it proves the `- 8` headroom too, not just the order.
+    for (what, p) in [
+        ("latin1", value_ptr),
+        ("empty_arr", empty_ptr),
+        ("s", s.ptr()),
+        ("empty", empty.ptr()),
+    ] {
+        assert!(
+            narrow_oop::is_encodable(p as u64),
+            "{what} at {p:#x} is outside the narrow window derived from these same four addresses"
+        );
+    }
     assert_eq!(
         narrow_oop::ref_field_size(),
         4,
@@ -270,7 +341,7 @@ fn string_intrinsics_decode_a_narrow_value_slot() {
         "a registered narrow ref field must select the narrow load arm",
     );
 
-    let s = make_narrow_string(value_ptr, 0, 0);
+    fill_narrow_string(&mut s, value_ptr, 0, 0);
     let s_ptr = s.ptr();
 
     // `length()` = value.length >> coder — it dereferences the decoded slot to
@@ -292,9 +363,9 @@ fn string_intrinsics_decode_a_narrow_value_slot() {
     );
 
     // An empty string: `value.length == 0`, and the narrow slot is still a
-    // real (non-null) array reference.
-    let empty_arr = make_byte_array(b"");
-    let empty = make_narrow_string(empty_arr.ptr(), 0, 0);
+    // real (non-null) array reference. Both halves were allocated up front;
+    // only the fill happens here.
+    fill_narrow_string(&mut empty, empty_ptr, 0, 0);
     assert_eq!(length(empty.ptr()), 0, "empty length");
     assert_eq!(is_empty(empty.ptr()), 1, "empty isEmpty");
 
