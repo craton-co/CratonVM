@@ -319,8 +319,17 @@ processor uses.
 * `zgc.rs` / `zgc_concurrent.rs` — ZGC is opt-in and experimental; its
   address-keyed state (colour pointers, forwarding tables) is a distinct model
   that deserves its own pass rather than a paragraph here.
-  **Scope note added 2026-08-07:** "opt-in" means the default-off `zgc` Cargo
-  feature, *not* unreachable — `ZgcRealHeap` (`zgc.rs:1396`) is fully wired
+  **Scope note added 2026-08-13:** "opt-in and experimental" is now WRONG in
+  its first half — ZGC has been the **default** `GcAlgorithm` since 2026-08-10
+  (`vm/src/config.rs`), so the `zgc` Cargo feature is on in every default
+  build. The rest of this section still stands: the module has never had its
+  own audit pass, and the collector that actually runs is a stop-the-world
+  non-moving mark-sweep rather than the colour-pointer model described here.
+  See
+  `docs/feature-designs/zgc-maturity-assessment-and-plan-20260813.md`.
+
+  **Scope note added 2026-08-07 (superseded in its "default-off" clause):**
+  "opt-in" means the default-off `zgc` Cargo feature, *not* unreachable — `ZgcRealHeap` (`zgc.rs:1396`) is fully wired
   (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`) and selectable with
   `-XX:+UseZGC`. The colour-pointer / forwarding-table state named above belongs
   to the *simulation* half of the file (lines 1–1395), which has no production

@@ -2523,7 +2523,23 @@ impl ZgcRealHeap {
     /// Create a heap with the given total capacity in bytes.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let cap = total_bytes.max(4096);
-        let arena = Arena::new(cap);
+        let mut arena = Arena::new(cap);
+        // Put a floor under the large-object end. Without it the split between
+        // the two ends exists but carries no weight: TLAB chunks are carved at
+        // 512 KiB apiece and a thread-heavy workload creates thousands of them,
+        // so the low end reaches the high end's cursor while the large-object
+        // region still holds almost nothing (measured: 3,829 chunk-sized spans,
+        // 1.96 GB of a 2.15 GB arena, at the failing allocation). See
+        // `Arena::high_reserve`, and note that the reserve is a preference the
+        // low end may still overrun rather than fail.
+        //
+        // `capacity / 8` — 256 MiB at `-Xmx 2g`, ~120 live 2 MB buffers, which
+        // is an order of magnitude more than any workload measured here holds
+        // at once. The floor of 8 MiB keeps small heaps (and the gc unit tests,
+        // which build arenas of a few KiB) from reserving a share that
+        // `set_high_reserve`'s quarter-of-capacity clamp would then have to
+        // take back.
+        arena.set_high_reserve((cap / 8).max(8 * 1024 * 1024));
         // Capture the arena envelope ONCE, as plain `usize`. This backs
         // `conservative_addr_span`, and it is deliberately not read through
         // `self.arena.lock()`: the span's whole purpose is to let a caller
@@ -2688,6 +2704,12 @@ impl ZgcRealHeap {
         }
     }
 
+    /// Cap on how much the one-shot fragmentation report walks and prints:
+    /// walls visited in the winning window, and class rows emitted. A report
+    /// that scrolls the log away at the moment the log is least readable is
+    /// the failure mode the one-shot guard exists to avoid.
+    const ZGC_FRAG_REPORT_WALLS: usize = 32;
+
     /// One-shot report of an arena allocation failure, with the occupancy that
     /// says whether the heap was full or merely fragmented.
     ///
@@ -2725,12 +2747,118 @@ impl ZgcRealHeap {
         );
     }
 
+    /// Gather what is standing between the holes, once, on the allocation
+    /// failure that is about to become an `OutOfMemoryError`.
+    ///
+    /// The one-line guard above says the heap is fragmented rather than full.
+    /// That is where every previous investigation of this failure stopped, and
+    /// it is one question short: *fragmented by what?* A free list of 3892
+    /// half-megabyte spans holding 93% of the heap can mean the spans are
+    /// walled by a live/dead mosaic (nothing short of relocation serves the
+    /// request) or that a handful of small survivors is holding gigabytes
+    /// hostage (a targeted fix does). [`Arena::frag_profile`] separates those,
+    /// and this walks the winning window's walls so the occupants can be named.
+    ///
+    /// Returns `None` on every call after the first: the failure repeats for
+    /// every subsequent request once the arena is out, and this report is far
+    /// too long to emit per failure.
+    ///
+    /// Bounded on purpose: at most [`Self::ZGC_FRAG_REPORT_WALLS`] walls are
+    /// walked and that many class rows returned.
+    fn frag_report_once(&self, request: usize, arena: &Arena) -> Option<ZFragReport> {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if REPORTED.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let profile = arena.frag_profile(request);
+        let (high_blocks, high_bytes, high_max) = arena.high_free_shape();
+        let mut report = ZFragReport {
+            profile,
+            high_cursor: arena.high_cursor(),
+            high_blocks,
+            high_bytes,
+            high_max,
+            occupants: Vec::new(),
+            unregistered_bytes: 0,
+        };
+        let Some(window) = report.profile.cheapest else {
+            return Some(report);
+        };
+        // Walk the walls inside that window and tally their occupants. Each
+        // wall is a run of live objects laid end to end; a byte that is not a
+        // registered base is counted rather than skipped, because unregistered
+        // bytes below the cursor are themselves a finding — an un-retired TLAB
+        // tail is exactly that, and it is invisible to both the allocator and
+        // the sweep.
+        let base = arena.base_ptr() as usize;
+        let blocks = arena.free_blocks_sorted();
+        let mut by_class: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+        let mut walls_walked = 0usize;
+        for w in blocks.windows(2) {
+            let wall_start = w[0].0 + w[0].1;
+            let wall_end = w[1].0;
+            if wall_end <= wall_start || wall_start < window.start || wall_end > window.end {
+                continue;
+            }
+            walls_walked += 1;
+            if walls_walked > Self::ZGC_FRAG_REPORT_WALLS {
+                break;
+            }
+            let mut off = wall_start;
+            while off < wall_end {
+                let addr = base + off;
+                if self.registry.contains(addr) {
+                    // SAFETY: the registry holds only live allocation bases.
+                    let header = unsafe { &*(addr as *const ObjectHeader) };
+                    match Self::alloc_size(header) {
+                        Some(size) => {
+                            let e = by_class.entry(header.class_id.as_u32()).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 += size;
+                            off += size.max(8);
+                        }
+                        None => {
+                            // Unsizable header: the sweep refuses these too, so
+                            // the rest of this run cannot be strided.
+                            report.unregistered_bytes += wall_end - off;
+                            break;
+                        }
+                    }
+                } else {
+                    report.unregistered_bytes += 8;
+                    off += 8;
+                }
+            }
+        }
+        let mut rows: Vec<(u32, usize, usize)> =
+            by_class.into_iter().map(|(c, (n, b))| (c, n, b)).collect();
+        rows.sort_unstable_by_key(|&(c, n, b)| (std::cmp::Reverse(b), std::cmp::Reverse(n), c));
+        rows.truncate(Self::ZGC_FRAG_REPORT_WALLS);
+        report.occupants = rows;
+        Some(report)
+    }
+
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
+        // Which end of the arena. See `Arena::high_cursor` for the measurement
+        // this exists for; the short version is that one long-lived object
+        // inside a thread's private TLAB chunk caps every hole in the heap at
+        // one chunk, so an object too big for any TLAB must not be allocated
+        // among TLAB chunks.
+        let large = size >= ZGC_LARGE_OBJECT_MIN;
         let ptr = {
             let mut arena = self.arena.lock();
-            let mut got = arena.alloc(size, 8);
+            // The high end first for a large object, the low end as the
+            // fallback: the two ends share one middle, so a high-end refusal
+            // does not mean the arena is out — and serving a large object from
+            // the small-object end is merely bad for later fragmentation,
+            // while failing is an `OutOfMemoryError`.
+            let mut got = if large {
+                arena.alloc_high(size, 8).or_else(|| arena.alloc(size, 8))
+            } else {
+                arena.alloc(size, 8)
+            };
             if got.is_none() {
                 // Before this can be called a failure: every live TLAB is
                 // holding a chunk whose unused tail is arena space no allocator
@@ -2747,7 +2875,11 @@ impl ZgcRealHeap {
                 drop(arena);
                 self.retire_all_tlabs();
                 arena = self.arena.lock();
-                got = arena.alloc(size, 8);
+                got = if large {
+                    arena.alloc_high(size, 8).or_else(|| arena.alloc(size, 8))
+                } else {
+                    arena.alloc(size, 8)
+                };
             }
             let ptr = match got {
                 Some(p) => p,
@@ -2769,14 +2901,30 @@ impl ZgcRealHeap {
                     // `ZipContentTests` began failing at the Spring Boot
                     // suite's default `-Xmx 2g` on the day ZGC became the
                     // default collector.
+                    let used = arena.used();
+                    let capacity = arena.capacity();
+                    let free_list_bytes = arena.free_list_bytes();
+                    let largest = arena.largest_free_block();
+                    let shape = arena.free_span_shape();
+                    // ...and, once, WHAT is standing between the holes. The
+                    // guard line says "fragmented, not exhausted"; this says
+                    // by what, which is the question every previous
+                    // investigation of this failure stopped one step short of.
+                    // Gathered under the lock, LOGGED without it — see
+                    // `ZFragReport`.
+                    let frag = self.frag_report_once(size, &arena);
+                    drop(arena);
                     Self::warn_alloc_failed_once(
                         size,
-                        arena.used(),
-                        arena.capacity(),
-                        arena.free_list_bytes(),
-                        arena.largest_free_block(),
-                        arena.free_span_shape(),
+                        used,
+                        capacity,
+                        free_list_bytes,
+                        largest,
+                        shape,
                     );
+                    if let Some(frag) = frag {
+                        frag.log(size);
+                    }
                     // Ask for a collection at the next safepoint. A native
                     // cannot collect where it stands, but `vm_exec`'s
                     // native-boundary hook acts on this latch — and a request
@@ -2798,7 +2946,29 @@ impl ZgcRealHeap {
             // — nothing else is consulted. Only once the tail is genuinely low
             // does the free-list probe run, and `has_free_block_at_least` is
             // O(1) for exactly the "no" answer that matters here.
-            let margin = zgc_headroom_margin(arena.capacity());
+            //
+            // The margin is widened by whatever of the large-object reserve is
+            // still UNCLAIMED, and that widening is the point. A TLAB chunk is
+            // reserved space, not allocated space: `allocated` never sees the
+            // part of a chunk that has not been handed to an object, so on a
+            // workload with thousands of threads the classic live-bytes trigger
+            // is blind to the arena filling up. Measured on `TestNonBlockingAPI`
+            // (2026-08-13): ~4,000 threads x 512 KiB of chunks consumed the
+            // whole 2 GB arena while `allocated` — object bytes — sat around
+            // 150 MB, so the only trigger that ever fired was this one, and at
+            // a bare `margin` it fired when the un-bumped middle was already
+            // down to 16 MB. By then the small-object end had bumped straight
+            // through the large-object reserve, and the large-object region was
+            // stuck at the 93 MB it had happened to claim.
+            //
+            // Arming while the middle is still `margin + unclaimed reserve`
+            // wide collects EARLY enough that the retired chunk tails reach the
+            // free list and refills start recycling instead of bumping — which
+            // is what leaves the reserve for the end it was reserved for. It
+            // cannot storm: `needs_gc` puts both of its terms behind the same
+            // `gc_rearm` floor.
+            let margin = zgc_headroom_margin(arena.capacity())
+                .saturating_add(arena.unclaimed_high_reserve());
             let tail = arena.capacity().saturating_sub(arena.used());
             if tail < margin && !arena.has_free_block_at_least(margin) {
                 self.headroom_low.store(true, Ordering::Relaxed);
@@ -3791,7 +3961,18 @@ const ZGC_TLAB_ALIGN: usize = 8;
 ///
 /// 512 KiB keeps the hole granularity an order of magnitude above the array
 /// shapes real workloads repeat, and raises `max_tlab_alloc` (`chunk / 8`) from
-/// 8 KiB to 64 KiB so mid-sized arrays stop needing an arena hole at all. The
+/// 8 KiB to 64 KiB so mid-sized arrays stop needing an arena hole at all.
+///
+/// **Do not reach for this knob again.** Raising it was the answer to the
+/// 64 KiB failure and it did not survive the next one: on 2026-08-13 a 2 MB
+/// `char[]` hit the same wall at 512 KiB. Two changes have since removed the
+/// coupling this constant was being used to paper over — allocations no TLAB
+/// can serve are placed at the arena's other end (`ZGC_LARGE_OBJECT_MIN`,
+/// `Arena::high_cursor`), and a refill now accepts a shorter RECYCLED chunk so
+/// retired chunks stop being one survivor short of reusable
+/// (`ZgcRealHeap::tlab_refill`). What is left for this number to decide is the
+/// accounting blind spot named above, and that is what it should be derived
+/// from. The
 /// accounting blind spot it costs is `live_threads * 512 KiB` — a few MiB on
 /// the thread counts this VM runs, against a heap sized in gigabytes — and the
 /// unused tail is returned to the free list at every retire
@@ -3801,6 +3982,87 @@ const ZGC_TLAB_ALIGN: usize = 8;
 /// takes `capacity / 1024` first, so this ceiling only binds above ~512 MiB,
 /// which is exactly where the fragmentation it exists to prevent appears.
 const ZGC_TLAB_MAX_CHUNK: usize = 512 * 1024;
+
+/// Size at or above which an allocation is served from the arena's HIGH end
+/// (`Arena::alloc_high`) instead of being bump-allocated among TLAB chunks.
+///
+/// 64 KiB, and the number is derived rather than picked: it is
+/// `ZGC_TLAB_MAX_CHUNK / 8`, which is exactly `ZTlabConfig::max_tlab_alloc` —
+/// the size above which no TLAB will ever serve an object. So the rule is not
+/// "big objects go up there", it is **"an object that can only come from the
+/// shared arena must not be placed among the thread-private chunks"**, and the
+/// threshold is the definition of that set rather than a tuning knob.
+///
+/// # Why the two populations must not share space
+///
+/// This heap does not compact, so the largest servable request is the largest
+/// gap between two survivors. Measured on `TestNonBlockingAPI` under ZGC
+/// (2026-08-13, `-Xmx 2g`): a 2,101,264-byte `char[]` raised
+/// `OutOfMemoryError` with **1.99 GB of the 2 GB heap free**, because the
+/// largest hole was 524,192 bytes — one `ZGC_TLAB_MAX_CHUNK` minus 96. The
+/// fragmentation report named the walls exactly: **544 live bytes in four
+/// runs — four `AbstractQueuedSynchronizer$ConditionNode`s and two
+/// `ExclusiveNode`s — standing inside 2,621,264 bytes of otherwise contiguous
+/// arena**. A thread that parks leaves one small, long-lived AQS node inside
+/// its own 512 KiB private chunk; one survivor per chunk caps every hole in
+/// the heap at one chunk, for the rest of the process.
+///
+/// Raising the chunk size only relocates that ceiling — it had already been
+/// raised once (64 KiB -> 512 KiB) when a 65,552-byte `DFAState[8192]` hit the
+/// same wall in Hibernate's `sql.exec.SmokeTests`. Splitting the populations
+/// removes it: at the high end a large object's only possible neighbours are
+/// other large objects, which are rarer by orders of magnitude, so the holes
+/// they leave stay large.
+const ZGC_LARGE_OBJECT_MIN: usize = ZGC_TLAB_MAX_CHUNK / 8;
+
+
+/// The size of a RECYCLED TLAB chunk worth taking, given the full chunk size
+/// `want`, the request `need` that forced this refill, and the largest block on
+/// the low end's free list.
+///
+/// `None` means "ask for a full chunk" — either the free list has nothing worth
+/// having, or it already has a full-size block, in which case the ordinary
+/// `alloc(want)` will find it and there is nothing to decide.
+///
+/// Split out of [`ZgcRealHeap::tlab_refill`] so the decision can be tested
+/// against the exact numbers that produced the defect, which is not reachable
+/// through the heap's public API: it takes ~4,000 threads and a full 2 GB arena
+/// to reproduce the shape, and the shape is one comparison.
+///
+/// The floor is `want / 8`, which is `ZTlabConfig::max_tlab_alloc` — the bound
+/// that decides what a TLAB will serve at all. A chunk at the floor therefore
+/// still holds at least eight of the largest object it can ever be asked for.
+/// Below that a buffer is churning rather than buffering.
+#[inline]
+fn recycled_chunk_size(want: usize, need: usize, largest_low_free: usize) -> Option<usize> {
+    let size = largest_low_free & !(ZGC_TLAB_ALIGN - 1);
+    let floor = (want / 8).max(need);
+    (size >= floor && size < want).then_some(size)
+}
+
+/// Share of the arena that TLAB chunks may hold in RESERVATION at one time.
+///
+/// A chunk is not allocated memory, it is *claimed* memory: the part of it not
+/// yet handed to an object belongs to no object and to no free list, and no
+/// collection can reclaim it while its owning thread is alive. The chunk size
+/// therefore has to be a function of how many threads are claiming one, and
+/// until this constant existed it was not — it was `capacity / 1024` clamped to
+/// [`ZGC_TLAB_MAX_CHUNK`], i.e. a flat 512 KiB on any heap above 512 MiB
+/// however many threads the workload ran.
+///
+/// Measured on Tomcat's `TestNonBlockingAPI` (2026-08-13, `-Xmx 2g`): the class
+/// runs ~4,000 threads, and `4,000 x 512 KiB` is **2 GB — the entire heap**.
+/// The arena filled with chunk reservations, the un-bumped middle closed, and
+/// a 2 MB `char[]` had nowhere left to go while 1.99 GB sat on the free list.
+/// No collection could help: the chunks were legitimately claimed by live
+/// threads.
+///
+/// `capacity / 16` (134 MiB at `-Xmx 2g`) divided by the live buffer count is
+/// the budget each thread gets, clamped into
+/// `[min_tlab_size(), ZGC_TLAB_MAX_CHUNK]`. The clamp is what keeps ordinary
+/// workloads unchanged: below 256 threads the per-thread share still exceeds
+/// 512 KiB at `-Xmx 2g`, so the chunk is the same 512 KiB it was.
+const ZGC_TLAB_RESERVATION_SHARE: usize = 16;
 
 /// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
 ///
@@ -3965,6 +4227,15 @@ impl ZArenaTlab {
 pub struct ZArenaTlabRegistry {
     /// Process-unique identity, used only to key the thread-local handle cache.
     id: u64,
+    /// Registered buffers, as an atomic so the refill path can read it without
+    /// taking [`Self::slots`].
+    ///
+    /// Taking that lock at refill time would be a lock-order INVERSION: the
+    /// documented order is `slots -> cell -> arena`, and a refill runs with the
+    /// cell already held. Maintained at the two places `slots` changes size
+    /// (insert in `attach`, prune in `retire_all_tlabs`), so it is exact
+    /// between them and never more than one insert stale.
+    live_slots: AtomicUsize,
     /// Normalised policy. `initial_chunk == 0` means "this heap is too small
     /// for a TLAB" — see [`Self::chunk_bytes_for_capacity`].
     config: ZTlabConfig,
@@ -4007,6 +4278,27 @@ impl ZArenaTlabRegistry {
         if want.saturating_mul(4) > capacity {
             return 0;
         }
+        want & !(ZGC_TLAB_ALIGN - 1)
+    }
+
+    /// The chunk size to carve RIGHT NOW, for an arena of `capacity` bytes.
+    ///
+    /// [`Self::chunk_bytes_for_capacity`] fixes a ceiling once, at
+    /// construction. This divides the reservation budget
+    /// ([`ZGC_TLAB_RESERVATION_SHARE`]) by the buffers actually registered, so
+    /// the chunk shrinks as the thread count rises and the total claimed by
+    /// TLABs stays bounded whatever the workload does.
+    ///
+    /// `0` (the too-small-heap answer) stays `0`: the ceiling decides whether
+    /// this heap has TLABs at all, and this only decides how big they are.
+    fn chunk_bytes_now(&self, capacity: usize) -> usize {
+        let ceiling = self.config.initial_chunk;
+        if ceiling == 0 {
+            return 0;
+        }
+        let live = self.live_slots.load(Ordering::Relaxed).max(1);
+        let budget = capacity / ZGC_TLAB_RESERVATION_SHARE;
+        let want = (budget / live).clamp(crate::tlab::min_tlab_size(), ceiling);
         want & !(ZGC_TLAB_ALIGN - 1)
     }
 
@@ -4074,6 +4366,7 @@ impl ZArenaTlabRegistry {
                 config
             },
             slots: Mutex::new(FxHashMap::default()),
+            live_slots: AtomicUsize::new(0),
         }
     }
 
@@ -4113,6 +4406,7 @@ impl ZArenaTlabRegistry {
                 None => {
                     let cell = Arc::new(Mutex::new(ZArenaTlab::new()));
                     slots.insert(key, Arc::clone(&cell));
+                    self.live_slots.store(slots.len(), Ordering::Relaxed);
                     cell
                 }
             }
@@ -4362,6 +4656,7 @@ impl ZgcRealHeap {
             let before = slots.len();
             slots.retain(|_, cell| Arc::strong_count(cell) > 1);
             summary.slots_pruned = before - slots.len();
+            self.tlabs.live_slots.store(slots.len(), Ordering::Relaxed);
         }
         // The per-buffer tripwire is asserted inside `tlab_retire_locked`,
         // while that buffer's cell lock is still held — race-free, and strictly
@@ -4445,17 +4740,23 @@ impl ZgcRealHeap {
 
     /// Carve a fresh chunk out of the arena for `tlab`.
     ///
-    /// `Some(())` means the caller's retry is guaranteed to fit: the chunk is
-    /// at least `initial_chunk`, and `max_tlab_alloc <= initial_chunk / 8`, so
-    /// any request that reached here is comfortably smaller than the chunk.
-    /// `None` means the arena could not serve a chunk; the caller falls back to
-    /// [`Self::alloc_raw`], which is the pre-TLAB path unchanged.
+    /// `Some(())` means the caller's retry is guaranteed to fit. The chunk is
+    /// no longer always `initial_chunk` — a recycled one may be shorter, see
+    /// the note in the body — but it is never shorter than `need`, which is
+    /// what the guarantee actually rests on. `None` means the arena could not
+    /// serve a chunk; the caller falls back to [`Self::alloc_raw`], which is
+    /// the pre-TLAB path unchanged.
     ///
     /// There is no keep-the-buffer "direct" path and no HotSpot refill-waste
     /// ratchet, because the remainder is recovered rather than abandoned — see
     /// [`ZArenaTlabRegistry::for_capacity`].
     fn tlab_refill(&self, tlab: &mut ZArenaTlab, need: usize) -> Option<()> {
-        let want = self.tlabs.config().initial_chunk;
+        // Sized against the LIVE buffer count, not once at construction — see
+        // `ZGC_TLAB_RESERVATION_SHARE`. A request too big for the current chunk
+        // takes `alloc_raw`, which is where it went before TLABs existed.
+        let want = self
+            .tlabs
+            .chunk_bytes_now(self.arena_end.saturating_sub(self.arena_base));
         if want == 0 || need > want {
             return None;
         }
@@ -4465,9 +4766,40 @@ impl ZgcRealHeap {
         // serialisation this whole section exists to remove.
         let carved = {
             let mut arena = self.arena.lock();
-            arena.alloc(want, ZGC_TLAB_ALIGN)
+            // ACCEPT A SHORTER CHUNK WHEN THE FREE LIST HAS ONE.
+            //
+            // This is the difference between an allocator that recycles and one
+            // that only consumes. A retired chunk gives back the span BELOW its
+            // survivors, so a chunk that held even one live object comes back
+            // SHORTER than a chunk — and a fixed-size request for `want` can
+            // then never be served by the remains of any chunk that ever
+            // contained a survivor. The free list fills with near-chunk-sized
+            // spans that only a bump can be an alternative to, and the bump is
+            // finite.
+            //
+            // Measured on `TestNonBlockingAPI` (2026-08-13, `-Xmx 2g`) with the
+            // fixed-size request: **3,828 free spans of 524,192 bytes** — one
+            // per thread that had ever parked — against a 524,288-byte chunk
+            // request. Every one of them was **96 bytes short**: exactly one
+            // `AbstractQueuedSynchronizer$ConditionNode`. 1.96 GB of a 2.15 GB
+            // heap sat on the free list in pieces that were each one small
+            // object short of reusable, so every refill in the process bumped,
+            // the arena reached capacity, and a 2 MB `char[]` had nowhere to go.
+            //
+            // The floor is `want / 8` — the same `max_tlab_alloc` bound that
+            // decides what a TLAB will serve at all, so a chunk at the floor
+            // still holds at least eight of the largest object it can ever be
+            // asked for. Below that a buffer is churning rather than buffering
+            // and the honest answer is a full-size chunk (or the failure that
+            // follows it).
+            let largest = arena.largest_low_free_block();
+            let sized = recycled_chunk_size(want, need, largest)
+                .and_then(|size| arena.alloc(size, ZGC_TLAB_ALIGN).map(|p| (p, size)));
+            // `alloc(want)` covers both the "the free list has a full-size
+            // block" case and the bump.
+            sized.or_else(|| arena.alloc(want, ZGC_TLAB_ALIGN).map(|p| (p, want)))
         };
-        let ptr = carved?;
+        let (ptr, want) = carved?;
         // An arena block can carry stale bytes: a split remainder, or the tail
         // filler header a previous retire left behind. `alloc_raw` zeroes per
         // object for exactly this reason; the TLAB pays it once per chunk
@@ -4555,6 +4887,109 @@ impl ZgcRealHeap {
         }
     }
 }
+
+/// Everything the one-shot fragmentation report needs, gathered while the
+/// arena lock is held so the logging — which resolves class NAMES through the
+/// VM's class manager — can happen after it is released.
+///
+/// Splitting it is not tidiness. [`ZgcRealHeap::alloc_raw`] reaches its failure
+/// arm holding the arena mutex, and [`crate::collector::class_name_for_diagnostics`]
+/// calls back into the VM to take the class-manager lock; naming under the
+/// arena lock would invert `arena -> class_manager` against every ordinary
+/// allocation path (`class_manager -> arena`) — i.e. turn a diagnostic into a
+/// deadlock reachable only when the heap is already failing.
+struct ZFragReport {
+    profile: crate::arena::FragProfile,
+    /// The large-object end's downward bump cursor. `capacity` means the end
+    /// was never used at all, which is a different diagnosis from "used and
+    /// full".
+    high_cursor: usize,
+    /// `free_high` blocks, bytes and largest — the split's OWN free list. "The
+    /// split is in place" and "the split has room in it" are different claims,
+    /// and only the second predicts whether a large request can be served.
+    high_blocks: usize,
+    high_bytes: usize,
+    high_max: usize,
+    /// `(class_id, objects, bytes)` for the occupants of the winning window's
+    /// walls, largest byte total first.
+    occupants: Vec<(u32, usize, usize)>,
+    /// Bytes inside the window that are below the cursor but are neither
+    /// free-listed nor a registered object base.
+    unregistered_bytes: usize,
+}
+
+impl ZFragReport {
+    /// Emit the report. Called with **no** heap lock held — see the type doc.
+    fn log(&self, request: usize) {
+        let p = &self.profile;
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request,
+            spans = p.spans,
+            largest_span = p.largest_span,
+            free_bytes = p.free_bytes,
+            walls = p.walls,
+            wall_bytes = p.wall_bytes,
+            span_hist = %crate::arena::format_log2_hist(&p.span_hist),
+            wall_hist = %crate::arena::format_log2_hist(&p.wall_hist),
+            high_cursor = self.high_cursor,
+            high_blocks = self.high_blocks,
+            high_bytes = self.high_bytes,
+            high_max = self.high_max,
+            "zgc frag: the shape of the free list at the failing request \
+             (histograms are log2 lower bounds: `512K:3892` = 3892 spans of \
+             512 KiB..1 MiB)",
+        );
+        let Some(w) = p.cheapest else {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                request,
+                "zgc frag: no contiguous stretch of the swept region is even {request} bytes \
+                 wide — the walls are not the problem, the request exceeds the whole span \
+                 from the lowest free block to the highest.",
+            );
+            return;
+        };
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request,
+            window_start = w.start,
+            window_end = w.end,
+            window_bytes = w.end - w.start,
+            window_free = w.free_bytes,
+            wall_bytes = w.wall_bytes,
+            walls = w.walls,
+            "zgc frag: the CHEAPEST window that could serve this request — {} live bytes \
+             in {} run(s) are all that stand between {} free bytes spread over {} bytes of \
+             contiguous arena. A small number here means a handful of survivors is holding \
+             the window hostage; a number near the request means the region is a genuine \
+             live/dead mosaic.",
+            w.wall_bytes,
+            w.walls,
+            w.free_bytes,
+            w.end - w.start,
+        );
+        for &(class_id, count, bytes) in &self.occupants {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                class = %crate::collector::class_name_for_diagnostics(class_id),
+                count,
+                bytes,
+                "zgc frag: wall occupant",
+            );
+        }
+        if self.unregistered_bytes != 0 {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                bytes = self.unregistered_bytes,
+                "zgc frag: bytes inside the window that are below the cursor but neither \
+                 free-listed nor a registered object base — memory no allocator and no \
+                 sweep can see.",
+            );
+        }
+    }
+}
+
 
 /// Heap-side seam for the reference-slot census.
 ///
@@ -5783,6 +6218,22 @@ impl GarbageCollector for ZgcRealHeap {
             // this sweep and the last-resort merge `Arena::alloc` runs before
             // it returns `None` cannot drift apart.
             arena.coalesce_free_list();
+            // The same two steps for the LARGE-OBJECT end. They are separate
+            // calls, not a wider version of the two above, because a merge
+            // that straddled the point where the two cursors meet would be
+            // re-routed into one region by its offset alone — see
+            // `Arena::coalesce_high`. Cheap: this list holds large objects, so
+            // it is three orders of magnitude shorter than the low one.
+            arena.coalesce_high();
+            let reclaimed_high = arena.retract_high_cursor_into_free_head();
+            if reclaimed_high != 0 {
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = reclaimed_high,
+                    high_cursor = arena.high_cursor(),
+                    "zgc sweep: retracted the large-object cursor into a free head",
+                );
+            }
             // Un-bump a wholly-free tail. Coalescing above has made the topmost
             // span maximal, so this is one comparison — and it is the only
             // thing on a non-compacting heap that can restore a large
@@ -5921,6 +6372,130 @@ impl GarbageCollector for ZgcRealHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // TLAB chunk recycling
+    // ------------------------------------------------------------------
+
+    /// The chunk must be a function of how many threads are claiming one, and
+    /// the total claimed must stay bounded. The numbers are the ones from the
+    /// `TestNonBlockingAPI` failure: `-Xmx 2g`, ~4,000 threads, a flat 512 KiB
+    /// chunk — `4,000 x 512 KiB` is the whole heap.
+    #[test]
+    fn the_chunk_shrinks_so_total_reservation_stays_bounded() {
+        const CAP: usize = 2 * 1024 * 1024 * 1024;
+        let reg = ZArenaTlabRegistry::for_capacity(CAP);
+        let budget = CAP / ZGC_TLAB_RESERVATION_SHARE;
+
+        // A handful of threads: unchanged, the ceiling binds.
+        reg.live_slots.store(8, Ordering::Relaxed);
+        assert_eq!(
+            reg.chunk_bytes_now(CAP),
+            ZGC_TLAB_MAX_CHUNK,
+            "an ordinary thread count must see exactly the chunk it saw before",
+        );
+
+        // The workload that produced the defect.
+        reg.live_slots.store(4000, Ordering::Relaxed);
+        let chunk = reg.chunk_bytes_now(CAP);
+        assert!(
+            chunk < ZGC_TLAB_MAX_CHUNK,
+            "4000 threads must not each get a full chunk (got {chunk})",
+        );
+        assert!(
+            chunk * 4000 <= budget,
+            "total reservation {} must stay inside the budget {budget}",
+            chunk * 4000,
+        );
+        // The old behaviour, stated so the regression is unmistakable: a flat
+        // 512 KiB chunk at this thread count claimed 97.7% of a 2 GiB heap.
+        assert!(
+            ZGC_TLAB_MAX_CHUNK * 4000 * 10 >= CAP * 9,
+            "precondition: a flat chunk at this thread count claimed the heap",
+        );
+
+        // Never below the floor, however many threads there are.
+        reg.live_slots.store(10_000_000, Ordering::Relaxed);
+        assert_eq!(
+            reg.chunk_bytes_now(CAP),
+            crate::tlab::min_tlab_size(),
+            "the floor holds",
+        );
+    }
+
+    /// A heap too small for TLABs stays too small for TLABs: the adaptive
+    /// sizer decides how big a chunk is, never whether there is one.
+    #[test]
+    fn a_heap_with_no_tlabs_gets_no_chunk_from_the_adaptive_sizer() {
+        let reg = ZArenaTlabRegistry::for_capacity(8 * 1024);
+        assert_eq!(reg.config.initial_chunk, 0, "precondition: TLABs are off here");
+        reg.live_slots.store(1, Ordering::Relaxed);
+        assert_eq!(reg.chunk_bytes_now(8 * 1024), 0);
+    }
+
+    /// The exact numbers from the `TestNonBlockingAPI` failure, 2026-08-13.
+    ///
+    /// A 512 KiB chunk that held one 96-byte `AQS$ConditionNode` comes back as
+    /// a 524,192-byte span. Under the fixed-size request that span was
+    /// unusable for a refill **forever**, so every refill in the process had to
+    /// bump; the arena reached capacity with 1.96 GB sitting on the free list
+    /// in 3,828 pieces that were each one small object short of reusable.
+    ///
+    /// Ninety-six bytes is the whole defect, so that is the number this test
+    /// asserts on.
+    #[test]
+    fn a_chunk_remnant_one_object_short_is_still_worth_taking() {
+        const CHUNK: usize = 512 * 1024;
+        const NODE: usize = 96;
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK - NODE),
+            Some(CHUNK - NODE),
+            "a chunk short by one AQS node must still be recycled",
+        );
+    }
+
+    /// The other three answers the decision has to give, so a change that
+    /// makes the case above pass by always saying yes fails here.
+    #[test]
+    fn the_recycled_chunk_decision_refuses_the_three_cases_it_must() {
+        const CHUNK: usize = 512 * 1024;
+        // 1. Nothing on the free list: ask for a full chunk.
+        assert_eq!(recycled_chunk_size(CHUNK, 64, 0), None);
+        // 2. Below the floor (`want / 8` = `max_tlab_alloc`): a buffer that
+        //    small is churn, not a buffer.
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK / 8 - 8), None);
+        assert_eq!(
+            recycled_chunk_size(CHUNK, 64, CHUNK / 8),
+            Some(CHUNK / 8),
+            "the floor itself is acceptable",
+        );
+        // 3. At or above a full chunk: there is nothing to decide, the ordinary
+        //    `alloc(want)` finds it.
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK), None);
+        assert_eq!(recycled_chunk_size(CHUNK, 64, CHUNK * 4), None);
+    }
+
+    /// The guarantee `tlab_refill`'s contract rests on: whatever size comes
+    /// back, the request that forced the refill still fits in it. A recycled
+    /// chunk shorter than `need` would hand the caller a buffer its own
+    /// allocation cannot use, and the caller's `tlab.alloc(size)?` would then
+    /// fail with a live chunk installed.
+    #[test]
+    fn a_recycled_chunk_is_never_shorter_than_the_request_that_forced_it() {
+        const CHUNK: usize = 512 * 1024;
+        for need in [8usize, 1024, CHUNK / 8, CHUNK / 8 + 8, CHUNK / 2] {
+            for largest in [0usize, 4096, CHUNK / 8, CHUNK / 2, CHUNK - 96, CHUNK, CHUNK * 2] {
+                if let Some(size) = recycled_chunk_size(CHUNK, need, largest) {
+                    assert!(
+                        size >= need,
+                        "need={need} largest={largest} produced a {size}-byte chunk",
+                    );
+                    assert!(size <= largest, "cannot carve more than the block holds");
+                    assert_eq!(size % ZGC_TLAB_ALIGN, 0, "chunks stay on the object grid");
+                }
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // ColoredPointer tests
