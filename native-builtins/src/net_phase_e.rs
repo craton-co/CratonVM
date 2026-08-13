@@ -12511,6 +12511,45 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // these — so without this, custom/OCSP/CRL trust managers are
             // silently never invoked. Consulted post-handshake by
             // `t27_tls::engine_run_trust_check`.
+
+            // args[3] — the caller's `SecureRandom`. This handler used to
+            // ignore it completely, which is a divergence from
+            // `sun.security.ssl.SSLContextImpl.engineInit` regardless of where
+            // the handshake's entropy comes from: that method ends with
+            //
+            //     secureRandom = Objects.requireNonNullElseGet(sr, SecureRandom::new);
+            //     /* The initial delay of seeding the random number generator
+            //      * could be long enough to cause the initial handshake on our
+            //      * first connection to time out and fail. Make sure it is
+            //      * primed and ready by getting some initial output from it. */
+            //     secureRandom.nextInt();
+            //
+            // (verified against this host's JDK 25 `src.zip`). The draw is part
+            // of the method's observable behaviour, not an implementation
+            // detail — netty's `SslContextBuilderTest.
+            // {testServerContextWithSecureRandom,testClientContextWithSecureRandom}`
+            // hand in a counting `SecureRandom` subclass and assert it was
+            // drawn from; both failed `expected: <true> but was: <false>`.
+            //
+            // NOTE, deliberately: this primes the caller's generator, it does
+            // NOT re-source the TLS handshake from it. CratonVM's engine is
+            // rustls-backed and its record/key randomness comes from `ring`'s
+            // CSPRNG through the `CryptoProvider`; there is no supported way to
+            // drive that from a Java object mid-handshake, and routing it
+            // through one would mean a caller's weak or fixed-seed
+            // `SecureRandom` silently weakened real key material. See the
+            // retirement note for this batch.
+            if let Some(Value::Object(Some(sr))) = args.get(3) {
+                // Rooted through the same handle scope everything else in this
+                // handler uses — `nextInt()` runs Java and can move `sr`, and a
+                // raw pin nested inside the scope would have to be unwound in
+                // exactly the right order on every exit path.
+                let sr_h = ctx.root(*sr);
+                let sr_now = ctx.get(&sr_h);
+                // A generator that throws propagates, exactly as it does out of
+                // the real `engineInit`.
+                ctx.invoke_virtual(sr_now, "nextInt", "()I", &[])?;
+            }
             Ok(None)
         },
     );
@@ -12788,6 +12827,38 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(ssc_get(ctx, this).timeout_secs)))
     });
+    // getIds() / getSession(byte[]) — the two LOOKUP methods on this
+    // interface. They had no registration at all, and `SSLSessionContext` is a
+    // real JDK interface with no bodies, so every call threw
+    // `AbstractMethodError: method javax/net/ssl/SSLSessionContext.getIds()
+    // Ljava/util/Enumeration; has no Code attribute`. That is 36 of netty's
+    // `JdkSslEngineTest` failures on its own (`SSLEngineTest
+    // .currentSessionCacheSize`, which every session-resumption test calls
+    // before it does anything else).
+    //
+    // The answers are honest rather than fabricated: rustls owns the session
+    // cache and exposes no enumeration of it, so this context genuinely knows
+    // of no cached sessions. An EMPTY enumeration and a null lookup are what
+    // the API says that state looks like — which is also what a real JSSE
+    // context answers before anything has been cached. The alternative, an
+    // `AbstractMethodError`, tells the caller nothing and cannot be caught by
+    // code written against this interface.
+    //
+    // If this VM ever grows a real session cache, these two are where it
+    // surfaces; the no-op cache-tuning setters above carry the same caveat.
+    r.register(ssc, "getIds", "()Ljava/util/Enumeration;", |ctx, _args| {
+        // The same object `Collections.emptyEnumeration()` answers, whose two
+        // methods this workspace already implements natively
+        // (`phases_late::collections::register_p63_enumeration`).
+        let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+        Ok(Some(Value::Object(Some(e))))
+    });
+    r.register(
+        ssc,
+        "getSession",
+        "([B)Ljavax/net/ssl/SSLSession;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     let sf = "javax/net/ssl/SSLSocketFactory";
     r.register(
