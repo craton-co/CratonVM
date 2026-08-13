@@ -2272,6 +2272,33 @@ impl VmHeap {
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
             );
+            // Which check abandoned a chunk. `par_accepts` alone cannot say,
+            // and one `None` from any chunk discards the whole cycle's
+            // attempt. Legend is on `PAR_CHUNK_BAILS`; printed as a bare array
+            // so a soak log can be diffed without parsing seven key=value
+            // pairs, and unconditionally for the same reason as the line above.
+            let b = &crate::gen_heap::PAR_CHUNK_BAILS;
+            eprintln!(
+                "[GC] young_sweep_chunk_bails: overshoot={} gap_filler={} zero_span={} \
+                 bad_size={} hole_crossing={} phantom={} anchor_miss={}",
+                b[0].load(O::Relaxed),
+                b[1].load(O::Relaxed),
+                b[2].load(O::Relaxed),
+                b[3].load(O::Relaxed),
+                b[4].load(O::Relaxed),
+                b[5].load(O::Relaxed),
+                b[6].load(O::Relaxed),
+            );
+            // …and of the zero-span bails, which of the predicate's three
+            // conditions did the refusing. See `ZERO_RUN_REFUSALS`.
+            let z = &crate::gen_heap::ZERO_RUN_REFUSALS;
+            eprintln!(
+                "[GC] young_sweep_zero_refusals: misaligned={} live_inside={} \
+                 implausible_next={}",
+                z[0].load(O::Relaxed),
+                z[1].load(O::Relaxed),
+                z[2].load(O::Relaxed),
+            );
         }
         // Old-gen free-list coalescing (the counterpart of the young sweep's
         // post-sweep coalescer). A large `merged` with compaction never having
