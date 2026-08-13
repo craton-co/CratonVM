@@ -1,10 +1,12 @@
 # The young walk treats a run of EMPTY objects as corruption at other sites
 
-**Status:** the two sites that can be reached from a real workload are
-**RESOLVED** (2026-08-13). **Three remain**, and the reason they remain is now
-precise: they are never entered at all on any workload reachable from this
-repro, so no change to them can be measured. A separate finding — phantom
-extents under memory pressure — is split out at the bottom.
+**Status:** all five sites that any workload actually enters are **RESOLVED**
+(2026-08-13). Three remain, and the reason is now precise rather than assumed:
+they are never entered at all, at any heap size tried, so no change to them can
+be measured. Two other residuals are recorded at the bottom — a NEW and
+unexplained phantom-extent finding under memory pressure, and the
+16-bytes-per-empty-object retention, which is now measured and deliberately left
+alone.
 
 ## Background
 
@@ -127,8 +129,45 @@ anything is freed — it is a throughput cost and a grid-integrity signal, not a
 known reclamation bug. Repro: any batch-01 class at `--Xmx 320m` under
 `-XX:+UseGenerationalGC` with `CRATONVM_GC_STATS=1`.
 
-### The 16-bytes-per-empty-object retention
+### The 16-bytes-per-empty-object retention — MEASURED, and deliberately not closed
 
-Unchanged from wave 3: an accepted run is stepped over, not parsed, so each dead
-empty object stays until a moving cycle resets from-space. Bounded and
-self-limiting; parsing them is a separate safety argument.
+An accepted run is stepped over, not parsed, so each dead empty object in it
+stays until a moving cycle resets from-space. Under a permanent non-moving sweep
+there is no moving cycle, so the obvious worry is that this accumulates.
+
+**It does not.** `EMPTY_RUN_BYTES_LAST` (the bytes skipped by the LAST completed
+sweep — the standing retention, since every cycle re-skips the same runs; a
+cumulative total would just multiply it by the cycle count) against
+`young_used`, on `BatchingConnectionTest` under `-XX:+UseGenerationalGC` at
+seven heap sizes:
+
+| young collections | retained | young used | fraction |
+|---|---|---|---|
+| 4 (`--Xmx 1500m`) | 25 216 B | 326.9 MB | 0.008% |
+| 13 (`450m`) | 28 992 B | 117.8 MB | 0.025% |
+| 16 (`320m`) | 14 400 B | 83.6 MB | 0.017% |
+| 20 (`260m`) | 26 720 B | 68.0 MB | 0.039% |
+| 26 (`220m`) | 22 848 B | 57.4 MB | 0.040% |
+| 27 (`190m`) | 22 080 B | 49.6 MB | 0.045% |
+
+Flat at **13–29 KB from 4 collections to 27** — no trend with cycle count. The
+fraction column rises only because the young generation shrinks with `-Xmx`, not
+because the retained bytes grow. `CascadeComplicatedTest` at `450m`: 6 144 B.
+
+**Why it is not being closed.** The change would be to push the run as a dead
+region at the two walks that reclaim (the sequential walk and `sweep_chunk`)
+instead of stepping over it. The liveness argument is actually sound — marks
+live in the side channel keyed by ADDRESS, so a live object whose header was
+clobbered to zero is still in `side_sorted`, and the predicate already refuses
+any run containing a marked base; an unmarked slot is what the sweep frees
+everywhere else. But it would be **the first change in this family that frees
+something the previous code retained.** Waves 1–4 only ever reduced how much the
+walk skipped, which is safe in the direction the collector already errs. Trading
+that property for ≤0.045% of the young generation is not a good trade, and the
+retained span doubles as a margin against precisely the hazard the original
+comment named — a live allocation whose header a stale register-held reference
+clobbered, a family that has cost this codebase several investigations.
+
+The instrument is kept so the decision is re-checkable rather than a remembered
+opinion: if a workload ever shows this figure growing with cycle count, that is
+new evidence and the trade changes.

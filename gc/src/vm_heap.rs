@@ -2272,6 +2272,11 @@ impl VmHeap {
                 crate::gen_heap::SWEEP_WALK_OVERSHOOT_HITS.load(O::Relaxed),
                 crate::gen_heap::SWEEP_ANCHOR_NOT_A_BASE.load(O::Relaxed),
             );
+            eprintln!(
+                "[GC] young_sweep_empty_runs: last_cycle_bytes={} young_used={}",
+                crate::gen_heap::EMPTY_RUN_BYTES_LAST.load(O::Relaxed),
+                crate::gen_heap::EMPTY_RUN_YOUNG_USED_LAST.load(O::Relaxed),
+            );
             // Which check abandoned a chunk. `par_accepts` alone cannot say,
             // and one `None` from any chunk discards the whole cycle's
             // attempt. Legend is on `PAR_CHUNK_BAILS`; printed as a bare array
