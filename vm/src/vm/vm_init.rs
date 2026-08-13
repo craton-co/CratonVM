@@ -3824,6 +3824,7 @@ impl SharedVm {
                 swallow_counter: std::sync::atomic::AtomicU64::new(0),
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+                stack_dump_acked_tids: parking_lot::Mutex::new(Vec::new()),
                 stack_sample_mode: std::sync::atomic::AtomicBool::new(false),
             },
             jit: crate::vm::realms::JitRealm {
@@ -7085,9 +7086,26 @@ impl SharedVm {
         // watchdog. They wake, emit their park-site snapshot / current
         // frames, and the process aborts right after.
         self.threads.thread_registry.unpark_all_for_stack_dump();
-        // Summarize every registered thread (incl. those with no dumpable
-        // interpreter frames — blocked in a native lock, or never started).
-        self.threads.thread_registry.dump_thread_summary_to_stderr();
+        // The per-thread summary is NOT printed here. It used to be, and that
+        // made its most load-bearing column a lie: printed at request time, it
+        // cannot know which threads went on to answer, so it labelled every
+        // RUNNING thread "read the live stack dump above" — including threads
+        // that never produced one. The watchdog now calls
+        // [`Self::dump_thread_summary_after_dumps`] once the grace period has
+        // closed, when the ack set is complete.
+    }
+
+    /// T19.H1 — print the per-thread summary once the watchdog's grace period
+    /// has closed, so it can distinguish a RUNNING thread that dumped from one
+    /// that stayed silent (i.e. is in JIT-compiled code or a long native call).
+    ///
+    /// Summarizes every registered thread, including those with no dumpable
+    /// interpreter frames — blocked in a native lock, or never started.
+    pub fn dump_thread_summary_after_dumps(&self) {
+        let acked = self.debug.stack_dump_acked_tids.lock().clone();
+        self.threads
+            .thread_registry
+            .dump_thread_summary_to_stderr(&acked);
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -7254,6 +7272,9 @@ impl SharedVm {
         self.debug
             .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // Record WHICH thread answered, not just how many did — see
+        // `stack_dump_acked_tids`.
+        self.debug.stack_dump_acked_tids.lock().push(tid);
     }
 
     /// T19.H1 — count of threads that have completed their dump.
