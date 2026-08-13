@@ -22040,28 +22040,33 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         // duplicates `net_phase_e::inet_addr_host_name_value` because both
         // registrations exist and either may win the last-writer-wins registry
         // slot — they must not disagree.
-        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            Some((h, i)) => (h, i),
-            None => {
-                let h = match ctx.get_field(this, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                (h, String::new())
-            }
+        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
         };
-        let answer = if host.is_empty() { ip } else { host };
+        // The no-name fallback is `getHostAddress()` — scope suffix included.
+        let answer = if host.is_empty() {
+            crate::net_phase_e::inet_addr_scoped_text(ctx, this, "")
+        } else {
+            host
+        };
         Ok(Some(Value::Object(Some(ctx.create_string(&answer)))))
     });
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Some((_, ip)) = crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            let ip = if ip.is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                ip
-            };
-            return Ok(Some(Value::Object(Some(ctx.create_string(&ip)))));
+        if crate::net_phase_e::inet_addr_resolve(ctx, this).is_some() {
+            // Shared with the `net_phase_e` registrations so the IPv6 scope
+            // suffix cannot depend on which duplicate won the registry slot.
+            let v = crate::net_phase_e::inet_addr_host_address_value(ctx, this);
+            if let Value::Object(Some(s)) = v {
+                if ctx.read_string(s).is_some_and(|t| !t.is_empty()) {
+                    return Ok(Some(v));
+                }
+            }
+            return Ok(Some(Value::Object(Some(ctx.create_string("127.0.0.1")))));
         }
         let nf = ctx.object_num_fields(this);
         if nf > 1 {
@@ -22077,17 +22082,16 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     // with real DNS resolution; do NOT re-register here as it would shadow them.
     r.register(ia, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Real-JDK `InetAddress.toString()` => `hostName + "/" + ipString`.
-        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
-            Some(pair) => pair,
-            None => {
-                let h = match ctx.get_field(this, 0) {
-                    Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                (h, String::new())
-            }
+        // Real-JDK `InetAddress.toString()` => `hostName + "/" + getHostAddress()`,
+        // and the right-hand half carries the IPv6 scope suffix.
+        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                _ => String::new(),
+            },
         };
+        let ip = crate::net_phase_e::inet_addr_scoped_text(ctx, this, "");
         let s = ctx.create_string(&format!("{host}/{ip}"));
         Ok(Some(Value::Object(Some(s))))
     });
