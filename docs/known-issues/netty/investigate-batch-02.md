@@ -124,11 +124,20 @@ handed out ids inside the JDK's reserved range (so
 type), and a Java recording leaked its 100 000-event ring for the life of the
 process.
 
+A ninth defect closed later the same day: `Recording.enable(...)`/`disable(...)`/
+`withThreshold(...)` were stored by the JDK and read by nobody, so `disable` did
+nothing and a Java recording swept up every built-in event the VM emitted. Now
+honoured, with all nine rows of a settings probe matching HotSpot. The rule had
+to be *measured*: HotSpot records both of a probe's custom events for a bare
+`new Recording()` and none of its own `jdk.*` types, so the default is per-type
+(`jdk.jfr.Enabled` is `true` for a user class, `false` in the JDK's built-in
+metadata) — a first draft that defaulted custom events to off disagreed on three
+rows.
+
 Residual divergences from HotSpot, all documented at the code: stream delivery
 is synchronous on the committing thread, `start()` does not block, dumped event
-types carry no `eventThread`/`stackTrace`, and `Recording.enable(...)` settings
-are still not consumed by the Rust recorder (so a Java recording captures every
-event the VM emits, not the enabled subset).
+types carry no `eventThread`/`stackTrace`, and the `stackTrace`/`period`/`cutoff`/
+`throttle`/`level` settings have no counterpart in the Rust recorder.
 
 ## Repro
 
