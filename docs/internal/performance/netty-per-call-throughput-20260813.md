@@ -1,6 +1,27 @@
 # netty `io.netty.buffer` throughput gap — it is per-call cost, not the Unsafe path
 
-**Status:** OPEN (gap is real and unfixed). **Root cause RE-MEASURED 2026-08-12**
+**Status: RETIRED 2026-08-13 — kept as the measurement record it always was.**
+This page never described a netty defect; its own conclusion was that the gap is
+CratonVM's VM-wide per-call cost, and that it should be read "as evidence for
+sizing that work, not as a netty bug". Both of the things it asked for have now
+happened, so it moves out of `known-issues`:
+
+* **Its one filed netty consequence is fixed.** `SearchProcessorTest` — the
+  class whose 120 s per-method timeout this page's cost was tripping — is
+  15/15 at 95–105 s, from 14/15 at 153–159 s. See
+  [the ArrayList / view-carrier record](../fixed-suite-bugs/netty/arraylist-native-overhead-and-view-carrier-FIXED-20260813.md).
+* **Its two VM-wide levers are re-filed where they belong**, with fresh numbers
+  and with the three attempts that did NOT convert into time recorded beside
+  them:
+  [the VM-wide per-call cost](../../known-issues/vm-per-call-dispatch-cost-20260813.md).
+  Read that page's §3 before sizing anything from the profile below.
+
+Nothing measured here has been retracted. The §5a gate-pass memo is still the
+one defect this investigation produced, and §3's refutations still stand.
+Everything after this banner is the 2026-08-12 text, unedited.
+
+---
+
 on the Azure Linux host (`20.80.105.49`), dev `6d1bfd531`, quiet box.
 
 The previous revision of this doc named the `sun.misc.Unsafe` bulk-access

@@ -1373,6 +1373,82 @@ fn anchors_for_subject<'a>(trust: &'a TrustManagerState, subject_der: &[u8]) -> 
         .unwrap_or(&[])
 }
 
+/// Order the presented certificates into a PATH from the end entity, dropping
+/// any that are not on it. Returns the indices in path order, starting at 0.
+///
+/// `validate_chain` used to require `parsed[i].issuer == parsed[i+1].subject`
+/// for every `i` and reject anything else as `BrokenChain`. That is path
+/// VALIDATION of an already-built path; what a caller hands
+/// `checkClientTrusted`/`checkServerTrusted` is a certificate SET, and RFC 5280
+/// §6 is explicit that building the path from it comes first. Two shapes that
+/// are legal and were refused:
+///
+/// * a **cross-signed** intermediate — the same subject and key certified by
+///   two different roots, both intermediates supplied so that either root can
+///   be the trust anchor. Only one of them is on the path to any given anchor;
+///   the other is not a break, it is an alternative. This is
+///   `io.netty.pkitesting.CertificateBuilderTest.authenticatingCrossSignedCertificate`,
+///   which supplies `[leaf, crossIssuer, oldIssuer]` (both issuers named
+///   `CN=issuer.netty.io`) and trusts only the root that signed `oldIssuer`;
+/// * a chain sent out of order, which real peers do send.
+///
+/// Selection is deliberately conservative: it only ever REORDERS and DROPS. It
+/// never admits a certificate that the steps after it would have rejected —
+/// every cert on the returned path still goes through the CA, anchor, name
+/// constraint, signature and revocation steps unchanged. Dropping an
+/// off-path certificate is what the JDK's own `SunCertPathBuilder` does.
+///
+/// Where several candidates share the required subject DN, the one whose own
+/// issuer is a configured trust anchor wins, then one that is itself an anchor
+/// subject; ties fall back to the caller's order. That preference is the whole
+/// of the cross-signing fix — both candidates link to the leaf, and only the
+/// anchor test tells them apart.
+fn select_path(parsed: &[ParsedCert], trust: &TrustManagerState) -> Vec<usize> {
+    let mut path = vec![0usize];
+    let mut used = vec![false; parsed.len()];
+    used[0] = true;
+    // Bounded by the input length: a cross-certified pair is a cycle in the
+    // subject/issuer graph, and `used` is what keeps it from being walked
+    // forever.
+    for _ in 1..parsed.len() {
+        let cur = &parsed[*path.last().expect("path is never empty")];
+        // Self-issued root: nothing can follow it.
+        if cur.issuer_der == cur.subject_der {
+            break;
+        }
+        // The path ends as soon as the current certificate's issuer is a
+        // configured anchor — continuing past it would prefer a longer path
+        // over the trusted one.
+        if !anchors_for_subject(trust, &cur.issuer_der).is_empty() {
+            break;
+        }
+        let mut best: Option<(u8, usize)> = None;
+        for (j, cand) in parsed.iter().enumerate() {
+            if used[j] || cand.subject_der != cur.issuer_der {
+                continue;
+            }
+            let rank = if !anchors_for_subject(trust, &cand.issuer_der).is_empty() {
+                0
+            } else if !anchors_for_subject(trust, &cand.subject_der).is_empty() {
+                1
+            } else {
+                2
+            };
+            if best.is_none_or(|(r, _)| rank < r) {
+                best = Some((rank, j));
+            }
+        }
+        match best {
+            Some((_, j)) => {
+                used[j] = true;
+                path.push(j);
+            }
+            None => break,
+        }
+    }
+    path
+}
+
 fn select_trust_anchor<'a>(
     parsed: &'a [ParsedCert],
     chain: &[Vec<u8>],
@@ -1587,6 +1663,58 @@ impl std::fmt::Display for TrustError {
 /// choose to delegate to a JCE provider. See the OID block above for the
 /// inventory of recognised-but-unimplemented OIDs.
 pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<(), TrustError> {
+    // The presented order is a valid path far more often than not, so try it
+    // first and keep its verdict.
+    let presented = validate_ordered_chain(chain, trust);
+    if presented.is_ok() {
+        return presented;
+    }
+    // PKIX path BUILDING (RFC 5280 §6). What a caller hands
+    // `checkClientTrusted`/`checkServerTrusted` is a certificate SET; the
+    // ordered path has to be built from it, and this function previously
+    // required the caller to have built it already. See `select_path` for the
+    // two legal shapes that were refused — a cross-signed intermediate, and a
+    // chain sent out of order.
+    //
+    // Deliberately structured so that building can only turn a REJECTION into
+    // an ACCEPTANCE: the rebuilt path is put through the very same validation,
+    // and if that does not fully succeed the ORIGINAL error is returned
+    // unchanged. No error variant, index or message moves because of this
+    // block, which is what keeps the existing rejection tests meaningful.
+    if let Some(rebuilt) = rebuild_path(chain, trust) {
+        if validate_ordered_chain(&rebuilt, trust).is_ok() {
+            return Ok(());
+        }
+    }
+    presented
+}
+
+/// Re-order `chain` into a path from the end entity, or `None` when the
+/// presented order is already that path (so the caller has nothing to retry).
+///
+/// Parsing here repeats what `validate_ordered_chain` just did, which is
+/// deliberate: this runs only on the failure path, where one extra parse of a
+/// handful of certificates is not worth threading parsed state through the
+/// success path for.
+fn rebuild_path(chain: &[Vec<u8>], trust: &TrustManagerState) -> Option<Vec<Vec<u8>>> {
+    if chain.len() < 2 {
+        return None;
+    }
+    let mut parsed: Vec<ParsedCert> = Vec::with_capacity(chain.len());
+    for der in chain {
+        parsed.push(parse_certificate(der).ok()?);
+    }
+    let path = select_path(&parsed, trust);
+    if path.len() == chain.len() && path.iter().enumerate().all(|(i, &j)| i == j) {
+        return None;
+    }
+    Some(path.iter().map(|&i| chain[i].clone()).collect())
+}
+
+fn validate_ordered_chain(
+    chain: &[Vec<u8>],
+    trust: &TrustManagerState,
+) -> Result<(), TrustError> {
     if chain.is_empty() {
         return Err(TrustError::EmptyChain);
     }
@@ -5218,6 +5346,84 @@ mod tests {
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
         validate_chain(&[leaf, root], &trust).expect("real RSA chain must validate");
+    }
+
+    /// A CROSS-SIGNED intermediate: the same subject and the same key
+    /// certified by two different roots, both supplied so that either root can
+    /// be the trust anchor. Only one of them is on the path to the configured
+    /// anchor; the other is an alternative, not a break — and this was refused
+    /// as `BrokenChain` until path building landed.
+    /// `io.netty.pkitesting.CertificateBuilderTest
+    /// .authenticatingCrossSignedCertificate` is the real-world case.
+    #[test]
+    fn validate_chain_builds_a_path_past_a_cross_signed_intermediate() {
+        let (trusted_pk, trusted_sk) = shared_rsa_root();
+        let trusted_spki = Rsa::public_key_to_der(trusted_pk);
+        let (other_pk, other_sk) = Rsa::generate_keypair(1024);
+        let other_spki = Rsa::public_key_to_der(&other_pk);
+        let (issuer_pk, issuer_sk) = Rsa::generate_keypair(1024);
+        let issuer_spki = Rsa::public_key_to_der(&issuer_pk);
+
+        let ca = |subject: &'static str, issuer: &'static str, spki: &[u8], sk: &RsaPrivateKey| {
+            mk_rsa_signed_cert(
+                &SignedCertSpec {
+                    not_before_utc: "200101000000Z",
+                    not_after_utc: "300101000000Z",
+                    subject_cn: subject,
+                    issuer_cn: issuer,
+                    spki_der: spki,
+                    sig_alg_oid: OID_SIG_SHA256_RSA,
+                    key_usage_bits: Some(KU_KEY_CERT_SIGN),
+                    ext_key_usages: &[],
+                    basic_constraints_ca: Some(true),
+                },
+                sk,
+            )
+        };
+
+        let trusted_root = ca("Trusted Root", "Trusted Root", &trusted_spki, trusted_sk);
+        // Same subject, same key, two different issuing roots.
+        let issuer_by_trusted = ca("Cross Issuer", "Trusted Root", &issuer_spki, trusted_sk);
+        let issuer_by_other = ca("Cross Issuer", "Other Root", &issuer_spki, &other_sk);
+        let leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "leaf.example.com",
+                issuer_cn: "Cross Issuer",
+                spki_der: &other_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            &issuer_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, trusted_root);
+
+        // Presented with the intermediate that does NOT lead to the anchor
+        // first — the order netty's cross-signing test produces.
+        let r = validate_chain(
+            &[
+                leaf.clone(),
+                issuer_by_other.clone(),
+                issuer_by_trusted.clone(),
+            ],
+            &trust,
+        );
+        assert!(r.is_ok(), "cross-signed path must validate, got {r:?}");
+
+        // Already a valid path: must still validate, by the untouched
+        // presented-order route.
+        let r = validate_chain(&[leaf.clone(), issuer_by_trusted, issuer_by_other.clone()], &trust);
+        assert!(r.is_ok(), "already-ordered path must still validate, got {r:?}");
+
+        // Path building must NOT rescue a set with no path to the anchor:
+        // dropping the untrusted intermediate leaves a leaf with no issuer.
+        let r = validate_chain(&[leaf, issuer_by_other], &trust);
+        assert!(r.is_err(), "no path to the anchor must stay rejected, got {r:?}");
     }
 
     #[test]

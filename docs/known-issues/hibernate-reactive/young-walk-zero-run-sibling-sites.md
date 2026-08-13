@@ -1,12 +1,14 @@
 # The young walk treats a run of EMPTY objects as corruption at other sites
 
-**Status:** all SIX sites that any workload has been made to enter are
-**RESOLVED** (2026-08-13). Two remain, and the reason is now precise rather than
-assumed: both need a workload that genuinely fills the old generation, which
-three probe shapes did not manage. Two other residuals are recorded at the bottom — a NEW and
-unexplained phantom-extent finding under memory pressure, and the
-16-bytes-per-empty-object retention, which is now measured and deliberately left
-alone.
+**Status:** **ALL EIGHT sites RESOLVED** (2026-08-13). The two that the previous
+revision recorded as needing "a workload that genuinely fills the old
+generation" are fixed in wave 7; that prerequisite turned out to be only half
+the story, and the other half was two configuration gates and one hardcoded
+argument. Both residuals have now been taken on (2026-08-13). The phantom-extent finding
+is **NOT REPRODUCIBLE** — 25 runs, including at the commit it was recorded at —
+so it stays open as an unexplained observation with a leading hypothesis and a
+new discriminator, not as a live defect. The 16-bytes-per-empty-object retention
+is **re-measured on current dev and the deferral stands**.
 
 ## Background
 
@@ -85,24 +87,22 @@ ABBA-interleaved, wave3/wave4/wave4/wave3, at two heap sizes, two rounds each
 
 ## Still open
 
-### The three sites that no suite workload enters
+### The three sites that no suite workload enters — ALL THREE NOW RESOLVED
 
-`mark_young_to_old_refs` is **fixed** (2026-08-13). The other two are still
-unreached, and this section records exactly what it took to find that out so the
-next attempt starts from evidence rather than from a fresh guess.
+All three are fixed (2026-08-13, waves 6 and 7). This section keeps what it took
+to reach them, because "no workload enters this" was the wrong diagnosis twice,
+in two different ways.
 
-**All three are entered only from paths a suite workload never takes.** `major=0`
-on every hibernate-reactive run at every heap size from 1500m down to 190m — no
-major GC ever happens, so neither major-path walk can run, and
-`walk_young_objects` is diagnostic. `probes/GcWalkProbe.java` reaches the first
-of them: it churns `new Object()` (the all-zero-header shape), keeps a chained
-surviving set so there are real young→old edges, and calls `System.gc()`, which
-CratonVM turns into an explicit `request_major_gc()` rather than waiting for old
-gen to reach 75%.
+**The first time it was the workload.** `major=0` on every hibernate-reactive
+run at every heap size from 1500m down to 190m, so neither major-path walk could
+run. `probes/GcWalkProbe.java` fixed that for `mark_young_to_old_refs`.
+
+**The second time it was not the workload at all.** Three more probe shapes
+still could not reach the other two, and the reason was configuration and code,
+not allocation behaviour — see below. `probes/OldGenFillProbe.java` and
+`probes/HeapDumpWalkProbe.java` reach them.
 
 #### `mark_young_to_old_refs` — fixed, and it was firing on every entry
-
-With the probe reaching it, the anomaly is not occasional:
 
 | | entries | zero-run anomalies |
 |---|---|---|
@@ -120,52 +120,135 @@ carries the fix instead is the second argument: **an empty object has no fields,
 so a run of them contains no young→old reference to miss.** The alignment and
 plausible-next-header conditions still establish that `resume` is on-grid.
 
-#### `fixup_young_old_refs` — needs a compaction that MOVES something
+#### `fixup_young_old_refs` — `System.gc()` can never reach it
 
-Gated on `!compact_map.is_empty()`. Three probe shapes produced 10–20 major GCs
-and never a non-empty map: `sp_evacuated=0 sp_unaged=91347` says why — the
-probe's `System.gc()` cadence collects objects before they reach PROMOTION_AGE,
-so old gen never accumulates enough to have anything to slide.
-`probes/OldGenProbe.java` is the closest attempt (long-lived blobs with bulk
-payload, scattered thirds dropped each round to fragment rather than truncate);
-it needs a shape that lets objects AGE first — fewer, later `System.gc()` calls,
-or an old generation small enough to hit the 75% trigger on its own.
+The previous revision blamed the probe's `System.gc()` cadence for leaving
+`sp_evacuated=0 sp_unaged=91347`. That was true and it was not the blocker.
+Three gates sit in front of this walk, and only the third is about allocation:
 
-#### `walk_young_objects` — not reachable by `jcmd` on this VM
+1. **Old-gen compaction is disabled by default.** `oldgen_compact_enabled()` has
+   been `CRATONVM_OLDGEN_COMPACT`-gated since 2026-08-03, pending root-cause
+   attribution of the corruption it caused. `CRATONVM_GC=oldgen-compact` is the
+   supported spelling; the launcher prints the migration line for the legacy
+   name, which is how to confirm the flag was actually seen.
+2. **An interior conservative root downgrades the cycle to the in-place sweep**
+   (`COMPACT_DOWNGRADED_INTERIOR_ROOT`, negative control
+   `CRATONVM_GC=-old-interior-pins`). Measured zero here, so not the blocker —
+   but it is the gate to check first, because it is silent unless the counter is
+   non-zero.
+3. **`System.gc()` routes around the compactor entirely.** An explicit full GC
+   takes the non-moving young path (`nonmoving-explicit-full-gc`), which reaches
+   old gen through `sweep_old_gen_non_moving` → `old_gen_gc(.., compact = false,
+   ..)` with the argument **hardcoded**. Compaction lives only on the MOVING
+   path's `major_gc`, whose Phase 5 fires on `old_gen.used() >= capacity * 75/100
+   || major_requested`.
 
-Its callers are `walk_objects()` (heap dump / class histogram) and
-`collect_young_to_old_roots()` (the CONCURRENT old-gen marker's `initial_mark`
-and `remark`). Neither is reachable today:
+So the prerequisite is not "fill old gen" but "**drive old gen past 75% by
+ALLOCATION, with no `System.gc()` at all**". With `-Xmx 128m` (old = N/2 = 64 MB)
+and a live set whose rotating third is replaced each round, `probes/OldGenFillProbe.java`
+takes `fixup_yo` from 0 to **13–17 entries**. The tell that a run is on the wrong
+path is `oldgen_coalesce: calls=N` matching the major count: that counter is
+incremented by the in-place arm.
 
-* `jcmd <pid> GC.class_histogram` fails with
-  `java.io.IOException: non existent JVM pid` — CratonVM does not implement the
-  HotSpot attach listener, so no `jcmd` command reaches it. Verified against a
-  live probe process, not inferred.
-* the concurrent marker is gated on `old_gen_needs_gc()`, which is the same
-  old-gen-pressure condition `fixup_young_old_refs` needs.
+#### `walk_young_objects` — reached through the heap dump, not the marker
 
-So both remaining sites reduce to one prerequisite: **a workload that genuinely
-fills the old generation.** `YOUNG_WALK_ENTRIES` turns "did I manage it" into a
-one-line check.
+Two doors, and the one the previous revision chased is the shut one:
 
-### Phantom extents under memory pressure — NEW, unexplained
+* **The concurrent old-gen marker** (`collect_young_to_old_roots`) needs
+  `old_gen_needs_gc()` — old ≥ 75% — to still hold when `maybe_concurrent_gc`
+  asks after a minor GC. On the generational backend it never does: the Phase-5
+  major runs INSIDE the young collection and clears old first. Measured with
+  `CRATONVM_DBG_MIRRORPIN=1`: `old_gen_used=130974736 / cap=134217728` (97.6%) at
+  Phase 5, and 55% immediately after the major. Raising the live set to 77% of
+  old capacity did not change it.
+* **`hprof::dump_heap`** calls `VmHeap::walk_objects()`, which starts with
+  `walk_young_objects()`, and `maybe_dump_heap_on_oom` fires it under
+  `-XX:+HeapDumpOnOutOfMemoryError` with no heap-ratio gymnastics at all. That
+  takes `walk_young` from 0 to **1–43 entries**.
+* `jcmd <pid> GC.class_histogram` remains the third, permanently shut door:
+  CratonVM implements no attach listener, so it fails with
+  `java.io.IOException: non existent JVM pid`. Verified against a live probe.
 
-Found while reaching for the sites above, and not part of this family:
+One detail matters when shaping the probe: the OOM must land IMMEDIATELY after a
+`System.gc()`. An explicit full GC is the one deterministic way to select the
+non-moving sweep, and only that sweep leaves runs of zeroed dead empty objects in
+from-space. A gradual `hog.add(new byte[chunk])` loop runs many more collections
+on the way down, every one of them moving (`moving-no-jit-frames-live`), and
+hands the dump a dense from-space with nothing to misread. `CRATONVM_NO_MOVING_YOUNG=1`
+does **not** substitute: the decision still read `moving-no-jit-frames-live`.
+
+#### What the fix is worth, and how that was established
+
+On the probes the anomaly does not fire at either site: `fixup_yo` 0/13 and
+`walk_young` 0/1, identical across an ABBA-interleaved pre/fix/fix/pre run. That
+is a real reading and it is not the whole answer, because `walk_young_objects` is
+`pub` and the regression can be driven directly instead:
+
+```
+[ plain object ][ 4 swept empty objects ][ plain object ]
+```
+
+`a_run_of_swept_empty_objects_does_not_hide_the_young_objects_after_it` walks
+that from-space. **Without the fix it returns 1 of 6 objects** — the recovery arm
+re-anchors at the next FREE BLOCK, so it drops the run AND the live object behind
+it. With the fix it returns both plain objects.
+
+That is why this one is a correctness fix rather than a consistency fix: the
+enumeration is what `collect_young_to_old_roots` turns into the concurrent
+marker's young→old roots, and its call site calls those mandatory — "a missed
+mark root here = cleanup frees a live object".
+
+### Phantom extents under memory pressure — NOT REPRODUCIBLE (2026-08-13)
+
+The original observation, kept because it was real when taken:
 
 | | 700m | 450m | 320m |
 |---|---|---|---|
 | `phantom_extents` (sequential walk) | 0 | 224 | 847 |
 | `par_accepts` / `par_attempts` | 8/8 | 3/13 | 2/20 |
 | chunk bails, reason | — | `phantom=12` | `phantom=66` |
+| `sp_evacuated` | 162 002 | 235 764 | 83 221 |
 
-Every bail is reason `phantom` — a header whose extent subsumes a marked object
-base, which is the corruption family, not a benign shape (`zero_span=0` and all
-three zero-run refusals 0 at every size). It appears only when selective
-promotion is active, which makes forwarded headers the obvious suspect —
-**ruled out**: `ObjectHeader::make_forwarded` is
-`quartet_of(prev) | target | MARK_FORWARDED`, so kind, element type, `gc_age`
-and `gc_flags` all survive forwarding and `gen_object_total_size` sizes a
-forwarded header correctly. Sample reports:
+**It does not reproduce.** Re-run against the documented recipe (batch-01 class,
+`-XX:+UseGenerationalGC`, `CRATONVM_GC_STATS=1`), every run reading
+`phantom_extents=0`, `live_in_dead=0`, `par_accepts == par_attempts` and every
+chunk-bail reason 0:
+
+* **6 heap sizes** — 700m, 450m, 320m, 260m, 220m, 190m.
+* **12 classes** — all of batch-01 at 320m.
+* **2 binaries, ABBA-interleaved** at 320m — current dev AND a build of
+  `5defebbb0^`, i.e. the commit the numbers above were taken at. So this is not
+  "wave 4 fixed it": it does not reproduce at its own commit either.
+* The stated precondition IS satisfied — selective promotion is active in every
+  run (`sp_selective=5..14`, `sp_evacuated=669..114085`), so this is not the
+  "narrow probe reports its own reach" failure.
+
+What differs is scale of work, not configuration: the original 700m run
+evacuated 162 002 objects where the re-run evacuates 669. Those runs were taken
+on a host at load >100 with 45 leaked Testcontainers containers, and the honest
+reading is that the trigger is a timing/pressure regime that a quiet host does
+not enter, not a code path that has since changed.
+
+#### The leading hypothesis, and the discriminator that would settle it
+
+The check's premise is "`side_sorted` holds object BASES, and live objects never
+nest". The first half has one documented exception, in `mark_young`'s own
+comment:
+
+> When the anchor oracle cannot resolve a candidate ... the code below falls
+> back to side-marking the RAW candidate address — which is correct only if the
+> candidate happens to BE a base.
+
+A conservative candidate is frequently an object-INTERIOR word, and the
+late-resolution pass that marks the real base cannot unmark the raw address — so
+`side_sorted` can carry both. An interior mark of a perfectly VALID object then
+satisfies the phantom premise exactly. That fits every feature of the finding:
+`live_in_dead=0` throughout (nothing was ever freed wrongly — the object is
+retained, the sweep just discards its own work), the correlation with selective
+promotion and with memory pressure (more fragmentation → more unresolved
+candidates), and both sample reports, whose heads size CONSISTENTLY
+(`144 = 16 + 16×8`, `272 = 16 + 16×16`) with the victim at an interior offset of
+32 and 128:
 
 ```
 offset=513936 span_bytes=144 span_head_class_id=0    kind_byte=1 num_slots=16
@@ -174,10 +257,22 @@ offset=518792 span_bytes=272 span_head_class_id=65   kind_byte=0 num_slots=16
              victim_interior_offset=128 last_anchor_off=518440
 ```
 
-`live_in_dead=0` throughout, so the guard is catching it and re-anchoring before
-anything is freed — it is a throughput cost and a grid-integrity signal, not a
-known reclamation bug. Repro: any batch-01 class at `--Xmx 320m` under
-`-XX:+UseGenerationalGC` with `CRATONVM_GC_STATS=1`.
+It is a hypothesis, not a measurement, and 25 runs could not promote it. So what
+landed is the **discriminator**, not a fix: `SWEEP_PHANTOM_INTERIOR_MARKS`
+(`[GC] young_sweep: … phantom_nonbase_marks=`) counts how many of the marks a
+reported extent subsumes are unresolved RAW candidates, and the bounded report
+gained `victim_is_unresolved_raw` and `nonbase_marks_inside`. Read beside
+`phantom_extents`: **equal counts say the guard is firing on interior marks;
+zero says the subsumed marks were real bases and the walk really did leave the
+grid.** One line, next occurrence, instead of another 25 runs.
+
+**The verdict itself is deliberately unchanged.** Screening interior marks out
+of the check is a one-line change and it is tempting, but it would weaken a
+CORRUPTION guard on a symptom that cannot currently be reproduced, and it would
+cost detection for a real phantom whose only subsumed mark happens to be an
+unresolved candidate. That trade needs the counter's evidence first. The
+end-of-sweep `dead_regions` × `side_sorted` merge remains the backstop either
+way, and it RETAINS rather than zeroes.
 
 ### The 16-bytes-per-empty-object retention — MEASURED, and deliberately not closed
 
@@ -221,3 +316,24 @@ clobbered, a family that has cost this codebase several investigations.
 The instrument is kept so the decision is re-checkable rather than a remembered
 opinion: if a workload ever shows this figure growing with cycle count, that is
 new evidence and the trade changes.
+
+**Re-checked 2026-08-13, after waves 5–7.** Same instrument, same class
+(`BatchingConnectionTest`, `-XX:+UseGenerationalGC`), current dev — the point
+being that waves 6 and 7 added two more sites that step over empty-object runs,
+so the standing retention could have grown:
+
+| `-Xmx` | retained | young used | fraction |
+|---|---|---|---|
+| 700m | 21 728 B | 96.2 MB | 0.023% |
+| 450m | 11 520 B | 96.3 MB | 0.012% |
+| 320m | 19 072 B | 52.6 MB | 0.036% |
+| 260m | 20 768 B | 68.2 MB | 0.030% |
+| 220m | 19 040 B | 57.4 MB | 0.033% |
+| 190m | 20 256 B | 49.7 MB | 0.041% |
+
+11.5–21.7 KB against 13–29 KB before, and the fraction ceiling is 0.041% against
+0.045%. No growth, and the two new sites did not move it — which is what the
+mechanism predicts, since both of them run on paths that reclaim nothing
+(`fixup_young_old_refs` walks a freshly-compacted to-space, and
+`walk_young_objects` only enumerates). **The deferral stands, on fresh numbers
+rather than on the earlier decision being remembered.**

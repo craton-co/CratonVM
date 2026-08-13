@@ -7030,6 +7030,47 @@ impl ClassManager {
         out
     }
 
+    /// `true` when [`Self::next_resource_url_from`] can serve `name`.
+    pub fn resource_name_supports_incremental_scan(name: &str) -> bool {
+        crate::class_path::ClassPath::name_supports_incremental_scan(name)
+    }
+
+    /// The incremental form of [`Self::find_all_resource_urls`]: the next URL
+    /// at or after `(segment, index)`, plus the cursor to resume at.
+    ///
+    /// `segment` walks the same three class paths in the same order the
+    /// whole-list version concatenates them — 0 bootstrap, 1 extension, 2
+    /// application — so enumerating from `(0, 0)` to exhaustion yields exactly
+    /// what `find_all_resource_urls` returns, in the same order. It exists so a
+    /// caller that stops early stops the SCAN early; see
+    /// `ClassPath::next_resource_url_from` for the measurement.
+    ///
+    /// A cursor is only meaningful for as long as the classpath is unchanged.
+    /// Appending a root mid-enumeration shifts what an index names, exactly as
+    /// it does for a JDK `Enumeration` held across a `URLClassLoader.addURL`.
+    pub fn next_resource_url_from(
+        &self,
+        name: &str,
+        segment: usize,
+        index: usize,
+    ) -> Option<(String, usize, usize)> {
+        let paths = [
+            self.bootstrap.class_path(),
+            self.extension.class_path(),
+            self.application.class_path(),
+        ];
+        let mut seg = segment;
+        let mut idx = index;
+        while seg < paths.len() {
+            if let Some((url, next)) = paths[seg].next_resource_url_from(name, idx) {
+                return Some((url, seg, next));
+            }
+            seg += 1;
+            idx = 0;
+        }
+        None
+    }
+
     /// with the given name. Parallel to [`find_all_resource_urls`] but returns
     /// content rather than URLs — used by Rust-native resource enumeration
     /// paths (e.g. `ServiceLoader` provider discovery in
@@ -10723,6 +10764,18 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/ConcurrentHashMap$KeySetView" => "java/util/AbstractSet",
         "java/util/concurrent/ConcurrentSkipListSet" => "java/util/AbstractSet",
 
+        // The carrier classes a map's `values()`/`entrySet()` view is minted
+        // under (native-collections' `MAP_VIEW_CARRIERS`). In the real JDK
+        // every one of them extends `AbstractCollection`; with no class file
+        // the default `java/lang/Object` arm below would leave the view
+        // outside the Collection dispatch chain entirely.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/TreeMap$EntrySet"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => "java/util/AbstractCollection",
+
         // Concrete List/Queue hierarchy:
         "java/util/ArrayList" => "java/util/AbstractList",
         "java/util/LinkedList" => "java/util/AbstractSequentialList",
@@ -10831,6 +10884,22 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
             "java/io/Serializable",
+        ],
+        // A map view is a `Collection`, and deliberately NOT a `List` — that
+        // divergence (`hashMap.values() instanceof List` answering true) is
+        // half of what giving these views their own carrier class fixes. The
+        // `EntrySet` carrier is a `Set` for the same reason its JDK twin is.
+        "java/util/HashMap$Values"
+        | "java/util/LinkedHashMap$LinkedValues"
+        | "java/util/TreeMap$Values"
+        | "java/util/Hashtable$ValueCollection"
+        | "java/util/concurrent/ConcurrentHashMap$ValuesView" => {
+            &["java/util/Collection", "java/lang/Iterable"]
+        }
+        "java/util/TreeMap$EntrySet" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
         ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"

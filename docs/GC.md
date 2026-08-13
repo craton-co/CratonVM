@@ -24,18 +24,39 @@ Generational's 519 / 115 / 1 in 356 min, and 63 classes are non-PASS under
 Generational while passing under both other backends
 ([record](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md)).
 
+**Those are the 2026-08-10 figures, and the record's own 2026-08-11 re-run of
+the same three arms supersedes them:** ZGC **629 / 11 / 0 in 178.4 min**,
+Generational **628 / 11 / 0 in 177.5 min**. The promotion still stands — ZGC
+leads on PASS, ties on HANG, and is the only backend that has never crashed on
+this suite — but the margin is one class, not eighty-five. Do not quote the
+08-10 gap without the 08-11 one beside it; the cross-suite picture is
+[the Phase 1 baseline](feature-designs/zgc-phase1-empirical-baseline-20260813.md).
+
 Two consequences worth stating plainly:
 
-* **It costs heap.** No compaction means ~1.5x the generational footprint on
-  buffer-churning workloads — `ZipContentTests` OOMs at `-Xmx 2g` and passes
-  from 3g. Raise `-Xmx` before diagnosing a post-flip `OutOfMemoryError`.
+* **It costs heap — but not by a known factor.** No compaction means a
+  non-compacting collector needs more headroom, and how much is a property of
+  the workload's allocation shapes. The "~1.5x" figure that stood here until
+  2026-08-13 came from one class, `ZipContentTests`, which OOMed at `-Xmx 2g`
+  and passed at 3g; it now passes 29/29 at 2g under ZGC after two allocator
+  defects were fixed, so the figure is withdrawn. Raise `-Xmx` to get moving
+  after a post-flip `OutOfMemoryError`, and file it: all three known instances
+  of the shape turned out to be allocator bugs.
 * **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
   `--no-default-features` build has no ZGC at all and defaults to Generational.
 
 The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
 record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
-predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
-it is the measurement this flip still owes. The plan to make this a real,
+predates the two ZGC-only defects fixed on 2026-08-10 and is **superseded**:
+the same day, the 26 classes that were the entire ZGC-vs-default delta were
+re-run on one binary at `-Xmx 2g` and gave ZGC 16 PASS / 7 HANG / 3 FAIL
+against the default collector's 14 / 10 / 2 — "no functional ZGC-vs-default
+difference is left". One of those two defects silently
+zeroed a primitive array, which is a shape that manufactures FAILs wherever it
+occurs rather than in one place, so treat that row as **unmeasured** rather
+than as evidence against ZGC. Every other suite that has a per-collector
+sweep — Spring Framework (2848 classes), Tomcat, H2, Hibernate Reactive — puts
+ZGC at parity or one class ahead. The plan to make this a real,
 concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
@@ -276,11 +297,24 @@ Allocation failure escalates: young pause → synchronous full mark cycle
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
 a post-sweep re-arm so a large live set cannot storm. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
-registry. Non-moving ⇒ the pointer map is always empty (`zgc.rs:2464`) and
+registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
-protocol. Mutators have no TLABs on this backend (every allocation takes
-the arena lock, `vm_heap.rs:2114`) — it is a correctness-first reference
-backend, not a throughput one.
+protocol.
+
+**Mutators DO have TLABs on this backend**, contrary to what this paragraph
+said until 2026-08-13. `VmHeap::refill_tlab` returns `None` for `VmHeap::Zgc`
+and always has, which is what the old claim was reading — but the buffers are
+not reached that way. `ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`)
+is the funnel for every object and every array, it is **on by default**, and
+`CRATONVM_ZGC_TLAB=0` is the kill switch. A TLAB chunk is *reserved* space that
+no collection can reclaim while its owning thread lives, so it is invisible to
+any trigger that counts live bytes; the reservation budget is bounded by the
+live buffer count (`ZGC_TLAB_RESERVATION_SHARE`) for exactly that reason.
+
+The arena is **two-ended**: small objects and TLAB chunks bump up from offset 0,
+allocations at or above `ZGC_LARGE_OBJECT_MIN` (64 KiB — the size no TLAB will
+ever serve) bump *down* from capacity with their own free list, and a reserve
+(`capacity / 8`) keeps the low end from consuming the whole large-object end.
 
 The always-empty pointer map and the neutral `VmHeap::Zgc` arms that go
 with it are correct *only* while the collector is non-moving, and they fail

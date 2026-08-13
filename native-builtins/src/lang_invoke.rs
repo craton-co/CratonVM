@@ -410,7 +410,12 @@ pub(crate) fn mirror_to_descriptor(
 /// and the return token, so MethodHandle combinators can add/drop parameters
 /// while preserving the exact JVM type spellings. Returns None on malformed
 /// input.
-fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
+///
+/// `pub(crate)` since 2026-08-13: `phases_late`'s Quarkus logging mirror needs
+/// the same split to fill an argument vector from a descriptor it reads off
+/// the class rather than one it writes down, and a second copy of this walk is
+/// a second place for the `[`/`L…;`/primitive rules to drift.
+pub(crate) fn split_descriptor_params(desc: &str) -> Option<(Vec<String>, String)> {
     let b = desc.as_bytes();
     if b.first() != Some(&b'(') {
         return None;

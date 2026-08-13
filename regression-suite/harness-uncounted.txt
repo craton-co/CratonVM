@@ -24,6 +24,11 @@ RClassUnloadSweep      # zero assertions by design: whether a weak reference has
                        # there is no assertion population to count. See the
                        # comment in the vector itself.
 
+RClassUnloadSweepGen   # the same probe under -XX:+UseGenerationalGC (see
+                       # class_cv_args in run.sh), so it inherits the row above
+                       # for the same reason: one diff-only observable, no
+                       # assertion population.
+
 # CLEARED 2026-08-12 (lane W7-51/W7-60 round 3). RPriorityQueueGc and
 # RTreeRangeGc both publish a count now, so their rows are DELETED rather than
 # annotated — the reverse direction of the ratchet says a vector that starts
@@ -51,4 +56,6 @@ RClassUnloadSweep      # zero assertions by design: whether a weak reference has
 # are both satisfied and adding them here would fire the REVERSE direction of
 # this ratchet on every run. Verified by reading the two sources, and by the
 # same census over all 72 vectors that produced this file: the only three
-# without a count are the two cleared above and RClassUnloadSweep.
+# without a count are the two cleared above and RClassUnloadSweep (and, since
+# 2026-08-13, its Generational twin RClassUnloadSweepGen, which is that same
+# vector's probe and not a new observable).
