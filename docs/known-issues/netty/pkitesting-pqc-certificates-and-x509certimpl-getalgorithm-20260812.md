@@ -1,7 +1,7 @@
 # `CertificateBuilderTest` — PQC certificates, and a `getAlgorithm()` on the wrong receiver
 
-**Status:** OPEN (2026-08-12). Split out of
-[the batch-11 triage record](../../internal/fixed-suite-bugs/netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md)
+**Status:** OPEN (2026-08-12). Split out of the batch-11 triage record
+(`netty-batch11-inet6-and-sha1-oid-CLOSED-20260812.md`)
 when that page's other six causes were closed. This is the whole of what is
 left, re-measured on `dev` `e48ebe9d0` — the batch-11 page's own numbers for it
 are stale in both directions.

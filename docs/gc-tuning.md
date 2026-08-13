@@ -34,6 +34,24 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 > `[moving-young] fallback`. See
 > [`docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md).
 
+### What is actually shipping, in one place
+
+Everything in this block was re-derived from the tree on 2026-08-13. If another
+page contradicts it, that page is stale — several were, and the reason this
+block exists is that a default collector documented as an opt-in experiment
+leaves an operator unable to tell what they are running.
+
+| Question | Answer | Where it is decided |
+|---|---|---|
+| Which collector runs if I set nothing? | **ZGC**, since 2026-08-10 | `VmConfig::default`, `vm/src/config.rs` |
+| Is the `zgc` Cargo feature on? | **Yes, by default** — it gates the `GcAlgorithm::Zgc` variant, so the default could not be `Zgc` without it | `gc/Cargo.toml`, `vm/Cargo.toml`, `vm-cli/Cargo.toml` (`^default = `) |
+| How do I get a build with no ZGC? | `--no-default-features` (name `mimalloc` back if you still want it). Generational becomes the default there and `-XX:+UseZGC` warns and falls back | `vm-cli/Cargo.toml` |
+| How do I switch collector at runtime? | `-XX:+UseGenerationalGC` (or `-XX:-UseZGC`); `-XX:+UseG1GC` for G1. Available in every build | `parse_gc_algorithm`, `vm/src/config.rs` |
+| Does ZGC move objects? | **No.** Non-moving, non-generational, whole-heap stop-the-world mark-sweep over one arena | `ZgcRealHeap::collect_garbage`, `gc/src/zgc.rs` |
+| Does ZGC have TLABs? | **Yes, default-on.** Not through `VmHeap::refill_tlab` (which returns `None` here) but inside the backend. Kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab` | `ZgcRealHeap::alloc_raw_tlab`, `gc/src/zgc/tlab.rs` |
+| Is it concurrent, generational or compacting? | **None of the three.** The machinery for all of them is written and unit-tested but not adopted | [maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) |
+| What does it cost me? | Headroom. Not compacting means free memory can be plentiful and still too broken up to serve one large array | the sizing notes below |
+
 | Backend | Module | Status | Best for |
 |---|---|---|---|
 | **ZGC** (default since 2026-08-10) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. A stop-the-world, non-moving, non-generational whole-heap mark-sweep. Fewest hangs and zero crashes across the Tomcat suite; costs ~1.5x heap. See [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) for what is and is not built, and the plan to close it. |
@@ -50,15 +68,18 @@ Trade-offs at a glance:
   per pause target. It pays a per-store remembered-set cost (~10 ns) but
   amortises full-heap compaction. Use it when the old generation is large
   and reclamation latency matters more than minor-GC throughput.
-- **ZGC** is **not** stub-only. `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real
+- **ZGC** is **not** stub-only. `ZgcRealHeap` (`gc/src/zgc.rs`) is a real
   memory-backed collector — `Arena` storage, real `ObjectHeader`s, real
   reference processing — and `-XX:+UseZGC` really selects it
   (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`). What it is *not* is
   ZGC: it is stop-the-world, non-moving, whole-heap and non-generational. (It
-  *does* have TLABs — thread-private 512 KiB chunks carved from the arena,
-  default-on, kill switch `CRATONVM_ZGC_TLAB=0`. The claim that "every
-  allocation takes the arena lock" was true before the chunked TLAB landed and
-  is not true now.) The colored-pointer /
+  *does* have TLABs — thread-private chunks carved from the arena, default-on,
+  kill switch `CRATONVM_ZGC_TLAB=0` or `CRATONVM_GC=-zgc-tlab`. The claim that
+  "every allocation takes the arena lock" was true before the chunked TLAB
+  landed and is not true now. The chunk is **not** a fixed 512 KiB: since
+  2026-08-13 it is a share of the heap divided by the live buffer count, capped
+  at 512 KiB, because a fixed chunk times a large thread count is the whole
+  heap.) The colored-pointer /
   `ZPage` code above it in the same file is a metadata-only simulation with no
   production consumer. On the 1975-class Spring Boot suite:
   1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
@@ -88,7 +109,7 @@ Trade-offs at a glance:
   from the top, with its own free list and a floor of `capacity / 8` reserved
   for it. The reason is that this collector does not compact, so the largest
   request it can serve is the largest gap between two survivors — and one
-  long-lived object inside a thread's private 512 KiB chunk caps every hole in
+  long-lived object inside a thread's private chunk caps every hole in
   the heap at one chunk. Measured before the split, on Tomcat's
   `TestNonBlockingAPI`: a 2 MB `char[]` raised `OutOfMemoryError` with 1.99 GB
   of a 2 GB heap free, held out by **544 live bytes in four AQS nodes**. The

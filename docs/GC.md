@@ -276,11 +276,24 @@ Allocation failure escalates: young pause → synchronous full mark cycle
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
 a post-sweep re-arm so a large live set cannot storm. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
-registry. Non-moving ⇒ the pointer map is always empty (`zgc.rs:2464`) and
+registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
-protocol. Mutators have no TLABs on this backend (every allocation takes
-the arena lock, `vm_heap.rs:2114`) — it is a correctness-first reference
-backend, not a throughput one.
+protocol.
+
+**Mutators DO have TLABs on this backend**, contrary to what this paragraph
+said until 2026-08-13. `VmHeap::refill_tlab` returns `None` for `VmHeap::Zgc`
+and always has, which is what the old claim was reading — but the buffers are
+not reached that way. `ZgcRealHeap::alloc_raw_tlab` (over `gc/src/zgc/tlab.rs`)
+is the funnel for every object and every array, it is **on by default**, and
+`CRATONVM_ZGC_TLAB=0` is the kill switch. A TLAB chunk is *reserved* space that
+no collection can reclaim while its owning thread lives, so it is invisible to
+any trigger that counts live bytes; the reservation budget is bounded by the
+live buffer count (`ZGC_TLAB_RESERVATION_SHARE`) for exactly that reason.
+
+The arena is **two-ended**: small objects and TLAB chunks bump up from offset 0,
+allocations at or above `ZGC_LARGE_OBJECT_MIN` (64 KiB — the size no TLAB will
+ever serve) bump *down* from capacity with their own free list, and a reserve
+(`capacity / 8`) keeps the low end from consuming the whole large-object end.
 
 The always-empty pointer map and the neutral `VmHeap::Zgc` arms that go
 with it are correct *only* while the collector is non-moving, and they fail

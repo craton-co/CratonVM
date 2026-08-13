@@ -143,7 +143,7 @@ what makes the maturity question hard to answer at all. As of this commit:
 |---|---|---|
 | "Why it is **default-off**" | `zgc-production-implementation-plan.md` | **Stale.** ZGC has been the default `GcAlgorithm` since 2026-08-10 (`vm/src/config.rs:769`). |
 | ZGC "has **no TLABs** (every allocation takes the arena lock)" | `gc-tuning.md` | **Stale.** The ZGC TLAB is default-ON (`CRATONVM_ZGC_TLAB`, `zgc_tlab_enabled_by_default`) and `alloc_raw_tlab` is the funnel for every object and array. |
-| "ZGC is **opt-in and experimental**" | `docs/internal/audits/gc-crate-audit.md:319` | **Stale** in the same way. |
+| "ZGC is **opt-in and experimental**" | `audits/gc-crate-audit.md` (internal) | **Stale** in the same way. |
 | Spring Boot "1860 PASS vs Generational's 1902, 49 HANG vs 18" | `gc-tuning.md` | **Stale in ZGC's disfavour**, and the page says so: the numbers predate two ZGC-only fixes from 2026-08-10 and the suite has not been re-run under ZGC since. |
 
 A default collector documented as an opt-in experiment is a governance
@@ -158,7 +158,7 @@ Five phases. Each has an exit criterion that is a **measurement**, not a
 merge — the standing lesson from this tree is that a landed change with no
 re-measurement is indistinguishable from an inert one.
 
-### Phase 0 — Say what is actually shipping *(days; no collector work)*
+### Phase 0 — Say what is actually shipping *(days; no collector work)* — **DONE 2026-08-13**
 
 Close Gap C. Reconcile `gc-tuning.md`, `zgc-production-implementation-plan.md`
 and `gc-crate-audit.md` with the tree: ZGC is the default, it has TLABs, it is
@@ -167,6 +167,25 @@ reserve to the tuning page as an operator-visible property.
 
 **Exit:** no page describes ZGC as default-off or TLAB-less; a reader can
 determine the shipping configuration from `gc-tuning.md` alone.
+
+**Done.** `gc-tuning.md` gained a *What is actually shipping, in one place*
+table — eight questions, each with the file that decides it — and the book's
+`memory-and-gc.md`, `internals/garbage-collector.md` and `contributing/building.md`
+were rewritten: all three still said ZGC was absent from a stock build. `GC.md`,
+`concurrent-gc-maturation.md`, the production plan's §1 header and the 2026-07-10
+gc-audit page were corrected or date-scoped rather than edited away.
+
+**Phase 0 also turned up a live defect, which is the argument for doing it
+first.** `zgc-tlab` and `zgc-startbits` are kill switches for default-ON
+machinery, and both were declared in `flag_groups::INVENTORY` with
+`off_word: None` — the shape reserved for a default-OFF opt-in. `resolve` turns
+`-token` into *unsetting* the key for such a row, and both parsers read an unset
+key as **on**, so `CRATONVM_GC=-zgc-tlab` was accepted, reported no unknown
+token, and left the TLAB running. The same wrong shape is what made the
+generated `flag-inventory.md` describe both as `opt-in | off`. Both now carry
+`off_word: Some("0")`, with a test that fails if either reverts. This is the
+`young-pause-goal-ms` defect (two rows away in the same file) for the second
+time: **the documentation drift and the inert switch were the same edit.**
 
 ### Phase 1 — Re-establish the empirical baseline *(one suite cycle)*
 
