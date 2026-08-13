@@ -18,12 +18,32 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 > **The default collector changed on 2026-08-10: it is now ZGC, not
 > Generational.** If you pinned nothing, your runs moved. Two things follow.
 >
-> **(1) Budget more heap.** ZGC does not compact, so a buffer-churning workload
-> needs roughly **1.5x** the heap the generational collector needed:
-> `ZipContentTests` OOMs under ZGC at `-Xmx 2g` and passes from 3g up, where
-> Generational passes at 2g. If something started throwing `OutOfMemoryError`
-> after this change, raise `-Xmx` before investigating anything else.
+> **(1) Budget more heap — RETIRED as a standing rule, 2026-08-13.** This
+> paragraph used to say ZGC needs roughly **1.5x** the heap the generational
+> collector needed, on the strength of one class: `ZipContentTests` OOMed under
+> ZGC at `-Xmx 2g` and passed from 3g up, where Generational passed at 2g.
 >
+> **That class now passes 29/29 at `-Xmx 2g` under ZGC**, and 29/29 under
+> Generational on the same heap
+> (`fixed-suite-bugs/vm/zgc-oom-with-84-percent-of-the-heap-free-FIXED-20260810.md`).
+> Two defects were under it, both specific to a non-compacting collector and
+> both fixed: the GC trigger asked about live bytes when the binding constraint
+> is allocatable space, and the arena's bump cursor was a one-way ratchet.
+> **The sole measurement behind the 1.5x figure is gone, so the figure is
+> withdrawn rather than restated.**
+>
+> The same happened to the other two instances of the shape. Hibernate's
+> `DFAState[8192]` OOM (2026-08-11) was an allocator sizing bug; Tomcat's 2 MB
+> `char[]` OOM (2026-08-13) was mostly a TLAB *reservation* bug —
+> 4,000 threads x 512 KiB claiming the whole heap behind a trigger that counts
+> only object bytes. **All three known instances were allocator defects, not
+> the price of not compacting.**
+>
+> What still holds, and is the honest general statement: **a non-compacting
+> collector needs more headroom than a compacting one, and how much is a
+> property of the workload's allocation shapes rather than a constant.** If
+> something throws `OutOfMemoryError` under ZGC, raise `-Xmx` to get moving —
+> but file it, because every instance so far has had a fixable cause.
 > **(2) The escape hatch is `-XX:+UseGenerationalGC`**, available in every
 > build including `--no-default-features`. `-XX:-UseZGC` does the same thing.
 >
@@ -64,7 +84,7 @@ leaves an operator unable to tell what they are running.
 
 | Backend | Module | Status | Best for |
 |---|---|---|---|
-| **ZGC** (default since 2026-08-10) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. A stop-the-world, non-moving, non-generational whole-heap mark-sweep. Fewest hangs and zero crashes across the Tomcat suite; costs ~1.5x heap. See [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) for what is and is not built, and the plan to close it. |
+| **ZGC** (default since 2026-08-10) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. A stop-the-world, non-moving, non-generational whole-heap mark-sweep. Fewest hangs and zero crashes across the Tomcat suite. The "costs ~1.5x heap" rule was withdrawn on 2026-08-13 — its one supporting class now passes at the same heap Generational does. See [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md) for what is and is not built, and the plan to close it. |
 | **Generational** | [`gc/src/gen_heap.rs`](../gc/src/gen_heap.rs) | Production; the escape hatch (`-XX:+UseGenerationalGC`) | Tight heap budgets, and anything that regressed on the flip. Young copying + old free-list + write barriers + card table. Carries the `[moving-young] fallback` throughput problem the flip exists to escape. |
 | **G1** (Garbage-First) | [`gc/src/g1.rs`](../gc/src/g1.rs) | Production | Throughput-oriented workloads on larger heaps. Region-based, mixed young/old collections, optional concurrent marking. STW today; parallel evacuator deferred. |
 
@@ -104,7 +124,9 @@ Trade-offs at a glance:
   was flat at 512 KiB however many threads a workload ran, and that class runs
   ~4,000 of them — `4,000 x 512 KiB` is the whole heap. The chunk is now sized
   against the live thread count. The headroom premium is real, but it is not a
-  single constant and the 1.5x figure has never been re-measured; see
+  single constant, and the 1.5x figure was WITHDRAWN on 2026-08-13 when its
+  one supporting class turned out to pass at 2g under ZGC after two allocator
+  fixes; see
   fixed-suite-bugs/tomcat/zgc-nonblockingapi-fragmentation-oom-double-fault-hang-FIXED-20260813.md
   and
   [the maturity assessment](feature-designs/zgc-maturity-assessment-and-plan-20260813.md).

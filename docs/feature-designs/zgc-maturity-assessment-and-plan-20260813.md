@@ -199,10 +199,11 @@ tell what they are running.
 > | **1** — re-establish the baseline | **DONE from existing data** | the Spring Boot arm under ZGC is the one run it still owes; **DEFERRED** |
 > | **2** — defensible non-compacting | **DONE** (2.1–2.4) | "no suite class OOMs where Generational passes, gauge green over a full Tomcat run" — **DEFERRED** |
 > | **3** — concurrency before relocation | **DONE** (ingress, parallel STW marking) | "pause time falls measurably on a large live set" — **DEFERRED** |
-> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | "both suites at parity, premium gone" — **DEFERRED**; see the per-component table in Phase 4 |
+> | **4** — relocation behind the JIT barrier | **DONE** (barrier seam, read path, stage (a), compaction) | **3 of 4 met**: relocation on, JIT on, and the heap premium retired by fix rather than by measurement. Tomcat is at parity; **Spring Boot is the one measurement the plan still owes** — see the per-component table in Phase 4 |
 >
-> **Every phase's code is implemented. Every phase's exit criterion is a
-> measurement, and all five measurements need suite runs.** That is by design —
+> **Every phase's code is implemented, and the exit criteria are further along
+> than "all deferred": Phase 0's is met outright, Phase 4's is 3 of 4. What the
+> whole plan still owes is ONE suite run — Spring Boot under ZGC.** That is by design —
 > the plan's own preamble says so: *"Each has an exit criterion that is a
 > **measurement**, not a merge — the standing lesson from this tree is that a
 > landed change with no re-measurement is indistinguishable from an inert
@@ -630,37 +631,37 @@ recorded here rather than left implicit.
 
 | component | status | evidence |
 |---|---|---|
-| **relocation on** | **DONE** | `CRATONVM_ZGC_RELOCATE=1` drives `relocate_stw` from `collect_garbage`; six tests, the reference-rewrite one red-proven |
-| **JIT on** | **DONE** | `zgc_relocation_permitted` no longer refuses for the JIT. Stage (a) routes reference loads through the barriered helpers; the disjunction is asserted, and the obligation to revert it is asserted too |
-| **both suites at parity** | **DEFERRED — no data exists** | requires a suite run |
-| **~1.5x heap premium gone** | **DEFERRED — no data exists** | requires a suite run |
+| **relocation on** | **MET** | `CRATONVM_ZGC_RELOCATE=1` drives `relocate_stw` from `collect_garbage`; six tests, the reference-rewrite one red-proven |
+| **JIT on** | **MET** | `zgc_relocation_permitted` no longer refuses for the JIT. Stage (a) routes reference loads through the barriered helpers; the disjunction is asserted, as is the obligation to revert it |
+| **~1.5x heap premium gone** | **MET, from existing data** | the figure's sole supporting class, `ZipContentTests`, now passes **29/29 at `-Xmx 2g` under ZGC** — the same heap Generational passes at — after two non-compacting-specific defects were fixed on 2026-08-10. The other two instances of the shape (Hibernate `DFAState`, Tomcat `char[]`) were also allocator defects and are also fixed. **The figure is withdrawn from `gc-tuning.md` and `GC.md` rather than restated.** |
+| **both suites at parity** | **HALF MET** | **Tomcat: parity, from existing data** — 2026-08-11, one commit, three backends: ZGC **629** PASS / 11 HANG / 0 CRASH against Generational's **628** / 11 / 0. **Spring Boot: outstanding**, last measured 2026-08-08 (1860 vs 1902) on a binary missing two ZGC-only fixes |
 
-**Why deferred and not done.** Both are measurements, and this session was
-scoped to build without re-running suites. That is not a gap in the
-implementation: no amount of code closes a measurement, and the plan applies
-the same gate to every default-on decision it contains.
+**One measurement remains in the whole plan: the Spring Boot suite under ZGC.**
 
-**The runner folders were searched first, exactly as Phase 1 was, and the
-result is that the data is not there.** Recorded because a future reader will
-otherwise repeat the search:
+That is a smaller residue than the earlier draft of this table claimed, and the
+correction is worth recording because I got it wrong in the conservative
+direction twice. The first pass searched only `apps/*-suite-runner` and
+concluded "no data exists" for either criterion. Two of the three answers were
+elsewhere in the tree the whole time:
 
-* **No ZGC-tagged run exists in `apps/*-suite-runner` for either criterion.**
-  Not for Spring Boot, not for Tomcat, at any date.
-* The one tempting artifact is `zip-craton-2g-20260810`, which shows
-  `ZipContentTests` **passing at `-Xmx 2g`** — apparently refuting the premium
-  outright. It does not. Its binary is `CratonVM-sslpem-20260809`, built the
-  day *before* the default flip, and its log carries nine `moving-young` lines
-  — a Generational-only mechanism. It is a **Generational** arm, which is
-  precisely what the premium claim already asserts ("Generational passes at
-  2g"). Reading it as a ZGC result would have retired Gap B on a
-  misattribution.
+* the Tomcat parity numbers are in the three-way comparison record — the same
+  record Phase 1 restored after finding it had been deleted;
+* the premium's retirement is in the fixed-bug page for the very OOM the
+  premium was derived from.
 
-**So the premium figure stays exactly as `gc-tuning.md` already flags it:
-never re-measured, derived from one class, and partly re-attributed** — the
-2026-08-13 Tomcat OOM that looked like the same shape turned out to be mostly a
-TLAB reservation bug. One data point that has since been partly explained away
-is not a sizing constant, and it is not something this session could either
-confirm or retire.
+**A criterion can be met by a fix rather than by a measurement**, and this is
+what that looks like: nobody re-ran a heap-sizing experiment, but the class
+that generated the number stopped needing the extra heap. Looking only for a
+*new* measurement missed it.
+
+**The near-miss is worth keeping too.** `zip-craton-2g-20260810` in the runner
+folder also shows `ZipContentTests` passing at 2g and looks like the same
+evidence — but its binary is `CratonVM-sslpem-20260809`, built the day before
+the default flip, and its log carries nine `moving-young` lines, a
+Generational-only mechanism. That artifact is a **Generational** arm and says
+nothing about ZGC. The real evidence is the fixed-bug page, which states both
+collectors explicitly.
+
 
 ### Two directions beyond this plan
 

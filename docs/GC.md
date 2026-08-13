@@ -34,9 +34,14 @@ this suite — but the margin is one class, not eighty-five. Do not quote the
 
 Two consequences worth stating plainly:
 
-* **It costs heap.** No compaction means ~1.5x the generational footprint on
-  buffer-churning workloads — `ZipContentTests` OOMs at `-Xmx 2g` and passes
-  from 3g. Raise `-Xmx` before diagnosing a post-flip `OutOfMemoryError`.
+* **It costs heap — but not by a known factor.** No compaction means a
+  non-compacting collector needs more headroom, and how much is a property of
+  the workload's allocation shapes. The "~1.5x" figure that stood here until
+  2026-08-13 came from one class, `ZipContentTests`, which OOMed at `-Xmx 2g`
+  and passed at 3g; it now passes 29/29 at 2g under ZGC after two allocator
+  defects were fixed, so the figure is withdrawn. Raise `-Xmx` to get moving
+  after a post-flip `OutOfMemoryError`, and file it: all three known instances
+  of the shape turned out to be allocator bugs.
 * **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
   `--no-default-features` build has no ZGC at all and defaults to Generational.
 
