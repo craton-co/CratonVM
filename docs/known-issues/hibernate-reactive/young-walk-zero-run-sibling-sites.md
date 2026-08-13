@@ -1,9 +1,9 @@
 # The young walk treats a run of EMPTY objects as corruption at other sites
 
-**Status:** all five sites that any workload actually enters are **RESOLVED**
-(2026-08-13). Three remain, and the reason is now precise rather than assumed:
-they are never entered at all, at any heap size tried, so no change to them can
-be measured. Two other residuals are recorded at the bottom — a NEW and
+**Status:** all SIX sites that any workload has been made to enter are
+**RESOLVED** (2026-08-13). Two remain, and the reason is now precise rather than
+assumed: both need a workload that genuinely fills the old generation, which
+three probe shapes did not manage. Two other residuals are recorded at the bottom — a NEW and
 unexplained phantom-extent finding under memory pressure, and the
 16-bytes-per-empty-object retention, which is now measured and deliberately left
 alone.
@@ -85,18 +85,68 @@ ABBA-interleaved, wave3/wave4/wave4/wave3, at two heap sizes, two rounds each
 
 ## Still open
 
-### Three sites that cannot be reached
+### The three sites that no suite workload enters
 
-`mark_young_to_old_refs`, `fixup_young_old_refs` and `walk_young_objects` read
-**0 entries** at every heap size tried. The first two are on the major-GC /
-compaction path (`sp_defrag=0` throughout) and the third is the diagnostic walk
-behind `jcmd GC.heap_info` / `GC.class_histogram`. Wiring them would be an
-unmeasurable change, and unlike the two just fixed, none of them has a live set
-to pass the predicate — `mark_young_to_old_refs` has `walked_bases` (the bases
-the sweep verified, arguably a better on-grid oracle), `fixup_young_old_refs`
-has nothing, `walk_young_objects` has nothing. Whoever needs them should first
-find a workload that enters them; `YOUNG_WALK_ENTRIES` makes that a one-line
-check rather than a guess.
+`mark_young_to_old_refs` is **fixed** (2026-08-13). The other two are still
+unreached, and this section records exactly what it took to find that out so the
+next attempt starts from evidence rather than from a fresh guess.
+
+**All three are entered only from paths a suite workload never takes.** `major=0`
+on every hibernate-reactive run at every heap size from 1500m down to 190m — no
+major GC ever happens, so neither major-path walk can run, and
+`walk_young_objects` is diagnostic. `probes/GcWalkProbe.java` reaches the first
+of them: it churns `new Object()` (the all-zero-header shape), keeps a chained
+surviving set so there are real young→old edges, and calls `System.gc()`, which
+CratonVM turns into an explicit `request_major_gc()` rather than waiting for old
+gen to reach 75%.
+
+#### `mark_young_to_old_refs` — fixed, and it was firing on every entry
+
+With the probe reaching it, the anomaly is not occasional:
+
+| | entries | zero-run anomalies |
+|---|---|---|
+| before | 4 / 20 (two probe sizes) | **4 / 20 — 100%** |
+| after | 4 / 20 (unchanged) | **0 / 0** |
+
+ABBA-interleaved, 4 runs per arm, all `PROBE-DONE`. Every major cycle was
+seeding its young→old marks from the anomaly arm's CONSERVATIVE scan of the
+skipped stretch instead of from a parse.
+
+This walk has no young live set to hand the predicate — a major cycle retains
+young conservatively and deliberately walks live and dead objects alike, so
+`&[]` is all there is and the no-marked-base-inside condition is vacuous. What
+carries the fix instead is the second argument: **an empty object has no fields,
+so a run of them contains no young→old reference to miss.** The alignment and
+plausible-next-header conditions still establish that `resume` is on-grid.
+
+#### `fixup_young_old_refs` — needs a compaction that MOVES something
+
+Gated on `!compact_map.is_empty()`. Three probe shapes produced 10–20 major GCs
+and never a non-empty map: `sp_evacuated=0 sp_unaged=91347` says why — the
+probe's `System.gc()` cadence collects objects before they reach PROMOTION_AGE,
+so old gen never accumulates enough to have anything to slide.
+`probes/OldGenProbe.java` is the closest attempt (long-lived blobs with bulk
+payload, scattered thirds dropped each round to fragment rather than truncate);
+it needs a shape that lets objects AGE first — fewer, later `System.gc()` calls,
+or an old generation small enough to hit the 75% trigger on its own.
+
+#### `walk_young_objects` — not reachable by `jcmd` on this VM
+
+Its callers are `walk_objects()` (heap dump / class histogram) and
+`collect_young_to_old_roots()` (the CONCURRENT old-gen marker's `initial_mark`
+and `remark`). Neither is reachable today:
+
+* `jcmd <pid> GC.class_histogram` fails with
+  `java.io.IOException: non existent JVM pid` — CratonVM does not implement the
+  HotSpot attach listener, so no `jcmd` command reaches it. Verified against a
+  live probe process, not inferred.
+* the concurrent marker is gated on `old_gen_needs_gc()`, which is the same
+  old-gen-pressure condition `fixup_young_old_refs` needs.
+
+So both remaining sites reduce to one prerequisite: **a workload that genuinely
+fills the old generation.** `YOUNG_WALK_ENTRIES` turns "did I manage it" into a
+one-line check.
 
 ### Phantom extents under memory pressure — NEW, unexplained
 
