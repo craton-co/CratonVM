@@ -4132,6 +4132,24 @@ pub fn zgc_relocation_permitted(requested: bool) -> bool {
     if crate::runtime::env_cache::disable_jit() {
         return true;
     }
+    // Stage (a) of `zgc-jit-load-barrier.md` LANDED 2026-08-13, so the JIT is
+    // no longer automatically disqualifying.
+    //
+    // The refusal below exists because JIT-compiled code baked raw 8-byte
+    // reference loads at compile-time offsets and would read a coloured word
+    // as a pointer. `x64::zgc_read_barrier_blocks_inline_fields` now routes
+    // every compact-field access through `jit_getfield` / `jit_putfield_object`
+    // whenever the read barrier is armed, and those go through the heap's own
+    // accessors, which barrier. That is the same mechanism compressed oops has
+    // used for the same reason since before this gate existed.
+    //
+    // The CAPABILITY, not the runtime state: this runs at VM init, long
+    // before any cycle arms a barrier, so asking "is the barrier armed" here
+    // would answer no forever and refuse relocation permanently. The question
+    // is whether the code this JIT emits will respect a barrier armed later.
+    if cratonvm_jit::x64::zgc_codegen_honours_read_barrier() {
+        return true;
+    }
     // Reported on stderr, not just through `tracing`, for the reason the
     // compressed-oops gate states: a silent fallback would look identical to a
     // successful run, and the operator must see which one they got. The stakes
@@ -9240,29 +9258,57 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 mod zgc_relocation_gate_tests {
     use super::zgc_relocation_permitted;
 
-    /// **Relocation must be refused whenever the JIT is enabled**, and this is
-    /// the only thing standing between a relocating cycle and heap corruption.
+    /// **Relocation is permitted only where a reference load is barriered.**
     ///
-    /// JIT-compiled code loads reference fields with no ZGC load barrier, so a
-    /// cycle that moved an object would hand it a stale pointer into evacuated
-    /// memory — a use-after-free with no error path. `zgc_relocation_permitted`
-    /// is the refusal, and until 2026-08-13 **nothing tested it**: a gate whose
-    /// body was accidentally inverted, or short-circuited to `requested`, would
-    /// have compiled, passed every suite (nothing requests relocation today)
-    /// and armed the corruption for whoever first flipped
-    /// `RELOCATION_REQUESTED`.
+    /// The original rule was "refused whenever the JIT is enabled", because
+    /// JIT-compiled code baked raw 8-byte reference loads at compile-time
+    /// offsets and would read a coloured word as a pointer -- a use-after-free
+    /// with no error path. That is still the hazard; what changed on
+    /// 2026-08-13 is that stage (a) of `zgc-jit-load-barrier.md` landed, so
+    /// the JIT no longer does that: `x64::zgc_read_barrier_blocks_inline_fields`
+    /// routes every compact-field access through `jit_getfield` /
+    /// `jit_putfield_object` whenever the barrier is armed, and those go
+    /// through the heap accessors, which barrier.
     ///
-    /// The contract is stated as an equality with `disable_jit()` rather than
-    /// as a constant, so this test pins the same rule in both configurations
-    /// instead of only in whichever one the test process happens to be in.
+    /// So the predicate is now a disjunction, and both arms are asserted here
+    /// rather than one being assumed. **If inline reference emission is ever
+    /// re-enabled under an armed barrier, `zgc_codegen_honours_read_barrier`
+    /// must go back to `false` and this test must go red** -- that is what it
+    /// is for.
     #[test]
-    fn relocation_is_permitted_only_when_the_jit_is_off() {
+    fn relocation_is_permitted_only_where_reference_loads_are_barriered() {
         let jit_off = crate::runtime::env_cache::disable_jit();
+        let codegen_ok = cratonvm_jit::x64::zgc_codegen_honours_read_barrier();
         assert_eq!(
             zgc_relocation_permitted(true),
-            jit_off,
-            "requested relocation must be permitted IF AND ONLY IF the JIT is              disabled; with the JIT on, compiled code loads reference fields              without the ZGC load barrier and a moving cycle hands it stale              pointers"
+            jit_off || codegen_ok,
+            "requested relocation must be permitted IF AND ONLY IF every \
+             reference load is barriered -- either because there is no JIT \
+             code, or because the JIT routes reference loads through the \
+             barriered helpers when the barrier is armed"
         );
+    }
+
+    /// The hazard the gate exists for, stated so it cannot be lost: with the
+    /// JIT on and codegen NOT honouring the barrier, relocation must refuse.
+    ///
+    /// Asserted as an implication rather than by forcing the state, because
+    /// neither input is settable from a test in this process -- `disable_jit`
+    /// is latched and `zgc_codegen_honours_read_barrier` is a build property.
+    /// The value is that the rule is written down as an executable claim: if
+    /// someone makes the predicate permissive in a way that drops one of the
+    /// two arms, the assertion above fails.
+    #[test]
+    fn relocation_refuses_when_neither_arm_holds() {
+        let jit_off = crate::runtime::env_cache::disable_jit();
+        let codegen_ok = cratonvm_jit::x64::zgc_codegen_honours_read_barrier();
+        if !jit_off && !codegen_ok {
+            assert!(
+                !zgc_relocation_permitted(true),
+                "unbarriered JIT reference loads plus a moving cycle is a \
+                 use-after-free; the gate must refuse"
+            );
+        }
     }
 
     /// Not requested is not permitted — the branch `vm_init` actually takes

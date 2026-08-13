@@ -304,7 +304,70 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// which go through the width-aware `read_compact_field` / `write_compact_field`.
 #[inline]
 pub fn narrow_oops_block_inline_fields() -> bool {
-    narrow_oops_enabled()
+    narrow_oops_enabled() || zgc_read_barrier_blocks_inline_fields()
+}
+
+/// Whether ZGC's read-path load barrier forces every compact-field access
+/// through the helpers -- **stage (a) of `zgc-jit-load-barrier.md`**.
+///
+/// # The problem this closes
+///
+/// The inline compact-field fast paths bake a raw 8-byte load at a
+/// compile-time offset and hand the result on as an object reference. Once
+/// ZGC colours its reference slots, that word is `Z_COLORED_TAG | colour |
+/// 42-bit offset` -- not a pointer. JIT code reading it raw would dereference
+/// a wild address, or, after relocation, a stale one: a use-after-free with no
+/// error path. That is exactly why `zgc_relocation_permitted` refuses to
+/// relocate while the JIT is on.
+///
+/// # Why the fallback is a complete fix and not a stopgap
+///
+/// `jit_getfield` / `jit_putfield_object` go through the heap's own accessors,
+/// and `ZgcRealHeap::get_array_element` (and the field twin) now run
+/// `load_barrier_slot` before decoding. So a reference load routed to the
+/// helper IS barriered -- forwarded, published to the marker, and self-healed
+/// -- by the same code the interpreter uses. The design doc calls the
+/// helper-CALL arms "the barrier's cheap escape hatch" for this reason: they
+/// are correct today, and inline emission is a throughput optimisation on top,
+/// not a correctness prerequisite.
+///
+/// This is the identical argument, and the identical mechanism, as the
+/// compressed-oops clause above: a representation the inline emitter does not
+/// understand disables the inline emitter rather than being half-supported.
+///
+/// The flag lives in `cratonvm-types` rather than `cratonvm-gc` because this
+/// crate depends on the gc crate only as a dev-dependency, on purpose -- see
+/// the acyclicity note in `jit/Cargo.toml`. Reaching for a real edge to read
+/// one bool would trade a documented graph invariant for a convenience.
+///
+/// # Cost
+///
+/// Zero unless a ZGC cycle has armed the barrier, which nothing in a default
+/// run does. The predicate is a relaxed load of a process-wide flag that stays
+/// false for the whole life of an ordinary process.
+#[inline]
+pub fn zgc_read_barrier_blocks_inline_fields() -> bool {
+    cratonvm_types::zgc_read_barrier_armed()
+}
+
+/// Whether this build's codegen HONOURS the ZGC read barrier -- the
+/// capability, as distinct from
+/// [`zgc_read_barrier_blocks_inline_fields`]'s runtime state.
+///
+/// `zgc_relocation_permitted` runs at VM init, long before any cycle arms a
+/// barrier, so asking the runtime predicate there always answers "not armed"
+/// and relocation would be refused forever. The question that gate actually
+/// needs is *"if a cycle arms the barrier later, will the code this JIT emits
+/// respect it?"* -- which is a property of the build.
+///
+/// A constant `true` since stage (a) landed on 2026-08-13. It is a function
+/// and not a `const` so that it has somewhere to state the obligation: **if
+/// inline reference emission is ever re-enabled under an armed barrier, this
+/// must go back to `false`**, or `zgc_relocation_permitted` silently starts
+/// allowing a relocating cycle to hand JIT code stale pointers.
+#[inline]
+pub fn zgc_codegen_honours_read_barrier() -> bool {
+    true
 }
 
 /// Default-on inline reference-`putfield` fast path.
