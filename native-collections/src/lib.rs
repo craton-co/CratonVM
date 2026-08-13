@@ -3760,6 +3760,16 @@ fn al_slots_resolved(ctx: &dyn NativeContext) -> Option<(usize, usize, usize)> {
 /// the element → Xerces external-DTD entity stack empty → "Premature end of
 /// file"). Resolve against the receiver's actual class instead.
 fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usize) {
+    al_slots_and_layout_for(ctx, this).0
+}
+
+/// [`al_slots_for`] with the receiver's [`AlLayout`] verdict, from the same
+/// memo entry. Callers that need both — `al_state` does, on every operation —
+/// must use this rather than asking twice.
+fn al_slots_and_layout_for(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> ((usize, usize, usize), AlLayout) {
     let cid = ctx.class_id_of_object(this);
     let raw = cid.as_u32();
     let vm = ctx.vm_identity();
@@ -3791,7 +3801,10 @@ fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usiz
         });
         return slots;
     }
-    (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS)
+    (
+        (AL_FIELD_DATA, AL_FIELD_SIZE, AL_NUM_FIELDS),
+        AlLayout::Lenient,
+    )
 }
 
 /// Ways in the direct-mapped receiver-class -> list-slot-layout cache.
@@ -3811,11 +3824,69 @@ fn al_slots_for(ctx: &dyn NativeContext, this: ObjectRef) -> (usize, usize, usiz
 const AL_SLOTS_WAYS: usize = 64;
 
 thread_local! {
-    /// `(vm_identity, [(ClassId, (data, size, n)); WAYS])`.
+    /// `(vm_identity, [(ClassId, ((data, size, n), layout)); WAYS])`.
     static AL_SLOTS: std::cell::RefCell<(
         Option<usize>,
-        [Option<(u32, (usize, usize, usize))>; AL_SLOTS_WAYS],
+        [Option<(u32, ((usize, usize, usize), AlLayout))>; AL_SLOTS_WAYS],
     )> = const { std::cell::RefCell::new((None, [None; AL_SLOTS_WAYS])) };
+}
+
+/// What the receiver's CLASS says about its list layout — the class-only half
+/// of [`al_is_list_layout`], resolved once per `ClassId` and cached beside the
+/// slot layout in [`AL_SLOTS`].
+///
+/// PERF (2026-08-13, the `arraylist-native-overhead` residual). The predicate
+/// this replaces ran `class_id_by_name("java/util/ArrayList")` followed by
+/// `is_subclass` on EVERY `al_state`, and a second such pair for
+/// `java/util/Vector` whenever the first said no — each of them a
+/// `class_manager` read lock plus a name-hash lookup over a 19-byte string.
+/// `native_al_size` reached `al_state` twice, so one `ArrayList.size()` paid
+/// two of them. A flat `perf record -F 499` of a `size()`-only loop put
+/// `class_id_by_name` + `find_unique_class_by_name` + `classify_exact_name` at
+/// **15.9% of the whole run** — the largest family in that profile, ahead of
+/// every dispatch symbol.
+///
+/// Sound for the same reason as [`AL_SLOTS`] itself and `RECEIVER_FACTS`: a
+/// `ClassId` is never reissued and a class's ancestry is immutable after
+/// linking. Like `AL_SLOTS` it is only ever FILLED with a resolved verdict —
+/// while `java/util/ArrayList` is not loaded the old predicate answered its
+/// lenient `true` for every receiver, and freezing that into the memo would
+/// keep answering it after ArrayList arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlLayout {
+    /// `java/util/ArrayList` or a subclass — the ordinary case.
+    ArrayList,
+    /// `java/util/Vector` or a subclass (`java/util/Stack`), which carries its
+    /// own `elementData`/`elementCount` slots.
+    Vector,
+    /// Exactly `java/lang/Object`. CratonVM's own class-id-0 placeholders land
+    /// here; a zero-field bare `Object` is not a list. See
+    /// [`is_bare_java_lang_object`], whose test this reproduces.
+    BareObject,
+    /// Nameless or unnamed class — the lenient arm the original carried so
+    /// bare synthetic allocations keep working.
+    Lenient,
+    /// A known, named, non-list class (`String`, `LinkedList`, a JDK bean).
+    /// Reading ArrayList's slots out of one of these is the wild-read the
+    /// guard exists to prevent — see [`al_state`].
+    Foreign,
+}
+
+impl AlLayout {
+    /// The verdict [`al_is_list_layout`] returns for an object of this class.
+    /// `n_fields` is the receiver's own field count, which every caller has
+    /// already read for the slot bounds check.
+    #[inline]
+    fn accepts(self, n_fields: usize) -> bool {
+        match self {
+            AlLayout::ArrayList | AlLayout::Vector | AlLayout::Lenient => true,
+            // `!is_bare_java_lang_object`: exact `java/lang/Object` with zero
+            // fields is rejected; one that carries fields is a CratonVM
+            // placeholder list and stays accepted.
+            AlLayout::BareObject => n_fields != 0,
+            AlLayout::Foreign => false,
+        }
+    }
 }
 
 /// The uncached body of [`al_slots_for`]. `None` when the layout could not be
@@ -3823,14 +3894,14 @@ thread_local! {
 fn al_slots_for_uncached(
     ctx: &dyn NativeContext,
     cid: ClassId,
-) -> Option<(usize, usize, usize)> {
+) -> Option<((usize, usize, usize), AlLayout)> {
     if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
         if cid == vec_id || ctx.is_subclass(cid, vec_id) {
             if let (Some(d), Some(s)) = (
                 ctx.resolve_field_index("java/util/Vector", "elementData"),
                 ctx.resolve_field_index("java/util/Vector", "elementCount"),
             ) {
-                return Some((d, s, std::cmp::max(d, s) + 1));
+                return Some(((d, s, std::cmp::max(d, s) + 1), AlLayout::Vector));
             }
             // A Vector receiver whose own layout is unresolvable must NOT fall
             // through to ArrayList's `size` slot — that is the DF08 mixup this
@@ -3838,23 +3909,35 @@ fn al_slots_for_uncached(
             return None;
         }
     }
-    al_slots_resolved(ctx)
+    let slots = al_slots_resolved(ctx)?;
+    // Refuse to CACHE a verdict until `java/util/ArrayList` itself resolves:
+    // the arm below this one is the old predicate's lenient "ArrayList not
+    // loaded (synthetic-jdk) — preserve old behavior" answer, and it stops
+    // being true the moment ArrayList loads. The uncached fallback in
+    // `al_slots_for` reproduces it meanwhile.
+    let al_id = ctx.class_id_by_name("java/util/ArrayList")?;
+    let layout = if cid == al_id || ctx.is_subclass(cid, al_id) {
+        AlLayout::ArrayList
+    } else {
+        // Not an ArrayList: reject only when the class is known and named.
+        match ctx.class_name_arc_of_id(cid).as_deref() {
+            None => AlLayout::Lenient,
+            Some("") => AlLayout::Lenient,
+            Some("java/lang/Object") => AlLayout::BareObject,
+            Some(_) => AlLayout::Foreign,
+        }
+    };
+    Some((slots, layout))
 }
 
 /// `true` iff `obj` has a list layout the `native_al_*` natives can read at the
 /// receiver-aware slots — ArrayList (or subclass) **or** Vector (or subclass,
-/// e.g. Stack). See [`al_is_arraylist_layout`] for the foreign-receiver rationale.
+/// e.g. Stack). See [`AlLayout`] for the foreign-receiver rationale and for why
+/// the answer is memoized per `ClassId` rather than re-derived per call.
 fn al_is_list_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    if al_is_arraylist_layout(ctx, obj) {
-        return true;
-    }
-    let cid = ctx.class_id_of_object(obj);
-    if let Some(vec_id) = ctx.class_id_by_name("java/util/Vector") {
-        if cid == vec_id || ctx.is_subclass(cid, vec_id) {
-            return true;
-        }
-    }
-    false
+    al_slots_and_layout_for(ctx, obj)
+        .1
+        .accepts(ctx.object_num_fields(obj))
 }
 
 /// Allocate an ArrayList instance, sized to fit whichever field layout the
@@ -3892,22 +3975,15 @@ fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// CratonVM's internal placeholder lists allocate against
 /// `java/util/ArrayList` (so they resolve by name and qualify), but bare
 /// class-id-0 allocations must keep working as before.
+///
+/// The classification itself now lives in [`AlLayout`], memoized per
+/// `ClassId`; this is the exact-ArrayList question on top of it, which is not
+/// the same as [`al_is_list_layout`] (that one also admits `Vector`).
 fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    let cid = ctx.class_id_of_object(obj);
-    match ctx.class_id_by_name("java/util/ArrayList") {
-        Some(al_id) => {
-            if cid == al_id || ctx.is_subclass(cid, al_id) {
-                return true;
-            }
-            // Not an ArrayList: reject only when the class is known and named.
-            match ctx.class_name_of_id(cid) {
-                None => true, // synthetic / unknown — lenient
-                Some(n) if n.is_empty() => true,
-                Some(n) if n == "java/lang/Object" => !is_bare_java_lang_object(ctx, obj),
-                Some(_) => false,
-            }
-        }
-        None => true, // ArrayList not loaded (synthetic-jdk) — preserve old behavior
+    match al_slots_and_layout_for(ctx, obj).1 {
+        AlLayout::ArrayList | AlLayout::Lenient => true,
+        AlLayout::BareObject => !is_bare_java_lang_object(ctx, obj),
+        AlLayout::Vector | AlLayout::Foreign => false,
     }
 }
 
@@ -3926,7 +4002,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // throw, so callers reaching `al_state` are read-only. Mirrors the same
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
-    let (data_slot, size_slot, _) = al_slots_for(ctx, this);
+    let ((data_slot, size_slot, _), layout) = al_slots_and_layout_for(ctx, this);
     // Receiver-layout guard. `al_state` is reached through `Collection`-
     // and `List`-interface natives (`size`, `forEach`, `stream`, …) whose
     // bytecode dispatcher can target *any* object — including non-list
@@ -3955,7 +4031,7 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // ArrayList slots when the receiver actually has ArrayList layout; otherwise
     // return the empty sentinel so the caller falls back to the receiver's own
     // `iterator()` (equals) / virtual dispatch.
-    if !al_is_list_layout(ctx, this) {
+    if !layout.accepts(n_fields) {
         return (None, 0);
     }
     let data = match ctx.get_field(this, data_slot) {
@@ -4690,6 +4766,63 @@ fn singleton_wrapper_size(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i3
     }
 }
 
+/// Outcome of [`al_state_for_read`].
+enum AlRead {
+    /// The receiver is a live map view and the caller wanted only its element
+    /// count, which the source answered without a rebuild.
+    ViewSize(i32),
+    /// Ordinary state: the (possibly relocated) receiver, its backing array
+    /// and its size.
+    State(ObjectRef, Option<ObjectRef>, i32),
+}
+
+/// `al_state` for a receiver that may be a live map view, computing the ONE
+/// `al_state` that both the marker test and the answer need.
+///
+/// `resync_values_view` opens with `values_view_source`, which is itself an
+/// `al_state`; every native that called it and then `al_state` therefore read
+/// the receiver's two fields twice and classified its layout twice. On the
+/// non-view path — every ordinary `ArrayList`, which is the bulk of the traffic
+/// — the second read is pure duplication: `values_view_source` allocates
+/// nothing and runs no Java, so nothing between the two can have moved the
+/// object. On the view path the rebuild DOES move things, so the re-read stays.
+///
+/// `size_only` additionally skips the rebuild altogether. A view's logical size
+/// is by construction its source's size — `resync_values_view` refills it from
+/// `collect_entries_any(source)` and stores exactly that many elements — so
+/// `size()` and `isEmpty()` never need the elements at all, and rebuilding for
+/// them was O(n) with an allocation PER CALL: measured at **15.9 us** for
+/// `values().size()` over a 64-entry `HashMap`, against 610 ns for
+/// `ArrayList.size()` on the same binary and 3 ns on HotSpot. One virtual
+/// `size()` on the source replaces it. A source that cannot answer falls back
+/// to the rebuild rather than inventing a number.
+fn al_state_for_read(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    size_only: bool,
+) -> Result<AlRead, MethodCallFailed> {
+    let (data, size) = al_state(ctx, this);
+    let Some(d) = data else {
+        return Ok(AlRead::State(this, None, size));
+    };
+    let Some(source) = view_source_in(ctx, d, size) else {
+        return Ok(AlRead::State(this, data, size));
+    };
+    // A view naming ITSELF as its source would recurse forever. The marker is
+    // never written that way, but these natives are reachable from application
+    // bytecode that can hand over any object.
+    if size_only && source != this {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(source, "size", "()I", &[]) {
+            if n >= 0 {
+                return Ok(AlRead::ViewSize(n));
+            }
+        }
+    }
+    let this = resync_values_view(ctx, this)?;
+    let (data, size) = al_state(ctx, this);
+    Ok(AlRead::State(this, data, size))
+}
+
 pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(r) = ksv_route(ctx, args, native_ksv_size) {
         return r;
@@ -4701,8 +4834,10 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(b) = unmod_receiver_backing(ctx, this) {
         return native_al_size(ctx, &[Value::Object(Some(b))]);
     }
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    let (this, data, size) = match al_state_for_read(ctx, this, true)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(n))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if data.is_none() {
         if let Some(r) =
             try_delegate_real_collection(ctx, this, "java/util/Collection", "size", "()I")
@@ -4724,8 +4859,10 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    let (this, data, size) = match al_state_for_read(ctx, this, true)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(i32::from(n == 0)))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if data.is_none() {
         if let Some(r) =
             try_delegate_real_collection(ctx, this, "java/util/Collection", "isEmpty", "()Z")
@@ -4866,8 +5003,10 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
         _ => {}
     }
-    let this = resync_values_view(ctx, this)?;
-    let (data, size) = al_state(ctx, this);
+    let (this, data, size) = match al_state_for_read(ctx, this, false)? {
+        AlRead::ViewSize(n) => return Ok(Some(Value::Int(n))),
+        AlRead::State(t, d, s) => (t, d, s),
+    };
     if index < 0 || index >= size {
         // HotSpot: IndexOutOfBoundsException, "Index N out of bounds for
         // length M". NOT the ArrayIndexOutOfBoundsException subclass -- that is
@@ -12352,7 +12491,19 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
 /// capacity slots of a normal list are always null).
 fn values_view_source(ctx: &dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
     let (data, size) = al_state(ctx, list);
-    let data = data?;
+    view_source_in(ctx, data?, size)
+}
+
+/// The marker test of [`values_view_source`], for a caller that already holds
+/// the receiver's `(elementData, size)` pair.
+///
+/// Split out so the hot natives can answer "is this a view?" from the
+/// `al_state` they had to run anyway. Reading it through `values_view_source`
+/// instead cost a second full `al_state` — two more `get_field`s and a second
+/// layout classification — on every `size()`/`isEmpty()`/`get()` of every
+/// ordinary list, which is the overwhelming majority of the calls.
+#[inline]
+fn view_source_in(ctx: &dyn NativeContext, data: ObjectRef, size: i32) -> Option<ObjectRef> {
     let dlen = ctx.array_length(data) as i32;
     if dlen > size {
         if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
@@ -58211,12 +58362,54 @@ mod tests {
         let list = ctx.alloc_object_of(al, 8);
 
         let uncached = super::al_slots_for_uncached(&ctx, al);
-        let first = super::al_slots_for(&ctx, list);
-        assert_eq!(first, super::al_slots_for(&ctx, list), "memo must be stable");
-        assert_eq!(first, super::al_slots_for(&ctx, list));
+        let first = super::al_slots_and_layout_for(&ctx, list);
+        assert_eq!(
+            first,
+            super::al_slots_and_layout_for(&ctx, list),
+            "memo must be stable"
+        );
+        assert_eq!(first, super::al_slots_and_layout_for(&ctx, list));
         if let Some(u) = uncached {
             assert_eq!(first, u, "memo must match the uncached resolution");
         }
+    }
+
+    /// The memo carries the layout VERDICT beside the slots now, so a stale or
+    /// cross-wired entry can answer "not a list" for a real list — which
+    /// `al_state` turns into a silently EMPTY collection rather than an error.
+    /// Pin the verdict per receiver class explicitly.
+    #[test]
+    fn al_layout_verdict_is_per_receiver_class() {
+        let (ctx, al, vec) = memo_ctx();
+        let list = ctx.alloc_object_of(al, 8);
+        let vector = ctx.alloc_object_of(vec, 8);
+
+        assert_eq!(super::al_slots_and_layout_for(&ctx, list).1, super::AlLayout::ArrayList);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, vector).1, super::AlLayout::Vector);
+        // Both must survive the other being asked for, in both orders.
+        assert_eq!(super::al_slots_and_layout_for(&ctx, vector).1, super::AlLayout::Vector);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, list).1, super::AlLayout::ArrayList);
+        assert!(super::al_is_list_layout(&ctx, list));
+        assert!(super::al_is_list_layout(&ctx, vector));
+        assert!(super::al_is_arraylist_layout(&ctx, list));
+        assert!(
+            !super::al_is_arraylist_layout(&ctx, vector),
+            "a Vector is list-layout but NOT ArrayList-layout"
+        );
+    }
+
+    /// A named class that is neither ArrayList nor Vector must be refused, or
+    /// `al_state` reads its slots as `elementData`/`size` — the wild read the
+    /// guard exists for.
+    #[test]
+    fn al_layout_verdict_refuses_a_foreign_named_class() {
+        let (ctx, _al, _vec) = memo_ctx();
+        let foreign = ClassId::new(4003);
+        ctx.define_class(foreign, "java/lang/String");
+        let s = ctx.alloc_object_of(foreign, 8);
+        assert_eq!(super::al_slots_and_layout_for(&ctx, s).1, super::AlLayout::Foreign);
+        assert!(!super::al_is_list_layout(&ctx, s));
+        assert!(!super::al_is_arraylist_layout(&ctx, s));
     }
 
     #[test]
