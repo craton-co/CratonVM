@@ -244,7 +244,7 @@ Not defects introduced or missed here — filed separately:
   `AdaptiveBigEndianDirectByteBufTest.testInternalNioBuffer`. All of them
   **pass when run solo**; the gap is 10× broadly and ~90× through
   `AdaptivePoolingAllocator` →
-  `known-issues/netty/adaptive-bytebuf-allocator-throughput-20260812.md`.
+  `internal/performance/netty-per-call-throughput-20260813.md`.
 * `AlignedPooledByteBufAllocatorTest` runs 28 tests HotSpot skips, because
   CratonVM pins `sun.misc.unsafe.memory.access=allow` and netty therefore keeps
   `hasUnsafe() == true` where HotSpot 25 turns it off →
